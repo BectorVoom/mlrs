@@ -54,3 +54,47 @@ pub enum BridgeError {
         found: String,
     },
 }
+
+/// Errors raised when validating the geometry of a compute primitive's operands
+/// before launching a device kernel (Phase 2 primitives, D-04 / ASVS V5).
+///
+/// Every variant corresponds to a caller-supplied-geometry violation the
+/// primitive must reject *before* any `unsafe` kernel launch, so a wrong shape
+/// becomes a recoverable typed error rather than an out-of-bounds device read.
+/// One variant per violation class (D-07), mirroring [`BridgeError`].
+#[derive(Debug, Error)]
+pub enum PrimError {
+    /// A declared `(rows, cols)` geometry does not match the operand's element
+    /// count: `rows * cols != len`. Carries the offending values plus a label
+    /// naming the operand (e.g. `"lhs"`, `"rhs"`, `"out"`) for diagnosis.
+    #[error(
+        "primitive '{operand}' shape mismatch: rows({rows}) * cols({cols}) = {} != len({len})",
+        rows * cols
+    )]
+    ShapeMismatch {
+        /// Which operand failed validation (e.g. `"lhs"` / `"rhs"` / `"out"`).
+        operand: &'static str,
+        /// Declared row count.
+        rows: usize,
+        /// Declared column count.
+        cols: usize,
+        /// Actual element count of the operand buffer.
+        len: usize,
+    },
+
+    /// Two operands disagree on a shared dimension that must match for the
+    /// operation to be defined — e.g. a GEMM where `lhs` is `m×k` but `rhs` is
+    /// `k'×n` with `k != k'` (the contraction dimension is incompatible).
+    #[error(
+        "primitive dimension mismatch ({dim}): lhs declares {lhs}, rhs declares {rhs}"
+    )]
+    DimMismatch {
+        /// Name of the disagreeing dimension (e.g. `"k"` for the GEMM
+        /// contraction dimension).
+        dim: &'static str,
+        /// The dimension value the lhs operand declared.
+        lhs: usize,
+        /// The dimension value the rhs operand declared.
+        rhs: usize,
+    },
+}

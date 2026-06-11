@@ -15,3 +15,4 @@ pub mod capability;
 pub mod bridge;
 pub mod device_array;
 pub mod pool;
+pub mod prims;

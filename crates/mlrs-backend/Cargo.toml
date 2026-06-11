@@ -12,6 +12,12 @@ arrow = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+# GEMM substrate (PRIM-01). cubek-matmul 0.2.0 is the cubecl-0.10-compatible
+# matmul source (the abandoned cubecl-matmul/cubecl-linalg pin cubecl 0.9/0.5
+# and cannot link). default-features=false so we never pull a conflicting
+# default cubecl runtime — the active backend is selected by this crate's own
+# cpu/wgpu/cuda/rocm features. Resolved by the Plan 02-01 Task-1 checkpoint.
+cubek-matmul = { version = "0.2.0", default-features = false }
 
 [dev-dependencies]
 env_logger = { workspace = true }

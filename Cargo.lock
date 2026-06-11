@@ -829,6 +829,7 @@ dependencies = [
  "cubecl-hip",
  "cubecl-ir",
  "cubecl-runtime",
+ "cubecl-std",
  "cubecl-wgpu",
  "half",
 ]
@@ -1134,6 +1135,31 @@ dependencies = [
  "derive-new",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "cubek-matmul"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83a4cea5f0f439907dc953c7638a6204b3f055f1bcbd10db91dfc5faa030ac1c"
+dependencies = [
+ "bytemuck",
+ "cubecl",
+ "cubecl-common",
+ "cubek-std",
+ "half",
+ "serde",
+]
+
+[[package]]
+name = "cubek-std"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a587d0a44b6f14f4c3711ac10717179b48adb59203b2b2bffe334876bf713187"
+dependencies = [
+ "cubecl",
+ "cubecl-common",
+ "half",
 ]
 
 [[package]]
@@ -2484,6 +2510,7 @@ dependencies = [
  "arrow",
  "bytemuck",
  "cubecl",
+ "cubek-matmul",
  "env_logger",
  "log",
  "mlrs-core",
