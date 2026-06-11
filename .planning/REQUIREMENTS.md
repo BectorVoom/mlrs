@@ -96,13 +96,43 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (populated during roadmap creation) | — | Pending |
+| FOUND-01 | Phase 1 | Pending |
+| FOUND-02 | Phase 1 | Pending |
+| FOUND-03 | Phase 1 | Pending |
+| FOUND-04 | Phase 1 | Pending |
+| FOUND-05 | Phase 1 | Pending |
+| FOUND-06 | Phase 1 | Pending |
+| FOUND-07 | Phase 1 | Pending |
+| FOUND-08 | Phase 1 | Pending |
+| FOUND-09 | Phase 1 | Pending |
+| PRIM-01 | Phase 2 | Pending |
+| PRIM-02 | Phase 2 | Pending |
+| PRIM-03 | Phase 2 | Pending |
+| PRIM-04 | Phase 2 | Pending |
+| PRIM-05 | Phase 3 | Pending |
+| LINEAR-01 | Phase 4 | Pending |
+| LINEAR-02 | Phase 4 | Pending |
+| DECOMP-01 | Phase 4 | Pending |
+| DECOMP-02 | Phase 4 | Pending |
+| LINEAR-03 | Phase 5 | Pending |
+| LINEAR-04 | Phase 5 | Pending |
+| LINEAR-05 | Phase 5 | Pending |
+| CLUSTER-01 | Phase 5 | Pending |
+| CLUSTER-02 | Phase 5 | Pending |
+| NEIGH-01 | Phase 5 | Pending |
+| NEIGH-02 | Phase 5 | Pending |
+| NEIGH-03 | Phase 5 | Pending |
+| PY-01 | Phase 6 | Pending |
+| PY-02 | Phase 6 | Pending |
+| PY-03 | Phase 6 | Pending |
+| PY-04 | Phase 6 | Pending |
+| PY-05 | Phase 6 | Pending |
 
 **Coverage:**
 - v1 requirements: 27 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 27 ⚠️
+- Mapped to phases: 27 ✓
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-06-11*
-*Last updated: 2026-06-11 after initial definition*
+*Last updated: 2026-06-11 after roadmap creation (traceability populated, 27/27 mapped)*
