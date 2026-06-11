@@ -82,6 +82,23 @@ impl<R: cubecl::Runtime, F: Pod> DeviceArray<R, F> {
         }
     }
 
+    /// Wrap an already-populated CubeCL handle as a `DeviceArray` of `len`
+    /// elements, without uploading or metering.
+    ///
+    /// Used by device-resident producers (e.g. the GEMM host API) that obtain
+    /// an output handle from the pool, launch a kernel that writes it, then
+    /// hand the result back as a typed length-carrying array (the result stays
+    /// on the device — D-05). `len` is the single source of truth for read-back
+    /// size (T-04-01), so callers MUST pass the true element count.
+    pub fn from_raw(handle: Handle, len: usize) -> Self {
+        Self {
+            handle,
+            len,
+            _runtime: PhantomData,
+            _dtype: PhantomData,
+        }
+    }
+
     /// Read the buffer back to a host `Vec<F>` of length [`len`](Self::len).
     ///
     /// Reads via `client.read_one` then reinterprets the bytes with

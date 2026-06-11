@@ -2511,6 +2511,7 @@ dependencies = [
  "bytemuck",
  "cubecl",
  "cubek-matmul",
+ "cubek-std",
  "env_logger",
  "log",
  "mlrs-core",

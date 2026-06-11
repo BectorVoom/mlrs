@@ -18,6 +18,10 @@ log = { workspace = true }
 # default cubecl runtime — the active backend is selected by this crate's own
 # cpu/wgpu/cuda/rocm features. Resolved by the Plan 02-01 Task-1 checkpoint.
 cubek-matmul = { version = "0.2.0", default-features = false }
+# cubek-std carries InputBinding / TensorBinding helpers the matmul launch_ref
+# entry point consumes. Same 0.2.0 line as cubek-matmul (re-exported through it
+# transitively, but named directly so we don't depend on a private re-export).
+cubek-std = { version = "0.2.0", default-features = false }
 
 [dev-dependencies]
 env_logger = { workspace = true }
