@@ -1,0 +1,14 @@
+[package]
+name = "mlrs-kernels"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-feature-free generic CubeCL compute kernels for mlrs."
+
+# CRITICAL (Criterion 1 / FOUND-02 / Pitfall 5): this crate carries ZERO
+# backend feature flags. `cubecl` is pulled with default-features = false and
+# NO runtime feature, so `cargo tree -p mlrs-kernels -e features` shows no
+# cubecl-cpu / cubecl-wgpu / cubecl-cuda / cubecl-rocm. Kernels stay generic
+# over both `<F: Float>` and `<R: Runtime>`; a concrete runtime is only
+# selected downstream in mlrs-backend.
+[dependencies]
+cubecl = { workspace = true }

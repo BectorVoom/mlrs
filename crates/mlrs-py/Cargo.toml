@@ -1,0 +1,12 @@
+[package]
+name = "mlrs-py"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 cdylib bindings for mlrs; owns the mimalloc global allocator."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true }
+mimalloc = { workspace = true }

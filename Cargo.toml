@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mlrs-core",
+    "crates/mlrs-kernels",
+    "crates/mlrs-backend",
+    "crates/mlrs-algos",
+    "crates/mlrs-py",
+]
+
+# Single source of truth for shared dependency versions (D-10: track latest).
+# Verified latest on crates.io 2026-06-11 via `cargo search`.
+[workspace.dependencies]
+# CubeCL: device-kernel layer. default-features=false so the feature-free
+# `mlrs-kernels` crate never pulls a backend runtime (Criterion 1 / Pitfall 5).
+cubecl = { version = "0.10.0", default-features = false }
+
+# Apache Arrow zero-copy interchange (mandated by CLAUDE.md).
+arrow = "59"
+
+# Safe zero-copy &[T] <-> &[u8] transmutation for the Arrow -> CubeCL handoff.
+bytemuck = { version = "1", features = ["derive"] }
+
+# Typed error enums in library crates (D-07 / D-10).
+thiserror = "2"
+
+# Boundary error handling in mlrs-py and scripts-driven Rust (D-10).
+anyhow = "1"
+
+# Custom global allocator, wired only in mlrs-py (FOUND-09).
+mimalloc = "0.1"
+
+# .npz named-array reader for the oracle fixtures (D-02). npyz avoids the
+# heavy `ndarray` dependency and reads into plain Vec<T>.
+npyz = { version = "0.9", features = ["npz"] }
+
+# Logging: dtype/backend selection (Criterion 4) and pool counters (D-05).
+log = "0.4"
+env_logger = "0.11"

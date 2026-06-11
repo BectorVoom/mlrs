@@ -1,0 +1,10 @@
+[package]
+name = "mlrs-core"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side comparison helpers, tolerances, oracle fixture loader, and typed errors for mlrs."
+
+[dependencies]
+thiserror = { workspace = true }
+npyz = { workspace = true }
+log = { workspace = true }

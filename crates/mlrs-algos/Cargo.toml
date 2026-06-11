@@ -1,0 +1,8 @@
+[package]
+name = "mlrs-algos"
+version = "0.1.0"
+edition = "2021"
+description = "sklearn-compatible ML estimators for mlrs (skeleton in Phase 1; estimators land in Phase 4+)."
+
+[dependencies]
+thiserror = { workspace = true }
