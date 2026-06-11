@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Plan 01-03 complete (Arrow hard-reject bridge + f64 capability gate)
-last_updated: "2026-06-11T12:05:00.000Z"
-last_activity: 2026-06-11 -- Plan 01-03 complete (Arrow hard-reject bridge: offset/nulls/misalign -> typed BridgeError before unsafe; f64 capability gate + dtype/backend logging + skip-with-log)
+stopped_at: Plan 01-04 complete (buffer-reuse pool + DeviceArray memory-efficiency layer)
+last_updated: "2026-06-11T12:11:24.000Z"
+last_activity: 2026-06-11 -- Plan 01-04 complete (BufferPool byte-size free-list + logged-only PoolStats counters; DeviceArray<R,F> pool-metered alloc + host<->device round-trip on cpu & wgpu)
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 5
-  completed_plans: 3
-  percent: 60
+  completed_plans: 4
+  percent: 80
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 01 (foundation-oracle-backend-abstraction-arrow-bridge) — EXECUTING
-Plan: 4 of 5
-Status: Executing Phase 01 — Plans 01-01, 01-02, 01-03 complete (Wave 0 + Wave 1 bridge/capability)
-Last activity: 2026-06-11 -- Plan 01-03 complete (Arrow hard-reject bridge + f64 capability gate; 12 tests pass on cpu & wgpu)
+Plan: 5 of 5
+Status: Executing Phase 01 — Plans 01-01..01-04 complete (Wave 0 + Wave 1 bridge/capability/memory layer); 01-05 (pipeline) remaining
+Last activity: 2026-06-11 -- Plan 01-04 complete (buffer-reuse pool + DeviceArray; 5 tests pass on cpu & wgpu)
 
-Progress: [██████░░░░] 60%
+Progress: [████████░░] 80%
 
 ## Performance Metrics
 
@@ -54,6 +54,7 @@ Progress: [██████░░░░] 60%
 *Updated after each plan completion*
 | Phase 01 P02 | 25 | 2 tasks | 12 files |
 | Phase 01 P03 | 7 | 2 tasks | 4 files |
+| Phase 01 P04 | 5 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -72,6 +73,9 @@ Recent decisions affecting current work:
 - [Phase ?]: [01-03]: Bridge ingress has NO unsafe block (bytemuck::try_cast_slice is the only, safe, reinterpretation) — stronger than "// SAFETY: on every unsafe"
 - [Phase ?]: [01-03]: upload() is honest "validated single-upload" (one host copy, A3), not literal zero-copy
 - [Phase ?]: [01-03]: f64 skip mechanism = logged early-return (skip_f64_with_log); on this env's wgpu adapter SHADER_F64 is present so f64 runs
+- [Phase ?]: [01-04]: Pool counters are LOGGED ONLY in Phase 1 (D-05) — tests assert the counters API increments, not a reuse-rate threshold (hard memory assertions deferred to Phase 2)
+- [Phase ?]: [01-04]: mlrs-level HashMap free-list keyed by exact byte size, on top of client.empty — no CubeCL MemoryConfiguration tuning in Phase 1 (RESEARCH Open Question 4)
+- [Phase ?]: [01-04]: DeviceArray::from_host meters the byte footprint through the pool then uploads via client.create (cubecl 0.10 has no in-place write into an empty handle)
 
 ### Pending Todos
 
@@ -98,6 +102,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-11T12:05:00.000Z
-Stopped at: Plan 01-03 complete (Arrow hard-reject bridge + f64 capability gate)
-Resume file: .planning/phases/01-foundation-oracle-backend-abstraction-arrow-bridge/01-04-PLAN.md
+Last session: 2026-06-11T12:11:24.000Z
+Stopped at: Plan 01-04 complete (buffer-reuse pool + DeviceArray memory-efficiency layer)
+Resume file: .planning/phases/01-foundation-oracle-backend-abstraction-arrow-bridge/01-05-PLAN.md
