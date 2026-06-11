@@ -52,7 +52,7 @@ Plans:
 **Success Criteria** (what must be TRUE):
 
   1. ✅ A GEMM primitive (substrate resolved in Plan 02-01: WRAPS `cubek-matmul` 0.2.0 — the cubecl-0.10-compatible matmul source in tracel-ai/cubek; `cubecl-matmul`/`cubecl-linalg` are abandoned on incompatible cubecl lines) matches a host reference within tolerance for f32 and f64 on both cpu and wgpu. **[Plan 02-01 complete; wording updated from "cubecl-matmul" → "cubek-matmul".]**
-  2. Reduction primitives (sum/mean/min/max/argmin/L2-norm) pass on wgpu via both a plane/subgroup path and a shared-memory fallback, with no hardcoded plane width (uses `PLANE_DIM`), numerically stable on large inputs.
+  2. ✅ Reduction primitives (sum/mean/min/max/argmin/L2-norm) pass on wgpu via both a plane/subgroup path and a shared-memory fallback, with no hardcoded plane width (uses `PLANE_DIM`), numerically stable on large inputs. **[Plan 02-02 complete; BOTH paths green on wgpu (plane genuinely exercised) + cpu, f32/f64, within 1e-5; argmin lowest-index tie-break pinned by numpy fixture.]**
   3. A pairwise squared-Euclidean distance primitive with a `max(d², 0)` clamp produces no negative distances under f32 and matches the host reference within tolerance.
   4. A covariance / XᵀX (Gram) primitive built on GEMM matches the host reference within tolerance for both dtypes on cpu and wgpu.
 
@@ -61,9 +61,9 @@ Plans:
 
 - [x] 02-01-PLAN.md — Wave 1: Wave-0 infra (PoolStats.read_backs, subgroup probe, GEMM fixtures) + GEMM substrate decision + GEMM primitive (PRIM-01) ✅ (cubek-matmul wrap; 4/4 oracle green cpu+wgpu)
 
-**Wave 2** *(blocked on Wave 1 completion)*
+**Wave 2**
 
-- [ ] 02-02-PLAN.md — Wave 2: dual-path reductions sum/mean/min/max/L2-norm + argmin/argmax (plane + shared, PLANE_DIM, lowest-index tie-break) (PRIM-02)
+- [x] 02-02-PLAN.md — Wave 2: dual-path reductions sum/mean/min/max/L2-norm + argmin/argmax (plane + shared, PLANE_DIM, lowest-index tie-break) (PRIM-02) ✅ (both paths green cpu+wgpu, f32/f64; argmin tie fixture)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 

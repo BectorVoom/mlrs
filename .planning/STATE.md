@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Plan 02-01 complete (GEMM PRIM-01 via cubek-matmul wrap + Wave-0 infra) — Phase 02 plan 1/5
+stopped_at: Plan 02-02 complete (reduction primitives PRIM-02, dual-path plane+shared) — Phase 02 plan 2/5
 last_updated: "2026-06-12T00:00:00.000Z"
-last_activity: 2026-06-12 -- Plan 02-01 executed (GEMM substrate + Wave-0 hooks)
+last_activity: 2026-06-12 -- Plan 02-02 executed (dual-path reductions + argmin tie-break)
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 10
-  completed_plans: 6
-  percent: 18
+  completed_plans: 7
+  percent: 21
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 02 (core-compute-primitives) — EXECUTING
-Plan: 2 of 5
-Status: Executing Phase 02 (plan 01 complete)
-Last activity: 2026-06-12 -- Plan 02-01 executed (GEMM substrate + Wave-0 hooks)
-Resume file: .planning/phases/02-core-compute-primitives/02-02-PLAN.md
+Plan: 3 of 5
+Status: Executing Phase 02 (plans 01-02 complete)
+Last activity: 2026-06-12 -- Plan 02-02 executed (dual-path reductions + argmin tie-break)
+Resume file: .planning/phases/02-core-compute-primitives/02-03-PLAN.md
 
-Progress: [██░░░░░░░░] 18% (1/6 phases; 6/10 plans)
+Progress: [██░░░░░░░░] 21% (1/6 phases; 7/10 plans)
 
 ## Performance Metrics
 
@@ -58,6 +58,7 @@ Progress: [██░░░░░░░░] 18% (1/6 phases; 6/10 plans)
 | Phase 01 P04 | 5 | 2 tasks | 3 files |
 | Phase 01 P05 | 18 | 3 tasks | 6 files |
 | Phase 02 P01 | 35 | 5 tasks | 14 files |
+| Phase 02 P02 | 95 | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -78,6 +79,10 @@ Recent decisions affecting current work:
 - [Phase ?]: [01-03]: f64 skip mechanism = logged early-return (skip_f64_with_log); on this env's wgpu adapter SHADER_F64 is present so f64 runs
 - [Phase ?]: [01-04]: Pool counters are LOGGED ONLY in Phase 1 (D-05) — tests assert the counters API increments, not a reuse-rate threshold (hard memory assertions deferred to Phase 2)
 - [Phase ?]: [01-04]: mlrs-level HashMap free-list keyed by exact byte size, on top of client.empty — no CubeCL MemoryConfiguration tuning in Phase 1 (RESEARCH Open Question 4)
+- [Phase 02]: [02-02]: Plane reduction kernels combine per-plane shuffle partials IN-CUBE to one partial per cube (NOT per-plane) — PLANE_DIM is runtime-variable on wgpu (min=32,max=64) so the host can't pre-size a per-plane output; in-cube combine makes plane/shared output layouts identical and the host plane-width-agnostic
+- [Phase 02]: [02-02]: Host clamps the plane-path launch cube to >= plane width (else planes_per_cube=CUBE_DIM_X/PLANE_DIM rounds to 0 and the combine reads nothing → got=0)
+- [Phase 02]: [02-02]: f32 large-magnitude reductions compare abs-OR-rel (numpy allclose) — strict abs-AND-rel is impossible when the f32 ULP (|x|·2⁻²³) exceeds 1e-5; both bounds stay 1e-5, f64 keeps strict assert_slice_close; sum/mean sweep uses non-negative data to avoid the near-zero relative artifact
+- [Phase 02]: [02-02]: row-L2-norm (Plan 03 distance) = prims::reduce::row_reduce(.., ScalarOp::L2Norm, ..); column-mean (Plan 04 covariance) = column_reduce(.., ScalarOp::Mean, ..); per-row argmin (Plan 05 KMeans) = argmin_rows
 - [Phase ?]: [01-04]: DeviceArray::from_host meters the byte footprint through the pool then uploads via client.create (cubecl 0.10 has no in-place write into an empty handle)
 - [Phase ?]: [01-05]: f32 oracle near-zero floor raised to 1e-2 (in pipeline_test only) — cross-backend f32 saxpy rounding (~1 ULP, abs_err ~3e-8) exceeds the strict 1e-5 *relative* bound on near-cancellation results; the 1e-5 *absolute* bound stays enforced. Core compare.rs (Plan 02) left untouched.
 - [Phase ?]: [01-05]: mimalloc #[global_allocator] defined exactly once in the mlrs-py cdylib (src/allocator.rs), never in a library crate; activation proven by exercising it (no public introspection symbol in the mimalloc crate)
