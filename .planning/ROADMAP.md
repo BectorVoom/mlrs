@@ -13,7 +13,7 @@ mlrs is built primitive-first along a strictly acyclic five-crate workspace. The
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Foundation — Oracle, Backend Abstraction, Arrow Bridge** - Workspace, generic R/F spine, oracle harness, Arrow zero-copy bridge, f64 capability gate, allocator
+- [x] **Phase 1: Foundation — Oracle, Backend Abstraction, Arrow Bridge** - Workspace, generic R/F spine, oracle harness, Arrow zero-copy bridge, f64 capability gate, allocator (completed 2026-06-11)
 - [ ] **Phase 2: Core Compute Primitives** - GEMM, reductions, pairwise distance, covariance/XᵀX validated standalone on cpu+wgpu
 - [ ] **Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)** - GPU Jacobi SVD + symmetric eig, sign-flip oracle-validated, gates four estimators
 - [ ] **Phase 4: Closed-Form Estimators** - LinearRegression, Ridge, PCA, TruncatedSVD assembled on validated primitives
@@ -123,7 +123,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Execution complete |  |
+| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
 | 2. Core Compute Primitives | 0/TBD | Not started | - |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 0/TBD | Not started | - |
 | 4. Closed-Form Estimators | 0/TBD | Not started | - |
