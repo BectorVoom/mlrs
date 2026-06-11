@@ -42,6 +42,10 @@ N = 1024
 # exercise real rounding rather than exact integer arithmetic.
 A = 2.5
 
+# GEMM convention-fixture shape (D-12). Small NON-square so the fixture also
+# exercises rectangular geometry: A is m×k, B is k×n, C = A @ B is m×n.
+GEMM_M, GEMM_K, GEMM_N = 5, 4, 3
+
 
 def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
     """Generate one seeded saxpy fixture and write it to ``tests/fixtures``.
@@ -65,9 +69,35 @@ def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
     return out_path
 
 
+def gen_gemm(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded GEMM convention fixture (D-12, PRIM-01).
+
+    Stores named arrays ``A`` (m×k), ``B`` (k×n) and the NumPy reference product
+    ``C = A @ B`` (m×n), every array cast to the fixture's dtype. The shape is
+    small and non-square (``GEMM_M``×``GEMM_K``×``GEMM_N``) so the fixture also
+    exercises rectangular geometry. Returns the absolute path written.
+    """
+    rng = np.random.default_rng(seed)
+    a = rng.standard_normal((GEMM_M, GEMM_K)).astype(dtype)
+    b = rng.standard_normal((GEMM_K, GEMM_N)).astype(dtype)
+    # Reference product. Compute in the fixture dtype so the committed C matches
+    # what a same-dtype device GEMM should produce (the loader exposes both an
+    # f32 and an f64 view, so the Rust test compares at the dtype under test).
+    c = (a @ b).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"gemm_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, A=a, B=b, C=c)
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
+        print(f"wrote {path}")
+    for dtype in (np.float32, np.float64):
+        path = gen_gemm(dtype=dtype)
         print(f"wrote {path}")
 
 
