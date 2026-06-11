@@ -26,7 +26,52 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::runtime::{self, ActiveRuntime};
-use mlrs_core::{assert_slice_close, load_npz, OracleCase, F32_TOL, F64_TOL};
+use mlrs_core::{assert_slice_close, is_close, load_npz, OracleCase, Tolerance, F32_TOL, F64_TOL};
+
+/// f32-precision near-zero floor for the GEMM oracle comparison, mirroring the
+/// `F32_ORACLE_NEAR_ZERO_FLOOR` precedent in `pipeline_test.rs`.
+///
+/// A GEMM accumulates `k` products, so near-cancellation rows produce genuinely
+/// tiny results whose *absolute* error stays far inside `1e-5` (a few ×10⁻⁹)
+/// while the *relative* term legitimately exceeds `1e-5` purely from f32
+/// rounding (~1 ULP). This floor raises the abs-only fallback to an
+/// f32-meaningful magnitude for the f32 GEMM cases ONLY; it never loosens the
+/// `1e-5` absolute bound — every element must still pass abs ≤ `1e-5`. The f64
+/// cases keep the strict core `assert_close`.
+const F32_GEMM_NEAR_ZERO_FLOOR: f64 = 1e-2;
+
+/// Element-wise f32 GEMM oracle compare: strict abs-AND-rel per `F32_TOL`,
+/// except abs-only (still bounded by `tol.abs` = `1e-5`) when
+/// `|expected| < F32_GEMM_NEAR_ZERO_FLOOR`. Panics with diagnostic detail.
+fn assert_slice_close_f32_gemm(got: &[f64], expected: &[f64], tol: &Tolerance) {
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "f32 gemm oracle length mismatch: got={} expected={}",
+        got.len(),
+        expected.len()
+    );
+    for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+        if e.abs() < F32_GEMM_NEAR_ZERO_FLOOR {
+            let abs_err = (g - e).abs();
+            assert!(
+                abs_err <= tol.abs,
+                "f32 gemm near-zero abs check failed at index {i}: got={g:e}, \
+                 expected={e:e}, abs_err={abs_err:e} (tol.abs={:e})",
+                tol.abs
+            );
+        } else {
+            assert!(
+                is_close(g, e, tol),
+                "f32 gemm assert_close failed at index {i}: got={g:e}, expected={e:e}, \
+                 abs_err={:e} (tol.abs={:e}, tol.rel={:e})",
+                (g - e).abs(),
+                tol.abs,
+                tol.rel
+            );
+        }
+    }
+}
 
 /// Resolve a workspace-root-relative fixture path (matches `pipeline_test.rs`).
 fn fixture(name: &str) -> PathBuf {
@@ -106,7 +151,6 @@ where
 /// f32 GEMM vs an f64 host triple-loop reference over several random shapes,
 /// including a large-K case for numerical stability (Pitfall 3).
 #[test]
-#[ignore = "device GEMM body lands in Plan 02-01 Task 5/6"]
 fn gemm_f32_matches_host_ref() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
@@ -123,13 +167,12 @@ fn gemm_f32_matches_host_ref() {
         let b64: Vec<f64> = b.iter().map(|&x| x as f64).collect();
         let expected = host_gemm_ref(&a64, &b64, m, k, n, false, false);
         let got64: Vec<f64> = got.iter().map(|&x| x as f64).collect();
-        assert_slice_close(&got64, &expected, &F32_TOL);
+        assert_slice_close_f32_gemm(&got64, &expected, &F32_TOL);
     }
 }
 
 /// f64 GEMM vs the f64 host reference, capability-gated (skip-with-log).
 #[test]
-#[ignore = "device GEMM body lands in Plan 02-01 Task 5/6"]
 fn gemm_f64_matches_host_ref() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
@@ -153,7 +196,6 @@ fn gemm_f64_matches_host_ref() {
 /// `transa` / `transb` match the transposed-operand host reference (D-06: the
 /// transpose is logical index arithmetic, never a materialized buffer).
 #[test]
-#[ignore = "device GEMM body lands in Plan 02-01 Task 5/6"]
 fn gemm_transpose_matches_host_ref() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
@@ -168,7 +210,7 @@ fn gemm_transpose_matches_host_ref() {
     let b64: Vec<f64> = b.iter().map(|&x| x as f64).collect();
     let expected = host_gemm_ref(&a_t64, &b64, m, k, n, true, false);
     let got64: Vec<f64> = got.iter().map(|&x| x as f64).collect();
-    assert_slice_close(&got64, &expected, &F32_TOL);
+    assert_slice_close_f32_gemm(&got64, &expected, &F32_TOL);
 
     // transb: B is stored as n×k and read transposed to k×n.
     let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.2 - 0.5).collect();
@@ -178,13 +220,12 @@ fn gemm_transpose_matches_host_ref() {
     let b_t64: Vec<f64> = b_t.iter().map(|&x| x as f64).collect();
     let expected = host_gemm_ref(&a64, &b_t64, m, k, n, false, true);
     let got64: Vec<f64> = got.iter().map(|&x| x as f64).collect();
-    assert_slice_close(&got64, &expected, &F32_TOL);
+    assert_slice_close_f32_gemm(&got64, &expected, &F32_TOL);
 }
 
 /// Device GEMM `C` matches the committed numpy `C = A @ B` convention fixture
 /// (f32 always, f64 capability-gated).
 #[test]
-#[ignore = "device GEMM body lands in Plan 02-01 Task 5/6"]
 fn gemm_npz_fixture_matches() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
@@ -202,7 +243,7 @@ fn gemm_npz_fixture_matches() {
     let got = run_gemm_case::<f32>(a, b, m, k, n, false, false);
     let got64: Vec<f64> = got.iter().map(|&x| x as f64).collect();
     let c64: Vec<f64> = c.iter().map(|&x| x as f64).collect();
-    assert_slice_close(&got64, &c64, &F32_TOL);
+    assert_slice_close_f32_gemm(&got64, &c64, &F32_TOL);
 
     // f64 fixture — capability-gated.
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
