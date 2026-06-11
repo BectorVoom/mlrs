@@ -12,7 +12,7 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 - [x] **FOUND-01**: A Cargo workspace splits compute kernels, backend/runtime selection, algorithms, and Python bindings into separate single-responsibility crates (`mlrs-core`, `mlrs-kernels`, `mlrs-backend`, `mlrs-algos`, `mlrs-py`)
 - [x] **FOUND-02**: Compute kernels are generic over float type (`f32`/`f64`) and over the CubeCL runtime, compiled once in a feature-free kernels crate
 - [x] **FOUND-03**: A backend is selected via Cargo features (`cuda`, `rocm`, `wgpu`, `cpu`); `cuda` compiles in this environment even though it cannot be run, and `wgpu`+`cpu` run as the correctness gate
-- [ ] **FOUND-04**: A backend capability layer queries runtime support (notably f64 / plane / subgroup) and gates or skips paths the active backend cannot run, so f32 stays the portable baseline on wgpu
+- [x] **FOUND-04**: A backend capability layer queries runtime support (notably f64 / plane / subgroup) and gates or skips paths the active backend cannot run, so f32 stays the portable baseline on wgpu
 - [ ] **FOUND-05**: A memory-efficient device-array abstraction wraps CubeCL buffers with reuse and minimal host↔device copies
 - [x] **FOUND-06**: Input data crosses into Rust as Apache Arrow buffers and feeds CubeCL device buffers zero-copy, with validation of offsets, null bitmaps, and alignment before any unsafe transmutation
 - [x] **FOUND-07**: An oracle test harness generates seeded random inputs, runs scikit-learn to produce reference outputs, and asserts results match within abs/rel error ≤ 1e-5
@@ -99,7 +99,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FOUND-01 | Phase 1 | Complete |
 | FOUND-02 | Phase 1 | Complete |
 | FOUND-03 | Phase 1 | Complete |
-| FOUND-04 | Phase 1 | Pending |
+| FOUND-04 | Phase 1 | Complete |
 | FOUND-05 | Phase 1 | Pending |
 | FOUND-06 | Phase 1 | Complete |
 | FOUND-07 | Phase 1 | Complete |
