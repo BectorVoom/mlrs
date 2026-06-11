@@ -82,6 +82,22 @@ pub fn plane_supported() -> bool {
     supports_plane(&crate::runtime::active_client())
 }
 
+/// Active runtime's plane (subgroup) width, used to size the plane-path
+/// reduction's per-(cube, plane) partial output (Plan 02).
+///
+/// Reports `client.properties().hardware.plane_size_max` — the upper plane
+/// size the adapter advertises (CUDA warp = 32; wgpu subgroups vary 4..128).
+/// When the adapter reports no plane support the value may be `0`; callers
+/// clamp to at least `1`. The min/max symbols were pinned in Plan 02-01
+/// (`spike_subgroup_query_reports_support`).
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn active_plane_width() -> u32 {
+    crate::runtime::active_client()
+        .properties()
+        .hardware
+        .plane_size_max
+}
+
 /// Static name of the active backend, derived from the compiled-in Cargo
 /// feature (FOUND-03: exactly one backend feature is active).
 ///

@@ -10,3 +10,4 @@
 //! `#[cfg(test)]` module — AGENTS.md §2).
 
 pub mod gemm;
+pub mod reduce;
