@@ -52,3 +52,58 @@ pub fn feature_enabled(kind: FloatKind) -> bool {
     let client = crate::runtime::active_client();
     client.properties().supports_type(kind)
 }
+
+/// Static name of the active backend, derived from the compiled-in Cargo
+/// feature (FOUND-03: exactly one backend feature is active).
+///
+/// Used in the dtype×backend oracle log line (Criterion 4) so CI output shows
+/// which backend a given oracle run executed on.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub const fn active_backend_name() -> &'static str {
+    #[cfg(feature = "cpu")]
+    {
+        "cpu"
+    }
+    #[cfg(feature = "wgpu")]
+    {
+        "wgpu"
+    }
+    #[cfg(feature = "cuda")]
+    {
+        "cuda"
+    }
+    #[cfg(feature = "rocm")]
+    {
+        "rocm"
+    }
+}
+
+/// Emit the canonical oracle dtype×backend log line at the start of an oracle
+/// test (Criterion 4: "CI log shows which dtype ran on which backend").
+///
+/// Logs at `info` level. `adapter` is a free-form adapter/device descriptor
+/// (e.g. the wgpu adapter name, or `"default"` for cpu) so the line is
+/// self-describing in CI output.
+pub fn log_oracle_dtype(dtype: FloatKind, backend: &str, adapter: &str) {
+    log::info!("oracle dtype={dtype:?} backend={backend} adapter={adapter}");
+}
+
+/// f64 skip-with-log gate (FOUND-04, T-03-04). Returns `true` when the f64 path
+/// should be **skipped** because the active backend lacks f64 support, after
+/// logging the reason at `warn` level. Returns `false` when f64 is supported and
+/// the caller should proceed.
+///
+/// This is the chosen skip/xfail mechanism (logged early-return — Claude's
+/// discretion per CONTEXT D-06/FOUND-04): an f64-gated oracle test calls this
+/// and `return`s early when it reports `true`, so the run is **skipped, not
+/// failed**, and CI shows the logged reason. On this environment's wgpu adapter
+/// (AMD RADV GFX1152, `SHADER_F64` present) it returns `false` and f64 runs.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn skip_f64_with_log() -> bool {
+    if feature_enabled(FloatKind::F64) {
+        return false;
+    }
+    let backend = active_backend_name();
+    log::warn!("skipping f64 oracle on {backend}: SHADER_F64 / f64 unsupported on this adapter");
+    true
+}
