@@ -19,4 +19,7 @@ pub mod tolerance;
 // `use mlrs_core::{assert_close, F32_TOL, BridgeError};` directly.
 pub use compare::{assert_close, assert_slice_close, is_close, NEAR_ZERO_FLOOR};
 pub use error::BridgeError;
+pub use label_perm::{best_match_accuracy, best_mapping, is_perfect_match, remap};
+pub use oracle::{load_npz, load_npz_reader, OracleCase};
+pub use sign_flip::{align_rows, align_sign, align_sign_in_place, canonical_sign};
 pub use tolerance::{Tolerance, F32_TOL, F64_TOL};

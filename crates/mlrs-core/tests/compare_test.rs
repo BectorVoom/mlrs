@@ -117,7 +117,7 @@ fn for_family_returns_global_default_today() {
 #[test]
 fn near_zero_floor_is_below_abs_tolerance() {
     // The guard never loosens the abs check: floor < abs tolerance.
-    assert!(NEAR_ZERO_FLOOR < F32_TOL.abs);
+    const { assert!(NEAR_ZERO_FLOOR < F32_TOL.abs) };
 }
 
 // --- BridgeError typed enum (D-07) ------------------------------------------
