@@ -51,12 +51,19 @@ Plans:
 **Requirements**: PRIM-01, PRIM-02, PRIM-03, PRIM-04
 **Success Criteria** (what must be TRUE):
 
-  1. A GEMM primitive (wrapping `cubecl-matmul`) matches a host reference within tolerance for f32 and f64 on both cpu and wgpu.
+  1. A GEMM primitive (substrate resolved in Plan 02-01: default hand-written tiled GEMM in `mlrs-kernels`, or a cubecl-0.10-compatible `cubecl-matmul` wrap if one is confirmed — `cubecl-matmul` has no 0.10 release) matches a host reference within tolerance for f32 and f64 on both cpu and wgpu.
   2. Reduction primitives (sum/mean/min/max/argmin/L2-norm) pass on wgpu via both a plane/subgroup path and a shared-memory fallback, with no hardcoded plane width (uses `PLANE_DIM`), numerically stable on large inputs.
   3. A pairwise squared-Euclidean distance primitive with a `max(d², 0)` clamp produces no negative distances under f32 and matches the host reference within tolerance.
   4. A covariance / XᵀX (Gram) primitive built on GEMM matches the host reference within tolerance for both dtypes on cpu and wgpu.
 
-**Plans**: TBD
+**Plans**: 5 plans
+Plans:
+
+- [ ] 02-01-PLAN.md — Wave 1: Wave-0 infra (PoolStats.read_backs, subgroup probe, GEMM fixtures) + GEMM substrate decision + GEMM primitive (PRIM-01)
+- [ ] 02-02-PLAN.md — Wave 2: dual-path reductions sum/mean/min/max/L2-norm + argmin/argmax (plane + shared, PLANE_DIM, lowest-index tie-break) (PRIM-02)
+- [ ] 02-03-PLAN.md — Wave 3: pairwise squared-Euclidean distance via GEMM-expansion + max(d²,0) clamp + optional sqrt (PRIM-03)
+- [ ] 02-04-PLAN.md — Wave 4: covariance / XᵀX via GEMM(transa) + ddof=0/1 normalization (PRIM-04)
+- [ ] 02-05-PLAN.md — Wave 5: D-10 build-failing memory gate (reuse>0/bounded, no mid-pipeline read-back, Gram reuses GEMM buffer)
 
 ### Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)
 
