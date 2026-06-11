@@ -1,18 +1,15 @@
 //! `mlrs-py` — PyO3 binding layer for mlrs (cdylib).
 //!
-//! This crate owns the process-wide `#[global_allocator]` (FOUND-09); it must
-//! be defined exactly once and only here (never in a library crate). The
-//! mimalloc wiring and the PyO3 surface are completed in Plan 05; Wave 0 keeps
-//! a minimal compiling stub.
-//!
-//! `mimalloc` is referenced here so the dependency is exercised; the actual
-//! `#[global_allocator]` activation + its `tests/allocator_test.rs` proof land
-//! in Plan 05.
+//! This crate owns the process-wide `#[global_allocator]` (FOUND-09): mimalloc
+//! is wired exactly once in [`allocator`], the single cdylib artifact, and never
+//! in any library crate. The allocator activation proof lives in the separate
+//! test file `crates/mlrs-py/tests/allocator_test.rs` (AGENTS.md §2 — no
+//! in-source test module).
 
-/// Placeholder re-export so the `mimalloc` dependency is wired (not yet the
-/// global allocator — that activation is Plan 05).
-pub use mimalloc::MiMalloc as _MiMalloc;
+// The `#[global_allocator]` definition. Source-only; its activation test is in
+// `tests/allocator_test.rs` (FOUND-09: source/test separation).
+mod allocator;
 
 /// Boundary errors use `anyhow` (D-10); this alias exercises the dependency
-/// until the real PyO3 surface lands in Plan 05.
+/// until the full PyO3 surface lands in a later phase.
 pub type BoundaryResult<T> = anyhow::Result<T>;
