@@ -42,7 +42,7 @@ Plans:
 - [x] 01-02-PLAN.md — mlrs-core oracle harness: assert_close, sign-flip, label-perm, npz loader, tolerance policy, BridgeError
 - [x] 01-03-PLAN.md — Arrow zero-copy bridge (hard-reject validation) + f64 capability gate
 - [x] 01-04-PLAN.md — DeviceArray + buffer-reuse pool with logged counters
-- [ ] 01-05-PLAN.md — end-to-end pipeline test (Arrow→kernel→oracle) + gen_oracle.py fixtures + mimalloc allocator
+- [x] 01-05-PLAN.md — end-to-end pipeline test (Arrow→kernel→oracle) + gen_oracle.py fixtures + mimalloc allocator
 
 ### Phase 2: Core Compute Primitives
 
@@ -123,7 +123,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 4/5 | In Progress|  |
+| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Execution complete |  |
 | 2. Core Compute Primitives | 0/TBD | Not started | - |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 0/TBD | Not started | - |
 | 4. Closed-Form Estimators | 0/TBD | Not started | - |

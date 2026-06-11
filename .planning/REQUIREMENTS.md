@@ -17,7 +17,7 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 - [x] **FOUND-06**: Input data crosses into Rust as Apache Arrow buffers and feeds CubeCL device buffers zero-copy, with validation of offsets, null bitmaps, and alignment before any unsafe transmutation
 - [x] **FOUND-07**: An oracle test harness generates seeded random inputs, runs scikit-learn to produce reference outputs, and asserts results match within abs/rel error ≤ 1e-5
 - [x] **FOUND-08**: The oracle harness provides sign-flip (for SVD/PCA components) and label-permutation (for clustering) comparison helpers, plus a documented per-estimator f32 tolerance policy
-- [ ] **FOUND-09**: A custom global allocator (mimalloc or jemalloc) is wired in, with source and test code kept in separate files per the project CubeCL protocol
+- [x] **FOUND-09**: A custom global allocator (mimalloc or jemalloc) is wired in, with source and test code kept in separate files per the project CubeCL protocol
 
 ### Compute Primitives
 
@@ -104,7 +104,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FOUND-06 | Phase 1 | Complete |
 | FOUND-07 | Phase 1 | Complete |
 | FOUND-08 | Phase 1 | Complete |
-| FOUND-09 | Phase 1 | Pending |
+| FOUND-09 | Phase 1 | Complete |
 | PRIM-01 | Phase 2 | Pending |
 | PRIM-02 | Phase 2 | Pending |
 | PRIM-03 | Phase 2 | Pending |

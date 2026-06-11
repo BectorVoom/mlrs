@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Plan 01-04 complete (buffer-reuse pool + DeviceArray memory-efficiency layer)
-last_updated: "2026-06-11T12:11:24.000Z"
-last_activity: 2026-06-11 -- Plan 01-04 complete (BufferPool byte-size free-list + logged-only PoolStats counters; DeviceArray<R,F> pool-metered alloc + host<->device round-trip on cpu & wgpu)
+stopped_at: Plan 01-05 complete (end-to-end pipeline test + mimalloc allocator) — Phase 01 execution done (5/5 plans)
+last_updated: "2026-06-11T12:30:00.000Z"
+last_activity: 2026-06-11 -- Plan 01-05 complete (Arrow->bridge->pool/DeviceArray->generic saxpy #[cube]->read-back->oracle on cpu & wgpu, f32 always + f64 capability-gated; mimalloc #[global_allocator] wired in mlrs-py with source/test split). Phase 01 execution complete.
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 5
-  completed_plans: 4
-  percent: 80
+  completed_plans: 5
+  percent: 100
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 01 (foundation-oracle-backend-abstraction-arrow-bridge) — EXECUTING
-Plan: 5 of 5
-Status: Executing Phase 01 — Plans 01-01..01-04 complete (Wave 0 + Wave 1 bridge/capability/memory layer); 01-05 (pipeline) remaining
-Last activity: 2026-06-11 -- Plan 01-04 complete (buffer-reuse pool + DeviceArray; 5 tests pass on cpu & wgpu)
+Phase: 01 (foundation-oracle-backend-abstraction-arrow-bridge) — EXECUTION COMPLETE (5/5 plans)
+Plan: 5 of 5 (complete)
+Status: Phase 01 execution complete — Plans 01-01..01-05 done (Wave 0 toolchain + Wave 1 bridge/capability/memory + Wave 2 end-to-end pipeline & allocator). Ready for phase verification/close.
+Last activity: 2026-06-11 -- Plan 01-05 complete (end-to-end pipeline test + mimalloc allocator; cpu & wgpu green, f32+f64)
 
-Progress: [████████░░] 80%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -55,6 +55,7 @@ Progress: [████████░░] 80%
 | Phase 01 P02 | 25 | 2 tasks | 12 files |
 | Phase 01 P03 | 7 | 2 tasks | 4 files |
 | Phase 01 P04 | 5 | 2 tasks | 3 files |
+| Phase 01 P05 | 18 | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,9 @@ Recent decisions affecting current work:
 - [Phase ?]: [01-04]: Pool counters are LOGGED ONLY in Phase 1 (D-05) — tests assert the counters API increments, not a reuse-rate threshold (hard memory assertions deferred to Phase 2)
 - [Phase ?]: [01-04]: mlrs-level HashMap free-list keyed by exact byte size, on top of client.empty — no CubeCL MemoryConfiguration tuning in Phase 1 (RESEARCH Open Question 4)
 - [Phase ?]: [01-04]: DeviceArray::from_host meters the byte footprint through the pool then uploads via client.create (cubecl 0.10 has no in-place write into an empty handle)
+- [Phase ?]: [01-05]: f32 oracle near-zero floor raised to 1e-2 (in pipeline_test only) — cross-backend f32 saxpy rounding (~1 ULP, abs_err ~3e-8) exceeds the strict 1e-5 *relative* bound on near-cancellation results; the 1e-5 *absolute* bound stays enforced. Core compare.rs (Plan 02) left untouched.
+- [Phase ?]: [01-05]: mimalloc #[global_allocator] defined exactly once in the mlrs-py cdylib (src/allocator.rs), never in a library crate; activation proven by exercising it (no public introspection symbol in the mimalloc crate)
+- [Phase ?]: [01-05]: f64 oracle cases stay capability-gated via skip_f64_with_log (skip-with-log, never fail) for backend portability — pattern for all future f64 oracle tests
 
 ### Pending Todos
 
@@ -102,6 +106,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-11T12:11:24.000Z
-Stopped at: Plan 01-04 complete (buffer-reuse pool + DeviceArray memory-efficiency layer)
-Resume file: .planning/phases/01-foundation-oracle-backend-abstraction-arrow-bridge/01-05-PLAN.md
+Last session: 2026-06-11T12:30:00.000Z
+Stopped at: Plan 01-05 complete (end-to-end pipeline test + mimalloc allocator) — Phase 01 execution complete (5/5 plans)
+Resume file: None (Phase 01 execution done; next: phase verification/close)
