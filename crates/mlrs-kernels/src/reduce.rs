@@ -43,12 +43,24 @@ use cubecl::prelude::*;
 // ===========================================================================
 
 /// Plane-path sum reduction: fold each plane with `plane_shuffle_xor` over
-/// `PLANE_DIM` (NO hardcoded width — D-03), writing one partial per plane.
+/// `PLANE_DIM` (NO hardcoded width — D-03), then combine the per-plane partials
+/// in shared memory so the kernel writes exactly ONE partial per cube at
+/// `output[CUBE_POS_X]` — the SAME output layout as the shared-memory path.
 ///
-/// `output` must be sized `num_cubes * planes_per_cube`; the host folds the
-/// per-plane partials into the final result.
+/// ## Why combine in-cube (not one partial per plane)
+/// `PLANE_DIM` is runtime-variable on some adapters (this env's wgpu reports
+/// `plane_size_min=32, plane_size_max=64`), so a host that pre-sizes a
+/// `num_cubes * planes_per_cube` output cannot know the true `planes_per_cube`.
+/// Folding the plane partials inside the cube (each plane-leader writes its
+/// partial to `shared[PLANE_POS]`, then unit 0 sums them) removes ALL host
+/// dependence on the plane width: the host treats this kernel exactly like the
+/// shared kernel (one partial per cube), and `plane_shuffle_xor` is still the
+/// genuinely-exercised subgroup primitive (D-03).
 #[cube(launch)]
 pub fn reduce_sum_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>) {
+    // Per-plane partials (one slot per plane in the cube). 256 is the max
+    // CubeDim.x, so at the smallest plane width (1) this still fits.
+    let mut shared = SharedMemory::<F>::new(256usize);
     let mut acc = if ABSOLUTE_POS < input.len() {
         input[ABSOLUTE_POS]
     } else {
@@ -59,10 +71,21 @@ pub fn reduce_sum_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut A
         acc += plane_shuffle_xor(acc, i);
         i *= 2u32;
     }
+    // Each plane-leader publishes its plane's partial.
     if UNIT_POS_PLANE == 0u32 {
+        shared[PLANE_POS as usize] = acc;
+    }
+    sync_cube();
+    // Unit 0 sums the per-plane partials into one cube partial.
+    if UNIT_POS_X == 0u32 {
         let planes_per_cube = CUBE_DIM_X / PLANE_DIM;
-        let out_idx = CUBE_POS_X * planes_per_cube + PLANE_POS;
-        output[out_idx as usize] = acc;
+        let mut total = F::from_int(0i64);
+        let mut p = 0u32;
+        while p < planes_per_cube {
+            total += shared[p as usize];
+            p += 1u32;
+        }
+        output[CUBE_POS_X as usize] = total;
     }
 }
 
@@ -100,9 +123,12 @@ pub fn reduce_sum_shared<F: Float + CubeElement>(input: &Array<F>, output: &mut 
 // ===========================================================================
 
 /// Plane-path sum-of-squares reduction (basis for the L2 norm). Each unit
-/// squares its element first, then the plane folds the squares.
+/// squares its element first, then the plane folds the squares and the per-plane
+/// partials are combined in shared memory to one cube partial (see
+/// [`reduce_sum_plane`] for the in-cube-combine rationale).
 #[cube(launch)]
 pub fn reduce_sumsq_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>) {
+    let mut shared = SharedMemory::<F>::new(256usize);
     let v = if ABSOLUTE_POS < input.len() {
         input[ABSOLUTE_POS]
     } else {
@@ -115,9 +141,18 @@ pub fn reduce_sumsq_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut
         i *= 2u32;
     }
     if UNIT_POS_PLANE == 0u32 {
+        shared[PLANE_POS as usize] = acc;
+    }
+    sync_cube();
+    if UNIT_POS_X == 0u32 {
         let planes_per_cube = CUBE_DIM_X / PLANE_DIM;
-        let out_idx = CUBE_POS_X * planes_per_cube + PLANE_POS;
-        output[out_idx as usize] = acc;
+        let mut total = F::from_int(0i64);
+        let mut p = 0u32;
+        while p < planes_per_cube {
+            total += shared[p as usize];
+            p += 1u32;
+        }
+        output[CUBE_POS_X as usize] = total;
     }
 }
 
@@ -154,19 +189,12 @@ pub fn reduce_sumsq_shared<F: Float + CubeElement>(input: &Array<F>, output: &mu
 // MIN
 // ===========================================================================
 
-/// Plane-path min reduction. Out-of-bounds units seed with the in-plane
-/// identity (their neighbour's value via the first valid lane) — we instead
-/// seed OOB lanes from lane 0's value by initialising them to the first
-/// in-bounds element is impossible per-lane, so OOB lanes are excluded by the
-/// host always launching `CubeDim.x` a multiple of the plane width with a
-/// padded power-of-two segment; for safety OOB lanes seed with a neutral large
-/// value that min() ignores (the first in-bounds element if present, else the
-/// lane's own — guarded so a fully-padded plane never contributes).
+/// Plane-path min reduction. OOB lanes seed with the cube's first element (a
+/// real value that never beats a true min); each plane folds via shuffle, then
+/// the per-plane minima are combined in shared memory to one cube partial.
 #[cube(launch)]
 pub fn reduce_min_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>) {
-    // OOB lanes seed with the lane-0 element of the plane segment when in
-    // bounds; the host pads each reduced segment to the cube size with real
-    // data or replicated edge values so no spurious identity is needed.
+    let mut shared = SharedMemory::<F>::new(256usize);
     let mut acc = if ABSOLUTE_POS < input.len() {
         input[ABSOLUTE_POS]
     } else {
@@ -181,9 +209,21 @@ pub fn reduce_min_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut A
         i *= 2u32;
     }
     if UNIT_POS_PLANE == 0u32 {
+        shared[PLANE_POS as usize] = acc;
+    }
+    sync_cube();
+    if UNIT_POS_X == 0u32 {
         let planes_per_cube = CUBE_DIM_X / PLANE_DIM;
-        let out_idx = CUBE_POS_X * planes_per_cube + PLANE_POS;
-        output[out_idx as usize] = acc;
+        let mut best = shared[0usize];
+        let mut p = 1u32;
+        while p < planes_per_cube {
+            let v = shared[p as usize];
+            if v < best {
+                best = v;
+            }
+            p += 1u32;
+        }
+        output[CUBE_POS_X as usize] = best;
     }
 }
 
@@ -223,9 +263,10 @@ pub fn reduce_min_shared<F: Float + CubeElement>(input: &Array<F>, output: &mut 
 // MAX
 // ===========================================================================
 
-/// Plane-path max reduction.
+/// Plane-path max reduction (mirror of [`reduce_min_plane`]).
 #[cube(launch)]
 pub fn reduce_max_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>) {
+    let mut shared = SharedMemory::<F>::new(256usize);
     let mut acc = if ABSOLUTE_POS < input.len() {
         input[ABSOLUTE_POS]
     } else {
@@ -240,9 +281,21 @@ pub fn reduce_max_plane<F: Float + CubeElement>(input: &Array<F>, output: &mut A
         i *= 2u32;
     }
     if UNIT_POS_PLANE == 0u32 {
+        shared[PLANE_POS as usize] = acc;
+    }
+    sync_cube();
+    if UNIT_POS_X == 0u32 {
         let planes_per_cube = CUBE_DIM_X / PLANE_DIM;
-        let out_idx = CUBE_POS_X * planes_per_cube + PLANE_POS;
-        output[out_idx as usize] = acc;
+        let mut best = shared[0usize];
+        let mut p = 1u32;
+        while p < planes_per_cube {
+            let v = shared[p as usize];
+            if v > best {
+                best = v;
+            }
+            p += 1u32;
+        }
+        output[CUBE_POS_X as usize] = best;
     }
 }
 

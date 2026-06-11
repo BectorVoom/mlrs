@@ -391,7 +391,23 @@ where
     let mut first_pass = true;
 
     loop {
-        let cube = cube_dim_for(cur_len);
+        // The plane path requires each cube to be at least one FULL plane (and a
+        // whole number of planes), else `planes_per_cube = CUBE_DIM_X/PLANE_DIM`
+        // rounds to 0 and the in-cube combine reads nothing. PLANE_DIM is
+        // runtime-variable on this env's wgpu (min=32, max=64), so we clamp the
+        // plane-path cube to at least `plane_size_max` and keep it a power of two
+        // (256 is a multiple of both 32 and 64). OOB lanes are zero-seeded (sum)
+        // or seeded with the cube's first element (min/max), so over-provisioning
+        // a small input is safe. The shared path keeps the tight `cube_dim_for`.
+        let cube = if path == ReducePath::Plane {
+            // Round the reported plane width up to a power of two, then take the
+            // larger of it and the tight cube dim (both powers of two ⇒ result
+            // is a power of two), capped at MAX_CUBE.
+            let pw = cube_dim_for(capability::active_plane_width().max(1) as usize);
+            cube_dim_for(cur_len).max(pw).min(MAX_CUBE as u32)
+        } else {
+            cube_dim_for(cur_len)
+        };
         let num_cubes = ((cur_len as u32) + cube - 1) / cube;
 
         let (count, dim) = (
@@ -399,14 +415,13 @@ where
             CubeDim { x: cube, y: 1, z: 1 },
         );
 
-        // Plane path writes one partial per (cube, plane); size accordingly.
-        let plane_w = capability::active_plane_width().max(1);
-        let planes_per_cube = if path == ReducePath::Plane {
-            (cube / plane_w).max(1)
-        } else {
-            1
-        };
-        let out_parts = (num_cubes * planes_per_cube) as usize;
+        // BOTH paths write exactly ONE partial per cube: the shared kernel via
+        // its log₂ tree, the plane kernel via an in-cube combine of its
+        // per-plane shuffle partials (so the host needs NO knowledge of the
+        // runtime plane width, which is variable on this env's wgpu adapter —
+        // plane_size_min=32, max=64). Output layout is identical, so the
+        // multi-pass driver is path-agnostic below this point.
+        let out_parts = num_cubes as usize;
         let out_bytes = out_parts * elem;
         let out_handle = pool.acquire(out_bytes);
 

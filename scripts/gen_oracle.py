@@ -92,6 +92,59 @@ def gen_gemm(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+def gen_argmin_tie(seed: int = SEED) -> str:
+    """Generate the deliberate-tie argmin convention fixture (D-02, PRIM-02).
+
+    Emits a small 2D ``int32`` matrix that contains, by construction, at least
+    one TIED minimum per row AND a tied global minimum, so the device argmin's
+    lowest-index tie-break can be pinned against numpy's ``argmin`` (which also
+    returns the lowest index on ties). Named arrays:
+
+      - ``X``            the ``rows × cols`` int32 input matrix.
+      - ``argmin_full``  scalar (length-1) numpy ``X.argmin()`` over the flat
+                         row-major buffer — the lowest flat index of the global
+                         minimum.
+      - ``argmin_rows``  length-``rows`` numpy ``X.argmin(axis=1)`` — the lowest
+                         column index of each row's minimum.
+
+    The matrix is integer-VALUED but stored as ``float64`` so the existing
+    oracle loader (``mlrs_core::oracle::load_npz``, which decodes only 4-/8-byte
+    FLOAT dtypes) reads it directly; the integer index references are likewise
+    stored as ``float64`` (every index is exactly representable). The ``i32`` in
+    the file name records the integer-valued nature of the source data, not its
+    on-disk dtype. Returns the absolute path written.
+    """
+    rng = np.random.default_rng(seed)
+    rows, cols = 4, 6
+    # Random small integers, then deliberately PLANT ties on the minimum so the
+    # tie-break is actually exercised (not just incidentally hit).
+    x = rng.integers(low=0, high=9, size=(rows, cols)).astype(np.float64)
+    # Row 0: tie the minimum at columns 1 and 4 (lowest index 1 must win).
+    x[0, :] = np.array([5, 1, 7, 3, 1, 8], dtype=np.float64)
+    # Row 1: tie the minimum at columns 0 and 2.
+    x[1, :] = np.array([2, 6, 2, 9, 4, 7], dtype=np.float64)
+    # Row 2: a clear single minimum at column 3 (control row).
+    x[2, :] = np.array([6, 5, 8, 0, 7, 9], dtype=np.float64)
+    # Row 3: tie the minimum at columns 2 and 5.
+    x[3, :] = np.array([4, 7, 1, 6, 8, 1], dtype=np.float64)
+
+    flat = x.reshape(-1)
+    argmin_full = np.asarray([float(flat.argmin())], dtype=np.float64)
+    argmin_rows = x.argmin(axis=1).astype(np.float64)
+
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"argmin_tie_i32_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=x,
+        argmin_full=argmin_full,
+        argmin_rows=argmin_rows,
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -99,6 +152,7 @@ def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_gemm(dtype=dtype)
         print(f"wrote {path}")
+    print(f"wrote {gen_argmin_tie()}")
 
 
 if __name__ == "__main__":
