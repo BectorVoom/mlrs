@@ -14,3 +14,9 @@ pub mod label_perm;
 pub mod oracle;
 pub mod sign_flip;
 pub mod tolerance;
+
+// Re-export the most-used symbols so downstream crates/tests can write
+// `use mlrs_core::{assert_close, F32_TOL, BridgeError};` directly.
+pub use compare::{assert_close, assert_slice_close, is_close, NEAR_ZERO_FLOOR};
+pub use error::BridgeError;
+pub use tolerance::{Tolerance, F32_TOL, F64_TOL};
