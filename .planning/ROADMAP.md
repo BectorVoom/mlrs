@@ -31,7 +31,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. The Arrow bridge rejects (does not silently upload) sliced/offset arrays, nullable arrays with set null bits, and misaligned buffers before any unsafe transmutation.
   4. The capability layer reports whether the active backend supports f64 (`feature_enabled(FloatKind::F64)`); f64 oracle tests skip/xfail with a logged reason on wgpu adapters lacking `SHADER_F64`, and the CI log shows which dtype ran on which backend.
   5. The oracle harness provides seeded-RNG fixtures, sign-flip and label-permutation comparison helpers, and a documented per-estimator-family f32 tolerance policy; the mimalloc global allocator is wired in `mlrs-py` with source/test code in separate files.
-**Plans**: TBD
+**Plans**: 5 plans
+Plans:
+- [ ] 01-01-PLAN.md — Wave 0: scaffold five-crate workspace + toolchain/API spike (resolve CubeCL 0.10 symbols A1–A7)
+- [ ] 01-02-PLAN.md — mlrs-core oracle harness: assert_close, sign-flip, label-perm, npz loader, tolerance policy, BridgeError
+- [ ] 01-03-PLAN.md — Arrow zero-copy bridge (hard-reject validation) + f64 capability gate
+- [ ] 01-04-PLAN.md — DeviceArray + buffer-reuse pool with logged counters
+- [ ] 01-05-PLAN.md — end-to-end pipeline test (Arrow→kernel→oracle) + gen_oracle.py fixtures + mimalloc allocator
 
 ### Phase 2: Core Compute Primitives
 **Goal**: GEMM, reductions, pairwise distance, and covariance/XᵀX are validated standalone so downstream estimators reuse trusted kernels rather than debugging math inside estimators.
@@ -97,7 +103,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 0/TBD | Not started | - |
+| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 0/5 | Planned | - |
 | 2. Core Compute Primitives | 0/TBD | Not started | - |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 0/TBD | Not started | - |
 | 4. Closed-Form Estimators | 0/TBD | Not started | - |
