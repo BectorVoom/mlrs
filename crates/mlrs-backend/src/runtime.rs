@@ -3,9 +3,9 @@
 //! Exactly one backend feature (`cpu` / `wgpu` / `cuda` / `rocm`) must be
 //! active; the matching `cfg` block re-exports `ActiveRuntime` / `ActiveDevice`.
 //!
-//! Wave 0 (Plan 01) Task 1 stands up the feature-gated re-exports; the
-//! `active_client()` constructor and the `Client` type alias that insulate the
-//! `ComputeClient` signature (assumption A6) land in Task 2.
+//! The `Client` type alias and `active_client()` constructor insulate the rest
+//! of the workspace from the concrete `ComputeClient` generic signature
+//! (assumption A6, resolved here against cubecl 0.10).
 
 #[cfg(feature = "cpu")]
 pub use cubecl::cpu::{CpuDevice as ActiveDevice, CpuRuntime as ActiveRuntime};
@@ -18,3 +18,25 @@ pub use cubecl::cuda::{CudaDevice as ActiveDevice, CudaRuntime as ActiveRuntime}
 
 #[cfg(feature = "rocm")]
 pub use cubecl::rocm::{RocmDevice as ActiveDevice, RocmRuntime as ActiveRuntime};
+
+/// The concrete CubeCL compute client for the active runtime.
+///
+/// A6 RESOLVED: in cubecl 0.10 `ComputeClient` is generic over a SINGLE
+/// `<R: Runtime>` parameter (NOT the `<Server, Channel>` form some older
+/// examples used). This alias is the single place that signature is written;
+/// downstream code refers to `runtime::Client` and never spells out the
+/// generics.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub type Client = cubecl::client::ComputeClient<ActiveRuntime>;
+
+/// Construct a compute client for the active runtime's default device.
+///
+/// Exactly one backend feature must be enabled; with none, this function is
+/// not compiled (and the workspace build would fail to resolve `ActiveRuntime`,
+/// enforcing the exactly-one-feature contract — T-01-03).
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn active_client() -> Client {
+    use cubecl::Runtime as _;
+    let device = ActiveDevice::default();
+    ActiveRuntime::client(&device)
+}

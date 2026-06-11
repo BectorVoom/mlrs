@@ -6,3 +6,5 @@
 //! runtime is chosen in `mlrs-backend`.
 
 pub mod smoke;
+
+pub use smoke::saxpy_kernel;
