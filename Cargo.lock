@@ -2488,6 +2488,7 @@ dependencies = [
  "log",
  "mlrs-core",
  "mlrs-kernels",
+ "npyz",
  "thiserror",
 ]
 

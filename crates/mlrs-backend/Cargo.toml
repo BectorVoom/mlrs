@@ -15,6 +15,9 @@ log = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }
+# Spike-only: probe the npz reader API (A4). The real oracle loader lives in
+# mlrs-core (Plan 02); this exercises npyz read+write end-to-end without numpy.
+npyz = { workspace = true }
 
 # This crate OWNS backend selection (FOUND-03 / Criterion 1). Exactly one of
 # these features must be active. Each forwards to the matching `cubecl` runtime
