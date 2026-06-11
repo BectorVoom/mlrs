@@ -56,13 +56,25 @@ Plans:
   3. A pairwise squared-Euclidean distance primitive with a `max(d², 0)` clamp produces no negative distances under f32 and matches the host reference within tolerance.
   4. A covariance / XᵀX (Gram) primitive built on GEMM matches the host reference within tolerance for both dtypes on cpu and wgpu.
 
-**Plans**: 5 plans
-Plans:
+**Plans**: 5 plansPlans:
+**Wave 1**
 
 - [ ] 02-01-PLAN.md — Wave 1: Wave-0 infra (PoolStats.read_backs, subgroup probe, GEMM fixtures) + GEMM substrate decision + GEMM primitive (PRIM-01)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 02-02-PLAN.md — Wave 2: dual-path reductions sum/mean/min/max/L2-norm + argmin/argmax (plane + shared, PLANE_DIM, lowest-index tie-break) (PRIM-02)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 02-03-PLAN.md — Wave 3: pairwise squared-Euclidean distance via GEMM-expansion + max(d²,0) clamp + optional sqrt (PRIM-03)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 02-04-PLAN.md — Wave 4: covariance / XᵀX via GEMM(transa) + ddof=0/1 normalization (PRIM-04)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 02-05-PLAN.md — Wave 5: D-10 build-failing memory gate (reuse>0/bounded, no mid-pipeline read-back, Gram reuses GEMM buffer)
 
 ### Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)
