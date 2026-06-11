@@ -45,6 +45,10 @@ pub struct PoolStats {
     pub peak_bytes: u64,
     /// Currently-live bytes: increased on `acquire`, decreased on `release`.
     pub live_bytes: u64,
+    /// Number of device→host read-backs performed through a metered read path
+    /// (bumped by [`BufferPool::record_read_back`]). Enables the D-10 memory
+    /// gate (Plan 02 asserts read-back count, not just logs it).
+    pub read_backs: u64,
 }
 
 /// An mlrs-level buffer-reuse pool over CubeCL device handles, keyed by byte
@@ -126,6 +130,19 @@ impl<R: cubecl::Runtime> BufferPool<R> {
     pub fn release(&mut self, handle: Handle, size_bytes: usize) {
         self.free.entry(size_bytes).or_default().push(handle);
         self.stats.live_bytes = self.stats.live_bytes.saturating_sub(size_bytes as u64);
+    }
+
+    /// Record a single device→host read-back (`read_backs += 1`).
+    ///
+    /// Mirrors the `acquire`/`release` counter-bump idiom. Call this at each
+    /// terminal read-back so the pool's `read_backs` counter is a real runtime
+    /// quantity the D-10 memory gate (Plan 02) can assert on, rather than a
+    /// code-review claim. The metered read path
+    /// [`DeviceArray::to_host_metered`] routes through here.
+    ///
+    /// [`DeviceArray::to_host_metered`]: crate::device_array::DeviceArray::to_host_metered
+    pub fn record_read_back(&mut self) {
+        self.stats.read_backs += 1;
     }
 
     /// Emit the current counters via `log::info!` (D-05, logged-only).

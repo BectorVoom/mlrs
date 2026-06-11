@@ -53,6 +53,35 @@ pub fn feature_enabled(kind: FloatKind) -> bool {
     client.properties().supports_type(kind)
 }
 
+/// Query whether the given client's backend supports plane (subgroup) ops.
+///
+/// Mirrors [`supports_type`] but for the plane/subgroup capability. cubecl 0.10
+/// exposes this via `client.features().plane` — an `EnumSet<Plane>` of the
+/// supported plane operations. We report support when the basic plane-op set
+/// (`Plane::Ops`) is present, which is the prerequisite for the reduction
+/// plane-path (Plan 02). The plane width is separately available via
+/// `client.properties().hardware.plane_size_{min,max}`.
+///
+/// A3 RESOLVED (subgroup-query symbol): the stable query is
+/// `client.features().plane.contains(Plane::Ops)` (NOT a `feature_enabled`
+/// form). Downstream plane-path code calls this facade and never re-discovers
+/// the symbol.
+pub fn supports_plane<R: Runtime>(client: &ComputeClient<R>) -> bool {
+    use cubecl::ir::features::Plane;
+    client.features().plane.contains(Plane::Ops)
+}
+
+/// Stable facade over the active runtime's plane/subgroup capability.
+///
+/// Constructs a client for the active runtime's default device and reports
+/// whether plane (subgroup) ops are supported. Plan 02's reduction plane-path
+/// skip calls this and never spells out the underlying `features().plane`
+/// query.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn plane_supported() -> bool {
+    supports_plane(&crate::runtime::active_client())
+}
+
 /// Static name of the active backend, derived from the compiled-in Cargo
 /// feature (FOUND-03: exactly one backend feature is active).
 ///

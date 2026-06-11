@@ -116,6 +116,51 @@ fn spike_capability_query_reports_f64() {
     );
 }
 
+/// Plan 02-01 Task 2 / A3: pin the subgroup-capability-query symbol for cubecl
+/// 0.10. The query compiles and RETURNS a value on the active backend; we log
+/// `subgroup_supported={bool}` plus the plane width so Plan 02's reduction
+/// plane-path skip has a resolved symbol to gate on.
+///
+/// A3 RESOLVED: the stable query is `client.features().plane.contains(
+/// Plane::Ops)` (surfaced via `capability::supports_plane` / `plane_supported`),
+/// and the plane width is `client.properties().hardware.plane_size_{min,max}`.
+/// The facade `capability::plane_supported()` must agree with the direct query.
+#[test]
+fn spike_subgroup_query_reports_support() {
+    use cubecl::ir::features::Plane;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let client = runtime::active_client();
+
+    // Direct query: does the active backend advertise plane (subgroup) ops?
+    let plane_ok = capability::supports_plane(&client);
+    // Plane width bounds (subgroup size) — also part of the resolved symbol set.
+    let plane_min = client.properties().hardware.plane_size_min;
+    let plane_max = client.properties().hardware.plane_size_max;
+    // The full plane op-set, for the SUMMARY record.
+    let has_sync = client.features().plane.contains(Plane::Sync);
+
+    let backend = capability::active_backend_name();
+    log::info!(
+        "subgroup backend={backend} subgroup_supported={plane_ok} \
+         plane_size_min={plane_min} plane_size_max={plane_max} plane_sync={has_sync}"
+    );
+    println!(
+        "subgroup backend={backend} subgroup_supported={plane_ok} \
+         plane_size_min={plane_min} plane_size_max={plane_max} plane_sync={has_sync}"
+    );
+
+    // The query must RETURN a value (it did, above) — we do NOT assert its
+    // truthiness, since plane support is adapter-dependent (cpu typically has
+    // no plane ops). The active-runtime facade must agree with the direct query.
+    assert_eq!(
+        capability::plane_supported(),
+        plane_ok,
+        "plane_supported facade must match supports_plane on the active client"
+    );
+}
+
 /// Task 3 / A3: probe the `cubecl::bytes::Bytes` constructors to determine the
 /// host-copy semantics for the Arrow bridge (Plan 03).
 #[test]

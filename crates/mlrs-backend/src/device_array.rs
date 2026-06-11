@@ -104,6 +104,20 @@ impl<R: cubecl::Runtime, F: Pod> DeviceArray<R, F> {
         view[..self.len].to_vec()
     }
 
+    /// Read the buffer back to a host `Vec<F>` while metering the read-back
+    /// through the pool's `read_backs` counter (D-10 memory gate).
+    ///
+    /// Identical result to [`to_host`](Self::to_host), but takes `&mut
+    /// BufferPool` and calls [`BufferPool::record_read_back`] first, so each
+    /// terminal read-back is a real runtime quantity the Plan-02 memory gate can
+    /// assert on (not a code-review claim — RESEARCH §D-10 assertion 2). Prefer
+    /// this at terminal reads; [`to_host`](Self::to_host) stays available for
+    /// the existing immutable call sites.
+    pub fn to_host_metered(&self, pool: &mut BufferPool<R>) -> Vec<F> {
+        pool.record_read_back();
+        self.to_host(pool)
+    }
+
     /// Number of `F` elements in the buffer.
     pub fn len(&self) -> usize {
         self.len
