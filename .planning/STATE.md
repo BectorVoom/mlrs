@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 1 context gathered
-last_updated: "2026-06-11T11:40:09.712Z"
-last_activity: 2026-06-11 -- Phase 01 execution started
+last_updated: "2026-06-11T11:54:10.770Z"
+last_activity: 2026-06-11 -- Plan 01-02 complete (mlrs-core oracle harness: assert_close, sign-flip, label-perm, npz loader, BridgeError)
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 5
-  completed_plans: 1
-  percent: 0
+  completed_plans: 2
+  percent: 40
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 01 (foundation-oracle-backend-abstraction-arrow-bridge) — EXECUTING
-Plan: 2 of 5
-Status: Executing Phase 01 — Plan 01-01 complete (Wave 0)
-Last activity: 2026-06-11 -- Plan 01-01 complete (workspace scaffold + CubeCL 0.10 spike, A1–A7 resolved)
+Plan: 3 of 5
+Status: Executing Phase 01 — Plans 01-01 and 01-02 complete (Waves 0 and 1)
+Last activity: 2026-06-11 -- Plan 01-02 complete (mlrs-core oracle harness: assert_close, sign-flip, label-perm, npz loader, BridgeError)
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [████░░░░░░] 40%
 
 ## Performance Metrics
 
@@ -52,6 +52,7 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: —
 
 *Updated after each plan completion*
+| Phase 01 P02 | 25 | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -64,6 +65,8 @@ Recent decisions affecting current work:
 - [Roadmap]: SVD/eig gets a dedicated phase (Phase 3) as the single hardest, highest-leverage primitive.
 - [Roadmap]: Closed-form estimators (Phase 4) precede iterative (Phase 5) to de-risk the Arrow/oracle pipeline before convergence-sensitive solvers.
 - [PROJECT.md]: scikit-learn (not cuML) is the oracle; sklearn-matching defaults (OLS=svd, KMeans=k-means++, TSVD=arpack, PCA with svd_flip) — not cuML defaults.
+- [Phase ?]: [01-02]: NEAR_ZERO_FLOOR=1e-8 chosen below the 1e-5 abs tolerance so the near-zero guard never loosens the absolute check
+- [Phase ?]: [01-02]: BridgeError lives in mlrs-core so Plan 03 bridge consumes it without a reverse dependency
 
 ### Pending Todos
 
@@ -90,6 +93,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-11T10:45:11.182Z
+Last session: 2026-06-11T11:54:00.589Z
 Stopped at: Phase 1 context gathered
 Resume file: .planning/phases/01-foundation-oracle-backend-abstraction-arrow-bridge/01-CONTEXT.md

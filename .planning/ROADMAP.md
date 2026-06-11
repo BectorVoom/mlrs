@@ -39,7 +39,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 
 - [x] 01-01-PLAN.md — Wave 0: scaffold five-crate workspace + toolchain/API spike (resolve CubeCL 0.10 symbols A1–A7)
-- [ ] 01-02-PLAN.md — mlrs-core oracle harness: assert_close, sign-flip, label-perm, npz loader, tolerance policy, BridgeError
+- [x] 01-02-PLAN.md — mlrs-core oracle harness: assert_close, sign-flip, label-perm, npz loader, tolerance policy, BridgeError
 - [ ] 01-03-PLAN.md — Arrow zero-copy bridge (hard-reject validation) + f64 capability gate
 - [ ] 01-04-PLAN.md — DeviceArray + buffer-reuse pool with logged counters
 - [ ] 01-05-PLAN.md — end-to-end pipeline test (Arrow→kernel→oracle) + gen_oracle.py fixtures + mimalloc allocator
@@ -123,7 +123,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 1/5 | In Progress | - |
+| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 2/5 | In Progress|  |
 | 2. Core Compute Primitives | 0/TBD | Not started | - |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 0/TBD | Not started | - |
 | 4. Closed-Form Estimators | 0/TBD | Not started | - |
