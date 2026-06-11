@@ -51,7 +51,7 @@ Plans:
 **Requirements**: PRIM-01, PRIM-02, PRIM-03, PRIM-04
 **Success Criteria** (what must be TRUE):
 
-  1. A GEMM primitive (substrate resolved in Plan 02-01: default hand-written tiled GEMM in `mlrs-kernels`, or a cubecl-0.10-compatible `cubecl-matmul` wrap if one is confirmed — `cubecl-matmul` has no 0.10 release) matches a host reference within tolerance for f32 and f64 on both cpu and wgpu.
+  1. ✅ A GEMM primitive (substrate resolved in Plan 02-01: WRAPS `cubek-matmul` 0.2.0 — the cubecl-0.10-compatible matmul source in tracel-ai/cubek; `cubecl-matmul`/`cubecl-linalg` are abandoned on incompatible cubecl lines) matches a host reference within tolerance for f32 and f64 on both cpu and wgpu. **[Plan 02-01 complete; wording updated from "cubecl-matmul" → "cubek-matmul".]**
   2. Reduction primitives (sum/mean/min/max/argmin/L2-norm) pass on wgpu via both a plane/subgroup path and a shared-memory fallback, with no hardcoded plane width (uses `PLANE_DIM`), numerically stable on large inputs.
   3. A pairwise squared-Euclidean distance primitive with a `max(d², 0)` clamp produces no negative distances under f32 and matches the host reference within tolerance.
   4. A covariance / XᵀX (Gram) primitive built on GEMM matches the host reference within tolerance for both dtypes on cpu and wgpu.
@@ -59,7 +59,7 @@ Plans:
 **Plans**: 5 plansPlans:
 **Wave 1**
 
-- [ ] 02-01-PLAN.md — Wave 1: Wave-0 infra (PoolStats.read_backs, subgroup probe, GEMM fixtures) + GEMM substrate decision + GEMM primitive (PRIM-01)
+- [x] 02-01-PLAN.md — Wave 1: Wave-0 infra (PoolStats.read_backs, subgroup probe, GEMM fixtures) + GEMM substrate decision + GEMM primitive (PRIM-01) ✅ (cubek-matmul wrap; 4/4 oracle green cpu+wgpu)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 

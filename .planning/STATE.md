@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: Phase 02 context captured (02-CONTEXT.md, 13 decisions across reductions/API/distance/memory-gate/oracle). Ready for /gsd-plan-phase 2. Plans not yet created.
-stopped_at: Plan 01-05 complete (end-to-end pipeline test + mimalloc allocator) — Phase 01 execution complete (5/5 plans)
-last_updated: "2026-06-11T21:21:26.498Z"
-last_activity: 2026-06-12 — Phase 02 context gathered
+status: executing
+stopped_at: Plan 02-01 complete (GEMM PRIM-01 via cubek-matmul wrap + Wave-0 infra) — Phase 02 plan 1/5
+last_updated: "2026-06-12T00:00:00.000Z"
+last_activity: 2026-06-12 -- Plan 02-01 executed (GEMM substrate + Wave-0 hooks)
 progress:
   total_phases: 6
   completed_phases: 1
-  total_plans: 5
-  completed_plans: 5
-  percent: 17
+  total_plans: 10
+  completed_plans: 6
+  percent: 18
 ---
 
 # Project State
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 02 — Core Compute Primitives (not started)
+**Current focus:** Phase 02 — core-compute-primitives
 
 ## Current Position
 
-Phase: 2
-Plan: Not started (context gathered)
-Status: Phase 02 context captured (02-CONTEXT.md, 13 decisions across reductions/API/distance/memory-gate/oracle). Ready for /gsd-plan-phase 2. Plans not yet created.
-Last activity: 2026-06-12 — Phase 02 context gathered
-Resume file: .planning/phases/02-core-compute-primitives/02-CONTEXT.md
+Phase: 02 (core-compute-primitives) — EXECUTING
+Plan: 2 of 5
+Status: Executing Phase 02 (plan 01 complete)
+Last activity: 2026-06-12 -- Plan 02-01 executed (GEMM substrate + Wave-0 hooks)
+Resume file: .planning/phases/02-core-compute-primitives/02-02-PLAN.md
 
-Progress: [██░░░░░░░░] 17% (1/6 phases)
+Progress: [██░░░░░░░░] 18% (1/6 phases; 6/10 plans)
 
 ## Performance Metrics
 
@@ -57,6 +57,7 @@ Progress: [██░░░░░░░░] 17% (1/6 phases)
 | Phase 01 P03 | 7 | 2 tasks | 4 files |
 | Phase 01 P04 | 5 | 2 tasks | 3 files |
 | Phase 01 P05 | 18 | 3 tasks | 6 files |
+| Phase 02 P01 | 35 | 5 tasks | 14 files |
 
 ## Accumulated Context
 
@@ -81,6 +82,10 @@ Recent decisions affecting current work:
 - [Phase ?]: [01-05]: f32 oracle near-zero floor raised to 1e-2 (in pipeline_test only) — cross-backend f32 saxpy rounding (~1 ULP, abs_err ~3e-8) exceeds the strict 1e-5 *relative* bound on near-cancellation results; the 1e-5 *absolute* bound stays enforced. Core compare.rs (Plan 02) left untouched.
 - [Phase ?]: [01-05]: mimalloc #[global_allocator] defined exactly once in the mlrs-py cdylib (src/allocator.rs), never in a library crate; activation proven by exercising it (no public introspection symbol in the mimalloc crate)
 - [Phase ?]: [01-05]: f64 oracle cases stay capability-gated via skip_f64_with_log (skip-with-log, never fail) for backend portability — pattern for all future f64 oracle tests
+- [Phase 02]: [02-01]: GEMM substrate = WRAP cubek-matmul 0.2.0 (Task-1 checkpoint). cubecl-matmul 0.9-pre / cubecl-linalg 0.5 are abandoned on incompatible cubecl lines; cubek-matmul 0.2.0 pins cubecl ^0.10 and unifies cleanly. mlrs-kernels stays feature-free (NO hand-written gemm_kernel); wrap lives in mlrs-backend/src/prims/gemm.rs.
+- [Phase 02]: [02-01]: f64 GEMM accumulates in f64 via MatmulElems::from_globals (acc kept at f64 global dtype for non-f16/bf16 out), sidestepping cubek-matmul's default f32-stage MatmulPrecision<f64>. Passed 1e-5 oracle gate on cpu AND wgpu (SHADER_F64 present).
+- [Phase 02]: [02-01]: Subgroup-query symbol RESOLVED = client.features().plane.contains(Plane::Ops) (cubecl::ir::features::Plane); plane width via properties().hardware.plane_size_{min,max}. Facade: capability::supports_plane / plane_supported. Plan 02 plane-path gates on this (no attempt-launch-and-skip fallback needed).
+- [Phase 02]: [02-01]: GEMM host API validates geometry (PrimError::ShapeMismatch/DimMismatch) and returns Result before any unsafe launch (D-04 / T-0201-02). Transpose = InputBinding::swap_dims logical swap, no transpose buffer (D-06).
 
 ### Pending Todos
 
@@ -96,6 +101,7 @@ None yet.
 - Phase 5 (LogisticRegression sub-task) needs `/gsd-plan-phase --research-phase 5` — QN/L-BFGS convergence parity with sklearn `lbfgs` is the highest correctness risk.
 - f64 absence on wgpu (the primary CI gate): capability-gating must be in place from Phase 1 or f64 tests silently skip/fail.
 - Maturin per-backend distribution naming (Phase 6) is undocumented first-party — small build-system spike expected.
+- [02-01] ROADMAP Criterion 1 / REQUIREMENTS wording "wraps cubecl-matmul" must be updated to "wraps cubek-matmul" (the cubecl algorithm crates were split into tracel-ai/cubek and renamed cubek-*). Orchestrator action.
 
 ## Deferred Items
 
@@ -107,6 +113,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-11T12:30:00.000Z
-Stopped at: Plan 01-05 complete (end-to-end pipeline test + mimalloc allocator) — Phase 01 execution complete (5/5 plans)
-Resume file: None (Phase 01 execution done; next: phase verification/close)
+Last session: 2026-06-12T00:00:00.000Z
+Stopped at: Plan 02-01 complete (GEMM PRIM-01 via cubek-matmul wrap + Wave-0 infra: read_backs, subgroup probe, GEMM npz fixtures)
+Resume file: .planning/phases/02-core-compute-primitives/02-02-PLAN.md (next: Plan 02-02)

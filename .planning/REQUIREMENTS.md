@@ -21,7 +21,7 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 
 ### Compute Primitives
 
-- [ ] **PRIM-01**: A backend-portable GEMM / matrix-multiply primitive is available to estimators and validated against an oracle
+- [x] **PRIM-01**: A backend-portable GEMM / matrix-multiply primitive is available to estimators and validated against an oracle (Plan 02-01: cubek-matmul 0.2.0 wrap; transpose flags D-06; f32/f64 oracle within 1e-5 on cpu+wgpu)
 - [ ] **PRIM-02**: Numerically-stable reduction primitives (sum/mean/min/max/argmin) work with a plane/subgroup path and a shared-memory fallback that both pass on wgpu
 - [ ] **PRIM-03**: A pairwise-distance primitive (Euclidean/squared) with a `max(d², 0)` clamp serves KMeans, DBSCAN, and KNN
 - [ ] **PRIM-04**: A covariance / XᵀX primitive serves PCA and the linear-model closed-form solvers
@@ -105,7 +105,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | FOUND-07 | Phase 1 | Complete |
 | FOUND-08 | Phase 1 | Complete |
 | FOUND-09 | Phase 1 | Complete |
-| PRIM-01 | Phase 2 | Pending |
+| PRIM-01 | Phase 2 | Complete (Plan 02-01) |
 | PRIM-02 | Phase 2 | Pending |
 | PRIM-03 | Phase 2 | Pending |
 | PRIM-04 | Phase 2 | Pending |
