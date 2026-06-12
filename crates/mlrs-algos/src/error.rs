@@ -20,9 +20,12 @@ use mlrs_core::PrimError;
 ///
 /// One variant per failure class: an out-of-range `n_components` (the chief
 /// untrusted-hyperparameter guard, T-04-01-01 / RESEARCH Pitfall 6), a negative
-/// Ridge `alpha`, an unfitted-estimator misuse, an unsupported operation (e.g.
-/// `inverse_transform` on TruncatedSVD), and a transparent wrap of any
-/// underlying [`PrimError`] from the primitive layer.
+/// Ridge `alpha`, the Phase-5 distance-based / iterative-solver hyperparameter
+/// guards (`InvalidK` / `InvalidEps` / `InvalidMinSamples` / `InvalidL1Ratio` /
+/// `InvalidC`, T-05-01-01) and the iterative-solver `NotConverged` cap, an
+/// unfitted-estimator misuse, an unsupported operation (e.g. `inverse_transform`
+/// on TruncatedSVD), and a transparent wrap of any underlying [`PrimError`] from
+/// the primitive layer.
 #[derive(Debug, Error)]
 pub enum AlgoError {
     /// A decomposition was constructed/fitted with `n_components` outside the
@@ -81,6 +84,94 @@ pub enum AlgoError {
         estimator: &'static str,
         /// The unsupported operation name.
         operation: &'static str,
+    },
+
+    /// A distance-based estimator (KMeans / KNeighbors*) was given an invalid
+    /// neighbor / cluster count `k`. The count must satisfy `1 ≤ k ≤ n_samples`
+    /// (you cannot request more clusters / neighbors than there are training
+    /// samples). Rejected at `fit` *before* any kernel launch so an untrusted
+    /// hyperparameter becomes a typed error, not an out-of-bounds device read
+    /// (T-05-01-01 / ASVS V5).
+    #[error(
+        "estimator '{estimator}': k = {k} is out of range \
+         (must be 1..={n_samples} = n_samples)"
+    )]
+    InvalidK {
+        /// Which estimator rejected the value (e.g. `"kmeans"` / `"knn"`).
+        estimator: &'static str,
+        /// The requested neighbor / cluster count.
+        k: usize,
+        /// The training sample count `k` must not exceed.
+        n_samples: usize,
+    },
+
+    /// DBSCAN was given a non-positive neighborhood radius `eps`. The radius must
+    /// be `eps ≥ 0` (a negative radius is geometrically meaningless and would
+    /// make every point noise). Rejected at `fit` (T-05-01-01).
+    #[error("estimator '{estimator}': eps = {eps} is invalid (must be >= 0)")]
+    InvalidEps {
+        /// Which estimator rejected the value (e.g. `"dbscan"`).
+        estimator: &'static str,
+        /// The offending radius.
+        eps: f64,
+    },
+
+    /// DBSCAN was given an invalid `min_samples`. A core point requires at least
+    /// one sample in its eps-neighborhood (itself), so `min_samples ≥ 1`.
+    /// Rejected at `fit` (T-05-01-01).
+    #[error(
+        "estimator '{estimator}': min_samples = {min_samples} is invalid \
+         (must be >= 1)"
+    )]
+    InvalidMinSamples {
+        /// Which estimator rejected the value (e.g. `"dbscan"`).
+        estimator: &'static str,
+        /// The offending core-point threshold.
+        min_samples: usize,
+    },
+
+    /// ElasticNet / Lasso was given an `l1_ratio` outside `[0, 1]`. The mixing
+    /// parameter blends the L1 and L2 penalties (`l1_ratio = 1` is pure Lasso,
+    /// `l1_ratio = 0` pure Ridge) so it must lie in the closed unit interval.
+    /// Rejected at `fit` (T-05-01-01).
+    #[error(
+        "estimator '{estimator}': l1_ratio = {l1_ratio} is invalid \
+         (must be 0 <= l1_ratio <= 1)"
+    )]
+    InvalidL1Ratio {
+        /// Which estimator rejected the value (e.g. `"elastic_net"` / `"lasso"`).
+        estimator: &'static str,
+        /// The offending mixing parameter.
+        l1_ratio: f64,
+    },
+
+    /// LogisticRegression was given a non-positive inverse-regularization `C`.
+    /// `C` scales the data-fit term against the L2 penalty and must be `C > 0`
+    /// (sklearn's contract); `C ≤ 0` makes the objective unbounded / degenerate.
+    /// Rejected at `fit` (T-05-01-01).
+    #[error("estimator '{estimator}': C = {c} is invalid (must be > 0)")]
+    InvalidC {
+        /// Which estimator rejected the value (e.g. `"logistic_regression"`).
+        estimator: &'static str,
+        /// The offending inverse-regularization strength.
+        c: f64,
+    },
+
+    /// An iterative solver (coordinate descent for Lasso/ElasticNet, L-BFGS for
+    /// LogisticRegression) failed to reach its convergence tolerance within the
+    /// `max_iter` cap. Surfaced as a typed error rather than silently returning a
+    /// non-converged estimate (D-06), carrying the `max_iter` bound that was
+    /// reached so the caller can raise it.
+    #[error(
+        "estimator '{estimator}': failed to converge within max_iter = {max_iter} \
+         iterations"
+    )]
+    NotConverged {
+        /// Which estimator's solver did not converge (e.g. `"lasso"` /
+        /// `"logistic_regression"`).
+        estimator: &'static str,
+        /// The iteration cap that was reached without converging.
+        max_iter: usize,
     },
 
     /// A primitive-layer failure (geometry / squareness / convergence /

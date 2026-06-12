@@ -1,11 +1,18 @@
-//! Shared estimator trait surface — `Fit` / `Predict` / `Transform` (D-04).
+//! Shared estimator trait surface — `Fit` / `Predict` / `Transform` (D-04) plus
+//! the Phase-5 discrete-output traits `PredictLabels` / `KNeighbors` /
+//! `PredictProba` (D-05/D-07).
 //!
-//! These three traits are the uniform, sklearn-mixin-style surface every
-//! Phase-4 (and Phase-5) estimator implements. They are the contract Phase-6's
-//! PyO3 wrapping is written against once, generically: a regressor is `Fit` +
-//! `Predict`; a decomposition is `Fit` + `Transform` (PCA also implements the
-//! optional `inverse_transform`). This mirrors scikit-learn's
-//! `RegressorMixin` / `TransformerMixin` split.
+//! These traits are the uniform, sklearn-mixin-style surface every Phase-4 (and
+//! Phase-5) estimator implements. They are the contract Phase-6's PyO3 wrapping
+//! is written against once, generically: a regressor is `Fit` + `Predict`; a
+//! decomposition is `Fit` + `Transform` (PCA also implements the optional
+//! `inverse_transform`). Phase-5 adds the distance-based / classification
+//! surface: a clustering/classifier estimator is `Fit` + `PredictLabels`
+//! (integer labels, D-05/D-06); a nearest-neighbor estimator is `Fit` +
+//! `KNeighbors` (distances + indices, D-07); a probabilistic classifier adds
+//! `PredictProba` (per-class fractions, D-07). This mirrors scikit-learn's
+//! `RegressorMixin` / `ClassifierMixin` / `ClusterMixin` / `TransformerMixin`
+//! split.
 //!
 //! ## Conventions (carried from D-08)
 //! - Generic over `<F: Float + CubeElement + Pod>` exactly as the Phase-2/3
@@ -110,4 +117,86 @@ where
             operation: "inverse_transform",
         })
     }
+}
+
+/// Predict INTEGER class/cluster labels for new samples (D-05/D-06). Unlike
+/// [`Predict`], which returns the continuous `F` regression target, this returns
+/// a length-`n_samples` `i32` label buffer — the discrete-output surface shared
+/// by `KMeans.predict` (nearest cluster centroid → cluster id) and
+/// `KNeighborsClassifier.predict` (majority neighbor vote → class id). Labels are
+/// `i32` so DBSCAN's noise sentinel `-1` is directly representable (D-06).
+///
+/// Runs device-side from the device-resident fitted state (D-03); the returned
+/// buffer is materialized on the host only at a Rust accessor / oracle-comparison
+/// boundary, exactly like [`Predict`].
+pub trait PredictLabels<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Predict the integer label for each sample of `x`
+    /// (`shape = (n_samples, n_features)`, row-major). Errors if the estimator is
+    /// unfitted or the geometry disagrees with the fitted `n_features`.
+    fn predict_labels(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError>;
+}
+
+/// Find the `k` nearest neighbors of each query sample (D-07). Returns BOTH the
+/// `n_queries × k` neighbor distances (`F`) and the `n_queries × k` neighbor
+/// indices (`i32`, indices into the fitted training set) — the sklearn
+/// `NearestNeighbors.kneighbors` contract that `KNeighborsClassifier` /
+/// `KNeighborsRegressor` build their votes on.
+///
+/// Runs device-side from the device-resident fitted training matrix (D-03); both
+/// returned buffers are device-resident until a host accessor / oracle boundary.
+pub trait KNeighbors<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// For each row of `x` (`shape = (n_queries, n_features)`, row-major) return
+    /// the `(distances, indices)` of its `k` nearest fitted-training neighbors,
+    /// each a flat `n_queries × k` row-major buffer (distances `F`, indices
+    /// `i32`). Errors if the estimator is unfitted, `k` exceeds the fitted sample
+    /// count, or the geometry disagrees with the fitted `n_features`.
+    fn kneighbors(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+        k: usize,
+    ) -> Result<
+        (
+            DeviceArray<ActiveRuntime, F>,
+            DeviceArray<ActiveRuntime, i32>,
+        ),
+        AlgoError,
+    >;
+}
+
+/// Predict per-class membership probabilities for new samples (D-07). Returns the
+/// `n_samples × n_classes` row-major matrix of class fractions (each row sums to
+/// 1) — the `predict_proba` surface implemented by `KNeighborsClassifier`
+/// (neighbor-vote fractions) and `LogisticRegression` (softmax probabilities).
+/// For LogisticRegression this is the PRIMARY gauge-invariant oracle gate
+/// (RESEARCH Pitfall 5).
+///
+/// Runs device-side from the device-resident fitted state (D-03); the returned
+/// buffer is host-materialized only at a Rust accessor / oracle boundary.
+pub trait PredictProba<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Predict the per-class probability row for each sample of `x`
+    /// (`shape = (n_samples, n_features)`, row-major), returning the flat
+    /// `n_samples × n_classes` row-major buffer. Errors if the estimator is
+    /// unfitted or the geometry disagrees with the fitted `n_features`.
+    fn predict_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
 }

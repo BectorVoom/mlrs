@@ -7,27 +7,37 @@
 //! already-validated Phase-2/3 primitives (thin SVD, GEMM, covariance/Gram,
 //! reductions) plus the new Phase-4 Cholesky/solve primitive in `mlrs-backend`.
 //!
-//! ## Module index (this file is OWNED by plan 04-01)
-//! - [`traits`] — the uniform `Fit` / `Predict` / `Transform` estimator surface
-//!   (D-04), re-exported below.
+//! ## Module index (this file is OWNED by the Wave-0 scaffold plans 04-01 / 05-01)
+//! - [`traits`] — the uniform estimator surface: `Fit` / `Predict` / `Transform`
+//!   (D-04) plus the Phase-5 `PredictLabels` / `KNeighbors` / `PredictProba`
+//!   (D-05/D-07), all re-exported below.
 //! - [`error`] — the estimator-facing [`AlgoError`](error::AlgoError) (invalid
 //!   hyperparameters; wraps `PrimError`).
-//! - [`linear`] — `LinearRegression` (04-03) + `Ridge` (04-05).
+//! - [`linear`] — `LinearRegression` (04-03) + `Ridge` (04-05) + the Phase-5
+//!   iterative linear models `Lasso` / `ElasticNet` / `LogisticRegression`
+//!   (05-07/08/09).
 //! - [`decomposition`] — `PCA` + `TruncatedSVD` (04-04).
+//! - [`cluster`] — `KMeans` (CLUSTER-01) + `DBSCAN` (CLUSTER-02) (05-07/08).
+//! - [`neighbors`] — `NearestNeighbors` / `KNeighborsClassifier` /
+//!   `KNeighborsRegressor` (NEIGH-01/02/03) (05-10).
 //!
-//! The estimator plans (04-03/04/05) edit ONLY their own estimator file and the
-//! relevant `linear/mod.rs` / `decomposition/mod.rs` module index — never this
-//! `lib.rs` — so they stay file-disjoint and parallel-safe.
+//! The estimator plans edit ONLY their own estimator file and the relevant
+//! module-index `mod.rs` (`linear/mod.rs` / `decomposition/mod.rs` /
+//! `cluster/mod.rs` / `neighbors/mod.rs`) — never this `lib.rs` — so they stay
+//! file-disjoint and parallel-safe.
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — no in-source
 //! `#[cfg(test)] mod tests`).
 
+pub mod cluster;
 pub mod decomposition;
 pub mod error;
 pub mod linear;
+pub mod neighbors;
 pub mod traits;
 
 // Re-export the estimator surface so downstream crates/tests write
-// `use mlrs_algos::{Fit, Predict, Transform, AlgoError};` directly.
+// `use mlrs_algos::{Fit, Predict, Transform, PredictLabels, KNeighbors,
+// PredictProba, AlgoError};` directly.
 pub use error::AlgoError;
-pub use traits::{Fit, Predict, Transform};
+pub use traits::{Fit, KNeighbors, Predict, PredictLabels, PredictProba, Transform};
