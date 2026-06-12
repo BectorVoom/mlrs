@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: Completed 04-05-PLAN.md (Ridge LINEAR-02 — Cholesky normal-equations (XᵀX+αI)·coef=Xᵀy via the 04-02 primitive, raw Gram via gemm(transa), α on the diagonal only, center-then-solve intercept; + estimator fit→predict/transform memory gate D-03). Phase 04 COMPLETE (all 5 plans).
-last_updated: "2026-06-12T08:13:31.543Z"
+stopped_at: Phase 5 context gathered
+last_updated: "2026-06-12T11:53:29.778Z"
 last_activity: 2026-06-12
 progress:
   total_phases: 6
@@ -29,7 +29,7 @@ Phase: 5
 Plan: Not started
 Status: Phase 04 complete (all 5 plans done)
 Last activity: 2026-06-12
-Resume file: .planning/phases/04-closed-form-estimators/04-05-PLAN.md
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-CONTEXT.md
 
 Progress: [███████░░░] 67% (4/6 phases; 20/20 plans)
 
@@ -159,6 +159,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12T07:56:33.000Z
-Stopped at: Completed 04-05-PLAN.md (Ridge LINEAR-02 — Cholesky normal-equations (XᵀX+αI)·coef=Xᵀy via the 04-02 primitive, raw Gram via gemm(transa), α on the diagonal only, center-then-solve intercept; + estimator fit→predict/transform memory gate D-03). Phase 04 COMPLETE (all 5 plans).
+Last session: 2026-06-12T11:53:29.771Z
+Stopped at: Phase 5 context gathered
 Resume file: Phase 04 complete — next is Phase 05 (iterative estimators) planning.
