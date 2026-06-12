@@ -131,4 +131,25 @@ pub enum PrimError {
         /// The final off-diagonal Frobenius norm at the sweep cap.
         residual: f64,
     },
+
+    /// A primitive that factorizes a symmetric POSITIVE-DEFINITE matrix (the
+    /// Phase-4 Cholesky normal-equations solve that Ridge consumes — D-02)
+    /// encountered a non-positive pivot during factorization: the matrix is not
+    /// actually SPD, so its Cholesky factor does not exist. The kernel flags the
+    /// offending pivot (via its `info` array) and the host surfaces it here
+    /// rather than returning a NaN-poisoned factor (RESEARCH Pitfall 4). Carries
+    /// the operand label, the diagonal index where the pivot went non-positive,
+    /// and the pivot value (the would-be `√` argument) for diagnosis.
+    #[error(
+        "primitive '{operand}' is not positive-definite: non-positive pivot {pivot_value:e} \
+         at diagonal index {pivot_index} (matrix is not SPD; Cholesky factor does not exist)"
+    )]
+    NotPositiveDefinite {
+        /// Which primitive failed the SPD check (e.g. `"cholesky"`).
+        operand: &'static str,
+        /// The diagonal index where the running pivot became non-positive.
+        pivot_index: usize,
+        /// The non-positive pivot value (the negative/zero `√` argument).
+        pivot_value: f64,
+    },
 }

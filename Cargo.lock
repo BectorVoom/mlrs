@@ -1122,6 +1122,7 @@ dependencies = [
  "half",
  "hashbrown 0.16.1",
  "log",
+ "sanitize-filename",
  "wasm-bindgen-futures",
  "wgpu",
 ]
@@ -2500,6 +2501,11 @@ dependencies = [
 name = "mlrs-algos"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "cubecl",
+ "env_logger",
+ "mlrs-backend",
+ "mlrs-core",
  "thiserror",
 ]
 

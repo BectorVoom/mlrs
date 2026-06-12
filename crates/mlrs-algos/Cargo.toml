@@ -2,7 +2,36 @@
 name = "mlrs-algos"
 version = "0.1.0"
 edition = "2021"
-description = "sklearn-compatible ML estimators for mlrs (skeleton in Phase 1; estimators land in Phase 4+)."
+description = "sklearn-compatible ML estimators for mlrs (Phase 4: LinearRegression, Ridge, PCA, TruncatedSVD)."
 
 [dependencies]
+mlrs-core = { path = "../mlrs-core" }
+mlrs-backend = { path = "../mlrs-backend" }
+# CubeCL: device-element trait surface (`Float` / `CubeElement`) the estimators
+# are generic over (D-08). default-features=false so this crate never pulls a
+# backend runtime — the active backend is selected through the `mlrs-backend`
+# feature passthrough below (mlrs-backend OWNS `ActiveRuntime`).
+cubecl = { workspace = true }
+# Safe host<->device element bridging (`bytemuck::Pod` bound, D-08) for the
+# materialize-at-accessor path (D-03).
+bytemuck = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Oracle harness (`load_npz`, `OracleCase`) + tolerance/sign-flip helpers the
+# estimator tests consume. Reachable through the main `mlrs-core` dep, but named
+# here so the test target is explicit about its oracle dependency.
+mlrs-core = { path = "../mlrs-core" }
+env_logger = { workspace = true }
+
+# Backend selection passthrough. `mlrs-algos` owns NO runtime of its own; each
+# feature forwards to the matching `mlrs-backend` feature so `--features cpu`/
+# `--features rocm`/`--features wgpu`/`--features cuda` propagate to the backend
+# that resolves the concrete `ActiveRuntime` (mirrors the backend's own feature
+# block; D-07 gate = cpu(f64) + rocm(f32)). default-features stay off on the
+# workspace cubecl pin (Security V12) — only these feature lines switch runtimes.
+[features]
+cpu = ["mlrs-backend/cpu"]
+wgpu = ["mlrs-backend/wgpu"]
+cuda = ["mlrs-backend/cuda"]
+rocm = ["mlrs-backend/rocm"]
