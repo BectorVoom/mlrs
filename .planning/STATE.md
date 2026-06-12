@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 4 context gathered
-last_updated: "2026-06-12T06:36:43.992Z"
-last_activity: 2026-06-12 -- Phase 04 planning complete
+stopped_at: Completed 04-01-PLAN.md
+last_updated: "2026-06-12T06:56:50.000Z"
+last_activity: 2026-06-12 -- Completed Phase 04 Plan 01 (Wave-0 scaffold)
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 15
-  completed_plans: 16
-  percent: 50
+  total_plans: 20
+  completed_plans: 17
+  percent: 52
 ---
 
 # Project State
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 3 complete — ready for Phase 4
+**Current focus:** Phase 04 — closed-form-estimators
 
 ## Current Position
 
-Phase: 4
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-06-12 -- Phase 04 planning complete
-Resume file: .planning/phases/04-closed-form-estimators/04-CONTEXT.md
+Phase: 04 (closed-form-estimators) — EXECUTING
+Plan: 2 of 5
+Status: Executing Phase 04
+Last activity: 2026-06-12 -- Completed Phase 04 Plan 01 (Wave-0 scaffold)
+Resume file: .planning/phases/04-closed-form-estimators/04-02-PLAN.md
 
-Progress: [█████░░░░░] 50% (3/6 phases; 16/16 plans)
+Progress: [█████░░░░░] 52% (3/6 phases; 17/20 plans)
 
 ## Performance Metrics
 
@@ -68,6 +68,7 @@ Progress: [█████░░░░░] 50% (3/6 phases; 16/16 plans)
 | Phase 03 P03 | 38 | 3 tasks | 5 files |
 | Phase 03 P04 | 45 | 3 tasks | 5 files |
 | Phase 03 P05 | 18 | 2 tasks | 1 file |
+| Phase 04 P01 | 9 | 3 tasks | 13 files |
 
 ## Accumulated Context
 
@@ -120,6 +121,10 @@ Recent decisions affecting current work:
 - [Phase 03]: [03-04]: Two-sided Jacobi eig pairs MUST be processed SEQUENTIALLY (single acting unit per pair), NOT the SVD's disjoint-parallel column schedule. A two-sided rotation Jᵀ·A·J touches the FULL rows AND columns p,q — including cross entries belonging to another index-disjoint pair — so index-disjoint pairs are NOT footprint-disjoint and a distributed/parallel shared-memory update RACES (first attempt stuck at residual ~0.1–0.8 → NotConverged on both cpu and rocm). Fix: unit 0 performs the whole rotation per pair, others idle, sync_cube after each pair (mirrors the SVD kernel's "acting unit does the whole rotation"). n is small (≤MAX_DIM=64, typically 4) so the serialization is cheap. Converges to ~1e-6 f32 / machine-precision f64.
 - [Phase 03]: [03-04]: eig convergence uses a TRUE post-sweep off-diagonal-norm measured from the live matrix (each unit sums a_ij² over j≠i, log₂-tree reduce → 2·Σ_{i<j} a_ij²; the sqrt(2) double-count makes the break marginally stricter = more accurate), NOT an in-sweep per-pair accumulator (which underestimates because a later rotation in the same sweep refills an off-diagonal, stopping early). conv_thr keeps the 03-03 8·ε·‖A‖_F·√pairs form.
 - [Phase 03]: [03-04]: eig() validate_geometry rejects a.len()!=n*n and n>MAX_DIM with PrimError::NotSquare BEFORE any unsafe launch (D-06 trusts symmetry, no (A+Aᵀ)/2); threads the covariance/GEMM out buffer straight through as the kernel working input (D-11 gate 2, no parallel n² alloc); descending eigenvalue sort + column permute host-side (D-04); NotConverged on cap (D-12). Small post-convergence w/V/info read-backs only — convergence loop fully in-kernel (D-11 gate 3), same precedent as svd.rs. The Task-2 `grep to_host==0` acceptance literally contradicts the mandated host descending sort; resolved in favor of the action/done + svd sibling.
+
+- [Phase 04]: [04-01]: AlgoError is estimator-LOCAL in mlrs-algos (not mlrs-core), wrapping PrimError via #[from] — the n_components/alpha hyperparameter guards (T-04-01-01) are estimator-specific so the primitive layer never depends on them; ? stays ergonomic across prim calls. New PrimError::NotPositiveDefinite { operand, pivot_index, pivot_value } lives in mlrs-core for the 04-02 Cholesky negative-pivot guard (T-04-01-02).
+- [Phase 04]: [04-01]: Fit/Predict/Transform trait surface (D-04) generic over <F: Float + CubeElement + Pod>; fit returns &mut self; Transform::inverse_transform has a default impl returning AlgoError::Unsupported so the surface stays total (PCA overrides, TruncatedSVD keeps default). mlrs-algos Cargo forwards cpu/wgpu/cuda/rocm to mlrs-backend (owns ActiveRuntime). lib.rs owns the module index; linear/decomposition mod.rs are stubs with commented future pub mod lines so 04-03/04/05 stay file-disjoint.
+- [Phase 04]: [04-01]: Nyquist Wave-0 scaffold — five #[ignore] test stubs (cholesky + 4 estimators, 30 fns) assert fixture load+shape only (no non-existent symbol refs) so the crates compile today; 04-02/03/04/05 remove #[ignore] and wire the real assertion. cholesky_test::fixture_loads loads cholesky_f64 via mlrs_core::load_npz and validates A/b/x/L keys+shapes (Task 2's --ignored verify target). gen_oracle.py gained gen_cholesky (scipy SPD solve + L factor), gen_linear_regression (full-rank + near-collinear small-σ case), gen_ridge (cholesky solver alpha sweep), gen_pca (svd_solver=full tall/wide + canonical alias), gen_truncated_svd (DETERMINISTIC algorithm='arpack', NOT randomized). 14 f32/f64 .npz blobs committed; regen needs /tmp venv with numpy+scipy+scikit-learn (PEP 668).
 
 ### Pending Todos
 

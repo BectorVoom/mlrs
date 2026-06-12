@@ -127,7 +127,7 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 04-01-PLAN.md — Wave-0 scaffold: mlrs-algos deps + Fit/Predict/Transform traits (D-04) + module stubs + PrimError::NotPositiveDefinite + gen_oracle.py sklearn fixtures + 5 #[ignore] Nyquist test stubs
+- [x] 04-01-PLAN.md — Wave-0 scaffold: mlrs-algos deps + Fit/Predict/Transform traits (D-04) + module stubs + PrimError::NotPositiveDefinite + gen_oracle.py sklearn fixtures + 5 #[ignore] Nyquist test stubs **[complete — compiles cpu+rocm; AlgoError + traits re-exported; 14 f32/f64 fixtures committed; 5 test crates list (30 fns), fixture_loads passes --ignored]**
 
 **Wave 2** *(parallel — file-disjoint)*
 
@@ -179,6 +179,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
-| 4. Closed-Form Estimators | 0/5 | Not started | - |
+| 4. Closed-Form Estimators | 1/5 | In progress | - |
 | 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |

@@ -110,10 +110,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PRIM-03 | Phase 2 | Complete (02-03) |
 | PRIM-04 | Phase 2 | Complete (02-04; D-10 gate 02-05) |
 | PRIM-05 | Phase 3 | Complete |
-| LINEAR-01 | Phase 4 | Pending |
-| LINEAR-02 | Phase 4 | Pending |
-| DECOMP-01 | Phase 4 | Pending |
-| DECOMP-02 | Phase 4 | Pending |
+| LINEAR-01 | Phase 4 | In progress (04-01 scaffold: Fit/Predict traits + linreg fixtures + #[ignore] tests; estimator lands 04-03) |
+| LINEAR-02 | Phase 4 | In progress (04-01 scaffold: NotPositiveDefinite + ridge fixtures + #[ignore] tests; primitive 04-02, estimator 04-05) |
+| DECOMP-01 | Phase 4 | In progress (04-01 scaffold: Fit/Transform+inverse traits + pca fixtures + #[ignore] tests; estimator lands 04-04) |
+| DECOMP-02 | Phase 4 | In progress (04-01 scaffold: Transform trait + tsvd arpack fixtures + #[ignore] tests; estimator lands 04-04) |
 | LINEAR-03 | Phase 5 | Pending |
 | LINEAR-04 | Phase 5 | Pending |
 | LINEAR-05 | Phase 5 | Pending |
