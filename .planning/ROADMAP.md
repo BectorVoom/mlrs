@@ -16,7 +16,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Foundation — Oracle, Backend Abstraction, Arrow Bridge** - Workspace, generic R/F spine, oracle harness, Arrow zero-copy bridge, f64 capability gate, allocator (completed 2026-06-11)
 - [x] **Phase 2: Core Compute Primitives** - GEMM, reductions, pairwise distance, covariance/XᵀX validated standalone on cpu+wgpu; D-10 build-failing memory gate green (completed 2026-06-12)
 - [x] **Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)** - GPU Jacobi SVD + symmetric eig, sign-flip oracle-validated, gates four estimators; D-11 build-failing memory gate (bounded Jacobi scratch + eig buffer reuse + no mid-sweep read-back) green on cpu+rocm (completed 2026-06-12)
-- [ ] **Phase 4: Closed-Form Estimators** - LinearRegression, Ridge, PCA, TruncatedSVD assembled on validated primitives
+- [x] **Phase 4: Closed-Form Estimators** - LinearRegression, Ridge, PCA, TruncatedSVD assembled on validated primitives
 - [ ] **Phase 5: Distance-Based & Iterative-Solver Estimators** - KMeans, DBSCAN, KNN×3, Lasso, ElasticNet, LogisticRegression
 - [ ] **Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels** - sklearn-compatible pyclass estimators, Arrow PyCapsule, maturin per-backend wheels
 
@@ -137,7 +137,7 @@ Plans:
 
 **Wave 3** *(blocked on Cholesky prim + linear/mod.rs)*
 
-- [ ] 04-05-PLAN.md — Ridge (raw Gram via gemm(transa) + diagonal-α + Cholesky solve, intercept unpenalized) (LINEAR-02) + D-03 fit→predict/transform memory gate extension
+- [x] 04-05-PLAN.md — Ridge (raw Gram via gemm(transa) + diagonal-α + Cholesky solve, intercept unpenalized) (LINEAR-02) + D-03 fit→predict/transform memory gate extension **[complete — Ridge<F> Fit+Predict solves (XᵀX+αI)·coef=Xᵀy via the 04-02 cholesky_solve (D-02, NOT SVD); raw centered Gram via gemm(transa=true) (Open Q1, not scaled covariance); α on the Gram diagonal only, intercept recovered via center-then-solve (never penalized, D-05); regularized Gram threaded through cholesky_solve out so the factor reuses it (D-11 gate 2); InvalidAlpha + geometry validated before launch; ridge_test alpha-sweep {0.1,1,10} + intercept-not-penalized + predict-consistency green cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5; 3 new D-03 estimator memory gates (bounded reuse / Ridge Gram reuse / no mid-pipeline readback) composed from prims since mlrs-backend cannot dev-dep mlrs-algos (dep cycle), 9/9 gates green both backends]**
 
 ### Phase 5: Distance-Based & Iterative-Solver Estimators
 
@@ -179,6 +179,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
-| 4. Closed-Form Estimators | 4/5 | In progress | - |
+| 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
 | 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |

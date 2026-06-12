@@ -25,19 +25,19 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 04 (closed-form-estimators) — EXECUTING
+Phase: 04 (closed-form-estimators) — COMPLETE
 Plan: 5 of 5
-Status: Executing Phase 04
-Last activity: 2026-06-12 -- Completed Phase 04 Plan 04 (PCA DECOMP-01 + TruncatedSVD DECOMP-02 decomposition estimators)
+Status: Phase 04 complete (all 5 plans done)
+Last activity: 2026-06-12 -- Completed Phase 04 Plan 05 (Ridge LINEAR-02 Cholesky normal-equations + estimator fit→predict/transform memory gate D-03)
 Resume file: .planning/phases/04-closed-form-estimators/04-05-PLAN.md
 
-Progress: [██████░░░░] 57% (3/6 phases; 19/20 plans)
+Progress: [███████░░░] 67% (4/6 phases; 20/20 plans)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 11
+- Total plans completed: 20
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -72,6 +72,7 @@ Progress: [██████░░░░] 57% (3/6 phases; 19/20 plans)
 | Phase 04 P02 | 5 | 2 tasks | 5 files |
 | Phase 04 P03 | 8 | 2 tasks | 3 files |
 | Phase 04 P04 | 11 | 2 tasks | 11 files |
+| Phase 04 P05 | 9 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -157,6 +158,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12T07:34:16.000Z
-Stopped at: Completed 04-04-PLAN.md (PCA DECOMP-01 + TruncatedSVD DECOMP-02 — shared centered/uncentered SVD skeleton, svd_flip via align_rows, distinct explained_variance_ formulas)
-Resume file: .planning/phases/04-closed-form-estimators/04-05-PLAN.md (Ridge LINEAR-02 — consumes the 04-02 Cholesky primitive).
+Last session: 2026-06-12T07:56:33.000Z
+Stopped at: Completed 04-05-PLAN.md (Ridge LINEAR-02 — Cholesky normal-equations (XᵀX+αI)·coef=Xᵀy via the 04-02 primitive, raw Gram via gemm(transa), α on the diagonal only, center-then-solve intercept; + estimator fit→predict/transform memory gate D-03). Phase 04 COMPLETE (all 5 plans).
+Resume file: Phase 04 complete — next is Phase 05 (iterative estimators) planning.

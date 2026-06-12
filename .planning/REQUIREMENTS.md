@@ -30,7 +30,7 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 ### Linear Models
 
 - [x] **LINEAR-01**: User can fit `LinearRegression` (OLS, SVD-based to match sklearn's default) and read `coef_` and `intercept_`, predicting within 1e-5 of scikit-learn
-- [ ] **LINEAR-02**: User can fit `Ridge` with an `alpha` penalty and obtain `coef_`/`intercept_` matching scikit-learn
+- [x] **LINEAR-02**: User can fit `Ridge` with an `alpha` penalty and obtain `coef_`/`intercept_` matching scikit-learn
 - [ ] **LINEAR-03**: User can fit `Lasso` (coordinate-descent) with `alpha` and obtain a sparse `coef_` matching scikit-learn within tolerance
 - [ ] **LINEAR-04**: User can fit `ElasticNet` (`alpha`, `l1_ratio`, shared coordinate-descent with Lasso) matching scikit-learn within tolerance
 - [ ] **LINEAR-05**: User can fit `LogisticRegression` (quasi-Newton/L-BFGS) for binary and multiclass classification with stable softmax, `predict`/`predict_proba` matching scikit-learn's `lbfgs` solver within tolerance
@@ -111,7 +111,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PRIM-04 | Phase 2 | Complete (02-04; D-10 gate 02-05) |
 | PRIM-05 | Phase 3 | Complete |
 | LINEAR-01 | Phase 4 | Complete (04-03: LinearRegression SVD pseudo-inverse OLS, RCOND=1e-6 sklearn-pinned cutoff, center-then-solve intercept; 6/6 oracle pass cpu(f64)+rocm(f32) within 1e-5 incl. collinear) |
-| LINEAR-02 | Phase 4 | In progress (04-01 scaffold: NotPositiveDefinite + ridge fixtures + #[ignore] tests; 04-02 Cholesky/SPD-solve primitive DONE — validated cpu(f64+f32)+rocm(f32); estimator 04-05 remaining) |
+| LINEAR-02 | Phase 4 | DONE (04-05: Ridge Cholesky normal-equations (XᵀX+αI)·coef=Xᵀy via the 04-02 primitive, raw Gram via gemm(transa), α on the diagonal only, center-then-solve intercept — sklearn within 1e-5 across the {0.1,1,10} alpha sweep on cpu(f64)+rocm(f32); Gram threaded through the factor, D-03 memory gate green) |
 | DECOMP-01 | Phase 4 | Complete (04-04: Pca<F> centered-X SVD, S²/(n−1), ratio over full spectrum, svd_flip via align_rows, transform/inverse_transform; 10 oracle tests pass cpu(f64)+rocm(f32) within 1e-5 incl. wide case) |
 | DECOMP-02 | Phase 4 | Complete (04-04: TruncatedSvd<F> uncentered-X arpack SVD, var(transform cols) explained_variance_, svd_flip via align_rows, transform; 6 oracle tests pass cpu(f64)+rocm(f32) within 1e-5) |
 | LINEAR-03 | Phase 5 | Pending |
