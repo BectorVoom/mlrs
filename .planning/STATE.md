@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: "Plan 03-05 complete — Phase 3 DONE (D-11 SVD/eig memory hard gate: three build-failing PoolStats assertions extending the Phase-2 gate to the iterative Jacobi sweep — memory_gate_jacobi_scratch_bounded (per-call fresh-alloc delta flat after warmup; live/peak return to baseline), memory_gate_eig_reuses_gram_buffer (eig(out=Some) peak live rise <2·n² → reuses the threaded covariance/GEMM buffer, no parallel n² matrix), memory_gate_svd_no_midsweep_readback (read_backs==0 after svd(), ==1 after the single terminal to_host_metered). All six gates (3 Phase-2 + 3 D-11) green on cpu(f32+f64) and rocm(f32); svd_test 7/7 + eig_test 4/4 green on both. Gate 2 deviation: used peak-live-bytes rise instead of the free-list probe because eig releases the threaded buffer after use — stronger honest signal, contract unchanged)."
-last_updated: "2026-06-12T05:18:00.000Z"
-last_activity: 2026-06-12 -- Plan 03-05 complete; Phase 3 (SVD/eig primitive hard gate) DONE — D-11 memory gate green on cpu+rocm
+status: completed
+stopped_at: "Plan 03-04 complete — two-sided cyclic Jacobi symmetric-eig primitive. jacobi_eig_sweep #[cube(launch)] single-cube kernel applies Jᵀ·A·J per pair via a single acting unit (sequential cyclic pairs — two-sided rotations are NOT footprint-disjoint so the SVD's parallel column schedule races), accumulates V, measures the true post-sweep off-diagonal norm in-kernel (no host round-trip), writes the diagonal UNSORTED. eig() host orchestration validates squareness→NotSquare before any unsafe launch (D-06, no symmetrization), reuses the covariance/GEMM out buffer as the kernel working input (D-11 gate 2), sorts eigenvalues descending + permutes eigenvector columns (D-04), returns NotConverged on a cap hit (D-12). All 4 eig_test green on cpu (f32+f64) and rocm gfx1100 (f32; f64 skip-with-log); svd_test still 7/7. PRIM-05 now complete (SVD half 03-03 + eig half 03-04). Only 03-05 (D-11 memory gate) remains in Phase 3."
+last_updated: "2026-06-12T05:27:16.272Z"
+last_activity: 2026-06-12
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 16
+  total_plans: 15
   completed_plans: 16
   percent: 50
 ---
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 3 (svd-eigendecomposition-primitive-hard-gate) — COMPLETE
-Plan: 5 of 5 (03-05 complete — phase done)
+Phase: 4
+Plan: Not started
 Status: Phase 3 complete
-Last activity: 2026-06-12 -- Plan 03-05 complete; Phase 3 DONE (D-11 memory gate green on cpu+rocm)
+Last activity: 2026-06-12
 Resume file: (Phase 3 complete — run /gsd-plan-phase 04 to begin the next phase)
 
 Progress: [█████░░░░░] 50% (3/6 phases; 16/16 plans)
@@ -37,7 +37,7 @@ Progress: [█████░░░░░] 50% (3/6 phases; 16/16 plans)
 
 **Velocity:**
 
-- Total plans completed: 5
+- Total plans completed: 10
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -46,6 +46,7 @@ Progress: [█████░░░░░] 50% (3/6 phases; 16/16 plans)
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01 | 5 | - | - |
+| 3 | 5 | - | - |
 
 **Recent Trend:**
 

@@ -106,6 +106,7 @@ Plans:
 **Wave 4**
 
 - [x] 03-05-PLAN.md — D-11 build-failing memory gate: bounded Jacobi scratch + eig buffer reuse + no mid-sweep read-back ✅ (three HARD PoolStats gates extending the Phase-2 gate to the iterative Jacobi sweep — memory_gate_jacobi_scratch_bounded: svd() per-call fresh-alloc delta flat after warmup + live/peak return to baseline; memory_gate_eig_reuses_gram_buffer: eig(out=Some) peak live rise <2·n² → reuses the threaded covariance/GEMM buffer, no parallel n² matrix; memory_gate_svd_no_midsweep_readback: read_backs==0 after svd(), ==1 after the single terminal to_host_metered. All six gates green on cpu f32+f64 and rocm f32; svd_test 7/7 + eig_test 4/4 green on both. Gate 2 used peak-live-bytes rise rather than the free-list probe because eig releases the threaded buffer after use. PRIM-05 complete — Phase 3 DONE)
+
 **Research flag**: NEEDS DEEPER RESEARCH — Jacobi SVD on GPU in CubeCL is not a pre-built `cubecl-matmul` primitive; the iterative Jacobi-rotation kernel design for `#[cube]` requires domain research. Run `/gsd-plan-phase --research-phase 3` before writing any code.
 
 ### Phase 4: Closed-Form Estimators
@@ -161,7 +162,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
-| 3. SVD / Eigendecomposition Primitive (Hard Gate) | 2/5 | In progress | - |
+| 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
 | 4. Closed-Form Estimators | 0/TBD | Not started | - |
 | 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |
