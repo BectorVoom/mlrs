@@ -7,10 +7,15 @@ regeneration tool: ``numpy.random.default_rng(seed)`` is the authoritative
 seeded RNG (avoid Rust-side RNG, RESEARCH Pitfall 7), and the committed blobs
 are checked in so CI never runs this script.
 
-Phase 1 emits the saxpy smoke case only. Phase 4+ extends this module to
-``import sklearn``, fit estimators, and ``np.savez`` their fitted attributes
-(``coef_`` / ``intercept_`` / ...) under the same ``case_dtype_seed`` naming
-convention (D-01/D-02).
+Phase 1 emits the saxpy smoke case only. Phase 4 extends this module with the
+estimator/primitive fixtures: ``gen_cholesky`` (scipy SPD solve + L factor),
+``gen_linear_regression`` / ``gen_ridge`` (sklearn ``coef_``/``intercept_``),
+``gen_pca`` / ``gen_truncated_svd`` (sklearn fitted decomposition attributes),
+all under the ``case_dtype_seed`` naming convention (D-01/D-02/D-07). These need
+``scipy`` + ``scikit-learn`` in addition to ``numpy`` — regen in a /tmp venv
+(PEP 668): ``python3 -m venv /tmp/oracle-venv &&
+/tmp/oracle-venv/bin/pip install numpy scipy scikit-learn``. The committed blobs
+are checked in; CI never runs this script.
 
 Fixture contract (consumed by ``mlrs_core::oracle::load_npz``):
   - named arrays ``a`` / ``x`` / ``y`` / ``expected``
@@ -331,6 +336,275 @@ def gen_eigh(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Phase-4 estimator / primitive fixtures (D-01/D-02/D-07).
+# ---------------------------------------------------------------------------
+
+# Cholesky/solve convention-fixture order (D-02, the new SPD-solve primitive).
+# A is n×n SPD (= MᵀM + λI, well-conditioned); b is n×rhs; the test compares the
+# device solve x against scipy's reference AND checks the ‖L·Lᵀ−A‖ invariant.
+CHOL_N, CHOL_RHS = 6, 2
+# Ridge that the primitive backs uses a single RHS, but the standalone Cholesky
+# fixture carries rhs>1 to exercise the multi-column triangular solve.
+
+# Linear-model convention-fixture shapes (LINEAR-01/02). FULL-RANK case (tall,
+# well-conditioned) + a NEAR-COLLINEAR case (a duplicated-then-perturbed column
+# so the small-σ cutoff is genuinely exercised — RESEARCH Pitfall 1 / Open Q3).
+LIN_N_SAMPLES, LIN_N_FEATURES = 12, 4
+LIN_TEST_SAMPLES = 3
+
+# PCA/TruncatedSVD convention-fixture shapes (DECOMP-01/02). TALL (m>n) is the
+# standard case; WIDE (n_features>n_samples) exercises the k=min(m,n) truncation
+# and the wide SVD path. n_components < min(m,n) so truncation is real.
+PCA_TALL = (10, 4)
+PCA_WIDE = (4, 6)
+PCA_N_COMPONENTS_TALL = 3
+PCA_N_COMPONENTS_WIDE = 2
+TSVD_SHAPE = (10, 5)
+TSVD_N_COMPONENTS = 3
+
+
+def gen_cholesky(seed: int = SEED, dtype=np.float32, n: int = CHOL_N,
+                 rhs: int = CHOL_RHS) -> str:
+    """Generate one seeded Cholesky/SPD-solve fixture (D-02, the new primitive).
+
+    Builds a WELL-CONDITIONED symmetric positive-definite ``A = MᵀM + λI`` (λ
+    keeps the smallest eigenvalue comfortably away from 0 so the f32 Cholesky is
+    stable) and a random RHS ``b`` (n×rhs). Stores:
+
+      - ``A`` (n×n SPD), ``b`` (n×rhs),
+      - ``x`` = ``scipy.linalg.solve(A, b, assume_a="pos")`` — the reference
+        solution the device solve is compared against (``‖A·x − b‖`` invariant),
+      - ``L`` = ``scipy.linalg.cholesky(A, lower=True)`` — the lower factor for
+        the ``‖L·Lᵀ − A‖`` reconstruction invariant.
+
+    Every array is cast to the fixture dtype so the committed reference matches a
+    same-dtype device solve. Returns the absolute path written.
+    """
+    import scipy.linalg as sla
+
+    rng = np.random.default_rng(seed)
+    m = rng.standard_normal((n, n))
+    # MᵀM is SPD up to rank; + λI guarantees strict positive-definiteness and a
+    # benign condition number for the f32 gate.
+    a = (m.T @ m + (n * 1.0) * np.eye(n)).astype(dtype)
+    b = rng.standard_normal((n, rhs)).astype(dtype)
+    # Reference solve (assume_a="pos" routes scipy to its Cholesky path) and the
+    # lower factor, both computed in the fixture dtype.
+    x = sla.solve(a.astype(dtype), b.astype(dtype), assume_a="pos").astype(dtype)
+    lower = sla.cholesky(a.astype(np.float64), lower=True).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"cholesky_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, A=a, b=b, x=x, L=lower)
+    return out_path
+
+
+def gen_linear_regression(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded LinearRegression fixture (LINEAR-01, sklearn).
+
+    Stores BOTH a full-rank case and a near-collinear case so the SVD-pseudo-
+    inverse small-σ cutoff (RESEARCH Pitfall 1) is exercised:
+
+      - ``X`` (full-rank, n_samples×n_features), ``y``,
+      - ``coef``/``intercept`` = sklearn ``LinearRegression(fit_intercept=True)``
+        ``coef_``/``intercept_`` on ``X``,
+      - ``X_test`` (held-out) and ``y_pred`` = ``predict(X_test)``,
+      - ``X_coll`` (near-collinear: feature 2 = feature 0 + tiny noise), ``y_coll``,
+        and the sklearn ``coef_col``/``intercept_col`` on that collinear system —
+        the case that breaks a no-cutoff pseudo-inverse.
+
+    sklearn's ``LinearRegression`` is ``scipy.linalg.lstsq`` (gelsd / SVD), the
+    exact contract LINEAR-01 pins. Every array cast to the fixture dtype.
+    Returns the absolute path written.
+    """
+    from sklearn.linear_model import LinearRegression
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((LIN_N_SAMPLES, LIN_N_FEATURES))
+    true_coef = rng.standard_normal(LIN_N_FEATURES)
+    y = x @ true_coef + 0.5 + 0.01 * rng.standard_normal(LIN_N_SAMPLES)
+
+    reg = LinearRegression(fit_intercept=True).fit(x, y)
+    x_test = rng.standard_normal((LIN_TEST_SAMPLES, LIN_N_FEATURES))
+    y_pred = reg.predict(x_test)
+
+    # NEAR-COLLINEAR case: duplicate column 0 into column 2 with a tiny
+    # perturbation → a near-zero singular value the cutoff must drop. A no-cutoff
+    # pseudo-inverse blows up the coefficients here (Pitfall 1).
+    x_coll = x.copy()
+    x_coll[:, 2] = x_coll[:, 0] + 1e-7 * rng.standard_normal(LIN_N_SAMPLES)
+    y_coll = x_coll @ true_coef + 0.5 + 0.01 * rng.standard_normal(LIN_N_SAMPLES)
+    reg_coll = LinearRegression(fit_intercept=True).fit(x_coll, y_coll)
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"linear_regression_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        coef=c(reg.coef_),
+        intercept=c([reg.intercept_]),
+        X_test=c(x_test),
+        y_pred=c(y_pred),
+        X_coll=c(x_coll),
+        y_coll=c(y_coll),
+        coef_col=c(reg_coll.coef_),
+        intercept_col=c([reg_coll.intercept_]),
+    )
+    return out_path
+
+
+def gen_ridge(seed: int = SEED, dtype=np.float32,
+              alphas=(0.1, 1.0, 10.0)) -> str:
+    """Generate one seeded Ridge fixture (LINEAR-02, sklearn cholesky solver).
+
+    Stores ``X``, ``y``, the ``alpha`` sweep, and the stacked sklearn
+    ``Ridge(alpha, fit_intercept=True, solver="cholesky")`` ``coef_``/
+    ``intercept_`` for each alpha (rows = alphas). The sweep includes
+    ``alpha=1.0`` (well-conditioned, the strict-1e-5 case) plus a smaller and a
+    larger alpha so the device Cholesky normal-equations path is pinned across
+    regularisation strengths. The intercept is NOT penalized (centering, D-05) —
+    matching sklearn. Every array cast to the fixture dtype. Returns the path.
+    """
+    from sklearn.linear_model import Ridge
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((LIN_N_SAMPLES, LIN_N_FEATURES))
+    true_coef = rng.standard_normal(LIN_N_FEATURES)
+    y = x @ true_coef + 0.5 + 0.01 * rng.standard_normal(LIN_N_SAMPLES)
+
+    coefs = []
+    intercepts = []
+    for a in alphas:
+        reg = Ridge(alpha=a, fit_intercept=True, solver="cholesky").fit(x, y)
+        coefs.append(reg.coef_)
+        intercepts.append(reg.intercept_)
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"ridge_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        alpha=c(list(alphas)),
+        coef=c(np.vstack(coefs)),
+        intercept=c(np.asarray(intercepts)),
+    )
+    return out_path
+
+
+def gen_pca(seed: int = SEED, dtype=np.float32, shape=PCA_TALL,
+            n_components: int = PCA_N_COMPONENTS_TALL, kind: str = "tall") -> str:
+    """Generate one seeded PCA fixture (DECOMP-01, sklearn svd_solver='full').
+
+    Stores ``X`` (``shape``), ``n_components``, and the sklearn
+    ``PCA(n_components, svd_solver="full")`` fitted attributes — ``components_``,
+    ``explained_variance_``, ``explained_variance_ratio_``, ``singular_values_``,
+    ``mean_`` — plus ``transform(X)``. This is sklearn's verified ``_fit_full``
+    arithmetic: center by column means → ``svd(full_matrices=False)`` →
+    ``svd_flip(u_based_decision=False)`` → ``explained_variance_ = S²/(n−1)``
+    (RESEARCH-verified). ``kind`` is ``tall`` (m>n) or ``wide``
+    (n_features>n_samples). Every array cast to the fixture dtype. The Rust test
+    sign-aligns ``components_`` rows with ``align_rows`` before comparing (D-03).
+    Returns the absolute path written.
+    """
+    from sklearn.decomposition import PCA
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(shape)
+    pca = PCA(n_components=n_components, svd_solver="full").fit(x)
+    transformed = pca.transform(x)
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    # The TALL case is also written under the canonical (kind-less)
+    # ``pca_{dtype}_seed{seed}.npz`` name so a consumer can load the default PCA
+    # fixture without knowing the tall/wide split; the wide case keeps its kind.
+    arrays = dict(
+        X=c(x),
+        n_components=c([n_components]),
+        components_=c(pca.components_),
+        explained_variance_=c(pca.explained_variance_),
+        explained_variance_ratio_=c(pca.explained_variance_ratio_),
+        singular_values_=c(pca.singular_values_),
+        mean_=c(pca.mean_),
+        transform=c(transformed),
+    )
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"pca_{kind}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **arrays)
+    if kind == "tall":
+        canonical = os.path.join(
+            _FIXTURE_DIR, f"pca_{dtype_tag}_seed{seed}.npz"
+        )
+        np.savez(canonical, **arrays)
+    return out_path
+
+
+def gen_truncated_svd(seed: int = SEED, dtype=np.float32, shape=TSVD_SHAPE,
+                      n_components: int = TSVD_N_COMPONENTS) -> str:
+    """Generate one seeded TruncatedSVD fixture (DECOMP-02, sklearn arpack).
+
+    Uses ``algorithm="arpack"`` (DETERMINISTIC, D-07) — NOT the sklearn default
+    ``"randomized"`` — with ``random_state=42`` so the committed blob is
+    reproducible. Stores ``X`` (``shape``), ``n_components``, and the sklearn
+    ``TruncatedSVD`` fitted attributes ``components_``, ``explained_variance_``,
+    ``singular_values_`` plus ``transform(X)``. TruncatedSVD does NOT center X
+    (thin SVD of uncentered X) and ``explained_variance_`` is the variance of the
+    transformed columns, NOT ``S²/(n−1)`` (RESEARCH Pitfall 2). Every array cast
+    to the fixture dtype; the Rust test sign-aligns ``components_`` rows with
+    ``align_rows`` (D-03). Returns the absolute path written.
+    """
+    from sklearn.decomposition import TruncatedSVD
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(shape)
+    # algorithm="arpack" → deterministic (D-07); random_state pins the arpack v0.
+    tsvd = TruncatedSVD(
+        n_components=n_components, algorithm="arpack", random_state=42
+    ).fit(x)
+    transformed = tsvd.transform(x)
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"truncated_svd_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        n_components=c([n_components]),
+        components_=c(tsvd.components_),
+        explained_variance_=c(tsvd.explained_variance_),
+        singular_values_=c(tsvd.singular_values_),
+        transform=c(transformed),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -363,6 +637,26 @@ def main() -> None:
     # np.linalg.eigh is the numpy reference, REVERSED to descending (D-04).
     print(f"wrote {gen_eigh(dtype=np.float32)}")
     print(f"wrote {gen_eigh(dtype=np.float64)}")
+
+    # ---- Phase-4 estimator/primitive fixtures (D-01/D-02/D-07) ----
+    # Each generator writes BOTH f32 (rocm gate) and f64 (cpu gate) blobs.
+    # Cholesky/SPD-solve primitive (D-02): scipy reference + L factor.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_cholesky(dtype=dtype)}")
+    # LinearRegression (LINEAR-01): full-rank + near-collinear (small-σ cutoff).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_linear_regression(dtype=dtype)}")
+    # Ridge (LINEAR-02): cholesky solver, alpha sweep incl. the strict 1.0 case.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_ridge(dtype=dtype)}")
+    # PCA (DECOMP-01): tall (m>n) + wide (n_features>n_samples); svd_solver=full.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_pca(dtype=dtype, shape=PCA_TALL, n_components=PCA_N_COMPONENTS_TALL, kind='tall')}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_pca(dtype=dtype, shape=PCA_WIDE, n_components=PCA_N_COMPONENTS_WIDE, kind='wide')}")
+    # TruncatedSVD (DECOMP-02): DETERMINISTIC algorithm='arpack' (NOT randomized).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_truncated_svd(dtype=dtype)}")
 
 
 if __name__ == "__main__":
