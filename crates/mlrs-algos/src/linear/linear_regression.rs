@@ -9,13 +9,17 @@
 //! Phase-2 [`gemm`] / [`column_reduce`] primitives — NO bespoke matmul/solve.
 //!
 //! The pseudo-inverse uses sklearn's small-singular-value cutoff (RESEARCH
-//! Pitfall 1): `σ⁺_i = 1/σ_i if σ_i > cutoff else 0` with
-//! `cutoff = rcond · σ_max`, `rcond = ε_F · max(m, n)` (the
-//! `numpy.linalg.lstsq`/`scipy gelsd` default). A near-collinear `X` produces a
-//! ~0 singular value whose reciprocal would explode the coefficients; the cutoff
-//! drops it so the result stays bounded and matches sklearn (T-04-03-01). A
-//! `NEAR_ZERO_FLOOR` fallback keeps the cutoff strictly positive even for an
-//! all-zero spectrum.
+//! Pitfall 1 / Open Q3): `σ⁺_i = 1/σ_i if σ_i > cutoff else 0` with
+//! `cutoff = rcond · σ_max`, `rcond = RCOND` (= `1e-6`). This MUST match
+//! `sklearn.linear_model.LinearRegression`, which since the `tol` parameter
+//! (default `1e-6`) passes that value as scipy's `lstsq(cond=…)` — scipy drops
+//! every `σ_i ≤ cond·σ_max`. The looser numpy-lstsq / scipy-gelsd default
+//! (`ε_F·max(m,n)`) does NOT match sklearn: on the near-collinear fixture its
+//! `σ_min/σ_max ≈ 3e-8` is above that f64 threshold, so numpy reciprocates the
+//! ~0 singular value and the coefficients EXPLODE to ~1e4, whereas sklearn (and
+//! this estimator) drop it and return the bounded ~0.485 minimum-norm solution
+//! (T-04-03-01). A `NEAR_ZERO_FLOOR` fallback keeps the cutoff strictly positive
+//! even for an all-zero spectrum.
 //!
 //! ## Intercept via center-then-solve (D-05)
 //! When `fit_intercept`, the column means `x̄` and `ȳ` are removed before the
@@ -50,6 +54,15 @@ use crate::traits::{Fit, Predict};
 /// the cutoff strictly positive for a degenerate (all-zero) spectrum so a tiny
 /// singular value is always zeroed rather than reciprocated.
 const NEAR_ZERO_FLOOR: f64 = 1e-8;
+
+/// Relative singular-value cutoff `rcond` for the pseudo-inverse — singular
+/// values with `σ_i ≤ rcond·σ_max` are dropped (σ⁺ = 0). Pinned to `1e-6` to
+/// match `sklearn.linear_model.LinearRegression`'s default `tol`, which it
+/// forwards as `scipy.linalg.lstsq(cond=…)` (D-02 / Open Q3). This is the value
+/// that reproduces sklearn on BOTH the full-rank and the near-collinear fixture;
+/// the much smaller `ε_F·max(m,n)` numpy default would keep the collinear ~0
+/// singular value and explode the coefficients (see module docs).
+const RCOND: f64 = 1e-6;
 
 /// Ordinary least squares (LINEAR-01) fitted by the SVD pseudo-inverse.
 ///
@@ -210,19 +223,16 @@ where
         let k = n_samples.min(n_features);
         let (u, s, vt) = svd::<F>(pool, &x_c_dev, (n_samples, n_features))?;
 
-        // --- 3. σ⁺ with sklearn's small-σ cutoff (Pitfall 1 / T-04-03-01).
-        //        rcond = ε_F · max(m, n) (numpy lstsq / scipy gelsd default);
-        //        cutoff = rcond · σ_max, floored at NEAR_ZERO_FLOOR so it is
-        //        strictly positive even for a degenerate spectrum. ---
+        // --- 3. σ⁺ with sklearn's small-σ cutoff (Pitfall 1 / T-04-03-01 /
+        //        Open Q3). cutoff = RCOND · σ_max (RCOND = 1e-6 = sklearn's
+        //        default `tol`, forwarded as scipy `lstsq(cond=…)`), floored at
+        //        NEAR_ZERO_FLOOR so it is strictly positive even for a degenerate
+        //        spectrum. The looser ε_F·max(m,n) numpy default would keep the
+        //        collinear ~0 singular value and explode the coefficients. ---
         let s_host = s.to_host(pool);
         let s64: Vec<f64> = s_host.iter().map(|&v| host_to_f64(v)).collect();
         let sigma_max = s64.iter().cloned().fold(0.0f64, f64::max);
-        let eps = match size_of::<F>() {
-            4 => f32::EPSILON as f64,
-            _ => f64::EPSILON,
-        };
-        let rcond = eps * (n_samples.max(n_features) as f64);
-        let cutoff = (rcond * sigma_max).max(NEAR_ZERO_FLOOR);
+        let cutoff = (RCOND * sigma_max).max(NEAR_ZERO_FLOOR);
 
         // --- 4. coef = V · diag(σ⁺) · (Uᵀ · y_c). Compose with gemm; the only
         //        host arithmetic is the length-k σ⁺ scaling (the cutoff guard). ---
