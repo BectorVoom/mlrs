@@ -363,6 +363,371 @@ PCA_N_COMPONENTS_WIDE = 2
 TSVD_SHAPE = (10, 5)
 TSVD_N_COMPONENTS = 3
 
+# ---------------------------------------------------------------------------
+# Phase-5 distance-based / iterative-solver fixtures (CLUSTER/NEIGH/LINEAR).
+# ---------------------------------------------------------------------------
+
+# KMeans convention-fixture (CLUSTER-01, D-09 injected init). A small,
+# well-separated 3-blob design (30 samples × 4 features, K=3) so Lloyd converges
+# to the SAME partition from the injected init in both mlrs and sklearn — the
+# oracle compares centers/labels/inertia up to a label permutation.
+KM_N_SAMPLES, KM_N_FEATURES, KM_K = 30, 4, 3
+
+# DBSCAN convention-fixture (CLUSTER-02). eps/min_samples chosen on a 2-blob +
+# scattered-noise design so the result has ≥1 cluster, ≥1 noise point (-1), and
+# ≥1 border point (Pitfall 7 determinism).
+DB_N_SAMPLES, DB_N_FEATURES = 40, 2
+DB_EPS, DB_MIN_SAMPLES = 0.7, 4
+
+# KNN convention-fixture (NEIGH-01/02/03 — one fixture serves all three). A
+# train set + held-out query set, k neighbors, with DISTINCT distances (Pitfall 8
+# — avoid tie ambiguity). Carries both classification targets (y_class) and
+# regression targets (y_reg) so the single blob serves classifier + regressor.
+KNN_N_TRAIN, KNN_N_QUERY, KNN_N_FEATURES = 30, 8, 3
+KNN_K, KNN_N_CLASSES = 5, 3
+
+# Lasso / ElasticNet convention-fixture (LINEAR-03/04). A design with a genuinely
+# SPARSE solution (some exact-zero coefficients, Pitfall 1) — more features than
+# are truly active.
+CD_N_SAMPLES, CD_N_FEATURES = 50, 8
+LASSO_ALPHA = 0.5
+EN_ALPHA, EN_L1_RATIO = 0.5, 0.5
+
+# LogisticRegression convention-fixture (LINEAR-05). Binary (2-class) + multiclass
+# (3-class); predict/predict_proba is the PRIMARY gauge-invariant gate (Pitfall 5).
+LOG_N_SAMPLES, LOG_N_QUERY, LOG_N_FEATURES = 40, 8, 4
+LOG_C, LOG_MAX_ITER = 1.0, 100
+
+
+def gen_kmeans(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded KMeans fixture (CLUSTER-01, D-09 injected init).
+
+    Fits ``sklearn.cluster.KMeans`` with an INJECTED fixed ``init`` array (D-09 —
+    k-means++ RNG cannot be reproduced bit-for-bit across numpy/Rust, so the
+    oracle supplies the initial centers and both mlrs and sklearn run Lloyd from
+    the SAME init), ``n_init=1`` (D-09b), ``max_iter=300``, ``tol=1e-4``. A small
+    well-separated 3-blob design (``KM_N_SAMPLES``×``KM_N_FEATURES``, K=``KM_K``)
+    so Lloyd converges identically up to a label permutation. Stores ``X``,
+    ``init`` (the injected centers), ``centers`` (``cluster_centers_``),
+    ``labels`` (``labels_``, int-valued), ``inertia`` (``inertia_``). Every array
+    passes through the ``c()`` C-contiguous wrapper. Returns the path written.
+    """
+    from sklearn.cluster import KMeans
+
+    rng = np.random.default_rng(seed)
+    # Three well-separated blobs so the partition is unambiguous.
+    centers_true = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [8.0, 8.0, 8.0, 8.0],
+            [-8.0, 8.0, -8.0, 8.0],
+        ]
+    )
+    per = KM_N_SAMPLES // KM_K
+    x = np.vstack(
+        [
+            centers_true[k] + 0.4 * rng.standard_normal((per, KM_N_FEATURES))
+            for k in range(KM_K)
+        ]
+    )
+    # Injected init (D-09): one actual sample drawn from each blob region so the
+    # init is sensible but FIXED (not k-means++ RNG). Both mlrs + sklearn start
+    # Lloyd here.
+    init = np.vstack([x[k * per] for k in range(KM_K)]).astype(np.float64)
+
+    km = KMeans(
+        n_clusters=KM_K, init=init, n_init=1, max_iter=300, tol=1e-4
+    ).fit(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"kmeans_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        init=c(init),
+        centers=c(km.cluster_centers_),
+        labels=c(km.labels_),
+        inertia=c([km.inertia_]),
+    )
+    return out_path
+
+
+def gen_dbscan(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded DBSCAN fixture (CLUSTER-02).
+
+    Fits ``sklearn.cluster.DBSCAN(eps=DB_EPS, min_samples=DB_MIN_SAMPLES,
+    metric='euclidean', algorithm='brute')`` on a 2-blob + scattered-noise design
+    chosen so the result has ≥1 cluster, ≥1 noise point (label ``-1``), and ≥1
+    border point (Pitfall 7 determinism — core = eps-neighbor-count incl. self ≥
+    min_samples). Stores ``X``, ``eps``, ``min_samples``, ``labels`` (``labels_``,
+    noise=-1, int-valued), ``core_sample_indices`` (``core_sample_indices_``,
+    int-valued). Every array passes through ``c()``. Returns the path written.
+    """
+    from sklearn.cluster import DBSCAN
+
+    rng = np.random.default_rng(seed)
+    # Two tight blobs (clusterable) + a handful of scattered points (noise).
+    blob_a = np.array([0.0, 0.0]) + 0.2 * rng.standard_normal((16, DB_N_FEATURES))
+    blob_b = np.array([3.0, 3.0]) + 0.2 * rng.standard_normal((16, DB_N_FEATURES))
+    noise = rng.uniform(low=-2.0, high=5.0, size=(8, DB_N_FEATURES))
+    x = np.vstack([blob_a, blob_b, noise])
+
+    db = DBSCAN(
+        eps=DB_EPS,
+        min_samples=DB_MIN_SAMPLES,
+        metric="euclidean",
+        algorithm="brute",
+    ).fit(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"dbscan_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        eps=c([DB_EPS]),
+        min_samples=c([DB_MIN_SAMPLES]),
+        labels=c(db.labels_),
+        core_sample_indices=c(db.core_sample_indices_),
+    )
+    return out_path
+
+
+def gen_knn(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded KNN fixture (NEIGH-01/02/03 — one fixture, all three).
+
+    Fits ``sklearn.neighbors.NearestNeighbors(n_neighbors=KNN_K,
+    algorithm='brute', metric='euclidean')`` on a train set and queries a held-out
+    set; ALSO fits a ``KNeighborsClassifier`` and ``KNeighborsRegressor`` (default
+    ``weights='uniform'``) so the single blob serves all three neighbor
+    estimators. Distances are DISTINCT by construction (Pitfall 8 — avoid tie
+    ambiguity). Stores:
+
+      - ``X`` (train), ``Xq`` (query), ``k``,
+      - ``distances`` (sqrt-Euclidean k-NN distances of Xq), ``indices``
+        (int-valued neighbor indices into X),
+      - ``y_class`` (int classification targets), ``y_reg`` (float regression
+        targets),
+      - ``predict_class`` (classifier ``predict(Xq)``, int), ``predict_proba``
+        (classifier ``predict_proba(Xq)``), ``predict_reg`` (regressor
+        ``predict(Xq)``).
+
+    Every array passes through ``c()``. Returns the path written.
+    """
+    from sklearn.neighbors import (
+        KNeighborsClassifier,
+        KNeighborsRegressor,
+        NearestNeighbors,
+    )
+
+    rng = np.random.default_rng(seed)
+    # Spread the train points widely so pairwise distances are distinct (Pitfall
+    # 8): random + a per-row unique offset.
+    x = rng.standard_normal((KNN_N_TRAIN, KNN_N_FEATURES)) * 3.0
+    x += np.arange(KNN_N_TRAIN)[:, None] * 0.01
+    xq = rng.standard_normal((KNN_N_QUERY, KNN_N_FEATURES)) * 3.0
+
+    nn = NearestNeighbors(
+        n_neighbors=KNN_K, algorithm="brute", metric="euclidean"
+    ).fit(x)
+    distances, indices = nn.kneighbors(xq)  # sqrt-Euclidean, ascending
+
+    # Classification + regression targets over the SAME train set.
+    y_class = rng.integers(low=0, high=KNN_N_CLASSES, size=KNN_N_TRAIN)
+    y_reg = x @ rng.standard_normal(KNN_N_FEATURES) + 0.5
+
+    clf = KNeighborsClassifier(
+        n_neighbors=KNN_K, algorithm="brute", metric="euclidean"
+    ).fit(x, y_class)
+    reg = KNeighborsRegressor(
+        n_neighbors=KNN_K, algorithm="brute", metric="euclidean"
+    ).fit(x, y_reg)
+    predict_class = clf.predict(xq)
+    predict_proba = clf.predict_proba(xq)
+    predict_reg = reg.predict(xq)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"knn_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        Xq=c(xq),
+        k=c([KNN_K]),
+        distances=c(distances),
+        indices=c(indices),
+        y_class=c(y_class),
+        y_reg=c(y_reg),
+        predict_class=c(predict_class),
+        predict_proba=c(predict_proba),
+        predict_reg=c(predict_reg),
+    )
+    return out_path
+
+
+def gen_lasso(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded Lasso fixture (LINEAR-03, sklearn coordinate descent).
+
+    Fits ``sklearn.linear_model.Lasso(alpha=LASSO_ALPHA, fit_intercept=True,
+    tol=1e-4, max_iter=1000)`` on a design whose true coefficient vector is SPARSE
+    (only some features active) so the fitted ``coef_`` has genuine exact zeros
+    (Pitfall 1 — the soft-threshold zeroing must be reproduced). Stores ``X``,
+    ``y``, ``alpha``, ``coef`` (``coef_``, incl. exact zeros), ``intercept``
+    (``intercept_``). Every array passes through ``c()``. Returns the path.
+    """
+    from sklearn.linear_model import Lasso
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((CD_N_SAMPLES, CD_N_FEATURES))
+    # SPARSE ground truth: only 3 of CD_N_FEATURES coefficients are non-zero.
+    true_coef = np.zeros(CD_N_FEATURES)
+    true_coef[[0, 3, 5]] = [2.5, -1.8, 3.1]
+    y = x @ true_coef + 0.5 + 0.05 * rng.standard_normal(CD_N_SAMPLES)
+
+    reg = Lasso(
+        alpha=LASSO_ALPHA, fit_intercept=True, tol=1e-4, max_iter=1000
+    ).fit(x, y)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"lasso_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        alpha=c([LASSO_ALPHA]),
+        coef=c(reg.coef_),
+        intercept=c([reg.intercept_]),
+    )
+    return out_path
+
+
+def gen_elastic_net(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded ElasticNet fixture (LINEAR-04, sklearn CD).
+
+    Fits ``sklearn.linear_model.ElasticNet(alpha=EN_ALPHA, l1_ratio=EN_L1_RATIO,
+    fit_intercept=True, tol=1e-4, max_iter=1000)`` on the same sparse-ground-truth
+    design as ``gen_lasso`` (the shared CD kernel serves both, D-03). Stores ``X``,
+    ``y``, ``alpha``, ``l1_ratio``, ``coef`` (``coef_``), ``intercept``
+    (``intercept_``). Every array passes through ``c()``. Returns the path.
+    """
+    from sklearn.linear_model import ElasticNet
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((CD_N_SAMPLES, CD_N_FEATURES))
+    true_coef = np.zeros(CD_N_FEATURES)
+    true_coef[[0, 3, 5]] = [2.5, -1.8, 3.1]
+    y = x @ true_coef + 0.5 + 0.05 * rng.standard_normal(CD_N_SAMPLES)
+
+    reg = ElasticNet(
+        alpha=EN_ALPHA,
+        l1_ratio=EN_L1_RATIO,
+        fit_intercept=True,
+        tol=1e-4,
+        max_iter=1000,
+    ).fit(x, y)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"elastic_net_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        alpha=c([EN_ALPHA]),
+        l1_ratio=c([EN_L1_RATIO]),
+        coef=c(reg.coef_),
+        intercept=c([reg.intercept_]),
+    )
+    return out_path
+
+
+def gen_logistic(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -> str:
+    """Generate one seeded LogisticRegression fixture (LINEAR-05, sklearn lbfgs).
+
+    Fits ``sklearn.linear_model.LogisticRegression(solver='lbfgs', C=LOG_C,
+    max_iter=LOG_MAX_ITER, tol=1e-4, fit_intercept=True)`` — the deprecated
+    ``multi_class`` argument is NOT passed (sklearn ≥1.5 multinomial by default).
+    Two fixture families per dtype: ``binary`` (2-class) and ``multi`` (3-class).
+    ``predict_proba``/``predict`` are the PRIMARY gauge-invariant gate (Pitfall 5
+    — the symmetric over-parameterized softmax has gauge freedom in ``coef_``);
+    ``coef_`` is the looser secondary reference. Stores ``X``, ``Xq``, ``y``,
+    ``C``, ``coef`` (``coef_``), ``intercept`` (``intercept_``), ``predict``
+    (``predict(Xq)``, int), ``predict_proba`` (``predict_proba(Xq)``). Every array
+    passes through ``c()``. Returns the path written.
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    rng = np.random.default_rng(seed)
+    n_classes = 3 if multiclass else 2
+    # Well-separated class blobs so the fit converges cleanly and predict is
+    # unambiguous.
+    centers = rng.standard_normal((n_classes, LOG_N_FEATURES)) * 4.0
+    per = LOG_N_SAMPLES // n_classes
+    x = np.vstack(
+        [
+            centers[k] + rng.standard_normal((per, LOG_N_FEATURES))
+            for k in range(n_classes)
+        ]
+    )
+    y = np.concatenate([np.full(per, k) for k in range(n_classes)])
+    xq = np.vstack(
+        [
+            centers[k] + rng.standard_normal((LOG_N_QUERY // n_classes, LOG_N_FEATURES))
+            for k in range(n_classes)
+        ]
+    )
+
+    clf = LogisticRegression(
+        solver="lbfgs",
+        C=LOG_C,
+        max_iter=LOG_MAX_ITER,
+        tol=1e-4,
+        fit_intercept=True,
+    ).fit(x, y)
+    predict = clf.predict(xq)
+    predict_proba = clf.predict_proba(xq)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    kind = "multi" if multiclass else "binary"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"logistic_{kind}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        Xq=c(xq),
+        y=c(y),
+        C=c([LOG_C]),
+        coef=c(clf.coef_),
+        intercept=c(clf.intercept_),
+        predict=c(predict),
+        predict_proba=c(predict_proba),
+    )
+    return out_path
+
 
 def gen_cholesky(seed: int = SEED, dtype=np.float32, n: int = CHOL_N,
                  rhs: int = CHOL_RHS) -> str:
@@ -664,6 +1029,30 @@ def main() -> None:
     # TruncatedSVD (DECOMP-02): DETERMINISTIC algorithm='arpack' (NOT randomized).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_truncated_svd(dtype=dtype)}")
+
+    # ---- Phase-5 distance-based / iterative-solver fixtures ----
+    # Each generator writes BOTH f32 (rocm gate) and f64 (cpu gate) blobs.
+    # KMeans (CLUSTER-01): injected init (D-09) so Lloyd is deterministic.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_kmeans(dtype=dtype)}")
+    # DBSCAN (CLUSTER-02): eps/min_samples giving cluster + noise(-1) + border.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_dbscan(dtype=dtype)}")
+    # KNN (NEIGH-01/02/03): one fixture serves NearestNeighbors + classifier +
+    # regressor; distinct distances (Pitfall 8).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_knn(dtype=dtype)}")
+    # Lasso (LINEAR-03): sparse coef_ with exact zeros (Pitfall 1).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_lasso(dtype=dtype)}")
+    # ElasticNet (LINEAR-04): shared CD design, l1_ratio mixing.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_elastic_net(dtype=dtype)}")
+    # LogReg (LINEAR-05): binary + multiclass; predict/predict_proba primary gate.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_logistic(dtype=dtype, multiclass=False)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_logistic(dtype=dtype, multiclass=True)}")
 
 
 if __name__ == "__main__":
