@@ -97,7 +97,7 @@ Plans:
 
 **Wave 2**
 
-- [ ] 03-03-PLAN.md — one-sided Jacobi SVD kernel + svd() prim (thin-U, tall+wide Aᵀ-swap, descending sort) + SVD oracle/invariant tests (D-01..D-05)
+- [x] 03-03-PLAN.md — one-sided Jacobi SVD kernel + svd() prim (thin-U, tall+wide Aᵀ-swap, descending sort) + SVD oracle/invariant tests (D-01..D-05) ✅ (jacobi_svd_sweep single-cube in-kernel convergence, A in global for gfx1100 LDS budget, two-threshold skip/break convergence; svd() validate+wide-swap+gemm thin-U+descending sort; 7 svd_test green on cpu f32+f64 and rocm f32, f64 skip-with-log)
 
 **Wave 3**
 

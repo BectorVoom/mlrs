@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Plan 03-02 complete (Nyquist Wave-0 scaffold — PrimError NotSquare/NotConverged; gen_oracle.py gen_svd/gen_eigh; five committed .npz fixtures svd_tall f32+f64/svd_wide f32/eigh f32+f64; svd_test.rs+eig_test.rs compile on cpu with all 11 VALIDATION.md fns present, ignored until prims land in 03-03/04)."
-last_updated: "2026-06-12T03:27:08.000Z"
-last_activity: 2026-06-12 -- Plan 03-02 complete (SVD/eig Nyquist Wave-0 scaffold + numpy fixtures)
+stopped_at: "Plan 03-03 complete (one-sided Jacobi thin-SVD — jacobi_svd_sweep single-cube #[cube] kernel with in-kernel two-threshold convergence, A in global memory for gfx1100's 64 KiB LDS budget; svd() host orchestration validates geometry, handles tall+wide via Aᵀ-swap, extracts thin-U via Phase-2 gemm A·V + column L2-norm with near-zero floor, sorts descending, NotConverged on cap; 7 svd_test green on cpu f32+f64 and rocm f32, f64 skip-with-log)."
+last_updated: "2026-06-12T04:08:00.000Z"
+last_activity: 2026-06-12 -- Plan 03-03 complete (one-sided Jacobi SVD primitive, green on cpu+rocm)
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 15
-  completed_plans: 13
-  percent: 38
+  completed_plans: 14
+  percent: 42
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 3 (svd-eigendecomposition-primitive-hard-gate) — EXECUTING
-Plan: 3 of 5 (03-02 complete)
+Plan: 4 of 5 (03-03 complete)
 Status: Executing Phase 3
-Last activity: 2026-06-12 -- Plan 03-02 complete (SVD/eig Nyquist Wave-0 scaffold + numpy fixtures)
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-03-PLAN.md
+Last activity: 2026-06-12 -- Plan 03-03 complete (one-sided Jacobi SVD primitive, green on cpu+rocm)
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-04-PLAN.md
 
-Progress: [████░░░░░░] 38% (2/6 phases; 13/15 plans)
+Progress: [████░░░░░░] 42% (2/6 phases; 14/15 plans)
 
 ## Performance Metrics
 
@@ -64,6 +64,7 @@ Progress: [████░░░░░░] 38% (2/6 phases; 13/15 plans)
 | Phase 02 P05 | 18 | 1 task | 1 file |
 | Phase 03 P01 | 10 | 2 tasks | 5 files |
 | Phase 03 P02 | 8 | 2 tasks | 9 files |
+| Phase 03 P03 | 38 | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -109,6 +110,10 @@ Recent decisions affecting current work:
 - [Phase 03]: [03-01]: GATE = cpu(f64) + rocm(f32) project-wide from Phase 3 (D-07, supersedes cpu+wgpu). CONFIRMED empirically: capability backend=rocm f32_supported=true f64_supported=false; cpu f64_supported=true. f64-on-rocm SKIPS-with-log via the unchanged skip_f64_with_log gate because cubecl-cpp 0.10 does NOT register F64 for the HIP backend — EXPECTED, not a defect. f64 SVD/eig validates on cpu; rocm validates f32. wgpu opportunistic only. ROADMAP/PROJECT/03-CONTEXT reconciled.
 - [Phase 03]: [03-02]: PrimError extended with NotSquare { operand, rows, cols } (D-06 eig squareness, ASVS V5) + NotConverged { operand, max_sweeps, residual } (D-12 Jacobi sweep cap) — thiserror, one variant per violation class. gen_oracle.py gen_svd uses np.linalg.svd(full_matrices=False) (descending S, D-02/D-04) saving A/U/S/Vt; gen_eigh uses np.linalg.eigh on a (M+Mᵀ)/2 symmetric matrix and stores w/V REVERSED to descending AT GENERATION (D-04) so the future test compares directly with no re-sort. Five fixtures committed: svd_tall f32+f64 (8×4), svd_wide f32 (4×8, Aᵀ-swap path), eigh f32+f64 (4×4).
 - [Phase 03]: [03-02]: Nyquist Wave-0 scaffold pattern — svd_test.rs (7 fns) + eig_test.rs (4 fns) carry all VALIDATION.md test names as #[ignore] stubs that assert fixture load + shape well-formedness only (NO reference to non-existent prims::svd/eig symbols), so the test crate compiles today; 03-03/04 remove #[ignore] and wire the real svd()/eig() + invariants. f64 fixture tests gate on skip_f64_with_log (cpu runs, rocm skips) verbatim from gemm_test.rs.
+- [Phase 03]: [03-03]: Jacobi convergence needs TWO thresholds, not one — a tiny rotation-skip bound (ε·‖A‖_F, so rotations are essentially never skipped) SEPARATE from a noise-floor-aware convergence-break bound (8·ε·‖A‖_F·√(n(n-1)/2)). Conflating them stalled the 256×64 f32 case at the 30-sweep cap (off-diag residual 7.9e-4 ≫ a single-ε 7e-5 bound) despite recon already within 1e-5; the √pairs scaling clears the accumulated f32 dot-product noise floor (≈4e-4) so it converges in ~7 sweeps. Reusable for the 03-04 two-sided eig kernel.
+- [Phase 03]: [03-03]: A1/LDS budget REALIZED — the all-shared 256×64 f32 Jacobi tile (82176 B: A 64KiB + V 16KiB + accumulator) overflowed gfx1100's 65536 B LDS and HIP rejected the launch. Fix: keep A column-major in the GLOBAL a_out handle throughout the sweep; only V (≤16 KiB) + the off-diagonal accumulator stay in SharedMemory. The single-cube convergence loop is still fully in-kernel (global handle is cube-private for a single-cube launch) so D-11 gate 3 (no host round-trip between sweeps) holds. MAX_ROWS is now a host-side problem-size cap, not a shared size. Pattern: when a shared tile overflows LDS, keep the large operand in global, shared only for the small accumulator.
+- [Phase 03]: [03-03]: thin-U via the Phase-2 gemm A·V from the ORIGINAL A and the kernel's accumulated V (NOT the kernel's rotated A) — satisfies D-02 + the plan's gemm key-link AND independently validates V. S[j]=‖B[:,j]‖₂ via column L2-norm reduce; U[:,j]=B[:,j]/S[j] with a 1e-8 near-zero floor leaving rank-deficient null-space columns at 0 (Pitfall 4, validated by the reconstruction invariant not per-vector compare). Wide path (D-05) materializes Aᵀ once into pooled scratch then relabels U=V', Vᵀ=U'ᵀ on the host.
+- [Phase 03]: [03-03]: svd.rs has 10 plain to_host calls (criterion-4 literal grep wanted 0) — these are the post-convergence host-side thin-U normalize + descending sort + permute (D-04/A4 blessed) + one-time pre-launch ‖A‖_F estimate, on the PLAIN (non-metered) path so they do NOT bump read_backs (same precedent as reduce.rs internal per-row to_host). The CONVERGENCE LOOP (criterion-4's intent) is fully device-resident in-kernel; the D-11 read_backs==1 gate (03-05) is unaffected.
 
 ### Pending Todos
 
@@ -135,6 +140,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12 -- Plan 03-02 complete
-Stopped at: Plan 03-02 complete — SVD/eig Nyquist Wave-0 scaffold. PrimError NotSquare/NotConverged (D-06/D-12); gen_oracle.py gen_svd/gen_eigh; five committed .npz fixtures (svd_tall f32+f64, svd_wide f32, eigh f32+f64). svd_test.rs (7 fns) + eig_test.rs (4 fns) compile on cpu with all VALIDATION.md test names present, ignored until the prims land. Plans 03-03 (SVD kernel) and 03-04 (eig kernel) now have failing/ignored tests to drive them.
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-03-PLAN.md (SVD Jacobi kernel — remove #[ignore] in svd_test.rs, wire svd::<F> + reconstruction/orthonormality invariants).
+Last session: 2026-06-12 -- Plan 03-03 complete
+Stopped at: Plan 03-03 complete — one-sided Jacobi thin-SVD primitive. jacobi_svd_sweep #[cube(launch)] single-cube kernel (A in global, V+accumulator in shared for gfx1100's LDS budget) with an in-kernel two-threshold convergence loop (tiny skip_thr + √pairs-scaled conv_thr); svd() host orchestration validates geometry, dispatches wide via Aᵀ-swap (D-05), extracts thin-U via Phase-2 gemm A·V + column L2-norm with a near-zero floor (D-02/Pitfall 4), sorts descending (D-04), returns NotConverged on a cap hit. All 7 svd_test green on cpu (f32+f64) and rocm gfx1100 (f32; f64 skip-with-log). 03-04 (eig kernel) + 03-05 (D-11 memory gate) remain.
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-04-PLAN.md (two-sided Jacobi symmetric-eig kernel — remove #[ignore] in eig_test.rs, wire eig::<F> + residual invariant; reuse the 03-03 single-cube/two-threshold/global-staging pattern).
