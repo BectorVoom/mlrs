@@ -67,7 +67,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 02-03-PLAN.md — Wave 3: pairwise squared-Euclidean distance via GEMM-expansion + max(d²,0) clamp + optional sqrt (PRIM-03)
+- [x] 02-03-PLAN.md — Wave 3: pairwise squared-Euclidean distance via GEMM-expansion + max(d²,0) clamp + optional sqrt (PRIM-03) ✅ (distance host API composes gemm+row-SumSq+clamp+optional sqrt, device-resident; min>=0 property holds on f32 cancellation; squared/sqrt npz fixtures; green cpu+wgpu)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 

@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 02 (core-compute-primitives) — EXECUTING
-Plan: 3 of 5
-Status: Executing Phase 02 (plans 01-02 complete)
-Last activity: 2026-06-12 -- Plan 02-02 executed (dual-path reductions + argmin tie-break)
-Resume file: .planning/phases/02-core-compute-primitives/02-03-PLAN.md
+Plan: 4 of 5
+Status: Executing Phase 02 (plans 01-03 complete)
+Last activity: 2026-06-12 -- Plan 02-03 executed (PRIM-03 GEMM-expansion distance + clamp + optional sqrt)
+Resume file: .planning/phases/02-core-compute-primitives/02-04-PLAN.md
 
-Progress: [██░░░░░░░░] 21% (1/6 phases; 7/10 plans)
+Progress: [███░░░░░░░] 26% (1/6 phases; 8/10 plans)
 
 ## Performance Metrics
 
@@ -59,6 +59,7 @@ Progress: [██░░░░░░░░] 21% (1/6 phases; 7/10 plans)
 | Phase 01 P05 | 18 | 3 tasks | 6 files |
 | Phase 02 P01 | 35 | 5 tasks | 14 files |
 | Phase 02 P02 | 95 | 3 tasks | 8 files |
+| Phase 02 P03 | 7 | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,10 @@ Recent decisions affecting current work:
 - [Phase 02]: [02-02]: Host clamps the plane-path launch cube to >= plane width (else planes_per_cube=CUBE_DIM_X/PLANE_DIM rounds to 0 and the combine reads nothing → got=0)
 - [Phase 02]: [02-02]: f32 large-magnitude reductions compare abs-OR-rel (numpy allclose) — strict abs-AND-rel is impossible when the f32 ULP (|x|·2⁻²³) exceeds 1e-5; both bounds stay 1e-5, f64 keeps strict assert_slice_close; sum/mean sweep uses non-negative data to avoid the near-zero relative artifact
 - [Phase 02]: [02-02]: row-L2-norm (Plan 03 distance) = prims::reduce::row_reduce(.., ScalarOp::L2Norm, ..); column-mean (Plan 04 covariance) = column_reduce(.., ScalarOp::Mean, ..); per-row argmin (Plan 05 KMeans) = argmin_rows
+- [Phase 02]: [02-03]: distance needs the SQUARED row norm ‖x‖² (not sqrt), so added ScalarOp::SumSq (Σxᵢ², no sqrt finalize) to prims::reduce — distinct from L2Norm which sqrt-finalizes; row_reduce(.., ScalarOp::SumSq, ..) is the ‖x‖² term of the GEMM-expansion
+- [Phase 02]: [02-03]: scale kernel signature (Plan 04 covariance consumes) = mlrs_kernels::scale::launch::<F, R>(client, count, dim, input: ArrayArg, output: ArrayArg, factor: F) — factor a scalar F passed BY VALUE (no ScalarArg wrapper, cubecl 0.10)
+- [Phase 02]: [02-03]: dist_combine_clamp uses a 2D launch (i=ABSOLUTE_POS_X rows, j=ABSOLUTE_POS_Y cols, 16×16 cube); the max(d²,0) clamp is the STATEMENT form so no negative squared distance escapes under f32 cancellation (distance_min_nonnegative pins min>=0)
+- [Phase 02]: [02-03]: distance pipeline stays device-resident in distance.rs (grep to_host == 0); the optional Euclidean sqrt (D-08) runs in place over the already-clamped buffer so sqrt never sees a negative argument
 - [Phase ?]: [01-04]: DeviceArray::from_host meters the byte footprint through the pool then uploads via client.create (cubecl 0.10 has no in-place write into an empty handle)
 - [Phase ?]: [01-05]: f32 oracle near-zero floor raised to 1e-2 (in pipeline_test only) — cross-backend f32 saxpy rounding (~1 ULP, abs_err ~3e-8) exceeds the strict 1e-5 *relative* bound on near-cancellation results; the 1e-5 *absolute* bound stays enforced. Core compare.rs (Plan 02) left untouched.
 - [Phase ?]: [01-05]: mimalloc #[global_allocator] defined exactly once in the mlrs-py cdylib (src/allocator.rs), never in a library crate; activation proven by exercising it (no public introspection symbol in the mimalloc crate)
@@ -118,6 +123,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12T00:00:00.000Z
-Stopped at: Plan 02-01 complete (GEMM PRIM-01 via cubek-matmul wrap + Wave-0 infra: read_backs, subgroup probe, GEMM npz fixtures)
-Resume file: .planning/phases/02-core-compute-primitives/02-02-PLAN.md (next: Plan 02-02)
+Last session: 2026-06-12T00:06:00.000Z
+Stopped at: Plan 02-03 complete (PRIM-03 GEMM-expansion distance: elementwise kernels + distance host API + min>=0 property + squared/sqrt npz fixtures; green cpu+wgpu)
+Resume file: .planning/phases/02-core-compute-primitives/02-04-PLAN.md (next: Plan 02-04 covariance)
