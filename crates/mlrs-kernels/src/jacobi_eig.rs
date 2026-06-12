@@ -36,12 +36,19 @@
 //! rows/cols `p, q` of `A` and to columns `p, q` of `V`; the `sync_cube()`
 //! between steps makes the writes visible before the next.
 //!
-//! ## Round-robin (chess-tournament) pair schedule (RESEARCH Pattern 6)
-//! One sweep visits all `n(n-1)/2` index pairs over `n-1` steps, `floor(n/2)`
-//! disjoint pairs per step (the standard circle method: index 0 fixed, the rest
-//! rotate). Disjoint pairs touch disjoint indices, so the rotations within a
-//! step are write-conflict-free. `continue` is NOT supported in `#[cube]`, so a
-//! below-threshold pair is if-wrapped (`if a_pq.abs() > skip_thr { ... }`).
+//! ## Cyclic (sequential-pair) sweep schedule — NOT the SVD's parallel schedule
+//! One sweep visits all `n(n-1)/2` upper-triangle index pairs `(p, q)` in cyclic
+//! row-major order, ONE pair at a time. Unlike the one-sided SVD kernel (which
+//! rotates index-disjoint COLUMN pairs concurrently because each rotation's
+//! write footprint is its two columns), the TWO-sided eig rotation of plane
+//! `(p, q)` touches the ENTIRE rows AND columns `p, q` — including cross entries
+//! that belong to another index-disjoint pair — so index-disjoint pairs are NOT
+//! footprint-disjoint and CANNOT rotate concurrently without racing. We instead
+//! parallelise only the `O(n)` row/column/`V` update ACROSS units within each
+//! pair (unit `k` updates index `k`'s entries), with a `sync_cube()` between the
+//! column pass and the row pass and after each pair. `continue` is NOT supported
+//! in `#[cube]`, so a below-threshold pair is if-wrapped
+//! (`if a_pq.abs() > skip_thr { ... }`).
 //!
 //! ## Convergence (D-12 constants — RECORDED here)
 //! TWO distinct thresholds are passed by value (the key Pitfall-5 fix, mirroring
@@ -144,106 +151,122 @@ pub fn jacobi_eig_sweep<F: Float + CubeElement>(
     sync_cube();
 
     // --- Sweep loop (in-kernel; no host round-trip — D-11 gate 3). ---
+    //
+    // ## Why pairs are processed SEQUENTIALLY (not the SVD's disjoint-parallel
+    //    schedule)
+    // The one-sided SVD kernel rotates disjoint COLUMN pairs concurrently: a
+    // column-disjoint pair set has a disjoint write footprint (each rotation
+    // touches only its two columns). The TWO-sided eig rotation of plane (p, q)
+    // touches the ENTIRE rows AND columns p, q — including the cross entries
+    // a[p][a], a[q][b] that belong to ANOTHER index-disjoint pair (a, b). So
+    // index-disjoint pairs are NOT footprint-disjoint here, and rotating them
+    // concurrently would race on those cross entries. We therefore visit the
+    // n(n-1)/2 upper-triangle pairs (p, q) one at a time (cyclic row-major
+    // order), parallelising only the O(n) row/column/V update ACROSS units
+    // within each pair (unit k updates index k's entries). A sync_cube after the
+    // angle read and after the writes keeps the single-pair update race-free.
     let mut sweep = 0u32;
     let mut converged = false;
     while sweep < max_sweeps && !converged {
-        // Reset this sweep's per-pair off-diagonal accumulator.
-        if i < n {
-            off_sh[i as usize] = zero;
-        }
-        sync_cube();
+        let mut p = 0u32;
+        while p < n {
+            let mut q = p + 1u32;
+            while q < n {
+                // A SINGLE unit (unit 0) performs the entire two-sided rotation
+                // for plane (p, q) — reading/writing the full rows AND columns
+                // p, q of A and the columns p, q of V — while all other units
+                // idle. This mirrors the SVD kernel's "the acting unit does the
+                // whole rotation" idiom (which is proven on the CPU backend) and
+                // sidesteps the cross-unit shared-memory aliasing that a
+                // distributed two-sided update would create (an index-disjoint
+                // unit's column write would alias this plane's row footprint). A
+                // sync_cube after the pair makes the result visible to all units
+                // before the next pair / the convergence reduction.
+                if i == 0u32 {
+                    // 2×2 symmetric block: a_pp, a_qq, a_pq (= a_qp).
+                    let a_pp = a_sh[(p * MAX_DIM + p) as usize];
+                    let a_qq = a_sh[(q * MAX_DIM + q) as usize];
+                    let a_pq = a_sh[(p * MAX_DIM + q) as usize];
 
-        // Round-robin schedule: n-1 steps, each a disjoint set of pairs (circle
-        // method — index 0 fixed, the rest rotate).
-        let mut n_steps = 0u32;
-        if n > 0u32 {
-            n_steps = n - 1u32;
-        }
-        let mut step = 0u32;
-        while step < n_steps {
-            if i < n {
-                let half = n / 2u32;
-                let mut pos = 0u32;
-                while pos < half {
-                    // position -> player index under the circle rotation.
-                    let idx_a = circle_player(pos, step, n);
-                    let idx_b = circle_player(n - 1u32 - pos, step, n);
-                    // Order the pair so (p, q) = (lo, hi).
-                    let p = if idx_a < idx_b { idx_a } else { idx_b };
-                    let q = if idx_a < idx_b { idx_b } else { idx_a };
-                    // Only the LOW-index unit performs this pair's rotation.
-                    if i == p && p != q {
-                        // 2×2 symmetric block: a_pp, a_qq, a_pq (= a_qp).
-                        let a_pp = a_sh[(p * MAX_DIM + p) as usize];
-                        let a_qq = a_sh[(q * MAX_DIM + q) as usize];
-                        let a_pq = a_sh[(p * MAX_DIM + q) as usize];
+                    // --- Symmetric Jacobi rotation that zeroes a_pq (skip only
+                    //     when |a_pq| is below the TINY skip bound; `continue`
+                    //     unsupported → if-wrap). ---
+                    if a_pq.abs() > skip_thr {
+                        // θ = (a_qq − a_pp) / (2·a_pq);
+                        // t = sign(θ) / (|θ| + sqrt(1 + θ²));
+                        // c = 1/sqrt(1 + t²);  s = c·t.
+                        let theta = (a_qq - a_pp) / (two * a_pq);
+                        let denom = theta.abs() + (one + theta * theta).sqrt();
+                        let mut t = one / denom;
+                        if theta < zero {
+                            t = -t;
+                        }
+                        let cs = one / (one + t * t).sqrt();
+                        let sn = cs * t;
 
-                        // Record this pair's off-diagonal contribution a_pq² for
-                        // the convergence test (accumulate into the p slot).
-                        off_sh[p as usize] += a_pq * a_pq;
+                        // Apply A ← Jᵀ·A·J. First A·J (column pass over all rows
+                        // k: columns p, q), then Jᵀ·(A·J) (row pass over all
+                        // columns k: rows p, q). The single acting unit does both
+                        // passes in order, so no intra-pair barrier is needed.
+                        let mut k = 0u32;
+                        while k < n {
+                            let a_kp = a_sh[(k * MAX_DIM + p) as usize];
+                            let a_kq = a_sh[(k * MAX_DIM + q) as usize];
+                            a_sh[(k * MAX_DIM + p) as usize] = cs * a_kp - sn * a_kq;
+                            a_sh[(k * MAX_DIM + q) as usize] = sn * a_kp + cs * a_kq;
+                            k += 1u32;
+                        }
+                        let mut kk = 0u32;
+                        while kk < n {
+                            let a_pk = a_sh[(p * MAX_DIM + kk) as usize];
+                            let a_qk = a_sh[(q * MAX_DIM + kk) as usize];
+                            a_sh[(p * MAX_DIM + kk) as usize] = cs * a_pk - sn * a_qk;
+                            a_sh[(q * MAX_DIM + kk) as usize] = sn * a_pk + cs * a_qk;
+                            kk += 1u32;
+                        }
 
-                        // --- Symmetric Jacobi rotation that zeroes a_pq (skip
-                        //     only when |a_pq| is below the TINY skip bound;
-                        //     `continue` unsupported → if-wrap). ---
-                        if a_pq.abs() > skip_thr {
-                            // θ = (a_qq − a_pp) / (2·a_pq);
-                            // t = sign(θ) / (|θ| + sqrt(1 + θ²));
-                            // c = 1/sqrt(1 + t²);  s = c·t.
-                            let theta = (a_qq - a_pp) / (two * a_pq);
-                            let denom = theta.abs() + (one + theta * theta).sqrt();
-                            let mut t = one / denom;
-                            if theta < zero {
-                                t = -t;
-                            }
-                            let cs = one / (one + t * t).sqrt();
-                            let sn = cs * t;
-
-                            // Apply Jᵀ·A·J. Update rows/cols p, q of A. First the
-                            // two affected COLUMNS (k, p) and (k, q) for every row
-                            // k, then the two affected ROWS (p, k) and (q, k).
-                            // Because A is symmetric and we keep it symmetric, we
-                            // update the full matrix. Read both column entries,
-                            // write the rotated pair.
-                            let mut k = 0u32;
-                            while k < n {
-                                let a_kp = a_sh[(k * MAX_DIM + p) as usize];
-                                let a_kq = a_sh[(k * MAX_DIM + q) as usize];
-                                a_sh[(k * MAX_DIM + p) as usize] = cs * a_kp - sn * a_kq;
-                                a_sh[(k * MAX_DIM + q) as usize] = sn * a_kp + cs * a_kq;
-                                k += 1u32;
-                            }
-                            // Now the affected ROWS (the column update above moved
-                            // entries; apply the same rotation on the left).
-                            let mut kk = 0u32;
-                            while kk < n {
-                                let a_pk = a_sh[(p * MAX_DIM + kk) as usize];
-                                let a_qk = a_sh[(q * MAX_DIM + kk) as usize];
-                                a_sh[(p * MAX_DIM + kk) as usize] = cs * a_pk - sn * a_qk;
-                                a_sh[(q * MAX_DIM + kk) as usize] = sn * a_pk + cs * a_qk;
-                                kk += 1u32;
-                            }
-
-                            // Accumulate the rotation into V columns p, q:
-                            // V ← V·J (eigenvectors are the columns of V).
-                            let mut r = 0u32;
-                            while r < n {
-                                let v_rp = v_sh[(r * MAX_DIM + p) as usize];
-                                let v_rq = v_sh[(r * MAX_DIM + q) as usize];
-                                v_sh[(r * MAX_DIM + p) as usize] = cs * v_rp - sn * v_rq;
-                                v_sh[(r * MAX_DIM + q) as usize] = sn * v_rp + cs * v_rq;
-                                r += 1u32;
-                            }
+                        // Accumulate the rotation into V columns p, q (V ← V·J;
+                        // eigenvectors are the columns of V).
+                        let mut r = 0u32;
+                        while r < n {
+                            let v_rp = v_sh[(r * MAX_DIM + p) as usize];
+                            let v_rq = v_sh[(r * MAX_DIM + q) as usize];
+                            v_sh[(r * MAX_DIM + p) as usize] = cs * v_rp - sn * v_rq;
+                            v_sh[(r * MAX_DIM + q) as usize] = sn * v_rp + cs * v_rq;
+                            r += 1u32;
                         }
                     }
-                    pos += 1u32;
                 }
+                sync_cube();
+                q += 1u32;
             }
-            sync_cube();
-            step += 1u32;
+            p += 1u32;
         }
 
         // --- In-kernel off-diagonal-norm convergence test (no host round-trip).
-        //     Tree-reduce off_sh[0..n] (= Σ_{i<j} a_ij²) into off_sh[0]. ---
+        //     Measure the TRUE post-sweep off-diagonal norm directly from the
+        //     current matrix state: unit i sums a_ij² over j != i for its row i
+        //     into off_sh[i] (a real measurement of where the matrix stands after
+        //     this sweep's rotations — NOT an in-sweep estimate that a later
+        //     rotation could refill). The per-row sums double-count each pair
+        //     (a_ij² appears in row i and row j), so off_sh[0] holds
+        //     2·Σ_{i<j} a_ij²; the scalar factor is folded consistently into the
+        //     conv_thr comparison (the host scales conv_thr the same way). ---
+        if i < n {
+            let mut acc = zero;
+            let mut j = 0u32;
+            while j < n {
+                if j != i {
+                    let aij = a_sh[(i * MAX_DIM + j) as usize];
+                    acc += aij * aij;
+                }
+                j += 1u32;
+            }
+            off_sh[i as usize] = acc;
+        }
+        sync_cube();
+
+        // Tree-reduce off_sh[0..n] (= 2·Σ_{i<j} a_ij²) into off_sh[0].
         let mut s = next_pow2_half(n);
         while s > 0u32 {
             if i < s && (i + s) < n {
@@ -278,22 +301,6 @@ pub fn jacobi_eig_sweep<F: Float + CubeElement>(
         info_out[0usize] = F::cast_from(sweep);
         info_out[1usize] = off_sh[0usize].sqrt();
     }
-}
-
-/// Circle-method player index for circle position `pos` at rotation `step`, over
-/// `n` players. Position 0 is the fixed pivot (player 0); positions `1..n`
-/// rotate: player = ((pos - 1 + step) mod (n - 1)) + 1. This yields the standard
-/// round-robin tournament so one sweep covers all `n(n-1)/2` pairs over `n-1`
-/// steps. (Identical to the SVD kernel's helper — kept local so the two kernels
-/// stay independent.)
-#[cube]
-fn circle_player(pos: u32, step: u32, n: u32) -> u32 {
-    let mut player = 0u32;
-    if pos > 0u32 {
-        let m = n - 1u32;
-        player = ((pos - 1u32 + step) % m) + 1u32;
-    }
-    player
 }
 
 /// Largest power of two strictly less than `n` (the starting stride for a
