@@ -151,8 +151,32 @@ Plans:
   3. `Lasso` and `ElasticNet` share a coordinate-descent kernel (Lasso = `l1_ratio==1`) and produce `coef_` matching scikit-learn's CD solver within tolerance.
   4. `LogisticRegression` (quasi-Newton/L-BFGS) with stable softmax handles binary and multiclass, with `predict`/`predict_proba` matching scikit-learn's `lbfgs` solver within tolerance.
 
-**Plans**: TBD
-**Research flag**: NEEDS DEEPER RESEARCH (LogisticRegression sub-task) — matching sklearn `lbfgs` within 1e-5 across penalty types and multinomial formulations is the highest correctness risk in the project; penalty normalization, step-size schedule, and convergence criteria need research. Run `/gsd-plan-phase --research-phase 5` for the LogisticRegression sub-task before implementation. CD convergence for Lasso/ElasticNet is medium-risk; validate tolerance during implementation.
+**Plans**: 11 plans
+Plans:
+**Wave 1**
+
+- [ ] 05-01-PLAN.md — Wave-0 scaffold: traits (PredictLabels/KNeighbors/PredictProba D-05/D-07) + AlgoError variants (D-06) + cluster/neighbors module stubs + 10 kernel/prim stub modules + gen_oracle.py 6 generators + 14 committed fixtures (KMeans injected init D-09) + 14 #[ignore] oracle test stubs + i32 DeviceArray confirmation
+
+**Wave 2** *(parallel — file-disjoint NEW primitives, D-01 primitive-first)*
+
+- [ ] 05-02-PLAN.md — NEW top-k selection primitive (D-02, lowest-index tie) + standalone oracle (NEIGH-01/02/03)
+- [ ] 05-03-PLAN.md — NEW KMeans primitives: Lloyd centroid-update+inertia + k-means++ D²-sampling (host-seeded RNG D-09a/c) + standalone oracles (CLUSTER-01)
+- [ ] 05-04-PLAN.md — NEW DBSCAN eps-region+core-mask primitive (D-04 device-compute half) + standalone oracle (CLUSTER-02)
+- [ ] 05-05-PLAN.md — NEW coordinate-descent step primitive + host CD loop (D-03/D-10, sklearn coef_+sparsity) + standalone oracle (LINEAR-03/04)
+- [ ] 05-06-PLAN.md — NEW L-BFGS solver primitive (highest risk): softmax loss/grad kernel + host two-loop (m=10) + convex-quadratic standalone validation (Pitfall 5) (LINEAR-05)
+
+**Wave 3** *(parallel — estimators on validated prims, file-disjoint by module)*
+
+- [ ] 05-07-PLAN.md — KMeans (k-means++ + Lloyd, PredictLabels) + DBSCAN (host index-ordered DFS, noise=-1) up to label permutation (CLUSTER-01/02)
+- [ ] 05-08-PLAN.md — NearestNeighbors (KNeighbors trait) + KNeighborsClassifier (predict/predict_proba) + KNeighborsRegressor (predict) (NEIGH-01/02/03)
+- [ ] 05-09-PLAN.md — Lasso + ElasticNet (shared CD helper, penalty map + center-then-solve intercept) coef_+sparsity (LINEAR-03/04)
+
+**Wave 4** *(blocked on the iterative-solver/DBSCAN prims)*
+
+- [ ] 05-10-PLAN.md — LogisticRegression (L-BFGS over symmetric softmax, l2_reg=1/(C·n)) predict_proba primary gauge-invariant gate (LINEAR-05)
+- [ ] 05-11-PLAN.md — memory-gate extensions: D-10 iterative-solver bounded-allocation + 1-scalar/iter readback (CD+L-BFGS) + D-04 DBSCAN n²-bound (documented exceptions)
+
+**Research flag**: COMPLETED — `/gsd-plan-phase --research-phase 5` done; 05-RESEARCH.md pins sklearn 1.9.0 / scipy 1.17.1 solver objectives, penalty scalings, and stopping criteria verbatim. LogReg L-BFGS remains the highest correctness risk (gated on gauge-invariant predict_proba per Pitfall 5); CD convergence validated against committed Lasso/ElasticNet fixtures.
 
 ### Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels
 
@@ -180,5 +204,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
 | 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
-| 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |
+| 5. Distance-Based & Iterative-Solver Estimators | 0/11 | Planned | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |
