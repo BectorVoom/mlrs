@@ -25,16 +25,27 @@
 //! (the global handle is cube-private for a single-cube launch — D-11 gate 3
 //! holds: no HOST round-trip between sweeps). `V` is staged COLUMN-MAJOR in shared
 //! (`v_sh[c*MAX_COLS + r]`, initialised to the identity).
-//! Per round-robin step a disjoint set of column pairs `(i, j)` rotate
-//! concurrently — each pair is handled by the lower-indexed unit, which reads
-//! both columns from `a_out`/`v_sh`, computes the Jacobi rotation, and writes both
-//! back; the `sync_cube()` between steps makes the writes visible before the next.
+//! Within each round-robin step a set of COLUMN-disjoint pairs `(lo, hi)` is
+//! enumerated; every unit scans all pair positions for that step and the
+//! lower-indexed unit (`c == lo`) of each pair performs the whole rotation
+//! (reading both columns from `a_out`/`v_sh`, computing the Jacobi rotation, and
+//! writing both back). The `sync_cube()` between steps makes those writes visible
+//! before the next step. Because the pairs in a step touch pairwise-disjoint
+//! columns, the lo-unit rotations within one step do not write-alias; this is a
+//! correctness property of the schedule, NOT a claim that the cpu backend runs the
+//! lo units in parallel (the cpu runtime serializes a cube's units — 03-03).
 //!
-//! ## Round-robin (chess-tournament) pair schedule (RESEARCH Pattern 6)
-//! One sweep visits all `n(n-1)/2` column pairs over `n-1` steps, `floor(n/2)`
-//! disjoint pairs per step. We use the standard circle method: index 0 is fixed,
-//! the rest rotate. Disjoint pairs touch disjoint columns, so the rotations
-//! within a step are write-conflict-free.
+//! ## Round-robin (chess-tournament) pair schedule with ghost padding (CR-01)
+//! One sweep must visit ALL `n(n-1)/2` column pairs. The textbook circle method
+//! enumerates every pair only when the player count is EVEN; with an ODD player
+//! count `n-1` rounds over `n-1` rotating positions silently omit ~half the pairs
+//! (`cols=5` visits 6/10, `cols=7` visits 12/21). We therefore pad to an EVEN
+//! player count `players = cols` (even) or `cols + 1` (odd — the extra "ghost"
+//! player sits out one real pair per round, i.e. the bye), run `players - 1`
+//! rounds of `players / 2` positions via the circle method, and SKIP any pairing
+//! that touches the ghost column (`hi >= cols`). This visits every real pair
+//! exactly once for BOTH parities (verified: cols=4→6/6, 5→10/10, 6→15/15,
+//! 7→21/21). Position 0 is the fixed pivot; positions `1..players` rotate.
 //!
 //! ## Convergence (D-12 constants — RECORDED here)
 //! TWO distinct thresholds are passed by value (the key Pitfall-5 fix):
@@ -44,9 +55,19 @@
 //!     bound stalls convergence (a loose skip bound stops zeroing real
 //!     off-diagonals and the norm plateaus high).
 //!   - `conv_thr` — the convergence-break bound. After each full sweep the
-//!     off-diagonal Frobenius norm `sqrt(Σ_{i<j} γ_ij²)` is reduced with the
-//!     `reduce_sumsq_shared` log₂-tree idiom (in-kernel); the loop breaks when
-//!     that norm `≤ conv_thr`. It is set to `8 · ε_F · ‖A‖_F · sqrt(pairs)`
+//!     off-diagonal Frobenius norm is measured from a CLEAN POST-SWEEP state
+//!     (WR-01, mirroring `jacobi_eig.rs`): in a dedicated pass each unit `c`
+//!     recomputes the Gram off-diagonals `γ_cj = colᶜ·colʲ` against every other
+//!     column `j != c` of the rotated `a_out` and sums `γ_cj²` into `off_sh[c]`,
+//!     then a `reduce_sumsq_shared` log₂-tree idiom (in-kernel) reduces them. The
+//!     per-column sums double-count each pair (`γ_ij²` appears in column i AND
+//!     column j), so `off_sh[0]` holds `2·Σ_{i<j} γ_ij²` and its sqrt is
+//!     `sqrt(2)·‖offdiag‖`; the loop breaks when that `≤ conv_thr`. Measuring AFTER
+//!     the sweep (not accumulating γ² DURING rotation, which mixes pre/mid-sweep
+//!     column states and can declare convergence one sweep early — the exact
+//!     pitfall the eig kernel calls out) makes the reported `info[1]` residual
+//!     describe the RETURNED matrix, so the host's `NotConverged` guard is sound.
+//!     It is set to `8 · ε_F · ‖A‖_F · sqrt(pairs)`
 //!     (`pairs = n(n-1)/2`) to account for the ACCUMULATED f32 rounding floor of
 //!     the dot products — a single-`ε` bound is unreachable in f32 for moderate
 //!     `n` and the loop would hit the cap every time (Pitfall 5). `ε_f32 ≈
@@ -152,46 +173,42 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
     let mut sweep = 0u32;
     let mut converged = false;
     while sweep < max_sweeps && !converged {
-        // Reset this sweep's per-pair off-diagonal accumulator.
-        if c < cols {
-            off_sh[c as usize] = zero;
+        // Ghost-padded round-robin (CR-01): pad to an EVEN player count so the
+        // circle method enumerates ALL n(n-1)/2 pairs for odd AND even `cols`.
+        // `players = cols` when cols is even, else `cols + 1` (the ghost player
+        // >= cols supplies the bye). Run `players - 1` steps of `players/2`
+        // positions; SKIP any pairing touching the ghost column (`hi >= cols`).
+        let mut players = cols;
+        if cols % 2u32 != 0u32 {
+            players = cols + 1u32;
         }
-        sync_cube();
-
-        // Round-robin schedule: n-1 steps, each a disjoint set of pairs. We use
-        // the circle method — column 0 fixed, the rest rotate. For step s, unit
-        // `c` (when it is the LOW member of its pair) rotates its pair.
-        // To keep the schedule simple and correct on a single cube we iterate the
-        // canonical pair set (i<j) but partition rotations so disjoint pairs in a
-        // step run concurrently and a sync_cube separates steps.
         let mut n_steps = 0u32;
-        if cols > 0u32 {
-            n_steps = cols - 1u32;
+        if players > 0u32 {
+            n_steps = players - 1u32;
         }
         let mut step = 0u32;
         while step < n_steps {
-            // Circle-method pairing for this step: position p in [0, cols) maps to
-            // a "player". Player 0 is fixed; player at position p (p>=1) is
-            // ((p - 1 + step) % (cols - 1)) + 1. Pair position p with position
-            // (cols - 1 - p) for p in [0, cols/2).
-            // Each unit determines whether it is the LOW column of exactly one
-            // pair this step and, if so, rotates it.
+            // Circle-method pairing for this step over `players` positions: player
+            // 0 is fixed, positions 1..players rotate. Pair position p with
+            // position (players - 1 - p) for p in [0, players/2). Every unit scans
+            // all pair positions and the lo-unit (`c == lo`) of each real pair acts
+            // (the pairs in a step are column-disjoint, so the acting units do not
+            // write-alias within the step).
             if c < cols {
-                // Find c's position in the circle ordering, then its partner.
-                // Build the partner column for `c` this step. We compute, for each
-                // pair position p, the two player columns and let the lower one act.
-                // To avoid per-unit search, every unit scans the pair positions.
-                let half = cols / 2u32;
+                let half = players / 2u32;
                 let mut p = 0u32;
                 while p < half {
-                    // position -> player column under the circle rotation.
-                    let col_a = circle_player(p, step, cols);
-                    let col_b = circle_player(cols - 1u32 - p, step, cols);
+                    // position -> player column under the circle rotation (over the
+                    // padded `players`); a player >= cols is the ghost.
+                    let col_a = circle_player(p, step, players);
+                    let col_b = circle_player(players - 1u32 - p, step, players);
                     // Order the pair so (lo, hi).
                     let lo = if col_a < col_b { col_a } else { col_b };
                     let hi = if col_a < col_b { col_b } else { col_a };
-                    // Only the LOW-column unit performs this pair's rotation.
-                    if c == lo && lo != hi {
+                    // Only the LOW-column unit performs this pair's rotation, and
+                    // only for REAL pairs (skip ghost pairs `hi >= cols` and the
+                    // self-pair `lo == hi`).
+                    if c == lo && lo != hi && hi < cols {
                         // --- α = Σ a_ki², β = Σ a_kj², γ = Σ a_ki·a_kj. ---
                         let mut alpha = zero;
                         let mut beta = zero;
@@ -205,13 +222,13 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
                             gamma += aki * akj;
                             r += 1u32;
                         }
-                        // Record this pair's off-diagonal contribution γ² for the
-                        // convergence test (accumulate into the lo slot).
-                        off_sh[lo as usize] += gamma * gamma;
 
                         // --- Jacobi rotation that zeroes γ (skip only when γ is
                         //     below the TINY skip bound; `continue` unsupported →
-                        //     if-wrap). ---
+                        //     if-wrap). The off-diagonal norm is NOT accumulated
+                        //     here (WR-01) — it is measured in a clean post-sweep
+                        //     pass below so the convergence test reflects the
+                        //     RETURNED matrix, not a within-sweep mixture. ---
                         if gamma.abs() > skip_thr {
                             let two = F::from_int(2i64);
                             let zeta = (beta - alpha) / (two * gamma);
@@ -251,7 +268,37 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
         }
 
         // --- In-kernel off-diagonal-norm convergence test (no host round-trip).
-        //     Tree-reduce off_sh[0..cols] (= Σ_{i<j} γ_ij²) into off_sh[0]. ---
+        //     CLEAN POST-SWEEP MEASUREMENT (WR-01, mirrors jacobi_eig.rs): now that
+        //     this sweep's rotations are complete, unit `c` recomputes the Gram
+        //     off-diagonals γ_cj = colᶜ·colʲ against every other column j != c of
+        //     the rotated `a_out` and sums γ_cj² into off_sh[c]. This is a real
+        //     measurement of where the matrix stands AFTER the sweep — not an
+        //     in-sweep estimate a later rotation could refill. The per-column sums
+        //     double-count each pair, so off_sh[0] holds 2·Σ_{i<j} γ_ij² (the
+        //     sqrt(2) is folded into the host's conv_thr comparison the same way as
+        //     eig — it only makes the break marginally stricter, which is safe). ---
+        if c < cols {
+            let mut acc = zero;
+            let mut j = 0u32;
+            while j < cols {
+                if j != c {
+                    let mut gamma = zero;
+                    let mut r = 0u32;
+                    while r < rows {
+                        let aci = a_out[(c * rows + r) as usize];
+                        let acj = a_out[(j * rows + r) as usize];
+                        gamma += aci * acj;
+                        r += 1u32;
+                    }
+                    acc += gamma * gamma;
+                }
+                j += 1u32;
+            }
+            off_sh[c as usize] = acc;
+        }
+        sync_cube();
+
+        // Tree-reduce off_sh[0..cols] (= 2·Σ_{i<j} γ_ij²) into off_sh[0].
         let mut s = next_pow2_half(cols);
         while s > 0u32 {
             if c < s && (c + s) < cols {
@@ -261,7 +308,8 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
             sync_cube();
             s /= 2u32;
         }
-        // off_sh[0] now holds Σ γ². Convergence when sqrt(Σγ²) <= conv_thr.
+        // off_sh[0] now holds 2·Σ_{i<j} γ_ij². Convergence when its sqrt
+        // (= sqrt(2)·‖offdiag‖) <= conv_thr.
         let off_norm = off_sh[0usize].sqrt();
         if off_norm <= conv_thr {
             converged = true;
@@ -289,15 +337,17 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
 }
 
 /// Circle-method player column for circle position `pos` at rotation `step`,
-/// over `cols` players. Position 0 is the fixed pivot (player 0); positions
-/// `1..cols` rotate: player = ((pos - 1 + step) mod (cols - 1)) + 1. This yields
-/// the standard round-robin tournament so one sweep covers all `n(n-1)/2` pairs
-/// over `n-1` steps.
+/// over `players` positions (the EVEN-padded count — `cols` or `cols+1`, CR-01).
+/// Position 0 is the fixed pivot (player 0); positions `1..players` rotate:
+/// player = ((pos - 1 + step) mod (players - 1)) + 1. With an even `players` the
+/// standard round-robin tournament covers all `players·(players-1)/2` position
+/// pairs over `players - 1` steps; the caller skips any pair touching a ghost
+/// position (`>= cols`), leaving exactly the `cols·(cols-1)/2` real pairs.
 #[cube]
-fn circle_player(pos: u32, step: u32, cols: u32) -> u32 {
+fn circle_player(pos: u32, step: u32, players: u32) -> u32 {
     let mut player = 0u32;
     if pos > 0u32 {
-        let m = cols - 1u32;
+        let m = players - 1u32;
         player = ((pos - 1u32 + step) % m) + 1u32;
     }
     player
