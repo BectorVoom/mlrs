@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Plan 03-03 complete (one-sided Jacobi thin-SVD — jacobi_svd_sweep single-cube #[cube] kernel with in-kernel two-threshold convergence, A in global memory for gfx1100's 64 KiB LDS budget; svd() host orchestration validates geometry, handles tall+wide via Aᵀ-swap, extracts thin-U via Phase-2 gemm A·V + column L2-norm with near-zero floor, sorts descending, NotConverged on cap; 7 svd_test green on cpu f32+f64 and rocm f32, f64 skip-with-log)."
-last_updated: "2026-06-12T04:08:00.000Z"
-last_activity: 2026-06-12 -- Plan 03-03 complete (one-sided Jacobi SVD primitive, green on cpu+rocm)
+stopped_at: "Plan 03-04 complete (two-sided cyclic Jacobi symmetric-eig — jacobi_eig_sweep single-cube #[cube] kernel applying Jᵀ·A·J with single-acting-unit sequential cyclic-pair rotation and in-kernel post-sweep off-diagonal-norm convergence; eig() host orchestration validates squareness→NotSquare before launch, reuses the covariance/GEMM out buffer (D-11 gate 2), sorts eigenvalues descending (D-04), NotConverged on cap; 4 eig_test green on cpu f32+f64 and rocm f32, f64 skip-with-log; svd_test still 7/7)."
+last_updated: "2026-06-12T05:00:00.000Z"
+last_activity: 2026-06-12 -- Plan 03-04 complete (two-sided Jacobi symmetric-eig primitive, green on cpu+rocm)
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 15
-  completed_plans: 14
-  percent: 42
+  completed_plans: 15
+  percent: 44
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 3 (svd-eigendecomposition-primitive-hard-gate) — EXECUTING
-Plan: 4 of 5 (03-03 complete)
+Plan: 5 of 5 (03-04 complete)
 Status: Executing Phase 3
-Last activity: 2026-06-12 -- Plan 03-03 complete (one-sided Jacobi SVD primitive, green on cpu+rocm)
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-04-PLAN.md
+Last activity: 2026-06-12 -- Plan 03-04 complete (two-sided Jacobi symmetric-eig primitive, green on cpu+rocm)
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-05-PLAN.md
 
-Progress: [████░░░░░░] 42% (2/6 phases; 14/15 plans)
+Progress: [████░░░░░░] 44% (2/6 phases; 15/15 plans)
 
 ## Performance Metrics
 
@@ -65,6 +65,7 @@ Progress: [████░░░░░░] 42% (2/6 phases; 14/15 plans)
 | Phase 03 P01 | 10 | 2 tasks | 5 files |
 | Phase 03 P02 | 8 | 2 tasks | 9 files |
 | Phase 03 P03 | 38 | 3 tasks | 5 files |
+| Phase 03 P04 | 45 | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -114,6 +115,9 @@ Recent decisions affecting current work:
 - [Phase 03]: [03-03]: A1/LDS budget REALIZED — the all-shared 256×64 f32 Jacobi tile (82176 B: A 64KiB + V 16KiB + accumulator) overflowed gfx1100's 65536 B LDS and HIP rejected the launch. Fix: keep A column-major in the GLOBAL a_out handle throughout the sweep; only V (≤16 KiB) + the off-diagonal accumulator stay in SharedMemory. The single-cube convergence loop is still fully in-kernel (global handle is cube-private for a single-cube launch) so D-11 gate 3 (no host round-trip between sweeps) holds. MAX_ROWS is now a host-side problem-size cap, not a shared size. Pattern: when a shared tile overflows LDS, keep the large operand in global, shared only for the small accumulator.
 - [Phase 03]: [03-03]: thin-U via the Phase-2 gemm A·V from the ORIGINAL A and the kernel's accumulated V (NOT the kernel's rotated A) — satisfies D-02 + the plan's gemm key-link AND independently validates V. S[j]=‖B[:,j]‖₂ via column L2-norm reduce; U[:,j]=B[:,j]/S[j] with a 1e-8 near-zero floor leaving rank-deficient null-space columns at 0 (Pitfall 4, validated by the reconstruction invariant not per-vector compare). Wide path (D-05) materializes Aᵀ once into pooled scratch then relabels U=V', Vᵀ=U'ᵀ on the host.
 - [Phase 03]: [03-03]: svd.rs has 10 plain to_host calls (criterion-4 literal grep wanted 0) — these are the post-convergence host-side thin-U normalize + descending sort + permute (D-04/A4 blessed) + one-time pre-launch ‖A‖_F estimate, on the PLAIN (non-metered) path so they do NOT bump read_backs (same precedent as reduce.rs internal per-row to_host). The CONVERGENCE LOOP (criterion-4's intent) is fully device-resident in-kernel; the D-11 read_backs==1 gate (03-05) is unaffected.
+- [Phase 03]: [03-04]: Two-sided Jacobi eig pairs MUST be processed SEQUENTIALLY (single acting unit per pair), NOT the SVD's disjoint-parallel column schedule. A two-sided rotation Jᵀ·A·J touches the FULL rows AND columns p,q — including cross entries belonging to another index-disjoint pair — so index-disjoint pairs are NOT footprint-disjoint and a distributed/parallel shared-memory update RACES (first attempt stuck at residual ~0.1–0.8 → NotConverged on both cpu and rocm). Fix: unit 0 performs the whole rotation per pair, others idle, sync_cube after each pair (mirrors the SVD kernel's "acting unit does the whole rotation"). n is small (≤MAX_DIM=64, typically 4) so the serialization is cheap. Converges to ~1e-6 f32 / machine-precision f64.
+- [Phase 03]: [03-04]: eig convergence uses a TRUE post-sweep off-diagonal-norm measured from the live matrix (each unit sums a_ij² over j≠i, log₂-tree reduce → 2·Σ_{i<j} a_ij²; the sqrt(2) double-count makes the break marginally stricter = more accurate), NOT an in-sweep per-pair accumulator (which underestimates because a later rotation in the same sweep refills an off-diagonal, stopping early). conv_thr keeps the 03-03 8·ε·‖A‖_F·√pairs form.
+- [Phase 03]: [03-04]: eig() validate_geometry rejects a.len()!=n*n and n>MAX_DIM with PrimError::NotSquare BEFORE any unsafe launch (D-06 trusts symmetry, no (A+Aᵀ)/2); threads the covariance/GEMM out buffer straight through as the kernel working input (D-11 gate 2, no parallel n² alloc); descending eigenvalue sort + column permute host-side (D-04); NotConverged on cap (D-12). Small post-convergence w/V/info read-backs only — convergence loop fully in-kernel (D-11 gate 3), same precedent as svd.rs. The Task-2 `grep to_host==0` acceptance literally contradicts the mandated host descending sort; resolved in favor of the action/done + svd sibling.
 
 ### Pending Todos
 
@@ -140,6 +144,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12 -- Plan 03-03 complete
-Stopped at: Plan 03-03 complete — one-sided Jacobi thin-SVD primitive. jacobi_svd_sweep #[cube(launch)] single-cube kernel (A in global, V+accumulator in shared for gfx1100's LDS budget) with an in-kernel two-threshold convergence loop (tiny skip_thr + √pairs-scaled conv_thr); svd() host orchestration validates geometry, dispatches wide via Aᵀ-swap (D-05), extracts thin-U via Phase-2 gemm A·V + column L2-norm with a near-zero floor (D-02/Pitfall 4), sorts descending (D-04), returns NotConverged on a cap hit. All 7 svd_test green on cpu (f32+f64) and rocm gfx1100 (f32; f64 skip-with-log). 03-04 (eig kernel) + 03-05 (D-11 memory gate) remain.
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-04-PLAN.md (two-sided Jacobi symmetric-eig kernel — remove #[ignore] in eig_test.rs, wire eig::<F> + residual invariant; reuse the 03-03 single-cube/two-threshold/global-staging pattern).
+Last session: 2026-06-12 -- Plan 03-04 complete
+Stopped at: Plan 03-04 complete — two-sided cyclic Jacobi symmetric-eig primitive. jacobi_eig_sweep #[cube(launch)] single-cube kernel applies Jᵀ·A·J per pair via a single acting unit (sequential cyclic pairs — two-sided rotations are NOT footprint-disjoint so the SVD's parallel column schedule races), accumulates V, measures the true post-sweep off-diagonal norm in-kernel (no host round-trip), writes the diagonal UNSORTED. eig() host orchestration validates squareness→NotSquare before any unsafe launch (D-06, no symmetrization), reuses the covariance/GEMM out buffer as the kernel working input (D-11 gate 2), sorts eigenvalues descending + permutes eigenvector columns (D-04), returns NotConverged on a cap hit (D-12). All 4 eig_test green on cpu (f32+f64) and rocm gfx1100 (f32; f64 skip-with-log); svd_test still 7/7. PRIM-05 now complete (SVD half 03-03 + eig half 03-04). Only 03-05 (D-11 memory gate) remains in Phase 3.
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-05-PLAN.md (D-11 memory gate — assert eig()/svd() reuse the covariance/GEMM buffer (gate 2), read_backs==1 (gate 3, convergence loop device-resident), reuse-bounded allocations; both prims already thread out through and keep the convergence loop in-kernel).

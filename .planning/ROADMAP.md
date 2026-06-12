@@ -101,7 +101,7 @@ Plans:
 
 **Wave 3**
 
-- [ ] 03-04-PLAN.md — two-sided Jacobi symmetric-eig kernel + eig() prim (validate-square, descending, buffer reuse) + eigh oracle/residual tests (D-01/D-04/D-06)
+- [x] 03-04-PLAN.md — two-sided Jacobi symmetric-eig kernel + eig() prim (validate-square, descending, buffer reuse) + eigh oracle/residual tests (D-01/D-04/D-06) ✅ (jacobi_eig_sweep single-cube #[cube] Jᵀ·A·J via single-acting-unit sequential cyclic pairs — two-sided rotations are not footprint-disjoint so the SVD parallel schedule races; in-kernel post-sweep off-diagonal-norm convergence; eig() validate-square→NotSquare pre-launch, covariance/GEMM out-buffer reuse D-11 gate 2, descending sort D-04, NotConverged on cap; 4 eig_test green on cpu f32+f64 and rocm f32, f64 skip-with-log; svd_test still 7/7. PRIM-05 eig half complete)
 
 **Wave 4**
 
