@@ -16,8 +16,12 @@ pub use cubecl::wgpu::{WgpuDevice as ActiveDevice, WgpuRuntime as ActiveRuntime}
 #[cfg(feature = "cuda")]
 pub use cubecl::cuda::{CudaDevice as ActiveDevice, CudaRuntime as ActiveRuntime};
 
+// cubecl 0.10 re-exports `cubecl_hip` as `cubecl::hip` under `rocm = ["hip"]`;
+// there is NO `cubecl::rocm` module and NO `HipDevice` alias. The device struct
+// is `AmdDevice` (derives `Default`, so `ActiveDevice::default()` in
+// `active_client()` still works). RESEARCH 03 CRITICAL FINDING 2 / Pattern 1.
 #[cfg(feature = "rocm")]
-pub use cubecl::rocm::{RocmDevice as ActiveDevice, RocmRuntime as ActiveRuntime};
+pub use cubecl::hip::{AmdDevice as ActiveDevice, HipRuntime as ActiveRuntime};
 
 /// The concrete CubeCL compute client for the active runtime.
 ///

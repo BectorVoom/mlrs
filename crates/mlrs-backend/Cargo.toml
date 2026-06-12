@@ -36,4 +36,10 @@ npyz = { workspace = true }
 cpu = ["cubecl/cpu"]
 wgpu = ["cubecl/wgpu"]
 cuda = ["cubecl/cuda"]
-rocm = ["cubecl/rocm"]
+# `cubecl/std` propagates the `multi_threading` cfg (= all(feature std, not wasm))
+# into `cubecl-hip`, which otherwise fails with three E0432 unresolved imports
+# (`MultiStream` / `ResolvedStreams` / `EventStreamBackend`). `cubecl/default`
+# is the simplest correct switch verified in RESEARCH 03 (Pattern 1 / Pitfall 2).
+# Do NOT weaken `default-features = false` on the workspace cubecl/cubek pins —
+# only this rocm feature line changes (D-07 / RESEARCH Security V12).
+rocm = ["cubecl/rocm", "cubecl/std", "cubecl/default"]
