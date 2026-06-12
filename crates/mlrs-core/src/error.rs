@@ -97,4 +97,38 @@ pub enum PrimError {
         /// The dimension value the rhs operand declared.
         rhs: usize,
     },
+
+    /// A primitive that requires a square matrix (e.g. the symmetric
+    /// eigendecomposition, which trusts symmetry but validates squareness —
+    /// D-06 / ASVS V5) was handed a `rows != cols` geometry. Rejected *before*
+    /// any `unsafe` kernel launch so a wrong shape is a recoverable typed error,
+    /// not an out-of-bounds device read. Carries a label naming the operand.
+    #[error(
+        "primitive '{operand}' must be square: rows({rows}) != cols({cols})"
+    )]
+    NotSquare {
+        /// Which operand failed the squareness check (e.g. `"input"`).
+        operand: &'static str,
+        /// Declared row count.
+        rows: usize,
+        /// Declared column count.
+        cols: usize,
+    },
+
+    /// An iterative primitive (the Jacobi SVD/eig sweep) failed to drive the
+    /// off-diagonal norm below its internal threshold within the max-sweep cap
+    /// (D-12 — convergence constants are internal, not public API). Carries the
+    /// operand label, the sweep cap that was hit, and the final off-diagonal
+    /// norm so the caller can diagnose a pathological input.
+    #[error(
+        "primitive '{operand}' did not converge within {max_sweeps} sweeps (off-diagonal norm {residual:e})"
+    )]
+    NotConverged {
+        /// Which primitive failed to converge (e.g. `"svd"` / `"eig"`).
+        operand: &'static str,
+        /// The max-sweep cap that was reached without converging (D-12).
+        max_sweeps: u32,
+        /// The final off-diagonal Frobenius norm at the sweep cap.
+        residual: f64,
+    },
 }

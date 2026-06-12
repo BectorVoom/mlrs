@@ -58,6 +58,18 @@ DIST_ROWS_X, DIST_ROWS_Y, DIST_COLS = 5, 4, 3
 # rectangular data matrix and ddof actually changes the normalisation.
 COV_N_SAMPLES, COV_N_FEATURES = 7, 4
 
+# SVD convention-fixture shapes (D-05, PRIM-05). SVD_TALL is m≥n (the standard
+# thin-SVD orientation); SVD_WIDE is m<n so the fixture exercises the Aᵀ-swap
+# path (run Jacobi on Aᵀ then swap U↔V, D-05). Small + non-square so geometry is
+# realistic without being a stress test.
+SVD_TALL = (8, 4)
+SVD_WIDE = (4, 8)
+
+# Symmetric-eig convention-fixture size (D-06, PRIM-05). EIG_N is the order of
+# the square symmetric matrix the eig primitive decomposes; small so the
+# committed fixture stays tiny while still exercising sort/sign handling.
+EIG_N = 4
+
 
 def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
     """Generate one seeded saxpy fixture and write it to ``tests/fixtures``.
@@ -226,6 +238,93 @@ def gen_argmin_tie(seed: int = SEED) -> str:
     return out_path
 
 
+def gen_svd(
+    seed: int = SEED,
+    dtype=np.float32,
+    shape: tuple[int, int] = SVD_TALL,
+    kind: str = "tall",
+) -> str:
+    """Generate one seeded thin-SVD convention fixture (D-05/D-09, PRIM-05).
+
+    Stores named arrays ``A`` (``shape``), ``U``, ``S``, ``Vt`` — the NumPy
+    reference thin SVD ``U, S, Vt = np.linalg.svd(A, full_matrices=False)``
+    (D-02: ``full_matrices=False`` so ``U`` is ``m×k`` and ``Vt`` is ``k×n`` with
+    ``k = min(m, n)``). ``np.linalg.svd`` ALWAYS returns the singular values in
+    DESCENDING order (D-04), so the fixture stores them as-is; the Rust test
+    sign-aligns ``U``/``Vt`` rows with ``align_rows`` before comparing (D-03 —
+    singular vectors are only defined up to a sign). Every array is cast to the
+    fixture's dtype so the committed reference matches a same-dtype device SVD.
+
+    The file name encodes ``svd_{kind}_{dtype}_seed{seed}``; ``kind`` is ``tall``
+    (m≥n, the thin orientation) or ``wide`` (m<n, the Aᵀ-swap path, D-05).
+    Returns the absolute path written.
+    """
+    rng = np.random.default_rng(seed)
+    a = rng.standard_normal(shape).astype(dtype)
+    # Thin SVD (full_matrices=False, D-02): U is m×k, S is length-k descending,
+    # Vt is k×n with k = min(m, n). Compute in the fixture dtype.
+    u, s, vt = np.linalg.svd(a, full_matrices=False)
+    u = u.astype(dtype)
+    s = s.astype(dtype)
+    vt = vt.astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"svd_{kind}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, A=a, U=u, S=s, Vt=vt)
+    return out_path
+
+
+def gen_eigh(
+    seed: int = SEED,
+    dtype=np.float32,
+    n: int = EIG_N,
+    kind: str = "symmetric",
+) -> str:
+    """Generate one seeded symmetric-eig convention fixture (D-04/D-06, PRIM-05).
+
+    Builds a SYMMETRIC ``n×n`` matrix ``A`` (the eig primitive's only v1 feeder
+    is the symmetric-by-construction covariance Gram, D-06) by symmetrising a
+    random matrix as ``A = (M + Mᵀ) / 2``, then decomposes it with
+    ``w, V = np.linalg.eigh(A)``. ``np.linalg.eigh`` returns eigenvalues in
+    ASCENDING order; the device eig primitive sorts DESCENDING (D-04) so
+    estimators inherit the right order — therefore the fixture stores ``w`` and
+    the eigenvector columns ``V`` REVERSED to descending here, matching what the
+    primitive emits (the test then compares directly, no re-sort). Eigenvectors
+    are only defined up to a sign, so the Rust test sign-aligns columns with
+    ``align_rows`` before comparing (D-03).
+
+    Stores named arrays ``A`` (``n×n`` symmetric), ``w`` (length-``n`` descending
+    eigenvalues), ``V`` (``n×n`` eigenvectors as COLUMNS, descending). The file
+    name encodes ``eigh_{dtype}_seed{seed}``. Returns the absolute path written.
+    """
+    rng = np.random.default_rng(seed)
+    m = rng.standard_normal((n, n)).astype(dtype)
+    # Symmetrise (D-06: the eig primitive trusts symmetry; the oracle must feed a
+    # genuinely symmetric matrix). Compute in the fixture dtype.
+    a = ((m + m.T) * 0.5).astype(dtype)
+    w_asc, v_asc = np.linalg.eigh(a)
+    # eigh returns ASCENDING; reverse to DESCENDING (D-04) so the fixture matches
+    # the primitive's output order. Reverse eigenvalues and the eigenvector
+    # COLUMNS together so each column stays paired with its eigenvalue.
+    w = w_asc[::-1].astype(dtype)
+    v = v_asc[:, ::-1].astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    # ``kind`` distinguishes the well-conditioned case from degenerate variants
+    # (e.g. clustered eigenvalues, D-08); the default symmetric case omits the
+    # kind tag for a stable, canonical file name.
+    suffix = "" if kind == "symmetric" else f"_{kind}"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"eigh{suffix}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, A=a, w=w, V=v)
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -243,6 +342,16 @@ def main() -> None:
     print(f"wrote {gen_covariance(dtype=np.float64, ddof=1)}")
     print(f"wrote {gen_covariance(dtype=np.float32, ddof=1)}")
     print(f"wrote {gen_argmin_tie()}")
+    # SVD (PRIM-05, D-05/D-09): tall (m≥n) f32+f64 to exercise the f64 cpu gate,
+    # plus a wide (m<n) f32 case for the Aᵀ-swap path. np.linalg.svd is the
+    # numpy reference (full_matrices=False, descending S — D-02/D-04).
+    print(f"wrote {gen_svd(dtype=np.float32, shape=SVD_TALL, kind='tall')}")
+    print(f"wrote {gen_svd(dtype=np.float64, shape=SVD_TALL, kind='tall')}")
+    print(f"wrote {gen_svd(dtype=np.float32, shape=SVD_WIDE, kind='wide')}")
+    # Symmetric eig (PRIM-05, D-04/D-06): f32+f64 so the f64 cpu path is pinned.
+    # np.linalg.eigh is the numpy reference, REVERSED to descending (D-04).
+    print(f"wrote {gen_eigh(dtype=np.float32)}")
+    print(f"wrote {gen_eigh(dtype=np.float64)}")
 
 
 if __name__ == "__main__":
