@@ -61,9 +61,17 @@ use crate::runtime::ActiveRuntime;
 /// - The `rows_x × rows_y` result is acquired from `pool` when `out` is `None`,
 ///   else the supplied buffer is reused (D-11). The result stays device-resident
 ///   (D-05) — NO host round-trip inside this API.
-/// - `path` selects the reduction kernel family for the norm terms
-///   ([`ReducePath::Shared`] is always portable; [`ReducePath::Plane`] is the
-///   subgroup fast path where supported).
+///
+/// ## Internal reduction path (CR-01 / D-03)
+/// The per-row SQUARED-norm reductions are an INTERNAL implementation detail of
+/// distance, not a caller-visible kernel choice, so they always run on the
+/// always-portable [`ReducePath::Shared`] path. The plane (subgroup) path is
+/// capability-gated and returns `None` on adapters without subgroup support
+/// (e.g. the cpu backend) — forwarding a caller-chosen `Plane` into the norm
+/// term would unwrap that `None` and PANIC (the D-03 skip contract is for the
+/// reduction's own public callers, not for distance's internal use). Distance
+/// therefore exposes NO `path` parameter; the norm reduction is unconditionally
+/// shared-path-backed and can never be plane-gated to `None`.
 ///
 /// Generic over the float element type `F` (`f32` / `f64`); the f64 path is
 /// capability-gated by the caller via `skip_f64_with_log`.
@@ -76,7 +84,6 @@ pub fn distance<F>(
     (rows_y, cols_y): (usize, usize),
     sqrt: bool,
     out: Option<DeviceArray<ActiveRuntime, F>>,
-    path: ReducePath,
 ) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
 where
     F: Float + CubeElement + Pod,
@@ -102,10 +109,13 @@ where
     // --- 2. Per-row SQUARED norms ‖x_i‖² (len rows_x) and ‖y_j‖² (len rows_y)
     //        via the Plan-02 row reduction with SumSq (NO sqrt — distance needs
     //        the squared norm directly). Device-resident outputs. ---
-    let xnorm = row_reduce::<F>(pool, x, rows_x, cols, ScalarOp::SumSq, path)?
-        .expect("row SumSq reduction is shared-path-backed (never plane-gated to None)");
-    let ynorm = row_reduce::<F>(pool, y, rows_y, cols, ScalarOp::SumSq, path)?
-        .expect("row SumSq reduction is shared-path-backed (never plane-gated to None)");
+    // CR-01: force the always-portable Shared path for the INTERNAL norm term —
+    // never the caller's choice — so the reduction is never plane-gated to None
+    // (which would panic the `.expect` below on a non-subgroup adapter, e.g. cpu).
+    let xnorm = row_reduce::<F>(pool, x, rows_x, cols, ScalarOp::SumSq, ReducePath::Shared)?
+        .expect("shared path is never plane-gated to None");
+    let ynorm = row_reduce::<F>(pool, y, rows_y, cols, ScalarOp::SumSq, ReducePath::Shared)?
+        .expect("shared path is never plane-gated to None");
 
     // --- 3. Combine + clamp: out[i,j] = max(‖x_i‖² + ‖y_j‖² − 2·XYᵀ[i,j], 0).
     //        Device-resident; the clamp guarantees no negative squared distance

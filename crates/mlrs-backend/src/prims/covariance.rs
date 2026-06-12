@@ -68,9 +68,21 @@ use crate::runtime::ActiveRuntime;
 ///   is itself the scaled-in-place result — covariance reuses it rather than
 ///   allocating a parallel one (D-10 gate 3). The result stays device-resident
 ///   (D-05): NO host round-trip inside this API.
-/// - `path` selects the reduction kernel family for the column means
-///   ([`ReducePath::Shared`] is always portable; [`ReducePath::Plane`] is the
-///   subgroup fast path where supported).
+///
+/// ## Internal reduction path (CR-01 / D-03)
+/// The column-mean reduction is an INTERNAL implementation detail of covariance,
+/// not a caller-visible kernel choice, so it always runs on the always-portable
+/// [`ReducePath::Shared`] path. The plane (subgroup) path is capability-gated and
+/// returns `None` on adapters without subgroup support (e.g. cpu); forwarding a
+/// caller-chosen `Plane` into the mean term would unwrap that `None` and PANIC.
+/// Covariance therefore exposes NO `path` parameter; the mean reduction is
+/// unconditionally shared-path-backed and can never be plane-gated to `None`.
+///
+/// ## `n_samples - ddof` must be positive (WR-01)
+/// The `1/(n_samples - ddof)` normalisation divides by `n_samples - ddof`; when
+/// it is `<= 0` (e.g. a single-sample matrix with `ddof = 1`) the result would
+/// be `inf`/`NaN`. This is rejected at the boundary with
+/// [`PrimError::DimMismatch`] before any launch.
 ///
 /// Generic over the float element type `F` (`f32` / `f64`); the f64 path is
 /// capability-gated by the caller via `skip_f64_with_log`.
@@ -80,21 +92,24 @@ pub fn covariance<F>(
     (n_samples, n_features): (usize, usize),
     ddof: u32,
     out: Option<DeviceArray<ActiveRuntime, F>>,
-    path: ReducePath,
 ) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
 where
     F: Float + CubeElement + Pod,
 {
-    // --- D-04 / T-0204-02: validate geometry BEFORE any unsafe launch. ---
-    validate_geometry(a.len(), (n_samples, n_features), out.as_ref().map(DeviceArray::len))?;
+    // --- D-04 / T-0204-02 / WR-01: validate geometry (incl. n_samples-ddof > 0)
+    //     BEFORE any unsafe launch. ---
+    validate_geometry(a.len(), (n_samples, n_features), ddof, out.as_ref().map(DeviceArray::len))?;
 
     // --- 1. Column means (length n_features) via the Plan-02 column reduction.
     //        Two-pass centring for stability (RESEARCH Pitfall 4): mean first,
     //        then subtract per column. column_reduce is shared-path-backed (the
     //        plane path is gated separately), so it is always `Some` here. The
     //        means stay device-resident as `means_dev`. ---
-    let means_dev = column_reduce::<F>(pool, a, n_samples, n_features, ScalarOp::Mean, path)?
-        .expect("column-mean reduction is shared-path-backed (never plane-gated to None)");
+    // CR-01: force the always-portable Shared path for the INTERNAL mean term —
+    // never the caller's choice — so the reduction is never plane-gated to None
+    // (which would panic the `.expect` below on a non-subgroup adapter, e.g. cpu).
+    let means_dev = column_reduce::<F>(pool, a, n_samples, n_features, ScalarOp::Mean, ReducePath::Shared)?
+        .expect("shared path is never plane-gated to None");
 
     // --- 2. Centre the columns on the DEVICE: centred[r, c] = A[r, c] − mean[c]
     //        via the `center_columns` per-element kernel (broadcasting the
@@ -172,12 +187,15 @@ where
     Ok(gram)
 }
 
-/// Validate the covariance operand geometry (D-04 / T-0204-02). `a` is
+/// Validate the covariance operand geometry (D-04 / T-0204-02 / WR-01). `a` is
 /// `n_samples × n_features`; `n_samples * n_features == a.len()`. The output
-/// (if supplied) must be the `n_features × n_features` Gram.
+/// (if supplied) must be the `n_features × n_features` Gram. The normalisation
+/// divisor `n_samples - ddof` must be `> 0` (WR-01) — otherwise the `1/(n-ddof)`
+/// scale divides by zero (or negative) and silently produces `inf`/`NaN`.
 fn validate_geometry(
     a_len: usize,
     (n_samples, n_features): (usize, usize),
+    ddof: u32,
     out_len: Option<usize>,
 ) -> Result<(), PrimError> {
     if n_samples
@@ -190,6 +208,26 @@ fn validate_geometry(
             rows: n_samples,
             cols: n_features,
             len: a_len,
+        });
+    }
+    // CR-03: reject empty geometry at the boundary so a 0×cols / rows×0 matrix
+    // never reaches the reduction/GEMM driver (where an empty-axis reduction's
+    // identity is ambiguous). A valid covariance needs at least one sample and
+    // one feature.
+    if n_samples == 0 || n_features == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "a",
+            rows: n_samples,
+            cols: n_features,
+            len: a_len,
+        });
+    }
+    // WR-01: the 1/(n_samples - ddof) divisor must be strictly positive.
+    if (n_samples as i64) - (ddof as i64) <= 0 {
+        return Err(PrimError::DimMismatch {
+            dim: "n_samples-ddof",
+            lhs: n_samples,
+            rhs: ddof as usize,
         });
     }
     if let Some(o) = out_len {

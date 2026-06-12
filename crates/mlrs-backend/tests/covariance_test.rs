@@ -38,9 +38,10 @@ use mlrs_backend::capability::{self, FloatKind};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::covariance::covariance;
-use mlrs_backend::prims::reduce::ReducePath;
 use mlrs_backend::runtime::{self, ActiveRuntime};
-use mlrs_core::{assert_slice_close, is_close, load_npz, OracleCase, Tolerance, F32_TOL, F64_TOL};
+use mlrs_core::{
+    assert_slice_close, is_close, load_npz, OracleCase, PrimError, Tolerance, F32_TOL, F64_TOL,
+};
 
 /// f32-precision near-zero floor for the covariance oracle comparison, mirroring
 /// `F32_GEMM_NEAR_ZERO_FLOOR` in `gemm_test.rs` and `F32_DIST_NEAR_ZERO_FLOOR`
@@ -157,9 +158,6 @@ where
         (n_samples, n_features),
         ddof,
         None,
-        // Shared path is always portable; the reduction's plane path is gated
-        // separately and validated in reduce_test.rs.
-        ReducePath::Shared,
     )
     .expect("covariance host API rejects nothing for a valid shape");
     cov_dev.to_host_metered(&mut pool)
@@ -254,5 +252,113 @@ fn covariance_ddof1_matches() {
 
     println!(
         "covariance ddof1 backend={backend}: sample covariance matches host ref + np.cov fixture (f32 + f64)"
+    );
+}
+
+/// CR-01 regression: `covariance` must NOT panic and must return CORRECT results
+/// on an adapter WITHOUT subgroup (plane) support. Before the fix, covariance
+/// forwarded the caller's `ReducePath` into the internal column-mean reduction;
+/// on a non-subgroup adapter (e.g. cpu) the plane path returns `None`, which the
+/// `.expect(..)` unwrapped into a PANIC. The fix forces the always-portable
+/// Shared path for the INTERNAL mean term unconditionally, so covariance is
+/// correct on EVERY adapter regardless of plane support. f32 so the case always
+/// runs (no f64 gate).
+#[test]
+fn covariance_internal_mean_portable_no_plane_panic() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(FloatKind::F32, backend, "default");
+
+    let plane = capability::plane_supported();
+    println!("CR-01 covariance regression backend={backend} plane_supported={plane}");
+
+    let (ns, nf) = (7usize, 4usize);
+    let a32: Vec<f32> = (0..ns * nf).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+
+    // Load-bearing: this call does NOT panic on a non-subgroup adapter (it would
+    // have before CR-01) AND returns the correct covariance.
+    let got32 = run_covariance_case::<f32>(&a32, ns, nf, 0);
+    let a64: Vec<f64> = a32.iter().map(|&v| v as f64).collect();
+    let expected = host_cov_ref(&a64, ns, nf, 0);
+    let got64: Vec<f64> = got32.iter().map(|&v| v as f64).collect();
+    assert_slice_close_f32_cov(&got64, &expected, &F32_TOL);
+
+    println!(
+        "CR-01 covariance regression backend={backend}: covariance correct + no plane-panic \
+         (internal mean is unconditionally Shared-path)"
+    );
+}
+
+/// WR-01 regression: `covariance` with `n_samples == ddof` (divisor `== 0`) must
+/// return a typed `PrimError`, NOT silently produce `inf`/`NaN`. Also pins the
+/// CR-03 empty-geometry rejection: `0 × n_features` and `n_samples × 0` are
+/// rejected at the boundary before any kernel launch.
+#[test]
+fn covariance_rejects_zero_divisor_and_empty_geometry() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // `DeviceArray` does not implement Debug, so `expect_err` (which needs the
+    // Ok-type to be Debug) cannot be used; match the Result explicitly instead.
+    fn expect_prim_err(
+        r: Result<DeviceArray<ActiveRuntime, f32>, PrimError>,
+        ctx: &str,
+    ) -> PrimError {
+        match r {
+            Ok(_) => panic!("expected PrimError ({ctx}), got Ok"),
+            Err(e) => e,
+        }
+    }
+
+    // WR-01: a single-sample matrix with ddof = 1 ⇒ n_samples - ddof == 0.
+    let one_sample: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+    let a_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &one_sample);
+    let err = expect_prim_err(
+        covariance::<f32>(&mut pool, &a_dev, (1, 4), /* ddof */ 1, None),
+        "n_samples == ddof (zero divisor)",
+    );
+    assert!(
+        matches!(err, PrimError::DimMismatch { dim: "n_samples-ddof", .. }),
+        "WR-01: expected DimMismatch(n_samples-ddof), got {err:?}"
+    );
+
+    // WR-01: ddof > n_samples (negative divisor) is also rejected.
+    let two_sample: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let a2: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &two_sample);
+    let err2 = expect_prim_err(
+        covariance::<f32>(&mut pool, &a2, (2, 4), /* ddof */ 3, None),
+        "ddof > n_samples (negative divisor)",
+    );
+    assert!(
+        matches!(err2, PrimError::DimMismatch { dim: "n_samples-ddof", .. }),
+        "WR-01: expected DimMismatch(n_samples-ddof), got {err2:?}"
+    );
+
+    // CR-03: empty geometry rejected at the boundary (0 samples, 0 features).
+    let empty: Vec<f32> = Vec::new();
+    let a_empty: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &empty);
+    let err3 = expect_prim_err(
+        covariance::<f32>(&mut pool, &a_empty, (0, 4), 0, None),
+        "0 × n_features",
+    );
+    assert!(
+        matches!(err3, PrimError::ShapeMismatch { operand: "a", .. }),
+        "CR-03: expected ShapeMismatch(a) for empty geometry, got {err3:?}"
+    );
+    let err4 = expect_prim_err(
+        covariance::<f32>(&mut pool, &a_empty, (4, 0), 0, None),
+        "n_samples × 0",
+    );
+    assert!(
+        matches!(err4, PrimError::ShapeMismatch { operand: "a", .. }),
+        "CR-03: expected ShapeMismatch(a) for empty geometry, got {err4:?}"
+    );
+
+    println!(
+        "WR-01/CR-03 covariance regression backend={backend}: zero/negative divisor + \
+         empty geometry rejected with typed PrimError (no inf/NaN)"
     );
 }

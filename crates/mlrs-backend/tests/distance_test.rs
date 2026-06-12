@@ -38,7 +38,6 @@ use mlrs_backend::capability::{self, FloatKind};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::distance;
-use mlrs_backend::prims::reduce::ReducePath;
 use mlrs_backend::runtime::{self, ActiveRuntime};
 use mlrs_core::{assert_slice_close, is_close, load_npz, OracleCase, Tolerance, F32_TOL, F64_TOL};
 
@@ -148,9 +147,6 @@ where
         (rows_y, cols),
         sqrt,
         None,
-        // Shared path is always portable; the reduction's plane path is gated
-        // separately and validated in reduce_test.rs.
-        ReducePath::Shared,
     )
     .expect("distance host API rejects nothing for a valid shape");
     d_dev.to_host_metered(&mut pool)
@@ -332,4 +328,44 @@ fn distance_npz_fixture_matches() {
     let got = run_distance_case::<f64>(x, y, rx, ry, c, true);
     assert_slice_close(&got, d, &F64_TOL);
     println!("distance npz backend={backend}: squared + sqrt fixtures match");
+}
+
+/// CR-01 regression: `distance` must NOT panic and must return CORRECT results on
+/// an adapter WITHOUT subgroup (plane) support. Before the fix, distance
+/// forwarded the caller's `ReducePath` into the internal squared-norm reduction;
+/// on a non-subgroup adapter (e.g. cpu) the plane path returns `None`, which the
+/// `.expect(..)` unwrapped into a PANIC. The fix forces the always-portable
+/// Shared path for the INTERNAL norm term unconditionally, so distance is correct
+/// on EVERY adapter regardless of plane support. This test pins that contract:
+/// when `plane_supported()` is `false` (the cpu interpreter), distance still
+/// produces the right squared distances rather than panicking.
+#[test]
+fn distance_internal_norm_portable_no_plane_panic() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(FloatKind::F32, backend, "default");
+
+    // The regression only bites on adapters that lack plane support (the panic
+    // path). On a plane-capable adapter (this env's wgpu) the result is still
+    // correct, so we run + assert correctness everywhere and log the plane state.
+    let plane = capability::plane_supported();
+    println!("CR-01 regression backend={backend} plane_supported={plane}");
+
+    let (rx, ry, c) = (5usize, 4usize, 3usize);
+    let x: Vec<f32> = (0..rx * c).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+    let y: Vec<f32> = (0..ry * c).map(|i| ((i % 11) as f32) * 0.1 - 0.5).collect();
+
+    // The load-bearing assertion: this call does NOT panic on a non-subgroup
+    // adapter (it would have before CR-01) AND returns the correct distances.
+    let got = run_distance_case::<f32>(&x, &y, rx, ry, c, false);
+    let x64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+    let y64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+    let expected = host_dist_sq_ref(&x64, &y64, rx, ry, c);
+    let got64: Vec<f64> = got.iter().map(|&v| v as f64).collect();
+    assert_slice_close_f32_dist(&got64, &expected, &F32_TOL);
+
+    println!(
+        "CR-01 regression backend={backend}: distance correct + no plane-panic \
+         (internal norm is unconditionally Shared-path)"
+    );
 }

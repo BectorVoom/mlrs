@@ -94,7 +94,6 @@ fn memory_gate_reuse_bounded() {
             (rows_y, cols),
             /* sqrt */ false,
             Some(out),
-            ReducePath::Shared,
         )
         .expect("distance accepts the validated same shape");
         let allocs_this_iter = pool.stats().allocations - allocs_before;
@@ -193,7 +192,6 @@ fn memory_gate_no_midpipeline_readback() {
         (m, n),
         /* sqrt */ false,
         None,
-        ReducePath::Shared,
     )
     .expect("distance accepts the validated shape");
     assert_eq!(d.len(), m * m, "distance output is rows_x × rows_y");
@@ -290,7 +288,6 @@ fn memory_gate_gram_reuses_gemm_buffer() {
         (n_samples, n_features),
         /* ddof */ 0,
         Some(cov_out),
-        ReducePath::Shared,
     )
     .expect("covariance accepts the validated shape");
     let allocs_during_cov = pool.stats().allocations - allocs_before_cov;
