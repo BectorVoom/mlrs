@@ -74,10 +74,11 @@ use crate::jacobi_eig::MAX_DIM;
 /// - `l_out` is the row-major `n × n` LOWER Cholesky factor (`l_out[i*n + j]`,
 ///   strictly-upper entries left 0) — exposed EXPLICITLY so the host can check the
 ///   `‖L·Lᵀ − A‖` invariant without re-deriving the factor.
-/// - `info_out` is length 2: `[0] = non-SPD flag` (`< 0` ⇒ negative/zero pivot,
-///   carrying the negated pivot value) and `[1] = pivot index` (the diagonal
-///   index where the factorization failed, encoded as a float). `info_out[0]`
-///   stays `≥ 0` for an SPD input.
+/// - `info_out` is length 3: `[0] = non-SPD flag` (`< 0` ⇒ a non-positive pivot
+///   was hit; `≥ 0` ⇒ SPD/OK), `[1] = pivot index` (the diagonal index where the
+///   factorization failed, encoded as a float), and `[2] = pivot value` (the
+///   actual non-positive `√` argument, for host diagnosis). For an SPD input all
+///   three stay 0.
 /// - `n` is the runtime active dimension (`n ≤ MAX_DIM`).
 /// - `rhs` is the number of right-hand-side columns.
 ///
@@ -110,6 +111,7 @@ pub fn cholesky_solve<F: Float + CubeElement>(
     if unit == 0u32 {
         info_out[0usize] = zero;
         info_out[1usize] = zero;
+        info_out[2usize] = zero;
     }
     sync_cube();
 
@@ -153,8 +155,11 @@ pub fn cholesky_solve<F: Float + CubeElement>(
             // emit NaN. `continue` is unsupported in #[cube] → if-wrap so the rest
             // of the factor writes a safe placeholder instead of √(negative).
             if diag <= floor && spd_ok {
-                info_out[0usize] = -F::abs(diag) - F::from_int(1i64);
+                // Strictly-negative flag (-1), the failing diagonal index, and the
+                // actual non-positive pivot value — all unambiguous for the host.
+                info_out[0usize] = F::from_int(-1i64);
                 info_out[1usize] = F::cast_from(i);
+                info_out[2usize] = diag;
                 spd_ok = false;
             }
             if spd_ok {

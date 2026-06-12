@@ -9,6 +9,7 @@
 //! Tests live in `crates/mlrs-backend/tests/` (never an in-source
 //! `#[cfg(test)]` module — AGENTS.md §2).
 
+pub mod cholesky;
 pub mod covariance;
 pub mod distance;
 pub mod eig;
