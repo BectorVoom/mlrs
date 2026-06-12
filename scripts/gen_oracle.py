@@ -532,7 +532,14 @@ def gen_pca(seed: int = SEED, dtype=np.float32, shape=PCA_TALL,
     transformed = pca.transform(x)
 
     def c(arr):
-        return np.asarray(arr).astype(dtype)
+        # Force C-contiguous (row-major) so the committed flat buffer matches the
+        # row-major `n_components x n_features` convention every Rust consumer
+        # assumes. sklearn PCA's `components_` is FORTRAN-contiguous (it comes
+        # from scipy's column-major `Vt`); without this the npz stores the
+        # column-major ravel and `load_npz(..).expect_f64("components_")` yields a
+        # transposed flat buffer, silently breaking the row-major contract
+        # (04-04 Rule-1 fix).
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
 
     dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
     os.makedirs(_FIXTURE_DIR, exist_ok=True)
