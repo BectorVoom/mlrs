@@ -122,8 +122,16 @@ where
     let client = runtime::active_client();
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
-    let x_host: Vec<F> = case.expect_f64("X").iter().map(|&v| f64_to::<F>(v)).collect();
-    let y_host: Vec<F> = case.expect_f64("y").iter().map(|&v| f64_to::<F>(v)).collect();
+    let x_host: Vec<F> = case
+        .expect_f64("X")
+        .iter()
+        .map(|&v| f64_to::<F>(v))
+        .collect();
+    let y_host: Vec<F> = case
+        .expect_f64("y")
+        .iter()
+        .map(|&v| f64_to::<F>(v))
+        .collect();
     let xt_host: Vec<F> = case
         .expect_f64("X_test")
         .iter()
@@ -140,7 +148,10 @@ where
     let pred = reg
         .predict(&mut pool, &xt_dev, (N_TEST, N_FEATURES))
         .expect("predict on X_test");
-    pred.to_host(&pool).iter().map(|&v| host_to_f64(v)).collect()
+    pred.to_host(&pool)
+        .iter()
+        .map(|&v| host_to_f64(v))
+        .collect()
 }
 
 fn f64_to<F: Pod>(v: f64) -> F {
@@ -239,7 +250,9 @@ fn linear_regression_collinear_cutoff_f64() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
     if capability::skip_f64_with_log() {
-        println!("linreg collinear f64 backend={backend}: SKIPPED (no f64 support on this adapter)");
+        println!(
+            "linreg collinear f64 backend={backend}: SKIPPED (no f64 support on this adapter)"
+        );
         return;
     }
     let case = load_npz(fixture("linear_regression_f64_seed42.npz")).expect("load linreg_f64");

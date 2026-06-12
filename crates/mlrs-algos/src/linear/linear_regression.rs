@@ -241,10 +241,10 @@ where
         let t1 = gemm::<F>(
             pool,
             &u,
-            (k, n_samples),    // logical Uᵀ is (k × m)
+            (k, n_samples), // logical Uᵀ is (k × m)
             &y_c_dev,
             (n_samples, 1),
-            true,  // u buffer is U (m×k) row-major; transa reads it as Uᵀ.
+            true, // u buffer is U (m×k) row-major; transa reads it as Uᵀ.
             false,
             None,
         )?;
@@ -268,10 +268,10 @@ where
         let coef = gemm::<F>(
             pool,
             &vt,
-            (n_features, k),   // logical V is (n × k)
+            (n_features, k), // logical V is (n × k)
             &t2_dev,
             (k, 1),
-            true,  // vt buffer is Vᵀ (k×n) row-major; transa reads it as V.
+            true, // vt buffer is Vᵀ (k×n) row-major; transa reads it as V.
             false,
             None,
         )?;
