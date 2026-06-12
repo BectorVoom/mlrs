@@ -58,12 +58,16 @@
 //!     rotations are essentially never skipped; conflating it with the break
 //!     bound stalls convergence.
 //!   - `conv_thr` — the convergence-break bound. After each full sweep the
-//!     off-diagonal Frobenius norm `sqrt(Σ_{i<j} a_ij²)` is reduced with a
-//!     log₂-tree (in-kernel — mirrors `reduce_sumsq_shared`); the loop breaks
-//!     when that norm `≤ conv_thr`. It is set to `8 · ε_F · ‖A‖_F · sqrt(pairs)`
+//!     off-diagonal Frobenius norm is measured DIRECTLY from the current matrix
+//!     state (each unit sums `a_ij²` over `j != i` for its row `i`, then a
+//!     log₂-tree reduction — in-kernel, mirrors `reduce_sumsq_shared`). The
+//!     per-row sums double-count each pair, so the reduced value is
+//!     `2·Σ_{i<j} a_ij²` and its sqrt is `sqrt(2)·‖offdiag‖`; the loop breaks
+//!     when that `≤ conv_thr`. `conv_thr` is `8 · ε_F · ‖A‖_F · sqrt(pairs)`
 //!     (`pairs = n(n-1)/2`) to clear the ACCUMULATED f32 rounding floor — a
-//!     single-`ε` bound is unreachable in f32 for moderate `n` (Pitfall 5).
-//!     `ε_f32 ≈ 1.2e-7`, `ε_f64 ≈ 2.2e-16`.
+//!     single-`ε` bound is unreachable in f32 for moderate `n` (Pitfall 5); the
+//!     extra `sqrt(2)` only makes the break marginally STRICTER (more accurate),
+//!     which is safe. `ε_f32 ≈ 1.2e-7`, `ε_f64 ≈ 2.2e-16`.
 //! The loop also stops at `max_sweeps = 30` (generous; cyclic Jacobi converges
 //! quadratically). A cap hit without convergence surfaces `NotConverged` on the
 //! host (D-12).
