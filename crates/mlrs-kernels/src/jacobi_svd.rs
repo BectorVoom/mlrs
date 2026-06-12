@@ -14,15 +14,21 @@
 //! cube holding `A` + `V` in `SharedMemory` keeps the loop device-resident.
 //! v1 sizes (mostly small, one ~256×64) fit one cube (RESEARCH Pattern 2 / A1).
 //!
-//! ## Layout (one unit per column)
-//! Unit `c` (`UNIT_POS_X`) owns column `c` of the `m×n` matrix `A` and column
-//! `c` of the `n×n` accumulator `V`. `A` is staged COLUMN-MAJOR in shared memory
-//! (`a_sh[c*MAX_ROWS + r]`) so a column is a contiguous owned strip; `V` is
-//! likewise column-major (`v_sh[c*MAX_COLS + r]`, initialised to the identity).
+//! ## Layout (one unit per column; A in GLOBAL, V in shared — A1/LDS budget)
+//! Unit `c` (`UNIT_POS_X`) owns column `c`. The `m×n` matrix `A` is held
+//! COLUMN-MAJOR in the GLOBAL `a_out` handle (`a_out[c*rows + r]`), NOT in shared
+//! memory: a `256×64` f32 tile alone is 64 KiB, which together with `V` overflows
+//! gfx1100's 64 KiB LDS (RESEARCH A1 / Open Q2 — verified: the all-shared layout
+//! requested 82176 > 65536 bytes and the HIP launch was rejected). Keeping `A` in
+//! global drops shared usage to `V` (`n×n`, ≤ 16 KiB) + the off-diagonal
+//! accumulator, well within budget, while the convergence loop stays in-kernel
+//! (the global handle is cube-private for a single-cube launch — D-11 gate 3
+//! holds: no HOST round-trip between sweeps). `V` is staged COLUMN-MAJOR in shared
+//! (`v_sh[c*MAX_COLS + r]`, initialised to the identity).
 //! Per round-robin step a disjoint set of column pairs `(i, j)` rotate
 //! concurrently — each pair is handled by the lower-indexed unit, which reads
-//! both columns, computes the Jacobi rotation, and writes both back; the
-//! `sync_cube()` between steps makes the writes visible before the next step.
+//! both columns from `a_out`/`v_sh`, computes the Jacobi rotation, and writes both
+//! back; the `sync_cube()` between steps makes the writes visible before the next.
 //!
 //! ## Round-robin (chess-tournament) pair schedule (RESEARCH Pattern 6)
 //! One sweep visits all `n(n-1)/2` column pairs over `n-1` steps, `floor(n/2)`
@@ -31,23 +37,33 @@
 //! within a step are write-conflict-free.
 //!
 //! ## Convergence (D-12 constants — RECORDED here)
-//! After each full sweep the off-diagonal Frobenius norm `sqrt(Σ_{i<j} γ_ij²)`
-//! (with `γ_ij = column_i · column_j`) is reduced with the `reduce_sumsq_shared`
-//! log₂-tree idiom (in-kernel). The loop breaks when that norm falls below
-//! `threshold` or the sweep count reaches `max_sweeps`. The host passes both by
-//! value: `threshold = 8 · ε_F · ‖A‖_F` (ε_f32 ≈ 1.2e-7, ε_f64 ≈ 2.2e-16) and
-//! `max_sweeps = 30`. **Forcing case:** the moderate 256×64 case
-//! (`svd_moderate_256x64`) and the clustered/repeated D-08 cases need a generous
-//! cap; cyclic one-sided Jacobi converges quadratically (~10–15 sweeps for
-//! n ≤ 256, cuSolver's Jacobi default is `n_iterations = 15`), so 30 is generous
-//! headroom while the `8·ε_F·‖A‖_F` threshold stays reachable in f32 (a tighter
-//! f64-grade threshold would loop to the cap every time in f32 — Pitfall 5).
+//! TWO distinct thresholds are passed by value (the key Pitfall-5 fix):
+//!   - `skip_thr` — the per-pair rotation-skip bound. A pair `(i, j)` rotates
+//!     only when `|γ_ij| > skip_thr`. This MUST stay TINY (`ε_F · ‖A‖_F`) so
+//!     rotations are essentially never skipped; conflating it with the break
+//!     bound stalls convergence (a loose skip bound stops zeroing real
+//!     off-diagonals and the norm plateaus high).
+//!   - `conv_thr` — the convergence-break bound. After each full sweep the
+//!     off-diagonal Frobenius norm `sqrt(Σ_{i<j} γ_ij²)` is reduced with the
+//!     `reduce_sumsq_shared` log₂-tree idiom (in-kernel); the loop breaks when
+//!     that norm `≤ conv_thr`. It is set to `8 · ε_F · ‖A‖_F · sqrt(pairs)`
+//!     (`pairs = n(n-1)/2`) to account for the ACCUMULATED f32 rounding floor of
+//!     the dot products — a single-`ε` bound is unreachable in f32 for moderate
+//!     `n` and the loop would hit the cap every time (Pitfall 5). `ε_f32 ≈
+//!     1.2e-7`, `ε_f64 ≈ 2.2e-16`.
+//! The loop also stops at `max_sweeps = 30` (generous; cyclic one-sided Jacobi
+//! converges quadratically). **Forcing case:** the moderate 256×64 case
+//! (`svd_moderate_256x64`) plateaus at an off-diagonal norm ≈ `4e-4` (the f32
+//! noise floor) while its reconstruction is already within 1e-5; the
+//! noise-floor-aware `conv_thr` lets it converge in ~7 sweeps instead of looping
+//! to the cap. cuSolver's Jacobi default is `n_iterations = 15`.
 //!
 //! ## CubeCL expression notes
-//! - `SharedMemory::<F>::new(N)` requires a COMPILE-TIME size — the tile is sized
-//!   to a comptime cap (`MAX_ROWS` × `MAX_COLS`) and the active region is bounded
-//!   by the runtime `(rows, cols)` (mirrors `reduce.rs` sizing 256 + `input.len()`
-//!   guard).
+//! - `SharedMemory::<F>::new(N)` requires a COMPILE-TIME size — `v_sh` is sized to
+//!   the comptime cap (`MAX_COLS` × `MAX_COLS`) and the active region is bounded
+//!   by the runtime `cols` (mirrors `reduce.rs` sizing 256 + `input.len()` guard).
+//!   `A` is NOT in shared (it lives in global `a_out`), so the LDS footprint is
+//!   independent of `MAX_ROWS`.
 //! - `continue` is NOT supported in `#[cube]` — the "skip below-threshold pair"
 //!   is `if gamma.abs() > thr { ...rotate... }` (RESEARCH Pattern 6).
 //! - generic constants via `F::from_int` / `F::new`; `Float` methods `.abs()` /
@@ -61,12 +77,15 @@
 
 use cubecl::prelude::*;
 
-/// Comptime row cap for the staged `A` tile. The active row count `rows` is a
-/// runtime value bounded by this; a launch with `rows > MAX_ROWS` is rejected by
-/// the host before launch (`prims/svd.rs`).
+/// Host-side row cap for the tall dimension. `A` lives in global memory so this
+/// is NOT a shared-memory size; it bounds the supported problem size and the
+/// host (`prims/svd.rs`) rejects `max(rows,cols) > MAX_ROWS` before launch.
 pub const MAX_ROWS: u32 = 256;
 
-/// Comptime column cap for the staged `A` / `V` tiles.
+/// Comptime column cap for the shared `V` tile (`MAX_COLS × MAX_COLS`) and the
+/// off-diagonal accumulator. The thin dimension `cols ≤ MAX_COLS`. At f32 this is
+/// `64·64·4 = 16 KiB` for `V` + `64·4 = 256 B` for the accumulator — well within
+/// gfx1100's 64 KiB LDS (A1).
 pub const MAX_COLS: u32 = 64;
 
 /// One-sided Jacobi SVD sweep over a tall `A` (`rows × cols`, `rows ≥ cols`),
@@ -80,7 +99,9 @@ pub const MAX_COLS: u32 = 64;
 /// - `v_out` is `V` in COLUMN-major layout (`v_out[c*cols + r]`).
 /// - `rows` / `cols` are the runtime active dimensions (`cols ≤ MAX_COLS`,
 ///   `rows ≤ MAX_ROWS`).
-/// - `threshold` is the off-diagonal-norm convergence bound (`8·ε_F·‖A‖_F`).
+/// - `skip_thr` is the TINY per-pair rotation-skip bound (`ε_F·‖A‖_F`).
+/// - `conv_thr` is the off-diagonal-norm convergence-break bound
+///   (`8·ε_F·‖A‖_F·sqrt(pairs)`).
 /// - `max_sweeps` is the sweep cap (D-12).
 ///
 /// Launch with ONE cube of `cols` units (`CubeDim { x: cols, .. }`).
@@ -92,11 +113,12 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
     info_out: &mut Array<F>,
     rows: u32,
     cols: u32,
-    threshold: F,
+    skip_thr: F,
+    conv_thr: F,
     max_sweeps: u32,
 ) {
-    // Column-major staging: a_sh[c*MAX_ROWS + r], v_sh[c*MAX_COLS + r].
-    let mut a_sh = SharedMemory::<F>::new((MAX_ROWS * MAX_COLS) as usize);
+    // V staged column-major in shared (v_sh[c*MAX_COLS + r]); A lives in the
+    // GLOBAL a_out handle column-major (a_out[c*rows + r]) — A1/LDS budget.
     let mut v_sh = SharedMemory::<F>::new((MAX_COLS * MAX_COLS) as usize);
     // Per-pair off-diagonal contributions γ_ij² for the convergence reduction.
     // One slot per column (the lower-indexed unit of a pair writes its γ²).
@@ -106,14 +128,15 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
     let zero = F::from_int(0i64);
     let one = F::from_int(1i64);
 
-    // --- Stage: load my column c of A (row-major in → column-major shared) and
-    //     initialise my column c of V to the identity. Only the active region
-    //     (c < cols) participates; OOB units idle. ---
+    // --- Stage: copy my column c of A (row-major in → column-major GLOBAL a_out)
+    //     and initialise my column c of V to the identity in shared. Only the
+    //     active region (c < cols) participates; OOB units idle. ---
     if c < cols {
         let mut r = 0u32;
         while r < rows {
-            // a_in is row-major (rows, cols): element (r, c) at r*cols + c.
-            a_sh[(c * MAX_ROWS + r) as usize] = a_in[(r * cols + c) as usize];
+            // a_in is row-major (rows, cols): element (r, c) at r*cols + c;
+            // a_out is column-major: element (r, c) at c*rows + r.
+            a_out[(c * rows + r) as usize] = a_in[(r * cols + c) as usize];
             r += 1u32;
         }
         let mut k = 0u32;
@@ -175,8 +198,8 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
                         let mut gamma = zero;
                         let mut r = 0u32;
                         while r < rows {
-                            let aki = a_sh[(lo * MAX_ROWS + r) as usize];
-                            let akj = a_sh[(hi * MAX_ROWS + r) as usize];
+                            let aki = a_out[(lo * rows + r) as usize];
+                            let akj = a_out[(hi * rows + r) as usize];
                             alpha += aki * aki;
                             beta += akj * akj;
                             gamma += aki * akj;
@@ -186,9 +209,10 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
                         // convergence test (accumulate into the lo slot).
                         off_sh[lo as usize] += gamma * gamma;
 
-                        // --- Jacobi rotation that zeroes γ (skip if below thr;
-                        //     `continue` unsupported → if-wrap). ---
-                        if gamma.abs() > threshold {
+                        // --- Jacobi rotation that zeroes γ (skip only when γ is
+                        //     below the TINY skip bound; `continue` unsupported →
+                        //     if-wrap). ---
+                        if gamma.abs() > skip_thr {
                             let two = F::from_int(2i64);
                             let zeta = (beta - alpha) / (two * gamma);
                             // t = sign(zeta) / (|zeta| + sqrt(1 + zeta²)).
@@ -200,13 +224,13 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
                             }
                             let cs = one / (one + t * t).sqrt();
                             let sn = cs * t;
-                            // Apply to columns lo, hi of A and V.
+                            // Apply to columns lo, hi of A (global) and V (shared).
                             let mut rr = 0u32;
                             while rr < rows {
-                                let aki = a_sh[(lo * MAX_ROWS + rr) as usize];
-                                let akj = a_sh[(hi * MAX_ROWS + rr) as usize];
-                                a_sh[(lo * MAX_ROWS + rr) as usize] = cs * aki - sn * akj;
-                                a_sh[(hi * MAX_ROWS + rr) as usize] = sn * aki + cs * akj;
+                                let aki = a_out[(lo * rows + rr) as usize];
+                                let akj = a_out[(hi * rows + rr) as usize];
+                                a_out[(lo * rows + rr) as usize] = cs * aki - sn * akj;
+                                a_out[(hi * rows + rr) as usize] = sn * aki + cs * akj;
                                 rr += 1u32;
                             }
                             let mut kk = 0u32;
@@ -237,9 +261,9 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
             sync_cube();
             s /= 2u32;
         }
-        // off_sh[0] now holds Σ γ². Convergence when sqrt(Σγ²) <= threshold.
+        // off_sh[0] now holds Σ γ². Convergence when sqrt(Σγ²) <= conv_thr.
         let off_norm = off_sh[0usize].sqrt();
-        if off_norm <= threshold {
+        if off_norm <= conv_thr {
             converged = true;
         }
         sync_cube();
@@ -247,14 +271,10 @@ pub fn jacobi_svd_sweep<F: Float + CubeElement>(
         sweep += 1u32;
     }
 
-    // --- Write back: rotated A (column-major) and V (column-major), plus the
-    //     sweep count so the host can detect a cap hit (NotConverged). ---
+    // --- Write back: rotated A is ALREADY in a_out (global, in place); write V
+    //     (column-major) from shared, plus the sweep count + final norm so the
+    //     host can detect a cap hit (NotConverged). ---
     if c < cols {
-        let mut r = 0u32;
-        while r < rows {
-            a_out[(c * rows + r) as usize] = a_sh[(c * MAX_ROWS + r) as usize];
-            r += 1u32;
-        }
         let mut k = 0u32;
         while k < cols {
             v_out[(c * cols + k) as usize] = v_sh[(c * MAX_COLS + k) as usize];

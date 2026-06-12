@@ -181,7 +181,7 @@ where
     let v_arg = unsafe { ArrayArg::from_raw_parts(v_handle.clone(), k * k) };
     let info_arg = unsafe { ArrayArg::from_raw_parts(info_handle.clone(), 2) };
 
-    let threshold = compute_threshold::<F>(pool, a, rows * cols);
+    let (skip_thr, conv_thr) = compute_thresholds::<F>(pool, a, rows * cols, cols);
     jacobi_svd_sweep::launch::<F, ActiveRuntime>(
         &client,
         count,
@@ -192,7 +192,8 @@ where
         info_arg,
         rows as u32,
         cols as u32,
-        threshold,
+        skip_thr,
+        conv_thr,
         MAX_SWEEPS,
     );
 
@@ -210,10 +211,9 @@ where
     let residual = host_to_f64(info[1]);
     if sweeps_run >= MAX_SWEEPS && residual.is_finite() {
         // Only flag non-convergence if the cap was hit AND the residual is still
-        // above the threshold band. We recompute the threshold scale here; a cap
-        // hit with a tiny residual is a benign "converged exactly at the cap".
-        let thr = host_to_f64(threshold);
-        if residual > thr {
+        // above the convergence band; a cap hit with a residual already at/below
+        // conv_thr is a benign "converged exactly at the cap".
+        if residual > host_to_f64(conv_thr) {
             return Err(PrimError::NotConverged {
                 operand: "svd",
                 max_sweeps: MAX_SWEEPS,
@@ -341,15 +341,22 @@ where
     Ok((u_final, s_final, vt_final))
 }
 
-/// Compute the convergence threshold `8 · ε_F · ‖A‖_F` (D-12). `‖A‖_F` is the
-/// Frobenius norm of the input; `ε_F` is the per-dtype machine epsilon. Reads the
-/// input back to form `‖A‖_F` on the host — this is a ONE-TIME pre-launch scale
+/// Compute the `(skip_thr, conv_thr)` pair (D-12). `‖A‖_F` is the input's
+/// Frobenius norm; `ε_F` the per-dtype machine epsilon; `pairs = n(n-1)/2`.
+///   - `skip_thr = ε_F · ‖A‖_F` — TINY, so rotations are essentially never
+///     skipped (a loose skip bound stalls convergence — Pitfall 5).
+///   - `conv_thr = 8 · ε_F · ‖A‖_F · sqrt(pairs)` — the convergence-break bound,
+///     scaled by `sqrt(pairs)` to clear the ACCUMULATED f32 rounding floor of the
+///     off-diagonal dot products (else the loop hits the cap every time — the
+///     `svd_moderate_256x64` forcing case).
+/// Reads the input back ONCE to form `‖A‖_F` on the host — a pre-launch scale
 /// estimate, NOT a mid-sweep round-trip (the convergence loop stays in-kernel).
-fn compute_threshold<F>(
+fn compute_thresholds<F>(
     pool: &BufferPool<ActiveRuntime>,
     a: &DeviceArray<ActiveRuntime, F>,
     len: usize,
-) -> F
+    cols: usize,
+) -> (F, F)
 where
     F: Float + CubeElement + Pod,
 {
@@ -364,11 +371,12 @@ where
         4 => f32::EPSILON as f64,
         _ => f64::EPSILON,
     };
-    // Guard a near-zero matrix: keep the threshold strictly positive so the
-    // kernel's `|gamma| > threshold` skip and the `off_norm <= threshold` break
-    // are both well-defined.
-    let thr = (THRESHOLD_SCALE * eps * fro).max(eps);
-    f64_to_host::<F>(thr)
+    let pairs = (cols * cols.saturating_sub(1)) as f64 / 2.0;
+    // Keep both strictly positive for a near-zero matrix so the kernel's
+    // `|gamma| > skip_thr` and `off_norm <= conv_thr` are well-defined.
+    let skip_thr = (eps * fro).max(eps);
+    let conv_thr = (THRESHOLD_SCALE * eps * fro * pairs.max(1.0).sqrt()).max(skip_thr);
+    (f64_to_host::<F>(skip_thr), f64_to_host::<F>(conv_thr))
 }
 
 /// Validate the SVD operand geometry (ASVS V5 / T-03-03-01). `a` is
