@@ -6,11 +6,20 @@
 //! runtime is chosen in `mlrs-backend`.
 
 pub mod cholesky;
+// Phase-5 kernel stubs (Wave-0 scaffold owns these registrations; plans
+// 05-02..06 fill their own file body — file-disjoint, parallel-safe). Each is an
+// empty compiling module until its plan adds the `#[cube]` kernel + a `pub use`
+// of its symbol INSIDE that file.
+pub mod coordinate;
+pub mod dbscan;
 pub mod elementwise;
 pub mod jacobi_eig;
 pub mod jacobi_svd;
+pub mod kmeans;
+pub mod lbfgs;
 pub mod reduce;
 pub mod smoke;
+pub mod topk;
 
 pub use cholesky::cholesky_solve;
 pub use elementwise::{center_columns, clamp_nonneg, dist_combine_clamp, scale, sqrt_elem};
