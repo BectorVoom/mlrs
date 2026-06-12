@@ -153,6 +153,18 @@ where
         rows_y as u32,
     );
 
+    // CR-02 / WR-07: the cross term `xy` (XYᵀ) and the two squared-norm vectors
+    // are TRANSIENT scratch — all THREE are consumed by the `dist_combine_clamp`
+    // launch above and never read again. The output buffer (`out_handle`) is a
+    // SEPARATE handle (the caller's `out`, or a distinct pool acquisition) and is
+    // NOT released here — the caller owns the returned result. The optional sqrt
+    // pass below reads only `out_handle`, never these three. Release each at its
+    // TRUE byte size so `live_bytes` is conserved and the buffers are reusable;
+    // the combine kernel's reads are same-stream-ordered before any later reuse.
+    xy.release_into(pool);
+    xnorm.release_into(pool);
+    ynorm.release_into(pool);
+
     // --- 4. Optional Euclidean sqrt at the boundary (D-08), in place over the
     //        already-clamped (non-negative) buffer — so sqrt never sees a
     //        negative argument. Still device-resident. ---

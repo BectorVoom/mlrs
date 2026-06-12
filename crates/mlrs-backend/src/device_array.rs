@@ -135,6 +135,35 @@ impl<R: cubecl::Runtime, F: Pod> DeviceArray<R, F> {
         self.to_host(pool)
     }
 
+    /// The buffer's TRUE byte footprint (`len * size_of::<F>()`).
+    ///
+    /// This is the single source of truth for the size a handle was acquired at,
+    /// so it is the ONLY size a release should ever file the handle under (WR-07):
+    /// releasing under a guessed/wrong size pollutes the free-list and causes a
+    /// later same-keyed `acquire` to hand back a buffer of a different real size
+    /// (over/under-read). Mirrors the `len`-as-source-of-truth invariant
+    /// [`from_host`](Self::from_host) / [`from_raw`](Self::from_raw) maintain for
+    /// read-back.
+    pub fn byte_size(&self) -> usize {
+        self.len * size_of::<F>()
+    }
+
+    /// Return this array's buffer to the pool's free-list for later reuse,
+    /// consuming the array (CR-02 / WR-07).
+    ///
+    /// The handle is filed under the array's OWN [`byte_size`](Self::byte_size)
+    /// — the true acquisition size — so the free-list key is always correct
+    /// (WR-07: no guessed size). Taking `self` by value enforces at the type
+    /// level that the array cannot be read after its buffer is released: a
+    /// released buffer may be handed to a later `acquire`, so reusing the array
+    /// afterwards would alias live memory. Call this ONLY on genuinely-transient
+    /// scratch whose consuming kernel has already been launched — NEVER on a
+    /// buffer that is returned to the caller or otherwise outlives the call.
+    pub fn release_into(self, pool: &mut BufferPool<R>) {
+        let bytes = self.byte_size();
+        pool.release(self.handle, bytes);
+    }
+
     /// Number of `F` elements in the buffer.
     pub fn len(&self) -> usize {
         self.len

@@ -139,6 +139,15 @@ where
     );
     let centred_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_raw(centred_handle, a_len);
 
+    // CR-02 / WR-07: the column means are TRANSIENT scratch — consumed by the
+    // `center_columns` launch above and never read again (not returned to the
+    // caller). Release them at their TRUE byte size (`n_features * size_of::<F>`)
+    // so the buffer conserves `live_bytes` and lands on the free-list for reuse.
+    // The consuming kernel is already launched and same-stream-ordered before any
+    // later kernel that could reuse this buffer, so this is not a live-aliasing
+    // release.
+    means_dev.release_into(pool);
+
     // --- 3. Gram AᵀA via GEMM(transa = true): the stored matrix is
     //        (n_samples × n_features); transa reads it as its transpose
     //        (n_features × n_samples) with NO transpose buffer (D-06 / D-09),
@@ -161,6 +170,14 @@ where
         false,
         out,
     )?;
+
+    // CR-02 / WR-07: the centred copy is TRANSIENT scratch — consumed by the GEMM
+    // above (both lhs and rhs read it) and never read again. The GEMM output
+    // (`gram`) is a SEPARATE handle (a fresh pool acquisition, or the caller's
+    // `out`), so releasing `centred_dev` does NOT touch the returned buffer.
+    // Release at its TRUE byte size so `live_bytes` is conserved and the buffer is
+    // reusable; the GEMM's reads are same-stream-ordered before any reuse.
+    centred_dev.release_into(pool);
 
     // --- 4. Normalise by 1/(n_samples − ddof) IN PLACE over the GEMM output
     //        buffer (the load-bearing reuse for D-10 gate 3). ddof = 0 ⇒ 1/n

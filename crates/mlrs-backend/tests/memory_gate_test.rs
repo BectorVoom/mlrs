@@ -54,13 +54,29 @@ fn fill(rows: usize, cols: usize) -> Vec<f32> {
 // Gate 1 — repeated same-shape calls: reuse > 0, allocations bounded (not ∝N).
 // ===========================================================================
 
-/// D-10 gate 1: threading ONE `BufferPool` and running a primitive (`distance`)
-/// `N` times at the SAME shape — reusing the caller-provided out-buffer AND the
-/// pool scratch (D-11) — drives the free-list: after the first iteration the
-/// per-iteration allocation count does NOT grow (`allocations <=
-/// FIRST_ITER_ALLOCS`, i.e. bounded, NOT linear in `N`) and reuse is exercised
-/// (`reuses >= N - 1`). This is the realistic-allocation reuse assertion Phase 1
-/// D-05 deferred to Phase 2.
+/// D-10 gate 1 (HONEST scratch-reuse gate — CR-02/WR-07): threading ONE
+/// `BufferPool` and running `distance` `N` times at the SAME shape must prove
+/// GENUINE transient-scratch reuse, not `from_host` metering churn. Distance now
+/// RELEASES its internal scratch (the XYᵀ cross term, the two squared-norm
+/// vectors, the reduction partials) at their TRUE byte sizes once consumed, so:
+///
+///   1a. `live_bytes` CONSERVES — after a warmup iteration it returns to the EXACT
+///       same value every subsequent iteration (the transient scratch is released
+///       back down to the persistent footprint). Before the CR-02 release fix,
+///       `live_bytes` grew MONOTONICALLY (nothing was ever released), so this
+///       equality is the RED-if-removed signal: deleting the scratch releases
+///       makes `live_bytes` climb each iteration and this assertion fails.
+///   1b. `peak_bytes` PLATEAUS — it stops growing after the warmup, because the
+///       released scratch is reused in place rather than stacking. Without the
+///       releases `peak_bytes` would rise ~linearly with `N`.
+///   1c. `reuses` GROW with iteration count by a fixed positive per-iteration
+///       delta — the free-list serves the SAME-shape scratch each iteration. The
+///       per-iteration reuse delta being `> 0` AND attributable to the released
+///       scratch (not just the 2 `from_host` metering handles, which are present
+///       from iteration 0) is the genuine-reuse signal.
+///
+/// These go RED if the scratch releases are removed — the gate can no longer pass
+/// on `from_host` churn alone.
 #[test]
 fn memory_gate_reuse_bounded() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -78,14 +94,18 @@ fn memory_gate_reuse_bounded() {
 
     // A single caller-provided out-buffer (rows_x × rows_y), reused every
     // iteration (D-11): re-wrap the SAME handle each call so distance writes back
-    // into it instead of acquiring a fresh output.
+    // into it instead of acquiring a fresh output. (The output is NOT released by
+    // distance — the caller owns it — so it is part of the persistent footprint.)
     let out_handle = pool.acquire(rows_x * rows_y * std::mem::size_of::<f32>());
 
-    let mut first_iter_allocs: u64 = 0;
-    for iter in 0..N {
+    // Per-iteration snapshots so we can assert conservation + monotone reuse.
+    let mut live_after: Vec<u64> = Vec::with_capacity(N);
+    let mut peak_after: Vec<u64> = Vec::with_capacity(N);
+    let mut reuses_after: Vec<u64> = Vec::with_capacity(N);
+
+    for _iter in 0..N {
         let out = DeviceArray::<ActiveRuntime, f32>::from_raw(out_handle.clone(), rows_x * rows_y);
 
-        let allocs_before = pool.stats().allocations;
         let _d = distance::<f32>(
             &mut pool,
             &x,
@@ -96,39 +116,75 @@ fn memory_gate_reuse_bounded() {
             Some(out),
         )
         .expect("distance accepts the validated same shape");
-        let allocs_this_iter = pool.stats().allocations - allocs_before;
 
-        if iter == 0 {
-            first_iter_allocs = allocs_this_iter;
-        } else {
-            // HARD GATE 1a: bounded — a later iteration never allocates MORE than
-            // the first did (the free-list serves the repeated same-shape scratch
-            // / output, so allocations are flat, NOT linear in the call count).
-            assert!(
-                allocs_this_iter <= first_iter_allocs,
-                "D-10 gate 1 (bounded) FAILED on {backend}: iter {iter} allocated \
-                 {allocs_this_iter} buffers > FIRST_ITER_ALLOCS={first_iter_allocs} \
-                 — allocations are growing with N (no reuse). stats={:?}",
-                pool.stats()
-            );
-        }
+        let s = pool.stats();
+        live_after.push(s.live_bytes);
+        peak_after.push(s.peak_bytes);
+        reuses_after.push(s.reuses);
     }
 
-    // HARD GATE 1b: reuse is actually exercised. With N same-shape iterations the
-    // free-list must have served at least N-1 acquires (every iteration after the
-    // first reuses the released scratch / output of the previous one).
-    let reuses = pool.stats().reuses;
+    // Use iteration 0 as warmup (first sight of each scratch size is a fresh
+    // allocation); the steady-state invariants hold from iteration 1 onward.
+    let live_baseline = live_after[1];
+    let peak_baseline = peak_after[1];
+
+    for iter in 2..N {
+        // HARD GATE 1a: live_bytes CONSERVES — identical every steady-state
+        // iteration. A growing live_bytes means scratch is NOT being released
+        // (the exact CR-02 regression). This is the load-bearing honesty signal.
+        assert_eq!(
+            live_after[iter], live_baseline,
+            "D-10 gate 1a (live_bytes conserved) FAILED on {backend}: iter {iter} \
+             live_bytes={} != baseline={live_baseline} — transient scratch is NOT \
+             being released (CR-02 regression). Removing the scratch releases makes \
+             live_bytes climb monotonically. stats={:?}",
+            live_after[iter],
+            pool.stats()
+        );
+
+        // HARD GATE 1b: peak_bytes PLATEAUS — it never rises after the warmup,
+        // because released scratch is reused in place rather than stacking.
+        assert_eq!(
+            peak_after[iter], peak_baseline,
+            "D-10 gate 1b (peak_bytes bounded) FAILED on {backend}: iter {iter} \
+             peak_bytes={} != baseline={peak_baseline} — peak is growing with N \
+             (scratch not released → buffers stack). stats={:?}",
+            peak_after[iter],
+            pool.stats()
+        );
+
+        // HARD GATE 1c: reuses GROW each steady-state iteration by a fixed
+        // positive delta — genuine same-shape scratch reuse, NOT a one-off from
+        // `from_host` churn. The delta counts the released-then-reacquired scratch
+        // buffers (XYᵀ, the two norms, the reduction partials, the per-row
+        // segments), which would be ZERO if nothing were released.
+        let delta = reuses_after[iter] - reuses_after[iter - 1];
+        assert!(
+            delta > 0,
+            "D-10 gate 1c (scratch reuse grows) FAILED on {backend}: iter {iter} \
+             reuse delta={delta} (reuses {} -> {}) — no per-iteration scratch reuse, \
+             so the gate would pass on from_host churn alone. stats={:?}",
+            reuses_after[iter - 1],
+            reuses_after[iter],
+            pool.stats()
+        );
+    }
+
+    // The per-iteration reuse delta must exceed what the 2 `from_host` input
+    // uploads could contribute (those happen ONCE before the loop, so they add
+    // nothing per-iteration): the steady-state delta is entirely released scratch.
+    let steady_delta = reuses_after[N - 1] - reuses_after[N - 2];
     assert!(
-        reuses >= (N as u64) - 1,
-        "D-10 gate 1 (reuse>0) FAILED on {backend}: reuses={reuses} < N-1={} \
-         — the same-shape repetition did not exercise the free-list. stats={:?}",
-        N - 1,
+        steady_delta >= 1,
+        "D-10 gate 1 (genuine scratch reuse) FAILED on {backend}: steady-state reuse \
+         delta={steady_delta} — not attributable to released scratch. stats={:?}",
         pool.stats()
     );
 
     println!(
-        "D-10 gate 1 backend={backend}: N={N} FIRST_ITER_ALLOCS={first_iter_allocs} \
-         reuses={reuses} final_stats={:?}",
+        "D-10 gate 1 backend={backend}: N={N} live_baseline={live_baseline} \
+         peak_baseline={peak_baseline} steady_reuse_delta={steady_delta} \
+         final_stats={:?}",
         pool.stats()
     );
 }

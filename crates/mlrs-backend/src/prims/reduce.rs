@@ -207,6 +207,13 @@ where
             .expect("shared/plane-gated segment reduce");
         let rv = reduced.to_host(pool);
         out_host.push(finalize_scalar::<F>(op, rv[0], cols));
+        // CR-02 / WR-07: both per-row scratch arrays are TRANSIENT — `seg_dev` was
+        // consumed by reduce_segment as its input, and `reduced` was just read to
+        // host. Neither outlives this iteration nor is returned, so release both
+        // at their TRUE byte sizes (the free-list then serves the SAME-shape next
+        // row, conserving live_bytes across the row loop).
+        reduced.release_into(pool);
+        seg_dev.release_into(pool);
     }
     Ok(Some(DeviceArray::from_host(pool, &out_host)))
 }
@@ -240,6 +247,9 @@ where
             .expect("shared/plane-gated segment reduce");
         let rv = reduced.to_host(pool);
         out_host.push(finalize_scalar::<F>(op, rv[0], rows));
+        // CR-02 / WR-07: release the per-column transient scratch (see row_reduce).
+        reduced.release_into(pool);
+        seg_dev.release_into(pool);
     }
     Ok(Some(DeviceArray::from_host(pool, &out_host)))
 }
@@ -411,6 +421,17 @@ where
     // The first pass for SumSq must square; subsequent passes only sum the
     // already-squared partials. Track whether we are on the first pass.
     let mut first_pass = true;
+    // CR-02 / WR-07: track whether `cur_handle` is a POOL-acquired intermediate
+    // partial (releasable transient scratch) or the caller's original
+    // `input_handle` (NOT ours to release). The first pass reads the caller's
+    // input; every later pass reads the previous pass's pool-acquired partial.
+    let mut cur_is_pool_scratch = false;
+
+    // IN-02: the plane width is LOOP-INVARIANT (the adapter does not change
+    // mid-reduction), so query it ONCE here as a power-of-two cube floor rather
+    // than re-building a client every pass inside the loop. Only meaningful on the
+    // plane path; computed unconditionally (cheap) to keep the loop branch-free.
+    let plane_cube_floor = cube_dim_for(capability::active_plane_width().max(1) as usize);
 
     loop {
         // The plane path requires each cube to be at least one FULL plane (and a
@@ -422,11 +443,10 @@ where
         // or seeded with the cube's first element (min/max), so over-provisioning
         // a small input is safe. The shared path keeps the tight `cube_dim_for`.
         let cube = if path == ReducePath::Plane {
-            // Round the reported plane width up to a power of two, then take the
-            // larger of it and the tight cube dim (both powers of two ⇒ result
-            // is a power of two), capped at MAX_CUBE.
-            let pw = cube_dim_for(capability::active_plane_width().max(1) as usize);
-            cube_dim_for(cur_len).max(pw).min(MAX_CUBE as u32)
+            // Take the larger of the loop-invariant plane floor (IN-02, hoisted
+            // above) and the tight cube dim (both powers of two ⇒ result is a
+            // power of two), capped at MAX_CUBE.
+            cube_dim_for(cur_len).max(plane_cube_floor).min(MAX_CUBE as u32)
         } else {
             cube_dim_for(cur_len)
         };
@@ -491,11 +511,26 @@ where
 
         first_pass = false;
 
+        // CR-02 / WR-07: the just-consumed `cur_handle` is dead — this pass read
+        // it into `out_handle` and no later pass touches it. If it was a
+        // POOL-acquired partial from the PREVIOUS pass (NOT the caller's original
+        // input), release it at its TRUE byte size (`cur_len * elem`) so
+        // `live_bytes` is conserved and the partial buffer is reusable next pass.
+        // The consuming kernel above is same-stream-ordered before any later
+        // kernel that could reuse this buffer, so this is not a live-aliasing
+        // release. NEVER release the caller's input (`cur_is_pool_scratch ==
+        // false` on the first pass) nor the returned `out_handle`.
+        if cur_is_pool_scratch {
+            let consumed_bytes = cur_len * elem;
+            pool.release(cur_handle.clone(), consumed_bytes);
+        }
+
         if out_parts == 1 {
             return Ok(Some(DeviceArray::from_raw(out_handle, 1)));
         }
         cur_handle = out_handle;
         cur_len = out_parts;
+        cur_is_pool_scratch = true;
     }
 }
 
@@ -545,10 +580,17 @@ where
 
     // Read the per-cube winners and combine on the host (lowest-index tie-break,
     // global index = cube_offset + local index).
-    let vals: Vec<F> = DeviceArray::<ActiveRuntime, F>::from_raw(val_handle, num_cubes as usize)
-        .to_host(pool);
-    let idxs: Vec<u32> =
-        DeviceArray::<ActiveRuntime, u32>::from_raw(idx_handle, num_cubes as usize).to_host(pool);
+    let vals_dev = DeviceArray::<ActiveRuntime, F>::from_raw(val_handle, num_cubes as usize);
+    let idxs_dev = DeviceArray::<ActiveRuntime, u32>::from_raw(idx_handle, num_cubes as usize);
+    let vals: Vec<F> = vals_dev.to_host(pool);
+    let idxs: Vec<u32> = idxs_dev.to_host(pool);
+    // CR-02 / WR-07: the per-cube value/index scratch is TRANSIENT — fully read
+    // back above and never used again (argreduce returns a host `u32`, not a
+    // device buffer). Release both at their TRUE byte sizes so `live_bytes` is
+    // conserved and the buffers are reusable. The read-backs complete before the
+    // release, and no device result aliases these handles.
+    vals_dev.release_into(pool);
+    idxs_dev.release_into(pool);
 
     let mut best_val = host_to_f64(vals[0]);
     let mut best_idx = idxs[0]; // cube 0 offset is 0
