@@ -37,8 +37,10 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::covariance::covariance;
 use mlrs_backend::prims::distance::distance;
+use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
+use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::{self, ActiveRuntime};
 
 /// Deterministic test data: `n` row-major `rows × cols` f32 values with a small,
@@ -430,4 +432,383 @@ fn count_gram_sized_fresh_allocs(
     } else {
         0
     }
+}
+
+// ===========================================================================
+// ===========================================================================
+//  PHASE-3 / D-11 — the iterative SVD/eig memory gate (Plan 03-05).
+//
+//  Plan 02-05 (above) asserted the device-residency contract for the four
+//  SINGLE-PASS Phase-2 primitives. Plan 03-05 EXTENDS that gate to the project's
+//  first MULTI-PASS device loop — the one-sided (SVD) / two-sided (eig) cyclic
+//  Jacobi sweep. The iterative sweep is exactly where a per-sweep allocation or a
+//  mid-sweep host round-trip could regress memory efficiency SILENTLY, so the
+//  three D-11 gates below are the guardrail. They assert on the SAME `PoolStats`
+//  counters as the Phase-2 gates and are equally HARD / build-failing — a failure
+//  here is a real signal that the in-kernel convergence contract (D-11) broke; it
+//  must NOT be weakened to pass.
+//
+//  ## The three D-11 gates
+//    1. `memory_gate_jacobi_scratch_bounded` — driving `svd()` N times at the
+//       SAME shape through ONE pool proves the Jacobi sweep scratch is BOUNDED:
+//       the per-call FRESH-allocation delta is FLAT (== 0) after warmup
+//       (allocations do NOT grow with the sweep/iteration count — the loop is
+//       in-kernel, so the host sees a fixed set of pool buffers per call), and
+//       `live_bytes`/`peak_bytes` return to baseline (scratch released via
+//       `release_into`, not stacked). A per-sweep allocation regression makes the
+//       allocation delta climb and this gate goes RED (T-03-05-01).
+//    2. `memory_gate_eig_reuses_gram_buffer` — passing a covariance/GEMM
+//       `n_features²` output buffer as `eig()`'s `out` threads it straight through
+//       as the kernel's working input, so eig allocates NO PARALLEL `n²`-sized
+//       input buffer. We assert the count of fresh `n²`-byte-size allocations on
+//       the `out=Some` (reuse) path equals the `out=None` baseline — a parallel
+//       input copy would be +1 and the gate goes RED (D-11 gate 2).
+//    3. `memory_gate_svd_no_midsweep_readback` — `svd()` performs ZERO metered
+//       read-backs (`read_backs == 0` after it returns: the convergence loop is a
+//       single in-kernel cube, and the post-convergence sort uses plain `to_host`,
+//       which deliberately does NOT bump the counter), then EXACTLY one
+//       (`read_backs == 1`) after the single terminal `to_host_metered`. A
+//       mid-sweep host round-trip would route through the metered path and the
+//       gate goes RED (T-03-05-02 / D-11 gate 3).
+//
+//  The counter assertions are backend-agnostic (green on cpu f32+f64 AND rocm
+//  f32 — the Phase-2 gate observed identical figures cpu==wgpu; the same holds
+//  cpu==rocm). f64 runs on cpu only; the gates here drive f32 (portable on every
+//  backend) so they assert the SAME counters everywhere with no capability gate.
+// ===========================================================================
+// ===========================================================================
+
+/// A deterministic, well-conditioned tall `rows × cols` f32 matrix for the
+/// Jacobi gates: a small diagonal-dominant spread so the sweep converges quickly
+/// (the gates assert on POOL COUNTERS, not numerical values, but the prim must
+/// CONVERGE — a `NotConverged` would `expect`-panic, so the fill is conditioned).
+fn fill_conditioned(rows: usize, cols: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            // Diagonal-dominant: large on the (wrapped) diagonal, tiny elsewhere.
+            v[r * cols + c] = if r % cols == c {
+                4.0 + (c as f32) * 0.5
+            } else {
+                0.05 * (((r + c) % 7) as f32) - 0.15
+            };
+        }
+    }
+    v
+}
+
+/// A deterministic symmetric `n × n` f32 matrix for the eig gate (eig TRUSTS
+/// symmetry — D-06 — so we hand it a genuinely symmetric, well-conditioned input
+/// that converges; the gate asserts on counters, not eigenvalues).
+fn fill_symmetric(n: usize) -> Vec<f32> {
+    let mut a = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            a[i * n + j] = if i == j {
+                3.0 + (i as f32)
+            } else {
+                let v = 0.1 * (((i + j) % 5) as f32) - 0.2;
+                v // symmetric: a[i,j] depends only on (i+j)
+            };
+        }
+    }
+    a
+}
+
+// ===========================================================================
+// D-11 Gate 1 — bounded Jacobi scratch (allocations don't grow with sweeps).
+// ===========================================================================
+
+/// D-11 gate 1 (T-03-05-01): thread ONE `BufferPool` through `svd()` and run it
+/// `N` times at the SAME shape. Because the convergence sweep loop is ENTIRELY
+/// in-kernel (a single cube launch — no host-driven per-sweep iteration), the
+/// host sees a FIXED set of pool buffers per `svd()` call regardless of how many
+/// internal Jacobi sweeps the kernel runs. So:
+///
+///   1a. The per-call FRESH-allocation delta is FLAT (== 0) after a warmup call:
+///       once each scratch byte-size has been seen once, every subsequent call is
+///       served entirely from the free-list (reuses), adding NO fresh allocation.
+///       A per-sweep or per-call allocation regression makes this delta climb —
+///       the RED-if-broken signal.
+///   1b. `live_bytes` CONSERVES — after the warmup it returns to the exact same
+///       value every call (all transient scratch released via `release_into`; the
+///       returned U/S/Vᵀ are released by the caller each iteration). A growing
+///       `live_bytes` means scratch is NOT released (it stacks).
+///   1c. `peak_bytes` PLATEAUS — it never rises after the warmup, because the
+///       released scratch is reused in place rather than stacking with sweeps.
+#[test]
+fn memory_gate_jacobi_scratch_bounded() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    const N: usize = 5;
+    let (rows, cols) = (6usize, 4usize); // tall: k = cols = 4.
+    let input = fill_conditioned(rows, cols);
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Device-resident input, uploaded ONCE and reused across all N calls (so the
+    // per-call deltas measure ONLY svd()'s internal scratch, not input churn).
+    let a: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &input);
+
+    let mut allocs_after: Vec<u64> = Vec::with_capacity(N);
+    let mut live_after: Vec<u64> = Vec::with_capacity(N);
+    let mut peak_after: Vec<u64> = Vec::with_capacity(N);
+
+    for _iter in 0..N {
+        let (u, s, vt) =
+            svd::<f32>(&mut pool, &a, (rows, cols)).expect("svd converges on the conditioned input");
+        // Release the returned factors back to the pool so `live_bytes` returns to
+        // the persistent baseline (the input `a`) — the caller owns these, so the
+        // gate must release them to observe conservation.
+        u.release_into(&mut pool);
+        s.release_into(&mut pool);
+        vt.release_into(&mut pool);
+
+        let st = pool.stats();
+        allocs_after.push(st.allocations);
+        live_after.push(st.live_bytes);
+        peak_after.push(st.peak_bytes);
+    }
+
+    // Iteration 0 is warmup (first sight of each scratch size is a fresh alloc);
+    // steady state holds from iteration 1 onward.
+    let live_baseline = live_after[1];
+    let peak_baseline = peak_after[1];
+
+    for iter in 2..N {
+        // HARD GATE 1a: the per-call FRESH-allocation delta is FLAT (== 0) — the
+        // load-bearing "allocations don't grow with sweep/iteration count" signal.
+        let alloc_delta = allocs_after[iter] - allocs_after[iter - 1];
+        assert_eq!(
+            alloc_delta, 0,
+            "D-11 gate 1a (bounded Jacobi scratch) FAILED on {backend}: call {iter} \
+             allocated {alloc_delta} fresh buffer(s) (allocations {} -> {}) — the \
+             sweep scratch is GROWING with the call/sweep count instead of being \
+             recycled from the free-list. stats={:?}",
+            allocs_after[iter - 1],
+            allocs_after[iter],
+            pool.stats()
+        );
+
+        // HARD GATE 1b: live_bytes CONSERVES — scratch released, not stacked.
+        assert_eq!(
+            live_after[iter], live_baseline,
+            "D-11 gate 1b (live_bytes conserved) FAILED on {backend}: call {iter} \
+             live_bytes={} != baseline={live_baseline} — svd scratch is NOT being \
+             released (it stacks each call). stats={:?}",
+            live_after[iter],
+            pool.stats()
+        );
+
+        // HARD GATE 1c: peak_bytes PLATEAUS — bounded, never rises with sweeps.
+        assert_eq!(
+            peak_after[iter], peak_baseline,
+            "D-11 gate 1c (peak_bytes bounded) FAILED on {backend}: call {iter} \
+             peak_bytes={} != baseline={peak_baseline} — peak grows with the call \
+             count (scratch stacks). stats={:?}",
+            peak_after[iter],
+            pool.stats()
+        );
+    }
+
+    println!(
+        "D-11 gate 1 backend={backend}: N={N} rows={rows} cols={cols} \
+         live_baseline={live_baseline} peak_baseline={peak_baseline} \
+         final_stats={:?}",
+        pool.stats()
+    );
+}
+
+// ===========================================================================
+// D-11 Gate 2 — eig() reuses the covariance/GEMM output buffer (no parallel n²).
+// ===========================================================================
+
+/// D-11 gate 2 (covariance/GEMM buffer reuse): `eig()` accepts an optional `out`
+/// buffer — the covariance/GEMM `n_features²` output handle — which it threads
+/// straight through as the kernel's working INPUT (the kernel only reads it,
+/// writing `w`/`V`), so the `full` PCA path does NOT allocate a PARALLEL `n²`
+/// matrix for the eig input.
+///
+/// The honest, falsifiable signal is the PEAK live-bytes RISE that eig drives
+/// while the threaded-through `out` buffer is held LIVE by the caller. The PCA
+/// `full` path holds the covariance/GEMM Gram (`n²`) live and passes it as `out`;
+/// eig threads it straight through as the kernel input, so the buffers live AT
+/// eig's high-water mark are: the threaded `out` (`n²`, already live) + the small
+/// internal scratch eig acquires (`w` = `n`, `V` = `n²`, `info` = 2). If eig
+/// instead COPIED `out` into a FRESH `a_in` working buffer, an EXTRA `n²` buffer
+/// would be live simultaneously with `out`, raising the peak by a further `n²`.
+///
+/// So we measure the peak rise eig drives ABOVE the live baseline (the threaded
+/// `out` held by the caller) and assert it stays BELOW the `2·n²` threshold a
+/// parallel-input copy would cross. Concretely the reuse-path eig high-water
+/// addition is `w + V + info ≈ n² + small`; a parallel copy would be `≥ 2·n²`.
+/// The `< 2·n²` bound is the load-bearing, build-failing reuse detector (`Handle`
+/// has no `PartialEq`, so byte-accounting — not handle identity — is the probe).
+///
+/// Why peak-rise (not the Phase-2 free-list probe or a raw `allocations` count):
+/// eig RELEASES the threaded `out` back to the pool after the launch consumes it,
+/// so a free-list-residency probe would (correctly) see the legitimately-reused
+/// buffer pooled and cannot distinguish it from a parallel one; and the raw
+/// `allocations` count is confounded by upstream free-list warming (the seed GEMM
+/// vs. the `from_host` metering buffer leave the free-list in different states).
+/// The simultaneously-LIVE byte high-water mark is immune to both: a reused input
+/// is the SAME live buffer as `out`, a copied input is an ADDITIONAL live buffer.
+#[test]
+fn memory_gate_eig_reuses_gram_buffer() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    let n = 4usize; // n_features
+    let gram_elems = n * n;
+    let n2_bytes = (gram_elems * std::mem::size_of::<f32>()) as u64;
+
+    // Symmetric, well-conditioned n×n input (eig TRUSTS symmetry — D-06).
+    let sym = fill_symmetric(n);
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let a: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &sym);
+
+    // A genuine n_features² covariance/GEMM output buffer (AᵀA over `a`), exactly
+    // as the PCA `full` path produces before calling eig. This is the buffer the
+    // caller holds LIVE and passes through as eig's `out` (D-11 gate 2).
+    let gram_out = gemm::<f32>(
+        &mut pool,
+        &a,
+        (n, n),
+        &a,
+        (n, n),
+        /* transa */ true,
+        /* transb */ false,
+        None,
+    )
+    .expect("seed GEMM accepts the validated n×n shape");
+    assert_eq!(gram_out.len(), gram_elems, "seed GEMM output is n_features²");
+
+    // Thread the Gram output through as eig's `out`. It stays live (the caller's
+    // `gram_out` still owns the handle) across the eig call.
+    let eig_out =
+        DeviceArray::<ActiveRuntime, f32>::from_raw(gram_out.handle().clone(), gram_elems);
+
+    // Live baseline just before eig: the persistent footprint the caller holds
+    // (input `a` + the live Gram `out`). eig's peak rise is measured ABOVE this.
+    let live_before = pool.stats().live_bytes;
+    let peak_before = pool.stats().peak_bytes;
+
+    let (w, v) = eig::<f32>(&mut pool, &a, n, Some(eig_out)).expect("eig converges (out=Some)");
+
+    // The high-water mark eig drove above the pre-call live baseline. Because eig
+    // reuses the threaded `out` as its kernel input (not a fresh copy), the only
+    // NEW simultaneously-live bytes are eig's own outputs/scratch (w + V + info).
+    let peak_after = pool.stats().peak_bytes;
+    let eig_peak_rise = peak_after.saturating_sub(live_before.max(peak_before));
+
+    // HARD GATE 2: eig's peak rise above the live baseline is LESS THAN a second
+    // parallel n² matrix (2·n²). A reuse keeps the input == the live `out`, so the
+    // rise is ≈ n² (V) + small (w + info); a parallel input copy would add a
+    // second n² and push the rise to ≥ 2·n². The strict `< 2·n²` bound goes RED
+    // the instant eig copies `out` into a fresh parallel working buffer.
+    assert!(
+        eig_peak_rise < 2 * n2_bytes,
+        "D-11 gate 2 FAILED on {backend}: eig(out=Some) drove a peak rise of \
+         {eig_peak_rise} B above the live baseline — ≥ 2·n² ({} B) means a PARALLEL \
+         n² input buffer was allocated alongside the threaded-through `out` instead \
+         of reusing it as the kernel input. n²={n2_bytes} B live_before={live_before} \
+         peak_after={peak_after} stats={:?}",
+        2 * n2_bytes,
+        pool.stats()
+    );
+
+    w.release_into(&mut pool);
+    v.release_into(&mut pool);
+
+    println!(
+        "D-11 gate 2 backend={backend}: n_features²={gram_elems} n²_bytes={n2_bytes} \
+         live_before={live_before} peak_after={peak_after} \
+         eig_peak_rise={eig_peak_rise} (< 2·n² → eig reused the threaded `out`) \
+         stats={:?}",
+        pool.stats()
+    );
+}
+
+// ===========================================================================
+// D-11 Gate 3 — no host round-trip between sweeps (read_backs == 1 terminal).
+// ===========================================================================
+
+/// D-11 gate 3 (T-03-05-02): `svd()` runs its convergence sweep loop ENTIRELY
+/// in-kernel (a single cube launch), so it performs NO metered device→host
+/// read-back between sweeps. The prim's internal post-convergence reads (the V/S
+/// sort + thin-U normalize) go through PLAIN `to_host`, which deliberately does
+/// NOT bump the `read_backs` counter — so after `svd()` returns the count is
+/// still 0. The ONLY metered read-back is the caller's single terminal
+/// `to_host_metered` on a result, bumping the count to exactly 1.
+///
+/// A mid-sweep host round-trip (a host-driven sweep loop reading the matrix back
+/// between sweeps through the metered path) would push `read_backs > 1` and this
+/// gate goes RED — the load-bearing "device-resident convergence loop" signal.
+#[test]
+fn memory_gate_svd_no_midsweep_readback() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    let (rows, cols) = (6usize, 4usize);
+    let input = fill_conditioned(rows, cols);
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let a: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &input);
+
+    // Sanity: no metered read-back before svd() runs.
+    assert_eq!(
+        pool.stats().read_backs,
+        0,
+        "no metered read-back before svd() runs (on {backend})"
+    );
+
+    // Run the full SVD: the in-kernel convergence loop + the post-convergence
+    // host sort (plain to_host, NOT metered). The convergence loop performs no
+    // mid-sweep metered round-trip.
+    let (u, _s, vt) =
+        svd::<f32>(&mut pool, &a, (rows, cols)).expect("svd converges on the conditioned input");
+
+    // HARD GATE 3a: read_backs == 0 after svd() returns — the convergence loop is
+    // in-kernel and the internal sort/normalize uses plain to_host (unmetered).
+    assert_eq!(
+        pool.stats().read_backs,
+        0,
+        "D-11 gate 3a FAILED on {backend}: read_backs={} after svd() (expected 0) — \
+         the convergence sweep loop performed a MID-SWEEP metered host round-trip \
+         instead of staying device-resident. stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
+
+    // --- Terminal read: the SINGLE metered read-back on a result factor. ---
+    let host_u = u.to_host_metered(&mut pool);
+    assert_eq!(host_u.len(), rows * cols, "terminal read-back yields U (rows×k)");
+
+    // HARD GATE 3b: read_backs == 1 after exactly ONE terminal to_host_metered.
+    assert_eq!(
+        pool.stats().read_backs,
+        1,
+        "D-11 gate 3b FAILED on {backend}: read_backs={} (expected exactly 1, the \
+         terminal read) — svd secretly round-trips device→host through the metered \
+         path between sweeps. stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
+
+    // Release the held factors so the pool's Drop log shows a clean footprint.
+    u.release_into(&mut pool);
+    vt.release_into(&mut pool);
+
+    println!(
+        "D-11 gate 3 backend={backend}: svd rows={rows} cols={cols} \
+         read_backs={} (terminal only) stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
 }
