@@ -30,7 +30,9 @@
 //!
 //! Per AGENTS.md §2, tests live in `tests/`, never as a `#[cfg(test)] mod tests`
 //! in `src/`. Each test is a plain `#[test]` and logs the active backend line; the
-//! counter assertions are backend-agnostic (green on cpu AND wgpu).
+//! counter assertions are backend-agnostic (green on cpu AND rocm — the Phase-3
+//! D-07 GPU gate; the Phase-2 figures were identical cpu==wgpu and remain so
+//! cpu==rocm, matching the Phase-3 section lower in this file).
 
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;

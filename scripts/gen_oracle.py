@@ -64,6 +64,12 @@ COV_N_SAMPLES, COV_N_FEATURES = 7, 4
 # realistic without being a stress test.
 SVD_TALL = (8, 4)
 SVD_WIDE = (4, 8)
+# SVD_TALL_ODD has an ODD thin dimension (k = min(m, n) = 5) to pin the
+# circle-method round-robin schedule for odd `cols` (CR-01 — the even-only
+# schedule silently omitted ~half the column pairs for odd k, returning a
+# wrong/non-orthonormal factorization). 9×5 keeps the fixture tiny while
+# exercising the ghost-padded odd-parity pairing.
+SVD_TALL_ODD = (9, 5)
 
 # Symmetric-eig convention-fixture size (D-06, PRIM-05). EIG_N is the order of
 # the square symmetric matrix the eig primitive decomposes; small so the
@@ -348,6 +354,11 @@ def main() -> None:
     print(f"wrote {gen_svd(dtype=np.float32, shape=SVD_TALL, kind='tall')}")
     print(f"wrote {gen_svd(dtype=np.float64, shape=SVD_TALL, kind='tall')}")
     print(f"wrote {gen_svd(dtype=np.float32, shape=SVD_WIDE, kind='wide')}")
+    # Odd thin-dim (k=5) tall case (CR-01): f32 (cpu+rocm) + f64 (cpu gate) so
+    # the committed numpy oracle pins the odd-parity pairing the primitive must
+    # now hold. 9×5 → U is 9×5, S length 5, Vt is 5×5.
+    print(f"wrote {gen_svd(dtype=np.float32, shape=SVD_TALL_ODD, kind='tall_odd')}")
+    print(f"wrote {gen_svd(dtype=np.float64, shape=SVD_TALL_ODD, kind='tall_odd')}")
     # Symmetric eig (PRIM-05, D-04/D-06): f32+f64 so the f64 cpu path is pinned.
     # np.linalg.eigh is the numpy reference, REVERSED to descending (D-04).
     print(f"wrote {gen_eigh(dtype=np.float32)}")
