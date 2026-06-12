@@ -5,12 +5,14 @@
 //! depend on any CubeCL backend runtime feature (Criterion 1); a concrete
 //! runtime is chosen in `mlrs-backend`.
 
+pub mod cholesky;
 pub mod elementwise;
 pub mod jacobi_eig;
 pub mod jacobi_svd;
 pub mod reduce;
 pub mod smoke;
 
+pub use cholesky::cholesky_solve;
 pub use elementwise::{center_columns, clamp_nonneg, dist_combine_clamp, scale, sqrt_elem};
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
