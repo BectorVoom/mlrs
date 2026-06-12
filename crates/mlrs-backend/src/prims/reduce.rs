@@ -250,8 +250,12 @@ pub enum ScalarOp {
     Min,
     /// maximum over the axis.
     Max,
-    /// `sqrt(Σ xᵢ²)` over the axis (row-L2-norm consumed by Plan 03 distance).
+    /// `sqrt(Σ xᵢ²)` over the axis (row-L2-norm).
     L2Norm,
+    /// `Σ xᵢ²` over the axis — the SQUARED L2 norm, NO sqrt finalize. This is
+    /// the term Plan 03's GEMM-expansion distance needs directly (`‖x_i‖²`),
+    /// distinct from [`ScalarOp::L2Norm`] which applies the final sqrt.
+    SumSq,
 }
 
 impl ScalarOp {
@@ -260,7 +264,7 @@ impl ScalarOp {
             ScalarOp::Sum | ScalarOp::Mean => Op::Sum,
             ScalarOp::Min => Op::Min,
             ScalarOp::Max => Op::Max,
-            ScalarOp::L2Norm => Op::SumSq,
+            ScalarOp::L2Norm | ScalarOp::SumSq => Op::SumSq,
         }
     }
 }
@@ -274,7 +278,9 @@ where
     F: Float + CubeElement + Pod,
 {
     match op {
-        ScalarOp::Sum | ScalarOp::Min | ScalarOp::Max => raw,
+        // SumSq passes the raw Σxᵢ² through (the squared norm — no sqrt), unlike
+        // L2Norm which finalizes with sqrt.
+        ScalarOp::Sum | ScalarOp::Min | ScalarOp::Max | ScalarOp::SumSq => raw,
         ScalarOp::Mean => f64_to_host::<F>(host_to_f64(raw) / (n.max(1) as f64)),
         ScalarOp::L2Norm => f64_to_host::<F>(host_to_f64(raw).sqrt()),
     }
