@@ -51,6 +51,13 @@ GEMM_M, GEMM_K, GEMM_N = 5, 4, 3
 # the fixture exercises rectangular geometry and rows_x != rows_y.
 DIST_ROWS_X, DIST_ROWS_Y, DIST_COLS = 5, 4, 3
 
+# Covariance convention-fixture shape (D-12, PRIM-04). A is
+# n_samples×n_features (observations in rows, features in columns — the
+# ``rowvar=False`` convention); the covariance C is n_features×n_features.
+# n_samples > n_features and non-square so the fixture exercises a realistic
+# rectangular data matrix and ddof actually changes the normalisation.
+COV_N_SAMPLES, COV_N_FEATURES = 7, 4
+
 
 def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
     """Generate one seeded saxpy fixture and write it to ``tests/fixtures``.
@@ -130,6 +137,42 @@ def gen_distance(seed: int = SEED, dtype=np.float32, sqrt: bool = False) -> str:
     return out_path
 
 
+def gen_covariance(seed: int = SEED, dtype=np.float32, ddof: int = 1) -> str:
+    """Generate one seeded covariance convention fixture (D-12, PRIM-04).
+
+    Stores named arrays ``A`` (n_samples×n_features) and the NumPy reference
+    covariance ``C`` (n_features×n_features), every array cast to the fixture's
+    dtype. The reference is ``np.cov(A, rowvar=False, ddof=ddof)``:
+
+      - ``rowvar=False`` so the FEATURES are the columns of ``A`` (matching the
+        host API's ``(n_samples, n_features)`` row-major contract — observations
+        in rows). This pins exactly the convention PCA + the linear closed-form
+        solvers inherit.
+      - ``ddof=0`` is the population normalisation (divide by ``n``); ``ddof=1``
+        is the sample normalisation (divide by ``n − 1``). Both are emitted so
+        the device covariance is pinned for BOTH conventions (D-12).
+
+    ``np.cov`` centres each column by its mean before forming ``AᵀA`` and then
+    divides by ``n − ddof`` — exactly the device pipeline (column-mean centring →
+    ``AᵀA`` via GEMM(transa) → ``1/(n−ddof)`` scale). The fixture is therefore
+    the authoritative normalisation oracle, not a tautology of the device
+    algebra. Returns the absolute path written.
+    """
+    rng = np.random.default_rng(seed)
+    a = rng.standard_normal((COV_N_SAMPLES, COV_N_FEATURES)).astype(dtype)
+    # rowvar=False: variables (features) are the COLUMNS of A. Compute in the
+    # fixture dtype so the committed C matches a same-dtype device covariance.
+    c = np.cov(a, rowvar=False, ddof=ddof).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"cov_ddof{ddof}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, A=a, C=c)
+    return out_path
+
+
 def gen_argmin_tie(seed: int = SEED) -> str:
     """Generate the deliberate-tie argmin convention fixture (D-02, PRIM-02).
 
@@ -194,6 +237,11 @@ def main() -> None:
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_distance(dtype=dtype, sqrt=False)}")
     print(f"wrote {gen_distance(dtype=np.float64, sqrt=True)}")
+    # Covariance (PRIM-04): population (ddof=0) f64, sample (ddof=1) f64 + f32
+    # so BOTH ddof conventions are pinned and the f32 sample case is covered.
+    print(f"wrote {gen_covariance(dtype=np.float64, ddof=0)}")
+    print(f"wrote {gen_covariance(dtype=np.float64, ddof=1)}")
+    print(f"wrote {gen_covariance(dtype=np.float32, ddof=1)}")
     print(f"wrote {gen_argmin_tie()}")
 
 
