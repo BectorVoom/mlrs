@@ -31,7 +31,20 @@ findings:
   warning: 7
   info: 4
   total: 14
-status: issues_found
+status: resolved
+resolved:
+  - CR-01
+  - CR-02
+  - CR-03
+  - WR-01
+  - WR-07
+  - IN-02
+resolved_count: 6
+gap_closure: 2026-06-12
+gap_closure_commits:
+  - "ac93f8b fix(02): distance/covariance force internal Shared path; guard covariance divisor (CR-01/WR-01)"
+  - "dde3f9e fix(02): reject empty-input reductions at boundary; op-correct empty identity (CR-03)"
+  - "689cf5d fix(02): release transient scratch with true byte size; honest reuse gate (CR-02/WR-07/IN-02)"
 ---
 
 # Phase 2: Code Review Report
@@ -39,7 +52,7 @@ status: issues_found
 **Reviewed:** 2026-06-12
 **Depth:** standard
 **Files Reviewed:** 22
-**Status:** issues_found
+**Status:** resolved (gap-closure 2026-06-12 — all 3 Critical + WR-01/WR-07 + IN-02 fixed; see per-finding RESOLVED notes and `02-REVIEW-FIX-SUMMARY.md`)
 
 ## Summary
 
@@ -56,6 +69,8 @@ The numerical-tolerance handling in tests is honest (abs bound never loosened; n
 ## Critical Issues
 
 ### CR-01: `distance` / `covariance` panic on `ReducePath::Plane` without subgroup support
+
+**Status:** RESOLVED (commit ac93f8b) — distance/covariance now force the always-portable `ReducePath::Shared` for their INTERNAL norm/mean term and removed the now-dead `path` parameter from both public signatures; regression tests (`distance_internal_norm_portable_no_plane_panic`, `covariance_internal_mean_portable_no_plane_panic`) prove correct results + no panic on a plane-less adapter.
 
 **File:** `crates/mlrs-backend/src/prims/distance.rs:105-108`, `crates/mlrs-backend/src/prims/covariance.rs:96-97`
 **Issue:** `row_reduce` and `column_reduce` honor the D-03 skip contract: when `path == Plane` and `capability::plane_supported()` is `false` they log a warning and `return Ok(None)` (reduce.rs:187-190 and 224-227). But the composite primitives unwrap that `None` with `.expect(...)`:
@@ -91,6 +106,8 @@ If the `path` parameter is meant to be live, add a test that drives `distance`/`
 
 ### CR-02: Acquired scratch/output buffers are never released — pool accounting and reuse are broken
 
+**Status:** RESOLVED (commit 689cf5d) — added `DeviceArray::release_into(pool)` (files the handle under its own true `byte_size()`, consumes `self`); transient scratch is now released once its consuming kernel is launched in covariance (means + centred copy), distance (XYᵀ + both norms), `reduce_segment` (each inter-pass partial), row/column_reduce (per-axis segment + result), and argreduce (per-cube value/index) — never the returned output. Memory gate 1 was rewritten to assert `live_bytes` conservation + `peak_bytes` plateau + growing scratch-reuse, and was verified to go RED when the releases are removed.
+
 **File:** `crates/mlrs-backend/src/prims/reduce.rs:432`, `crates/mlrs-backend/src/prims/gemm.rs:99`, `crates/mlrs-backend/src/prims/distance.rs:118`, `crates/mlrs-backend/src/prims/covariance.rs:106`
 **Issue:** Every real buffer obtained via `pool.acquire(...)` for kernel scratch or output is wrapped in a `DeviceArray` (or kept as a loop handle) and **never returned via `pool.release(...)`**. `DeviceArray` has no `Drop` impl (device_array.rs has no `impl Drop`), so dropping a `DeviceArray` neither decrements `live_bytes` nor pushes the handle back onto the free-list. Concretely:
 
@@ -113,6 +130,8 @@ Consequences:
 At minimum, document that `live_bytes`/`peak_bytes` are non-conserving and rewrite gate 1 to assert on a counter that actually measures scratch reuse, so the gate cannot pass on `from_host` churn alone.
 
 ### CR-03: Empty-input reductions return wrong identity; `min`/`max`/`l2_norm([])` yield `0`
+
+**Status:** RESOLVED (commit dde3f9e + covariance arm in ac93f8b) — empty geometry is now rejected at the public boundary: `validate_nonempty` guards the full-array reductions/argreduce, `validate_matrix` rejects `rows==0 || cols==0` for axis-wise reductions, and covariance's `validate_geometry` rejects empty `a`. As defense-in-depth the now-unreachable `reduce_segment` `len==0` branch returns the OP-CORRECT identity (Sum/SumSq→0, Min→+inf, Max→-inf) instead of a blanket 0. Pinned by `empty_reductions_rejected_at_boundary`.
 
 **File:** `crates/mlrs-backend/src/prims/reduce.rs:385-388`
 **Issue:** `reduce_segment` short-circuits *all* ops on `len == 0` to `F::from_int(0)`:
@@ -144,6 +163,8 @@ Prefer rejecting empty geometry at the public boundary (`validate_matrix` / the 
 ## Warnings
 
 ### WR-01: `covariance` with `n_samples == ddof` produces `inf` with no validation
+
+**Status:** RESOLVED (commit ac93f8b) — `covariance::validate_geometry` now takes `ddof` and rejects `(n_samples as i64) - (ddof as i64) <= 0` with `PrimError::DimMismatch { dim: "n_samples-ddof", .. }` before any launch. Kept consistent with CR-03 (empty geometry rejected in the same validator). Pinned by `covariance_rejects_zero_divisor_and_empty_geometry`.
 
 **File:** `crates/mlrs-backend/src/prims/covariance.rs:155-156`
 **Issue:** `denom = (n_samples as i64) - (ddof as i64)` and `factor = recip(denom)`. When `n_samples == ddof` (e.g. a single-sample matrix with `ddof = 1`), `denom == 0` and `recip` computes `1.0 / 0.0 == inf`, scaling the entire Gram to `inf`/`NaN` with no error. The docstring claims "`> 0` for any valid covariance" but nothing enforces it.
@@ -181,6 +202,8 @@ Prefer rejecting empty geometry at the public boundary (`validate_matrix` / the 
 
 ### WR-07: `BufferPool::release` accepts a size that may not match the handle's real size
 
+**Status:** RESOLVED (commit 689cf5d) — every new release routes through `DeviceArray::release_into`, which releases under the array's own `byte_size()` = `len * size_of::<F>()` (the true acquisition size carried by the array), so a mismatched-size release is impossible by construction. The one raw `pool.release` in `reduce_segment` likewise uses the partial's true `cur_len * elem`.
+
 **File:** `crates/mlrs-backend/src/pool.rs:130-133`
 **Issue:** `release(handle, size_bytes)` files the handle under `size_bytes` with no verification that the handle was acquired at that size. A caller that releases a handle under the wrong key pollutes the free-list: a later `acquire(size_bytes)` hands back a buffer of a *different* real size, causing an over/under-read. The `saturating_sub` on `live_bytes` masks the accounting error but not the buffer-size mismatch. Given CR-02 (release is barely used), this is latent, but it becomes load-bearing once releases are added.
 **Fix:** Carry the byte size in `DeviceArray` (it already knows `len * size_of::<F>()`) and release with the array's own size, or key the free-list off a handle that records its size, so a mismatched release is impossible.
@@ -194,6 +217,8 @@ Prefer rejecting empty geometry at the public boundary (`validate_matrix` / the 
 **Fix:** Document the zero-length-axis behavior or reject it at `validate_matrix`.
 
 ### IN-02: `feature_enabled` constructs a fresh client on every call
+
+**Status:** RESOLVED (commit 689cf5d, loop-hoist arm only) — the loop-invariant `active_plane_width()` query is now computed ONCE before `reduce_segment`'s multi-pass loop (as a power-of-two cube floor) instead of every pass. The broader "fresh client per call" smell in `capability.rs` is left as documented v1-perf-scope (the facade contract is unchanged).
 
 **File:** `crates/mlrs-backend/src/capability.rs:51-54`, `81-83`, `94-99`
 **Issue:** `feature_enabled`, `plane_supported`, and `active_plane_width` each call `crate::runtime::active_client()`, building/cloning a client per invocation. `reduce_segment`'s plane path calls `active_plane_width()` inside the multi-pass loop (reduce.rs:412), repeating the query every pass. Out of v1 perf scope, but it is also a correctness smell if `active_client()` is not idempotent across calls.

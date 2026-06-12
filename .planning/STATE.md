@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Plan 02-05 complete (D-10 build-failing memory gate: reuse>0/bounded, read_backs==1, Gram reuses GEMM buffer) — Phase 02 COMPLETE (5/5 plans)
-last_updated: "2026-06-12T00:30:00.000Z"
-last_activity: 2026-06-12 -- Plan 02-05 executed (D-10 memory gate: three HARD PoolStats assertions, green cpu+wgpu; Phase 02 complete)
+stopped_at: Phase 02 code-review gap-closure complete (CR-01/CR-02/CR-03 + WR-01/WR-07/IN-02 resolved; cpu+wgpu green; no tolerance loosened) — Phase 02 COMPLETE (5/5 plans)
+last_updated: "2026-06-12T01:30:00.000Z"
+last_activity: 2026-06-12 -- Phase 02 review gap-closure: distance/covariance internal Shared path + dropped path param (CR-01); transient scratch released with true byte size + honest memory gate (CR-02/WR-07); empty-reduction rejection + covariance divisor guard (CR-03/WR-01); plane-width hoist (IN-02). Commits ac93f8b, dde3f9e, 689cf5d.
 progress:
   total_phases: 6
   completed_phases: 2
@@ -25,11 +25,11 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 02 (core-compute-primitives) — COMPLETE
+Phase: 02 (core-compute-primitives) — COMPLETE (review gap-closure applied 2026-06-12)
 Plan: 5 of 5 (all complete)
-Status: Phase 02 complete (plans 01-05 done); next Phase 03 needs `/gsd-plan-phase --research-phase 3`
-Last activity: 2026-06-12 -- Plan 02-05 executed (D-10 build-failing memory gate; Phase 02 complete)
-Resume file: — (Phase 02 complete; Phase 03 SVD/eig needs research before planning)
+Status: Phase 02 complete + code review resolved (02-REVIEW.md: CR-01/CR-02/CR-03/WR-01/WR-07/IN-02 fixed; see 02-REVIEW-FIX-SUMMARY.md); next Phase 03 needs `/gsd-plan-phase --research-phase 3`
+Last activity: 2026-06-12 -- Phase 02 review gap-closure (3 Critical + WR-01/WR-07/IN-02; cpu+wgpu green, no tolerance loosened)
+Resume file: — (Phase 02 complete + review-clean; Phase 03 SVD/eig needs research before planning)
 
 Progress: [███░░░░░░░] 33% (2/6 phases; 10/10 plans)
 
