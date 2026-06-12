@@ -89,6 +89,16 @@ reconciling.
   and must be updated (orchestrator/planner action). The f64 capability gate
   (`skip_f64_with_log`) stays in place as the portable mechanism, but on rocm
   f64 is expected to RUN, not skip.
+  - **RESEARCH CORRECTION (Plan 03-01, empirical):** the clause "gfx1100 supports
+    f64 natively → f64 runs on rocm" is **FALSE at the CubeCL layer**. Although
+    the gfx1100 *hardware* supports f64, `cubecl-cpp 0.10.0` does NOT register
+    `F64` for the HIP backend (`register_supported_types`, `src/shared/base.rs`),
+    so `capability::supports_type(F64) == false` on rocm (measured:
+    `capability backend=rocm f32_supported=true f64_supported=false`). Therefore
+    **the gate is cpu(f64) + rocm(f32)**: f64 validates on **cpu** (which runs
+    f64), rocm validates **f32**, and f64-on-rocm **SKIPS-with-log** exactly as
+    Phase 2 — this is EXPECTED, not a defect. `skip_f64_with_log` is the unchanged
+    portable mechanism. (RESEARCH 03 CRITICAL FINDING 2 / Pitfall 1; cites D-07.)
 
 ### Oracle & tolerance policy
 - **D-09:** **Primary reference = numpy fixtures + reference-free invariants.**

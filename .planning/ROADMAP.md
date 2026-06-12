@@ -2,7 +2,7 @@
 
 ## Overview
 
-mlrs is built primitive-first along a strictly acyclic five-crate workspace. The foundation phase lands the spine that makes everything else testable: the scikit-learn oracle harness (sign-flip + label-permutation helpers + f32 tolerance policy), the Arrow zero-copy bridge with validation, the f64 capability gate, and per-backend wheel naming. From there, compute primitives are validated standalone before any estimator exists — GEMM/reductions/distance/covariance, then the SVD/eig hard gate in its own phase. Estimators are then "mostly assembly": closed-form models (OLS, Ridge, PCA, TruncatedSVD) first to exercise the full pipeline with no convergence risk, then distance-based and iterative-solver estimators, then the complete PyO3 Python surface and per-backend wheels. Correctness against scikit-learn within 1e-5 on both the `cpu` and `wgpu` backends, for both `f32` and `f64` (capability-gated), is the gate at every phase.
+mlrs is built primitive-first along a strictly acyclic five-crate workspace. The foundation phase lands the spine that makes everything else testable: the scikit-learn oracle harness (sign-flip + label-permutation helpers + f32 tolerance policy), the Arrow zero-copy bridge with validation, the f64 capability gate, and per-backend wheel naming. From there, compute primitives are validated standalone before any estimator exists — GEMM/reductions/distance/covariance, then the SVD/eig hard gate in its own phase. Estimators are then "mostly assembly": closed-form models (OLS, Ridge, PCA, TruncatedSVD) first to exercise the full pipeline with no convergence risk, then distance-based and iterative-solver estimators, then the complete PyO3 Python surface and per-backend wheels. Correctness against scikit-learn within 1e-5 is the gate at every phase: through Phase 2 this ran on `cpu` and `wgpu`; **from Phase 3 the gate moves to `cpu` + `rocm`** (D-07), with `f64` validated on `cpu` and `f32` on `rocm` (f64-on-rocm skips-with-log — cubecl-cpp 0.10 does not register F64 for the HIP backend; wgpu is opportunistic only).
 
 ## Phases
 
@@ -84,9 +84,9 @@ Plans:
 **Requirements**: PRIM-05
 **Success Criteria** (what must be TRUE):
 
-  1. A Jacobi SVD for general matrices matches a host/NumPy reference within tolerance after sign-flip normalization, for f32 and f64 (f64 capability-gated on wgpu).
+  1. A Jacobi SVD for general matrices matches a host/NumPy reference within tolerance after sign-flip normalization, for f32 and f64. The correctness gate is **cpu + rocm** (D-07): f64 validates on cpu; rocm validates f32; f64-on-rocm SKIPS-with-log because cubecl-cpp 0.10 does not register F64 for the HIP backend (empirically confirmed, RESEARCH 03 CRITICAL FINDING 2 — not a defect). wgpu is opportunistic only.
   2. A symmetric eigendecomposition of a covariance matrix (PCA `full` solver path) matches the reference eigenvalues/eigenvectors within tolerance after sign alignment.
-  3. The SVD/eig oracle tests pass on both cpu and wgpu (with documented f32 tolerance), proving the primitive before any estimator consumes it.
+  3. The SVD/eig oracle tests pass on the **cpu + rocm** gate (with documented f32 tolerance), proving the primitive before any estimator consumes it — f64 validates on cpu, f32 validates on rocm, and f64-on-rocm skips-with-log (cubecl-cpp 0.10 F64 unregistered).
 
 **Plans**: 5 plans
 Plans:

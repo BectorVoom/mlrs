@@ -67,7 +67,7 @@ must be right and the backend abstraction must hold.
 - **Language**: Rust (core, kernels, bindings) — full rewrite, no C++/CUDA from cuML retained
 - **Compute**: CubeCL only for device kernels; generic over float type and runtime
 - **Backends**: Cargo features `cuda` (compile-only / untestable in this environment), `rocm`, `wgpu`, `cpu`
-- **Test/CI target**: wgpu + cpu are the primary correctness gates; cuda/rocm compile but are verified opportunistically
+- **Test/CI target**: through Phase 2 the primary gate was wgpu + cpu; **from Phase 3 the correctness gate is cpu + rocm** (D-07) — f64 validates on cpu, f32 validates on rocm, and f64-on-rocm SKIPS-with-log (cubecl-cpp 0.10 does not register F64 for the HIP backend; empirical, not a defect). cuda compiles only (untestable here); wgpu is opportunistic from Phase 3.
 - **Precision**: kernels generic over `f32` and `f64`; both validated in v1
 - **Correctness**: abs/rel error ≤ 1e-5 vs scikit-learn on random-data oracle tests
 - **Python**: ≥ 3.12; sklearn-compatible API surface; users install the package matching their backend
@@ -83,7 +83,7 @@ must be right and the backend abstraction must hold.
 | sklearn-compatible API via PyO3 | Lets existing scikit-learn/cuML users adopt with minimal code change | — Pending |
 | scikit-learn as oracle (not cuML) | CPU reference runs in CI without a GPU; cuML reference would require CUDA hardware | — Pending |
 | Apache Arrow zero-copy interchange | Memory-efficiency priority; avoids host-side copies crossing the Python↔Rust↔device boundary | — Pending |
-| wgpu + cpu as primary CI gate | CUDA untestable in this environment; wgpu runs on commodity hardware/CI | — Pending |
+| Gate = cpu + rocm from Phase 3 (was wgpu + cpu through Phase 2) | gfx1100/ROCm 7.1.1 runs real GPU kernels here; cpu runs f64. f32 validates on rocm, f64 on cpu; f64-on-rocm skips-with-log (cubecl-cpp 0.10 F64 unregistered). CUDA untestable; wgpu opportunistic. (D-07) | — Adopted Phase 3 |
 | Generic over float (`f32`/`f64`) | f64 makes 1e-5 tolerance comfortable; mirrors cuML's float/double symmetry | — Pending |
 | Memory efficiency as per-phase requirement | Stated high priority; retrofitting zero-copy/allocators later is costly | — Pending |
 
