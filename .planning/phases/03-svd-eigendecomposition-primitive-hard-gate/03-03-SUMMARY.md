@@ -25,7 +25,7 @@ tech-stack:
     - "Iterative single-cube #[cube] kernel: in-kernel sweep loop + shared-tree off-diagonal-norm convergence test (no host round-trip between sweeps — D-11 gate 3)"
     - "LDS-budget split: the matrix stays in a GLOBAL handle (a_out, column-major) while only V + the off-diagonal accumulator live in shared, so a 256×64 f32 problem fits gfx1100's 64 KiB LDS"
     - "Two-threshold Jacobi convergence: tiny rotation-skip bound (ε·‖A‖_F) separate from a noise-floor-aware convergence-break bound (8·ε·‖A‖_F·√pairs)"
-    - "Round-robin (circle-method) parallel pair schedule covering all n(n-1)/2 pairs over n-1 disjoint steps per sweep"
+    - "Ghost-padded round-robin (circle-method) pair schedule covering all n(n-1)/2 pairs per sweep for ODD and EVEN cols (CR-01 fix — the original n-1-step form was even-only)"
 
 key-files:
   created:
@@ -144,3 +144,68 @@ The plan's Task-2 acceptance criterion 4 literally greps `to_host == 0` in `svd.
 ## Self-Check: PASSED
 
 All created files present on disk (`jacobi_svd.rs`, `svd.rs`, `03-03-SUMMARY.md`); all four task commits (`1d34c42`, `bf0bb6f`, `d92c619`, `f95c8cf`) exist in git history.
+
+---
+
+## CR-01 Resolution (post-review fix, 2026-06-12)
+
+The Phase-03 code review (`03-REVIEW.md`) found a CRITICAL correctness bug in the
+one-sided Jacobi SVD sweep schedule (CR-01) plus the convergence-trustworthiness
+issue (WR-01) and the coverage gap that masked them (WR-05 / IN-04). All resolved
+on the main working tree; phase completion / re-verification is left to the
+orchestrator.
+
+### Schedule fix (CR-01)
+The circle-method round-robin enumerated all `n(n-1)/2` column pairs only for
+EVEN `cols`. For odd `cols` it visited ~half (`cols=5`→6/10, `cols=7`→12/21),
+leaving off-diagonals un-zeroed → wrong/non-orthonormal factorization or spurious
+`NotConverged` on well-conditioned odd-rank input. Fixed by **ghost padding**: pad
+to an even player count (`cols`, or `cols+1` with a ghost "bye" for odd `cols`),
+run `players-1` circle-method rounds, and skip any pairing touching the ghost
+column (`hi >= cols`). Every real pair is now visited exactly once for both
+parities (verified 4→6/6, 5→10/10, 6→15/15, 7→21/21). The `circle_player` helper
+now rotates over `players`, and the header/inline schedule comments (IN-03) were
+corrected to match the actual "every unit scans every position, the lo unit acts"
+implementation and to state the exact parity contract.
+
+### Clean post-sweep convergence norm (WR-01 / WR-04)
+The off-diagonal norm was accumulated DURING the sweep (a pre/mid-sweep mixture
+that could declare convergence one sweep early and made the host `NotConverged`
+guard untrustworthy). It is now measured from a CLEAN post-sweep state, mirroring
+`jacobi_eig.rs`: a dedicated pass recomputes the Gram off-diagonals `γ_cj` from the
+rotated `a_out` and sums `γ_cj²`, so `info[1]` describes the RETURNED matrix. The
+per-column sums double-count each pair (`2·Σ_{i<j} γ²`), folded into `conv_thr` the
+same way as eig (marginally stricter, safe).
+
+### Coverage added (WR-05 / IN-04)
+- `gen_oracle.py`: `SVD_TALL_ODD=(9,5)` ODD thin-dim case (f32+f64); committed
+  `svd_tall_odd_{f32,f64}_seed42.npz` (np.linalg.svd, descending S).
+- `svd_test.rs`: `svd_tall_odd_{f32,f64}_fixture` (oracle + reconstruction +
+  orthonormality on the odd 9×5 shape — these FAIL on the pre-fix kernel) and
+  `svd_not_converged_on_low_sweep_cap` (asserts `Err(NotConverged)` on a 1-sweep
+  cap, then confirms the same input converges under the production cap).
+- New host hook `svd_with_max_sweeps` exposes the cap so the `NotConverged` path
+  is reachable; production `svd()` still uses `MAX_SWEEPS = 30`.
+
+### Tolerance tightening (WR-04)
+`svd_reconstruction_invariant` tightened from the loose `1e-4` to the `1e-5`
+contract, asserted as the scale-invariant RELATIVE Frobenius error
+(`‖UΣVᵀ−A‖/‖A‖ ≤ 1e-5`; reaches ~1e-6 post-fix). The singular-vector oracle compare
+uses numpy-`allclose` abs-OR-rel (`atol=rtol=1e-5`, the absolute arm never
+loosened) per the Phase-2 D-10 precedent — an individual f32 component ~4e-2
+differs from numpy by ~7e-7 (inside the 1e-5 ABSOLUTE contract but not 1e-5
+strict-relative); documented inline.
+
+### Verification
+- `cargo test --features cpu --test svd_test` → 10/10 pass (f64 runs on cpu).
+- `cargo test --features rocm --test svd_test` → 10/10 pass (f32; this gfx1100
+  adapter also ran f64 natively rather than skip-with-log).
+- `cargo test --features cpu|rocm --test eig_test --test memory_gate_test` →
+  4/4 + 6/6 pass on both; `memory_gate_svd_no_midsweep_readback` still asserts
+  `read_backs == 1`, proving the convergence loop stayed fully in-kernel (no
+  memory gate weakened, no invariant loosened).
+
+### Fix commits
+- `04c4584` fix(03): odd-cols pair coverage + clean post-sweep convergence norm
+- `2593af7` feat(03): `svd_with_max_sweeps` hook for the NotConverged test
+- `43eca9c` test(03): odd-dim oracle + NotConverged coverage; recon → 1e-5
