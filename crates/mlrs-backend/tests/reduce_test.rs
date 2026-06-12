@@ -26,7 +26,7 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::reduce::{self, ReducePath, ScalarOp};
 use mlrs_backend::runtime::{self, ActiveRuntime};
-use mlrs_core::{assert_slice_close, load_npz, OracleCase, F32_TOL, F64_TOL};
+use mlrs_core::{assert_slice_close, load_npz, OracleCase, PrimError, F32_TOL, F64_TOL};
 
 /// Resolve a workspace-root-relative fixture path (mirrors `pipeline_test.rs`).
 fn fixture(name: &str) -> PathBuf {
@@ -416,4 +416,84 @@ fn argmin_tie_breaks_lowest_index() {
     assert_eq!(got_max, host_max_idx, "argmax vs host reference (lowest index)");
 
     println!("argmin tie-break (full + per-row) lowest-index OK on {backend}");
+}
+
+// ===========================================================================
+// 4. CR-03: empty-input reductions are REJECTED at the boundary (not 0 / ±inf).
+// ===========================================================================
+
+/// CR-03 regression: a full-array `min`/`max`/`l2_norm`/`sum`/`mean` over an
+/// EMPTY array, and an axis-wise reduction over a `0 × cols` / `rows × 0` matrix,
+/// must return a typed `PrimError` rather than silently producing a WRONG result.
+/// Before the fix, `reduce_segment` short-circuited ALL ops to `0` on `len == 0`,
+/// so `min([])`/`max([])`/`l2_norm([])` returned `0` (an incorrect identity — an
+/// empty min should be `+inf`, an empty max `-inf`), and `validate_matrix`
+/// accepted a `0 × cols` matrix (`0 * cols == 0 == len`). The fix rejects empty
+/// geometry at the public boundary so the ambiguity never reaches the kernel
+/// driver. f32 so the case always runs (no f64 gate).
+#[test]
+fn empty_reductions_rejected_at_boundary() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Helper: build an empty device array and assert a reduction call errors.
+    let empty: Vec<f32> = Vec::new();
+    let arr: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &empty);
+
+    fn is_shape_err(r: Result<Option<DeviceArray<ActiveRuntime, f32>>, PrimError>) -> bool {
+        matches!(r, Err(PrimError::ShapeMismatch { .. }))
+    }
+
+    for path in [ReducePath::Shared, ReducePath::Plane] {
+        assert!(
+            is_shape_err(reduce::min::<f32>(&mut pool, &arr, path)),
+            "CR-03: full-array min over [] must be rejected (was a wrong 0), path={path:?}"
+        );
+        assert!(
+            is_shape_err(reduce::max::<f32>(&mut pool, &arr, path)),
+            "CR-03: full-array max over [] must be rejected (was a wrong 0), path={path:?}"
+        );
+        assert!(
+            is_shape_err(reduce::l2_norm::<f32>(&mut pool, &arr, path)),
+            "CR-03: full-array l2_norm over [] must be rejected, path={path:?}"
+        );
+        assert!(
+            is_shape_err(reduce::sum::<f32>(&mut pool, &arr, path)),
+            "CR-03: full-array sum over [] must be rejected, path={path:?}"
+        );
+        assert!(
+            is_shape_err(reduce::mean::<f32>(&mut pool, &arr, path)),
+            "CR-03: full-array mean over [] must be rejected, path={path:?}"
+        );
+    }
+
+    // argmin / argmax over an empty array have no valid index → rejected.
+    assert!(
+        matches!(reduce::argmin::<f32>(&mut pool, &arr), Err(PrimError::ShapeMismatch { .. })),
+        "CR-03: argmin over [] must be rejected (was index 0)"
+    );
+    assert!(
+        matches!(reduce::argmax::<f32>(&mut pool, &arr), Err(PrimError::ShapeMismatch { .. })),
+        "CR-03: argmax over [] must be rejected (was index 0)"
+    );
+
+    // Axis-wise reductions over a degenerate `0 × cols` / `rows × 0` matrix are
+    // rejected even though `rows * cols == 0 == len` would otherwise validate.
+    assert!(
+        is_shape_err(reduce::row_reduce::<f32>(&mut pool, &arr, 0, 4, ScalarOp::Sum, ReducePath::Shared)),
+        "CR-03: row_reduce over 0×cols must be rejected"
+    );
+    assert!(
+        is_shape_err(reduce::row_reduce::<f32>(&mut pool, &arr, 4, 0, ScalarOp::Sum, ReducePath::Shared)),
+        "CR-03: row_reduce over rows×0 must be rejected"
+    );
+    assert!(
+        is_shape_err(reduce::column_reduce::<f32>(&mut pool, &arr, 0, 4, ScalarOp::Mean, ReducePath::Shared)),
+        "CR-03: column_reduce over 0×cols must be rejected"
+    );
+
+    println!("CR-03 empty-reduction rejection OK on {backend}: no silent 0 / wrong identity");
 }

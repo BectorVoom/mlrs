@@ -93,6 +93,7 @@ pub fn sum<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    validate_nonempty(input.len())?;
     reduce_segment::<F>(pool, input.handle().clone(), input.len(), Op::Sum, path)
 }
 
@@ -106,6 +107,7 @@ pub fn mean<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    validate_nonempty(input.len())?;
     let n = input.len();
     let summed = match reduce_segment::<F>(pool, input.handle().clone(), n, Op::Sum, path)? {
         Some(s) => s,
@@ -128,6 +130,7 @@ pub fn min<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    validate_nonempty(input.len())?;
     reduce_segment::<F>(pool, input.handle().clone(), input.len(), Op::Min, path)
 }
 
@@ -140,6 +143,7 @@ pub fn max<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    validate_nonempty(input.len())?;
     reduce_segment::<F>(pool, input.handle().clone(), input.len(), Op::Max, path)
 }
 
@@ -154,6 +158,7 @@ pub fn l2_norm<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    validate_nonempty(input.len())?;
     let summed = match reduce_segment::<F>(pool, input.handle().clone(), input.len(), Op::SumSq, path)? {
         Some(s) => s,
         None => return Ok(None),
@@ -301,6 +306,7 @@ pub fn argmin<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    validate_nonempty(input.len())?;
     argreduce::<F>(pool, input.handle().clone(), input.len(), true)
 }
 
@@ -312,6 +318,7 @@ pub fn argmax<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    validate_nonempty(input.len())?;
     argreduce::<F>(pool, input.handle().clone(), input.len(), false)
 }
 
@@ -383,8 +390,17 @@ where
         return Ok(None);
     }
     if len == 0 {
-        let zero = vec![F::from_int(0i64)];
-        return Ok(Some(DeviceArray::from_host(pool, &zero)));
+        // CR-03: defense-in-depth — the public boundaries (`validate_nonempty` /
+        // `validate_matrix`) already reject empty geometry, so this branch should
+        // be unreachable in practice. If it is ever reached, return the
+        // OP-CORRECT identity (NOT a blanket 0): Sum/SumSq → 0, Min → +inf,
+        // Max → -inf. Returning 0 for Min/Max would be a silently wrong result.
+        let identity = match op {
+            Op::Sum | Op::SumSq => f64_to_host::<F>(0.0),
+            Op::Min => f64_to_host::<F>(f64::INFINITY),
+            Op::Max => f64_to_host::<F>(f64::NEG_INFINITY),
+        };
+        return Ok(Some(DeviceArray::from_host(pool, &vec![identity])));
     }
 
     let elem = size_of::<F>();
@@ -559,6 +575,36 @@ fn validate_matrix(len: usize, rows: usize, cols: usize) -> Result<(), PrimError
             rows,
             cols,
             len,
+        });
+    }
+    // CR-03: reject empty geometry at the boundary so a 0×cols / rows×0 matrix
+    // never reaches the segment driver, where an empty-axis reduction's identity
+    // (min→+inf, max→-inf vs sum→0) is ambiguous. An axis-wise reduction needs at
+    // least one row AND one column.
+    if rows == 0 || cols == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "input",
+            rows,
+            cols,
+            len,
+        });
+    }
+    Ok(())
+}
+
+/// CR-03: reject an empty full-array reduction at the public boundary. A
+/// full-array `min`/`max`/`l2_norm`/`sum`/`mean` over zero elements has no
+/// well-defined identity to return (and `min([])`/`max([])` historically returned
+/// a WRONG `0` instead of `±inf`), so the empty case is rejected here rather than
+/// silently producing a degenerate value. `argmin`/`argmax` over an empty array
+/// likewise have no valid index.
+fn validate_nonempty(len: usize) -> Result<(), PrimError> {
+    if len == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "input",
+            rows: 0,
+            cols: 0,
+            len: 0,
         });
     }
     Ok(())
