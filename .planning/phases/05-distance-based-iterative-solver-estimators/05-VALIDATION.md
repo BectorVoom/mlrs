@@ -2,8 +2,8 @@
 phase: 5
 slug: distance-based-iterative-solver-estimators
 status: draft
-nyquist_compliant: false
-wave_0_complete: false
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-06-12
 ---
 
@@ -93,4 +93,4 @@ created: 2026-06-12
 - [ ] Feedback latency: targeted prim oracle < ~30s
 - [ ] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-06-12
