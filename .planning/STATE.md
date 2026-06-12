@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Plan 03-01 complete (ROCm/HIP bring-up — runtime.rs cubecl::hip re-export + Cargo rocm feature += cubecl/std,cubecl/default; spike_saxpy_runs_on_active_backend runs a real HIP kernel on gfx1100; capability split CONFIRMED rocm f32=true/f64=false, cpu f64=true; ROADMAP/PROJECT/03-CONTEXT reconciled to cpu+rocm gate per D-07)."
-last_updated: "2026-06-12T03:14:45.655Z"
-last_activity: 2026-06-12 -- Plan 03-01 complete (ROCm bring-up + gate reconciliation)
+stopped_at: "Plan 03-02 complete (Nyquist Wave-0 scaffold — PrimError NotSquare/NotConverged; gen_oracle.py gen_svd/gen_eigh; five committed .npz fixtures svd_tall f32+f64/svd_wide f32/eigh f32+f64; svd_test.rs+eig_test.rs compile on cpu with all 11 VALIDATION.md fns present, ignored until prims land in 03-03/04)."
+last_updated: "2026-06-12T03:27:08.000Z"
+last_activity: 2026-06-12 -- Plan 03-02 complete (SVD/eig Nyquist Wave-0 scaffold + numpy fixtures)
 progress:
   total_phases: 6
   completed_phases: 2
   total_plans: 15
-  completed_plans: 12
-  percent: 36
+  completed_plans: 13
+  percent: 38
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 3 (svd-eigendecomposition-primitive-hard-gate) — EXECUTING
-Plan: 2 of 5 (03-01 complete)
+Plan: 3 of 5 (03-02 complete)
 Status: Executing Phase 3
-Last activity: 2026-06-12 -- Plan 03-01 complete (ROCm bring-up + gate reconciliation)
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-02-PLAN.md
+Last activity: 2026-06-12 -- Plan 03-02 complete (SVD/eig Nyquist Wave-0 scaffold + numpy fixtures)
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-03-PLAN.md
 
-Progress: [████░░░░░░] 36% (2/6 phases; 12/15 plans)
+Progress: [████░░░░░░] 38% (2/6 phases; 13/15 plans)
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ Progress: [████░░░░░░] 36% (2/6 phases; 12/15 plans)
 | Phase 02 P04 | 12 | 2 tasks | 9 files |
 | Phase 02 P05 | 18 | 1 task | 1 file |
 | Phase 03 P01 | 10 | 2 tasks | 5 files |
+| Phase 03 P02 | 8 | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -106,6 +107,8 @@ Recent decisions affecting current work:
 - [Phase 02]: [02-05]: Pattern — free-list probe for allocation-identity when the handle type is not comparable: a reused-in-place buffer stays LIVE (off the free-list); only a parallel allocate-then-release lands on it, so acquire-and-check-reuse distinguishes the two.
 - [Phase 03]: [03-01]: ROCm/HIP bring-up = two fixes — runtime.rs re-exports cubecl::hip::{AmdDevice as ActiveDevice, HipRuntime as ActiveRuntime} (no cubecl::rocm module in cubecl 0.10; rocm=["hip"]), and Cargo rocm feature = ["cubecl/rocm","cubecl/std","cubecl/default"] (cubecl/std propagates the multi_threading cfg into cubecl-hip, else 3× E0432 MultiStream/ResolvedStreams/EventStreamBackend). default-features=false on cubecl/cubek pins left intact (Security V12). spike_saxpy_runs_on_active_backend now runs a real HIP kernel on gfx1100.
 - [Phase 03]: [03-01]: GATE = cpu(f64) + rocm(f32) project-wide from Phase 3 (D-07, supersedes cpu+wgpu). CONFIRMED empirically: capability backend=rocm f32_supported=true f64_supported=false; cpu f64_supported=true. f64-on-rocm SKIPS-with-log via the unchanged skip_f64_with_log gate because cubecl-cpp 0.10 does NOT register F64 for the HIP backend — EXPECTED, not a defect. f64 SVD/eig validates on cpu; rocm validates f32. wgpu opportunistic only. ROADMAP/PROJECT/03-CONTEXT reconciled.
+- [Phase 03]: [03-02]: PrimError extended with NotSquare { operand, rows, cols } (D-06 eig squareness, ASVS V5) + NotConverged { operand, max_sweeps, residual } (D-12 Jacobi sweep cap) — thiserror, one variant per violation class. gen_oracle.py gen_svd uses np.linalg.svd(full_matrices=False) (descending S, D-02/D-04) saving A/U/S/Vt; gen_eigh uses np.linalg.eigh on a (M+Mᵀ)/2 symmetric matrix and stores w/V REVERSED to descending AT GENERATION (D-04) so the future test compares directly with no re-sort. Five fixtures committed: svd_tall f32+f64 (8×4), svd_wide f32 (4×8, Aᵀ-swap path), eigh f32+f64 (4×4).
+- [Phase 03]: [03-02]: Nyquist Wave-0 scaffold pattern — svd_test.rs (7 fns) + eig_test.rs (4 fns) carry all VALIDATION.md test names as #[ignore] stubs that assert fixture load + shape well-formedness only (NO reference to non-existent prims::svd/eig symbols), so the test crate compiles today; 03-03/04 remove #[ignore] and wire the real svd()/eig() + invariants. f64 fixture tests gate on skip_f64_with_log (cpu runs, rocm skips) verbatim from gemm_test.rs.
 
 ### Pending Todos
 
@@ -132,6 +135,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12 -- Plan 03-01 complete
-Stopped at: Plan 03-01 complete — ROCm/HIP bring-up (runtime.rs cubecl::hip re-export + Cargo rocm feature += cubecl/std,cubecl/default). spike_saxpy_runs_on_active_backend runs a real HIP kernel on gfx1100. Capability split confirmed: rocm f32=true/f64=false, cpu f64=true. ROADMAP/PROJECT/03-CONTEXT reconciled to the cpu+rocm gate (D-07) — GPU work in plans 03-02..05 unblocked.
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-02-PLAN.md (Wave-0 scaffold: PrimError NotSquare/NotConverged + gen_oracle.py svd/eigh fixtures + test skeletons).
+Last session: 2026-06-12 -- Plan 03-02 complete
+Stopped at: Plan 03-02 complete — SVD/eig Nyquist Wave-0 scaffold. PrimError NotSquare/NotConverged (D-06/D-12); gen_oracle.py gen_svd/gen_eigh; five committed .npz fixtures (svd_tall f32+f64, svd_wide f32, eigh f32+f64). svd_test.rs (7 fns) + eig_test.rs (4 fns) compile on cpu with all VALIDATION.md test names present, ignored until the prims land. Plans 03-03 (SVD kernel) and 03-04 (eig kernel) now have failing/ignored tests to drive them.
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-03-PLAN.md (SVD Jacobi kernel — remove #[ignore] in svd_test.rs, wire svd::<F> + reconstruction/orthonormality invariants).

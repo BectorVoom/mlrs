@@ -93,7 +93,7 @@ Plans:
 **Wave 1**
 
 - [x] 03-01-PLAN.md — ROCm/HIP bring-up (runtime.rs hip path + rocm Cargo feature) + saxpy gate on gfx1100 + cpu+rocm doc reconciliation (D-07) ✅ (cubecl::hip re-export + cubecl/std,cubecl/default; spike_saxpy runs real HIP kernel on gfx1100; capability split confirmed rocm f32=true/f64=false, cpu f64=true; ROADMAP/PROJECT/03-CONTEXT reconciled)
-- [ ] 03-02-PLAN.md — Wave-0 scaffold: PrimError NotSquare/NotConverged + gen_oracle.py svd/eigh fixtures + committed .npz + svd_test/eig_test skeletons (D-06/D-09/D-12)
+- [x] 03-02-PLAN.md — Wave-0 scaffold: PrimError NotSquare/NotConverged + gen_oracle.py svd/eigh fixtures + committed .npz + svd_test/eig_test skeletons (D-06/D-09/D-12) ✅ (PrimError +NotSquare/+NotConverged; gen_svd/gen_eigh; five fixtures svd_tall f32+f64/svd_wide f32/eigh f32+f64; svd_test 7 fns + eig_test 4 fns compile on cpu, ignored until 03-03/04 land the prims)
 
 **Wave 2**
 
@@ -161,7 +161,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
-| 3. SVD / Eigendecomposition Primitive (Hard Gate) | 1/5 | In progress | - |
+| 3. SVD / Eigendecomposition Primitive (Hard Gate) | 2/5 | In progress | - |
 | 4. Closed-Form Estimators | 0/TBD | Not started | - |
 | 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |
