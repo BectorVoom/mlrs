@@ -155,11 +155,11 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 05-01-PLAN.md — Wave-0 scaffold: traits (PredictLabels/KNeighbors/PredictProba D-05/D-07) + AlgoError variants (D-06) + cluster/neighbors module stubs + 10 kernel/prim stub modules + gen_oracle.py 6 generators + 14 committed fixtures (KMeans injected init D-09) + 14 #[ignore] oracle test stubs + i32 DeviceArray confirmation
+- [x] 05-01-PLAN.md — Wave-0 scaffold: traits (PredictLabels/KNeighbors/PredictProba D-05/D-07) + AlgoError variants (D-06) + cluster/neighbors module stubs + 10 kernel/prim stub modules + gen_oracle.py 6 generators + 14 committed fixtures (KMeans injected init D-09) + 14 #[ignore] oracle test stubs + i32 DeviceArray confirmation
 
 **Wave 2** *(parallel — file-disjoint NEW primitives, D-01 primitive-first)*
 
-- [ ] 05-02-PLAN.md — NEW top-k selection primitive (D-02, lowest-index tie) + standalone oracle (NEIGH-01/02/03)
+- [x] 05-02-PLAN.md — NEW top-k selection primitive (D-02, lowest-index tie) + standalone oracle (NEIGH-01/02/03) **[complete; select_k #[cube] selection-by-rank kernel + top_k validate-before-launch wrapper, oracle green cpu(f64) within 1e-5 + indices exact]**
 - [ ] 05-03-PLAN.md — NEW KMeans primitives: Lloyd centroid-update+inertia + k-means++ D²-sampling (host-seeded RNG D-09a/c) + standalone oracles (CLUSTER-01)
 - [ ] 05-04-PLAN.md — NEW DBSCAN eps-region+core-mask primitive (D-04 device-compute half) + standalone oracle (CLUSTER-02)
 - [ ] 05-05-PLAN.md — NEW coordinate-descent step primitive + host CD loop (D-03/D-10, sklearn coef_+sparsity) + standalone oracle (LINEAR-03/04)
