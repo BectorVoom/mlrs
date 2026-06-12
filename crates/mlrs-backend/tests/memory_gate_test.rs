@@ -37,11 +37,12 @@
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::cholesky::cholesky_solve;
 use mlrs_backend::prims::covariance::covariance;
 use mlrs_backend::prims::distance::distance;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
-use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
+use mlrs_backend::prims::reduce::{column_reduce, row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::{self, ActiveRuntime};
 
@@ -137,7 +138,8 @@ fn memory_gate_reuse_bounded() {
         // iteration. A growing live_bytes means scratch is NOT being released
         // (the exact CR-02 regression). This is the load-bearing honesty signal.
         assert_eq!(
-            live_after[iter], live_baseline,
+            live_after[iter],
+            live_baseline,
             "D-10 gate 1a (live_bytes conserved) FAILED on {backend}: iter {iter} \
              live_bytes={} != baseline={live_baseline} — transient scratch is NOT \
              being released (CR-02 regression). Removing the scratch releases makes \
@@ -149,7 +151,8 @@ fn memory_gate_reuse_bounded() {
         // HARD GATE 1b: peak_bytes PLATEAUS — it never rises after the warmup,
         // because released scratch is reused in place rather than stacking.
         assert_eq!(
-            peak_after[iter], peak_baseline,
+            peak_after[iter],
+            peak_baseline,
             "D-10 gate 1b (peak_bytes bounded) FAILED on {backend}: iter {iter} \
              peak_bytes={} != baseline={peak_baseline} — peak is growing with N \
              (scratch not released → buffers stack). stats={:?}",
@@ -267,7 +270,11 @@ fn memory_gate_no_midpipeline_readback() {
 
     // --- Terminal compare: the SINGLE metered read-back (Plan-01 path). ---
     let host = d.to_host_metered(&mut pool);
-    assert_eq!(host.len(), m * m, "terminal read-back yields the full matrix");
+    assert_eq!(
+        host.len(),
+        m * m,
+        "terminal read-back yields the full matrix"
+    );
 
     // HARD GATE 2: exactly one metered read-back across the whole pipeline.
     assert_eq!(
@@ -329,7 +336,11 @@ fn memory_gate_gram_reuses_gemm_buffer() {
         None,
     )
     .expect("seed GEMM accepts the validated shape");
-    assert_eq!(gram_out.len(), gram_elems, "seed GEMM output is n_features²");
+    assert_eq!(
+        gram_out.len(),
+        gram_elems,
+        "seed GEMM output is n_features²"
+    );
 
     // How many n_features²-sized buffers were freshly allocated so far? Exactly
     // one (the seed GEMM's output). This is "the GEMM's own" allocation.
@@ -358,7 +369,11 @@ fn memory_gate_gram_reuses_gemm_buffer() {
     // asserted directly here — the free-list probe below is the load-bearing
     // reuse detector (it proves no PARALLEL Gram was allocated, which is exactly
     // the gate-3 contract).
-    assert_eq!(cov.len(), gram_elems, "covariance output is the n_features² Gram");
+    assert_eq!(
+        cov.len(),
+        gram_elems,
+        "covariance output is the n_features² Gram"
+    );
 
     // HARD GATE 3: covariance allocated NO fresh n_features²-sized Gram buffer.
     // It is allowed transient scratch (the centred copy is n_samples·n_features,
@@ -375,14 +390,11 @@ fn memory_gate_gram_reuses_gemm_buffer() {
     // partials. None is the n_features² Gram (which threaded through `out`).
     // Assert no fresh allocation is the Gram byte-size — i.e. covariance did not
     // raise the allocation count by acquiring a buffer of gram_bytes.
-    let gram_sized_allocs_during_cov = count_gram_sized_fresh_allocs(
-        &mut pool,
-        gram_bytes,
-        n_samples,
-        n_features,
-    );
+    let gram_sized_allocs_during_cov =
+        count_gram_sized_fresh_allocs(&mut pool, gram_bytes, n_samples, n_features);
     assert_eq!(
-        gram_sized_allocs_during_cov, 0,
+        gram_sized_allocs_during_cov,
+        0,
         "D-10 gate 3 FAILED on {backend}: covariance freshly allocated \
          {gram_sized_allocs_during_cov} buffer(s) of the Gram byte-size \
          ({gram_bytes} B) — it did NOT reuse the GEMM output for the Gram. \
@@ -559,8 +571,8 @@ fn memory_gate_jacobi_scratch_bounded() {
     let mut peak_after: Vec<u64> = Vec::with_capacity(N);
 
     for _iter in 0..N {
-        let (u, s, vt) =
-            svd::<f32>(&mut pool, &a, (rows, cols)).expect("svd converges on the conditioned input");
+        let (u, s, vt) = svd::<f32>(&mut pool, &a, (rows, cols))
+            .expect("svd converges on the conditioned input");
         // Release the returned factors back to the pool so `live_bytes` returns to
         // the persistent baseline (the input `a`) — the caller owns these, so the
         // gate must release them to observe conservation.
@@ -584,7 +596,8 @@ fn memory_gate_jacobi_scratch_bounded() {
         // load-bearing "allocations don't grow with sweep/iteration count" signal.
         let alloc_delta = allocs_after[iter] - allocs_after[iter - 1];
         assert_eq!(
-            alloc_delta, 0,
+            alloc_delta,
+            0,
             "D-11 gate 1a (bounded Jacobi scratch) FAILED on {backend}: call {iter} \
              allocated {alloc_delta} fresh buffer(s) (allocations {} -> {}) — the \
              sweep scratch is GROWING with the call/sweep count instead of being \
@@ -596,7 +609,8 @@ fn memory_gate_jacobi_scratch_bounded() {
 
         // HARD GATE 1b: live_bytes CONSERVES — scratch released, not stacked.
         assert_eq!(
-            live_after[iter], live_baseline,
+            live_after[iter],
+            live_baseline,
             "D-11 gate 1b (live_bytes conserved) FAILED on {backend}: call {iter} \
              live_bytes={} != baseline={live_baseline} — svd scratch is NOT being \
              released (it stacks each call). stats={:?}",
@@ -606,7 +620,8 @@ fn memory_gate_jacobi_scratch_bounded() {
 
         // HARD GATE 1c: peak_bytes PLATEAUS — bounded, never rises with sweeps.
         assert_eq!(
-            peak_after[iter], peak_baseline,
+            peak_after[iter],
+            peak_baseline,
             "D-11 gate 1c (peak_bytes bounded) FAILED on {backend}: call {iter} \
              peak_bytes={} != baseline={peak_baseline} — peak grows with the call \
              count (scratch stacks). stats={:?}",
@@ -687,7 +702,11 @@ fn memory_gate_eig_reuses_gram_buffer() {
         None,
     )
     .expect("seed GEMM accepts the validated n×n shape");
-    assert_eq!(gram_out.len(), gram_elems, "seed GEMM output is n_features²");
+    assert_eq!(
+        gram_out.len(),
+        gram_elems,
+        "seed GEMM output is n_features²"
+    );
 
     // Thread the Gram output through as eig's `out`. It stays live (the caller's
     // `gram_out` still owns the handle) across the eig call.
@@ -790,7 +809,11 @@ fn memory_gate_svd_no_midsweep_readback() {
 
     // --- Terminal read: the SINGLE metered read-back on a result factor. ---
     let host_u = u.to_host_metered(&mut pool);
-    assert_eq!(host_u.len(), rows * cols, "terminal read-back yields U (rows×k)");
+    assert_eq!(
+        host_u.len(),
+        rows * cols,
+        "terminal read-back yields U (rows×k)"
+    );
 
     // HARD GATE 3b: read_backs == 1 after exactly ONE terminal to_host_metered.
     assert_eq!(
@@ -810,6 +833,485 @@ fn memory_gate_svd_no_midsweep_readback() {
     println!(
         "D-11 gate 3 backend={backend}: svd rows={rows} cols={cols} \
          read_backs={} (terminal only) stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
+}
+
+// ===========================================================================
+// ===========================================================================
+//  PHASE-4 / D-03 — the closed-form ESTIMATOR fit→predict/transform gate
+//  (Plan 04-05).
+//
+//  Plans 02-05 / 03-05 (above) asserted the device-residency contract for the
+//  single-pass and iterative PRIMITIVES. Plan 04-05 EXTENDS that gate to the
+//  ESTIMATOR pipelines the Phase-4 closed-form models compose — the
+//  fit→predict round (LinearRegression / Ridge) and the fit→transform round
+//  (PCA) — proving the device-resident fitted state (D-03) drives bounded pool
+//  reuse, that Ridge's regularized Gram is threaded through the Cholesky factor
+//  with no parallel n² allocation (D-11 gate 2 carried into the estimator), and
+//  that an estimator round performs NO mid-pipeline host read-back (D-03).
+//
+//  ## Why the pipelines are composed from prims here, not via `mlrs-algos`
+//  `mlrs-algos` depends on `mlrs-backend` (it owns `ActiveRuntime` + the pool),
+//  so `mlrs-backend` CANNOT dev-depend on `mlrs-algos` — that is a dependency
+//  CYCLE cargo rejects. So these gates drive the EXACT primitive composition the
+//  estimators run, in the crate that owns the pool/prims: Ridge's
+//  `fit` = `gemm(transa)` raw centered Gram → diagonal-α → `cholesky_solve`
+//  (with the Gram threaded through `out`); `predict`/`transform` = a `gemm`
+//  round over the fitted state. The pool counters these gates assert on are the
+//  SAME ones the estimator code paths drive (the estimators call these very
+//  prims), so the device-residency / Gram-reuse / no-readback contract is proven
+//  at the layer that actually allocates.
+//
+//  ## The three D-03 estimator gates
+//    A `memory_gate_estimator_fit_round_reuse_bounded` — N (≥3) same-shape
+//      fit→predict (linear) and fit→transform (PCA-style gemm) rounds drive
+//      pool reuse with allocations BOUNDED (the per-round fresh-allocation delta
+//      is FLAT after warmup) AND `reuses ≥ N−1` (the device-resident fitted
+//      state + same-shape scratch is served from the free-list each round).
+//    B `memory_gate_ridge_reuses_gram_for_factor` — Ridge's `fit` threads its
+//      regularized Gram (`XᵀX + αI`) through `cholesky_solve`'s `out`, so the
+//      Cholesky factor reuses it: the peak-live rise the solve drives ABOVE the
+//      held-live Gram baseline stays `< 2·n_features²` (a parallel n² input copy
+//      would cross it). Mirrors `memory_gate_eig_reuses_gram_buffer`.
+//    C `memory_gate_estimator_round_no_midpipeline_readback` — a fit→predict
+//      round performs ZERO metered read-backs (`read_backs == 0`), then EXACTLY
+//      one (`== 1`) after a single terminal `to_host_metered`. Mirrors
+//      `memory_gate_svd_no_midsweep_readback`.
+//
+//  These are HARD `assert!`s (build-failing). f32 is portable on every backend,
+//  so the gates drive f32 and assert the SAME backend-agnostic counters on cpu
+//  AND rocm (the f64 estimator path is capability-gated elsewhere; the counter
+//  contract is dtype-independent, so no `skip_f64_with_log` is needed here).
+// ===========================================================================
+// ===========================================================================
+
+/// Replicate Ridge's `fit` as the estimator does (Plan 04-05 `ridge.rs`): the
+/// RAW centered Gram `XᵀX` via `gemm(transa=true)`, `alpha` on the Gram
+/// DIAGONAL only, then `cholesky_solve` threading the regularized Gram through
+/// `out` (D-11 gate 2). Centered host data is precomputed by the caller so this
+/// mirrors the estimator's on-device portion. Returns the device-resident
+/// `coef` (length `n_features`) — exactly the estimator's fitted state.
+fn ridge_fit_round(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_centered: &DeviceArray<ActiveRuntime, f32>,
+    y_centered: &DeviceArray<ActiveRuntime, f32>,
+    n_samples: usize,
+    n_features: usize,
+    alpha: f32,
+) -> DeviceArray<ActiveRuntime, f32> {
+    // Key-link column-mean reduction on the centered design (estimator does this
+    // as the documented `column_reduce(Mean)` site).
+    let means = column_reduce::<f32>(
+        pool,
+        x_centered,
+        n_samples,
+        n_features,
+        ScalarOp::Mean,
+        ReducePath::Shared,
+    )
+    .expect("column_reduce shared path")
+    .expect("shared path is never plane-gated to None");
+    means.release_into(pool);
+
+    // Raw Gram XᵀX via gemm(transa=true).
+    let raw_gram = gemm::<f32>(
+        pool,
+        x_centered,
+        (n_features, n_samples),
+        x_centered,
+        (n_samples, n_features),
+        true,
+        false,
+        None,
+    )
+    .expect("raw Gram gemm");
+
+    // alpha on the diagonal only; release the raw Gram and re-stage the
+    // regularized one (the estimator's diagonal-α injection).
+    let mut gram_host = raw_gram.to_host(pool);
+    for i in 0..n_features {
+        gram_host[i * n_features + i] += alpha;
+    }
+    raw_gram.release_into(pool);
+    let gram: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(pool, &gram_host);
+
+    // Xᵀy via gemm(transa=true).
+    let xty = gemm::<f32>(
+        pool,
+        x_centered,
+        (n_features, n_samples),
+        y_centered,
+        (n_samples, 1),
+        true,
+        false,
+        None,
+    )
+    .expect("Xᵀy gemm");
+
+    // Solve (XᵀX + αI)·coef = Xᵀy, threading the Gram through `out` (D-11 gate 2).
+    let gram_out =
+        DeviceArray::<ActiveRuntime, f32>::from_raw(gram.handle().clone(), n_features * n_features);
+    let coef = cholesky_solve::<f32>(pool, &gram, &xty, n_features, 1, Some(gram_out))
+        .expect("cholesky_solve on the SPD regularized Gram");
+
+    drop(gram); // its cloned handle was threaded through `out` and released by the solve.
+    xty.release_into(pool);
+    coef
+}
+
+/// Replicate the estimator `predict`/`transform` on-device round: a `gemm` of
+/// the fitted state over `X` (LinearRegression/Ridge `X·coef`, PCA `X·components`).
+/// Returns the device-resident result (the estimator broadcasts the intercept on
+/// a tiny host pass AFTER this; that is not part of the device round measured here).
+fn estimator_apply_round(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, f32>,
+    coef: &DeviceArray<ActiveRuntime, f32>,
+    n_samples: usize,
+    n_features: usize,
+    n_out: usize,
+) -> DeviceArray<ActiveRuntime, f32> {
+    gemm::<f32>(
+        pool,
+        x,
+        (n_samples, n_features),
+        coef,
+        (n_features, n_out),
+        false,
+        false,
+        None,
+    )
+    .expect("estimator apply gemm")
+}
+
+/// Host-center an `n_samples × n_features` design + length-`n_samples` target
+/// (the estimator's two-pass centering), returning the centered `(X, y)` Vecs.
+fn center(x: &[f32], y: &[f32], n_samples: usize, n_features: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut x_mean = vec![0.0f32; n_features];
+    let mut y_mean = 0.0f32;
+    for r in 0..n_samples {
+        for c in 0..n_features {
+            x_mean[c] += x[r * n_features + c];
+        }
+        y_mean += y[r];
+    }
+    let inv = 1.0 / n_samples as f32;
+    for m in x_mean.iter_mut() {
+        *m *= inv;
+    }
+    y_mean *= inv;
+    let xc: Vec<f32> = (0..n_samples * n_features)
+        .map(|i| x[i] - x_mean[i % n_features])
+        .collect();
+    let yc: Vec<f32> = (0..n_samples).map(|r| y[r] - y_mean).collect();
+    (xc, yc)
+}
+
+// ===========================================================================
+// D-03 Gate A — bounded reuse across repeated same-shape estimator rounds.
+// ===========================================================================
+
+/// D-03 gate A (estimator fit→predict / fit→transform bounded reuse): thread ONE
+/// `BufferPool` and run N (≥3) same-shape Ridge `fit`+`predict` rounds and N
+/// same-shape PCA-style `fit`+`transform` (gemm) rounds. Because the heavy work
+/// is composed of the SAME-shape prims each round and their scratch is released,
+/// the host sees a FIXED set of pool buffers per round:
+///
+///   A1. The per-round FRESH-allocation delta is FLAT (== 0) after warmup — once
+///       each scratch byte-size has been seen, every subsequent round is served
+///       from the free-list (reuses), adding NO fresh allocation. A per-round
+///       allocation regression (e.g. the device-resident fitted state silently
+///       re-uploading or a prim leaking scratch) makes this delta climb — RED.
+///   A2. `reuses` GROW by ≥ 1 each steady-state round AND the total reuse count
+///       is ≥ N−1 — the device-resident fitted `coef` + same-shape Gram/solve
+///       scratch is served from the free-list each round (D-03 residency drives
+///       the reuse; a host round-trip of the fitted state would not).
+#[test]
+fn memory_gate_estimator_fit_round_reuse_bounded() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    const N: usize = 4;
+    let (n_samples, n_features) = (8usize, 4usize);
+    let alpha = 1.0f32;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Well-conditioned, device-resident inputs uploaded ONCE (so per-round deltas
+    // measure ONLY the fit/predict scratch, not input churn).
+    let x_raw = fill_conditioned(n_samples, n_features);
+    let y_raw: Vec<f32> = (0..n_samples).map(|i| 0.3 * (i as f32) - 1.0).collect();
+    let (xc, yc) = center(&x_raw, &y_raw, n_samples, n_features);
+    let xc_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &xc);
+    let yc_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &yc);
+    // Predict/transform input (raw X, same shape).
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_raw);
+
+    let mut allocs_after: Vec<u64> = Vec::with_capacity(N);
+    let mut reuses_after: Vec<u64> = Vec::with_capacity(N);
+
+    for _round in 0..N {
+        // fit → device-resident coef (the fitted state, D-03).
+        let coef = ridge_fit_round(&mut pool, &xc_dev, &yc_dev, n_samples, n_features, alpha);
+        // predict: X·coef (n_samples×1), on-device.
+        let pred = estimator_apply_round(&mut pool, &x_dev, &coef, n_samples, n_features, 1);
+        // transform: a second same-shape gemm round (PCA `X·components` analogue,
+        // n_features components → n_features-wide projection), on-device.
+        let proj = estimator_apply_round(&mut pool, &x_dev, &coef, n_samples, n_features, 1);
+
+        // Release the round's outputs + fitted state back to the pool so the
+        // steady-state footprint conserves (the caller owns them each round).
+        pred.release_into(&mut pool);
+        proj.release_into(&mut pool);
+        coef.release_into(&mut pool);
+
+        let st = pool.stats();
+        allocs_after.push(st.allocations);
+        reuses_after.push(st.reuses);
+    }
+
+    // Iteration 0 is warmup (first sight of each scratch size is a fresh alloc).
+    for round in 2..N {
+        // HARD GATE A1: the per-round FRESH-allocation delta is FLAT (== 0).
+        let alloc_delta = allocs_after[round] - allocs_after[round - 1];
+        assert_eq!(
+            alloc_delta,
+            0,
+            "D-03 gate A1 (bounded estimator-round allocations) FAILED on {backend}: \
+             round {round} allocated {alloc_delta} fresh buffer(s) (allocations {} -> \
+             {}) — the fit→predict/transform scratch is GROWING with the round count \
+             instead of being recycled from the free-list (device-resident fitted \
+             state not driving reuse). stats={:?}",
+            allocs_after[round - 1],
+            allocs_after[round],
+            pool.stats()
+        );
+
+        // HARD GATE A2a: reuses grow by ≥ 1 each steady-state round.
+        let reuse_delta = reuses_after[round] - reuses_after[round - 1];
+        assert!(
+            reuse_delta >= 1,
+            "D-03 gate A2 (estimator-round reuse grows) FAILED on {backend}: round \
+             {round} reuse delta={reuse_delta} (reuses {} -> {}) — no per-round reuse, \
+             so the device-resident fitted state + same-shape scratch is NOT served \
+             from the free-list. stats={:?}",
+            reuses_after[round - 1],
+            reuses_after[round],
+            pool.stats()
+        );
+    }
+
+    // HARD GATE A2b: total reuses ≥ N−1 across the repeated rounds.
+    let total_reuses = reuses_after[N - 1];
+    assert!(
+        total_reuses >= (N as u64) - 1,
+        "D-03 gate A2b (reuses ≥ N−1) FAILED on {backend}: total reuses={total_reuses} \
+         < N−1={} across {N} fit→predict/transform rounds. stats={:?}",
+        (N as u64) - 1,
+        pool.stats()
+    );
+
+    println!(
+        "D-03 gate A backend={backend}: N={N} allocs_flat_after_warmup \
+         total_reuses={total_reuses} (≥ N−1) final_stats={:?}",
+        pool.stats()
+    );
+}
+
+// ===========================================================================
+// D-03 Gate B — Ridge reuses the regularized Gram buffer for the Cholesky factor.
+// ===========================================================================
+
+/// D-03 gate B (Ridge Gram-buffer reuse, D-11 gate 2 carried into the estimator):
+/// Ridge `fit` passes its regularized Gram `(XᵀX + αI)` as `cholesky_solve`'s
+/// `out`, which the primitive threads straight through as the kernel's working
+/// INPUT — so the Cholesky factor does NOT allocate a PARALLEL `n_features²`
+/// matrix. We measure the peak-live RISE the solve drives ABOVE the held-live
+/// Gram baseline and assert it stays `< 2·n_features²`: a reuse keeps the input
+/// == the live Gram (rise ≈ the kernel's own `x`/`L`/`info` scratch); a parallel
+/// input copy would add a second `n²` and push the rise to `≥ 2·n²`. Mirrors
+/// `memory_gate_eig_reuses_gram_buffer`'s peak-live approach (the threaded `out`
+/// is released after the launch, so a free-list probe cannot distinguish reuse
+/// from a parallel copy — only the simultaneously-LIVE high-water mark can).
+#[test]
+fn memory_gate_ridge_reuses_gram_for_factor() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    let (n_samples, n_features) = (8usize, 4usize);
+    let n2_bytes = (n_features * n_features * std::mem::size_of::<f32>()) as u64;
+    let alpha = 1.0f32;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_raw = fill_conditioned(n_samples, n_features);
+    let y_raw: Vec<f32> = (0..n_samples).map(|i| 0.3 * (i as f32) - 1.0).collect();
+    let (xc, yc) = center(&x_raw, &y_raw, n_samples, n_features);
+    let xc_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &xc);
+    let yc_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &yc);
+
+    // Build the regularized Gram exactly as Ridge::fit does, and hold it LIVE
+    // across the solve so we can measure the solve's peak rise above it.
+    let raw_gram = gemm::<f32>(
+        &mut pool,
+        &xc_dev,
+        (n_features, n_samples),
+        &xc_dev,
+        (n_samples, n_features),
+        true,
+        false,
+        None,
+    )
+    .expect("raw Gram gemm");
+    let mut gram_host = raw_gram.to_host(&pool);
+    for i in 0..n_features {
+        gram_host[i * n_features + i] += alpha;
+    }
+    raw_gram.release_into(&mut pool);
+    let gram: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &gram_host);
+
+    let xty = gemm::<f32>(
+        &mut pool,
+        &xc_dev,
+        (n_features, n_samples),
+        &yc_dev,
+        (n_samples, 1),
+        true,
+        false,
+        None,
+    )
+    .expect("Xᵀy gemm");
+
+    // Thread the Gram through `out`; it stays live (the caller's `gram` still owns
+    // the handle) across the cholesky_solve call.
+    let gram_out =
+        DeviceArray::<ActiveRuntime, f32>::from_raw(gram.handle().clone(), n_features * n_features);
+
+    let live_before = pool.stats().live_bytes;
+    let peak_before = pool.stats().peak_bytes;
+
+    let coef = cholesky_solve::<f32>(&mut pool, &gram, &xty, n_features, 1, Some(gram_out))
+        .expect("cholesky_solve on the SPD regularized Gram");
+
+    let peak_after = pool.stats().peak_bytes;
+    let solve_peak_rise = peak_after.saturating_sub(live_before.max(peak_before));
+
+    // HARD GATE B: the solve's peak rise above the live Gram baseline is LESS than
+    // a second parallel n² matrix (2·n²). A reuse keeps the kernel input == the
+    // live `out`; a parallel input copy would add a second n² and push the rise to
+    // ≥ 2·n². The strict `< 2·n²` bound goes RED the instant the factor copies the
+    // Gram into a fresh parallel working buffer.
+    assert!(
+        solve_peak_rise < 2 * n2_bytes,
+        "D-03 gate B FAILED on {backend}: Ridge cholesky_solve(out=Some) drove a peak \
+         rise of {solve_peak_rise} B above the live Gram baseline — ≥ 2·n² ({} B) means \
+         a PARALLEL n² input buffer was allocated alongside the threaded-through Gram \
+         instead of reusing it as the Cholesky factor's working input. n²={n2_bytes} B \
+         live_before={live_before} peak_after={peak_after} stats={:?}",
+        2 * n2_bytes,
+        pool.stats()
+    );
+
+    drop(gram); // its cloned handle was threaded through `out` and released by the solve.
+    xty.release_into(&mut pool);
+    coef.release_into(&mut pool);
+
+    println!(
+        "D-03 gate B backend={backend}: n_features²={} n²_bytes={n2_bytes} \
+         live_before={live_before} peak_after={peak_after} \
+         solve_peak_rise={solve_peak_rise} (< 2·n² → Ridge reused the Gram for the \
+         factor) stats={:?}",
+        n_features * n_features,
+        pool.stats()
+    );
+}
+
+// ===========================================================================
+// D-03 Gate C — no mid-pipeline read-back in an estimator fit→predict round.
+// ===========================================================================
+
+/// D-03 gate C (estimator round device-residency): a full Ridge `fit`→`predict`
+/// round stays DeviceArray→DeviceArray with NO metered host read-back — the
+/// fitted `coef` is device-resident (D-03) and `predict`'s `X·coef` gemm runs
+/// on-device. The internal host passes the estimator/prims make (the centering,
+/// the diagonal-α materialize, the cholesky info read, the reduction's per-row
+/// slicing) all use PLAIN `to_host`, which deliberately does NOT bump
+/// `read_backs` — so after the round the count is still 0. The ONLY metered
+/// read-back is the caller's single terminal `to_host_metered` on the prediction,
+/// bumping the count to exactly 1. A mid-pipeline metered round-trip (e.g. the
+/// fitted state round-tripping host→device→host between fit and predict) would
+/// push `read_backs > 1` and this gate goes RED.
+#[test]
+fn memory_gate_estimator_round_no_midpipeline_readback() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    let (n_samples, n_features) = (8usize, 4usize);
+    let alpha = 1.0f32;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_raw = fill_conditioned(n_samples, n_features);
+    let y_raw: Vec<f32> = (0..n_samples).map(|i| 0.3 * (i as f32) - 1.0).collect();
+    let (xc, yc) = center(&x_raw, &y_raw, n_samples, n_features);
+    let xc_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &xc);
+    let yc_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &yc);
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_raw);
+
+    // Sanity: no metered read-back before the round runs.
+    assert_eq!(
+        pool.stats().read_backs,
+        0,
+        "no metered read-back before the estimator round (on {backend})"
+    );
+
+    // fit → device-resident coef; predict → X·coef on-device. The whole round is
+    // DeviceArray→DeviceArray; the internal host passes use plain (unmetered)
+    // to_host, so read_backs stays 0.
+    let coef = ridge_fit_round(&mut pool, &xc_dev, &yc_dev, n_samples, n_features, alpha);
+    let pred = estimator_apply_round(&mut pool, &x_dev, &coef, n_samples, n_features, 1);
+
+    // HARD GATE C-a: read_backs == 0 after the fit→predict round (no mid-pipeline
+    // metered host round-trip — the fitted state stayed device-resident, D-03).
+    assert_eq!(
+        pool.stats().read_backs,
+        0,
+        "D-03 gate C-a FAILED on {backend}: read_backs={} after the fit→predict round \
+         (expected 0) — the estimator round performed a MID-PIPELINE metered host \
+         round-trip (fitted state not device-resident, D-03 broken). stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
+
+    // --- Terminal read: the SINGLE metered read-back on the prediction. ---
+    let host_pred = pred.to_host_metered(&mut pool);
+    assert_eq!(
+        host_pred.len(),
+        n_samples,
+        "terminal read-back yields the prediction"
+    );
+
+    // HARD GATE C-b: read_backs == 1 after exactly ONE terminal to_host_metered.
+    assert_eq!(
+        pool.stats().read_backs,
+        1,
+        "D-03 gate C-b FAILED on {backend}: read_backs={} (expected exactly 1, the \
+         terminal predict read) — the estimator round secretly round-trips \
+         device→host through the metered path mid-pipeline. stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
+
+    coef.release_into(&mut pool);
+
+    println!(
+        "D-03 gate C backend={backend}: fit→predict round read_backs={} (terminal only) \
+         stats={:?}",
         pool.stats().read_backs,
         pool.stats()
     );
