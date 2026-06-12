@@ -13,3 +13,4 @@ pub mod covariance;
 pub mod distance;
 pub mod gemm;
 pub mod reduce;
+pub mod svd;
