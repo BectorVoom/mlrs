@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 03 context gathered (SVD/eig hard gate) — 5 areas decided; GPU gate changed wgpu→rocm project-wide (D-07). Next: /gsd-plan-phase --research-phase 3
-last_updated: "2026-06-12T06:00:00.000Z"
-last_activity: 2026-06-12 -- Phase 03 discuss: two distinct Jacobi routines (SVD + symmetric-eig), thin/economy, tall+wide, numpy fixtures + reference-free invariants, hold 1e-5, extend build-failing memory gate. Gate backend → cpu+rocm (ROCm 7.1.1/gfx1100 runnable, native f64); rocm bring-up is first task. Commit acac68f.
+stopped_at: Phase 03 planned (SVD/eig hard gate) — 5 plans / 4 waves, research + Nyquist + patterns done, plan-checker PASSED. Next: /gsd-execute-phase 3
+last_updated: "2026-06-12T12:00:00.000Z"
+last_activity: 2026-06-12 -- Phase 03 plan-phase complete: research (ROCm bring-up de-risked on gfx1100; HIGH-confidence finding that f64 is UNSUPPORTED on rocm/cubecl-cpp → f64-on-cpu / f32-on-rocm split), VALIDATION.md, PATTERNS.md (11 analogs), 5 PLAN.md, plan-checker PASSED (12 dims, PRIM-05 covered). Commit 0c972cc.
 progress:
   total_phases: 6
   completed_phases: 2
-  total_plans: 10
+  total_plans: 15
   completed_plans: 10
   percent: 33
 ---
@@ -25,11 +25,11 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 03 (svd-eigendecomposition-primitive-hard-gate) — context gathered, not planned
-Plan: 0 of TBD
-Status: Phase 03 context captured (03-CONTEXT.md, 13 decisions). Phase is NEEDS DEEPER RESEARCH — next `/gsd-plan-phase --research-phase 3`. ⚠ Gate backend changed wgpu→rocm project-wide (D-07) — ROADMAP.md/PROJECT.md still document cpu+wgpu and need reconciling; rocm bring-up (HIP runtime on gfx1100) is the first task.
-Last activity: 2026-06-12 -- Phase 03 discuss complete (surface/shapes/oracle/memory-gate + rocm gate change); commit acac68f
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-CONTEXT.md
+Phase: 03 (svd-eigendecomposition-primitive-hard-gate) — planned, ready to execute
+Plan: 0 of 5 (4 waves)
+Status: Phase 03 planned. 5 PLAN.md (W1: 03-01 ROCm bring-up+doc reconcile, 03-02 PrimError+fixtures+test scaffold; W2: 03-03 one-sided Jacobi SVD; W3: 03-04 two-sided symmetric-eig; W4: 03-05 D-11 memory gate). plan-checker PASSED. ⚠ KEY RESEARCH FINDING: f64 is UNSUPPORTED on rocm at the cubecl-cpp layer (F64 unregistered) — gate is cpu(f64)+rocm(f32), NOT "f64-native-on-rocm" as D-07 wording implied; 03-01 Task 2 reconciles ROADMAP/PROJECT/CONTEXT. ROCm bring-up needs two verified fixes (runtime.rs `cubecl::hip` import + Cargo `rocm` feature += cubecl/std,cubecl/default).
+Last activity: 2026-06-12 -- Phase 03 plan-phase complete (research→VALIDATION→PATTERNS→5 plans→checker PASSED); commit 0c972cc
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-01-PLAN.md
 
 Progress: [███░░░░░░░] 33% (2/6 phases; 10/10 plans)
 
