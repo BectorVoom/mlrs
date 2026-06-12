@@ -121,7 +121,23 @@ Plans:
   3. `PCA` with `n_components` exposes `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`, and `transform`/`inverse_transform`, matching scikit-learn after `svd_flip` sign alignment.
   4. `TruncatedSVD` (no centering) exposes `components_`/`explained_variance_`/`singular_values_`/`transform`, matching scikit-learn's deterministic `arpack` path after sign alignment.
 
-**Plans**: TBD
+**Note**: Success criterion 1 "via cpu and wgpu" is superseded by Phase-3 D-07 — the runnable gate is cpu(f64) + rocm(f32); f64-on-rocm skips-with-log. wgpu is opportunistic only.
+
+**Plans**: 5 plans
+Plans:
+**Wave 1**
+
+- [ ] 04-01-PLAN.md — Wave-0 scaffold: mlrs-algos deps + Fit/Predict/Transform traits (D-04) + module stubs + PrimError::NotPositiveDefinite + gen_oracle.py sklearn fixtures + 5 #[ignore] Nyquist test stubs
+
+**Wave 2** *(parallel — file-disjoint)*
+
+- [ ] 04-02-PLAN.md — NEW Cholesky + triangular-solve primitive (kernel + prim wrapper, jacobi_eig blueprint) validated standalone f32+f64 cpu+rocm (D-02; the highest-risk sub-deliverable)
+- [ ] 04-03-PLAN.md — LinearRegression (SVD pseudo-inverse + small-σ cutoff + center-then-solve intercept) (LINEAR-01)
+- [ ] 04-04-PLAN.md — PCA (center→SVD, S²/(n−1), svd_flip) + TruncatedSVD (uncentered arpack, var(transform)) (DECOMP-01, DECOMP-02)
+
+**Wave 3** *(blocked on Cholesky prim + linear/mod.rs)*
+
+- [ ] 04-05-PLAN.md — Ridge (raw Gram via gemm(transa) + diagonal-α + Cholesky solve, intercept unpenalized) (LINEAR-02) + D-03 fit→predict/transform memory gate extension
 
 ### Phase 5: Distance-Based & Iterative-Solver Estimators
 
@@ -163,6 +179,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
-| 4. Closed-Form Estimators | 0/TBD | Not started | - |
+| 4. Closed-Form Estimators | 0/5 | Not started | - |
 | 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |
