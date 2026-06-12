@@ -486,7 +486,7 @@ singular_values_ = S
 | A2 | scipy/scikit-learn install cleanly into a /tmp venv for fixture regen | Standard Stack | Low — only affects fixture regeneration, not the shipped artifact; fixtures are committed blobs. |
 | A3 | A 64×64 f64 Cholesky tile (32 KiB shared) fits gfx1100 LDS alongside the b/x scratch | Pattern 2 | Low — jacobi_eig already runs a 32 KiB (A+V) shared layout on gfx1100; Cholesky needs only L (16/32 KiB) + small b/x. If f64 overflows, keep L in global like jacobi_svd did (precedent exists). |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Raw Gram vs scaled covariance for Ridge.**
    - What we know: `prims::covariance` centers + scales by `1/(n−ddof)`. Ridge needs RAW `XᵀX`.
