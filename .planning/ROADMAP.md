@@ -131,7 +131,7 @@ Plans:
 
 **Wave 2** *(parallel — file-disjoint)*
 
-- [ ] 04-02-PLAN.md — NEW Cholesky + triangular-solve primitive (kernel + prim wrapper, jacobi_eig blueprint) validated standalone f32+f64 cpu+rocm (D-02; the highest-risk sub-deliverable)
+- [x] 04-02-PLAN.md — NEW Cholesky + triangular-solve primitive (kernel + prim wrapper, jacobi_eig blueprint) validated standalone f32+f64 cpu+rocm (D-02; the highest-risk sub-deliverable) **[complete — single-cube in-kernel cholesky_solve (factor+fwd+back, D-11 gate 3); prims::cholesky validate-before-launch + out=Some Gram reuse + NotPositiveDefinite non-SPD guard; ‖A·x−b‖/‖L·Lᵀ−A‖/non-SPD pass cpu(f64+f32)+rocm(f32; f64 skip-with-log), 6/6 each gate]**
 - [ ] 04-03-PLAN.md — LinearRegression (SVD pseudo-inverse + small-σ cutoff + center-then-solve intercept) (LINEAR-01)
 - [ ] 04-04-PLAN.md — PCA (center→SVD, S²/(n−1), svd_flip) + TruncatedSVD (uncentered arpack, var(transform)) (DECOMP-01, DECOMP-02)
 

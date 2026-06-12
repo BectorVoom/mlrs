@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-01-PLAN.md
-last_updated: "2026-06-12T06:56:50.000Z"
-last_activity: 2026-06-12 -- Completed Phase 04 Plan 01 (Wave-0 scaffold)
+stopped_at: Completed 04-02-PLAN.md
+last_updated: "2026-06-12T07:06:44.000Z"
+last_activity: 2026-06-12 -- Completed Phase 04 Plan 02 (Cholesky/SPD-solve primitive)
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 20
-  completed_plans: 17
-  percent: 52
+  completed_plans: 18
+  percent: 55
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 04 (closed-form-estimators) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Executing Phase 04
-Last activity: 2026-06-12 -- Completed Phase 04 Plan 01 (Wave-0 scaffold)
-Resume file: .planning/phases/04-closed-form-estimators/04-02-PLAN.md
+Last activity: 2026-06-12 -- Completed Phase 04 Plan 02 (Cholesky/SPD-solve primitive)
+Resume file: .planning/phases/04-closed-form-estimators/04-03-PLAN.md
 
-Progress: [█████░░░░░] 52% (3/6 phases; 17/20 plans)
+Progress: [█████░░░░░] 55% (3/6 phases; 18/20 plans)
 
 ## Performance Metrics
 
@@ -69,6 +69,7 @@ Progress: [█████░░░░░] 52% (3/6 phases; 17/20 plans)
 | Phase 03 P04 | 45 | 3 tasks | 5 files |
 | Phase 03 P05 | 18 | 2 tasks | 1 file |
 | Phase 04 P01 | 9 | 3 tasks | 13 files |
+| Phase 04 P02 | 5 | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -125,6 +126,7 @@ Recent decisions affecting current work:
 - [Phase 04]: [04-01]: AlgoError is estimator-LOCAL in mlrs-algos (not mlrs-core), wrapping PrimError via #[from] — the n_components/alpha hyperparameter guards (T-04-01-01) are estimator-specific so the primitive layer never depends on them; ? stays ergonomic across prim calls. New PrimError::NotPositiveDefinite { operand, pivot_index, pivot_value } lives in mlrs-core for the 04-02 Cholesky negative-pivot guard (T-04-01-02).
 - [Phase 04]: [04-01]: Fit/Predict/Transform trait surface (D-04) generic over <F: Float + CubeElement + Pod>; fit returns &mut self; Transform::inverse_transform has a default impl returning AlgoError::Unsupported so the surface stays total (PCA overrides, TruncatedSVD keeps default). mlrs-algos Cargo forwards cpu/wgpu/cuda/rocm to mlrs-backend (owns ActiveRuntime). lib.rs owns the module index; linear/decomposition mod.rs are stubs with commented future pub mod lines so 04-03/04/05 stay file-disjoint.
 - [Phase 04]: [04-01]: Nyquist Wave-0 scaffold — five #[ignore] test stubs (cholesky + 4 estimators, 30 fns) assert fixture load+shape only (no non-existent symbol refs) so the crates compile today; 04-02/03/04/05 remove #[ignore] and wire the real assertion. cholesky_test::fixture_loads loads cholesky_f64 via mlrs_core::load_npz and validates A/b/x/L keys+shapes (Task 2's --ignored verify target). gen_oracle.py gained gen_cholesky (scipy SPD solve + L factor), gen_linear_regression (full-rank + near-collinear small-σ case), gen_ridge (cholesky solver alpha sweep), gen_pca (svd_solver=full tall/wide + canonical alias), gen_truncated_svd (DETERMINISTIC algorithm='arpack', NOT randomized). 14 f32/f64 .npz blobs committed; regen needs /tmp venv with numpy+scipy+scikit-learn (PEP 668).
+- [Phase 04]: [04-02]: Cholesky/SPD-solve primitive = single-cube, all-shared-memory mlrs-kernels::cholesky_solve #[cube] kernel (feature-free, D-13) doing factor + forward + back triangular solve in ONE launch (D-11 gate 3, no host round-trip). UNIT-0-DOES-ALL serial schedule (jacobi_eig "acting unit" idiom) because the Cholesky-Banachiewicz recurrence is inherently sequential and n≤64 makes serialization cheap. Writes the lower factor L to a DEDICATED l_out buffer so the host checks ‖L·Lᵀ−A‖ from the KERNEL-EMITTED L (cholesky_solve_with_factor returns (x,L)), never re-derived. Diagonal sqrt guard (≤1e-12 floor) → info_out flag, never NaN (Pitfall 4). info array is LENGTH 3 [flag, pivot_index, pivot_value] (a length-2 encoded form reported the wrong pivot sign — fixed). prims::cholesky::cholesky_solve(pool,a,b,n,rhs,out) validates n*n/n≤MAX_DIM (NotSquare) + n*rhs (ShapeMismatch) BEFORE the unsafe launch (ASVS V5), threads out=Some Gram buffer through (D-11 gate 2, no parallel n² alloc), returns PrimError::NotPositiveDefinite on a non-positive pivot. ‖A·x−b‖ + ‖L·Lᵀ−A‖ + non-SPD all pass cpu(f64+f32)+rocm(f32; f64 skip-with-log). NOTE: mlrs-kernels has no cpu/rocm feature (feature-free by design) — the plan's `cargo build -p mlrs-kernels --features cpu` verb is wrong; the real launch-codegen gate is the backend build + cholesky_test under each feature.
 
 ### Pending Todos
 
@@ -151,6 +153,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12T06:00:51.456Z
-Stopped at: Phase 4 context gathered
-Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-05-PLAN.md (D-11 memory gate — assert eig()/svd() reuse the covariance/GEMM buffer (gate 2), read_backs==1 (gate 3, convergence loop device-resident), reuse-bounded allocations; both prims already thread out through and keep the convergence loop in-kernel).
+Last session: 2026-06-12T07:06:44.000Z
+Stopped at: Completed 04-02-PLAN.md (Cholesky/SPD-solve primitive)
+Resume file: .planning/phases/04-closed-form-estimators/04-03-PLAN.md (LinearRegression estimator — SVD pseudo-inverse lstsq, centering for intercept; consumes the Phase-3 thin SVD primitive, no new kernel).
