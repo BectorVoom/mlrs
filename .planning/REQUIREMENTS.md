@@ -24,7 +24,7 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 - [x] **PRIM-01**: A backend-portable GEMM / matrix-multiply primitive is available to estimators and validated against an oracle (Plan 02-01: cubek-matmul 0.2.0 wrap; transpose flags D-06; f32/f64 oracle within 1e-5 on cpu+wgpu)
 - [x] **PRIM-02**: Numerically-stable reduction primitives (sum/mean/min/max/argmin) work with a plane/subgroup path and a shared-memory fallback that both pass on wgpu
 - [x] **PRIM-03**: A pairwise-distance primitive (Euclidean/squared) with a `max(d², 0)` clamp serves KMeans, DBSCAN, and KNN
-- [ ] **PRIM-04**: A covariance / XᵀX primitive serves PCA and the linear-model closed-form solvers
+- [x] **PRIM-04**: A covariance / XᵀX primitive serves PCA and the linear-model closed-form solvers (Plan 02-04: column-mean center + GEMM(transa) AᵀA + 1/(n-ddof) scale, ddof=0/1 match np.cov on cpu+wgpu; Plan 02-05 D-10 gate proves the GEMM-output-buffer reuse)
 - [ ] **PRIM-05**: An SVD / eigendecomposition primitive (GPU Jacobi or equivalent) serves PCA, TruncatedSVD, and the OLS/Ridge SVD solver paths, validated against an oracle within tolerance
 
 ### Linear Models
@@ -108,7 +108,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PRIM-01 | Phase 2 | Complete (Plan 02-01) |
 | PRIM-02 | Phase 2 | Complete (Plan 02-02) |
 | PRIM-03 | Phase 2 | Complete (02-03) |
-| PRIM-04 | Phase 2 | Pending |
+| PRIM-04 | Phase 2 | Complete (02-04; D-10 gate 02-05) |
 | PRIM-05 | Phase 3 | Pending |
 | LINEAR-01 | Phase 4 | Pending |
 | LINEAR-02 | Phase 4 | Pending |

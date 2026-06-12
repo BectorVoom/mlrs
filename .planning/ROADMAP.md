@@ -14,7 +14,7 @@ mlrs is built primitive-first along a strictly acyclic five-crate workspace. The
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Foundation — Oracle, Backend Abstraction, Arrow Bridge** - Workspace, generic R/F spine, oracle harness, Arrow zero-copy bridge, f64 capability gate, allocator (completed 2026-06-11)
-- [ ] **Phase 2: Core Compute Primitives** - GEMM, reductions, pairwise distance, covariance/XᵀX validated standalone on cpu+wgpu
+- [x] **Phase 2: Core Compute Primitives** - GEMM, reductions, pairwise distance, covariance/XᵀX validated standalone on cpu+wgpu; D-10 build-failing memory gate green (completed 2026-06-12)
 - [ ] **Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)** - GPU Jacobi SVD + symmetric eig, sign-flip oracle-validated, gates four estimators
 - [ ] **Phase 4: Closed-Form Estimators** - LinearRegression, Ridge, PCA, TruncatedSVD assembled on validated primitives
 - [ ] **Phase 5: Distance-Based & Iterative-Solver Estimators** - KMeans, DBSCAN, KNN×3, Lasso, ElasticNet, LogisticRegression
@@ -53,8 +53,8 @@ Plans:
 
   1. ✅ A GEMM primitive (substrate resolved in Plan 02-01: WRAPS `cubek-matmul` 0.2.0 — the cubecl-0.10-compatible matmul source in tracel-ai/cubek; `cubecl-matmul`/`cubecl-linalg` are abandoned on incompatible cubecl lines) matches a host reference within tolerance for f32 and f64 on both cpu and wgpu. **[Plan 02-01 complete; wording updated from "cubecl-matmul" → "cubek-matmul".]**
   2. ✅ Reduction primitives (sum/mean/min/max/argmin/L2-norm) pass on wgpu via both a plane/subgroup path and a shared-memory fallback, with no hardcoded plane width (uses `PLANE_DIM`), numerically stable on large inputs. **[Plan 02-02 complete; BOTH paths green on wgpu (plane genuinely exercised) + cpu, f32/f64, within 1e-5; argmin lowest-index tie-break pinned by numpy fixture.]**
-  3. A pairwise squared-Euclidean distance primitive with a `max(d², 0)` clamp produces no negative distances under f32 and matches the host reference within tolerance.
-  4. A covariance / XᵀX (Gram) primitive built on GEMM matches the host reference within tolerance for both dtypes on cpu and wgpu.
+  3. ✅ A pairwise squared-Euclidean distance primitive with a `max(d², 0)` clamp produces no negative distances under f32 and matches the host reference within tolerance. **[Plan 02-03 complete; GEMM-expansion + statement-form clamp, min>=0 property pinned on f32 cancellation, squared/sqrt fixtures, green cpu+wgpu.]**
+  4. ✅ A covariance / XᵀX (Gram) primitive built on GEMM matches the host reference within tolerance for both dtypes on cpu and wgpu. **[Plan 02-04 complete; column-mean center + GEMM(transa) AᵀA + 1/(n-ddof) scale, ddof=0/1 match np.cov, green cpu+wgpu. Plan 02-05 D-10 memory gate proves the device-resident composition (reuse>0/bounded, read_backs==1, Gram reuses GEMM buffer) end-to-end.]**
 
 **Plans**: 5 plansPlans:
 **Wave 1**
@@ -75,7 +75,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 02-05-PLAN.md — Wave 5: D-10 build-failing memory gate (reuse>0/bounded, no mid-pipeline read-back, Gram reuses GEMM buffer)
+- [x] 02-05-PLAN.md — Wave 5: D-10 build-failing memory gate (reuse>0/bounded, no mid-pipeline read-back, Gram reuses GEMM buffer) ✅ (memory_gate_test.rs: 3 HARD PoolStats assertions — FIRST_ITER_ALLOCS=15/reuses=62, read_backs==1 for GEMM→reduce→distance, free-list probe confirms 0 parallel Gram allocs; green cpu+wgpu, identical figures; zero new deps, zero source-symbol changes)
 
 ### Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)
 
@@ -143,7 +143,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
-| 2. Core Compute Primitives | 0/TBD | Not started | - |
+| 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 0/TBD | Not started | - |
 | 4. Closed-Form Estimators | 0/TBD | Not started | - |
 | 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |

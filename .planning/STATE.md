@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Plan 02-04 complete (covariance / XᵀX PRIM-04 via GEMM(transa) + ddof=0/1, GEMM-buffer reuse) — Phase 02 plan 4/5
-last_updated: "2026-06-12T00:00:00.000Z"
-last_activity: 2026-06-12 -- Plan 02-04 executed (covariance: column-mean center + AᵀA + ddof scale, GEMM-output-buffer reuse for D-10 gate 3)
+stopped_at: Plan 02-05 complete (D-10 build-failing memory gate: reuse>0/bounded, read_backs==1, Gram reuses GEMM buffer) — Phase 02 COMPLETE (5/5 plans)
+last_updated: "2026-06-12T00:30:00.000Z"
+last_activity: 2026-06-12 -- Plan 02-05 executed (D-10 memory gate: three HARD PoolStats assertions, green cpu+wgpu; Phase 02 complete)
 progress:
   total_phases: 6
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 10
-  completed_plans: 9
-  percent: 30
+  completed_plans: 10
+  percent: 33
 ---
 
 # Project State
@@ -25,13 +25,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 02 (core-compute-primitives) — EXECUTING
-Plan: 5 of 5
-Status: Executing Phase 02 (plans 01-04 complete)
-Last activity: 2026-06-12 -- Plan 02-04 executed (PRIM-04 covariance / XᵀX via GEMM(transa) + ddof=0/1, GEMM-buffer reuse)
-Resume file: .planning/phases/02-core-compute-primitives/02-05-PLAN.md
+Phase: 02 (core-compute-primitives) — COMPLETE
+Plan: 5 of 5 (all complete)
+Status: Phase 02 complete (plans 01-05 done); next Phase 03 needs `/gsd-plan-phase --research-phase 3`
+Last activity: 2026-06-12 -- Plan 02-05 executed (D-10 build-failing memory gate; Phase 02 complete)
+Resume file: — (Phase 02 complete; Phase 03 SVD/eig needs research before planning)
 
-Progress: [███░░░░░░░] 30% (1/6 phases; 9/10 plans)
+Progress: [███░░░░░░░] 33% (2/6 phases; 10/10 plans)
 
 ## Performance Metrics
 
@@ -61,6 +61,7 @@ Progress: [███░░░░░░░] 30% (1/6 phases; 9/10 plans)
 | Phase 02 P02 | 95 | 3 tasks | 8 files |
 | Phase 02 P03 | 7 | 3 tasks | 8 files |
 | Phase 02 P04 | 12 | 2 tasks | 9 files |
+| Phase 02 P05 | 18 | 1 task | 1 file |
 
 ## Accumulated Context
 
@@ -100,6 +101,8 @@ Recent decisions affecting current work:
 - [Phase 02]: [02-04]: Covariance GEMM-output-buffer reuse (D-10 gate 3, LOAD-BEARING for Plan 05): covariance() drives the internal gemm(transa=true) into a SINGLE out buffer (caller's `out` when supplied D-11, else gemm's own pool.acquire) and launches scale with that SAME handle as input AND output (gram.handle()==in==out), normalising 1/(n-ddof) IN PLACE; returns Ok(gram) — the returned handle IS the GEMM output handle, no parallel Gram allocation. Plan 05 gate 3: pass a GEMM output DeviceArray as covariance's out; allocations does not bump for a fresh Gram.
 - [Phase 02]: [02-04]: center_columns elementwise kernel added (Rule 2 — D-05) so covariance.rs keeps grep -c to_host == 0; out[tid]=a[tid]-mean[tid%cols], same per-element class as scale/clamp_nonneg, feature-free. NOT a new Gram kernel (AᵀA still composes GEMM); zero external deps (T-0204-SC held).
 - [Phase 02]: [02-04]: ddof folded into the scale factor 1/(n_samples-ddof): ddof=0 population (1/n), ddof=1 sample (1/(n-1)). Fixtures pin np.cov(A, rowvar=False, ddof) — features as COLUMNS, matching the (n_samples, n_features) row-major contract; A 7×4, C 4×4. Direct centred-AᵀA/(n-ddof) host ref independent of the GEMM(transa) algebra.
+- [Phase 02]: [02-05]: D-10 memory gate is build-failing (memory_gate_test.rs) — three HARD PoolStats assertions activate Phase-1 D-05's deferred gate. Gate 1 (reuse_bounded): allocations<=FIRST_ITER_ALLOCS for iters 2..N AND reuses>=N-1 (observed FIRST_ITER_ALLOCS=15, reuses=62, N=5). Gate 2 (read_backs==1): GEMM→reduce→distance chain + ONE terminal to_host_metered; the reduction's internal plain to_host does NOT bump read_backs (only the metered path does), so the counter isolates the terminal read. Gate 3 (Gram reuses GEMM buffer): free-list PROBE, not handle identity — CubeCL Handle has no PartialEq, so detect a parallel Gram by acquiring gram_bytes after covariance and checking reuse-vs-fresh; observed 0 parallel Gram allocations. Identical figures cpu==wgpu (counters backend-agnostic). Zero new deps, zero source-symbol changes.
+- [Phase 02]: [02-05]: Pattern — free-list probe for allocation-identity when the handle type is not comparable: a reused-in-place buffer stays LIVE (off the free-list); only a parallel allocate-then-release lands on it, so acquire-and-check-reuse distinguishes the two.
 
 ### Pending Todos
 
@@ -127,6 +130,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12T00:12:00.000Z
-Stopped at: Plan 02-04 complete (PRIM-04 covariance / XᵀX: column-mean center + center_columns kernel + AᵀA via GEMM(transa) + 1/(n-ddof) scale in place over the GEMM output buffer — D-10 gate-3 reuse; ddof=0/1 match np.cov + host ref; green cpu+wgpu)
-Resume file: .planning/phases/02-core-compute-primitives/02-05-PLAN.md (next: Plan 02-05 D-10 memory gate — gate 3 asserts the covariance GEMM-buffer reuse documented in 02-04-SUMMARY)
+Last session: 2026-06-12T00:30:00.000Z
+Stopped at: Plan 02-05 complete (D-10 build-failing memory gate — memory_gate_test.rs: reuse>0/bounded [FIRST_ITER_ALLOCS=15, reuses=62], read_backs==1 [GEMM→reduce→distance, terminal metered read only], Gram reuses GEMM buffer [free-list probe: 0 parallel allocs]; green cpu+wgpu, identical figures). Phase 02 COMPLETE — all four primitives PRIM-01..04 validated standalone + device-resident composition proven end-to-end.
+Resume file: — (Phase 02 complete). Next: Phase 03 SVD/eig needs `/gsd-plan-phase --research-phase 3` before any code (no pre-built CubeCL Jacobi SVD primitive).
