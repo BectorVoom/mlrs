@@ -94,6 +94,11 @@ fn host_max(x: &[f64]) -> f64 {
 fn host_l2(x: &[f64]) -> f64 {
     x.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
+/// Squared L2 norm `Σ xᵢ²` (no sqrt) — host reference for `ScalarOp::SumSq`,
+/// the squared-norm op Plan 03 distance consumes.
+fn host_sumsq(x: &[f64]) -> f64 {
+    x.iter().map(|v| v * v).sum::<f64>()
+}
 /// numpy-style argmin: lowest index of the minimum.
 fn host_argmin(x: &[f64]) -> u32 {
     let mut bi = 0usize;
@@ -123,6 +128,9 @@ fn check_full_scalar<F>(
         ScalarOp::Min => host_min(host),
         ScalarOp::Max => host_max(host),
         ScalarOp::L2Norm => host_l2(host),
+        // SumSq has no full-array public reduction fn (it is an axis-only op for
+        // the distance norm term); this helper is never called with it.
+        ScalarOp::SumSq => unreachable!("check_full_scalar is not invoked with SumSq"),
     };
 
     for path in [ReducePath::Shared, ReducePath::Plane] {
@@ -133,6 +141,7 @@ fn check_full_scalar<F>(
             ScalarOp::Min => reduce::min::<F>(pool, &arr, path),
             ScalarOp::Max => reduce::max::<F>(pool, &arr, path),
             ScalarOp::L2Norm => reduce::l2_norm::<F>(pool, &arr, path),
+            ScalarOp::SumSq => unreachable!("check_full_scalar is not invoked with SumSq"),
         }
         .expect("reduction must not error on valid geometry");
 
@@ -339,6 +348,7 @@ fn reduce_host(seg: &[f64], op: ScalarOp) -> f64 {
         ScalarOp::Min => host_min(seg),
         ScalarOp::Max => host_max(seg),
         ScalarOp::L2Norm => host_l2(seg),
+        ScalarOp::SumSq => host_sumsq(seg),
     }
 }
 

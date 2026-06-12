@@ -46,6 +46,11 @@ A = 2.5
 # exercises rectangular geometry: A is m×k, B is k×n, C = A @ B is m×n.
 GEMM_M, GEMM_K, GEMM_N = 5, 4, 3
 
+# Distance convention-fixture shape (D-12, PRIM-03). X is rows_x×cols, Y is
+# rows_y×cols; the pairwise squared distance D is rows_x×rows_y. Non-square so
+# the fixture exercises rectangular geometry and rows_x != rows_y.
+DIST_ROWS_X, DIST_ROWS_Y, DIST_COLS = 5, 4, 3
+
 
 def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
     """Generate one seeded saxpy fixture and write it to ``tests/fixtures``.
@@ -89,6 +94,39 @@ def gen_gemm(seed: int = SEED, dtype=np.float32) -> str:
     os.makedirs(_FIXTURE_DIR, exist_ok=True)
     out_path = os.path.join(_FIXTURE_DIR, f"gemm_{dtype_tag}_seed{seed}.npz")
     np.savez(out_path, A=a, B=b, C=c)
+    return out_path
+
+
+def gen_distance(seed: int = SEED, dtype=np.float32, sqrt: bool = False) -> str:
+    """Generate one seeded pairwise-distance convention fixture (D-12, PRIM-03).
+
+    Stores named arrays ``X`` (rows_x×cols), ``Y`` (rows_y×cols) and the NumPy
+    reference pairwise distance ``D`` (rows_x×rows_y), every array cast to the
+    fixture's dtype. ``D[i,j] = sum_k (X[i,k] - Y[j,k])**2`` (the SQUARED
+    Euclidean distance); when ``sqrt`` is set, ``D = sqrt(squared)`` (the
+    optional Euclidean boundary, D-08).
+
+    The reference is computed the direct way (``(X[:,None,:] - Y[None,:,:])**2``
+    summed over the feature axis) rather than the GEMM-expansion the device
+    uses, so the fixture is an INDEPENDENT oracle of the expansion identity, not
+    a tautology. Returns the absolute path written.
+    """
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((DIST_ROWS_X, DIST_COLS)).astype(dtype)
+    y = rng.standard_normal((DIST_ROWS_Y, DIST_COLS)).astype(dtype)
+    # Direct squared pairwise distance (compute in fixture dtype to match a
+    # same-dtype device result): broadcast over the feature axis.
+    diff = x[:, None, :].astype(dtype) - y[None, :, :].astype(dtype)
+    sq = (diff * diff).sum(axis=2).astype(dtype)
+    d = np.sqrt(sq).astype(dtype) if sqrt else sq
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    kind = "sqrt" if sqrt else "sq"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"dist_{kind}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, X=x, Y=y, D=d)
     return out_path
 
 
@@ -152,6 +190,10 @@ def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_gemm(dtype=dtype)
         print(f"wrote {path}")
+    # Distance (PRIM-03): squared f32/f64 + the sqrt f64 variant (D-12).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_distance(dtype=dtype, sqrt=False)}")
+    print(f"wrote {gen_distance(dtype=np.float64, sqrt=True)}")
     print(f"wrote {gen_argmin_tie()}")
 
 
