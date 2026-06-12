@@ -9,7 +9,7 @@ pub mod elementwise;
 pub mod reduce;
 pub mod smoke;
 
-pub use elementwise::{clamp_nonneg, dist_combine_clamp, scale, sqrt_elem};
+pub use elementwise::{center_columns, clamp_nonneg, dist_combine_clamp, scale, sqrt_elem};
 pub use reduce::{
     argmax_shared, argmin_shared, reduce_max_plane, reduce_max_shared, reduce_min_plane,
     reduce_min_shared, reduce_sum_plane, reduce_sum_shared, reduce_sumsq_plane, reduce_sumsq_shared,

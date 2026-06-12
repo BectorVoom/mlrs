@@ -69,6 +69,29 @@ pub fn scale<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, fa
     }
 }
 
+/// Column centring (PRIM-04 covariance): subtract the per-column mean from each
+/// element of a `rows × cols` row-major matrix, `out[r, c] = a[r, c] − mean[c]`.
+///
+/// One unit handles one element at `ABSOLUTE_POS`; the column index is
+/// `tid % cols` so the broadcast mean is read from the length-`cols` `mean`
+/// array. Bounds-checked on `tid < a.len()` (over-provisioned threads are
+/// no-ops, T-0204-01). `cols` is a scalar `u32` passed by value (cubecl 0.10,
+/// like `dist_combine_clamp`'s `rows`/`cols`). Keeps the two-pass covariance
+/// centring device-resident (no host round-trip in `covariance.rs`, D-05).
+#[cube(launch)]
+pub fn center_columns<F: Float + CubeElement>(
+    a: &Array<F>,
+    mean: &Array<F>,
+    output: &mut Array<F>,
+    cols: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < a.len() {
+        let c = tid % cols as usize;
+        output[tid] = a[tid] - mean[c];
+    }
+}
+
 /// Distance combine + clamp (PRIM-03): for the `rows × cols` output element
 /// `(i, j)`, compute `‖x_i‖² + ‖y_j‖² − 2·XYᵀ[i,j]` then clamp to `max(d², 0)`
 /// (the GEMM-expansion of the squared Euclidean distance, D-07).
