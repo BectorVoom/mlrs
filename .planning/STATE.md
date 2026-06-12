@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: completed
-stopped_at: "Plan 03-04 complete — two-sided cyclic Jacobi symmetric-eig primitive. jacobi_eig_sweep #[cube(launch)] single-cube kernel applies Jᵀ·A·J per pair via a single acting unit (sequential cyclic pairs — two-sided rotations are NOT footprint-disjoint so the SVD's parallel column schedule races), accumulates V, measures the true post-sweep off-diagonal norm in-kernel (no host round-trip), writes the diagonal UNSORTED. eig() host orchestration validates squareness→NotSquare before any unsafe launch (D-06, no symmetrization), reuses the covariance/GEMM out buffer as the kernel working input (D-11 gate 2), sorts eigenvalues descending + permutes eigenvector columns (D-04), returns NotConverged on a cap hit (D-12). All 4 eig_test green on cpu (f32+f64) and rocm gfx1100 (f32; f64 skip-with-log); svd_test still 7/7. PRIM-05 now complete (SVD half 03-03 + eig half 03-04). Only 03-05 (D-11 memory gate) remains in Phase 3."
-last_updated: "2026-06-12T05:27:16.272Z"
+stopped_at: Phase 4 context gathered
+last_updated: "2026-06-12T06:00:51.464Z"
 last_activity: 2026-06-12
 progress:
   total_phases: 6
@@ -29,7 +29,7 @@ Phase: 4
 Plan: Not started
 Status: Phase 3 complete
 Last activity: 2026-06-12
-Resume file: (Phase 3 complete — run /gsd-plan-phase 04 to begin the next phase)
+Resume file: .planning/phases/04-closed-form-estimators/04-CONTEXT.md
 
 Progress: [█████░░░░░] 50% (3/6 phases; 16/16 plans)
 
@@ -146,6 +146,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12 -- Plan 03-04 complete
-Stopped at: Plan 03-04 complete — two-sided cyclic Jacobi symmetric-eig primitive. jacobi_eig_sweep #[cube(launch)] single-cube kernel applies Jᵀ·A·J per pair via a single acting unit (sequential cyclic pairs — two-sided rotations are NOT footprint-disjoint so the SVD's parallel column schedule races), accumulates V, measures the true post-sweep off-diagonal norm in-kernel (no host round-trip), writes the diagonal UNSORTED. eig() host orchestration validates squareness→NotSquare before any unsafe launch (D-06, no symmetrization), reuses the covariance/GEMM out buffer as the kernel working input (D-11 gate 2), sorts eigenvalues descending + permutes eigenvector columns (D-04), returns NotConverged on a cap hit (D-12). All 4 eig_test green on cpu (f32+f64) and rocm gfx1100 (f32; f64 skip-with-log); svd_test still 7/7. PRIM-05 now complete (SVD half 03-03 + eig half 03-04). Only 03-05 (D-11 memory gate) remains in Phase 3.
+Last session: 2026-06-12T06:00:51.456Z
+Stopped at: Phase 4 context gathered
 Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-05-PLAN.md (D-11 memory gate — assert eig()/svd() reuse the covariance/GEMM buffer (gate 2), read_backs==1 (gate 3, convergence loop device-resident), reuse-bounded allocations; both prims already thread out through and keep the convergence loop in-kernel).
