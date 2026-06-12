@@ -71,7 +71,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 02-04-PLAN.md — Wave 4: covariance / XᵀX via GEMM(transa) + ddof=0/1 normalization (PRIM-04)
+- [x] 02-04-PLAN.md — Wave 4: covariance / XᵀX via GEMM(transa) + ddof=0/1 normalization (PRIM-04) ✅ (covariance host API composes column-mean center + device center_columns kernel + gemm(transa) AᵀA + 1/(n-ddof) scale in place over the GEMM output buffer — D-10 gate-3 reuse achieved; ddof=0 population + ddof=1 sample match np.cov(rowvar=False) fixtures + direct host ref, f32+f64, green cpu+wgpu)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 

@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Plan 02-02 complete (reduction primitives PRIM-02, dual-path plane+shared) — Phase 02 plan 2/5
+stopped_at: Plan 02-04 complete (covariance / XᵀX PRIM-04 via GEMM(transa) + ddof=0/1, GEMM-buffer reuse) — Phase 02 plan 4/5
 last_updated: "2026-06-12T00:00:00.000Z"
-last_activity: 2026-06-12 -- Plan 02-02 executed (dual-path reductions + argmin tie-break)
+last_activity: 2026-06-12 -- Plan 02-04 executed (covariance: column-mean center + AᵀA + ddof scale, GEMM-output-buffer reuse for D-10 gate 3)
 progress:
   total_phases: 6
   completed_phases: 1
   total_plans: 10
-  completed_plans: 7
-  percent: 21
+  completed_plans: 9
+  percent: 30
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 02 (core-compute-primitives) — EXECUTING
-Plan: 4 of 5
-Status: Executing Phase 02 (plans 01-03 complete)
-Last activity: 2026-06-12 -- Plan 02-03 executed (PRIM-03 GEMM-expansion distance + clamp + optional sqrt)
-Resume file: .planning/phases/02-core-compute-primitives/02-04-PLAN.md
+Plan: 5 of 5
+Status: Executing Phase 02 (plans 01-04 complete)
+Last activity: 2026-06-12 -- Plan 02-04 executed (PRIM-04 covariance / XᵀX via GEMM(transa) + ddof=0/1, GEMM-buffer reuse)
+Resume file: .planning/phases/02-core-compute-primitives/02-05-PLAN.md
 
-Progress: [███░░░░░░░] 26% (1/6 phases; 8/10 plans)
+Progress: [███░░░░░░░] 30% (1/6 phases; 9/10 plans)
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Progress: [███░░░░░░░] 26% (1/6 phases; 8/10 plans)
 | Phase 02 P01 | 35 | 5 tasks | 14 files |
 | Phase 02 P02 | 95 | 3 tasks | 8 files |
 | Phase 02 P03 | 7 | 3 tasks | 8 files |
+| Phase 02 P04 | 12 | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -96,6 +97,9 @@ Recent decisions affecting current work:
 - [Phase 02]: [02-01]: f64 GEMM accumulates in f64 via MatmulElems::from_globals (acc kept at f64 global dtype for non-f16/bf16 out), sidestepping cubek-matmul's default f32-stage MatmulPrecision<f64>. Passed 1e-5 oracle gate on cpu AND wgpu (SHADER_F64 present).
 - [Phase 02]: [02-01]: Subgroup-query symbol RESOLVED = client.features().plane.contains(Plane::Ops) (cubecl::ir::features::Plane); plane width via properties().hardware.plane_size_{min,max}. Facade: capability::supports_plane / plane_supported. Plan 02 plane-path gates on this (no attempt-launch-and-skip fallback needed).
 - [Phase 02]: [02-01]: GEMM host API validates geometry (PrimError::ShapeMismatch/DimMismatch) and returns Result before any unsafe launch (D-04 / T-0201-02). Transpose = InputBinding::swap_dims logical swap, no transpose buffer (D-06).
+- [Phase 02]: [02-04]: Covariance GEMM-output-buffer reuse (D-10 gate 3, LOAD-BEARING for Plan 05): covariance() drives the internal gemm(transa=true) into a SINGLE out buffer (caller's `out` when supplied D-11, else gemm's own pool.acquire) and launches scale with that SAME handle as input AND output (gram.handle()==in==out), normalising 1/(n-ddof) IN PLACE; returns Ok(gram) — the returned handle IS the GEMM output handle, no parallel Gram allocation. Plan 05 gate 3: pass a GEMM output DeviceArray as covariance's out; allocations does not bump for a fresh Gram.
+- [Phase 02]: [02-04]: center_columns elementwise kernel added (Rule 2 — D-05) so covariance.rs keeps grep -c to_host == 0; out[tid]=a[tid]-mean[tid%cols], same per-element class as scale/clamp_nonneg, feature-free. NOT a new Gram kernel (AᵀA still composes GEMM); zero external deps (T-0204-SC held).
+- [Phase 02]: [02-04]: ddof folded into the scale factor 1/(n_samples-ddof): ddof=0 population (1/n), ddof=1 sample (1/(n-1)). Fixtures pin np.cov(A, rowvar=False, ddof) — features as COLUMNS, matching the (n_samples, n_features) row-major contract; A 7×4, C 4×4. Direct centred-AᵀA/(n-ddof) host ref independent of the GEMM(transa) algebra.
 
 ### Pending Todos
 
@@ -123,6 +127,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12T00:06:00.000Z
-Stopped at: Plan 02-03 complete (PRIM-03 GEMM-expansion distance: elementwise kernels + distance host API + min>=0 property + squared/sqrt npz fixtures; green cpu+wgpu)
-Resume file: .planning/phases/02-core-compute-primitives/02-04-PLAN.md (next: Plan 02-04 covariance)
+Last session: 2026-06-12T00:12:00.000Z
+Stopped at: Plan 02-04 complete (PRIM-04 covariance / XᵀX: column-mean center + center_columns kernel + AᵀA via GEMM(transa) + 1/(n-ddof) scale in place over the GEMM output buffer — D-10 gate-3 reuse; ddof=0/1 match np.cov + host ref; green cpu+wgpu)
+Resume file: .planning/phases/02-core-compute-primitives/02-05-PLAN.md (next: Plan 02-05 D-10 memory gate — gate 3 asserts the covariance GEMM-buffer reuse documented in 02-04-SUMMARY)
