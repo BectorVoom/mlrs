@@ -102,12 +102,38 @@ pub fn svd<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    svd_with_max_sweeps::<F>(pool, a, (rows, cols), MAX_SWEEPS)
+}
+
+/// Identical to [`svd`] but with a caller-chosen sweep cap (D-12). Production
+/// callers use [`svd`] (cap = `MAX_SWEEPS = 30`); this exists so the test suite
+/// can drive the `NotConverged` path with an artificially LOW cap (e.g. 1) and
+/// assert the cap-hit input surfaces [`PrimError::NotConverged`] rather than a
+/// silently-unconverged factorization or an infinite loop (WR-05). It does NOT
+/// change the convergence policy — only the cap passed to the in-kernel loop.
+#[allow(clippy::type_complexity)]
+pub fn svd_with_max_sweeps<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    a: &DeviceArray<ActiveRuntime, F>,
+    (rows, cols): (usize, usize),
+    max_sweeps: u32,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    PrimError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
     // --- ASVS V5 / T-03-03-01: validate geometry BEFORE any unsafe launch. ---
     validate_geometry(a.len(), (rows, cols))?;
 
     if rows >= cols {
         // Tall path: Jacobi directly on A, U/S/Vᵀ as-is.
-        svd_tall::<F>(pool, a, rows, cols, false)
+        svd_tall::<F>(pool, a, rows, cols, false, max_sweeps)
     } else {
         // Wide path (D-05): run on Aᵀ (which is tall, cols×rows), then swap
         // U ↔ V. We materialize Aᵀ once into pooled scratch (the single allowed
@@ -125,7 +151,7 @@ where
         let at_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &at_host);
         // SVD of Aᵀ (cols × rows, tall since cols > rows). Pass swap=true so the
         // returned tuple is already (U, S, Vᵀ) of the ORIGINAL A.
-        let res = svd_tall::<F>(pool, &at_dev, cols, rows, true);
+        let res = svd_tall::<F>(pool, &at_dev, cols, rows, true, max_sweeps);
         at_dev.release_into(pool);
         res
     }
@@ -141,6 +167,7 @@ fn svd_tall<F>(
     rows: usize,
     cols: usize,
     swap_uv: bool,
+    max_sweeps: u32,
 ) -> Result<
     (
         DeviceArray<ActiveRuntime, F>,
@@ -194,7 +221,7 @@ where
         cols as u32,
         skip_thr,
         conv_thr,
-        MAX_SWEEPS,
+        max_sweeps,
     );
 
     // The rotated-A scratch is not used for extraction (we recompute A·V via the
@@ -209,14 +236,14 @@ where
     info_dev.release_into(pool);
     let sweeps_run = host_to_f64(info[0]) as u32;
     let residual = host_to_f64(info[1]);
-    if sweeps_run >= MAX_SWEEPS && residual.is_finite() {
+    if sweeps_run >= max_sweeps && residual.is_finite() {
         // Only flag non-convergence if the cap was hit AND the residual is still
         // above the convergence band; a cap hit with a residual already at/below
         // conv_thr is a benign "converged exactly at the cap".
         if residual > host_to_f64(conv_thr) {
             return Err(PrimError::NotConverged {
                 operand: "svd",
-                max_sweeps: MAX_SWEEPS,
+                max_sweeps,
                 residual,
             });
         }
