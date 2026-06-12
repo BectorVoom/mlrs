@@ -18,4 +18,4 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 pub mod linear_regression;
-// 04-05 adds: pub mod ridge;
+pub mod ridge;
