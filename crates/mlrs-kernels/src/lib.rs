@@ -6,11 +6,13 @@
 //! runtime is chosen in `mlrs-backend`.
 
 pub mod elementwise;
+pub mod jacobi_eig;
 pub mod jacobi_svd;
 pub mod reduce;
 pub mod smoke;
 
 pub use elementwise::{center_columns, clamp_nonneg, dist_combine_clamp, scale, sqrt_elem};
+pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
 pub use reduce::{
     argmax_shared, argmin_shared, reduce_max_plane, reduce_max_shared, reduce_min_plane,
