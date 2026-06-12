@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-02-PLAN.md
-last_updated: "2026-06-12T07:06:44.000Z"
-last_activity: 2026-06-12 -- Completed Phase 04 Plan 02 (Cholesky/SPD-solve primitive)
+stopped_at: Completed 04-04-PLAN.md
+last_updated: "2026-06-12T07:34:16.000Z"
+last_activity: 2026-06-12 -- Completed Phase 04 Plan 04 (PCA + TruncatedSVD decomposition estimators)
 progress:
   total_phases: 6
   completed_phases: 3
   total_plans: 20
-  completed_plans: 18
-  percent: 55
+  completed_plans: 19
+  percent: 57
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 04 (closed-form-estimators) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Executing Phase 04
-Last activity: 2026-06-12 -- Completed Phase 04 Plan 03 (LinearRegression LINEAR-01 — SVD pseudo-inverse OLS)
-Resume file: .planning/phases/04-closed-form-estimators/04-04-PLAN.md
+Last activity: 2026-06-12 -- Completed Phase 04 Plan 04 (PCA DECOMP-01 + TruncatedSVD DECOMP-02 decomposition estimators)
+Resume file: .planning/phases/04-closed-form-estimators/04-05-PLAN.md
 
-Progress: [██████░░░░] 58% (3/6 phases; 19/20 plans)
+Progress: [██████░░░░] 57% (3/6 phases; 19/20 plans)
 
 ## Performance Metrics
 
@@ -71,6 +71,7 @@ Progress: [██████░░░░] 58% (3/6 phases; 19/20 plans)
 | Phase 04 P01 | 9 | 3 tasks | 13 files |
 | Phase 04 P02 | 5 | 2 tasks | 5 files |
 | Phase 04 P03 | 8 | 2 tasks | 3 files |
+| Phase 04 P04 | 11 | 2 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -128,6 +129,7 @@ Recent decisions affecting current work:
 - [Phase 04]: [04-01]: Fit/Predict/Transform trait surface (D-04) generic over <F: Float + CubeElement + Pod>; fit returns &mut self; Transform::inverse_transform has a default impl returning AlgoError::Unsupported so the surface stays total (PCA overrides, TruncatedSVD keeps default). mlrs-algos Cargo forwards cpu/wgpu/cuda/rocm to mlrs-backend (owns ActiveRuntime). lib.rs owns the module index; linear/decomposition mod.rs are stubs with commented future pub mod lines so 04-03/04/05 stay file-disjoint.
 - [Phase 04]: [04-01]: Nyquist Wave-0 scaffold — five #[ignore] test stubs (cholesky + 4 estimators, 30 fns) assert fixture load+shape only (no non-existent symbol refs) so the crates compile today; 04-02/03/04/05 remove #[ignore] and wire the real assertion. cholesky_test::fixture_loads loads cholesky_f64 via mlrs_core::load_npz and validates A/b/x/L keys+shapes (Task 2's --ignored verify target). gen_oracle.py gained gen_cholesky (scipy SPD solve + L factor), gen_linear_regression (full-rank + near-collinear small-σ case), gen_ridge (cholesky solver alpha sweep), gen_pca (svd_solver=full tall/wide + canonical alias), gen_truncated_svd (DETERMINISTIC algorithm='arpack', NOT randomized). 14 f32/f64 .npz blobs committed; regen needs /tmp venv with numpy+scipy+scikit-learn (PEP 668).
 - [Phase 04]: [04-03]: LinearRegression (LINEAR-01) = OLS via SVD pseudo-inverse coef = V·diag(σ⁺)·Uᵀ·y_centered, composed from Phase-3 svd + Phase-2 gemm (transa reads Uᵀ/V with no transpose buffer, D-06) + column_reduce(Mean) — NO Cholesky (deliberately a different solver from Ridge, D-02). CUTOFF PIN (Open Q3): σ⁺_i = 1/σ_i if σ_i > RCOND·σ_max else 0 with RCOND=1e-6 — this is sklearn LinearRegression's default `tol`, which it forwards as scipy.linalg.lstsq(cond=tol) (sklearn/_base.py:752); the numpy/gelsd default ε·max(m,n) (~2.7e-15 in f64) is TOO SMALL and keeps the near-collinear σ_min≈1.13e-7 (σ_min/σ_max≈3e-8), reciprocating it → coef explodes to ~±2.93e4 (numpy lstsq rcond=None reproduces this; sklearn returns the bounded 0.485 min-norm). NEAR_ZERO_FLOOR=1e-8 floors the cutoff for a degenerate spectrum. Intercept via center-then-solve (D-05): host two-pass means, intercept_=ȳ−x̄·coef_. coef_/intercept_ device-resident (D-03); predict = X_test·coef on-device + intercept broadcast. LINEAR-01 oracle green cpu(f64)+rocm(f32; f64 skip-with-log), incl. collinear cutoff, within 1e-5.
+- [Phase 04]: [04-04]: PCA (DECOMP-01) + TruncatedSVD (DECOMP-02) share ONE skeleton — column_reduce(Mean)/center → Phase-3 svd → align_rows(Vᵀ) → truncate — with THREE documented per-estimator differences (RESEARCH Pitfall 2): PCA centers X, explained_variance_=S²/(n−1) (ddof=1), ratio over the FULL spectrum BEFORE truncation (Pitfall 6), implements inverse_transform; TruncatedSVD does NOT center, explained_variance_=var(transform cols, ddof=0) (NOT S²/(n−1)), ratio denom=total per-feature var of original X, inverse_transform stays the Unsupported default (D-01). svd_flip applied ESTIMATOR-side via align_rows on Vᵀ rows (primitive stays raw, D-01/D-03); transform=(X[−mean])·componentsᵀ via gemm transb (components_ is nc×n_features row-major read transposed, no transpose buffer, D-06). explained_variance_ computed host-side (reduce prim has no Variance ScalarOp; the ratio/truncation already need a host pass over length-k S — mirrors 04-03's host σ⁺). n_components>min(m,n) and n_samples≤1 rejected before launch (T-04-04-01/03). RULE-1 FIX: gen_oracle.py c() now wraps np.ascontiguousarray — sklearn PCA components_ is Fortran-contiguous, so the committed npz stored a column-major ravel that load_npz (npyz into_vec, no reorder) read transposed, silently breaking the row-major contract (latent because 04-01 scaffold only asserted LENGTH); regenerated the 6 PCA fixtures C-contiguous (TruncatedSVD arpack components_ were already C-contig). DECOMP-01/02 green cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5, incl. PCA wide (n_features>n_samples) Aᵀ-swap case.
 - [Phase 04]: [04-02]: Cholesky/SPD-solve primitive = single-cube, all-shared-memory mlrs-kernels::cholesky_solve #[cube] kernel (feature-free, D-13) doing factor + forward + back triangular solve in ONE launch (D-11 gate 3, no host round-trip). UNIT-0-DOES-ALL serial schedule (jacobi_eig "acting unit" idiom) because the Cholesky-Banachiewicz recurrence is inherently sequential and n≤64 makes serialization cheap. Writes the lower factor L to a DEDICATED l_out buffer so the host checks ‖L·Lᵀ−A‖ from the KERNEL-EMITTED L (cholesky_solve_with_factor returns (x,L)), never re-derived. Diagonal sqrt guard (≤1e-12 floor) → info_out flag, never NaN (Pitfall 4). info array is LENGTH 3 [flag, pivot_index, pivot_value] (a length-2 encoded form reported the wrong pivot sign — fixed). prims::cholesky::cholesky_solve(pool,a,b,n,rhs,out) validates n*n/n≤MAX_DIM (NotSquare) + n*rhs (ShapeMismatch) BEFORE the unsafe launch (ASVS V5), threads out=Some Gram buffer through (D-11 gate 2, no parallel n² alloc), returns PrimError::NotPositiveDefinite on a non-positive pivot. ‖A·x−b‖ + ‖L·Lᵀ−A‖ + non-SPD all pass cpu(f64+f32)+rocm(f32; f64 skip-with-log). NOTE: mlrs-kernels has no cpu/rocm feature (feature-free by design) — the plan's `cargo build -p mlrs-kernels --features cpu` verb is wrong; the real launch-codegen gate is the backend build + cholesky_test under each feature.
 
 ### Pending Todos
@@ -155,6 +157,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-12T07:18:37.000Z
-Stopped at: Completed 04-03-PLAN.md (LinearRegression LINEAR-01 — SVD pseudo-inverse OLS, sklearn-pinned RCOND=1e-6 cutoff)
-Resume file: .planning/phases/04-closed-form-estimators/04-04-PLAN.md (PCA / TruncatedSVD decompositions — consume the Phase-3 thin SVD primitive).
+Last session: 2026-06-12T07:34:16.000Z
+Stopped at: Completed 04-04-PLAN.md (PCA DECOMP-01 + TruncatedSVD DECOMP-02 — shared centered/uncentered SVD skeleton, svd_flip via align_rows, distinct explained_variance_ formulas)
+Resume file: .planning/phases/04-closed-form-estimators/04-05-PLAN.md (Ridge LINEAR-02 — consumes the 04-02 Cholesky primitive).

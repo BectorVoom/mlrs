@@ -42,8 +42,8 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 
 ### Decomposition
 
-- [ ] **DECOMP-01**: User can fit `PCA` with `n_components`, read `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`, and `transform`/`inverse_transform`, matching scikit-learn after sign alignment
-- [ ] **DECOMP-02**: User can fit `TruncatedSVD` with `n_components` (no centering), read `components_`/`explained_variance_`/`singular_values_` and `transform`, matching scikit-learn's deterministic `arpack` path after sign alignment
+- [x] **DECOMP-01**: User can fit `PCA` with `n_components`, read `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`, and `transform`/`inverse_transform`, matching scikit-learn after sign alignment
+- [x] **DECOMP-02**: User can fit `TruncatedSVD` with `n_components` (no centering), read `components_`/`explained_variance_`/`singular_values_` and `transform`, matching scikit-learn's deterministic `arpack` path after sign alignment
 
 ### Neighbors
 
@@ -112,8 +112,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PRIM-05 | Phase 3 | Complete |
 | LINEAR-01 | Phase 4 | Complete (04-03: LinearRegression SVD pseudo-inverse OLS, RCOND=1e-6 sklearn-pinned cutoff, center-then-solve intercept; 6/6 oracle pass cpu(f64)+rocm(f32) within 1e-5 incl. collinear) |
 | LINEAR-02 | Phase 4 | In progress (04-01 scaffold: NotPositiveDefinite + ridge fixtures + #[ignore] tests; 04-02 Cholesky/SPD-solve primitive DONE — validated cpu(f64+f32)+rocm(f32); estimator 04-05 remaining) |
-| DECOMP-01 | Phase 4 | In progress (04-01 scaffold: Fit/Transform+inverse traits + pca fixtures + #[ignore] tests; estimator lands 04-04) |
-| DECOMP-02 | Phase 4 | In progress (04-01 scaffold: Transform trait + tsvd arpack fixtures + #[ignore] tests; estimator lands 04-04) |
+| DECOMP-01 | Phase 4 | Complete (04-04: Pca<F> centered-X SVD, S²/(n−1), ratio over full spectrum, svd_flip via align_rows, transform/inverse_transform; 10 oracle tests pass cpu(f64)+rocm(f32) within 1e-5 incl. wide case) |
+| DECOMP-02 | Phase 4 | Complete (04-04: TruncatedSvd<F> uncentered-X arpack SVD, var(transform cols) explained_variance_, svd_flip via align_rows, transform; 6 oracle tests pass cpu(f64)+rocm(f32) within 1e-5) |
 | LINEAR-03 | Phase 5 | Pending |
 | LINEAR-04 | Phase 5 | Pending |
 | LINEAR-05 | Phase 5 | Pending |

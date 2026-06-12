@@ -133,7 +133,7 @@ Plans:
 
 - [x] 04-02-PLAN.md — NEW Cholesky + triangular-solve primitive (kernel + prim wrapper, jacobi_eig blueprint) validated standalone f32+f64 cpu+rocm (D-02; the highest-risk sub-deliverable) **[complete — single-cube in-kernel cholesky_solve (factor+fwd+back, D-11 gate 3); prims::cholesky validate-before-launch + out=Some Gram reuse + NotPositiveDefinite non-SPD guard; ‖A·x−b‖/‖L·Lᵀ−A‖/non-SPD pass cpu(f64+f32)+rocm(f32; f64 skip-with-log), 6/6 each gate]**
 - [x] 04-03-PLAN.md — LinearRegression (SVD pseudo-inverse + small-σ cutoff + center-then-solve intercept) (LINEAR-01) **[complete — coef = V·diag(σ⁺)·Uᵀ·y_centered via svd+gemm(transa, no transpose buffer)+column_reduce, NO Cholesky (D-02); cutoff pinned RCOND=1e-6 = sklearn LinearRegression.tol→scipy lstsq cond (numpy ε·max(m,n) explodes the f64 collinear case); intercept ȳ−x̄·coef_ (D-05); device-resident coef_/intercept_ (D-03); 6/6 oracle pass cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5 incl. collinear cutoff]**
-- [ ] 04-04-PLAN.md — PCA (center→SVD, S²/(n−1), svd_flip) + TruncatedSVD (uncentered arpack, var(transform)) (DECOMP-01, DECOMP-02)
+- [x] 04-04-PLAN.md — PCA (center→SVD, S²/(n−1), svd_flip) + TruncatedSVD (uncentered arpack, var(transform)) (DECOMP-01, DECOMP-02) **[complete — Pca/TruncatedSvd share one svd+align_rows skeleton with three documented differences (PCA centers + S²/(n−1) + inverse_transform; TSVD uncentered + var(transform cols) + Unsupported inverse); svd_flip estimator-side via align_rows (primitive raw, D-01/D-03); transform via gemm transb (no transpose buffer, D-06); n_components/n_samples guarded before launch; Rule-1 fix: gen_oracle.py c() forces C-contiguous (sklearn PCA components_ was Fortran-order → load_npz read transposed), 6 PCA fixtures regenerated; 10+6 oracle tests pass cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5 incl. PCA wide Aᵀ-swap case]**
 
 **Wave 3** *(blocked on Cholesky prim + linear/mod.rs)*
 
@@ -179,6 +179,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
-| 4. Closed-Form Estimators | 3/5 | In progress | - |
+| 4. Closed-Form Estimators | 4/5 | In progress | - |
 | 5. Distance-Based & Iterative-Solver Estimators | 0/TBD | Not started | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |
