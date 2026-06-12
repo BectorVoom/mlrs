@@ -88,7 +88,24 @@ Plans:
   2. A symmetric eigendecomposition of a covariance matrix (PCA `full` solver path) matches the reference eigenvalues/eigenvectors within tolerance after sign alignment.
   3. The SVD/eig oracle tests pass on both cpu and wgpu (with documented f32 tolerance), proving the primitive before any estimator consumes it.
 
-**Plans**: TBD
+**Plans**: 5 plans
+Plans:
+**Wave 1**
+
+- [ ] 03-01-PLAN.md — ROCm/HIP bring-up (runtime.rs hip path + rocm Cargo feature) + saxpy gate on gfx1100 + cpu+rocm doc reconciliation (D-07)
+- [ ] 03-02-PLAN.md — Wave-0 scaffold: PrimError NotSquare/NotConverged + gen_oracle.py svd/eigh fixtures + committed .npz + svd_test/eig_test skeletons (D-06/D-09/D-12)
+
+**Wave 2**
+
+- [ ] 03-03-PLAN.md — one-sided Jacobi SVD kernel + svd() prim (thin-U, tall+wide Aᵀ-swap, descending sort) + SVD oracle/invariant tests (D-01..D-05)
+
+**Wave 3**
+
+- [ ] 03-04-PLAN.md — two-sided Jacobi symmetric-eig kernel + eig() prim (validate-square, descending, buffer reuse) + eigh oracle/residual tests (D-01/D-04/D-06)
+
+**Wave 4**
+
+- [ ] 03-05-PLAN.md — D-11 build-failing memory gate: bounded Jacobi scratch + eig buffer reuse + no mid-sweep read-back
 **Research flag**: NEEDS DEEPER RESEARCH — Jacobi SVD on GPU in CubeCL is not a pre-built `cubecl-matmul` primitive; the iterative Jacobi-rotation kernel design for `#[cube]` requires domain research. Run `/gsd-plan-phase --research-phase 3` before writing any code.
 
 ### Phase 4: Closed-Form Estimators
