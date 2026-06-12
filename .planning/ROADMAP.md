@@ -204,5 +204,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
 | 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
-| 5. Distance-Based & Iterative-Solver Estimators | 0/11 | Planned | - |
+| 5. Distance-Based & Iterative-Solver Estimators | 1/11 | In progress | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |

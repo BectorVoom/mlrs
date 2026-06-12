@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 5 context gathered
-last_updated: "2026-06-12T13:09:25.036Z"
-last_activity: 2026-06-12 -- Phase 05 planning complete
+stopped_at: Completed 05-01-PLAN.md (Wave-0 scaffold)
+last_updated: "2026-06-12T22:01:00.000Z"
+last_activity: 2026-06-12 -- Phase 05 Plan 01 (Wave-0 scaffold) complete
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 20
-  completed_plans: 21
+  total_plans: 31
+  completed_plans: 22
   percent: 67
 ---
 
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 04 — closed-form-estimators
+**Current focus:** Phase 05 — distance-based-iterative-solver-estimators
 
 ## Current Position
 
-Phase: 5
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-06-12 -- Phase 05 planning complete
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-CONTEXT.md
+Phase: 05 (distance-based-iterative-solver-estimators) — EXECUTING
+Plan: 2 of 11
+Status: Executing Phase 05
+Last activity: 2026-06-12 -- Phase 05 Plan 01 (Wave-0 scaffold) complete
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-01-SUMMARY.md
 
-Progress: [███████░░░] 67% (4/6 phases; 20/20 plans)
+Progress: [███████░░░] 67% (4/6 phases; 22/31 plans)
 
 ## Performance Metrics
 
@@ -74,6 +74,7 @@ Progress: [███████░░░] 67% (4/6 phases; 20/20 plans)
 | Phase 04 P03 | 8 | 2 tasks | 3 files |
 | Phase 04 P04 | 11 | 2 tasks | 11 files |
 | Phase 04 P05 | 9 | 2 tasks | 4 files |
+| Phase 05 P01 | 16 | 4 tasks | 46 files |
 
 ## Accumulated Context
 
@@ -133,6 +134,8 @@ Recent decisions affecting current work:
 - [Phase 04]: [04-03]: LinearRegression (LINEAR-01) = OLS via SVD pseudo-inverse coef = V·diag(σ⁺)·Uᵀ·y_centered, composed from Phase-3 svd + Phase-2 gemm (transa reads Uᵀ/V with no transpose buffer, D-06) + column_reduce(Mean) — NO Cholesky (deliberately a different solver from Ridge, D-02). CUTOFF PIN (Open Q3): σ⁺_i = 1/σ_i if σ_i > RCOND·σ_max else 0 with RCOND=1e-6 — this is sklearn LinearRegression's default `tol`, which it forwards as scipy.linalg.lstsq(cond=tol) (sklearn/_base.py:752); the numpy/gelsd default ε·max(m,n) (~2.7e-15 in f64) is TOO SMALL and keeps the near-collinear σ_min≈1.13e-7 (σ_min/σ_max≈3e-8), reciprocating it → coef explodes to ~±2.93e4 (numpy lstsq rcond=None reproduces this; sklearn returns the bounded 0.485 min-norm). NEAR_ZERO_FLOOR=1e-8 floors the cutoff for a degenerate spectrum. Intercept via center-then-solve (D-05): host two-pass means, intercept_=ȳ−x̄·coef_. coef_/intercept_ device-resident (D-03); predict = X_test·coef on-device + intercept broadcast. LINEAR-01 oracle green cpu(f64)+rocm(f32; f64 skip-with-log), incl. collinear cutoff, within 1e-5.
 - [Phase 04]: [04-04]: PCA (DECOMP-01) + TruncatedSVD (DECOMP-02) share ONE skeleton — column_reduce(Mean)/center → Phase-3 svd → align_rows(Vᵀ) → truncate — with THREE documented per-estimator differences (RESEARCH Pitfall 2): PCA centers X, explained_variance_=S²/(n−1) (ddof=1), ratio over the FULL spectrum BEFORE truncation (Pitfall 6), implements inverse_transform; TruncatedSVD does NOT center, explained_variance_=var(transform cols, ddof=0) (NOT S²/(n−1)), ratio denom=total per-feature var of original X, inverse_transform stays the Unsupported default (D-01). svd_flip applied ESTIMATOR-side via align_rows on Vᵀ rows (primitive stays raw, D-01/D-03); transform=(X[−mean])·componentsᵀ via gemm transb (components_ is nc×n_features row-major read transposed, no transpose buffer, D-06). explained_variance_ computed host-side (reduce prim has no Variance ScalarOp; the ratio/truncation already need a host pass over length-k S — mirrors 04-03's host σ⁺). n_components>min(m,n) and n_samples≤1 rejected before launch (T-04-04-01/03). RULE-1 FIX: gen_oracle.py c() now wraps np.ascontiguousarray — sklearn PCA components_ is Fortran-contiguous, so the committed npz stored a column-major ravel that load_npz (npyz into_vec, no reorder) read transposed, silently breaking the row-major contract (latent because 04-01 scaffold only asserted LENGTH); regenerated the 6 PCA fixtures C-contiguous (TruncatedSVD arpack components_ were already C-contig). DECOMP-01/02 green cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5, incl. PCA wide (n_features>n_samples) Aᵀ-swap case.
 - [Phase 04]: [04-02]: Cholesky/SPD-solve primitive = single-cube, all-shared-memory mlrs-kernels::cholesky_solve #[cube] kernel (feature-free, D-13) doing factor + forward + back triangular solve in ONE launch (D-11 gate 3, no host round-trip). UNIT-0-DOES-ALL serial schedule (jacobi_eig "acting unit" idiom) because the Cholesky-Banachiewicz recurrence is inherently sequential and n≤64 makes serialization cheap. Writes the lower factor L to a DEDICATED l_out buffer so the host checks ‖L·Lᵀ−A‖ from the KERNEL-EMITTED L (cholesky_solve_with_factor returns (x,L)), never re-derived. Diagonal sqrt guard (≤1e-12 floor) → info_out flag, never NaN (Pitfall 4). info array is LENGTH 3 [flag, pivot_index, pivot_value] (a length-2 encoded form reported the wrong pivot sign — fixed). prims::cholesky::cholesky_solve(pool,a,b,n,rhs,out) validates n*n/n≤MAX_DIM (NotSquare) + n*rhs (ShapeMismatch) BEFORE the unsafe launch (ASVS V5), threads out=Some Gram buffer through (D-11 gate 2, no parallel n² alloc), returns PrimError::NotPositiveDefinite on a non-positive pivot. ‖A·x−b‖ + ‖L·Lᵀ−A‖ + non-SPD all pass cpu(f64+f32)+rocm(f32; f64 skip-with-log). NOTE: mlrs-kernels has no cpu/rocm feature (feature-free by design) — the plan's `cargo build -p mlrs-kernels --features cpu` verb is wrong; the real launch-codegen gate is the backend build + cholesky_test under each feature.
+
+- [Phase 05]: [05-01]: Wave-0 scaffold landed file-disjoint. AlgoError is extended IN-PLACE with 6 Phase-5 hyperparameter guards (InvalidK/InvalidEps/InvalidMinSamples/InvalidL1Ratio/InvalidC/NotConverged) in the InvalidAlpha struct-variant style; traits.rs gains PredictLabels (i32 labels, D-05/D-06), KNeighbors ((F dist, i32 idx), D-07), PredictProba (F per-class, D-07). The scaffold OWNS lib.rs + prims/mod.rs + kernels/lib.rs registrations (pub mod for 5 kernels + 5 prims, no pub use until the symbol exists) so plans 02-06 fill exactly one kernel file + one prim file and never touch the shared index — empty doc-comment-only module body is a valid compiling stub. D-06 i32 DeviceArray CONFIRMED by a NON-ignored round-trip test (incl. -1 noise) — zero pool/bridge changes, so no later plan is surprised. gen_oracle.py gained 6 generators: gen_kmeans carries an INJECTED init array (D-09, Lloyd deterministic across numpy/Rust), gen_dbscan tuned eps=0.7/min_samples=4 for cluster+noise(-1)+border, gen_knn is ONE fixture serving NEIGH-01/02/03 with distinct distances (Pitfall 8), gen_lasso has 5 exact-zero coefficients (Pitfall 1), gen_logistic stores the symmetric over-parameterized softmax (multi coef 3×n_features) with predict_proba the PRIMARY gauge-invariant gate (Pitfall 5). 14 fixtures committed (regen needs /tmp venv numpy+scipy+sklearn, PEP 668). 14 #[ignore] oracle stubs (6 prim + 8 estimator) assert load_npz+shape only (NO non-existent symbol) so both test crates compile on cpu+rocm today.
 
 ### Pending Todos
 
