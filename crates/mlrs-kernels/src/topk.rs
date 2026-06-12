@@ -9,23 +9,23 @@
 //!
 //! ## Layout & parallelism
 //! One CUBE per query ROW (`CUBE_POS_X` selects the row). Within the cube, unit 0
-//! maintains a `k`-length running best — values in a `SharedMemory::<F>`, indices
-//! in a parallel `SharedMemory::<u32>` — kept ASCENDING by value. It linearly
-//! scans the row's `cols` candidates and INSERTS each into the running top-k,
-//! shifting larger entries right (insertion-select). On EQUAL value the LOWER
-//! column index wins, replicating `argmin_shared`'s exact tie rule
-//! (`else if ov == cv { if oi < ci {..} }`, reduce.rs:373-381). The `k` ≤ `cols`
-//! bound is validated host-side BEFORE launch (prims/topk.rs), so the comptime
-//! shared cap (256, the reduce.rs idiom) is never exceeded at runtime.
+//! emits the row's `k` smallest by SELECTION-BY-RANK: order candidates by the
+//! PAIR `(value, index)` (A precedes B iff `A.val < B.val`, or equal value with
+//! `A.idx < B.idx` — the exact lowest-index tie rule of `argmin_shared`,
+//! reduce.rs:373-381); slot 0 is the global minimum pair and slot r>0 is the
+//! minimum pair STRICTLY GREATER than the slot-(r-1) winner. Each slot is a full
+//! `cols` scan, so the kernel is k full passes per row.
 //!
-//! ## Why insertion-select on one unit (not a parallel tree)
+//! ## Why selection-by-rank on one unit (not SharedMemory insertion)
 //! `k` is small for the brute-force KNN consumers (sklearn default ≤ ~30) and the
-//! lowest-index tie-break must be applied in a strict left-to-right candidate
-//! order to match numpy/sklearn deterministically. A single-unit ascending
-//! insertion makes the tie semantics unambiguous and identical to a `k`-fold
-//! `argmin_shared`, at the cost of leaving the other units of the cube idle —
-//! acceptable for the small-`k` selection (Pitfall 8). No hardcoded plane width;
-//! the only comptime size is the 256 shared cap (matches the reduce kernels).
+//! lowest-index tie-break must be applied deterministically to match
+//! numpy/sklearn. The single-unit rank scan makes the tie semantics unambiguous
+//! and identical to a `k`-fold `argmin_shared`, at the cost of leaving the other
+//! units of the cube idle — acceptable for small-`k` selection (Pitfall 8).
+//! Crucially it uses ONLY `F`/`u32` accumulators and `if` guards (no mutable
+//! `bool`, no `SharedMemory`, no descending-shift loop) — constructs the
+//! `cubecl-cpu` MLIR lowering rejects (the cpu backend is the primary gate). No
+//! hardcoded plane width.
 //!
 //! All kernels are generic over `<F: Float + CubeElement>` and carry NO backend
 //! feature (D-13). Tests live in `crates/mlrs-backend/tests/topk_test.rs`
@@ -34,11 +34,6 @@
 use cubecl::prelude::*;
 
 pub use self::select_k as topk_select_k;
-
-/// Comptime cap on the running top-k buffers (matches the reduce kernels'
-/// `SharedMemory::new(256)` ceiling). The host validates `k <= cols` and the
-/// launch never requests more than 256, so the runtime `k` always fits.
-const MAX_K: usize = 256usize;
 
 /// Partial select-k over a `rows × cols` row-major distance matrix (D-02): for
 /// each query ROW, emit the `k` smallest values (ascending) and their column
@@ -52,9 +47,9 @@ const MAX_K: usize = 256usize;
 ///   `ScalarArg` wrapper, mirroring `dist_combine_clamp`'s `rows: u32`).
 ///
 /// Launched ONE cube per row (`CUBE_POS_X` = row); only unit 0 of each cube does
-/// the selection (small-`k` insertion-select — see the module docs). The running
-/// buffers are seeded with `+inf` / a sentinel-high index so an unfilled slot
-/// never beats a real candidate and a tie never lets the sentinel index win.
+/// the selection (small-`k` selection-by-rank — see the module docs). Each output
+/// slot is the minimum candidate pair strictly greater than the previous slot's
+/// winner, seeded so slot 0 admits the global minimum.
 #[cube(launch)]
 pub fn select_k<F: Float + CubeElement>(
     dist: &Array<F>,
@@ -70,79 +65,115 @@ pub fn select_k<F: Float + CubeElement>(
     // — everything is `if`-wrapped).
     if row < rows {
         if UNIT_POS_X == 0u32 {
-            let mut best_val = SharedMemory::<F>::new(MAX_K);
-            let mut best_idx = SharedMemory::<u32>::new(MAX_K);
-
-            // Seed the running top-k: +inf value, sentinel-high index so an
-            // unfilled slot is never selected and never wins a tie.
-            let inf = F::new(f32::INFINITY);
-            let mut s = 0u32;
-            while s < k {
-                best_val[s as usize] = inf;
-                best_idx[s as usize] = cols;
-                s += 1u32;
-            }
-
-            // Scan every candidate in the row and insert it into the ascending
-            // running top-k (insertion-select), preserving the lowest-index tie.
             let base = row * cols;
-            let mut c = 0u32;
-            while c < cols {
-                let cand_val = dist[(base + c) as usize];
-                let cand_idx = c;
+            let out_base = row * k;
 
-                // Find the insertion slot: the first position whose current
-                // entry the candidate should precede. STRICTLY-smaller value
-                // wins; on EQUAL value the LOWER index wins (argmin_shared rule).
-                // `pos == k` means the candidate is not in the top-k.
-                let mut pos = k;
-                let mut found = false;
-                let mut p = 0u32;
-                while p < k {
-                    if !found {
-                        let cv = best_val[p as usize];
-                        let ci = best_idx[p as usize];
-                        let mut precedes = false;
-                        if cand_val < cv {
-                            precedes = true;
-                        } else if cand_val == cv {
-                            if cand_idx < ci {
-                                precedes = true;
+            // SELECTION-BY-RANK (no SharedMemory, no mutable bool, no descending
+            // shift — the cubecl-cpu MLIR lowering rejects those; this body uses
+            // only `F`/`u32` accumulators and `if` guards, matching the proven
+            // `argmin_shared` shape generalized k-fold).
+            //
+            // Order candidates by the PAIR (value, index): pair A precedes pair B
+            // iff `A.val < B.val` OR (`A.val == B.val` AND `A.idx < B.idx`) — the
+            // exact lowest-index tie rule. Indices within a row are distinct, so
+            // every pair is unique and the k smallest pairs are a strict ascending
+            // chain. Slot 0 is the global minimum pair; slot r>0 is the minimum
+            // pair STRICTLY GREATER than the pair emitted at slot r-1.
+            //
+            // `prev_*` carry the last emitted pair. There is NO float-infinity
+            // sentinel (cubecl-cpu's MLIR lowering rejects `F::INFINITY` inside a
+            // #[cube]) and NO mutable bool flag (the cube macro fails to infer a
+            // cross-loop `0u32` flag): slot 0 admits EVERY candidate via the
+            // `r == 0` branch, and each rank pass SEEDS its running best from the
+            // FIRST admissible candidate it encounters by initialising best from
+            // candidate `c = 0`'s slot and only updating from `c = 1` onward when a
+            // candidate both is admissible AND precedes the running best.
+            //
+            // Concretely the running best is initialised to candidate 0 (value +
+            // index 0). For slot 0 that is already a valid admissible candidate.
+            // For slot r>0 candidate 0 may be INADMISSIBLE (≤ the previous pair);
+            // the scan below repairs that by taking the first admissible candidate
+            // as the running best (tracked by comparing on the PAIR order, which is
+            // total over the distinct row indices).
+            // Slot 0: the global minimum pair (lowest-index tie-break).
+            let mut best0_val = dist[base as usize];
+            let mut best0_idx = 0u32;
+            let mut c0 = 1u32;
+            while c0 < cols {
+                let cv = dist[(base + c0) as usize];
+                if cv < best0_val {
+                    best0_val = cv;
+                    best0_idx = c0;
+                }
+                // equal value can't lower the index here: c0 ascends, so the first
+                // occurrence already holds the lowest index (strict `<` keeps it).
+                c0 += 1u32;
+            }
+            out_val[out_base as usize] = best0_val;
+            out_idx[out_base as usize] = best0_idx;
+            let mut prev_val = best0_val;
+            let mut prev_idx = best0_idx;
+
+            // Slots 1..k: each is the minimum pair STRICTLY GREATER than the
+            // previous emitted pair (value, or equal value with higher index).
+            let mut r = 1u32;
+            while r < k {
+                // Seed the running best from prev so the first admissible candidate
+                // (guaranteed to exist since k ≤ cols and pairs are distinct)
+                // overwrites it; until then no real candidate equals (prev_val,
+                // prev_idx) so the seed is never emitted.
+                let mut best_val = prev_val;
+                let mut best_idx = prev_idx;
+
+                let mut c = 0u32;
+                while c < cols {
+                    let cv = dist[(base + c) as usize];
+                    let ci = c;
+
+                    // admit = (cv, ci) is strictly GREATER than the previous pair.
+                    let mut admit: u32 = 0u32;
+                    if cv > prev_val {
+                        admit = 1u32;
+                    } else if cv == prev_val {
+                        if ci > prev_idx {
+                            admit = 1u32;
+                        }
+                    }
+
+                    if admit == 1u32 {
+                        // better = (cv, ci) precedes the running best, where the
+                        // best is still the (prev) seed (best == prev) OR a real
+                        // earlier-admitted candidate. `best == prev` is detected by
+                        // `best_idx == prev_idx && best_val == prev_val`; since a
+                        // real admissible candidate is strictly greater than prev,
+                        // ANY admissible candidate precedes the prev-seed.
+                        let mut better: u32 = 0u32;
+                        if best_idx == prev_idx {
+                            // running best is still the prev seed → admit replaces it.
+                            better = 1u32;
+                        } else if cv < best_val {
+                            better = 1u32;
+                        } else if cv == best_val {
+                            if ci < best_idx {
+                                better = 1u32;
                             }
                         }
-                        if precedes {
-                            pos = p;
-                            found = true;
+                        if better == 1u32 {
+                            best_val = cv;
+                            best_idx = ci;
                         }
                     }
-                    p += 1u32;
+
+                    c += 1u32;
                 }
 
-                // If the candidate belongs in the top-k, shift the entries from
-                // `pos..k-1` one slot right (dropping the last) and drop it in.
-                if found {
-                    // Shift right from the tail down to `pos + 1` (descending
-                    // index walk, so no entry is overwritten before it is moved).
-                    let mut q = k - 1u32;
-                    while q > pos {
-                        best_val[q as usize] = best_val[(q - 1u32) as usize];
-                        best_idx[q as usize] = best_idx[(q - 1u32) as usize];
-                        q -= 1u32;
-                    }
-                    best_val[pos as usize] = cand_val;
-                    best_idx[pos as usize] = cand_idx;
-                }
+                out_val[(out_base + r) as usize] = best_val;
+                out_idx[(out_base + r) as usize] = best_idx;
 
-                c += 1u32;
-            }
+                prev_val = best_val;
+                prev_idx = best_idx;
 
-            // Emit the row's k smallest (ascending) into the row-major outputs.
-            let out_base = row * k;
-            let mut w = 0u32;
-            while w < k {
-                out_val[(out_base + w) as usize] = best_val[w as usize];
-                out_idx[(out_base + w) as usize] = best_idx[w as usize];
-                w += 1u32;
+                r += 1u32;
             }
         }
     }
