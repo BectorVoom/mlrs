@@ -19,4 +19,4 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 pub mod pca;
-// 04-04 adds: pub mod truncated_svd;
+pub mod truncated_svd;
