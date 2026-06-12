@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 02 code-review gap-closure complete (CR-01/CR-02/CR-03 + WR-01/WR-07/IN-02 resolved; cpu+wgpu green; no tolerance loosened) — Phase 02 COMPLETE (5/5 plans)
-last_updated: "2026-06-12T01:30:00.000Z"
-last_activity: 2026-06-12 -- Phase 02 review gap-closure: distance/covariance internal Shared path + dropped path param (CR-01); transient scratch released with true byte size + honest memory gate (CR-02/WR-07); empty-reduction rejection + covariance divisor guard (CR-03/WR-01); plane-width hoist (IN-02). Commits ac93f8b, dde3f9e, 689cf5d.
+stopped_at: Phase 03 context gathered (SVD/eig hard gate) — 5 areas decided; GPU gate changed wgpu→rocm project-wide (D-07). Next: /gsd-plan-phase --research-phase 3
+last_updated: "2026-06-12T06:00:00.000Z"
+last_activity: 2026-06-12 -- Phase 03 discuss: two distinct Jacobi routines (SVD + symmetric-eig), thin/economy, tall+wide, numpy fixtures + reference-free invariants, hold 1e-5, extend build-failing memory gate. Gate backend → cpu+rocm (ROCm 7.1.1/gfx1100 runnable, native f64); rocm bring-up is first task. Commit acac68f.
 progress:
   total_phases: 6
   completed_phases: 2
@@ -21,15 +21,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 02 — core-compute-primitives
+**Current focus:** Phase 03 — svd-eigendecomposition-primitive-hard-gate
 
 ## Current Position
 
-Phase: 02 (core-compute-primitives) — COMPLETE (review gap-closure applied 2026-06-12)
-Plan: 5 of 5 (all complete)
-Status: Phase 02 complete + code review resolved (02-REVIEW.md: CR-01/CR-02/CR-03/WR-01/WR-07/IN-02 fixed; see 02-REVIEW-FIX-SUMMARY.md); next Phase 03 needs `/gsd-plan-phase --research-phase 3`
-Last activity: 2026-06-12 -- Phase 02 review gap-closure (3 Critical + WR-01/WR-07/IN-02; cpu+wgpu green, no tolerance loosened)
-Resume file: — (Phase 02 complete + review-clean; Phase 03 SVD/eig needs research before planning)
+Phase: 03 (svd-eigendecomposition-primitive-hard-gate) — context gathered, not planned
+Plan: 0 of TBD
+Status: Phase 03 context captured (03-CONTEXT.md, 13 decisions). Phase is NEEDS DEEPER RESEARCH — next `/gsd-plan-phase --research-phase 3`. ⚠ Gate backend changed wgpu→rocm project-wide (D-07) — ROADMAP.md/PROJECT.md still document cpu+wgpu and need reconciling; rocm bring-up (HIP runtime on gfx1100) is the first task.
+Last activity: 2026-06-12 -- Phase 03 discuss complete (surface/shapes/oracle/memory-gate + rocm gate change); commit acac68f
+Resume file: .planning/phases/03-svd-eigendecomposition-primitive-hard-gate/03-CONTEXT.md
 
 Progress: [███░░░░░░░] 33% (2/6 phases; 10/10 plans)
 
