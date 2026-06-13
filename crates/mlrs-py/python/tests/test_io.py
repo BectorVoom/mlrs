@@ -151,6 +151,9 @@ def test_mlrsbase_check_fitted_raises_before_fit():
         def __init__(self, output_type="input"):
             self.output_type = output_type
 
+        def fit(self, X, y=None):  # noqa: D401 - placeholder for check_is_fitted
+            return self
+
     with pytest.raises(NotFittedError):
         _Dummy()._check_fitted()
 
