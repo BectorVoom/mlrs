@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-04-PLAN.md (DBSCAN eps-core-mask primitive)
-last_updated: "2026-06-13T03:03:11.000Z"
-last_activity: 2026-06-13 -- Phase 05 Plan 04 (DBSCAN eps-core-mask primitive) complete
+stopped_at: Completed 05-11-PLAN.md (iterative-solver + DBSCAN memory-gate reconciliation)
+last_updated: "2026-06-13T05:30:00.000Z"
+last_activity: 2026-06-13 -- Phase 05 Plan 11 (D-10 iterative-solver + D-04 DBSCAN memory gates) complete
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 31
-  completed_plans: 25
-  percent: 74
+  total_plans: 32
+  completed_plans: 32
+  percent: 83
 ---
 
 # Project State
@@ -25,13 +25,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 05 (distance-based-iterative-solver-estimators) — EXECUTING
-Plan: 11 of 11
-Status: Executing Phase 05
-Last activity: 2026-06-13 -- Phase 05 Plan 10 (LogisticRegression oracle, LINEAR-05; binary symmetric-multinomial self-reference + multiclass true-minimum sklearn) complete
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-10-SUMMARY.md
+Phase: 05 (distance-based-iterative-solver-estimators) — ALL PLANS COMPLETE
+Plan: 11 of 11 (complete)
+Status: Phase 05 plans complete (11/11)
+Last activity: 2026-06-13 -- Phase 05 Plan 11 (D-10 iterative-solver + D-04 DBSCAN memory gates; full memory_gate suite 11/11 green cpu, rocm test target builds) complete
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-11-SUMMARY.md
 
-Progress: [█████████░] 97% (4/6 phases; 31/32 plans)
+Progress: [██████████] 100% (4/6 phases; 32/32 plans)
 
 ## Performance Metrics
 
@@ -81,6 +81,7 @@ Progress: [█████████░] 97% (4/6 phases; 31/32 plans)
 | Phase 05 P08 | 18 | 2 tasks | 8 files |
 | Phase 05 P09 | 12 | 2 tasks | 6 files |
 | Phase 05 P10 | 80 | 1 task (Task 2; Task 1 pre-committed) | 7 files |
+| Phase 05 P11 | 12 | 2 tasks (co-located, 1 commit) | 1 file |
 
 ## Accumulated Context
 
@@ -89,6 +90,7 @@ Progress: [█████████░] 97% (4/6 phases; 31/32 plans)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [05-11]: Phase-5 memory-gate reconciliation (D-10 + D-04) landed as two HARD build-failing PoolStats gates in memory_gate_test.rs (+510 lines, 1 file, zero source edits). memory_gate_iterative_solver_bounded ENCODES the gate-2 EXCEPTION for host-driven iterative solvers: CD (cd_solve) driven N=5× at fixed shape proves per-call allocations delta==0 after warmup (residual + gap/col-dot scalars reused) and read_backs grows 1≤delta≤50 per call (one device-assembled duality-gap scalar per outer convergence check, observed steady delta=1, never a per-iteration array); L-BFGS (lbfgs_minimize) on a strongly-convex diagonal quadratic with a device-backed objective (loss routed through a length-1 from_host→to_host_metered→release scalar) proves allocations_during_minimize==0 (everything free-list-served after warmup; (s,y)-history+gradient host-reused) and read_backs_during_minimize==eval_count (EXACTLY one metered scalar/eval). memory_gate_dbscan_n2_bounded ENCODES the D-04 exception: eps_core_mask driven N=5× proves the n² distance matrix is allocated once + reused (alloc delta==0, live/peak conserved — released after the kernel) and the METERED read_backs delta==0 per call (DBSCAN's core-mask host readback is the documented UNMETERED plain-to_host single round-trip, so gate-2's read_backs==0 is preserved for the metered counter and the bound is enforced on allocations/live/peak). Doc comments label both as gate-encoded exceptions (bounded-allocation form), not regressions. Two Rule-1/3 test-local fixes (relaxed the L-BFGS converged-flag assertion to iters+minimizer-accuracy since the gtol/ftol stall fires just shy of gtol while landing on x*=b/a; switched a non-existent pool.write_to_handle to from_host+metered-read+release). Full memory_gate suite 11/11 green cpu(f32); rocm test target builds. T-05-11-01/02 mitigated. LINEAR-03/04/05 + CLUSTER-02 requirements gated.
 - [05-10]: LogisticRegression keeps the SYMMETRIC over-parameterized multinomial for ALL K (D-12). BINARY validates against OUR symmetric-multinomial SELF-REFERENCE (scipy on the exact estimator objective), NOT sklearn — sklearn ≥1.6's binomial-sigmoid K=2 loss differs ~3.6e-3 under L2 (user-approved tradeoff; no binomial path added). MULTICLASS stays sklearn-faithful (sklearn K≥3 multinomial = symmetric multinomial); fixture refit at the TRUE MINIMUM (tol=1e-10) so our deeper-converged solver matches to ~5e-8, passing strict 1e-5 predict_proba on cpu(f64).
 - [05-10]: For the gauge-redundant symmetric softmax, an EARLY ftol relative-f stall (iters<maxiter) is functional convergence — the gauge null-space keeps max|grad| above gtol (f32 plateaus ~1e-4). The estimator raises NotConverged ONLY at the iteration CAP; the predict_proba 1e-5 oracle is the correctness witness. Estimator-scoped (05-06 prim untouched). Defaults gtol=1e-5/max_iter=300.
 - [05-10]: f32 multiclass predict_proba uses a documented 5e-5 family tolerance (D-08 growth point) — flat-surface f32 round-off makes strict 1e-5 physically unreachable while predict (argmax) stays exact; f64 + binary-f32 stay strict 1e-5. Matches the cpu(f64)-correctness / rocm(f32)-opportunistic gate.
@@ -180,6 +182,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T05:00:00.000Z
-Stopped at: Completed 05-09-PLAN.md (Lasso + ElasticNet, shared CD helper, LINEAR-03/04)
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-09-SUMMARY.md
+Last session: 2026-06-13T05:30:00.000Z
+Stopped at: Completed 05-11-PLAN.md (D-10 iterative-solver + D-04 DBSCAN memory gates) — Phase 05 plans all complete (11/11)
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-11-SUMMARY.md
