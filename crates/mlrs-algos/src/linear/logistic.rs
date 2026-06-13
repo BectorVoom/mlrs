@@ -317,11 +317,22 @@ where
             let w_d: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &w_host);
             let b_d: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &b_host);
 
-            let res =
-                softmax_loss_grad::<F>(pool, x_dev, y_dev, &w_d, &b_d, n_samples, d, k, l2_reg);
-
-            w_d.release_into(pool);
-            b_d.release_into(pool);
+            // WR-02: release the two per-iteration scratch buffers through an RAII
+            // guard so a PANIC anywhere in `softmax_loss_grad` (a kernel-launch
+            // assertion, an `unreachable!` in a bit-cast for a non-f32/f64 `F`)
+            // still returns both handles to the pool's free-list as the closure
+            // frame unwinds — the previous `release_into` calls sat AFTER the
+            // fallible launch and ran only on the normal path, stranding both
+            // handles on a panic. The guard borrows the same `pool` only in its
+            // `Drop`, after the launch has fully returned (or unwound), so there is
+            // no aliasing with the `&mut pool` the launch itself takes.
+            let res = {
+                let mut guard = ScratchGuard::new(pool, w_d, b_d);
+                let (pool_ref, w_ref, b_ref) = guard.parts();
+                softmax_loss_grad::<F>(
+                    pool_ref, x_dev, y_dev, w_ref, b_ref, n_samples, d, k, l2_reg,
+                )
+            };
 
             let (loss, grad_w, mut grad_b) = match res {
                 Ok(v) => v,
@@ -535,6 +546,62 @@ where
             labels[r] = self.classes_[best] as i32;
         }
         Ok(DeviceArray::from_host(pool, &labels))
+    }
+}
+
+/// WR-02: a panic-safe RAII guard for the two per-iteration L-BFGS objective
+/// scratch buffers (`w_d`, `b_d`). It owns the buffers plus a mutable borrow of
+/// the pool and returns BOTH buffers to the pool's free-list in its `Drop` —
+/// whether the closure body returns normally OR unwinds on a panic from the
+/// device softmax launch. Releasing in `Drop` (not after the fallible launch)
+/// closes the WR-02 window where a panic between acquire and release stranded the
+/// handles for the process lifetime.
+struct ScratchGuard<'a, F: Pod> {
+    pool: &'a mut BufferPool<ActiveRuntime>,
+    w: Option<DeviceArray<ActiveRuntime, F>>,
+    b: Option<DeviceArray<ActiveRuntime, F>>,
+}
+
+impl<'a, F: Float + CubeElement + Pod> ScratchGuard<'a, F> {
+    /// Take ownership of the pool borrow and the two scratch buffers.
+    fn new(
+        pool: &'a mut BufferPool<ActiveRuntime>,
+        w: DeviceArray<ActiveRuntime, F>,
+        b: DeviceArray<ActiveRuntime, F>,
+    ) -> Self {
+        Self {
+            pool,
+            w: Some(w),
+            b: Some(b),
+        }
+    }
+
+    /// Reborrow the pool plus the two buffers for the launch. The returned
+    /// references all live as long as the `&mut self` reborrow, so the guard (and
+    /// thus the buffers) cannot be dropped until the launch fully returns.
+    fn parts(
+        &mut self,
+    ) -> (
+        &mut BufferPool<ActiveRuntime>,
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    ) {
+        (
+            self.pool,
+            self.w.as_ref().expect("scratch w present until drop"),
+            self.b.as_ref().expect("scratch b present until drop"),
+        )
+    }
+}
+
+impl<F: Pod> Drop for ScratchGuard<'_, F> {
+    fn drop(&mut self) {
+        if let Some(w) = self.w.take() {
+            w.release_into(self.pool);
+        }
+        if let Some(b) = self.b.take() {
+            b.release_into(self.pool);
+        }
     }
 }
 
