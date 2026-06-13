@@ -89,7 +89,14 @@ where
     //     readback — D-10). norm2_cols + the host w/y vectors are the reused
     //     solver state. ---
     let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-    let y_host: Vec<f64> = y.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+    // WR-07: read `y` to host EXACTLY ONCE. Keep the raw `Vec<F>` so it can both
+    // seed `r_dev` (the residual starts at `y`) and be promoted to f64 for the
+    // host solver state — the previous code read `y` to host a SECOND time at the
+    // `r_dev` seed (line 110), a duplicate device->host transfer of a buffer
+    // already resident in `y_host`, contradicting the "acquired ONCE, reused"
+    // bounded-allocation guarantee.
+    let y_raw: Vec<F> = y.to_host(pool);
+    let y_host: Vec<f64> = y_raw.iter().map(|&v| host_to_f64(v)).collect();
     let mut norm2_cols = vec![0.0f64; d];
     for j in 0..d {
         let mut s = 0.0f64;
@@ -107,7 +114,9 @@ where
     // --- Solver buffers acquired ONCE, reused every iteration (D-10). `r` starts
     //     at `y` (residual at `w = 0`); `w` is host-side scalar coefficient
     //     state. ---
-    let r_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y.to_host(pool));
+    // WR-07: seed the residual from the already-resident `y_raw` (no second
+    // device->host read of `y`).
+    let r_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y_raw);
     let gap_handle = pool.acquire(elem); // length-1 scalar gap output, reused.
     let dot_handle = pool.acquire(elem); // length-1 scalar col-dot output, reused.
 
