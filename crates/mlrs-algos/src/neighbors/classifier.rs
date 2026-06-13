@@ -12,11 +12,13 @@
 //! sklearn's `mode`/`argmax` behavior over the contiguous `[0, n_classes)` label
 //! space.
 //!
-//! ## Contiguous class space (sklearn `classes_`)
-//! The fixture targets are the contiguous integer range `[0, n_classes)` (sklearn
-//! re-labels to `classes_` indices). v1 stores the raw integer targets and uses
-//! `max + 1` as `n_classes`; the per-class fraction columns are therefore indexed
-//! directly by class id (D-07).
+//! ## Class space (sklearn `classes_`)
+//! `fit` collects the DISTINCT sorted training labels as `classes_` and remaps
+//! each sample to its DENSE class index (its position in `classes_`). The
+//! per-class fraction columns are indexed by this dense position, and
+//! `predict_labels` maps the argmax column back through `classes_` to recover the
+//! original id (CR-03) — so a NON-contiguous target (e.g. `{0, 2}`) returns the
+//! original `2`, never a phantom never-trained class (D-07).
 //!
 //! ## weights='uniform' only (CONTEXT Deferred)
 //! Each of the `k` neighbors contributes an equal `1/k` vote; `weights='distance'`
@@ -58,10 +60,18 @@ pub struct KNeighborsClassifier<F> {
     x_train_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted training geometry `(n_train, n_features)`, `None` until `fit`.
     train_shape_: Option<(usize, usize)>,
-    /// Host copy of the integer class targets (length `n_train`), gathered per
-    /// neighbor during the vote. `None` until `fit`.
+    /// Host copy of each training sample's DENSE class index (`0..n_classes_`),
+    /// gathered per neighbor during the vote. CR-03: this is the POSITION of the
+    /// sample's raw label in `classes_`, NOT the raw label, so a non-contiguous
+    /// target indexes the proba columns densely. `None` until `fit`.
     y_class_: Option<Vec<i32>>,
-    /// Number of distinct classes `= max(y_class) + 1` (contiguous `[0, n)`).
+    /// CR-03: the DISTINCT sorted training labels (`classes_`), one per proba
+    /// column. `predict_labels` maps each argmax column back through this vector
+    /// so a non-contiguous set (e.g. `{0, 2}`) returns the ORIGINAL id (`2`),
+    /// never a phantom column-1 class that never existed in training. Empty until
+    /// `fit`.
+    classes_: Vec<i32>,
+    /// Number of distinct classes `= classes_.len()`.
     n_classes_: usize,
 }
 
@@ -77,6 +87,7 @@ where
             x_train_: None,
             train_shape_: None,
             y_class_: None,
+            classes_: Vec::new(),
             n_classes_: 0,
         }
     }
@@ -86,7 +97,7 @@ where
         self.n_neighbors
     }
 
-    /// The number of distinct classes inferred at `fit` (`max(y) + 1`). Errors
+    /// The number of distinct classes inferred at `fit`. Errors
     /// with [`AlgoError::NotFitted`] before `fit`.
     pub fn n_classes(&self) -> Result<usize, AlgoError> {
         if self.y_class_.is_some() {
@@ -136,15 +147,24 @@ where
             }));
         }
 
-        // Gather the integer class labels host-side (they are integer-valued `F`
-        // in the fixture). n_classes is max + 1 over the contiguous label space.
+        // Gather the integer class labels host-side (they are integer-valued `F`).
+        // CR-03: build `classes_` as the DISTINCT sorted labels and remap each
+        // sample to its DENSE class index (its position in `classes_`), rather
+        // than inferring `n_classes = max+1`. A `max+1` width over a
+        // non-contiguous target (e.g. `{0, 2}`) creates a structurally-zero
+        // column 1 that argmax can still pick, returning a class id that never
+        // existed in training; sklearn maps votes through `classes_` and returns
+        // the original id. The WR-02 `class >= n_classes` guard cannot catch this
+        // GAP, so the fix is the dense remap + inverse map at predict.
         let y_host = y.to_host(pool);
-        let y_class: Vec<i32> = y_host
+        let raw_class: Vec<i32> = y_host
             .iter()
             .map(|&v| host_to_f64(v).round() as i32)
             .collect();
-        let n_classes = y_class.iter().copied().max().unwrap_or(-1) + 1;
-        if n_classes <= 0 {
+        let mut classes_: Vec<i32> = raw_class.clone();
+        classes_.sort_unstable();
+        classes_.dedup();
+        if classes_.is_empty() {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "y",
                 rows: n_train,
@@ -152,6 +172,17 @@ where
                 len: y.len(),
             }));
         }
+        let n_classes = classes_.len();
+        // Dense class index per training sample = position of its raw label in
+        // the sorted `classes_` (binary search, classes_ is sorted+deduped).
+        let y_class: Vec<i32> = raw_class
+            .iter()
+            .map(|&l| {
+                classes_
+                    .binary_search(&l)
+                    .expect("every raw label is in classes_ by construction") as i32
+            })
+            .collect();
 
         let x_host = x.to_host(pool);
         let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_host);
@@ -161,7 +192,8 @@ where
         self.x_train_ = Some(x_dev);
         self.train_shape_ = Some((n_train, n_features));
         self.y_class_ = Some(y_class);
-        self.n_classes_ = n_classes as usize;
+        self.classes_ = classes_;
+        self.n_classes_ = n_classes;
         Ok(self)
     }
 }
@@ -253,12 +285,26 @@ where
         // proba matrix (which itself validates k + geometry), then argmax each row.
         let proba = self.predict_proba(pool, x, shape)?;
 
-        // argmax_rows applies the lowest-index tie-break (02 convention) — over the
-        // contiguous [0, n_classes) label space the column index IS the class id.
+        // argmax_rows applies the lowest-index tie-break (02 convention). CR-03:
+        // the argmax column is the DENSE class index (`0..n_classes`); map it back
+        // through `classes_` to recover the ORIGINAL training label, so a
+        // non-contiguous set (e.g. `{0, 2}`) returns `2`, not the phantom `1`.
         let labels_u32 = argmax_rows::<F>(pool, &proba, n_query, n_classes)?;
         proba.release_into(pool);
 
-        let labels_i32: Vec<i32> = labels_u32.iter().map(|&u| u as i32).collect();
+        let labels_i32: Vec<i32> = labels_u32
+            .iter()
+            .map(|&u| {
+                // The dense index is always < n_classes (argmax_rows over the
+                // n_classes-wide proba row); guard defensively regardless.
+                let col = u as usize;
+                if col < self.classes_.len() {
+                    self.classes_[col]
+                } else {
+                    u as i32
+                }
+            })
+            .collect();
         Ok(DeviceArray::from_host(pool, &labels_i32))
     }
 }
