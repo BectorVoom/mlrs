@@ -199,7 +199,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 06-02-PLAN.md — Core Rust plumbing: PyCapsule ingress (reuse validate bridge), egress, capability guard, dtype-dispatch macro, GIL release, catch_unwind import probe, global pool
+- [x] 06-02-PLAN.md — Core Rust plumbing: PyCapsule ingress (reuse validate bridge), egress, capability guard, dtype-dispatch macro, GIL release, catch_unwind import probe, global pool ✅ (2/2 tasks; owned ArrayRef ingress no &[u8] borrow, guard_f64→PyValueError + backend_supports_f64(), #[pymodule] _mlrs catch_unwind→PyImportError, OnceLock<Mutex<BufferPool>>, any_estimator! skeleton; extension-module gated as a feature so cargo test links libpython; 14 Rust tests green cpu; PY-03/04/05)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
