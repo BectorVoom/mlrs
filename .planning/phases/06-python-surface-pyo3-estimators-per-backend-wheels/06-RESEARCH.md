@@ -515,19 +515,19 @@ Rationale:
 | A5 | A shared `Mutex<BufferPool>` is the right concurrency unit | BufferPool Lifecycle | Low — it is the safe default; the only cost is no intra-process device parallelism (accepted v1 scope). |
 | A6 | `pyo3-arrow` 0.18 targets PyO3 0.28 (so it composes with arrow 59) | Standard Stack | Low — docs.rs reports 0.18.x→PyO3 0.28; if it lags, use `arrow::pyarrow` directly (the dep-free alternative). |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **arrow::pyarrow vs pyo3-arrow — pick one.**
+1. **arrow::pyarrow vs pyo3-arrow — pick one. — RESOLVED: use `arrow::pyarrow`.**
    - What we know: both consume the capsule with correct ownership against PyO3 0.28. `arrow::pyarrow` adds no dependency (arrow is already pinned); `pyo3-arrow` adds the numpy buffer-protocol fallback + ergonomic owned `PyArray` arg.
    - What's unclear: whether the shim's numpy→pyarrow normalization (D-02) makes the buffer-protocol fallback redundant (it likely does).
-   - Recommendation: **default to `arrow::pyarrow` (one fewer dep)**; the shim already hands a pyarrow array. Adopt `pyo3-arrow` only if its owned-`PyArray` ergonomics measurably simplify the 11 wrappers.
+   - **RESOLUTION:** Use `arrow::pyarrow` (one fewer dep; the shim already normalizes to a freshly-contiguous pyarrow array, so the buffer-protocol fallback is redundant). Encoded in Plan 06-01 Task 1 (deps) + Plan 06-02 Task 1 (owned ingress). `pyo3-arrow` is NOT added.
 
-2. **Exact arrow 59 `FromPyArrow` method name** (`from_pyarrow_bound` vs `from_pyarrow`) — docs.rs 404'd this session.
-   - Recommendation: confirm at the start of the binding task via `cargo doc -p arrow --features pyarrow` locally; trivial to resolve, no design impact.
+2. **Exact arrow 59 `FromPyArrow` method name** (`from_pyarrow_bound` vs `from_pyarrow`) — docs.rs 404'd this session. — **RESOLVED in-execution.**
+   - **RESOLUTION:** Plan 06-01 Task 5 produces an `arrow_symbol_probe` deliverable confirming the exact method name locally via `cargo doc -p arrow --features pyarrow` BEFORE Plan 06-02 (which `depends_on` 06-01) consumes it. Sequenced correctly; trivial to resolve, no design impact.
 
-3. **DBSCAN/NearestNeighbors `predict`-less surface vs estimator_checks.**
+3. **DBSCAN/NearestNeighbors `predict`-less surface vs estimator_checks. — RESOLVED: skip predict-based checks for these two, documented.**
    - What we know: DBSCAN has no standalone `predict` (algos D-08); NearestNeighbors exposes `kneighbors`, not `predict`.
-   - Recommendation: skip predict-based checks for these two with a documented reason; this is sklearn-faithful (sklearn's own DBSCAN has no `predict`).
+   - **RESOLUTION:** Skip predict-based estimator_checks for DBSCAN and NearestNeighbors with a documented reason (sklearn-faithful — sklearn's own DBSCAN has no `predict`). Encoded in Plan 06-04 (predict-less shim surface) + Plan 06-06 `checks_triage.md` (documented skips).
 
 ## Environment Availability
 
@@ -561,7 +561,7 @@ Rationale:
 ### Phase Requirements → Test Map
 | Req ID | Behavior | Test Type | Automated Command | File Exists? |
 |--------|----------|-----------|-------------------|-------------|
-| PY-01 | 11 estimators `fit`/`predict`/`transform`/`score`, `fit` returns self; oracle + relevant checks | integration | `pytest python/tests/test_oracle_*.py python/tests/test_estimator_checks.py` | ❌ Wave 0 |
+| PY-01 | 12 estimators `fit`/`predict`/`transform`/`score`, `fit` returns self; oracle + relevant checks | integration | `pytest python/tests/test_oracle_*.py python/tests/test_estimator_checks.py` | ❌ Wave 0 |
 | PY-02 | `get_params`/`set_params` + sklearn names | unit | `pytest python/tests/test_params.py` (or via `check_get_params_invariance`) | ❌ Wave 0 |
 | PY-03 | Arrow PyCapsule ingest, ownership, GIL released | integration + Rust | `cargo test -p mlrs-py --features cpu` (ingress ownership) + a threaded GIL-release pytest | ❌ Wave 0 |
 | PY-04 | per-backend wheel names + import-fail on absent driver | build/smoke | `maturin build -m pyproject/cpu.pyproject.toml`; assert wheel name `mlrs_cpu-*`; a probe-failure test | ❌ Wave 0 |

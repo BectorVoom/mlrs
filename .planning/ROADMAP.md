@@ -180,12 +180,14 @@ Plans:
 
 ### Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels
 
-**Goal**: A Python ≥ 3.12 data scientist can `pip install` the wheel matching their backend and use all 11 v1 estimators through a sklearn-compatible API with zero-copy Arrow ingest and the GIL released during compute.
+**Goal**: A Python ≥ 3.12 data scientist can `pip install` the wheel matching their backend and use all 12 v1 estimators through a sklearn-compatible API with zero-copy Arrow ingest and the GIL released during compute.
+
+> **Estimator count note (reconciled 2026-06-13):** `mlrs-algos` ships **12** estimator structs — LinearRegression, Ridge, Lasso, **ElasticNet** (LINEAR-04), LogisticRegression, PCA, TruncatedSVD, KMeans, DBSCAN, NearestNeighbors, KNeighborsClassifier, KNeighborsRegressor. Earlier "11 estimators" narrative undercounted by folding ElasticNet into the Lasso shared-CD family; the Python surface wraps all 12 (dropping ElasticNet would drop LINEAR-04).
 **Depends on**: Phase 5
 **Requirements**: PY-01, PY-02, PY-03, PY-04, PY-05
 **Success Criteria** (what must be TRUE):
 
-  1. All 11 v1 estimators are `#[pyclass]` objects with sklearn-compatible `fit`/`predict`/`transform`/`score` (`fit` returns `self`) and pass `pytest` oracle tests plus relevant `sklearn.utils.estimator_checks`.
+  1. All 12 v1 estimators are `#[pyclass]`-backed objects with sklearn-compatible `fit`/`predict`/`transform`/`score` (`fit` returns `self`) and pass `pytest` oracle tests plus relevant `sklearn.utils.estimator_checks`.
   2. Estimators support `get_params`/`set_params` with constructor hyperparameters matching scikit-learn naming, and accept f32 and f64 NumPy/Arrow inputs via runtime dtype dispatch.
   3. NumPy/Arrow inputs cross the boundary via the Arrow PyCapsule interface with correct ownership/lifetime handling (no bare `&[u8]` borrows into Python-owned buffers), and `Python::allow_threads` releases the GIL around device compute.
   4. Per-backend wheels build via `maturin build --features <backend>` under distinct distribution names (`mlrs-cpu`, `mlrs-wgpu`, `mlrs-cuda`, `mlrs-rocm`) with `abi3-py312`; importing a wheel whose driver is absent fails with a clear error.

@@ -6,8 +6,12 @@
 <domain>
 ## Phase Boundary
 
-Phase 6 builds the **Python surface** over the 11 already-implemented `mlrs-algos`
-estimators and ships **per-backend wheels**. No new algorithms — this phase wraps
+Phase 6 builds the **Python surface** over the 12 already-implemented `mlrs-algos`
+estimators and ships **per-backend wheels**. (The boundary text below says "11" in
+places — reconciled 2026-06-13 to **12**: the count earlier folded **ElasticNet**
+(LINEAR-04) into the Lasso shared-CD family; the surface wraps all 12 structs —
+LinearRegression, Ridge, Lasso, ElasticNet, LogisticRegression, PCA, TruncatedSVD,
+KMeans, DBSCAN, NearestNeighbors, KNeighborsClassifier, KNeighborsRegressor.) No new algorithms — this phase wraps
 the existing Rust estimator layer (the `Fit` / `Predict` / `Transform` /
 `PredictLabels` / `KNeighbors` / `PredictProba` trait surface, each generic over
 `<F: Float + CubeElement + Pod>`) so a Python ≥ 3.12 data scientist can
