@@ -1,20 +1,36 @@
-//! Plan 05-08 — DBSCAN (CLUSTER-02) Wave-0 oracle SCAFFOLD.
+//! Plan 05-07 — DBSCAN (CLUSTER-02) sklearn oracle tests.
 //!
-//! Nyquist Wave-0 stub: every test below is `#[ignore]`d and asserts ONLY that
-//! the committed `dbscan_{f32,f64}_seed42.npz` fixture loads and is
-//! shape-well-formed — referencing NO `mlrs_algos::cluster::DBSCAN` symbol — so
-//! this crate COMPILES today. Plan 05-08 removes `#[ignore]`, imports `DBSCAN`,
-//! runs the device core-mask + host DFS expansion, and asserts `labels_`
-//! (noise=-1) + `core_sample_indices_` vs sklearn up to a label permutation
-//! (`mlrs_core::best_match_accuracy == 1.0`, D-09).
+//! Activated from the 05-01 Nyquist `#[ignore]` scaffold: each function loads
+//! the committed `dbscan_{f32,f64}_seed42.npz` fixture (which carries `eps`,
+//! `min_samples`, the sklearn `labels` with the `-1` noise sentinel, and
+//! `core_sample_indices`), constructs `DBSCAN::new(eps, min_samples)`, fits via
+//! the device eps-core mask + the host index-ordered DFS, and asserts:
+//!   - `core_sample_indices_` matches the sklearn fixture set EXACTLY (an integer
+//!     set — no tolerance; it is a count threshold), and
+//!   - `labels_` (noise = `-1`) matches sklearn up to a cluster-label permutation
+//!     (`mlrs_core::best_match_accuracy == 1.0`, D-09) — the `-1` noise label is
+//!     carried through the permutation matching as any other label.
 //!
-//! f64 stubs carry the `skip_f64_with_log` gate (cpu runs f64; rocm skips, D-07).
-//! Per AGENTS.md §2 tests live here, never an in-source `#[cfg(test)] mod tests`.
+//! DBSCAN is non-transductive: it implements `Fit` + `fit_predict` only, NO
+//! standalone `predict` (D-08).
+//!
+//! f64 functions carry the `skip_f64_with_log` capability gate verbatim (cpu
+//! runs f64; rocm skips per the CubeCL-HIP F64 gap, D-07). f32 runs on rocm.
+//! Per AGENTS.md §2 tests live in `crates/mlrs-algos/tests/`, never an in-source
+//! `#[cfg(test)] mod tests`.
 
 use std::path::PathBuf;
 
+use bytemuck::Pod;
+use cubecl::prelude::{CubeElement, Float};
+
+use mlrs_algos::cluster::dbscan::DBSCAN;
+use mlrs_algos::traits::Fit;
 use mlrs_backend::capability;
-use mlrs_core::{load_npz, OracleCase};
+use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::runtime::{self, ActiveRuntime};
+use mlrs_core::{best_match_accuracy, load_npz, OracleCase};
 
 /// DBSCAN fixture geometry (gen_oracle.py DB_N_SAMPLES × DB_N_FEATURES).
 const DB_N_SAMPLES: usize = 40;
@@ -29,47 +45,167 @@ fn fixture(name: &str) -> PathBuf {
     workspace_root.join("tests").join("fixtures").join(name)
 }
 
-fn assert_len(case: &OracleCase, name: &str, len: usize) {
-    let got = case.expect_f64(name).len();
+fn f64_to<F: Pod>(v: f64) -> F {
+    match std::mem::size_of::<F>() {
+        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("dbscan fixtures are f32/f64 only"),
+    }
+}
+
+/// Fit `DBSCAN::new(eps, min_samples)` on the fixture and return the host
+/// `(labels_ as i64, core_sample_indices_ as i32)`.
+fn fit_dbscan<F>(case: &OracleCase) -> (Vec<i64>, Vec<i32>)
+where
+    F: Float + CubeElement + Pod,
+{
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_host: Vec<F> = case.expect_f64("X").iter().map(|&v| f64_to::<F>(v)).collect();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
+
+    let eps = case.expect_f64("eps")[0];
+    let min_samples = case.expect_f64("min_samples")[0] as usize;
+
+    let mut db = DBSCAN::<F>::new(eps, min_samples);
+    db.fit(&mut pool, &x_dev, None, (DB_N_SAMPLES, DB_N_FEATURES))
+        .expect("DBSCAN::fit on a valid shape");
+
+    let labels: Vec<i64> = db
+        .labels(&pool)
+        .expect("labels_ after fit")
+        .iter()
+        .map(|&l| l as i64)
+        .collect();
+    let core: Vec<i32> = db
+        .core_sample_indices(&pool)
+        .expect("core_sample_indices_ after fit");
+    (labels, core)
+}
+
+/// `labels_` (noise = `-1`) match sklearn up to a cluster-label permutation
+/// (D-09) AND `core_sample_indices_` match the fixture set EXACTLY (integer set,
+/// no tolerance — it is a count threshold).
+fn run_dbscan<F>(case: &OracleCase, label: &str)
+where
+    F: Float + CubeElement + Pod,
+{
+    let labels_ref: Vec<i64> = case.expect_f64("labels").iter().map(|&v| v as i64).collect();
+    let core_ref: Vec<i32> = case
+        .expect_f64("core_sample_indices")
+        .iter()
+        .map(|&v| v as i32)
+        .collect();
+    assert_eq!(labels_ref.len(), DB_N_SAMPLES, "fixture labels len");
+
+    let (labels, core) = fit_dbscan::<F>(case);
+
+    // core_sample_indices_ EXACTLY matches the sklearn set (both ascending).
+    let mut core_sorted = core.clone();
+    core_sorted.sort_unstable();
+    let mut core_ref_sorted = core_ref.clone();
+    core_ref_sorted.sort_unstable();
     assert_eq!(
-        got, len,
-        "fixture array '{name}' should have {len} elements, got {got}"
+        core_sorted, core_ref_sorted,
+        "{label}: core_sample_indices_ must EXACTLY match sklearn (integer set)"
     );
-}
 
-/// LOAD-NOT-JUST-PRESENT: the `dbscan` fixture loads with well-formed
-/// X/labels/core_sample_indices (labels carry the -1 noise sentinel). WAVE-0 STUB
-/// — 05-08 wires the real DBSCAN estimator oracle.
-#[test]
-#[ignore = "Wave-0 scaffold: DBSCAN estimator not implemented until plan 05-08"]
-fn fixture_loads() {
-    let case = load_npz(fixture("dbscan_f64_seed42.npz")).expect("load dbscan_f64");
-    assert_len(&case, "X", DB_N_SAMPLES * DB_N_FEATURES);
-    assert_len(&case, "labels", DB_N_SAMPLES);
-    let core = case.expect_f64("core_sample_indices");
+    // labels_ match sklearn up to a cluster-label permutation (the -1 noise label
+    // is carried through the permutation matching like any other label, D-09).
+    let acc = best_match_accuracy(&labels, &labels_ref);
     assert!(
-        core.len() <= DB_N_SAMPLES,
-        "core_sample_indices length {} must be <= n_samples {DB_N_SAMPLES}",
-        core.len()
+        (acc - 1.0).abs() < f64::EPSILON,
+        "{label}: best_match_accuracy {acc} != 1.0 (labels not a permutation of sklearn, noise=-1)"
     );
 }
 
-/// labels (noise=-1) match sklearn up to a permutation (D-09), f32. WAVE-0 STUB.
+/// `labels_` (noise=-1) + `core_sample_indices_` vs sklearn up to a permutation,
+/// f32.
 #[test]
-#[ignore = "Wave-0 scaffold: DBSCAN estimator not implemented until plan 05-08"]
 fn dbscan_labels_match_sklearn_f32() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
     let case = load_npz(fixture("dbscan_f32_seed42.npz")).expect("load dbscan_f32");
-    assert_len(&case, "labels", DB_N_SAMPLES);
+    run_dbscan::<f32>(&case, "dbscan f32");
 }
 
-/// core_sample_indices_ match sklearn, f64 (cpu runs; rocm skips). WAVE-0 STUB.
+/// `core_sample_indices_` + labels vs sklearn, f64 (cpu runs; rocm skips-with-log).
 #[test]
-#[ignore = "Wave-0 scaffold: DBSCAN estimator not implemented until plan 05-08"]
 fn dbscan_core_sample_indices_match_sklearn_f64() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
     if capability::skip_f64_with_log() {
+        println!("dbscan f64 backend={backend}: SKIPPED (no f64 support on this adapter)");
         return;
     }
     let case = load_npz(fixture("dbscan_f64_seed42.npz")).expect("load dbscan_f64");
-    let core = case.expect_f64("core_sample_indices");
-    assert!(core.len() <= DB_N_SAMPLES);
+    run_dbscan::<f64>(&case, "dbscan f64");
+}
+
+/// `fit_predict` returns the same labels as `fit` + `labels_` (noise=-1), and a
+/// noise point IS present (the fixture is designed with ≥1 `-1`), exercising the
+/// non-transductive `fit_predict` path (D-08 — there is no standalone predict).
+#[test]
+fn dbscan_fit_predict_consistency_f32() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
+    let case = load_npz(fixture("dbscan_f32_seed42.npz")).expect("load dbscan_f32");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_host: Vec<f32> = case.expect_f64("X").iter().map(|&v| v as f32).collect();
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
+    let eps = case.expect_f64("eps")[0];
+    let min_samples = case.expect_f64("min_samples")[0] as usize;
+
+    let mut db = DBSCAN::<f32>::new(eps, min_samples);
+    let fp = db
+        .fit_predict(&mut pool, &x_dev, (DB_N_SAMPLES, DB_N_FEATURES))
+        .expect("DBSCAN::fit_predict");
+    let fp_labels: Vec<i32> = fp.to_host(&pool);
+    let fitted_labels: Vec<i32> = db.labels(&pool).unwrap();
+
+    assert_eq!(
+        fp_labels, fitted_labels,
+        "fit_predict labels must equal the fitted labels_"
+    );
+    assert!(
+        fp_labels.iter().any(|&l| l == -1),
+        "DBSCAN fixture is designed with >=1 noise point (label -1)"
+    );
+}
+
+/// Invalid hyperparameters are rejected at `fit` BEFORE any launch (ASVS V5):
+/// `eps < 0` → `InvalidEps`, `min_samples == 0` → `InvalidMinSamples`.
+#[test]
+fn dbscan_rejects_invalid_hyperparameters_f32() {
+    let case = load_npz(fixture("dbscan_f32_seed42.npz")).expect("load dbscan_f32");
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_host: Vec<f32> = case.expect_f64("X").iter().map(|&v| v as f32).collect();
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
+
+    // fit returns Result<&mut Self, _>; &mut Self is not Debug, so map the Ok arm
+    // away before inspecting the error (cannot use expect_err on a non-Debug Ok).
+    let mut bad_eps = DBSCAN::<f32>::new(-1.0, 4);
+    let err = bad_eps
+        .fit(&mut pool, &x_dev, None, (DB_N_SAMPLES, DB_N_FEATURES))
+        .map(|_| ())
+        .expect_err("eps < 0 must be rejected");
+    assert!(
+        matches!(err, mlrs_algos::AlgoError::InvalidEps { .. }),
+        "eps < 0 should surface InvalidEps, got {err:?}"
+    );
+
+    let mut bad_min = DBSCAN::<f32>::new(0.7, 0);
+    let err = bad_min
+        .fit(&mut pool, &x_dev, None, (DB_N_SAMPLES, DB_N_FEATURES))
+        .map(|_| ())
+        .expect_err("min_samples == 0 must be rejected");
+    assert!(
+        matches!(err, mlrs_algos::AlgoError::InvalidMinSamples { .. }),
+        "min_samples == 0 should surface InvalidMinSamples, got {err:?}"
+    );
 }
