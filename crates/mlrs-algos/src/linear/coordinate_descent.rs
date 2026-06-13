@@ -142,16 +142,27 @@ where
         y_mean *= inv;
     }
 
+    // WR-04: center in the WORKING dtype `F` exactly like sklearn (which centers
+    // once in the input dtype), NOT in f64-then-narrow. We round each mean to `F`
+    // precision first, so the centered design is `fl_F(x_F − mean_F)` — the SAME
+    // single rounding sklearn performs — rather than `fl_F(x_f64 − mean_f64)`,
+    // which injects a different round-off into `norm2_cols` (the soft-threshold
+    // denominator that drives the exact-zero sparsity pattern). cd_solve then
+    // re-reads this `F` design and promotes to f64 LOSSLESSLY, so there is one
+    // consistent representation end-to-end.
+    let x_mean_f: Vec<f64> = x_mean.iter().map(|&m| narrow_to_f::<F>(m)).collect();
+    let y_mean_f = narrow_to_f::<F>(y_mean);
     let mut x_centered: Vec<F> = vec![F::from_int(0i64); n_samples * n_features];
     for r in 0..n_samples {
         for c in 0..n_features {
-            let v = host_to_f64(x_host[r * n_features + c]) - x_mean[c];
-            x_centered[r * n_features + c] = f64_to_host::<F>(v);
+            let xij = host_to_f64(x_host[r * n_features + c]); // already F-exact
+            x_centered[r * n_features + c] = f64_to_host::<F>(xij - x_mean_f[c]);
         }
     }
     let mut y_centered: Vec<F> = vec![F::from_int(0i64); n_samples];
     for r in 0..n_samples {
-        y_centered[r] = f64_to_host::<F>(host_to_f64(y_host[r]) - y_mean);
+        let yi = host_to_f64(y_host[r]); // already F-exact
+        y_centered[r] = f64_to_host::<F>(yi - y_mean_f);
     }
 
     let x_c_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_centered);
@@ -231,6 +242,17 @@ fn f64_to_host<F: Pod>(v: f64) -> F {
     match size_of::<F>() {
         4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
         8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("coordinate-descent estimators are f32/f64 only"),
+    }
+}
+
+/// Round an `f64` to the WORKING precision of `F` (round-trip through f32 when
+/// `F = f32`, identity when `F = f64`), returned as an f64 that is exactly
+/// representable in `F` (WR-04 — match sklearn's single working-dtype centering).
+fn narrow_to_f<F: Pod>(v: f64) -> f64 {
+    match size_of::<F>() {
+        4 => v as f32 as f64,
+        8 => v,
         _ => unreachable!("coordinate-descent estimators are f32/f64 only"),
     }
 }
