@@ -344,8 +344,12 @@ where
 #[test]
 fn fixture_loads() {
     let bin = load_npz(fixture("logistic_binary_f64_seed42.npz")).expect("load logistic_binary_f64");
-    assert_len(&bin, "coef", LOG_N_FEATURES);
-    assert_len(&bin, "intercept", 1);
+    // Plan 05-10 regenerated logistic_binary as the SYMMETRIC-multinomial
+    // self-reference (D-12, K=2 via the same all-K path), so the binary fixture
+    // now carries K=2 weight rows + K=2 intercepts — NOT the old binomial 1×d
+    // coef / scalar intercept. coef = 2·LOG_N_FEATURES (8), intercept = 2.
+    assert_len(&bin, "coef", 2 * LOG_N_FEATURES);
+    assert_len(&bin, "intercept", 2);
     assert_len(&bin, "X", LOG_N_SAMPLES * LOG_N_FEATURES);
     assert_len(&bin, "y", LOG_N_SAMPLES);
 
