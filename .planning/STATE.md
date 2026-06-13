@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: phase_complete
-stopped_at: Phase 05 complete & verified (11/11 plans; 2 review BLOCKERs + 5 warnings + 1 regression fixed; VERIFICATION pass)
-last_updated: "2026-06-13T07:00:00.000Z"
-last_activity: 2026-06-13 -- Phase 05 verified: 11/11 plans; code-review CR-01/CR-02/WR-01..04 + lbfgs_test regression fixed; all targeted oracles green cpu(f64) at HEAD c580805
+status: verifying
+stopped_at: Phase 6 context gathered
+last_updated: "2026-06-13T08:10:51.708Z"
+last_activity: 2026-06-13 -- Phase 05 verified; targeted oracle suite (16 binaries) green cpu(f64) at HEAD c580805
 progress:
   total_phases: 6
   completed_phases: 5
-  total_plans: 32
+  total_plans: 31
   completed_plans: 32
   percent: 83
 ---
@@ -29,7 +29,7 @@ Phase: 05 (distance-based-iterative-solver-estimators) — COMPLETE & VERIFIED
 Plan: 11 of 11 (complete); code review fixed (CR-01/CR-02/WR-01..04 + lbfgs_test regression); VERIFICATION pass
 Status: Phase 05 verified — all 8 requirements (LINEAR-03/04/05, CLUSTER-01/02, NEIGH-01/02/03) satisfied
 Last activity: 2026-06-13 -- Phase 05 verified; targeted oracle suite (16 binaries) green cpu(f64) at HEAD c580805
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-VERIFICATION.md
+Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-CONTEXT.md
 
 Progress: [████████░░] 83% (5/6 phases; 32/32 plans planned-to-date)
 
@@ -188,6 +188,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T05:30:00.000Z
-Stopped at: Completed 05-11-PLAN.md (D-10 iterative-solver + D-04 DBSCAN memory gates) — Phase 05 plans all complete (11/11)
+Last session: 2026-06-13T08:10:51.694Z
+Stopped at: Phase 6 context gathered
 Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-11-SUMMARY.md
