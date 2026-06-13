@@ -28,5 +28,7 @@
 //! Tests live in `crates/mlrs-py/tests/` (AGENTS.md §2 — never an in-source
 //! `#[cfg(test)] mod tests`).
 
+pub mod cluster;
 pub mod decomposition;
 pub mod linear;
+pub mod neighbors;
