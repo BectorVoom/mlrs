@@ -134,6 +134,107 @@ def test_to_output_pyarrow_is_arrow_array():
 
 
 # --------------------------------------------------------------------------- #
+# CR-01: pyarrow egress must NOT silently flatten a genuine 2-D result
+# --------------------------------------------------------------------------- #
+
+
+def test_to_output_pyarrow_2d_matrix_raises_not_flatten():
+    # A genuine (rows, cols) matrix (e.g. predict_proba -> (2, 3)) has no
+    # faithful 1-D pyarrow representation; to_output must raise, never ravel it
+    # to a length-6 flat array of lost geometry (the CR-01 corruption).
+    buf = [0.1, 0.2, 0.7, 0.3, 0.3, 0.4]
+    with pytest.raises(ValueError, match="2-D results"):
+        _io.to_output(buf, (2, 3), "pyarrow", np.float64)
+
+
+def test_to_output_pyarrow_2d_with_inferred_axis_raises():
+    # The decomposition shim passes (rows, -1) for transform; the -1 resolves to
+    # a >1 column count here, so it is a matrix and must still raise.
+    buf = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    with pytest.raises(ValueError, match="2-D results"):
+        _io.to_output(buf, (2, -1), "pyarrow", np.float64)
+
+
+def test_to_output_pyarrow_column_vector_is_flattened_ok():
+    # A (rows, 1) single-column result IS a vector and may flatten to a 1-D
+    # arrow array without losing geometry.
+    out = _io.to_output([1.0, 2.0, 3.0], (3, 1), "pyarrow", np.float64)
+    assert isinstance(out, pa.Array)
+    assert out.to_pylist() == [1.0, 2.0, 3.0]
+
+
+def test_to_output_numpy_2d_matrix_preserves_shape():
+    # The numpy path must always preserve 2-D geometry (the safe container).
+    out = _io.to_output(
+        [0.1, 0.2, 0.7, 0.3, 0.3, 0.4], (2, 3), "numpy", np.float64
+    )
+    assert isinstance(out, np.ndarray)
+    assert out.shape == (2, 3)
+    assert out.tolist() == [[0.1, 0.2, 0.7], [0.3, 0.3, 0.4]]
+
+
+# --------------------------------------------------------------------------- #
+# WR-01: normalize_y must reject non-finite (NaN/Inf) targets
+# --------------------------------------------------------------------------- #
+
+
+def test_normalize_y_rejects_nan():
+    y = np.array([1.0, np.nan, 3.0], dtype=np.float64)
+    with pytest.raises(ValueError):
+        _io.normalize_y(y, dtype=np.float64)
+
+
+def test_normalize_y_rejects_inf():
+    y = np.array([1.0, np.inf, 3.0], dtype=np.float64)
+    with pytest.raises(ValueError):
+        _io.normalize_y(y, dtype=np.float64)
+
+
+def test_normalize_y_accepts_finite():
+    arr = _io.normalize_y(np.array([1.0, 2.0, 3.0]), dtype=np.float64)
+    assert isinstance(arr, pa.Array)
+    assert arr.to_pylist() == [1.0, 2.0, 3.0]
+
+
+# --------------------------------------------------------------------------- #
+# WR-03: f64 capability probe must FAIL CLOSED (False) on error
+# --------------------------------------------------------------------------- #
+
+
+def test_backend_supports_f64_fails_closed_on_probe_error(monkeypatch):
+    # If the capability query throws, the probe must return False (assume
+    # f64-incapable) so f64 is never defaulted onto an unknown/erroring backend.
+    # `from . import _mlrs` resolves the `_mlrs` attribute on the mlrs package,
+    # so patch that attribute to an object whose backend_supports_f64() raises.
+    import types
+
+    import mlrs as _pkg
+
+    fake = types.SimpleNamespace()
+
+    def _boom():
+        raise RuntimeError("simulated capability-probe failure")
+
+    fake.backend_supports_f64 = _boom
+    monkeypatch.setattr(_pkg, "_mlrs", fake, raising=False)
+    assert _io._backend_supports_f64() is False
+
+
+def test_backend_supports_f64_missing_extension_fails_closed(monkeypatch):
+    # When the extension cannot be imported at all, the probe must also fail
+    # closed (False), not optimistically report f64-capable. Simulate an
+    # unimportable extension by clearing the cached attr AND poisoning
+    # sys.modules so `from . import _mlrs` re-imports and fails.
+    import sys
+
+    import mlrs as _pkg
+
+    monkeypatch.delattr(_pkg, "_mlrs", raising=False)
+    monkeypatch.setitem(sys.modules, "mlrs._mlrs", None)
+    assert _io._backend_supports_f64() is False
+
+
+# --------------------------------------------------------------------------- #
 # MlrsBase — output_type purity, NotFitted, sklearn tags
 # --------------------------------------------------------------------------- #
 
