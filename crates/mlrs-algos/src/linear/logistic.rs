@@ -98,6 +98,12 @@ pub struct LogisticRegression<F> {
     tol: F,
     /// Number of classes inferred from the integer labels at `fit` (binary = 2).
     n_classes: usize,
+    /// CR-02: the DISTINCT sorted training labels (`classes_`), one per fitted
+    /// class column. The softmax kernel only ever sees the dense remapped index
+    /// `0..n_classes`; `predict_labels` maps each argmax column back through this
+    /// vector so a non-contiguous label set (e.g. `{0, 2}`) returns the ORIGINAL
+    /// id (`2`), never a phantom never-trained class. Empty until `fit`.
+    classes_: Vec<i64>,
     /// Number of features inferred at `fit` (for the predict geometry guard).
     n_features: usize,
     /// Fitted weights `W` (K×d, row-major: class-major), device-resident, `None`
@@ -128,6 +134,7 @@ where
             max_iter,
             tol,
             n_classes: 0,
+            classes_: Vec::new(),
             n_features: 0,
             coef_: None,
             intercept_: None,
@@ -208,13 +215,18 @@ where
             }));
         }
 
-        // --- Determine n_classes from the integer labels (binary = 2-class is
-        //     the K=2 case of the SAME symmetric softmax path, D-12). Labels are
-        //     stored as F (class indices); round to the nearest integer and take
-        //     max+1. Reject negative / non-integer-ish labels (ASVS V5: an
-        //     out-of-range label would index past the K weight rows). ---
+        // --- CR-02: determine the classes from the DISTINCT integer labels, not
+        //     `max(label)+1`. Inferring K from `max+1` mislabels a non-contiguous
+        //     target (`{0, 2}` would fit a phantom never-trained class 1 and could
+        //     emit id 1, which never existed) and forces a degenerate one-class
+        //     input up to binary. Instead: round + validate each label is a
+        //     non-negative integer, collect the DISTINCT sorted labels as
+        //     `classes_`, remap `y` to a dense `[0, n_classes)` index for the
+        //     kernel (which trusts `yi < K` and indexes the weight rows), and set
+        //     `n_classes = n_distinct`. `predict_labels` maps the argmax column
+        //     back through `classes_` to recover the original id. ---
         let y_host = y.to_host(pool);
-        let mut max_label: i64 = -1;
+        let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
         for &yv in y_host.iter() {
             let lf = host_to_f64(yv);
             let li = lf.round();
@@ -226,10 +238,37 @@ where
                     len: y.len(),
                 }));
             }
-            max_label = max_label.max(li as i64);
+            raw_labels.push(li as i64);
         }
-        // At least 2 classes (binary); K = max_label + 1.
-        let n_classes = ((max_label + 1) as usize).max(2);
+        // Distinct sorted labels = classes_; the dense remap index of label L is
+        // its position in this vector.
+        let mut classes_: Vec<i64> = raw_labels.clone();
+        classes_.sort_unstable();
+        classes_.dedup();
+        // sklearn requires >= 2 classes; a single-class (or empty) target is a
+        // degenerate problem, not a binary one (max+1 silently forced it to 2).
+        if classes_.len() < 2 {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "logistic.y (needs at least 2 distinct classes)",
+                rows: n_samples,
+                cols: classes_.len(),
+                len: y.len(),
+            }));
+        }
+        let n_classes = classes_.len();
+        // Remap each sample's raw label to its dense class index (classes_ is
+        // sorted, so a binary search gives the position). The kernel must ONLY
+        // see remapped indices in `0..n_classes`.
+        let y_remapped: Vec<F> = raw_labels
+            .iter()
+            .map(|&l| {
+                let idx = classes_
+                    .binary_search(&l)
+                    .expect("every raw label is in classes_ by construction");
+                f64_to_host::<F>(idx as f64)
+            })
+            .collect();
+        let y_remap_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y_remapped);
 
         // --- l2_reg = 1/(C·n_samples) (Pitfall 3); the intercept is unpenalized
         //     inside the 05-06 kernel (b never enters the ‖W‖² term). ---
@@ -240,9 +279,11 @@ where
         let w_len = k * d;
 
         // Device-resident X / y for the closure's softmax launcher (reused across
-        // every L-BFGS iteration — the params change, X/y do not).
+        // every L-BFGS iteration — the params change, X/y do not). CR-02: the
+        // kernel must see the DENSE remapped labels (`0..n_classes`), never the
+        // raw (possibly non-contiguous) ids.
         let x_dev = x;
-        let y_dev = y;
+        let y_dev = &y_remap_dev;
 
         // --- L-BFGS over the symmetric softmax. The flat parameter vector is
         //     [W (k×d) | b (k)]; the closure splits it, launches the device
@@ -346,7 +387,11 @@ where
         let coef_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &w_final);
         let intercept_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &b_final);
 
+        // The remapped-label device buffer is only needed during the solve.
+        y_remap_dev.release_into(pool);
+
         self.n_classes = n_classes;
+        self.classes_ = classes_;
         self.n_features = n_features;
         self.coef_ = Some(coef_dev);
         self.intercept_ = Some(intercept_dev);
@@ -474,7 +519,10 @@ where
                     best = c;
                 }
             }
-            labels[r] = best as i32;
+            // CR-02: `best` is the dense class COLUMN (`0..n_classes`); map it back
+            // through `classes_` to the ORIGINAL training label so a
+            // non-contiguous set (e.g. `{0, 2}`) returns `2`, not the phantom `1`.
+            labels[r] = self.classes_[best] as i32;
         }
         Ok(DeviceArray::from_host(pool, &labels))
     }
