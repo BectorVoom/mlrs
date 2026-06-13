@@ -253,6 +253,18 @@ where
             DeviceArray::from_host(pool, &init_host)
         };
 
+        // --- WR-03: KMeans NON-CONVERGENCE CONTRACT. Unlike Lasso / LogReg (which
+        //     surface AlgoError::NotConverged), KMeans matches sklearn's contract:
+        //     it NEVER errors on non-convergence — it returns the best-effort fit
+        //     after `max_iter` (sklearn only emits a ConvergenceWarning). This is
+        //     intentional, not an oversight: KMeans's objective is non-convex and a
+        //     `max_iter`-exhausted fit is still a usable clustering. The
+        //     `tol_scaled = tol · mean_var` below can be EXACTLY ZERO for a
+        //     constant-feature design (mean_var == 0); we deliberately keep that
+        //     sklearn `tol == 0` semantics (only the strict label-equality break or
+        //     `max_iter` can then stop the loop), and the constant-feature path is
+        //     covered by a regression test in `tests/kmeans_test.rs`.
+        //
         // --- tol_scaled = tol · mean(var(X, axis=0)) (Pitfall 6). sklearn scales
         //     the raw tol by the mean per-feature variance; computed host-side on
         //     the tiny n-vectors (the heavy assign/update stay on-device). ---

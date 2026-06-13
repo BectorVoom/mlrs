@@ -254,8 +254,48 @@ fn kmeans_predict_assigns_to_centers_f32() {
         (acc - 1.0).abs() < f64::EPSILON,
         "predict_labels best_match_accuracy {acc} != 1.0"
     );
+}
 
-    // SEED is a documented constant of the default-init path (not used here since
-    // we inject; reference it to avoid a dead-constant lint in the f64-skip case).
-    let _ = SEED;
+/// WR-03 regression: a CONSTANT-FEATURE design (every column identical across all
+/// samples) drives the mean per-feature variance to 0, so `tol_scaled = tol·0 = 0`
+/// — the deliberately-kept sklearn `tol == 0` semantics. The Lloyd loop can then
+/// stop only on the strict label-equality break or `max_iter`; KMeans's documented
+/// contract (matching sklearn) is to NEVER error on non-convergence but return the
+/// best-effort fit. This test pins that contract: fitting a degenerate
+/// constant-feature matrix must SUCCEED (no NotConverged, no panic) and return
+/// valid in-range labels.
+#[test]
+fn wr03_constant_feature_design_does_not_error() {
+    let client = runtime::active_client();
+    let mut pool = BufferPool::<ActiveRuntime>::new(client);
+
+    // 6 samples, 3 features, all entries identical → var(X, axis=0) == 0 for every
+    // feature → mean_var == 0 → tol_scaled == 0.
+    const N: usize = 6;
+    const D: usize = 3;
+    const K: usize = 2;
+    let x_host: Vec<f32> = vec![1.0f32; N * D];
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
+
+    // Inject a deterministic init: two distinct rows (so the two centers start
+    // apart even though the data is constant); avoids the k-means++ PRNG so the
+    // test is fully reproducible.
+    let init: Vec<f32> = vec![1.0f32; K * D];
+    let mut km = KMeans::<f32>::with_init(K, init);
+
+    let res = km.fit(&mut pool, &x_dev, None, (N, D));
+    assert!(
+        res.is_ok(),
+        "KMeans on a constant-feature (tol_scaled == 0) design must not error: {:?}",
+        res.err()
+    );
+
+    let labels = km.labels(&pool).expect("labels_ after fit");
+    assert_eq!(labels.len(), N, "one label per sample");
+    for &l in labels.iter() {
+        assert!(
+            l >= 0 && (l as usize) < K,
+            "label {l} out of range 0..{K}"
+        );
+    }
 }
