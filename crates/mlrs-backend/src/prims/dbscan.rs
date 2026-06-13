@@ -49,10 +49,13 @@ pub struct EpsCoreMask {
     /// Per-point self-inclusive eps-neighbor count (`count[i] >= 1` always — `i`
     /// is its own neighbor). Length `n`.
     pub counts: Vec<u32>,
-    /// Row-major `n × n` self-inclusive eps-adjacency (`adjacency[i*n+j] == true`
-    /// iff `d(x_i, x_j) <= eps`). The estimator's DFS expands a cluster by walking
-    /// the neighbors of each core point in ascending index order.
-    pub adjacency: Vec<bool>,
+    /// Row-major `n × n` self-inclusive eps-adjacency bitmask (`adjacency[i*n+j]
+    /// != 0` iff `d(x_i, x_j) <= eps`). WR-04: kept in the kernel's NATIVE `u32`
+    /// form — a single representation — rather than ALSO widening to a `Vec<bool>`
+    /// held live alongside it. The estimator's DFS walks the neighbors of each
+    /// core point in ascending index order via [`neighbors`](Self::neighbors),
+    /// which tests `!= 0`.
+    pub adjacency: Vec<u32>,
 }
 
 impl EpsCoreMask {
@@ -62,11 +65,13 @@ impl EpsCoreMask {
     }
 
     /// The ascending-index neighbor list of point `i` (the columns `j` with
-    /// `adjacency[i*n+j]`), self-inclusive — the host DFS frontier (D-04).
+    /// `adjacency[i*n+j] != 0`), self-inclusive — the host DFS frontier (D-04).
+    /// WR-04: tests the native `u32` bitmask directly, so no parallel `Vec<bool>`
+    /// copy is needed.
     pub fn neighbors(&self, i: usize) -> Vec<usize> {
         let n = self.n();
         let base = i * n;
-        (0..n).filter(|&j| self.adjacency[base + j]).collect()
+        (0..n).filter(|&j| self.adjacency[base + j] != 0).collect()
     }
 }
 
@@ -162,15 +167,17 @@ where
     d2.release_into(pool);
 
     // --- 4. Host-side core decision (kept off the device — the device did only
-    //        the n² threshold/count): is_core[i] = count[i] >= min_samples. The
-    //        adjacency is widened from the u32 bitmask to bool for the estimator. ---
+    //        the n² threshold/count): is_core[i] = count[i] >= min_samples. ---
     let is_core: Vec<bool> = counts.iter().map(|&c| c >= min_samples).collect();
-    let adjacency: Vec<bool> = adj_u32.iter().map(|&b| b != 0).collect();
-
+    // WR-04: store the kernel's native n² u32 adjacency DIRECTLY (no second
+    // n² Vec<bool> copy). `neighbors()` tests `!= 0`, so a single representation
+    // suffices — the previous code held BOTH `adj_u32` and a widened `Vec<bool>`
+    // live at once (5× the bitmask footprint), halving the n at which the prim
+    // OOMs versus the module's "bounded, accepted" framing.
     Ok(EpsCoreMask {
         is_core,
         counts,
-        adjacency,
+        adjacency: adj_u32,
     })
 }
 

@@ -199,8 +199,10 @@ fn dbscan_eps_neighborhood_includes_self_f64() {
             "count[{i}] must be >= 1 (self-inclusive eps-neighborhood, Pitfall 7), got {}",
             mask.counts[i]
         );
+        // WR-04: adjacency is the native u32 bitmask (single representation);
+        // a set entry is `!= 0`.
         assert!(
-            mask.adjacency[i * DB_N_SAMPLES + i],
+            mask.adjacency[i * DB_N_SAMPLES + i] != 0,
             "adjacency[{i}][{i}] (self) must be set — D[i,i]=0 <= eps²"
         );
     }
