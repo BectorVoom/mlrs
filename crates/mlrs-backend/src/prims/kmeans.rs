@@ -181,25 +181,67 @@ where
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.cmp(&b))
         });
-        for (rank, &c) in empties.iter().enumerate() {
-            let i = order[rank];
-            let donor = labels[i] as usize;
-            for j in 0..d {
-                let xij = host_to_f64(x_host[i * d + j]);
-                sums_f64[c * d + j] += xij;
-                sums_f64[donor * d + j] -= xij;
+        // CR-01: mirror sklearn's `_relocate_empty_clusters_dense` exactly —
+        // never drain a donor to empty. Walk the farthest-first ranking and, for
+        // each empty cluster, pick the next candidate whose DONOR still has
+        // `count >= 2` (so moving its point leaves the donor non-empty) and which
+        // has NOT already been relocated. A naive "take order[rank]" can hand the
+        // same donor away twice (driving a count to -1) or empty a singleton donor
+        // (count 0 → a center silently left at the origin, a WRONG centroid). If
+        // no valid donor remains for some empty cluster, surface a typed error
+        // rather than leaving a center at the origin.
+        let mut relocated: Vec<bool> = vec![false; n];
+        let mut cursor = 0usize;
+        for &c in empties.iter() {
+            let mut moved = false;
+            while cursor < n {
+                let i = order[cursor];
+                cursor += 1;
+                if relocated[i] {
+                    continue;
+                }
+                let donor = labels[i] as usize;
+                // Skip a candidate whose donor would be emptied (count <= 1) — a
+                // donor must retain at least one member after losing this point.
+                if counts_i64[donor] <= 1 {
+                    continue;
+                }
+                for j in 0..d {
+                    let xij = host_to_f64(x_host[i * d + j]);
+                    sums_f64[c * d + j] += xij;
+                    sums_f64[donor * d + j] -= xij;
+                }
+                counts_i64[c] += 1;
+                counts_i64[donor] -= 1;
+                relocated[i] = true;
+                moved = true;
+                break;
             }
-            counts_i64[c] += 1;
-            counts_i64[donor] -= 1;
+            if !moved {
+                // No candidate point can be relocated without emptying its donor
+                // (e.g. k == n with fewer than k distinct non-empty donors). This
+                // is unrecoverable here — never leave a center at the origin.
+                return Err(PrimError::ShapeMismatch {
+                    operand: "labels",
+                    rows: n,
+                    cols: k,
+                    len: empties.len(),
+                });
+            }
         }
     }
 
     let mut centers: Vec<F> = vec![F::from_int(0); sums_len];
     for c in 0..k {
-        // After relocation every cluster has count >= 1 (each empty got a point;
-        // a donor only loses a point if it had >= 2, since sklearn's ranking never
-        // hands the same singleton's point away — but guard anyway: a 0 count
-        // leaves the center at the origin rather than a NaN).
+        // After relocation every cluster has count >= 1: each empty cluster
+        // received exactly one point from a donor that retained >= 1 member, so
+        // no count can be 0 or negative here. The `> 0` check is a defensive
+        // invariant assertion; the relocation loop above is what guarantees it.
+        debug_assert!(
+            counts_i64[c] > 0,
+            "post-relocation cluster {c} has non-positive count {}",
+            counts_i64[c]
+        );
         if counts_i64[c] > 0 {
             let inv = 1.0_f64 / counts_i64[c] as f64;
             for j in 0..d {
