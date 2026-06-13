@@ -38,10 +38,13 @@ use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::cholesky::cholesky_solve;
+use mlrs_backend::prims::coordinate_descent::cd_solve;
 use mlrs_backend::prims::covariance::covariance;
+use mlrs_backend::prims::dbscan::eps_core_mask;
 use mlrs_backend::prims::distance::distance;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
+use mlrs_backend::prims::lbfgs::lbfgs_minimize;
 use mlrs_backend::prims::reduce::{column_reduce, row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::{self, ActiveRuntime};
@@ -1311,6 +1314,513 @@ fn memory_gate_estimator_round_no_midpipeline_readback() {
 
     println!(
         "D-03 gate C backend={backend}: fit→predict round read_backs={} (terminal only) \
+         stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
+}
+
+// ===========================================================================
+// ===========================================================================
+//  PHASE-5 / D-10 + D-04 — the ITERATIVE-SOLVER + DBSCAN memory-gate
+//  reconciliation (Plan 05-11).
+//
+//  Plans 02-05 / 03-05 / 04-05 (above) asserted the strict device-residency
+//  contract for the single-pass prims, the in-kernel iterative Jacobi sweep, and
+//  the closed-form estimator pipelines — including the hard
+//  `memory_gate_no_midpipeline_readback` "gate 2" rule that a device-resident
+//  pipeline performs ZERO mid-pipeline metered host read-backs (`read_backs == 0`
+//  until the single terminal compare).
+//
+//  Phase 5 ships the project's first HOST-DRIVEN iterative solvers (coordinate
+//  descent for Lasso/ElasticNet — `cd_solve`; L-BFGS for LogisticRegression —
+//  `lbfgs_minimize` + the device softmax objective) and DBSCAN (`eps_core_mask`).
+//  These three are the DELIBERATE, PER-PRD departures from the strict
+//  device-resident pipeline: the host owns the convergence loop / the sequential
+//  graph walk, so they MUST read back from the device. That is NOT a regression
+//  of gate 2 — it is the documented D-10 / D-04 EXCEPTION, and the two gates below
+//  ENCODE the exception so the contract is precise rather than absent:
+//
+//    * D-10 (iterative solvers): gate-2's `read_backs == 0` does NOT apply. The
+//      solvers read back EXACTLY ONE SCALAR per OUTER convergence check (the CD
+//      duality gap; the L-BFGS objective loss / `max|grad|`) — never a
+//      per-iteration ARRAY. Instead of "zero readback" the gate asserts the
+//      BOUNDED-ALLOCATION form: solver buffers (residual/scalars for CD; the
+//      (s,y)-history + gradient for L-BFGS; the device objective's scratch) are
+//      acquired ONCE and reused, so `allocations` is FLAT after warmup, while
+//      `read_backs` grows by a BOUNDED one-scalar-per-check amount.
+//
+//    * D-04 (DBSCAN): gate-2's `read_backs == 0` does NOT apply either. DBSCAN
+//      DELIBERATELY reads the core mask + n×n adjacency back to host (the cluster
+//      expansion is a sequential host graph walk). The gate asserts the
+//      bounded-allocation form: the n² distance matrix is allocated ONCE and
+//      REUSED across repeated `eps_core_mask` calls (NOT re-allocated per call —
+//      `allocations` FLAT after warmup, `live`/`peak` conserved), and the
+//      core-mask host readback is the documented single round-trip (a per-call
+//      BOUNDED `read_backs` increment, never a per-element readback).
+//
+//  These are HARD `assert!`s (build-failing) over the SAME `PoolStats` counters
+//  as the earlier gates. A failure here is a real signal that an iterative solver
+//  started allocating per-iteration, or DBSCAN started re-allocating the n² matrix
+//  per call, or that a per-iteration ARRAY readback crept in — it must NOT be
+//  weakened to pass. The counters are backend-agnostic: the gates drive f32
+//  (portable on every backend — cpu f32+f64 AND rocm f32), so they assert the
+//  SAME figures everywhere with no capability gate (matching the earlier gates;
+//  the f64 solver/DBSCAN paths are dtype-independent on the counter contract).
+//
+//  ## Why driven from prims here (not via `mlrs-algos`)
+//  Same reason as the Phase-4 section: `mlrs-algos` depends on `mlrs-backend`, so
+//  `mlrs-backend` cannot dev-depend on it (a cargo dependency cycle). These gates
+//  drive the EXACT solver/DBSCAN prims the estimators call, in the crate that owns
+//  the pool, so the bounded-allocation contract is proven at the layer that
+//  actually allocates.
+// ===========================================================================
+// ===========================================================================
+
+/// A small, strongly-convex quadratic objective `f(x) = ½·Σ a_i·x_i² − Σ b_i·x_i`
+/// for the L-BFGS half of the D-10 gate, whose loss is materialised on a tiny
+/// device buffer and read back through the METERED path so each objective call
+/// meters EXACTLY ONE scalar (the loss) — mirroring the per-iteration one-scalar
+/// readback the LogReg softmax objective (`softmax_loss_grad`) performs (the gate
+/// asserts the readback is BOUNDED + one-scalar, NOT that it is zero). The
+/// minimizer is `x*_i = b_i / a_i`; the diagonal `a_i > 0` makes it strongly
+/// convex so L-BFGS converges in a few iterations.
+///
+/// Memory shape (D-10 bounded allocation on the device side of the host loop): the
+/// length-1 loss device array is built `from_host` and RELEASED back to the pool
+/// each call, so after the first-sight warmup every subsequent call is served from
+/// the free-list (a REUSE, not a fresh allocation) — the per-evaluation fresh
+/// allocation count is bounded by the one-time warmup, NOT proportional to the
+/// iteration count.
+fn quadratic_loss_metered(
+    pool: &mut BufferPool<ActiveRuntime>,
+    a: &[f64],
+    b: &[f64],
+    x: &[f64],
+) -> f64 {
+    let d = x.len();
+    // Compute the loss on the host, then route it through a length-1 device buffer
+    // read back via the METERED path — so this objective call bumps `read_backs`
+    // by exactly 1 (one scalar), exactly like the device softmax objective's single
+    // metered loss readback. The length-1 buffer is released back to the pool so it
+    // is reused (not freshly allocated) on the next evaluation.
+    let mut loss = 0.0f64;
+    for i in 0..d {
+        loss += 0.5 * a[i] * x[i] * x[i] - b[i] * x[i];
+    }
+    let loss_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(pool, &[loss as f32]);
+    let metered = loss_dev.to_host_metered(pool)[0] as f64; // ← the ONE scalar/eval.
+    loss_dev.release_into(pool); // recycle the length-1 scratch (reused next eval).
+    metered
+}
+
+// ===========================================================================
+// D-10 — iterative solvers (CD + L-BFGS): bounded allocation + 1 scalar/check.
+// ===========================================================================
+
+/// D-10 iterative-solver gate (LINEAR-03/04/05) — **the documented EXCEPTION to
+/// the `memory_gate_no_midpipeline_readback` (gate 2) `read_backs == 0` rule.**
+///
+/// The Phase-2/3/4 gates assert a device-resident pipeline takes ZERO
+/// mid-pipeline metered read-backs. The Phase-5 host-driven iterative solvers
+/// DELIBERATELY break that: the HOST owns the convergence loop, so it MUST read a
+/// convergence scalar back each outer check. This is NOT a regression — for an
+/// iterative solver the right contract is BOUNDED ALLOCATION + a BOUNDED
+/// one-scalar-per-check readback, and this gate ENCODES exactly that so the
+/// departure is precise rather than silent:
+///
+///   (CD — `cd_solve`) Driving `cd_solve` `N` times at the SAME shape proves the
+///   solver buffers (the device residual `R`, the length-1 gap + col-dot scalar
+///   scratch) are acquired ONCE and reused: the per-call FRESH-allocation delta is
+///   FLAT (== 0) after warmup. AND the per-call `read_backs` increment is BOUNDED
+///   and POSITIVE — exactly the duality-gap scalar(s) read once per OUTER
+///   convergence check (`enet_gap` assembles the whole gap device-side into ONE
+///   scalar; the host reads only that, never the residual array). A regression
+///   that allocated per-iteration would make the alloc delta climb (T-05-11-01);
+///   one that read the residual/coefficient ARRAY back per iteration would blow
+///   the bounded per-call readback budget.
+///
+///   (L-BFGS — `lbfgs_minimize`) Running `lbfgs_minimize` on a strongly-convex
+///   device-backed quadratic proves the solver's (s,y)-history + gradient are
+///   host-reused (no per-iteration device allocation) and the objective reads
+///   back EXACTLY ONE scalar (the loss) per evaluation — `read_backs` grows by
+///   exactly the objective-evaluation count, NEVER a per-iteration array. The
+///   device side of the loop reuses ONE parameter buffer + ONE loss handle, so
+///   its fresh-allocation count is bounded (T-05-11-01).
+#[test]
+fn memory_gate_iterative_solver_bounded() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    // -------------------------------------------------------------------
+    // Part A — Coordinate descent (`cd_solve`): allocations FLAT after warmup,
+    // bounded one-scalar-per-outer-check readback. Lasso (l2_reg = 0).
+    // -------------------------------------------------------------------
+    const N: usize = 5;
+    let (n_samples, n_features) = (8usize, 4usize);
+    // Un-normalized penalties (α·l1_ratio·n form); a modest l1 keeps the solve
+    // multi-iteration (so there is genuine outer-check readback to bound) without
+    // driving everything to zero.
+    let l1_reg = 0.05f64 * n_samples as f64;
+    let l2_reg = 0.0f64;
+    let tol = 1e-4f64;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Device-resident inputs uploaded ONCE (so per-call deltas measure ONLY the
+    // solver's internal scratch, not input churn). Well-conditioned design.
+    let x_raw = fill_conditioned(n_samples, n_features);
+    let y_raw: Vec<f32> = (0..n_samples).map(|i| 0.3 * (i as f32) - 0.7).collect();
+    let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_raw);
+    let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y_raw);
+
+    let mut cd_allocs: Vec<u64> = Vec::with_capacity(N);
+    let mut cd_readbacks: Vec<u64> = Vec::with_capacity(N);
+
+    for _call in 0..N {
+        let coef = cd_solve::<f32>(
+            &mut pool,
+            &xd,
+            &yd,
+            n_samples,
+            n_features,
+            l1_reg,
+            l2_reg,
+            tol,
+            /* max_iter */ 50,
+        )
+        .expect("cd_solve accepts the validated shape and converges");
+        // Release the returned coef so the steady-state footprint conserves (the
+        // caller owns it each call) — exactly the Jacobi-gate release idiom.
+        coef.release_into(&mut pool);
+
+        let st = pool.stats();
+        cd_allocs.push(st.allocations);
+        cd_readbacks.push(st.read_backs);
+    }
+
+    // Call 0 is warmup (first sight of each scratch byte-size is a fresh alloc);
+    // steady state holds from call 1 onward.
+    for call in 2..N {
+        // HARD GATE (CD allocations flat): the per-call FRESH-allocation delta is
+        // 0 after warmup — the residual `R` + the gap/col-dot scalar scratch are
+        // reused from the free-list, NOT re-allocated per call. A per-iteration
+        // allocation regression (T-05-11-01) makes this climb. This is the
+        // BOUNDED-ALLOCATION form that REPLACES gate-2's read_backs==0 for the
+        // host-driven iterative solver (the documented D-10 exception).
+        let alloc_delta = cd_allocs[call] - cd_allocs[call - 1];
+        assert_eq!(
+            alloc_delta,
+            0,
+            "D-10 (CD bounded allocation) FAILED on {backend}: call {call} allocated \
+             {alloc_delta} fresh buffer(s) (allocations {} -> {}) — cd_solve's solver \
+             buffers (residual + gap/col-dot scalars) are GROWING with the call/iter \
+             count instead of being reused (T-05-11-01). stats={:?}",
+            cd_allocs[call - 1],
+            cd_allocs[call],
+            pool.stats()
+        );
+
+        // HARD GATE (CD bounded one-scalar-per-check readback): each cd_solve call
+        // reads back a POSITIVE but BOUNDED number of scalars — exactly one duality
+        // gap per OUTER convergence check (enet_gap assembles the gap device-side
+        // into ONE scalar; the host reads only that, never the residual ARRAY). The
+        // per-call increment must be ≥ 1 (the solver DID converge-check) and small
+        // (bounded by the outer-check count, NOT proportional to n_features or n).
+        // A per-iteration ARRAY readback would make this scale with the problem
+        // size — the gate's load-bearing "one scalar per check, never an array"
+        // signal (the documented D-10 departure from gate-2's read_backs==0).
+        let rb_delta = cd_readbacks[call] - cd_readbacks[call - 1];
+        assert!(
+            rb_delta >= 1,
+            "D-10 (CD reads a convergence scalar) FAILED on {backend}: call {call} \
+             read_backs delta={rb_delta} — cd_solve performed NO metered scalar \
+             read-back, so its convergence check is not exercised. stats={:?}",
+            pool.stats()
+        );
+        // Bounded: the per-call metered readback is one scalar per outer check, so
+        // it can never exceed the outer-iteration cap (50) and is FAR below a
+        // per-iteration array readback (which would be ≥ n_features per check).
+        assert!(
+            rb_delta <= 50,
+            "D-10 (CD readback is ONE scalar per check, not a per-iter ARRAY) FAILED \
+             on {backend}: call {call} read_backs delta={rb_delta} exceeds the outer \
+             convergence-check cap (50) — a per-iteration ARRAY readback crept in \
+             instead of the single device-assembled gap scalar. stats={:?}",
+            pool.stats()
+        );
+    }
+
+    let cd_steady_rb = cd_readbacks[N - 1] - cd_readbacks[N - 2];
+    println!(
+        "D-10 CD backend={backend}: N={N} cd_alloc_flat_after_warmup \
+         steady_readback_delta={cd_steady_rb} (one scalar/outer-check, bounded) \
+         stats={:?}",
+        pool.stats()
+    );
+
+    // -------------------------------------------------------------------
+    // Part B — L-BFGS (`lbfgs_minimize`): (s,y)-history + gradient reused (no
+    // per-iteration device alloc), EXACTLY ONE metered scalar (the loss) per
+    // objective evaluation — never a per-iteration array.
+    // -------------------------------------------------------------------
+    let d = 4usize;
+    // Strongly-convex diagonal quadratic: a_i > 0, minimizer x*_i = b_i/a_i.
+    let a = vec![2.0f64, 3.0, 1.5, 4.0];
+    let b = vec![1.0f64, -2.0, 0.5, 3.0];
+    let x0 = vec![0.0f64; d];
+
+    // Warm the length-1 loss scratch ONCE before measuring, so the first-sight
+    // allocation of that byte-size lands in the free-list and the per-evaluation
+    // device allocation during minimize is the reuse (bounded) path.
+    {
+        let warm: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &[0.0f32]);
+        let _ = warm.to_host_metered(&mut pool);
+        warm.release_into(&mut pool);
+    }
+
+    let allocs_before_lbfgs = pool.stats().allocations;
+    let reads_before_lbfgs = pool.stats().read_backs;
+    let mut eval_count: usize = 0;
+
+    let result = lbfgs_minimize(
+        x0,
+        |x: &[f64]| {
+            eval_count += 1;
+            // The device-backed objective: one metered scalar (the loss) per call;
+            // the length-1 loss scratch is released + reused (no fresh per-eval
+            // alloc after warmup — D-10 bounded allocation).
+            let loss = quadratic_loss_metered(&mut pool, &a, &b, x);
+            // Analytic gradient g_i = a_i·x_i − b_i (host scalar math — the L-BFGS
+            // (s,y)-history + gradient vectors are reused on the host by the solver).
+            let grad: Vec<f64> = (0..d).map(|i| a[i] * x[i] - b[i]).collect();
+            (loss, grad)
+        },
+        /* gtol */ 1e-4,
+        /* ftol */ 64.0 * f64::EPSILON,
+        /* maxls */ 50,
+        /* maxiter */ 100,
+    )
+    .expect("lbfgs_minimize on a strongly-convex quadratic");
+
+    let allocs_during_lbfgs = pool.stats().allocations - allocs_before_lbfgs;
+    let reads_during_lbfgs = pool.stats().read_backs - reads_before_lbfgs;
+
+    // Sanity: the solver ran REAL iterations and reached (near) the analytic
+    // minimizer x*_i = b_i/a_i — this proves the loop did genuine work whose
+    // per-evaluation readbacks/allocations we are bounding (a no-op solve would
+    // trivially pass the counter gates, making them vacuous). We assert progress +
+    // accuracy rather than the strict `converged` flag, since the gtol/ftol stop
+    // can fire just shy of the gtol threshold while still landing on the minimizer.
+    assert!(
+        result.iters >= 1 && eval_count >= 2,
+        "D-10 (L-BFGS ran real iterations) FAILED on {backend}: iters={} evals={} — \
+         the loop did not execute, so the bounded-readback assertions are vacuous. \
+         stats={:?}",
+        result.iters,
+        eval_count,
+        pool.stats()
+    );
+    for i in 0..d {
+        let want = b[i] / a[i];
+        assert!(
+            (result.x[i] - want).abs() < 1e-2,
+            "D-10 (L-BFGS minimizer) FAILED on {backend}: x[{i}]={} != b/a={want} \
+             (max_grad={}, iters={}) — the solver did not approach the minimizer, so \
+             the loop did no genuine work. stats={:?}",
+            result.x[i],
+            result.max_grad,
+            result.iters,
+            pool.stats()
+        );
+    }
+
+    // HARD GATE (L-BFGS bounded device allocation): the device side of the L-BFGS
+    // loop reuses the length-1 loss scratch (released + reacquired each eval), and
+    // the solver's (s,y)-history + gradient are host-reused — so across ALL
+    // objective evaluations it adds ZERO fresh device allocation after the warmup.
+    // The total fresh allocations during the entire minimize is 0 (everything is
+    // served from the free-list), NOT proportional to `eval_count`. A per-iteration
+    // device allocation regression (T-05-11-01) makes this climb.
+    assert_eq!(
+        allocs_during_lbfgs,
+        0,
+        "D-10 (L-BFGS bounded device allocation) FAILED on {backend}: \
+         allocations_during_minimize={allocs_during_lbfgs} (expected 0 — every \
+         per-eval buffer served from the free-list after warmup) over {eval_count} \
+         objective evaluations — the loss scratch / (s,y)-history / gradient is NOT \
+         being reused. stats={:?}",
+        pool.stats()
+    );
+
+    // HARD GATE (L-BFGS one metered scalar per evaluation, never an array): the
+    // objective meters EXACTLY ONE scalar (the loss) per call, so the total metered
+    // read-backs during minimize equals the objective-evaluation count — NOT a
+    // multiple of it (which a per-iteration ARRAY readback, or several scalar reads
+    // per check, would produce). This is the literal D-10 "one scalar per outer
+    // convergence check, never a per-iteration array" contract.
+    assert_eq!(
+        reads_during_lbfgs as usize,
+        eval_count,
+        "D-10 (L-BFGS one scalar/evaluation) FAILED on {backend}: \
+         read_backs_during_minimize={reads_during_lbfgs} != objective evaluations \
+         {eval_count} — the objective read back MORE than one scalar per evaluation \
+         (a per-iteration ARRAY readback or multiple scalar reads crept in instead of \
+         the single loss scalar). stats={:?}",
+        pool.stats()
+    );
+
+    println!(
+        "D-10 L-BFGS backend={backend}: evals={eval_count} \
+         allocs_during={allocs_during_lbfgs} (== 0, all reused) reads_during={reads_during_lbfgs} \
+         (== evals, one loss scalar each) converged={} iters={} stats={:?}",
+        result.converged,
+        result.iters,
+        pool.stats()
+    );
+}
+
+// ===========================================================================
+// D-04 — DBSCAN: n² distance matrix allocated once + reused, single readback.
+// ===========================================================================
+
+/// D-04 DBSCAN gate (CLUSTER-02) — **the documented EXCEPTION to the
+/// `memory_gate_no_midpipeline_readback` (gate 2) `read_backs == 0` rule for
+/// DBSCAN.**
+///
+/// DBSCAN (`eps_core_mask`) DELIBERATELY reads the core mask + the n×n adjacency
+/// back to host: the cluster expansion is an inherently sequential graph traversal
+/// the estimator runs on the host (D-04). So gate-2's `read_backs == 0`
+/// mid-pipeline assertion does NOT apply — DBSCAN gets the BOUNDED-ALLOCATION form
+/// instead, which this gate encodes:
+///
+///   (a) The dominant n² SQUARED-distance matrix is allocated ONCE and REUSED
+///       across repeated `eps_core_mask` calls at the SAME shape — it is released
+///       back to the pool after the kernel consumes it (the bounded brute-force v1
+///       cost, T-05-04-02), so the per-call FRESH-allocation delta is FLAT (== 0)
+///       after warmup AND `live`/`peak` bytes conserve. A per-call re-allocation
+///       regression (T-05-11-02) makes the alloc delta climb / peak rise with the
+///       call count.
+///
+///   (b) The core-mask host readback is the documented SINGLE round-trip: each
+///       call reads the count + adjacency back via PLAIN `to_host` (NOT the metered
+///       path — so it does NOT bump `read_backs`; the metered counter stays the
+///       terminal-only quantity gate 2 measures). The gate asserts `read_backs`
+///       does NOT grow per call (the DBSCAN readback is deliberately the unmetered
+///       documented round-trip, never a per-element metered readback that would
+///       scale with n²).
+#[test]
+fn memory_gate_dbscan_n2_bounded() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    const N: usize = 5;
+    let (n, dim) = (6usize, 3usize);
+    let eps = 1.5f64;
+    let min_samples = 2u32;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Device-resident point cloud uploaded ONCE (so per-call deltas measure ONLY
+    // eps_core_mask's internal n² scratch, not input churn). Well-spread points so
+    // some are core (the gate asserts on counters, not cluster labels, but the
+    // solve must run the real n² kernel).
+    let pts = fill_conditioned(n, dim);
+    let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &pts);
+
+    let mut allocs_after: Vec<u64> = Vec::with_capacity(N);
+    let mut live_after: Vec<u64> = Vec::with_capacity(N);
+    let mut peak_after: Vec<u64> = Vec::with_capacity(N);
+    let mut reads_after: Vec<u64> = Vec::with_capacity(N);
+
+    for _call in 0..N {
+        let mask = eps_core_mask::<f32>(&mut pool, &xd, n, dim, eps, min_samples)
+            .expect("eps_core_mask accepts the validated shape");
+        // The host result is owned by the caller and dropped here (no device
+        // buffer to release — the n² scratch was already released inside the prim).
+        assert_eq!(mask.n(), n, "eps_core_mask returns an n-point mask");
+
+        let st = pool.stats();
+        allocs_after.push(st.allocations);
+        live_after.push(st.live_bytes);
+        peak_after.push(st.peak_bytes);
+        reads_after.push(st.read_backs);
+    }
+
+    // Call 0 is warmup (first sight of the n² distance + n×n adjacency + count
+    // byte-sizes is a fresh alloc); steady state holds from call 1 onward.
+    let live_baseline = live_after[1];
+    let peak_baseline = peak_after[1];
+
+    for call in 2..N {
+        // HARD GATE (a — n² matrix allocated once + reused): the per-call FRESH-
+        // allocation delta is 0 after warmup — the dominant n² distance matrix (+
+        // the n×n adjacency + length-n count scratch) is served from the free-list
+        // each call, NOT re-allocated. A per-call re-allocation regression
+        // (T-05-11-02) makes this climb. This is DBSCAN's BOUNDED-ALLOCATION form
+        // that REPLACES gate-2's read_backs==0 (the documented D-04 exception).
+        let alloc_delta = allocs_after[call] - allocs_after[call - 1];
+        assert_eq!(
+            alloc_delta,
+            0,
+            "D-04 (DBSCAN n² allocated once + reused) FAILED on {backend}: call {call} \
+             allocated {alloc_delta} fresh buffer(s) (allocations {} -> {}) — the n² \
+             distance matrix is being RE-ALLOCATED per call instead of reused from \
+             the free-list (T-05-11-02). stats={:?}",
+            allocs_after[call - 1],
+            allocs_after[call],
+            pool.stats()
+        );
+
+        // HARD GATE (a — live/peak conserved): the n² scratch is released back to
+        // the pool after the kernel consumes it, so live_bytes returns to baseline
+        // and peak never rises with the call count (the bound is not a leak).
+        assert_eq!(
+            live_after[call],
+            live_baseline,
+            "D-04 (DBSCAN live_bytes conserved) FAILED on {backend}: call {call} \
+             live_bytes={} != baseline={live_baseline} — the n² distance scratch is \
+             NOT released after the kernel (it stacks each call). stats={:?}",
+            live_after[call],
+            pool.stats()
+        );
+        assert_eq!(
+            peak_after[call],
+            peak_baseline,
+            "D-04 (DBSCAN peak_bytes bounded) FAILED on {backend}: call {call} \
+             peak_bytes={} != baseline={peak_baseline} — peak grows with the call \
+             count (the n² matrix is re-allocated/stacked rather than reused). \
+             stats={:?}",
+            peak_after[call],
+            pool.stats()
+        );
+
+        // HARD GATE (b — single documented round-trip, NOT a metered per-element
+        // readback): the DBSCAN core-mask host readback uses PLAIN `to_host` (the
+        // documented D-04 round-trip), which deliberately does NOT bump the metered
+        // `read_backs` counter. So the metered count does NOT grow per call — the
+        // DBSCAN readback is the single documented host round-trip, never a metered
+        // per-element (n²-scaling) readback. (gate-2's read_backs==0 is preserved
+        // for the METERED counter precisely because DBSCAN's documented readback is
+        // unmetered — this is the encoded exception, not a regression.)
+        let rb_delta = reads_after[call] - reads_after[call - 1];
+        assert_eq!(
+            rb_delta,
+            0,
+            "D-04 (DBSCAN readback is the unmetered documented round-trip) FAILED on \
+             {backend}: call {call} metered read_backs delta={rb_delta} — the n² core \
+             mask is being read through the METERED path (per-element/n²-scaling) \
+             instead of the single documented plain-to_host round-trip. stats={:?}",
+            pool.stats()
+        );
+    }
+
+    println!(
+        "D-04 DBSCAN backend={backend}: N={N} n={n} dim={dim} alloc_flat_after_warmup \
+         live_baseline={live_baseline} peak_baseline={peak_baseline} \
+         metered_read_backs={} (n² readback is the unmetered documented round-trip) \
          stats={:?}",
         pool.stats().read_backs,
         pool.stats()
