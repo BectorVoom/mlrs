@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 05 (distance-based-iterative-solver-estimators) — EXECUTING
-Plan: 10 of 11
+Plan: 11 of 11
 Status: Executing Phase 05
-Last activity: 2026-06-13 -- Phase 05 Plan 09 (Lasso + ElasticNet, shared CD helper, LINEAR-03/04) complete
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-09-SUMMARY.md
+Last activity: 2026-06-13 -- Phase 05 Plan 10 (LogisticRegression oracle, LINEAR-05; binary symmetric-multinomial self-reference + multiclass true-minimum sklearn) complete
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-10-SUMMARY.md
 
-Progress: [█████████░] 94% (4/6 phases; 30/31 plans)
+Progress: [█████████░] 97% (4/6 phases; 31/32 plans)
 
 ## Performance Metrics
 
@@ -80,6 +80,7 @@ Progress: [█████████░] 94% (4/6 phases; 30/31 plans)
 | Phase 05 P07 | 6 | 2 tasks | 5 files |
 | Phase 05 P08 | 18 | 2 tasks | 8 files |
 | Phase 05 P09 | 12 | 2 tasks | 6 files |
+| Phase 05 P10 | 80 | 1 task (Task 2; Task 1 pre-committed) | 7 files |
 
 ## Accumulated Context
 
@@ -88,6 +89,9 @@ Progress: [█████████░] 94% (4/6 phases; 30/31 plans)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [05-10]: LogisticRegression keeps the SYMMETRIC over-parameterized multinomial for ALL K (D-12). BINARY validates against OUR symmetric-multinomial SELF-REFERENCE (scipy on the exact estimator objective), NOT sklearn — sklearn ≥1.6's binomial-sigmoid K=2 loss differs ~3.6e-3 under L2 (user-approved tradeoff; no binomial path added). MULTICLASS stays sklearn-faithful (sklearn K≥3 multinomial = symmetric multinomial); fixture refit at the TRUE MINIMUM (tol=1e-10) so our deeper-converged solver matches to ~5e-8, passing strict 1e-5 predict_proba on cpu(f64).
+- [05-10]: For the gauge-redundant symmetric softmax, an EARLY ftol relative-f stall (iters<maxiter) is functional convergence — the gauge null-space keeps max|grad| above gtol (f32 plateaus ~1e-4). The estimator raises NotConverged ONLY at the iteration CAP; the predict_proba 1e-5 oracle is the correctness witness. Estimator-scoped (05-06 prim untouched). Defaults gtol=1e-5/max_iter=300.
+- [05-10]: f32 multiclass predict_proba uses a documented 5e-5 family tolerance (D-08 growth point) — flat-surface f32 round-off makes strict 1e-5 physically unreachable while predict (argmax) stays exact; f64 + binary-f32 stay strict 1e-5. Matches the cpu(f64)-correctness / rocm(f32)-opportunistic gate.
 - [05-09]: Lasso + ElasticNet share ONE coordinate_descent::cd_fit host helper (D-03); Lasso = ElasticNet l1_ratio=1.0 (l2_reg=0, pure L1) — a true thin wrapper with no duplicate CD loop. The CD family is NOT unified with the 05-10 L-BFGS LogReg solver.
 - [05-09]: cd_fit maps user (alpha, l1_ratio) → sklearn un-normalized (l1_reg=α·l1_ratio·n, l2_reg=α·(1−l1_ratio)·n) (Pitfall 1, n-scaling load-bearing), centers X/y (D-13 ridge precedent), recovers unpenalized intercept = ȳ − x̄·coef; coef_/intercept_ match sklearn within 1e-5 incl. exact sparsity (cpu f32+f64).
 

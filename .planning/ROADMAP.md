@@ -173,7 +173,7 @@ Plans:
 
 **Wave 4** *(blocked on the iterative-solver/DBSCAN prims)*
 
-- [ ] 05-10-PLAN.md — LogisticRegression (L-BFGS over symmetric softmax, l2_reg=1/(C·n)) predict_proba primary gauge-invariant gate (LINEAR-05)
+- [x] 05-10-PLAN.md — LogisticRegression (L-BFGS over symmetric softmax, l2_reg=1/(C·n)) predict_proba primary gauge-invariant gate (LINEAR-05) **[complete; LogisticRegression<F> Fit+PredictLabels+PredictProba via lbfgs_minimize over softmax (D-12 symmetric multinomial all K). Oracle green cpu(f32+f64) 5/5: predict_proba PRIMARY 1e-5 (binary f32/f64 + multiclass f64 STRICT) + predict exact + coef_ gauge-fixed secondary. BINARY = symmetric-multinomial SELF-REFERENCE (scipy on exact objective, NOT sklearn binomial — differs ~3.6e-3 under L2, user-approved D-12 tradeoff); MULTICLASS sklearn-faithful, fixture refit at true minimum (tol=1e-10, agreement ~5e-8). ftol-stall = functional convergence for the gauge-redundant objective (only iteration-cap is NotConverged). f32 multiclass on documented 5e-5 family bound (predict argmax exact). rocm tests build green]**
 - [ ] 05-11-PLAN.md — memory-gate extensions: D-10 iterative-solver bounded-allocation + 1-scalar/iter readback (CD+L-BFGS) + D-04 DBSCAN n²-bound (documented exceptions)
 
 **Research flag**: COMPLETED — `/gsd-plan-phase --research-phase 5` done; 05-RESEARCH.md pins sklearn 1.9.0 / scipy 1.17.1 solver objectives, penalty scalings, and stopping criteria verbatim. LogReg L-BFGS remains the highest correctness risk (gated on gauge-invariant predict_proba per Pitfall 5); CD convergence validated against committed Lasso/ElasticNet fixtures.

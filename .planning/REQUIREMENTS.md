@@ -33,7 +33,7 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 - [x] **LINEAR-02**: User can fit `Ridge` with an `alpha` penalty and obtain `coef_`/`intercept_` matching scikit-learn
 - [x] **LINEAR-03**: User can fit `Lasso` (coordinate-descent) with `alpha` and obtain a sparse `coef_` matching scikit-learn within tolerance
 - [x] **LINEAR-04**: User can fit `ElasticNet` (`alpha`, `l1_ratio`, shared coordinate-descent with Lasso) matching scikit-learn within tolerance
-- [ ] **LINEAR-05**: User can fit `LogisticRegression` (quasi-Newton/L-BFGS) for binary and multiclass classification with stable softmax, `predict`/`predict_proba` matching scikit-learn's `lbfgs` solver within tolerance
+- [x] **LINEAR-05**: User can fit `LogisticRegression` (quasi-Newton/L-BFGS) for binary and multiclass classification with stable softmax, `predict`/`predict_proba` matching the reference `lbfgs` solver within tolerance. **CAVEAT (user-approved, D-12):** the estimator implements the SYMMETRIC over-parameterized multinomial for ALL K, including binary. sklearn ≥1.6 uses a BINOMIAL SIGMOID loss for K=2 (differs from the symmetric 2-class multinomial under L2 by ~3.6e-3), so the **binary** case validates against OUR own symmetric-multinomial SELF-REFERENCE (scipy on the exact estimator objective) at strict 1e-5 predict_proba, NOT sklearn's binomial fit. **Multiclass IS sklearn-faithful** (sklearn's K≥3 multinomial = the symmetric multinomial; fixture refit at the true minimum, agreement ~5e-8) and passes strict 1e-5 on cpu(f64). f32 multiclass predict_proba carries a documented 5e-5 family bound (flat-surface round-off; predict argmax exact). See 05-10-SUMMARY.
 
 ### Clustering
 
@@ -116,7 +116,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DECOMP-02 | Phase 4 | Complete (04-04: TruncatedSvd<F> uncentered-X arpack SVD, var(transform cols) explained_variance_, svd_flip via align_rows, transform; 6 oracle tests pass cpu(f64)+rocm(f32) within 1e-5) |
 | LINEAR-03 | Phase 5 | Complete |
 | LINEAR-04 | Phase 5 | Complete |
-| LINEAR-05 | Phase 5 | Pending |
+| LINEAR-05 | Phase 5 | Complete (binary = symmetric-multinomial self-reference, D-12) |
 | CLUSTER-01 | Phase 5 | Complete |
 | CLUSTER-02 | Phase 5 | Complete |
 | NEIGH-01 | Phase 5 | Complete (05-08) |
