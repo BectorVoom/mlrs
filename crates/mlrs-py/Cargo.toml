@@ -10,3 +10,25 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = { workspace = true }
 mimalloc = { workspace = true }
+
+# PyO3 0.28 (single linked ABI, see workspace pin). `extension-module` builds a
+# CPython extension; `abi3-py312` gives ONE wheel covering Python >=3.12 (D-09).
+pyo3 = { workspace = true, features = ["abi3-py312", "extension-module"] }
+
+# Arrow with the `pyarrow` FFI feature — consumes the __arrow_c_array__ capsule
+# from Python pyarrow arrays (D-02 ingress, wired in Plan 02). This is what
+# transitively pins pyo3 to 0.28.
+arrow = { workspace = true, features = ["pyarrow"] }
+
+# The Rust core the wrappers dispatch into (Plans 02/03).
+mlrs-algos = { path = "../mlrs-algos" }
+mlrs-backend = { path = "../mlrs-backend" }
+
+# Backend selection forwards to the sub-crate features; exactly one is chosen at
+# wheel-build time via the per-backend pyproject `[tool.maturin].features`.
+# Do NOT add the `numpy` Rust crate here — it would drag a second pyo3 ABI.
+[features]
+cpu = ["mlrs-backend/cpu", "mlrs-algos/cpu"]
+wgpu = ["mlrs-backend/wgpu", "mlrs-algos/wgpu"]
+cuda = ["mlrs-backend/cuda", "mlrs-algos/cuda"]
+rocm = ["mlrs-backend/rocm", "mlrs-algos/rocm"]

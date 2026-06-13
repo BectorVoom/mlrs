@@ -18,6 +18,15 @@ cubecl = { version = "0.10.0", default-features = false }
 # Apache Arrow zero-copy interchange (mandated by CLAUDE.md).
 arrow = "59"
 
+# PyO3 binding layer for the Python wheels (Phase 6).
+# PINNED to 0.28 (NOT the latest 0.29) — this is the ONE dep that overrides the
+# "track latest" workspace policy above. arrow-59's `pyarrow` feature transitively
+# pins pyo3 0.28.x, and only ONE pyo3 ABI may link into the `mlrs-py` cdylib;
+# mixing 0.28 + 0.29 links two PyInit ABIs and crashes the wheel at import
+# (D-09 / PY-05; RESEARCH 06 Pitfall 1). default-features=false: the
+# `extension-module` + `abi3-py312` features are selected per-crate in mlrs-py.
+pyo3 = { version = "0.28", default-features = false }
+
 # Safe zero-copy &[T] <-> &[u8] transmutation for the Arrow -> CubeCL handoff.
 bytemuck = { version = "1", features = ["derive"] }
 
