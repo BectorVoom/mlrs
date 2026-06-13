@@ -37,8 +37,8 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 
 ### Clustering
 
-- [ ] **CLUSTER-01**: User can fit `KMeans` with k-means++ initialization (sklearn default), read `cluster_centers_`, `labels_`, `inertia_`, and `predict` new points, matching scikit-learn up to label permutation
-- [ ] **CLUSTER-02**: User can fit `DBSCAN` with `eps`/`min_samples`, read `labels_` (including noise as -1) and `core_sample_indices_`, matching scikit-learn up to label permutation
+- [x] **CLUSTER-01**: User can fit `KMeans` with k-means++ initialization (sklearn default), read `cluster_centers_`, `labels_`, `inertia_`, and `predict` new points, matching scikit-learn up to label permutation
+- [x] **CLUSTER-02**: User can fit `DBSCAN` with `eps`/`min_samples`, read `labels_` (including noise as -1) and `core_sample_indices_`, matching scikit-learn up to label permutation
 
 ### Decomposition
 
@@ -117,8 +117,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | LINEAR-03 | Phase 5 | Pending |
 | LINEAR-04 | Phase 5 | Pending |
 | LINEAR-05 | Phase 5 | Pending |
-| CLUSTER-01 | Phase 5 | Pending |
-| CLUSTER-02 | Phase 5 | Pending |
+| CLUSTER-01 | Phase 5 | Complete |
+| CLUSTER-02 | Phase 5 | Complete |
 | NEIGH-01 | Phase 5 | Pending |
 | NEIGH-02 | Phase 5 | Pending |
 | NEIGH-03 | Phase 5 | Pending |

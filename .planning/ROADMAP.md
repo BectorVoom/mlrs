@@ -167,7 +167,7 @@ Plans:
 
 **Wave 3** *(parallel — estimators on validated prims, file-disjoint by module)*
 
-- [ ] 05-07-PLAN.md — KMeans (k-means++ + Lloyd, PredictLabels) + DBSCAN (host index-ordered DFS, noise=-1) up to label permutation (CLUSTER-01/02)
+- [x] 05-07-PLAN.md — KMeans (k-means++ + Lloyd, PredictLabels) + DBSCAN (host index-ordered DFS, noise=-1) up to label permutation (CLUSTER-01/02) **[complete; KMeans<F> Fit (injected/k-means++ init + Lloyd loop reproducing sklearn strict-OR-tol convergence Pitfall 6: array_equal break THEN center_shift<=tol·mean(var(X)), final assign pass, empty-cluster relocation in prim) + PredictLabels (i32 new-point assign, NOT Predict<F> D-08) + fit_predict; cluster_centers_/labels_(i32)/inertia_ device-resident. DBSCAN<F> Fit (eps_core_mask device prim D-04 → host index-ordered LIFO DFS exactly _dbscan_inner.pyx, expand only from core points, label_num++ per seed Pitfall 7) + fit_predict; labels_(i32 noise=-1)+core_sample_indices_; no standalone predict D-08. Validate-before-launch InvalidK/InvalidEps/InvalidMinSamples (ASVS V5). Oracle green cpu f32+f64 9/9: KMeans centers/labels up to permutation (best_match_accuracy==1.0) + inertia within 1e-5 from injected init; DBSCAN core_sample_indices_ exact + labels up to permutation. rocm(f32) test build green]**
 - [ ] 05-08-PLAN.md — NearestNeighbors (KNeighbors trait) + KNeighborsClassifier (predict/predict_proba) + KNeighborsRegressor (predict) (NEIGH-01/02/03)
 - [ ] 05-09-PLAN.md — Lasso + ElasticNet (shared CD helper, penalty map + center-then-solve intercept) coef_+sparsity (LINEAR-03/04)
 
@@ -204,5 +204,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
 | 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
-| 5. Distance-Based & Iterative-Solver Estimators | 1/11 | In progress | - |
+| 5. Distance-Based & Iterative-Solver Estimators | 7/11 | In progress | - |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |

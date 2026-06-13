@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 05 (distance-based-iterative-solver-estimators) — EXECUTING
-Plan: 6 of 11
+Plan: 7 of 11
 Status: Executing Phase 05
-Last activity: 2026-06-13 -- Phase 05 Plan 06 (L-BFGS solver primitive, highest risk) complete
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-06-SUMMARY.md
+Last activity: 2026-06-13 -- Phase 05 Plan 07 (KMeans + DBSCAN clustering estimators, CLUSTER-01/02) complete
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-07-SUMMARY.md
 
-Progress: [████████░░] 79% (4/6 phases; 27/31 plans)
+Progress: [█████████░] 90% (4/6 phases; 28/31 plans)
 
 ## Performance Metrics
 
@@ -77,6 +77,7 @@ Progress: [████████░░] 79% (4/6 phases; 27/31 plans)
 | Phase 05 P01 | 16 | 4 tasks | 46 files |
 | Phase 05 P02 | 23 | 2 tasks | 3 files |
 | Phase 05 P06 | 18 | 3 tasks | 3 files |
+| Phase 05 P07 | 6 | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -85,6 +86,9 @@ Progress: [████████░░] 79% (4/6 phases; 27/31 plans)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [05-07]: KMeans.predict implements PredictLabels (i32 cluster ids), NOT Predict<F> (D-08); DBSCAN is non-transductive (Fit + fit_predict only, no predict).
+- [05-07]: KMeans centers compared up to the label permutation (best_mapping remaps fitted→sklearn cluster ids before centroid compare); inertia is permutation-invariant so compared directly (D-09).
+- [05-07]: DBSCAN host index-ordered LIFO DFS is exactly _dbscan_inner.pyx (seeds 0..n, expand only from core points, label_num++ per seed) — Pitfall 7 deterministic border join.
 - [Roadmap]: Primitive-first horizontal-layer build order — primitives validated standalone before estimators (SVD/eig gates 4 estimators; distance gates 3).
 - [Roadmap]: SVD/eig gets a dedicated phase (Phase 3) as the single hardest, highest-leverage primitive.
 - [Roadmap]: Closed-form estimators (Phase 4) precede iterative (Phase 5) to de-risk the Arrow/oracle pipeline before convergence-sensitive solvers.
