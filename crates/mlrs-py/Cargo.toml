@@ -27,7 +27,10 @@ bytemuck = { workspace = true }
 # `extension-module` feature, which the per-backend maturin templates turn on;
 # `cargo test` leaves it off and links libpython through `pyo3/auto-initialize`
 # (a dev-dependency), so the Rust integration tests run a real interpreter.
-pyo3 = { workspace = true, features = ["abi3-py312"] }
+# `macros` enables `#[pyfunction]`/`#[pymodule]`/`wrap_pyfunction!` (off because
+# the workspace pin sets `default-features = false` to keep `extension-module`
+# out of the workspace-wide default). `abi3-py312` gives the single >=3.12 wheel.
+pyo3 = { workspace = true, features = ["abi3-py312", "macros"] }
 
 # Arrow with the `pyarrow` FFI feature — consumes the __arrow_c_array__ capsule
 # from Python pyarrow arrays (D-02 ingress, wired in Plan 02). This is what
@@ -44,7 +47,7 @@ mlrs-backend = { path = "../mlrs-backend" }
 # the test harness). `auto-initialize` pulls in libpython at link + spins up the
 # interpreter on first `Python::attach`.
 [dev-dependencies]
-pyo3 = { workspace = true, features = ["abi3-py312", "auto-initialize"] }
+pyo3 = { workspace = true, features = ["abi3-py312", "macros", "auto-initialize"] }
 
 # Backend selection forwards to the sub-crate features; exactly one is chosen at
 # wheel-build time via the per-backend pyproject `[tool.maturin].features`.
