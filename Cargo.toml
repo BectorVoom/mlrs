@@ -37,7 +37,15 @@ thiserror = "2"
 anyhow = "1"
 
 # Custom global allocator, wired only in mlrs-py (FOUND-09).
-mimalloc = "0.1"
+# `local_dynamic_tls`: mimalloc's bundled C library defaults to the initial-exec
+# TLS model, which reserves a slot in the executable's STATIC TLS block. A wheel
+# is `dlopen`'d into an already-running CPython, whose static TLS block is
+# exhausted, so an initial-exec extension fails to import with
+# `cannot allocate memory in static TLS block` (Plan 06-05 flagged this — the
+# editable `.so` needed `LD_PRELOAD`). Building mimalloc with the
+# local-dynamic TLS model makes the allocator `dlopen`-safe, so every backend
+# wheel `import mlrs` works WITHOUT any preload (packaging-layer fix, PY-04).
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
 # .npz named-array reader for the oracle fixtures (D-02). npyz avoids the
 # heavy `ndarray` dependency and reads into plain Vec<T>.
