@@ -251,7 +251,22 @@ where
         //     gradient is zeroed so b never moves off the origin. ---
         let x0 = vec![0.0f64; w_len + k];
         let fit_intercept = self.fit_intercept;
+
+        // WR-01: the closure runs on every L-BFGS iteration AND multiple times per
+        // line-search step. A `PrimError` from the device softmax launch must NOT
+        // panic across the (future PyO3) boundary — capture the FIRST error in a
+        // slot, return a sentinel (huge loss + zero grad) so the line search backs
+        // off, and surface the typed AlgoError after `lbfgs_minimize` returns. The
+        // sentinel never wins the line search, so a failed solve ends at the cap
+        // and the captured error takes precedence.
+        let mut prim_err: Option<PrimError> = None;
+        let grad_len = w_len + k;
         let closure = |params: &[f64]| -> (f64, Vec<f64>) {
+            // Once an error has been recorded, keep returning the sentinel without
+            // re-launching (the result is discarded anyway).
+            if prim_err.is_some() {
+                return (f64::MAX, vec![0.0f64; grad_len]);
+            }
             let w_host: Vec<F> = params[..w_len].iter().map(|&v| f64_to_host::<F>(v)).collect();
             let b_host: Vec<F> = if fit_intercept {
                 params[w_len..].iter().map(|&v| f64_to_host::<F>(v)).collect()
@@ -261,12 +276,19 @@ where
             let w_d: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &w_host);
             let b_d: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &b_host);
 
-            let (loss, grad_w, mut grad_b) =
-                softmax_loss_grad::<F>(pool, x_dev, y_dev, &w_d, &b_d, n_samples, d, k, l2_reg)
-                    .expect("softmax_loss_grad geometry validated before launch");
+            let res =
+                softmax_loss_grad::<F>(pool, x_dev, y_dev, &w_d, &b_d, n_samples, d, k, l2_reg);
 
             w_d.release_into(pool);
             b_d.release_into(pool);
+
+            let (loss, grad_w, mut grad_b) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    prim_err = Some(e);
+                    return (f64::MAX, vec![0.0f64; grad_len]);
+                }
+            };
 
             if !fit_intercept {
                 for g in grad_b.iter_mut() {
@@ -281,6 +303,12 @@ where
         let gtol = host_to_f64(self.tol);
         let maxiter = self.max_iter;
         let result = lbfgs_minimize(x0, closure, gtol, LBFGS_FTOL, LBFGS_MAXLS, maxiter)?;
+
+        // WR-01: a device softmax failure during the solve surfaces here as a typed
+        // AlgoError::Prim, never a panic across the estimator boundary.
+        if let Some(e) = prim_err {
+            return Err(AlgoError::Prim(e));
+        }
 
         // --- Convergence for the SYMMETRIC over-parameterized objective (D-12).
         //     The 05-06 prim reports `converged` only on the `max|grad| <= gtol`
