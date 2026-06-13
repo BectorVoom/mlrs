@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06-05-PLAN.md
-last_updated: "2026-06-13T14:00:00.000Z"
-last_activity: 2026-06-13 -- Completed Phase 06 Plan 05 (Python oracle harness: 34 cases re-validate 1e-5 for all 12 estimators through the full binding path + dtype dispatch + GIL-release; PY-01/03/05)
+stopped_at: Completed 06-06-PLAN.md (Phase 06 done — milestone v1.0 ready for close)
+last_updated: "2026-06-14T00:00:00.000Z"
+last_activity: 2026-06-14 -- Completed Phase 06 Plan 06 (estimator_checks triage: 475 passed/102 by-design xfailed/0 unexpected over 12 estimators on real cpu/f64 _mlrs; four per-backend wheels build cp312-abi3 mlrs_cpu/wgpu/cuda/rocm, each `import mlrs`; driver-absent ImportError asserted clean; cuda live-import + cross-hardware checks deferred to a CUDA host per user approval; PY-04)
 progress:
   total_phases: 6
-  completed_phases: 5
-  total_plans: 37
-  completed_plans: 37
-  percent: 95
+  completed_phases: 6
+  total_plans: 38
+  completed_plans: 38
+  percent: 100
 ---
 
 # Project State
@@ -25,13 +25,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 06 (python-surface-pyo3-estimators-per-backend-wheels) — EXECUTING
-Plan: 6 of 6
-Status: Executing Phase 06
-Last activity: 2026-06-13 -- Completed Phase 06 Plan 05 (Python oracle harness: 34 cases re-validate 1e-5 for all 12 estimators through the full numpy->pyarrow->FFI->device->host->numpy path; gauge-fixed predict_proba / sign-flip / label-perm helpers; dtype dispatch + f64-incapable raise + subprocess GIL-release; built real cpu _mlrs via maturin develop; PY-01/03/05)
-Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-05-SUMMARY.md
+Phase: 06 (python-surface-pyo3-estimators-per-backend-wheels) — COMPLETE
+Plan: 6 of 6 (DONE)
+Status: Phase 06 complete — milestone v1.0 ready for close
+Last activity: 2026-06-14 -- Completed Phase 06 Plan 06 (estimator_checks triage over the 12 estimators: 475 passed/102 by-design xfailed/19 skipped/0 unexpected/0 xpassed across 597 cases on the real cpu/f64 _mlrs; four per-backend wheels build cp312-abi3 under distinct dist names mlrs_cpu/wgpu/cuda/rocm each importable as `import mlrs`, cpu imports with NO LD_PRELOAD after the mimalloc local_dynamic_tls fix; driver-absent ImportError asserted clean in-process+subprocess; three cuda-hardware items — live cuda import, cross-hardware absent-driver, two-wheel-overwrite — DEFERRED to a CUDA host per user approval, not fabricated; PY-04)
+Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-06-SUMMARY.md
 
-Progress: [█████████░] 95% (5/6 phases; 37/37 plans complete; only 06-06 wheels/estimator_checks remain)
+Progress: [██████████] 100% (6/6 phases; 38/38 plans complete; Phase 06 done)
 
 ## Open Follow-ups (Phase 05)
 
@@ -91,6 +91,7 @@ Progress: [█████████░] 95% (5/6 phases; 37/37 plans complete
 | Phase 06 P01 | 6 | 4 tasks (Task 1 was the resolved human gate) | 21 files |
 | Phase 06 P02 | 16 | 2 tasks | 14 files |
 | Phase 06 P03 | 12 | 3 tasks | 8 files |
+| Phase 06 P06 | 95 | 3 tasks (Task 3 = resolved human-verify gate) | 11 files |
 
 ## Accumulated Context
 
@@ -99,6 +100,8 @@ Progress: [█████████░] 95% (5/6 phases; 37/37 plans complete
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [06-06]: estimator_checks criterion 1 is the RELEVANT subset, not "all checks pass" — parametrize_with_checks over all 12 instances on the real cpu/f64 _mlrs gives 475 passed / 102 by-design xfailed / 19 skipped / 0 unexpected failures / 0 xpassed across 597 cases. By-design gaps (sparse, object-dtype, pickle, NaN/allow_nan-off, supervised-2d-y warning, n_iter_, 1-sample special-case, string class labels) are declared via sklearn-native expected_failed_checks (_EXPECTED keyed by type(estimator).__name__) with a per-check reason, mirrored in checks_triage.md (the two MUST stay in sync — a stale xfail surfaces as xpassed). Three genuine failures were FIXED in the shim during triage (Rule 2: n_features_in_/_post_fit; Rule 1: _check_predict_X NotFittedError-before-AttributeError; Rule 2: predict feature-count validation), not masked. DBSCAN/NearestNeighbors are predict-less (sklearn-faithful) so no predict-based checks are generated for them — RESEARCH Open Q3 resolved.
+- [06-06]: Four per-backend wheels build via maturin under distinct dist names mlrs_cpu/wgpu/cuda/rocm, all cp312-abi3, each shipping mlrs/_mlrs.abi3.so and importable as the constant `import mlrs` (PY-04/D-07/D-09). mimalloc built with local_dynamic_tls closes the 06-05 static-TLS item so the cpu wheel imports in a fresh venv with NO LD_PRELOAD. cuda is compile-only in this environment: the wheel builds with the right name+tag but its live `import mlrs`, the cross-hardware foreign-driver-absent ImportError, and the two-wheel-namespace-overwrite check are DEFERRED to a CUDA host as opportunistic checks (user-approved; recorded honestly, NOT fabricated as passed). The driver-absent ImportError path is asserted clean (in-process + subprocess, no abort) for the runnable backends (D-08/T-06-16).
 - [06-05]: The Python oracle harness (criterion 1 / PY-01) re-validates 1e-5 through the FULL numpy->pyarrow->PyCapsule->Rust FFI->validate->device->host->numpy path for all 12 estimators by replaying the committed tests/fixtures/*.npz blobs as a SECOND consumer — 34 cases green on a REAL cpu _mlrs (maturin develop). LogisticRegression compares the gauge-fixed predict_proba (Phase-5 D-12), fit at the fixture's tight tol (default tol halts 3-6e-5 short); f64 holds strict 1e-5, f32 uses a documented 1e-4 band (epsilon, not a contract loosening) with exact labels as the hard gate. KMeans centers aligned via the recovered label permutation; PCA/TSVD components sign-flipped.
 - [06-05]: The cpu (CubeCL MLIR) device client is THREAD-AFFINE — device buffers allocated under the thread that first inits the global client cannot be read back on another thread (device_array.rs:117 'Memory slice doesn't exist'). This is consistent with mlrs's documented v1 single-process-global-client model (true cross-thread parallelism out of v1 scope). The PY-03 GIL-release test therefore runs in a FRESH subprocess (worker thread owns client init) and proves GIL release by the main thread's concurrent ~1e7-iteration progress, not by racing two threads for the one device.
 - [06-05]: Two packaging items deferred to 06-06: (1) the editable _mlrs.abi3.so needs LD_PRELOAD due to mimalloc static-TLS at dlopen ('cannot allocate memory in static TLS block') — fix at the wheel layer; (2) the f64-on-incapable-backend ValueError test is skipif-gated to the rocm wheel (skips on cpu where f64 is supported) — run on a ROCm host to exercise green. The lazy _mlrs loader was made recursion-safe (importlib.import_module) so a genuinely-unimportable extension raises a clear ImportError, not RecursionError.
@@ -193,10 +196,12 @@ Items acknowledged and carried forward from previous milestone close:
 
 | Category | Item | Status | Deferred At |
 |----------|------|--------|-------------|
-| *(none)* | | | |
+| cuda-hardware | Live `import mlrs` from the mlrs_cuda wheel on a CUDA host (wheel builds compile-only here) | Deferred (opportunistic) | 06-06 (user-approved) |
+| cuda-hardware | Cross-hardware foreign-driver-absent `import mlrs` raising a clean ImportError (not segfault) on real hardware | Deferred (opportunistic) | 06-06 (user-approved) |
+| packaging | Two backend wheels in one env overwriting the shared `mlrs` namespace (D-07 accepted-by-design) confirmed on a co-install host | Deferred (opportunistic) | 06-06 (user-approved) |
 
 ## Session Continuity
 
-Last session: 2026-06-13T13:10:00.000Z
-Stopped at: Completed 06-03-PLAN.md
-Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-03-SUMMARY.md
+Last session: 2026-06-14T00:00:00.000Z
+Stopped at: Completed 06-06-PLAN.md (Phase 06 done — all 6 phases / 38 plans complete; milestone v1.0 ready for close)
+Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-06-SUMMARY.md

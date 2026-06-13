@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)** - GPU Jacobi SVD + symmetric eig, sign-flip oracle-validated, gates four estimators; D-11 build-failing memory gate (bounded Jacobi scratch + eig buffer reuse + no mid-sweep read-back) green on cpu+rocm (completed 2026-06-12)
 - [x] **Phase 4: Closed-Form Estimators** - LinearRegression, Ridge, PCA, TruncatedSVD assembled on validated primitives
 - [x] **Phase 5: Distance-Based & Iterative-Solver Estimators** - KMeans, DBSCAN, KNN×3, Lasso, ElasticNet, LogisticRegression
-- [ ] **Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels** - sklearn-compatible pyclass estimators, Arrow PyCapsule, maturin per-backend wheels
+- [x] **Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels** - sklearn-compatible pyclass estimators, Arrow PyCapsule, maturin per-backend wheels (completed 2026-06-14)
 
 ## Phase Details
 
@@ -212,7 +212,7 @@ Plans:
 **Wave 5** *(blocked on Wave 4 completion)*
 
 - [x] 06-05-PLAN.md — Oracle pytest harness (1e-5 full-path, sign-flip/label-perm/gauge-fixed-proba) + f32/f64 dispatch + GIL-release tests **[complete — 34 oracle cases re-validate 1e-5 for all 12 estimators through the FULL numpy->pyarrow->PyCapsule->Rust FFI->validate->device->host->numpy path (criterion 1/PY-01), replaying the committed tests/fixtures/*.npz as a SECOND consumer on a REAL cpu _mlrs (maturin develop 1.14 + LD_PRELOAD for mimalloc static-TLS): linear coef_/intercept_ direct (Ridge 3-alpha sweep); LogisticRegression gauge-fixed predict_proba (D-12, NOT raw coef_) fit at fixture tight tol + exact labels; KMeans labels_ (label-perm) + centers (remapped) + inertia_; DBSCAN labels_ (label-perm) + core_sample_indices_; PCA/TSVD components_ (sign-flip) + transform (same-sign cols) + mean_/explained_variance_/singular_values_; k-NN distances(1e-5)+indices(exact), classifier predict/proba, regressor predict. test_dtype: f32/f64 preservation + int->f64 default via backend_supports_f64() (PY-05/D-05); f64-on-incapable raise skipif-gated to rocm (D-04/T-06-15); subprocess-isolated GIL-release smoke (worker .fit advances main-thread counter ~1e7 iters; cpu client is thread-affine). Rule-3 fix: recursion-safe lazy _mlrs loader (importlib.import_module). f64 strict 1e-5, f32 documented 1e-4 epsilon band w/ exact labels. 147 passed/1 skipped(f64-raise on cpu)/12 xfailed(estimator_checks, Plan 06). PY-01/03/05]**
-- [ ] 06-06-PLAN.md — estimator_checks triage + four wheel builds (distinct dist names, abi3-py312) + driver-absent ImportError
+- [x] 06-06-PLAN.md — estimator_checks triage + four wheel builds (distinct dist names, abi3-py312) + driver-absent ImportError **[complete — parametrize_with_checks over all 12 estimators on the real cpu/f64 _mlrs: 475 passed / 102 by-design xfailed (sklearn-native expected_failed_checks + checks_triage.md companion) / 19 skipped / 0 unexpected failures / 0 xpassed across 597 cases (criterion 1 = relevant subset, NOT all). Three genuine failures fixed in the shim during triage (Rule 2 n_features_in_/_post_fit; Rule 1 _check_predict_X NotFittedError-first; Rule 2 predict feature-count validation), not masked. DBSCAN/NearestNeighbors predict-less → no predict-based checks generated (Open Q3 resolved). Four wheels build cp312-abi3 under distinct dist names mlrs_cpu(51MB)/wgpu(7.5MB)/cuda(6.2MB compile-only)/rocm(21MB), each ships mlrs/_mlrs.abi3.so and is `import mlrs`; mimalloc local_dynamic_tls lets the cpu wheel import with NO LD_PRELOAD; rocm imports live (backend_supports_f64()==False, f64-incapable raise live). Driver-absent ImportError asserted clean in-process+subprocess (no abort, D-08/T-06-16). Task 3 human-verify resolved by user approval; live cuda import + cross-hardware absent-driver + two-wheel-overwrite DEFERRED to a CUDA host (opportunistic, recorded honestly). PY-04]**
 
 **Research flag**: Maturin per-feature distribution naming may need a small build-system spike — the multi-distribution pattern is undocumented in maturin's first-party docs. Otherwise standard patterns.
 
@@ -227,5 +227,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
 | 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
-| 5. Distance-Based & Iterative-Solver Estimators | 7/11 | In progress | - |
-| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 3/6 | In progress | - |
+| 5. Distance-Based & Iterative-Solver Estimators | 11/11 | Complete    | 2026-06-13 |
+| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 6/6 | Complete    | 2026-06-14 |
