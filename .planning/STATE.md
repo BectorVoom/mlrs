@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Phase 6 context gathered
-last_updated: "2026-06-13T12:10:50.759Z"
-last_activity: 2026-06-13 -- Phase 05 verified; targeted oracle suite (16 binaries) green cpu(f64) at HEAD c580805
+status: executing
+stopped_at: Completed 06-01-PLAN.md
+last_updated: "2026-06-13T12:30:55.000Z"
+last_activity: 2026-06-13 -- Completed Phase 06 Plan 01 (Python-surface Wave-0 scaffold)
 progress:
   total_phases: 6
   completed_phases: 5
-  total_plans: 31
-  completed_plans: 32
+  total_plans: 37
+  completed_plans: 33
   percent: 83
 ---
 
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 05 complete & verified — next up Phase 06 (Python Surface — PyO3 & per-backend wheels)
+**Current focus:** Phase 06 — python-surface-pyo3-estimators-per-backend-wheels
 
 ## Current Position
 
-Phase: 05 (distance-based-iterative-solver-estimators) — COMPLETE & VERIFIED
-Plan: 11 of 11 (complete); code review fixed (CR-01/CR-02/WR-01..04 + lbfgs_test regression); VERIFICATION pass
-Status: Phase 05 verified — all 8 requirements (LINEAR-03/04/05, CLUSTER-01/02, NEIGH-01/02/03) satisfied
-Last activity: 2026-06-13 -- Phase 05 verified; targeted oracle suite (16 binaries) green cpu(f64) at HEAD c580805
-Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-CONTEXT.md
+Phase: 06 (python-surface-pyo3-estimators-per-backend-wheels) — EXECUTING
+Plan: 2 of 6
+Status: Executing Phase 06
+Last activity: 2026-06-13 -- Completed Phase 06 Plan 01 (Python-surface Wave-0 scaffold)
+Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-01-SUMMARY.md
 
-Progress: [████████░░] 83% (5/6 phases; 32/32 plans planned-to-date)
+Progress: [████████░░] 83% (5/6 phases; 33/37 plans complete)
 
 ## Open Follow-ups (Phase 05)
 
@@ -88,6 +88,7 @@ Progress: [████████░░] 83% (5/6 phases; 32/32 plans planned-
 | Phase 05 P09 | 12 | 2 tasks | 6 files |
 | Phase 05 P10 | 80 | 1 task (Task 2; Task 1 pre-committed) | 7 files |
 | Phase 05 P11 | 12 | 2 tasks (co-located, 1 commit) | 1 file |
+| Phase 06 P01 | 6 | 4 tasks (Task 1 was the resolved human gate) | 21 files |
 
 ## Accumulated Context
 
@@ -161,6 +162,7 @@ Recent decisions affecting current work:
 - [Phase 05]: [05-04]: DBSCAN eps-core-mask primitive (D-04, CLUSTER-02) landed. mlrs_kernels::dbscan::eps_core_count is a feature-free #[cube] GATHER kernel: one unit per point i scans its OWN row of the n×n squared-distance matrix, writing each self-inclusive adjacency bit adj[i*n+j]=(d2[i,j]<=eps²) and accumulating the row's eps-neighbor count in a private u32. GATHER (not a 2D (i,j) map + scatter+atomic) was chosen because cubecl-cpu does NOT lower cross-unit atomics (critical-constraint note) — every output slot (count[i], adj[i,*]) is single-owner, so no atomic/no SharedMemory, and it LAUNCHED on cpu(f64) first try (the 05-02 MLIR failure mode avoided by construction). prims::dbscan::eps_core_mask validates n*d==x.len() + eps>=0(finite) + min_samples>=1 as PrimError::ShapeMismatch (synthetic "eps"/"min_samples" operand; PrimError has no InvalidEps — that's AlgoError, estimator layer) BEFORE any unsafe launch; REUSES the Phase-2 distance prim (sqrt=false) for the n² matrix; passes eps2 as a bytemuck-reinterpreted f64-PRECISE F (NOT F::new(f32), which truncates the threshold and could flip a boundary core bit on the integer-exact count); reads count + n×n adjacency back to host as the SINGLE D-04 documented round-trip (cholesky tiny-readback idiom scaled to n²); derives is_core[i]=count[i]>=min_samples HOST-side (device does only threshold/count); releases the n² scratch back to the pool (bounded+reused, plan-11 memory gate). Returns EpsCoreMask{is_core,counts,adjacency} (+ neighbors(i) ascending-index helper) for plan-07's host DFS — this prim does NOT expand clusters. dbscan_mask_test GREEN cpu(f64) 5/5: is_core INTEGER-EXACT vs sklearn core_sample_indices_ (f32+f64), self-inclusivity (every count[i]>=1 + diagonal adjacency bit set, Pitfall 7), bad-input guard (n*d/negative-eps/min_samples=0 → typed ShapeMismatch). rocm test target builds. lib.rs/prims/mod.rs untouched (file-disjoint).
 - [Phase 05]: [05-03]: KMeans Lloyd + k-means++ primitives (D-01, CLUSTER-01) landed. mlrs_kernels::kmeans has two feature-free #[cube] GATHER kernels: centroid_sumcount (one unit per (centroid c, feature j) scans all n rows accumulating Σ X[i,j] over label==c rows + the per-centroid count) and inertia_rows (one unit per row gathers Σ_j (X[i,j]−centers[label_i,j])²). GATHER (not scatter+atomic) was chosen because cubecl-cpu does not reliably lower cross-unit atomics; both kernels use only F/u32 accumulators + ascending while-scans + if-guards (the plan 05-02 SharedMemory-free MLIR-safe pattern) and LAUNCHED on cpu(f64) first try. prims::kmeans::{lloyd_update, inertia, kmeanspp_sample}: lloyd_update = device gather → host divide-by-count mean + sklearn empty-cluster relocation (an empty cluster moves to the not-yet-claimed sample with max squared distance to its nearest NON-EMPTY new center — the worst-served point — never a divide-by-zero NaN, T-05-03-02); inertia = device gather → host f64-accumulate Σ (squared, no sqrt, D-08); kmeanspp_sample = host SplitMix64 PRNG (hand-rolled, no rand crate, never OsRng — ASVS V6) drawing each next center ∝ device-computed D² weights read back ONCE PER CENTER at init only (D-09c, never on-device RNG). All entry points validate 1<=k<=n + n*d==x.len() + label-in-0..k as PrimError::ShapeMismatch BEFORE any unsafe launch. Assignment REUSES the Phase-2 distance + argmin_rows prims (not rebuilt). lloyd_test GREEN cpu(f64): centers vs sklearn cluster_centers_ within 1e-5 + inertia vs inertia_ within 1e-5 + empty-cluster relocation case; kmeanspp_test invariant GREEN: k distinct in-range indices + same-seed reproducible + different-seed-can-differ. rocm test target builds. lib.rs/prims/mod.rs untouched (file-disjoint).
 - [Phase 05]: [05-02]: Top-k select primitive (D-02, NEIGH-01/02/03) landed. mlrs_kernels::topk::select_k is a feature-free #[cube] SELECTION-BY-RANK kernel (one cube per query row, unit 0): order candidates by the (value,index) PAIR, emit slot 0 = global min pair and slot r>0 = min pair STRICTLY GREATER than the previous winner — provably identical to a k-fold argmin_shared over distinct row indices, with the exact lowest-index tie-break. CRITICAL cubecl-cpu constraint discovered: the first attempt (SharedMemory k-length insertion-select with mutable bool flags, F::INFINITY seed, descending-shift `while q>pos` loop) COMPILED but PANICKED at launch on the cpu backend ('failed to run pass' in cubecl_cpu MLIR lowering) AND F::INFINITY raised a From<NativeExpand<F>> compile error AND a cross-loop `let mut flag=0u32;` raised E0283 NativeExpand inference failure. Fix (Rule 1): rewrote using ONLY F/u32 accumulators + if-guards, no SharedMemory/no bool/no infinity/no descending shift, with explicitly-typed u32 flags (`let mut admit: u32 = 0u32;`). PATTERN for downstream Wave-2 kernels: avoid those constructs on the cpu gate. prims::topk::top_k validates rows*cols==dist.len() AND 1<=k<=cols as PrimError::ShapeMismatch (no InvalidK variant; distance.rs convention) BEFORE any unsafe launch; selects on SQUARED distance and sqrts ONLY the returned rows×k values at the boundary (Pitfall 8/D-08); returns device-resident (distances:F, indices:u32) with optional reused out buffers (D-11). Standalone oracle GREEN cpu(f64): distance(Xq,X,sqrt=false)→top_k(.,k,sqrt=true) vs sklearn kneighbors within 1e-5 + indices EXACT, constructed-tie pins lowest-index, bad-geometry guard returns typed ShapeMismatch. rocm test target builds. lib.rs/prims/mod.rs untouched (file-disjoint).
+- [Phase 06]: [06-01]: Python-surface Wave-0 scaffold landed. pyo3 PINNED 0.28 (not latest 0.29) as the SINGLE linked ABI in [workspace.dependencies] with an ABI-pin comment — the ONE dep overriding track-latest (arrow-59's pyarrow feature transitively pins 0.28; mixing 0.29 links two PyInit ABIs and crashes the wheel at import, D-09/PY-05). cargo tree -p mlrs-py --features cpu -i pyo3 resolves exactly one pyo3 v0.28.3; cpu build compiles. mlrs-py wired with pyo3 (abi3-py312, extension-module) + arrow (pyarrow) + mlrs-algos/mlrs-backend path deps + [features] cpu/wgpu/cuda/rocm forwarding to the sub-crates. FOUR per-backend maturin pyproject templates (pyproject/{cpu,wgpu,cuda,rocm}.pyproject.toml), identical except [project].name (mlrs-cpu/-wgpu/-cuda/-rocm) and [tool.maturin].features, all with CONSTANT module-name="mlrs._mlrs" + python-source so every wheel is `import mlrs` (D-07). Python dep floors (Task 1 HUMAN DECISION GATE): numpy>2.0.0 (INTENTIONAL & EXACT — numpy 2.x only, strictly >2.0.0, NOT normalized to >=2.0.0/>=1.26), pyarrow>=14, scikit-learn>=1.6 — written verbatim into all four templates. Pure-Python mlrs package (python/mlrs/{__init__,base,_io,linear,cluster,decomposition,neighbors}.py): 12 sklearn-compatible estimator shells subclassing MlrsBase(BaseEstimator)+family mixin with FAITHFUL __init__s (every ctor arg stored verbatim same-name — self.C=C for LogReg, self.random_state for KMeans; fit raises NotImplementedError until Plan 04); __init__.py guards the not-yet-built _mlrs extension import (clear ImportError / D-08 driver-probe hook) + re-exports all 12. pytest Nyquist scaffold (python/tests/, AGENTS.md §2 separation): conftest.py (committed-.npz loader + sign_flip_allclose PCA/SVD + label_perm_allclose KMeans/DBSCAN + requires_f64 skipif on mlrs.backend_supports_f64()) + 7 collecting stubs each tagged its PY-0x req, importorskip/xfail so the suite collects green pre-wrapper. RESOLVED Open Question Q2/A3: arrow-59 FromPyArrow has EXACTLY ONE method, ArrayData::from_pyarrow_bound(&Bound<PyAny>) — NO non-_bound variant — reachable as arrow::pyarrow::FromPyArrow (pub use arrow_pyarrow as pyarrow); recorded in the non-compiled src/arrow_symbol_probe.rs (absent from lib.rs mod list) for Plan 02 ingress.
 - [Phase 05]: [05-01]: Wave-0 scaffold landed file-disjoint. AlgoError is extended IN-PLACE with 6 Phase-5 hyperparameter guards (InvalidK/InvalidEps/InvalidMinSamples/InvalidL1Ratio/InvalidC/NotConverged) in the InvalidAlpha struct-variant style; traits.rs gains PredictLabels (i32 labels, D-05/D-06), KNeighbors ((F dist, i32 idx), D-07), PredictProba (F per-class, D-07). The scaffold OWNS lib.rs + prims/mod.rs + kernels/lib.rs registrations (pub mod for 5 kernels + 5 prims, no pub use until the symbol exists) so plans 02-06 fill exactly one kernel file + one prim file and never touch the shared index — empty doc-comment-only module body is a valid compiling stub. D-06 i32 DeviceArray CONFIRMED by a NON-ignored round-trip test (incl. -1 noise) — zero pool/bridge changes, so no later plan is surprised. gen_oracle.py gained 6 generators: gen_kmeans carries an INJECTED init array (D-09, Lloyd deterministic across numpy/Rust), gen_dbscan tuned eps=0.7/min_samples=4 for cluster+noise(-1)+border, gen_knn is ONE fixture serving NEIGH-01/02/03 with distinct distances (Pitfall 8), gen_lasso has 5 exact-zero coefficients (Pitfall 1), gen_logistic stores the symmetric over-parameterized softmax (multi coef 3×n_features) with predict_proba the PRIMARY gauge-invariant gate (Pitfall 5). 14 fixtures committed (regen needs /tmp venv numpy+scipy+sklearn, PEP 668). 14 #[ignore] oracle stubs (6 prim + 8 estimator) assert load_npz+shape only (NO non-existent symbol) so both test crates compile on cpu+rocm today.
 
 ### Pending Todos
@@ -175,7 +177,7 @@ None yet.
 
 - Phase 5 (LogisticRegression sub-task) needs `/gsd-plan-phase --research-phase 5` — QN/L-BFGS convergence parity with sklearn `lbfgs` is the highest correctness risk.
 - [03-01 RESOLVED] f64 absence on the GPU gate: the gate is now cpu(f64) + rocm(f32) from Phase 3 (D-07). f64 validates on cpu; f64-on-rocm skips-with-log (cubecl-cpp 0.10 F64 unregistered for HIP) — capability gate (skip_f64_with_log) already in place since Phase 1. Every Phase 3+ f64 oracle test must mirror the gemm_test.rs skip pattern.
-- Maturin per-backend distribution naming (Phase 6) is undocumented first-party — small build-system spike expected.
+- [06-01 RESOLVED] Maturin per-backend distribution naming: confirmed via RESEARCH Pattern 1 + implemented — `[project].name` per backend (mlrs-cpu/-wgpu/-cuda/-rocm) + constant `module-name="mlrs._mlrs"` gives N dist names with one `import mlrs`. Four templates landed in pyproject/. The build-system spike is closed; Plan 05 exercises the actual `maturin develop`/`build` once the /tmp venv exists.
 - [02-01] ROADMAP Criterion 1 / REQUIREMENTS wording "wraps cubecl-matmul" must be updated to "wraps cubek-matmul" (the cubecl algorithm crates were split into tracel-ai/cubek and renamed cubek-*). Orchestrator action.
 
 ## Deferred Items
@@ -188,6 +190,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T08:10:51.694Z
-Stopped at: Phase 6 context gathered
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-11-SUMMARY.md
+Last session: 2026-06-13T12:30:55.000Z
+Stopped at: Completed 06-01-PLAN.md
+Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-01-SUMMARY.md

@@ -195,7 +195,7 @@ Plans:
 **Plans**: 6 plans
 **Wave 1**
 
-- [ ] 06-01-PLAN.md — Wave-0 scaffold: pyo3 0.28 ABI pin, 4 per-backend pyproject templates, pure-Python mlrs package skeleton, pytest scaffold, arrow FromPyArrow symbol
+- [x] 06-01-PLAN.md — Wave-0 scaffold: pyo3 0.28 ABI pin, 4 per-backend pyproject templates, pure-Python mlrs package skeleton, pytest scaffold, arrow FromPyArrow symbol ✅ (4/4 tasks; numpy>2.0.0/pyarrow>=14/scikit-learn>=1.6 floors; FromPyArrow=ArrayData::from_pyarrow_bound)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
