@@ -60,9 +60,30 @@ pub const LBFGS_FTOL: f64 = 64.0 * f64::EPSILON;
 const WOLFE_C1: f64 = 1e-4;
 const WOLFE_C2: f64 = 0.9;
 
+/// WR-01: the precise reason [`lbfgs_minimize`] stopped. `converged` alone cannot
+/// distinguish a legitimate ftol stall (a genuine stationary point) from a
+/// line-search BREAKDOWN at a non-stationary point (a NaN/degenerate gradient) —
+/// both leave `converged = false` with `iters < maxiter`, so the estimator would
+/// wrongly accept the breakdown as success. The estimator must surface
+/// `NotConverged` on [`LbfgsStopReason::LineSearchFailed`] regardless of `iters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LbfgsStopReason {
+    /// `max_grad <= gtol` was reached — a true first-order stationary point.
+    Converged,
+    /// scipy's `ftol` relative-f-decrease stall (a flat/near-stationary point;
+    /// for the gauge-degenerate symmetric softmax this is the legitimate stop).
+    FtolStall,
+    /// The strong-Wolfe line search could not find an acceptable step — a
+    /// breakdown at a possibly NON-stationary point. NOT a success.
+    LineSearchFailed,
+    /// The `maxiter` cap was reached without any of the above stops.
+    MaxIter,
+}
+
 /// The outcome of an [`lbfgs_minimize`] run: the final iterate `x`, its objective
-/// value `loss`, the max-abs gradient at it, the iteration count, and whether the
-/// `gtol` convergence criterion was met before `maxiter` (`converged`).
+/// value `loss`, the max-abs gradient at it, the iteration count, whether the
+/// `gtol` convergence criterion was met before `maxiter` (`converged`), and the
+/// precise [`LbfgsStopReason`] (WR-01).
 #[derive(Debug, Clone)]
 pub struct LbfgsResult {
     /// Final parameter vector (the last iterate).
@@ -76,6 +97,9 @@ pub struct LbfgsResult {
     /// Whether `max_grad <= gtol` was reached before `maxiter` (else the estimator
     /// may surface [`mlrs_core`]`::AlgoError::NotConverged`).
     pub converged: bool,
+    /// WR-01: the precise stop reason, so the estimator can distinguish a benign
+    /// ftol stall from a line-search breakdown (which it must reject).
+    pub stop_reason: LbfgsStopReason,
 }
 
 /// Minimize `f` (returning `(loss, grad)` at a host parameter vector) by L-BFGS
@@ -146,11 +170,14 @@ where
             max_grad,
             iters: 0,
             converged: true,
+            stop_reason: LbfgsStopReason::Converged,
         });
     }
 
     let maxiter = if maxiter == 0 { LBFGS_MAXITER } else { maxiter };
     let mut converged = false;
+    // WR-01: assume the cap until a more specific stop fires below.
+    let mut stop_reason = LbfgsStopReason::MaxIter;
     let mut iters = 0usize;
 
     for k in 0..maxiter {
@@ -206,8 +233,11 @@ where
         let (t, new_loss, new_grad) = match ls {
             Some(v) => v,
             None => {
-                // Line search failed to find an acceptable step — stop at the
-                // current iterate (the estimator decides on NotConverged).
+                // Line search failed to find an acceptable step — a breakdown at
+                // a possibly non-stationary point. WR-01: record the distinct stop
+                // reason so the estimator surfaces NotConverged regardless of how
+                // many iterations ran (it is NOT a benign ftol stall).
+                stop_reason = LbfgsStopReason::LineSearchFailed;
                 break;
             }
         };
@@ -243,6 +273,7 @@ where
         // --- Convergence: gtol on max |grad|, ftol on relative-f decrease. ---
         if max_grad <= gtol {
             converged = true;
+            stop_reason = LbfgsStopReason::Converged;
             break;
         }
         let f_decrease = (prev_loss - loss).abs();
@@ -250,6 +281,11 @@ where
         if f_decrease / denom <= ftol {
             // Negligible relative-f decrease — scipy's `ftol` stop.
             converged = max_grad <= gtol;
+            stop_reason = if converged {
+                LbfgsStopReason::Converged
+            } else {
+                LbfgsStopReason::FtolStall
+            };
             break;
         }
     }
@@ -260,6 +296,7 @@ where
         max_grad,
         iters,
         converged,
+        stop_reason,
     })
 }
 

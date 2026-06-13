@@ -52,7 +52,7 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::lbfgs::{
-    lbfgs_minimize, softmax_loss_grad, LBFGS_FTOL, LBFGS_MAXLS,
+    lbfgs_minimize, softmax_loss_grad, LbfgsStopReason, LBFGS_FTOL, LBFGS_MAXLS,
 };
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
@@ -369,6 +369,16 @@ where
         //     stop (either `result.converged` OR `iters < maxiter`) is accepted —
         //     the primary `predict_proba` 1e-5 oracle is the correctness witness
         //     that the accepted iterate is the right minimizer (Pitfall 5). ---
+        // WR-01: a line-search BREAKDOWN (`LbfgsStopReason::LineSearchFailed`) is a
+        // stop at a possibly NON-stationary point — a non-minimizer — and must be
+        // surfaced as NotConverged REGARDLESS of `iters` (it can happen well before
+        // the cap). It is NOT the benign ftol stall the Pitfall-5 comment accepts.
+        if result.stop_reason == LbfgsStopReason::LineSearchFailed {
+            return Err(AlgoError::NotConverged {
+                estimator: "logistic_regression",
+                max_iter: maxiter,
+            });
+        }
         let hit_cap = result.iters >= maxiter;
         if hit_cap && !result.converged {
             return Err(AlgoError::NotConverged {
