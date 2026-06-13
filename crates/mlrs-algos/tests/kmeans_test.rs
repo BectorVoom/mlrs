@@ -35,7 +35,6 @@ use mlrs_core::{best_match_accuracy, load_npz, OracleCase, Tolerance, F32_TOL, F
 const KM_N_SAMPLES: usize = 30;
 const KM_N_FEATURES: usize = 4;
 const KM_K: usize = 3;
-const SEED: u64 = 42;
 
 fn fixture(name: &str) -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
