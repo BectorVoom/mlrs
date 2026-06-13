@@ -1,25 +1,60 @@
-//! Plan 05-03 — Lloyd update + inertia primitive Wave-0 oracle SCAFFOLD.
+//! Plan 05-03 — Lloyd centroid-update + inertia primitive standalone oracle.
 //!
-//! Nyquist Wave-0 stub: every test referencing the not-yet-existing
-//! `prims::kmeans` symbol is `#[ignore]`d and asserts ONLY that the committed
-//! `kmeans_{f32,f64}_seed42.npz` fixture loads (with the `init` key present, D-09)
-//! and is shape-well-formed — so this crate COMPILES today against the empty
-//! `prims::kmeans` stub. Plan 05-03 removes `#[ignore]` and wires the real
-//! centroid-sum-by-label + inertia oracle (centers/labels/inertia within 1e-5 up
-//! to a label permutation, run from the injected init).
+//! Exercises the NEW `mlrs_backend::prims::kmeans::{lloyd_update, inertia}` over
+//! the committed `kmeans_{f32,f64}_seed42.npz` sklearn fixture: taking `X` + the
+//! converged `labels`, `lloyd_update` must reproduce sklearn's `cluster_centers_`
+//! (the per-label means) within 1e-5, and `inertia` over those centers+labels
+//! must reproduce sklearn's `inertia_` (Σ squared distance to the assigned
+//! center) within 1e-5. Runs STANDALONE before the KMeans estimator (07) consumes
+//! it — the D-01 primitive-first discipline.
 //!
-//! f64 stubs carry the `skip_f64_with_log` gate (cpu runs f64; rocm skips, D-07).
-//! Per AGENTS.md §2 tests live here, never an in-source `#[cfg(test)] mod tests`.
+//! A `lloyd_relocates_empty_cluster` case feeds a CONSTRUCTED assignment that
+//! leaves one cluster id unused and asserts the empty cluster is RELOCATED to a
+//! real data point (never a divide-by-zero NaN — T-05-03-02).
+//!
+//! f64 functions carry the `skip_f64_with_log` capability gate (cpu runs f64;
+//! rocm skips, D-07). Per AGENTS.md §2 tests live here, never an in-source
+//! `#[cfg(test)] mod tests`.
 
 use std::path::PathBuf;
 
 use mlrs_backend::capability;
+use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::kmeans::{inertia, lloyd_update};
+use mlrs_backend::runtime::{self, ActiveRuntime};
 use mlrs_core::{load_npz, OracleCase};
 
 /// KMeans fixture geometry (gen_oracle.py KM_N_SAMPLES × KM_N_FEATURES, K=KM_K).
 const KM_N_SAMPLES: usize = 30;
 const KM_N_FEATURES: usize = 4;
 const KM_K: usize = 3;
+
+/// The project 1e-5 contract (centroids + inertia vs sklearn).
+const TOL: f64 = 1e-5;
+
+fn host_to_f64<F: bytemuck::Pod>(v: F) -> f64 {
+    match std::mem::size_of::<F>() {
+        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("lloyd tests are f32/f64 only"),
+    }
+}
+
+fn from_f64<F: bytemuck::Pod>(x: f64) -> F {
+    match std::mem::size_of::<F>() {
+        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(x as f32))),
+        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&x)),
+        _ => unreachable!("lloyd tests are f32/f64 only"),
+    }
+}
+
+fn fixture_vec<F: bytemuck::Pod>(case: &OracleCase, name: &str) -> Vec<F> {
+    case.expect_f64(name)
+        .iter()
+        .map(|&x| from_f64::<F>(x))
+        .collect()
+}
 
 fn fixture(name: &str) -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -38,11 +73,83 @@ fn assert_len(case: &OracleCase, name: &str, len: usize) {
     );
 }
 
+/// Shared oracle body: run `lloyd_update` from the fixture labels and assert the
+/// centers match sklearn `cluster_centers_` within 1e-5; run `inertia` and assert
+/// it matches sklearn `inertia_` within 1e-5. The fixture labels ARE sklearn's
+/// converged assignment, so the per-label means equal `cluster_centers_` (sklearn
+/// has run Lloyd to convergence) — no label-permutation ambiguity.
+fn check_lloyd<F>(fixture_name: &str)
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + bytemuck::Pod,
+{
+    let case = load_npz(fixture(fixture_name)).expect("load kmeans fixture");
+    let x: Vec<F> = fixture_vec::<F>(&case, "X");
+    let ref_centers: Vec<f64> = case.expect_f64("centers").to_vec(); // KM_K × KM_N_FEATURES
+    let ref_inertia: f64 = case.expect_f64("inertia")[0];
+    let labels: Vec<u32> = case
+        .expect_f64("labels")
+        .iter()
+        .map(|&l| l.round() as u32)
+        .collect();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x);
+
+    // --- lloyd_update: per-label means must equal sklearn cluster_centers_. ---
+    let centers_dev = lloyd_update::<F>(
+        &mut pool,
+        &x_dev,
+        &labels,
+        KM_N_SAMPLES,
+        KM_N_FEATURES,
+        KM_K,
+    )
+    .expect("lloyd_update on valid geometry");
+    let got_centers: Vec<f64> = centers_dev
+        .to_host(&pool)
+        .iter()
+        .map(|&v| host_to_f64(v))
+        .collect();
+
+    for c in 0..KM_K {
+        for j in 0..KM_N_FEATURES {
+            let slot = c * KM_N_FEATURES + j;
+            let abs_err = (got_centers[slot] - ref_centers[slot]).abs();
+            assert!(
+                abs_err <= TOL + TOL * ref_centers[slot].abs(),
+                "centroid[{c}][{j}] mismatch vs sklearn: got={:e} expected={:e} abs_err={abs_err:e}",
+                got_centers[slot],
+                ref_centers[slot]
+            );
+        }
+    }
+
+    // --- inertia: Σ squared distance to the assigned center vs sklearn inertia_. ---
+    let got_inertia = host_to_f64(
+        inertia::<F>(
+            &mut pool,
+            &x_dev,
+            &centers_dev,
+            &labels,
+            KM_N_SAMPLES,
+            KM_N_FEATURES,
+        )
+        .expect("inertia on valid geometry"),
+    );
+    let abs_err = (got_inertia - ref_inertia).abs();
+    assert!(
+        abs_err <= TOL + TOL * ref_inertia.abs(),
+        "inertia mismatch vs sklearn: got={got_inertia:e} expected={ref_inertia:e} abs_err={abs_err:e}"
+    );
+
+    centers_dev.release_into(&mut pool);
+    x_dev.release_into(&mut pool);
+}
+
 /// LOAD-NOT-JUST-PRESENT: the `kmeans` fixture loads with the injected `init`
-/// (D-09) and well-formed centers/labels/inertia shapes. WAVE-0 STUB — 05-03
-/// wires the real Lloyd-update oracle on `prims::kmeans`.
+/// (D-09) and well-formed centers/labels/inertia shapes.
 #[test]
-#[ignore = "Wave-0 scaffold: prims::kmeans not implemented until plan 05-03"]
 fn fixture_loads() {
     let case = load_npz(fixture("kmeans_f64_seed42.npz")).expect("load kmeans_f64");
     assert_len(&case, "init", KM_K * KM_N_FEATURES);
@@ -51,23 +158,80 @@ fn fixture_loads() {
     assert_len(&case, "inertia", 1);
 }
 
-/// Centroid sum-by-label reproduces sklearn `cluster_centers_` (up to perm), f32.
-/// WAVE-0 STUB — 05-03 wires the real assertion.
+/// Centroid sum-by-label reproduces sklearn `cluster_centers_` + inertia matches
+/// `inertia_`, f32 (runs on cpu AND rocm).
 #[test]
-#[ignore = "Wave-0 scaffold: prims::kmeans not implemented until plan 05-03"]
 fn lloyd_centers_match_sklearn_f32() {
-    let case = load_npz(fixture("kmeans_f32_seed42.npz")).expect("load kmeans_f32");
-    assert_len(&case, "centers", KM_K * KM_N_FEATURES);
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
+    check_lloyd::<f32>("kmeans_f32_seed42.npz");
 }
 
-/// Inertia (Σ d²) reproduces sklearn `inertia_`, f64 (cpu runs; rocm skips).
-/// WAVE-0 STUB — 05-03 wires the real assertion.
+/// Centroids + inertia (Σ d²) reproduce sklearn, f64 (cpu runs; rocm skips).
 #[test]
-#[ignore = "Wave-0 scaffold: prims::kmeans not implemented until plan 05-03"]
 fn lloyd_inertia_matches_sklearn_f64() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
     if capability::skip_f64_with_log() {
+        println!("lloyd f64 backend={backend}: SKIPPED (no f64 support on this adapter)");
         return;
     }
-    let case = load_npz(fixture("kmeans_f64_seed42.npz")).expect("load kmeans_f64");
-    assert_len(&case, "inertia", 1);
+    check_lloyd::<f64>("kmeans_f64_seed42.npz");
+}
+
+/// Empty-cluster relocation (T-05-03-02): a CONSTRUCTED assignment that uses only
+/// clusters 0 and 1 (cluster 2 EMPTY) must NOT produce a NaN centroid for cluster
+/// 2 — it is relocated to a real data point (a finite row of X). f32, runs on cpu
+/// AND rocm.
+#[test]
+fn lloyd_relocates_empty_cluster() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    println!("lloyd empty-cluster relocation backend={backend} (T-05-03-02)");
+
+    let case = load_npz(fixture("kmeans_f32_seed42.npz")).expect("load kmeans_f32");
+    let x: Vec<f32> = fixture_vec::<f32>(&case, "X");
+
+    // Assign every sample to cluster 0 or 1 (alternating); cluster 2 is EMPTY.
+    let labels: Vec<u32> = (0..KM_N_SAMPLES).map(|i| (i % 2) as u32).collect();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+
+    let centers_dev = lloyd_update::<f32>(
+        &mut pool,
+        &x_dev,
+        &labels,
+        KM_N_SAMPLES,
+        KM_N_FEATURES,
+        KM_K,
+    )
+    .expect("lloyd_update with an empty cluster");
+    let centers: Vec<f32> = centers_dev.to_host(&pool);
+    centers_dev.release_into(&mut pool);
+    x_dev.release_into(&mut pool);
+
+    // Cluster 2's centroid (the relocated empty cluster) must be FINITE (no NaN /
+    // no divide-by-zero) — and must equal some real data row.
+    for j in 0..KM_N_FEATURES {
+        let v = centers[2 * KM_N_FEATURES + j];
+        assert!(
+            v.is_finite(),
+            "empty cluster 2 feature {j} must be finite after relocation, got {v}"
+        );
+    }
+    // The relocated centroid equals one of the sample rows.
+    let relocated = &centers[2 * KM_N_FEATURES..3 * KM_N_FEATURES];
+    let matches_a_row = (0..KM_N_SAMPLES).any(|i| {
+        (0..KM_N_FEATURES).all(|j| {
+            (relocated[j] - x[i * KM_N_FEATURES + j]).abs() <= 1e-6
+        })
+    });
+    assert!(
+        matches_a_row,
+        "relocated empty cluster 2 must coincide with a real data row (farthest-point), got {relocated:?}"
+    );
 }
