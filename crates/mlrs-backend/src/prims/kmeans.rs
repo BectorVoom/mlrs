@@ -290,6 +290,18 @@ where
         });
     }
     let k = centers.len() / d;
+    // WR-06: reject an empty `centers` buffer (k == 0). `centers.len() % d == 0`
+    // is satisfied by `len == 0`, so without this guard the function would
+    // proceed with k == 0 — an inconsistent surface vs `validate_geometry`
+    // (which enforces `1 <= k`).
+    if k == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "centers",
+            rows: 0,
+            cols: d,
+            len: centers.len(),
+        });
+    }
     if labels.len() != n {
         return Err(PrimError::ShapeMismatch {
             operand: "labels",
@@ -503,6 +515,17 @@ where
         });
     }
     let k = centers.len() / d;
+    // WR-06: reject an empty `centers` buffer (k == 0); `len == 0` passes the
+    // `centers.len() % d == 0` check above, so guard explicitly for parity with
+    // `validate_geometry`'s `1 <= k`.
+    if k == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "centers",
+            rows: 0,
+            cols: d,
+            len: centers.len(),
+        });
+    }
     if labels.len() != n {
         return Err(PrimError::ShapeMismatch {
             operand: "labels",
