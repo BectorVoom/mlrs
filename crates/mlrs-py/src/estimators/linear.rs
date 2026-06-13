@@ -36,6 +36,20 @@ pub struct PyLinearRegression {
     inner: AnyLinearRegression,
 }
 
+impl PyLinearRegression {
+    /// Rust-callable default constructor (for the cross-crate smoke test, which
+    /// proves the macro-expanded wrapper instantiates in the `Unfit` arm without
+    /// a Python interpreter). Mirrors the `#[new]` defaults.
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyLinearRegression::Unfit { fit_intercept: true } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyLinearRegression::Unfit { .. })
+    }
+}
+
 #[pymethods]
 impl PyLinearRegression {
     /// `LinearRegression(fit_intercept=True)`.
@@ -179,6 +193,19 @@ pub struct PyRidge {
     inner: AnyRidge,
 }
 
+impl PyRidge {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyRidge::Unfit { alpha: 1.0, fit_intercept: true } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyRidge::Unfit { .. })
+    }
+}
+
 #[pymethods]
 impl PyRidge {
     /// `Ridge(alpha=1.0, fit_intercept=True)`.
@@ -312,6 +339,19 @@ pub struct PyLasso {
     inner: AnyLasso,
 }
 
+impl PyLasso {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyLasso::Unfit { alpha: 1.0, fit_intercept: true, max_iter: 1000, tol: 1e-4 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyLasso::Unfit { .. })
+    }
+}
+
 #[pymethods]
 impl PyLasso {
     /// `Lasso(alpha=1.0, fit_intercept=True, max_iter=1000, tol=1e-4)`.
@@ -443,6 +483,27 @@ crate::any_estimator! {
 #[pyclass(name = "ElasticNet")]
 pub struct PyElasticNet {
     inner: AnyElasticNet,
+}
+
+impl PyElasticNet {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyElasticNet::Unfit {
+                alpha: 1.0,
+                l1_ratio: 0.5,
+                fit_intercept: true,
+                max_iter: 1000,
+                tol: 1e-4,
+            },
+        }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyElasticNet::Unfit { .. })
+    }
 }
 
 #[pymethods]
@@ -579,6 +640,21 @@ crate::any_estimator! {
 #[pyclass(name = "LogisticRegression")]
 pub struct PyLogisticRegression {
     inner: AnyLogisticRegression,
+}
+
+impl PyLogisticRegression {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyLogisticRegression::Unfit { c: 1.0, fit_intercept: true, max_iter: 100, tol: 1e-4 },
+        }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyLogisticRegression::Unfit { .. })
+    }
 }
 
 #[pymethods]

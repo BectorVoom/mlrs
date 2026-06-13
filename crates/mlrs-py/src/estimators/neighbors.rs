@@ -32,6 +32,19 @@ pub struct PyNearestNeighbors {
     inner: AnyNearestNeighbors,
 }
 
+impl PyNearestNeighbors {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyNearestNeighbors::Unfit { n_neighbors: 5 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyNearestNeighbors::Unfit { .. })
+    }
+}
+
 #[pymethods]
 impl PyNearestNeighbors {
     /// `NearestNeighbors(n_neighbors=5)`.
@@ -130,6 +143,19 @@ crate::any_estimator! {
 #[pyclass(name = "KNeighborsClassifier")]
 pub struct PyKNeighborsClassifier {
     inner: AnyKNeighborsClassifier,
+}
+
+impl PyKNeighborsClassifier {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyKNeighborsClassifier::Unfit { n_neighbors: 5 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyKNeighborsClassifier::Unfit { .. })
+    }
 }
 
 #[pymethods]
@@ -263,6 +289,19 @@ crate::any_estimator! {
 #[pyclass(name = "KNeighborsRegressor")]
 pub struct PyKNeighborsRegressor {
     inner: AnyKNeighborsRegressor,
+}
+
+impl PyKNeighborsRegressor {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyKNeighborsRegressor::Unfit { n_neighbors: 5 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyKNeighborsRegressor::Unfit { .. })
+    }
 }
 
 #[pymethods]

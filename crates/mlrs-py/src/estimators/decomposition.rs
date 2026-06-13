@@ -32,6 +32,19 @@ pub struct PyPCA {
     inner: AnyPca,
 }
 
+impl PyPCA {
+    /// Rust-callable default constructor for the smoke test (PCA requires an
+    /// explicit `n_components`; the smoke test uses 2).
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyPca::Unfit { n_components: 2 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyPca::Unfit { .. })
+    }
+}
+
 #[pymethods]
 impl PyPCA {
     /// `PCA(n_components)` — v1 requires an explicit int `n_components`.
@@ -212,6 +225,19 @@ crate::any_estimator! {
 #[pyclass(name = "TruncatedSVD")]
 pub struct PyTruncatedSVD {
     inner: AnyTruncatedSvd,
+}
+
+impl PyTruncatedSVD {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyTruncatedSvd::Unfit { n_components: 2 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyTruncatedSvd::Unfit { .. })
+    }
 }
 
 #[pymethods]

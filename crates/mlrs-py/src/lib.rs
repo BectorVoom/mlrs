@@ -128,8 +128,30 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         )));
     }
 
-    // The driver is present: register the low-level surface. Estimator
-    // `#[pyclass]`es are added in Plan 03.
+    // The driver is present: register the low-level surface.
     m.add_function(wrap_pyfunction!(backend_supports_f64, m)?)?;
+
+    // Register all 12 estimator `#[pyclass]` wrappers (PY-01). The pure-Python
+    // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.
+    use estimators::cluster::{PyDBSCAN, PyKMeans};
+    use estimators::decomposition::{PyPCA, PyTruncatedSVD};
+    use estimators::linear::{
+        PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge,
+    };
+    use estimators::neighbors::{
+        PyKNeighborsClassifier, PyKNeighborsRegressor, PyNearestNeighbors,
+    };
+    m.add_class::<PyLinearRegression>()?;
+    m.add_class::<PyRidge>()?;
+    m.add_class::<PyLasso>()?;
+    m.add_class::<PyElasticNet>()?;
+    m.add_class::<PyLogisticRegression>()?;
+    m.add_class::<PyKMeans>()?;
+    m.add_class::<PyDBSCAN>()?;
+    m.add_class::<PyPCA>()?;
+    m.add_class::<PyTruncatedSVD>()?;
+    m.add_class::<PyNearestNeighbors>()?;
+    m.add_class::<PyKNeighborsClassifier>()?;
+    m.add_class::<PyKNeighborsRegressor>()?;
     Ok(())
 }

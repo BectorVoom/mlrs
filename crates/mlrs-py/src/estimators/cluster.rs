@@ -36,6 +36,19 @@ pub struct PyKMeans {
     inner: AnyKMeans,
 }
 
+impl PyKMeans {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyKMeans::Unfit { n_clusters: 8, seed: DEFAULT_SEED, max_iter: 300, tol: 1e-4 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyKMeans::Unfit { .. })
+    }
+}
+
 #[pymethods]
 impl PyKMeans {
     /// `KMeans(n_clusters=8, max_iter=300, tol=1e-4, random_state=None)`. The
@@ -166,6 +179,19 @@ crate::any_estimator! {
 #[pyclass(name = "DBSCAN")]
 pub struct PyDBSCAN {
     inner: AnyDbscan,
+}
+
+impl PyDBSCAN {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self { inner: AnyDbscan::Unfit { eps: 0.5, min_samples: 5 } }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyDbscan::Unfit { .. })
+    }
 }
 
 #[pymethods]
