@@ -376,12 +376,16 @@ where
 
     let mut rng = SplitMix64::new(seed);
     let mut chosen: Vec<usize> = Vec::with_capacity(k);
+    // WR-05: O(1) membership test (avoids the O(k·n) repeated `chosen.contains`)
+    // AND lets the degenerate fallback return a typed error instead of `expect`.
+    let mut is_chosen: Vec<bool> = vec![false; n];
 
     // Center 0: UNBIASED uniform over 0..n (host PRNG, not device). A plain
     // `next_u64() % n` is biased for `n` not a power of two (CR-02); use
     // rejection sampling so every index is equally likely.
     let first = rng.next_below(n as u64) as usize;
     chosen.push(first);
+    is_chosen[first] = true;
 
     // Read the samples once to the host so we can build the running per-sample
     // min-D² as centers are added; the per-step D² to the NEW center is computed
@@ -401,10 +405,22 @@ where
         let next = if total <= 0.0 {
             // All remaining samples coincide with a chosen center (degenerate /
             // duplicate data): fall back to the first not-yet-chosen index so we
-            // still return k DISTINCT centers.
-            (0..n)
-                .find(|i| !chosen.contains(i))
-                .expect("k <= n guarantees an unused index remains")
+            // still return k DISTINCT centers. WR-05: the `chosen.len() < k <= n`
+            // invariant normally guarantees an unused index, but a future caller
+            // (e.g. k == n on all-duplicate data where every index is already
+            // chosen) could violate it — return a typed error, never panic across
+            // the boundary.
+            match (0..n).find(|&i| !is_chosen[i]) {
+                Some(i) => i,
+                None => {
+                    return Err(PrimError::ShapeMismatch {
+                        operand: "k",
+                        rows: 1,
+                        cols: k,
+                        len: n,
+                    });
+                }
+            }
         } else {
             let target = rng.next_f64() * total;
             let mut acc = 0.0_f64;
@@ -427,15 +443,14 @@ where
             }
             // Guard against re-picking an already-chosen index (possible only via
             // a zero-weight rounding edge): walk forward to the next unused one.
-            if chosen.contains(&pick) {
-                (0..n)
-                    .find(|i| !chosen.contains(i))
-                    .unwrap_or(pick)
+            if is_chosen[pick] {
+                (0..n).find(|&i| !is_chosen[i]).unwrap_or(pick)
             } else {
                 pick
             }
         };
         chosen.push(next);
+        is_chosen[next] = true;
 
         // Update the running min-D²: each sample's nearest distance is the min of
         // its current nearest and its distance to the NEW center (device-computed
