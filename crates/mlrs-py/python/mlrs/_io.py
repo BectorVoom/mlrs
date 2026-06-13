@@ -135,16 +135,35 @@ def to_output(buf, shape, output_type, dtype):
     """Wrap a host buffer ``buf`` into the resolved ``output_type`` (D-03 / D-06).
 
     ``buf`` is a flat python list / 1-D sequence of host values; ``shape`` is the
-    target numpy shape (``(rows,)`` for vectors, ``(rows, cols)`` for matrices).
-    Integer labels/indices materialize as ``int32`` (D-06); floats keep ``dtype``.
-    For ``"pyarrow"`` egress a 1-D arrow array is returned (matrices are returned
-    as a flat arrow array — the row-major contract the caller documents).
+    target numpy shape (``(rows,)`` for vectors, ``(rows, cols)`` for matrices;
+    one axis may be ``-1`` for caller-inferred dims). Integer labels/indices
+    materialize as ``int32`` (D-06); floats keep ``dtype``.
+
+    The host buffer is reshaped to ``shape`` FIRST so the geometry the egress
+    contract carries (``egress.rs`` ``FloatResult`` ``(rows, cols)``) is honored
+    on every path. For ``"numpy"`` the shaped array is returned directly. For
+    ``"pyarrow"`` a 1-D arrow array is returned for genuine vectors (``ndim == 1``
+    or a ``(rows, 1)`` single-column result); a genuine 2-D matrix (``ndim > 1``
+    with more than one column) CANNOT be faithfully represented as a 1-D columnar
+    pyarrow ``Array``, so this raises ``ValueError`` rather than silently
+    flattening it (CR-01 - D-03 narrowed-set; request ``output_type='numpy'``).
     """
     np_dtype = np.dtype(dtype)
     flat = np.asarray(buf, dtype=np_dtype)
+    arr = flat.reshape(shape)
     if output_type == _PYARROW:
-        return pa.array(flat.ravel(order="C"))
-    return flat.reshape(shape)
+        # pyarrow Array is 1-D / columnar; a matrix has no faithful 1-D form.
+        # A (rows, 1) single-column result IS a vector and ravels safely; any
+        # other 2-D shape is a genuine matrix - refuse to flatten it so a
+        # predict_proba / transform / kneighbors result is never silently
+        # corrupted into a flat array of lost geometry (CR-01).
+        if arr.ndim > 1 and arr.shape[1] != 1:
+            raise ValueError(
+                "mlrs: pyarrow output_type is unsupported for 2-D results "
+                f"(shape {arr.shape}); request output_type='numpy'."
+            )
+        return pa.array(arr.ravel(order="C"))
+    return arr
 
 
 def _arrow_float_type(dtype):
