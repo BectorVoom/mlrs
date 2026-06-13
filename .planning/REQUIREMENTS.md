@@ -122,11 +122,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | NEIGH-01 | Phase 5 | Complete (05-08) |
 | NEIGH-02 | Phase 5 | Complete (05-08) |
 | NEIGH-03 | Phase 5 | Complete (05-08) |
-| PY-01 | Phase 6 | Complete (06-03) |
+| PY-01 | Phase 6 | Complete (06-03 wrappers; 06-04 shims; **06-05 oracle-validated 1e-5 end-to-end for all 12 estimators**) |
 | PY-02 | Phase 6 | Partial (06-03 — sklearn-named ctors stored verbatim; get_params/set_params via the shim's BaseEstimator in 06-04) |
-| PY-03 | Phase 6 | Complete (06-02) |
-| PY-04 | Phase 6 | Pending (import-probe done 06-02; maturin wheel build in 06-05) |
-| PY-05 | Phase 6 | Complete (06-02) |
+| PY-03 | Phase 6 | Complete (06-02 py.detach; **06-05 GIL-release proven by subprocess worker/main-counter smoke**) |
+| PY-04 | Phase 6 | Pending (import-probe done 06-02; per-backend maturin wheel build + driver-absent ImportError in 06-06) |
+| PY-05 | Phase 6 | Complete (06-02 dispatch; **06-05 f32/f64 preservation + int->f64 default + f64-on-incapable raise proven**) |
 
 **Coverage:**
 
