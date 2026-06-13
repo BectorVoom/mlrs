@@ -190,7 +190,13 @@ Plans:
   3. NumPy/Arrow inputs cross the boundary via the Arrow PyCapsule interface with correct ownership/lifetime handling (no bare `&[u8]` borrows into Python-owned buffers), and `Python::allow_threads` releases the GIL around device compute.
   4. Per-backend wheels build via `maturin build --features <backend>` under distinct distribution names (`mlrs-cpu`, `mlrs-wgpu`, `mlrs-cuda`, `mlrs-rocm`) with `abi3-py312`; importing a wheel whose driver is absent fails with a clear error.
 
-**Plans**: TBD
+**Plans**: 6 plans
+- [ ] 06-01-PLAN.md — Wave-0 scaffold: pyo3 0.28 ABI pin, 4 per-backend pyproject templates, pure-Python mlrs package skeleton, pytest scaffold, arrow FromPyArrow symbol
+- [ ] 06-02-PLAN.md — Core Rust plumbing: PyCapsule ingress (reuse validate bridge), egress, capability guard, dtype-dispatch macro, GIL release, catch_unwind import probe, global pool
+- [ ] 06-03-PLAN.md — 12 #[pyclass] estimator wrappers (linear/cluster/decomposition/neighbors) + module registration
+- [ ] 06-04-PLAN.md — Pure-Python sklearn shim: base/_io + 12 estimator classes (mixins, get_params/set_params, output_type), test_params
+- [ ] 06-05-PLAN.md — Oracle pytest harness (1e-5 full-path, sign-flip/label-perm/gauge-fixed-proba) + f32/f64 dispatch + GIL-release tests
+- [ ] 06-06-PLAN.md — estimator_checks triage + four wheel builds (distinct dist names, abi3-py312) + driver-absent ImportError
 **Research flag**: Maturin per-feature distribution naming may need a small build-system spike — the multi-distribution pattern is undocumented in maturin's first-party docs. Otherwise standard patterns.
 
 ## Progress
@@ -205,4 +211,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
 | 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
 | 5. Distance-Based & Iterative-Solver Estimators | 7/11 | In progress | - |
-| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/TBD | Not started | - |
+| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/6 | Not started | - |
