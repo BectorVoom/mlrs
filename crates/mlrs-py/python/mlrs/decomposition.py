@@ -25,16 +25,18 @@ class PCA(TransformerMixin, MlrsBase):
         obj = self._ext().PCA(self.n_components)
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     def transform(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("transform")(xa, rows, cols)
         return self._to_output(
             out, (rows, self.n_components), X, self._np_float()
         )
 
     def inverse_transform(self, Z):
+        self._check_fitted()
         za, rows, k = self._normalize(Z, dtype=self._np_float())
         out = self._suffixed("inverse_transform")(za, rows, k)
         return self._to_output(out, (rows, -1), Z, self._np_float())
@@ -83,10 +85,11 @@ class TruncatedSVD(TransformerMixin, MlrsBase):
         obj = self._ext().TruncatedSVD(self.n_components)
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     def transform(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("transform")(xa, rows, cols)
         return self._to_output(
             out, (rows, self.n_components), X, self._np_float()

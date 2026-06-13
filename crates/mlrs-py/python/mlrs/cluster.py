@@ -43,11 +43,11 @@ class KMeans(ClusterMixin, MlrsBase):
         )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
-        self._check_fitted()
+        xa, rows, cols = self._check_predict_X(X)
         out = self._mlrs_obj.predict_labels(xa, rows, cols)
         return self._to_output(out, (rows,), X, np.int32)
 
@@ -82,6 +82,7 @@ class DBSCAN(ClusterMixin, MlrsBase):
         obj = self._ext().DBSCAN(self.eps, self.min_samples)
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     @property

@@ -30,10 +30,11 @@ class LinearRegression(RegressorMixin, MlrsBase):
         obj = self._ext().LinearRegression(self.fit_intercept)
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("predict")(xa, rows, cols)
         return self._to_output(out, (rows,), X, self._np_float())
 
@@ -67,10 +68,11 @@ class Ridge(RegressorMixin, MlrsBase):
         obj = self._ext().Ridge(self.alpha, self.fit_intercept)
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("predict")(xa, rows, cols)
         return self._to_output(out, (rows,), X, self._np_float())
 
@@ -111,10 +113,11 @@ class Lasso(RegressorMixin, MlrsBase):
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("predict")(xa, rows, cols)
         return self._to_output(out, (rows,), X, self._np_float())
 
@@ -161,10 +164,11 @@ class ElasticNet(RegressorMixin, MlrsBase):
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("predict")(xa, rows, cols)
         return self._to_output(out, (rows,), X, self._np_float())
 
@@ -209,18 +213,18 @@ class LogisticRegression(ClassifierMixin, MlrsBase):
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
+        self._post_fit(cols)
         # classes_ exposed as int32 labels 0..n_classes-1 (v1 contiguous labels).
         self.classes_ = np.arange(obj.n_classes(), dtype=np.int32)
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
-        self._check_fitted()
+        xa, rows, cols = self._check_predict_X(X)
         out = self._mlrs_obj.predict_labels(xa, rows, cols)
         return self._to_output(out, (rows,), X, np.int32)
 
     def predict_proba(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("predict_proba")(xa, rows, cols)
         n_classes = self._mlrs_obj.n_classes()
         return self._to_output(out, (rows, n_classes), X, self._np_float())

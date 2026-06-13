@@ -36,7 +36,7 @@ class NearestNeighbors(MlrsBase):
                 "mlrs NearestNeighbors.kneighbors requires X (v1)"
             )
         k = self.n_neighbors if n_neighbors is None else n_neighbors
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         dist, idx = getattr(self._mlrs_obj, "kneighbors" + self._suffix())(
             xa, rows, cols, k
         )
@@ -65,13 +65,12 @@ class KNeighborsClassifier(ClassifierMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
-        self._check_fitted()
+        xa, rows, cols = self._check_predict_X(X)
         out = self._mlrs_obj.predict_labels(xa, rows, cols)
         return self._to_output(out, (rows,), X, np.int32)
 
     def predict_proba(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("predict_proba")(xa, rows, cols)
         n_classes = self._mlrs_obj.n_classes()
         return self._to_output(out, (rows, n_classes), X, self._np_float())
@@ -98,6 +97,6 @@ class KNeighborsRegressor(RegressorMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._normalize(X, dtype=self._np_float())
+        xa, rows, cols = self._check_predict_X(X)
         out = self._suffixed("predict")(xa, rows, cols)
         return self._to_output(out, (rows,), X, self._np_float())

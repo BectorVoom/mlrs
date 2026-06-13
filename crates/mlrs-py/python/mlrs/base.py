@@ -51,6 +51,38 @@ class MlrsBase(BaseEstimator):
         """1-D target ``y`` -> a fresh-contiguous pyarrow float array."""
         return _io.normalize_y(y, dtype=dtype)
 
+    def _check_predict_X(self, X, dtype=None):
+        """Fitted-guard + feature-count guard for a predict/transform input.
+
+        Runs BEFORE any ``_mlrs`` accessor touch so the sklearn contract holds:
+
+          * raises ``NotFittedError`` if ``fit`` has not run (``check_is_fitted``
+            keys on ``n_features_in_`` / ``_mlrs_obj``) — fixes
+            ``check_estimators_unfitted``. The per-method ``_normalize(X, dtype=
+            self._np_float())`` previously touched ``self._mlrs_obj.dtype()``
+            FIRST, raising ``AttributeError`` instead of ``NotFittedError`` on an
+            unfitted estimator;
+          * raises ``ValueError`` if ``X`` has a different feature count than the
+            fitted ``n_features_in_`` — fixes ``check_n_features_in_after_fitting``
+            (the device call would otherwise error with a less-recognizable
+            shape message).
+
+        Returns ``(pyarrow array, rows, cols)`` from :meth:`_normalize` (with the
+        fitted dtype when ``dtype`` is omitted). Use this at the top of every
+        ``predict`` / ``transform`` / ``kneighbors``.
+        """
+        self._check_fitted()
+        if dtype is None:
+            dtype = self._np_float()
+        xa, rows, cols = self._normalize(X, dtype=dtype)
+        expected = getattr(self, "n_features_in_", None)
+        if expected is not None and cols != expected:
+            raise ValueError(
+                f"X has {cols} features, but {type(self).__name__} is "
+                f"expecting {expected} features as input."
+            )
+        return xa, rows, cols
+
     # -- egress (D-03) ----------------------------------------------------- #
 
     def _resolve_output_type(self, input_obj):
@@ -111,6 +143,19 @@ class MlrsBase(BaseEstimator):
         return getattr(self._mlrs_obj, base_name + suffix)
 
     # -- fitted-state contract (T-06-13) ----------------------------------- #
+
+    def _post_fit(self, n_features):
+        """Set the sklearn-standard ``n_features_in_`` fitted attribute.
+
+        Called by every subclass ``fit`` after the ``_mlrs`` handle is stored.
+        sklearn's ``check_n_features_in`` / ``check_n_features_in_after_fitting``
+        require a fitted estimator to expose ``n_features_in_``; setting it here
+        (a real trailing-underscore attribute, not a property) ALSO lets the
+        DEFAULT ``check_is_fitted`` scan succeed, which the estimator_checks
+        ``check_fit_check_is_fitted`` / ``check_estimators_unfitted`` exercise.
+        ``n_features`` is the ``cols`` returned by :meth:`_normalize`.
+        """
+        self.n_features_in_ = int(n_features)
 
     def _check_fitted(self):
         """Raise ``NotFittedError`` if ``fit`` has not run on this estimator.
