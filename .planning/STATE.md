@@ -26,18 +26,18 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 05 (distance-based-iterative-solver-estimators) — EXECUTING
-Plan: 7 of 11
+Plan: 10 of 11
 Status: Executing Phase 05
-Last activity: 2026-06-13 -- Phase 05 Plan 08 (KNN estimator family: NearestNeighbors/Classifier/Regressor, NEIGH-01/02/03) complete
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-08-SUMMARY.md
+Last activity: 2026-06-13 -- Phase 05 Plan 09 (Lasso + ElasticNet, shared CD helper, LINEAR-03/04) complete
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-09-SUMMARY.md
 
-Progress: [█████████░] 92% (4/6 phases; 29/31 plans)
+Progress: [█████████░] 94% (4/6 phases; 30/31 plans)
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 27
+- Total plans completed: 30
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -79,6 +79,7 @@ Progress: [█████████░] 92% (4/6 phases; 29/31 plans)
 | Phase 05 P06 | 18 | 3 tasks | 3 files |
 | Phase 05 P07 | 6 | 2 tasks | 5 files |
 | Phase 05 P08 | 18 | 2 tasks | 8 files |
+| Phase 05 P09 | 12 | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,9 @@ Progress: [█████████░] 92% (4/6 phases; 29/31 plans)
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [05-09]: Lasso + ElasticNet share ONE coordinate_descent::cd_fit host helper (D-03); Lasso = ElasticNet l1_ratio=1.0 (l2_reg=0, pure L1) — a true thin wrapper with no duplicate CD loop. The CD family is NOT unified with the 05-10 L-BFGS LogReg solver.
+- [05-09]: cd_fit maps user (alpha, l1_ratio) → sklearn un-normalized (l1_reg=α·l1_ratio·n, l2_reg=α·(1−l1_ratio)·n) (Pitfall 1, n-scaling load-bearing), centers X/y (D-13 ridge precedent), recovers unpenalized intercept = ȳ − x̄·coef; coef_/intercept_ match sklearn within 1e-5 incl. exact sparsity (cpu f32+f64).
 
 - [05-07]: KMeans.predict implements PredictLabels (i32 cluster ids), NOT Predict<F> (D-08); DBSCAN is non-transductive (Fit + fit_predict only, no predict).
 - [05-07]: KMeans centers compared up to the label permutation (best_mapping remaps fitted→sklearn cluster ids before centroid compare); inertia is permutation-invariant so compared directly (D-09).
@@ -172,6 +176,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-13T04:30:00.000Z
-Stopped at: Completed 05-08-PLAN.md (KNN estimator family, NEIGH-01/02/03)
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-06-SUMMARY.md
+Last session: 2026-06-13T05:00:00.000Z
+Stopped at: Completed 05-09-PLAN.md (Lasso + ElasticNet, shared CD helper, LINEAR-03/04)
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-09-SUMMARY.md
