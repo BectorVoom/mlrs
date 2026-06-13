@@ -53,7 +53,7 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 
 ### Python Surface
 
-- [ ] **PY-01**: All v1 estimators are exposed as PyO3 `#[pyclass]` objects with sklearn-compatible `fit`/`predict`/`transform`/`score` methods, `fit` returning `self`
+- [x] **PY-01**: All v1 estimators are exposed as PyO3 `#[pyclass]` objects with sklearn-compatible `fit`/`predict`/`transform`/`score` methods, `fit` returning `self`
 - [ ] **PY-02**: Estimators support `get_params`/`set_params` and constructor hyperparameters matching scikit-learn naming
 - [x] **PY-03**: NumPy / Arrow inputs cross the Python↔Rust boundary via the Arrow PyCapsule interface with correct ownership/lifetime handling and the GIL released during compute
 - [ ] **PY-04**: Per-backend Python wheels build via maturin under distinct distribution names (e.g. `mlrs-cpu`, `mlrs-wgpu`) so a user installs the package matching their backend; importing a wheel whose driver is absent fails with a clear error
@@ -122,8 +122,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | NEIGH-01 | Phase 5 | Complete (05-08) |
 | NEIGH-02 | Phase 5 | Complete (05-08) |
 | NEIGH-03 | Phase 5 | Complete (05-08) |
-| PY-01 | Phase 6 | Pending |
-| PY-02 | Phase 6 | Pending |
+| PY-01 | Phase 6 | Complete (06-03) |
+| PY-02 | Phase 6 | Partial (06-03 — sklearn-named ctors stored verbatim; get_params/set_params via the shim's BaseEstimator in 06-04) |
 | PY-03 | Phase 6 | Complete (06-02) |
 | PY-04 | Phase 6 | Pending (import-probe done 06-02; maturin wheel build in 06-05) |
 | PY-05 | Phase 6 | Complete (06-02) |

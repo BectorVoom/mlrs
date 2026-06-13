@@ -203,7 +203,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 06-03-PLAN.md — 12 #[pyclass] estimator wrappers (linear/cluster/decomposition/neighbors) + module registration
+- [x] 06-03-PLAN.md — 12 #[pyclass] estimator wrappers (linear/cluster/decomposition/neighbors) + module registration **[complete — all 12 mlrs-algos estimators wrapped as #[pyclass] on _mlrs (add_class=12, PY-01); each drives a macro-emitted Any<Name> Unfit/F32/F64 dispatch enum (D-06/PY-05) with sklearn-named #[new] ctors stored verbatim (PY-02; LogReg C→c, KMeans random_state→seed); every fit/predict/transform/kneighbors/predict_proba runs the device trait call inside py.detach (PY-03) with guard_f64()? before the F64 arm (D-04); dtype-suffixed accessors materialize host Vec<f32|f64|i32> (D-03); DBSCAN predict-less (D-08); pyclass_smoke_test constructs all 12 Unfit without an interpreter; 16 Rust tests green cpu, both cpu & cpu,extension-module compile]**
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -228,4 +228,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
 | 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
 | 5. Distance-Based & Iterative-Solver Estimators | 7/11 | In progress | - |
-| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 0/6 | Not started | - |
+| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 3/6 | In progress | - |
