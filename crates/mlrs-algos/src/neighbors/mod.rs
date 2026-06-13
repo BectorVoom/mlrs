@@ -20,4 +20,6 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+pub mod classifier;
 pub mod nearest;
+pub mod regressor;
