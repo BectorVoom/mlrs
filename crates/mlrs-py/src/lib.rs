@@ -10,6 +10,15 @@
 // `tests/allocator_test.rs` (FOUND-09: source/test separation).
 mod allocator;
 
+// The shared binding primitives the `#[pyclass]` wrappers (Plan 03) consume:
+// boundary error mapping, Arrow PyCapsule ingress, device→host egress, and the
+// f64-on-incapable-backend capability guard. The `#[pymodule] _mlrs` + global
+// pool + dtype-dispatch macro are added in this plan's Task 2.
+pub mod capability;
+pub mod egress;
+pub mod errors;
+pub mod ingress;
+
 /// Boundary errors use `anyhow` (D-10); this alias exercises the dependency
 /// until the full PyO3 surface lands in a later phase.
 pub type BoundaryResult<T> = anyhow::Result<T>;

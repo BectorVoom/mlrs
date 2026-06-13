@@ -19,4 +19,4 @@ dependencies = ["numpy>2.0.0", "pyarrow>=14", "scikit-learn>=1.6"]
 manifest-path = "crates/mlrs-py/Cargo.toml"
 module-name = "mlrs._mlrs"
 python-source = "crates/mlrs-py/python"
-features = ["cuda"]
+features = ["cuda", "extension-module"]

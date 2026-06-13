@@ -11,9 +11,23 @@ crate-type = ["cdylib", "rlib"]
 anyhow = { workspace = true }
 mimalloc = { workspace = true }
 
-# PyO3 0.28 (single linked ABI, see workspace pin). `extension-module` builds a
-# CPython extension; `abi3-py312` gives ONE wheel covering Python >=3.12 (D-09).
-pyo3 = { workspace = true, features = ["abi3-py312", "extension-module"] }
+# The dependency-free foundation crate — `BridgeError` lives here (D-07) and the
+# boundary error→PyErr mapping in `errors.rs` matches on it directly.
+mlrs-core = { path = "../mlrs-core" }
+
+# `Pod` bound for the device→host egress generic; bytemuck adds no pyo3 ABI.
+bytemuck = { workspace = true }
+
+# PyO3 0.28 (single linked ABI, see workspace pin). `abi3-py312` gives ONE wheel
+# covering Python >=3.12 (D-09). `extension-module` is NOT enabled here: it tells
+# the linker the CPython symbols are provided by the host interpreter at import
+# (so the wheel must NOT link libpython), which is correct for the maturin wheel
+# build but breaks `cargo test` (the test binary then has undefined `PyExc_*` /
+# `Py*` symbols at link). It is enabled instead via the crate's own
+# `extension-module` feature, which the per-backend maturin templates turn on;
+# `cargo test` leaves it off and links libpython through `pyo3/auto-initialize`
+# (a dev-dependency), so the Rust integration tests run a real interpreter.
+pyo3 = { workspace = true, features = ["abi3-py312"] }
 
 # Arrow with the `pyarrow` FFI feature — consumes the __arrow_c_array__ capsule
 # from Python pyarrow arrays (D-02 ingress, wired in Plan 02). This is what
@@ -24,6 +38,14 @@ arrow = { workspace = true, features = ["pyarrow"] }
 mlrs-algos = { path = "../mlrs-algos" }
 mlrs-backend = { path = "../mlrs-backend" }
 
+# Test-only: link a real CPython and initialize it so the Rust integration tests
+# (`tests/ingress_test.rs`, `tests/probe_test.rs`) can build/run without the
+# `extension-module` link mode. Not part of the wheel (maturin uses the lib, not
+# the test harness). `auto-initialize` pulls in libpython at link + spins up the
+# interpreter on first `Python::attach`.
+[dev-dependencies]
+pyo3 = { workspace = true, features = ["abi3-py312", "auto-initialize"] }
+
 # Backend selection forwards to the sub-crate features; exactly one is chosen at
 # wheel-build time via the per-backend pyproject `[tool.maturin].features`.
 # Do NOT add the `numpy` Rust crate here — it would drag a second pyo3 ABI.
@@ -32,3 +54,9 @@ cpu = ["mlrs-backend/cpu", "mlrs-algos/cpu"]
 wgpu = ["mlrs-backend/wgpu", "mlrs-algos/wgpu"]
 cuda = ["mlrs-backend/cuda", "mlrs-algos/cuda"]
 rocm = ["mlrs-backend/rocm", "mlrs-algos/rocm"]
+
+# Wheel-only: tells PyO3 the CPython symbols come from the host interpreter at
+# import (so the cdylib does NOT link libpython). The per-backend maturin
+# templates add this to their `features` list; `cargo test`/`cargo build` leave
+# it off so the binary can link libpython for the integration tests.
+extension-module = ["pyo3/extension-module"]
