@@ -17,7 +17,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 2: Core Compute Primitives** - GEMM, reductions, pairwise distance, covariance/XᵀX validated standalone on cpu+wgpu; D-10 build-failing memory gate green (completed 2026-06-12)
 - [x] **Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)** - GPU Jacobi SVD + symmetric eig, sign-flip oracle-validated, gates four estimators; D-11 build-failing memory gate (bounded Jacobi scratch + eig buffer reuse + no mid-sweep read-back) green on cpu+rocm (completed 2026-06-12)
 - [x] **Phase 4: Closed-Form Estimators** - LinearRegression, Ridge, PCA, TruncatedSVD assembled on validated primitives
-- [ ] **Phase 5: Distance-Based & Iterative-Solver Estimators** - KMeans, DBSCAN, KNN×3, Lasso, ElasticNet, LogisticRegression
+- [x] **Phase 5: Distance-Based & Iterative-Solver Estimators** - KMeans, DBSCAN, KNN×3, Lasso, ElasticNet, LogisticRegression
 - [ ] **Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels** - sklearn-compatible pyclass estimators, Arrow PyCapsule, maturin per-backend wheels
 
 ## Phase Details

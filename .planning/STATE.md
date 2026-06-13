@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 05-11-PLAN.md (iterative-solver + DBSCAN memory-gate reconciliation)
-last_updated: "2026-06-13T05:30:00.000Z"
-last_activity: 2026-06-13 -- Phase 05 Plan 11 (D-10 iterative-solver + D-04 DBSCAN memory gates) complete
+status: phase_complete
+stopped_at: Phase 05 complete & verified (11/11 plans; 2 review BLOCKERs + 5 warnings + 1 regression fixed; VERIFICATION pass)
+last_updated: "2026-06-13T07:00:00.000Z"
+last_activity: 2026-06-13 -- Phase 05 verified: 11/11 plans; code-review CR-01/CR-02/WR-01..04 + lbfgs_test regression fixed; all targeted oracles green cpu(f64) at HEAD c580805
 progress:
   total_phases: 6
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 32
   completed_plans: 32
   percent: 83
@@ -21,17 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 05 — distance-based-iterative-solver-estimators
+**Current focus:** Phase 05 complete & verified — next up Phase 06 (Python Surface — PyO3 & per-backend wheels)
 
 ## Current Position
 
-Phase: 05 (distance-based-iterative-solver-estimators) — ALL PLANS COMPLETE
-Plan: 11 of 11 (complete)
-Status: Phase 05 plans complete (11/11)
-Last activity: 2026-06-13 -- Phase 05 Plan 11 (D-10 iterative-solver + D-04 DBSCAN memory gates; full memory_gate suite 11/11 green cpu, rocm test target builds) complete
-Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-11-SUMMARY.md
+Phase: 05 (distance-based-iterative-solver-estimators) — COMPLETE & VERIFIED
+Plan: 11 of 11 (complete); code review fixed (CR-01/CR-02/WR-01..04 + lbfgs_test regression); VERIFICATION pass
+Status: Phase 05 verified — all 8 requirements (LINEAR-03/04/05, CLUSTER-01/02, NEIGH-01/02/03) satisfied
+Last activity: 2026-06-13 -- Phase 05 verified; targeted oracle suite (16 binaries) green cpu(f64) at HEAD c580805
+Resume file: .planning/phases/05-distance-based-iterative-solver-estimators/05-VERIFICATION.md
 
-Progress: [██████████] 100% (4/6 phases; 32/32 plans)
+Progress: [████████░░] 83% (5/6 phases; 32/32 plans planned-to-date)
+
+## Open Follow-ups (Phase 05)
+
+- CR-01 empty-cluster relocation is sklearn-exact at the prim level (lloyd_test) but the estimator-level KMeans oracle has balanced clusters that never empty — add an estimator-level empty-cluster fixture to close end-to-end coverage.
+- Deferred code-review items: WR-05/06/07 + INFO IN-01..05 remain in 05-REVIEW.md (run `/gsd-code-review 05 --fix` to address).
+- Security gate: phase has no SECURITY.md (security_enforcement=true) — run `/gsd-secure-phase 05` before milestone close if desired.
 
 ## Performance Metrics
 
