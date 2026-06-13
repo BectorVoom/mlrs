@@ -17,3 +17,5 @@
 //! scaffold), keeping the estimator plans file-disjoint and parallel-safe.
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
+
+pub mod kmeans;
