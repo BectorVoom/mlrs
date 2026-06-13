@@ -59,6 +59,9 @@ pub mod egress;
 pub mod errors;
 pub mod ingress;
 
+// The 12 estimator `#[pyclass]` wrappers (Plan 03). Registered on `_mlrs` below.
+pub mod estimators;
+
 /// Boundary errors use `anyhow` (D-10); this alias documents the boundary error
 /// convention the binding surface uses (mapped to `PyErr` in [`errors`]).
 pub type BoundaryResult<T> = anyhow::Result<T>;

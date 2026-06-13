@@ -56,6 +56,21 @@ pub fn algo_err_to_py(err: AlgoError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
+/// Build the canonical "estimator not fitted" `PyErr` the `#[pyclass]` wrappers
+/// raise when an output method / fitted-attribute accessor is called before
+/// `fit` (T-06-09).
+///
+/// Mirrors the algos-level [`AlgoError::NotFitted`] `Display` text so the Python
+/// shim sees a uniform message and re-raises it as
+/// `sklearn.exceptions.NotFittedError`. Surfaced as a `PyValueError` (the same
+/// class `algo_err_to_py` uses for a `NotFitted`), so the wrapper's own
+/// not-fitted path and the algos-level one are indistinguishable to the shim.
+pub fn not_fitted(estimator: &str, operation: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "{estimator} is not fitted yet: call `fit` before `{operation}`"
+    ))
+}
+
 /// Map an opaque boundary [`anyhow::Error`] to a `PyErr`.
 ///
 /// Used for the few failures that arrive as `anyhow` at the binding boundary
