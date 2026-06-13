@@ -1,326 +1,297 @@
 ---
 phase: 05-distance-based-iterative-solver-estimators
-reviewed: 2026-06-13T04:46:32Z
+reviewed: 2026-06-13T07:05:38Z
 depth: standard
-files_reviewed: 23
+files_reviewed: 41
 files_reviewed_list:
-  - crates/mlrs-algos/src/traits.rs
-  - crates/mlrs-algos/src/error.rs
-  - crates/mlrs-algos/src/cluster/mod.rs
-  - crates/mlrs-algos/src/cluster/kmeans.rs
   - crates/mlrs-algos/src/cluster/dbscan.rs
-  - crates/mlrs-algos/src/neighbors/mod.rs
-  - crates/mlrs-algos/src/neighbors/nearest.rs
-  - crates/mlrs-algos/src/neighbors/classifier.rs
-  - crates/mlrs-algos/src/neighbors/regressor.rs
+  - crates/mlrs-algos/src/cluster/kmeans.rs
+  - crates/mlrs-algos/src/cluster/mod.rs
+  - crates/mlrs-algos/src/error.rs
+  - crates/mlrs-algos/src/lib.rs
   - crates/mlrs-algos/src/linear/coordinate_descent.rs
   - crates/mlrs-algos/src/linear/lasso.rs
-  - crates/mlrs-algos/src/linear/elastic_net.rs
   - crates/mlrs-algos/src/linear/logistic.rs
-  - crates/mlrs-kernels/src/topk.rs
-  - crates/mlrs-kernels/src/kmeans.rs
-  - crates/mlrs-kernels/src/dbscan.rs
-  - crates/mlrs-kernels/src/coordinate.rs
-  - crates/mlrs-kernels/src/lbfgs.rs
-  - crates/mlrs-backend/src/prims/topk.rs
-  - crates/mlrs-backend/src/prims/kmeans.rs
-  - crates/mlrs-backend/src/prims/dbscan.rs
+  - crates/mlrs-algos/src/linear/mod.rs
+  - crates/mlrs-algos/src/neighbors/classifier.rs
+  - crates/mlrs-algos/src/neighbors/mod.rs
+  - crates/mlrs-algos/src/neighbors/nearest.rs
+  - crates/mlrs-algos/src/neighbors/regressor.rs
+  - crates/mlrs-algos/src/traits.rs
+  - crates/mlrs-algos/tests/dbscan_test.rs
+  - crates/mlrs-algos/tests/elastic_net_test.rs
+  - crates/mlrs-algos/tests/kmeans_test.rs
+  - crates/mlrs-algos/tests/knn_classifier_test.rs
+  - crates/mlrs-algos/tests/knn_regressor_test.rs
+  - crates/mlrs-algos/tests/lasso_test.rs
+  - crates/mlrs-algos/tests/logistic_test.rs
+  - crates/mlrs-algos/tests/nearest_neighbors_test.rs
   - crates/mlrs-backend/src/prims/coordinate_descent.rs
+  - crates/mlrs-backend/src/prims/dbscan.rs
+  - crates/mlrs-backend/src/prims/kmeans.rs
   - crates/mlrs-backend/src/prims/lbfgs.rs
+  - crates/mlrs-backend/src/prims/mod.rs
+  - crates/mlrs-backend/src/prims/topk.rs
+  - crates/mlrs-backend/tests/cd_test.rs
+  - crates/mlrs-backend/tests/dbscan_mask_test.rs
+  - crates/mlrs-backend/tests/kmeanspp_test.rs
+  - crates/mlrs-backend/tests/lbfgs_test.rs
+  - crates/mlrs-backend/tests/lloyd_test.rs
+  - crates/mlrs-backend/tests/memory_gate_test.rs
+  - crates/mlrs-backend/tests/topk_test.rs
+  - crates/mlrs-kernels/src/coordinate.rs
+  - crates/mlrs-kernels/src/dbscan.rs
+  - crates/mlrs-kernels/src/kmeans.rs
+  - crates/mlrs-kernels/src/lbfgs.rs
+  - crates/mlrs-kernels/src/lib.rs
+  - crates/mlrs-kernels/src/topk.rs
 findings:
-  critical: 2
+  critical: 3
   warning: 7
-  info: 5
+  info: 4
   total: 14
 status: issues_found
 ---
 
 # Phase 5: Code Review Report
 
-**Reviewed:** 2026-06-13T04:46:32Z
+**Reviewed:** 2026-06-13T07:05:38Z
 **Depth:** standard
-**Files Reviewed:** 23
+**Files Reviewed:** 41
 **Status:** issues_found
 
 ## Summary
 
-Reviewed the Phase-5 distance-based & iterative-solver estimator stack: the trait
-surface, the two clustering estimators (KMeans, DBSCAN), the three KNN estimators,
-the coordinate-descent linear models (Lasso/ElasticNet), LogisticRegression, and
-all five backing kernels + prim launch wrappers.
+Phase 5 adds the distance-based and iterative-solver estimators (KMeans, DBSCAN,
+KNN family, Lasso/ElasticNet, LogisticRegression) plus their supporting prims and
+kernels. The code is heavily annotated, the validate-before-launch discipline is
+applied consistently, and prior review tags (CR-01, CR-02, WR-01..WR-04) are
+visibly addressed. The hyperparameter guards (ASVS V5), u32-overflow guards
+(WR-03), and the index/class bounds checks in the KNN gather (WR-02) are genuine
+and well placed.
 
-The code is carefully written and unusually well-documented. The DBSCAN host DFS
-was verified line-by-line against `_dbscan_inner.pyx` (labels-on-pop, ascending
-neighbor push, LIFO) and matches sklearn exactly. The topk `select_k`
-selection-by-rank kernel was traced through duplicate-value and out-of-order cases
-and is correct. The CubeCL GATHER patterns are a deliberate cubecl-cpu constraint
-and were not treated as findings.
+The adversarial pass surfaces three correctness BLOCKERS, each on a code path the
+committed oracle fixtures never exercise (every fixture uses contiguous labels and
+well-separated blobs that never empty a cluster), plus a set of robustness/quality
+WARNINGS. The most serious is the KMeans empty-cluster relocation, which can drive
+a cluster count NEGATIVE and silently place a centroid at the origin — a wrong
+result, not the NaN the code claims to prevent.
 
-Two BLOCKERs surfaced, both correctness-affecting on edge inputs that fall inside
-the documented "matches sklearn within 1e-5" contract:
+This is an adversarial review: the goal was to find defects on untested paths, not
+to confirm the tested oracle paths pass. No `<structural_findings>` block was
+provided, so all findings below are narrative.
 
-1. The k-means++ first-center draw and the inner weighted draw use modulo-reduced
-   PRNG output, which (a) silently breaks the documented cross-backend
-   seed-reproducibility invariant on the boundary and (b) the weighted-draw cumulative
-   scan can index a wrong sample under FP rounding, both of which can shift the final
-   partition past the oracle's label-permutation tolerance.
-2. `lloyd_update`'s empty-cluster relocation does not reproduce sklearn's relocation
-   target, so any fit that hits an empty cluster diverges from the oracle — and the
-   code self-documents this as an approximation.
-
-The remaining findings are robustness gaps (panics on edge inputs, an `.expect()`
-inside the L-BFGS inner loop, an unvalidated label space) and doc/quality defects.
+## Narrative Findings (AI reviewer)
 
 ## Critical Issues
 
-### CR-01: `lloyd_update` empty-cluster relocation diverges from sklearn
+### CR-01: KMeans empty-cluster relocation can drive a donor count negative and silently zero a centroid
 
-**File:** `crates/mlrs-backend/src/prims/kmeans.rs:150-198`
-**Issue:** The relocation comment itself admits the implementation does NOT match
-sklearn: sklearn's `_relocate_empty_clusters` moves an empty cluster to the point
-with the largest squared distance **to its own currently-assigned center**, and it
-selects those points from the global per-sample distance-to-assigned-center array
-(the same array used for inertia), removing the relocated point's contribution and
-decrementing the donor cluster. This code instead relocates to "the sample with the
-max squared distance to the nearest **non-empty new** center," with a per-empty
-`used[]` exclusion that has no sklearn analogue. For any dataset/init that produces
-an empty cluster during Lloyd (common with k-means++ on clustered data or small n),
-the resulting `cluster_centers_` / `labels_` / `inertia_` will not match the sklearn
-oracle even up to a label permutation — violating the core 1e-5 contract. The
-estimator (`kmeans.rs`) runs `with_init` for the deterministic oracle precisely so
-both sides run identical Lloyd; this relocation rule breaks that equivalence the
-moment a cluster empties.
-
-**Fix:** Reproduce sklearn's rule exactly. The relocation needs the per-sample
-squared distance to the *assigned* center (already computed by `inertia_rows`) and
-the old assignment, so the relocation must be lifted into the estimator's Lloyd loop
-(where labels + the previous centers are available) rather than living inside the
-stateless prim. Concretely, mirror `_relocate_empty_clusters_dense`:
-
-```text
-# after computing new sums/counts, before dividing:
-empty   = [c for c in 0..k if counts[c] == 0]
-far_idx = argsort(dist_to_assigned_center)[::-1][:len(empty)]   # global ranking
-for c, i in zip(empty, far_idx):
-    old = labels[i]
-    centers[c] = X[i]
-    counts[c]  += 1
-    counts[old] -= 1     # donor loses the point
-    # (sklearn also fixes the running sums; recompute affected rows)
-```
-Until the prim is given the assigned-center distances + old labels, it cannot
-reproduce sklearn and should not silently approximate.
-
-### CR-02: k-means++ host draw has modulo bias and an FP-rounding mis-pick that break seed-reproducibility and can shift the partition
-
-**File:** `crates/mlrs-backend/src/prims/kmeans.rs:321, 347-366`
-**Issue:** Two distinct defects in the documented-seeded k-means++ sampler:
-
-1. Line 321: `let first = (rng.next_u64() % n as u64) as usize;` — modulo reduction
-   of a 64-bit value is biased for `n` not a power of two and, more importantly, is
-   NOT the reduction sklearn uses (`sample_int = rng.randint(n)` over its own MT19937
-   stream). The module docstring promises "the same `seed` yields the SAME indices
-   across runs and backends" as a correctness invariant, but this draw is neither
-   sklearn-equivalent nor even unbiased. Because the *first* center seeds the entire
-   greedy D²-weighted chain, a different first index produces a different final
-   partition — which can exceed the oracle's label-permutation tolerance.
-
-2. Lines 347-366: the weighted draw does `target = rng.next_f64() * total` then a
-   forward cumulative scan picking the first `i` with `acc >= target`. Under f64
-   rounding the accumulated `acc` can fall a few ULP short of `total` on the last
-   element, so when `target` rounds to essentially `total` the loop never triggers
-   `acc >= target` and falls through to the initializer `pick = n - 1` — silently
-   selecting the last sample regardless of its weight (and `n-1` may even be an
-   already-chosen, zero-weight index, then "repaired" to an arbitrary unused index).
-   This is a wrong-sample selection, not just a tie-break nicety.
-
-**Fix:** For (1), if the goal is sklearn agreement the only robust path is to INJECT
-the init for the oracle (which `KMeans::with_init` already supports) and treat the
-internal sampler as best-effort; but then the "reproducible across backends" claim
-must be downgraded in the docs, OR replace the draw with an unbiased
-rejection-sampled `randint` and document that it is mlrs-specific, not
-sklearn-bit-identical. For (2), clamp the scan so it cannot fall through:
+**File:** `crates/mlrs-backend/src/prims/kmeans.rs:184-209`
+**Issue:** The relocation loop ranks ALL `n` samples by distance-to-assigned-center
+descending and hands the top `n_empty` to the empty clusters, decrementing each
+donor:
 
 ```rust
-let target = rng.next_f64() * total;
-let mut acc = 0.0_f64;
-let mut pick = n - 1;            // only used if EVERY weight is 0, already guarded by total<=0
-for (i, &w) in min_d2.iter().enumerate() {
-    acc += w;
-    if acc >= target { pick = i; break; }
-}
-// guarantee `pick` has positive weight (rounding can land past the last positive bin):
-if min_d2[pick] <= 0.0 {
-    pick = min_d2.iter().rposition(|&w| w > 0.0).unwrap_or(pick);
+for (rank, &c) in empties.iter().enumerate() {
+    let i = order[rank];
+    let donor = labels[i] as usize;
+    ...
+    counts_i64[c] += 1;
+    counts_i64[donor] -= 1;
 }
 ```
+
+Nothing prevents two of the chosen farthest points (`order[0]`, `order[1]`, …)
+from sharing the SAME donor cluster, nor from draining a donor that has only one
+member. sklearn's `_relocate_empty_clusters_dense` guards against exactly this: it
+never relocates a point whose donor would be emptied. Here a donor with
+`count == 1` that loses its single point lands at `counts_i64[donor] == 0`, and a
+donor that is the donor for two relocations lands at `-1`. The finalize loop then
+does `if counts_i64[c] > 0 { ... }` and otherwise leaves `centers[c]` at the
+origin. So the documented "guard anyway: a 0 count leaves the center at the origin
+rather than a NaN" produces a WRONG centroid (the origin) instead of the correct
+mean — a silent correctness failure, not the NaN-avoidance it claims. A `-1` count
+on a cluster that later regains points makes `inv = 1.0 / counts_i64[c]` negative.
+The KMeans fixture is 3 well-separated blobs that never empties a cluster, so this
+entire path is untested.
+**Fix:** Mirror sklearn: when selecting farthest points to relocate, skip any
+candidate whose donor cluster currently has `count <= 1` (advance to the next
+farthest), track relocated points so none is reused, and surface a typed
+`PrimError` if no valid donor remains — never leave a center at the origin.
+
+### CR-02: LogisticRegression infers `n_classes` from `max(label)+1`, mislabeling non-contiguous targets and risking an OOB device read
+
+**File:** `crates/mlrs-algos/src/linear/logistic.rs:217-232`
+**Issue:** Class count is `n_classes = ((max_label + 1) as usize).max(2)`. This is
+wrong in two provable ways:
+
+1. **Non-contiguous labels.** Training labels `{0, 2}` (class 1 absent — a legal
+   sklearn input that remaps to `classes_ = [0, 2]`, K=2) yield `max_label = 2 →
+   n_classes = 3`. A phantom never-trained class 1 is fit, and `predict_labels`
+   can return `1` (a class that does not exist). sklearn returns the original id
+   `2`.
+2. **Single-class input.** All labels `= 0` gives `max_label = 0`, then `.max(2)`
+   forces `n_classes = 2`, fitting a binary model on a degenerate one-class
+   problem instead of rejecting it (sklearn raises "needs at least 2 classes").
+
+Worse, the softmax kernel (`crates/mlrs-kernels/src/lbfgs.rs:138`,
+`yi = u32::cast_from(y[i])`) trusts `yi < k_classes` and indexes `w[yi*d ..]`. If
+the K computed here is ever smaller than `max_label + 1` (e.g. a future change, or
+a label set whose distinct count differs from `max+1`), that is an out-of-bounds
+device read of the weight buffer — the validate-before-launch contract is
+defeated because K is derived from the wrong quantity. The fixture only uses
+contiguous `0..K`, so this is untested.
+**Fix:** Collect distinct sorted labels, remap to a dense `[0, n_classes)` index
+(store the `classes_` map for the `predict_labels` inverse), reject `n_distinct <
+2` with a typed error, and set `n_classes = n_distinct`. The kernel must only see
+remapped indices.
+
+### CR-03: KNeighborsClassifier `n_classes` uses train `max+1`; a label gap returns a non-existent class id
+
+**File:** `crates/mlrs-algos/src/neighbors/classifier.rs:142-164` (guard at 219-228)
+**Issue:** `n_classes_ = max(y_class) + 1` over the TRAIN labels. With
+non-contiguous labels (e.g. `{0, 2}`), `n_classes_ = 3` allocates a 3-wide proba
+row whose column 1 is structurally always zero; `argmax_rows` over `[0, 3)` can
+return class id `1`, which never existed in training. sklearn maps neighbor votes
+through `classes_ = [0, 2]` and returns `2`. The WR-02 guard at line 221
+(`class as usize >= n_classes`) only catches ids `>= max+1`, not the GAP at id 1,
+so the wrong label passes silently. The committed KNN fixture draws `y_class` from
+`rng.integers(0, KNN_N_CLASSES)`, contiguous by luck, so the gap case is untested.
+**Fix:** Build `classes_` as the distinct sorted training labels, index proba
+columns by dense class position, and map the final argmax column back through
+`classes_` so a non-contiguous set returns the correct original id. Do not infer
+width from `max+1`.
 
 ## Warnings
 
-### WR-01: `softmax_loss_grad` failure panics inside the L-BFGS inner loop
+### WR-01: `lbfgs_minimize` reports a line-search breakdown as a successful (non-`NotConverged`) result
 
-**File:** `crates/mlrs-algos/src/linear/logistic.rs:266`
-**Issue:** The objective closure calls
-`softmax_loss_grad(..).expect("softmax_loss_grad geometry validated before launch")`.
-The closure is invoked on every L-BFGS iteration AND multiple times per line-search
-step. Any `PrimError` from the prim (e.g. a future allocator/launch failure, or a
-geometry assumption that does not hold for a degenerate `k`) becomes a hard panic
-that unwinds through the solver, instead of the typed `AlgoError` the rest of the
-estimator surface returns. A panicking library call across the PyO3 boundary (Phase
-6) is a crash, not a recoverable error.
+**File:** `crates/mlrs-backend/src/prims/lbfgs.rs:205-213, 248-253`; consumer at `crates/mlrs-algos/src/linear/logistic.rs:331-337`
+**Issue:** When `line_search_wolfe` returns `None`, the solver `break`s with the
+current `converged` flag (usually `false`) and `iters < maxiter`. The LogReg
+estimator only surfaces `NotConverged` when `result.iters >= maxiter &&
+!result.converged`, and its own comment explicitly ACCEPTS "early stop `iters <
+maxiter`" as converged (Pitfall 5). So a genuine line-search breakdown at a
+NON-stationary point (e.g. a NaN/degenerate gradient) is reported to the caller as
+success, yielding a non-minimizer with no error. This is a different stop reason
+than the legitimate ftol stall but is indistinguishable in `LbfgsResult`.
+**Fix:** Add a `stop_reason` (Converged / FtolStall / LineSearchFailed / MaxIter)
+to `LbfgsResult`; the estimator must surface `NotConverged` on `LineSearchFailed`
+regardless of `iters`.
 
-**Fix:** Make the closure fallible and thread the error out. Either have the closure
-capture a `Result` slot and return a sentinel large loss + zero grad on error (then
-check the slot after `lbfgs_minimize`), or change `lbfgs_minimize`'s closure bound to
-`FnMut(&[f64]) -> Result<(f64, Vec<f64>), PrimError>` and propagate with `?`.
+### WR-02: LogReg objective closure leaks pool buffers on a panic between acquire and release
 
-### WR-02: KNN `predict_proba` / regressor `predict` panic on empty training labels and index gather is unchecked at runtime
+**File:** `crates/mlrs-algos/src/linear/logistic.rs:276-301`
+**Issue:** The closure acquires `w_d`/`b_d` from `pool` (lines 276-277) and
+releases them at 282-283, but the release is NOT panic-safe: it sits after the
+fallible `softmax_loss_grad` call and is only reached on the normal path. A true
+panic (a kernel-launch assertion, or an `unreachable!` in a bit-cast for a
+non-f32/f64 `F`) between acquire and release strands both device handles for the
+process lifetime. The WR-01-tagged error capture only handles `Result::Err`, not
+unwinding.
+**Fix:** Release via an RAII guard whose `Drop` returns the handles, or scope the
+acquisitions so a panic cannot strand them.
 
-**File:** `crates/mlrs-algos/src/neighbors/classifier.rs:205-209`, `crates/mlrs-algos/src/neighbors/regressor.rs:160-161`
-**Issue:** `y_class[train_idx]` / `y_reg[train_idx]` index host vectors with
-`idx_host[q*k+j] as usize`, and the bounds check is only a `debug_assert!`
-(classifier) or absent (regressor). In release builds a corrupted/oversized index
-from `top_k` (or a `k`/`n_train` mismatch slipping past validation) is an unchecked
-panic or, worse, a silent wrong read. The classifier's `class as usize` slot write
-into `proba` is likewise only `debug_assert`-guarded, so an out-of-range class id
-(possible if test labels exceed train `max+1`) writes out of bounds in debug and is
-UB-adjacent in release if it ever fires.
+### WR-03: KMeans never surfaces non-convergence and silences it via a `tol_scaled` that can be exactly zero
 
-**Fix:** Promote the `debug_assert!`s to real bounds checks that return
-`AlgoError::Prim(PrimError::ShapeMismatch{..})`, or document and enforce the
-invariant that `top_k` indices are always `< n_train` and class ids `< n_classes`
-with a runtime guard at the gather site.
+**File:** `crates/mlrs-algos/src/cluster/kmeans.rs:256-348`
+**Issue:** For a constant-feature design (every column identical) the mean feature
+variance is 0, so `tol_scaled = tol · 0 = 0`. The Lloyd loop can then only stop on
+the strict label-equality break or `max_iter`; under f32 centroid jitter the
+strict break may never fire, so the loop silently exhausts `max_iter` and returns
+a non-converged fit with NO `NotConverged` (KMeans has no convergence error path
+at all, unlike Lasso/LogReg). Also note `tol_scaled` is computed in an O(n·d) host
+double-pass over the full materialized `x_host`, contradicting the "heavy work
+stays on-device" docstring.
+**Fix:** Decide and document KMeans's non-convergence contract (sklearn warns), and
+add a constant-feature regression test; if matching sklearn's `tol == 0`
+semantics, keep the zero but cover it.
 
-### WR-03: `KMeans::assign` casts `usize` n/k/d into kernel `u32` with no overflow guard, and `predict_labels` recomputes instead of reusing fitted labels
+### WR-04: DBSCAN adjacency is materialized as `n × n` `u32` then duplicated as `n × n` `bool` — 5× the bitmask footprint, both held live
 
-**File:** `crates/mlrs-algos/src/cluster/kmeans.rs:178-192, 382`
-**Issue:** Two issues. (a) The prim layer casts `n as u32`, `k as u32`, `d as u32`
-throughout (kmeans/dbscan/cd/lbfgs prims) with no check that the value fits in
-`u32`. For the n²-DBSCAN and n×k distance paths a large-but-legal `usize` silently
-truncates to a wrong `u32` launch geometry → out-of-bounds device reads. This is the
-exact class of "untrusted geometry becomes OOB device read" the validation comments
-claim to prevent, but the cast is unguarded. (b) `predict_labels` re-runs the full
-distance+argmin against the fitted centers even when called with the training matrix;
-not a bug, but note it can produce labels that differ from the stored `labels_` if
-the final post-Lloyd assignment pass and a fresh assign tie-break differently — they
-should be identical, so any divergence is a latent bug worth a test.
+**File:** `crates/mlrs-backend/src/prims/dbscan.rs:115-168`; `crates/mlrs-kernels/src/dbscan.rs:78-83`
+**Issue:** The kernel writes the adjacency as `u32` (`0`/`1`), the host reads it
+into `adj_u32` (line 155), then maps it to a second full `Vec<bool>` `adjacency`
+(line 168) while `adj_u32` is still alive. For the documented DoS surface
+(T-05-04-02, "large `n` drives the n² allocation") this is 4× the memory a bitmask
+needs on-device plus a redundant host copy, halving the `n` at which the prim OOMs
+versus what the module's own "bounded, accepted" framing implies.
+**Fix:** Keep one representation (e.g. test `adj_u32[..] != 0` inside
+`neighbors()`), or pack into a bitset; do not hold both `adj_u32` and `adjacency`.
 
-**Fix:** Add a `usize → u32` guard in each prim's validate step
-(`if n > u32::MAX as usize { return Err(ShapeMismatch...) }`) for every dimension
-passed to a launch. Confirm with a test that `predict_labels(X_train)` equals the
-stored `labels_`.
+### WR-05: `kmeanspp_sample` degenerate fallback `expect`s rather than returning a typed error
 
-### WR-04: ElasticNet/Lasso recompute column centering and norms with two full host readbacks of X
+**File:** `crates/mlrs-backend/src/prims/kmeans.rs:359-365`
+**Issue:** When `total <= 0.0` the fallback is
+`(0..n).find(|i| !chosen.contains(i)).expect("k <= n guarantees an unused index")`.
+This panics if the `chosen.len() < k <= n` invariant is ever violated by a future
+caller (e.g. `k == n` on all-duplicate data where `chosen` already holds all `n`),
+violating the project's "typed error, never a panic across the boundary"
+convention echoed elsewhere in this phase. It is also O(k·n) via repeated
+`chosen.contains`.
+**Fix:** Track membership in a `vec![bool; n]` and return a `PrimError` rather than
+`expect` when no unused index remains.
 
-**File:** `crates/mlrs-algos/src/linear/coordinate_descent.rs:126-158` + `crates/mlrs-backend/src/prims/coordinate_descent.rs:91-101`
-**Issue:** `cd_fit` reads X to host, centers it, re-uploads `x_centered`, and then
-`cd_solve` immediately reads the centered X back to host again to compute
-`norm2_cols`. Beyond the redundant round-trip (perf, out of scope), the correctness
-concern is numerical: centering is done in f64 then truncated back to `F` (f32) at
-line 149 before `cd_solve` re-reads and re-promotes to f64 for the norms. For f32
-this double f64→f32→f64 narrowing of the centered design injects extra rounding into
-the very quantity (`norm2_cols`, the soft-threshold denominator) that drives the
-exact-zero sparsity pattern the docs promise to match within 1e-5. sklearn centers
-in the working dtype once.
+### WR-06: `inertia` / `inertia_rows_host` omit the `k >= 1` guard their sibling kmeans entry points enforce
 
-**Fix:** Center in `F` directly (matching sklearn's dtype) or pass the f64 centered
-design through to `cd_solve` without the intermediate `F` narrowing, so the norms and
-the residual are computed from one consistent representation.
+**File:** `crates/mlrs-backend/src/prims/kmeans.rs:222-268, 421-466`
+**Issue:** Both derive `k = centers.len() / d` and check each label `< k`, but
+neither rejects `k == 0`: an empty `centers` buffer passes `centers.len() % d != 0`
+(0 % d == 0) and the function proceeds with `k == 0`. `lloyd_update` /
+`kmeanspp_sample` go through `validate_geometry` which enforces `1 <= k`; this
+inconsistent guard surface invites a future caller to hit the gap.
+**Fix:** Add `if k == 0 { return Err(ShapeMismatch{operand:"centers", ..}) }` to
+both.
 
-### WR-05: LogisticRegression accepts a non-contiguous / gapped label space silently
+### WR-07: `cd_solve` reads `y` back to host twice, contradicting its "acquired ONCE, reused" claim
 
-**File:** `crates/mlrs-algos/src/linear/logistic.rs:216-232`
-**Issue:** `n_classes` is derived as `max(round(y)) + 1`. If the integer labels are
-non-contiguous (e.g. classes `{0, 2}` with no `1`), `k = 3` weight rows are trained,
-class 1 gets an all-zero target and a meaningless probability column, and
-`predict_labels` can emit class `1` which never appeared in training. sklearn
-re-labels to a contiguous `classes_` index space and would never do this. The
-fixture happens to be contiguous (documented), so the oracle passes, but the public
-API silently mis-behaves on a realistic input.
-
-**Fix:** Build the sorted unique label set, map to contiguous `[0, n_classes)`
-indices for the solve, and map predictions back through `classes_` (store the
-original labels for `predict_labels` output), exactly like sklearn.
-
-### WR-06: DBSCAN `min_samples` validated as `< 1` but the field is `usize` — dead branch, and `eps` finiteness rejected via the wrong typed error path
-
-**File:** `crates/mlrs-algos/src/cluster/dbscan.rs:160-171`
-**Issue:** `min_samples` is `usize`; `self.min_samples < 1` is only true for `0`,
-which is correct, but the comment in `error.rs:119` says a core point needs ≥1 and
-the prim (`prims/dbscan.rs:209`) re-checks `min_samples < 1`. More substantively,
-the estimator validates `!(self.eps >= 0.0) || !self.eps.is_finite()` and maps BOTH
-to `InvalidEps`, but a non-finite (NaN/inf) `eps` is a different failure class than a
-negative one; mapping `NaN` to "must be >= 0" is a misleading diagnostic. Minor, but
-the duplicated validation in estimator + prim can drift.
-
-**Fix:** Keep a single source of truth for the eps/min_samples guard (estimator),
-and give NaN/inf its own message, or fold the finiteness check into the message text.
-
-### WR-07: `enet_gap` and the softmax kernel recompute logits/dot products O(k) and O(rows·cols) times per call with no early exit, risking divergence under f32 reassociation
-
-**File:** `crates/mlrs-kernels/src/lbfgs.rs:101-172`, `crates/mlrs-kernels/src/coordinate.rs:166-192`
-**Issue:** The softmax kernel computes `raw[i,k]` THREE separate times per `(i,k)`
-(row-max pass, sum-exp pass, gradient pass), each an independent `d`-length dot
-product. In f32 these three dot products are computed in the same order so they
-should agree bit-for-bit, but any future refactor that reorders one pass will
-silently desynchronize `lse[i]` from the `p[i,k]` used in the gradient, producing a
-subtly wrong gradient that L-BFGS will still "converge" on — landing off the oracle
-with no error. This is a latent correctness fragility in the project's
-highest-risk estimator.
-
-**Fix:** Compute `raw[i,*]` once into a small per-row scratch (k is tiny) and reuse
-it for the max, the sum-exp, the loss term, and the gradient, so the three passes
-cannot drift. If the cubecl-cpu lowering forbids the scratch array, add a test that
-pins `lse[i]` consistency across the passes.
+**File:** `crates/mlrs-backend/src/prims/coordinate_descent.rs:91-110`
+**Issue:** Line 92 materializes `y` to host (`y_host`); line 110 reads `y` to host
+AGAIN to seed `r_dev` (`DeviceArray::from_host(pool, &y.to_host(pool))`). The
+second copy is a duplicate device→host transfer of a buffer already in `y_host`.
+Not a correctness bug, but it contradicts the module docstring's bounded-allocation
+"acquired ONCE, reused" guarantee and doubles the `y` materialization cost.
+**Fix:** Seed `r_dev` from the existing `y_host` (mapped back to `F`) or by a
+device-side clone.
 
 ## Info
 
-### IN-01: LogisticRegression doc comments contradict the actual default constants
+### IN-01: `fit_predict` round-trips labels host→device→host→device unnecessarily
 
-**File:** `crates/mlrs-algos/src/linear/logistic.rs:95-97, 115-117, 122-123`
-**Issue:** The struct field docs and `new`/`with_opts` docs say defaults are
-`max_iter = 100` and `tol = 1e-4`, but the constants are `LOG_DEFAULT_MAX_ITER = 300`
-(line 69) and `LOG_DEFAULT_TOL = 1e-5` (line 77), and `new` passes those. The docs
-are stale relative to the code.
-**Fix:** Update the three doc comments to state `max_iter = 300` and `tol = 1e-5`.
-
-### IN-02: `error.rs` `InvalidEps` message says "must be >= 0" but the variant is documented "non-positive" / the comment says `eps >= 0`
-
-**File:** `crates/mlrs-algos/src/error.rs:108-117`
-**Issue:** The doc line 108 says "non-positive neighborhood radius `eps`" while the
-guard and message accept `eps == 0`. "Non-positive" implies `<= 0` is rejected, but
-`eps == 0` is actually allowed (only `< 0`/NaN rejected). Wording is contradictory.
-**Fix:** Change "non-positive" to "negative".
-
-### IN-03: `kmeans.rs` stores `labels_` then `fit_predict` reads them back and re-uploads
-
-**File:** `crates/mlrs-algos/src/cluster/kmeans.rs:401-403`, `crates/mlrs-algos/src/cluster/dbscan.rs:137-139`
+**File:** `crates/mlrs-algos/src/cluster/dbscan.rs:131-140`; `crates/mlrs-algos/src/cluster/kmeans.rs:415-424`
 **Issue:** `fit_predict` calls `self.labels(pool)` (device→host) then
-`DeviceArray::from_host` (host→device), a pointless round-trip when `labels_` is
-already a device buffer.
-**Fix:** Clone the device handle (or return a device-resident view) instead of the
-host bounce. Out of v1 perf scope but trivially avoidable.
+`DeviceArray::from_host(pool, &labels)` (host→device) although `self.labels_` is
+already device-resident. A device-side clone would avoid the round-trip. Minor —
+labels are small.
+**Fix:** Clone the existing `labels_` device buffer instead of host-bouncing.
 
-### IN-04: Magic constant `1e-6` integer-label tolerance is unexplained
+### IN-02: `host_to_f64` / `f64_to_host` bit-cast helpers duplicated across 6+ modules
 
-**File:** `crates/mlrs-algos/src/linear/logistic.rs:221`
-**Issue:** `(li - lf).abs() > 1e-6` rejects non-integer labels with a hardcoded
-tolerance; the same idea in the classifier uses `.round()` with no tolerance
-(classifier.rs:144). Inconsistent label-integrality policy across the two estimators.
-**Fix:** Extract a shared `nearest_integer_label` helper with one documented
-tolerance.
+**File:** `crates/mlrs-algos/src/cluster/kmeans.rs:429`; `linear/coordinate_descent.rs:232`; `linear/lasso.rs:179`; `linear/logistic.rs:485`; `neighbors/classifier.rs:267`; `neighbors/regressor.rs:182`
+**Issue:** The identical `match size_of::<F>() { 4 => .., 8 => .., _ =>
+unreachable!() }` cast pair is copy-pasted into at least six estimator modules
+(plus the prims and tests), with per-file `unreachable!` messages that drift.
+**Fix:** Hoist a shared `mlrs_core` helper (or a small sealed trait) and remove the
+~12 copies.
 
-### IN-05: `host_to_f64` / `f64_to_host` bit-cast helper duplicated verbatim across six files
+### IN-03: `KMeans` exposes no `max_iter` / `tol` override, unlike the other iterative estimators
 
-**File:** `crates/mlrs-algos/src/cluster/kmeans.rs:409`, `neighbors/classifier.rs:246`, `neighbors/regressor.rs:171`, `linear/coordinate_descent.rs:221`, `linear/elastic_net.rs:272`, `linear/logistic.rs:457` (+ backend prims)
-**Issue:** The identical `match size_of::<F>()` f32/f64 reinterpret pair is copied
-into at least six estimator files and three prim files. A single off-by-one in one
-copy would be a silent numeric corruption.
-**Fix:** Hoist to one shared `mlrs-core` (or `mlrs-algos` internal) helper module and
-import it everywhere.
+**File:** `crates/mlrs-algos/src/cluster/kmeans.rs:112-142`
+**Issue:** `new` and `with_init` hardcode `max_iter = 300`, `tol = 1e-4`.
+`Lasso::with_opts` and `LogisticRegression::with_opts` both expose the override;
+KMeans does not, an inconsistent surface the Phase-6 PyO3 layer will need.
+**Fix:** Add a `with_opts`/builder exposing `max_iter`/`tol` for parity.
+
+### IN-04: Dead `SEED` constant kept alive only by a `let _ = SEED;` lint suppression
+
+**File:** `crates/mlrs-algos/tests/kmeans_test.rs:38, 260`
+**Issue:** `const SEED: u64 = 42;` is never used (tests inject a fixed init); the
+test ends with `let _ = SEED;` purely to silence dead-code.
+**Fix:** Remove the unused constant and the suppression line.
 
 ---
 
-_Reviewed: 2026-06-13T04:46:32Z_
+_Reviewed: 2026-06-13T07:05:38Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
