@@ -13,10 +13,14 @@ behavior is xfailed-with-reason here. Any check that failed for a **real bug**
 was FIXED in the shim (see "Bugs fixed during triage"), not masked.
 
 Run: `pytest crates/mlrs-py/python/tests/test_estimator_checks.py`
-Result (cpu/f64): **475 passed, 102 xfailed (by-design), 19 skipped, 0 unexpected
-failures, 0 xpassed** across 597 parametrized check cases (12 estimators). (The
-`check_supervised_y_no_nan` xpass for LogisticRegression was removed from its
-xfail map — see the supervised table — leaving a clean 0-xpass triage.)
+
+As of the WR-01 post-review fix, `_io.normalize_y` runs
+`check_array(ensure_all_finite=True)` on `y`, so `check_supervised_y_no_nan` is
+rejected with sklearn's own message and PASSES for EVERY supervised estimator —
+it was removed from the `_SUPERVISED` xfail map entirely (it would otherwise
+xpass). See the supervised table below. The pre-fix counts (475 passed / 102
+xfailed) are recomputed by re-running the suite after the fix; the invariant
+that matters is **0 unexpected failures and 0 xpassed**.
 
 > The xfail map lives in `test_estimator_checks.py` (`_EXPECTED`); this document
 > is its human-readable companion. The two MUST stay in sync.
@@ -68,7 +72,12 @@ These genuinely failed and were fixed in the Plan-04 shim during this plan
 |-------|--------|
 | `check_supervised_y_2d` | No `DataConversionWarning` on a column-vector `y`; 1-D `y` is the v1 contract (no silent 2-D→1-D reshape warn). |
 | `check_requires_y_none` | The "y is required" rejection does not match sklearn's expected message verbatim (it still raises on `y=None`). |
-| `check_supervised_y_no_nan` | NaN/inf `y` is rejected, but not with sklearn's exact `inf`/`NaN` wording (allow_nan tag off by design). **Exception: LogisticRegression PASSES this — its `y` goes through `check_array` and the NaN rejection message is sklearn-accepted, so it is NOT in LogReg's xfail map.** |
+
+> `check_supervised_y_no_nan` is **no longer xfailed** for any estimator. As of
+> the WR-01 fix, `_io.normalize_y` runs `check_array(ensure_all_finite=True)` on
+> `y`, so a NaN/Inf target is rejected with sklearn's own `ValueError` message
+> for every supervised estimator and the check PASSES (verified). It was removed
+> from the `_SUPERVISED` map; keeping it would xpass and break the suite.
 
 ### Classifiers only (LogisticRegression, KNeighborsClassifier)
 

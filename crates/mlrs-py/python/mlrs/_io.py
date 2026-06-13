@@ -38,15 +38,17 @@ def _backend_supports_f64():
 
     Imported lazily so ``mlrs._io`` is importable without the ``_mlrs``
     extension (the pure-Python unit tests monkeypatch this). If the extension
-    is unavailable we conservatively report ``True`` (f64-capable) — the real
-    f64 guard still lives in the Rust ``guard_f64`` on the f64 dispatch arm.
+    is unavailable or the capability probe errors we FAIL CLOSED — report
+    ``False`` (assume f64-incapable) so an unknown/erroring backend never has
+    f64 data defaulted onto it (correctness > convenience, WR-03). The Rust
+    ``guard_f64`` remains the hard backstop on an explicit-f64 fit path.
     """
     try:
         from . import _mlrs
 
         return bool(_mlrs.backend_supports_f64())
     except Exception:
-        return True
+        return False  # unknown capability -> assume f64-incapable (safe)
 
 
 def pick_dtype(X):
@@ -110,8 +112,32 @@ def normalize_y(y, *, dtype):
     Rust ``fit`` uploads ``y`` as the same float dtype as ``X`` and infers class
     labels (for classifiers) from the float values, so ``y`` is uploaded as a
     fresh contiguous float buffer mirroring :func:`normalize_X`.
+
+    Validates ``y`` finiteness symmetrically with :func:`normalize_X` (WR-01):
+    the Rust bridge rejects only Arrow nulls, NOT NaN/Inf bit patterns, so an
+    un-checked ``y`` would upload poisoned targets to the device silently. We
+    run sklearn ``check_array(ensure_all_finite=True, ensure_2d=False)`` so a
+    NaN/Inf ``y`` raises the same sklearn-standard ``ValueError`` as ``X`` does.
     """
-    arr = np.ascontiguousarray(np.asarray(y), dtype=dtype).ravel(order="C")
+    # check_array(force_all_finite is renamed ensure_all_finite in sklearn>=1.6;
+    # pass ensure_all_finite for forward compat, fall back for older sklearn).
+    try:
+        checked = check_array(
+            y,
+            ensure_all_finite=True,
+            ensure_2d=False,
+            dtype=dtype,
+            copy=False,
+        )
+    except TypeError:  # pragma: no cover - pre-1.6 sklearn fallback
+        checked = check_array(
+            y,
+            force_all_finite=True,
+            ensure_2d=False,
+            dtype=dtype,
+            copy=False,
+        )
+    arr = np.ascontiguousarray(checked, dtype=dtype).ravel(order="C")
     return pa.array(arr, type=_arrow_float_type(dtype))
 
 

@@ -81,6 +81,13 @@ _COMMON = {
 }
 
 # Supervised-target message/shape conventions mlrs does not replicate in v1.
+#
+# NOTE: check_supervised_y_no_nan is intentionally NOT in this map. As of the
+# WR-01 fix, _io.normalize_y runs sklearn check_array(ensure_all_finite=True)
+# on y, so a NaN/Inf target is rejected with sklearn's own ValueError message
+# for EVERY supervised estimator. The check therefore PASSES (verified
+# empirically) and must not be xfailed — xfailing it would xpass and break the
+# suite, and would falsely advertise an unsupported behavior we now support.
 _SUPERVISED = {
     "check_supervised_y_2d": (
         "mlrs does not emit sklearn's DataConversionWarning when a column-vector "
@@ -89,10 +96,6 @@ _SUPERVISED = {
     "check_requires_y_none": (
         "the 'y is required' error message does not match sklearn's expected "
         "pattern verbatim (a regressor/classifier still raises on y=None)."
-    ),
-    "check_supervised_y_no_nan": (
-        "NaN/inf y is rejected by the bridge, but not with sklearn's exact "
-        "'inf'/'NaN' message wording (allow_nan tag is off by design)."
     ),
 }
 
@@ -141,17 +144,13 @@ _EXPECTED = {
     "Ridge": _merge(_COMMON, _SUPERVISED),
     "Lasso": _merge(_COMMON, _SUPERVISED, _N_ITER),
     "ElasticNet": _merge(_COMMON, _SUPERVISED, _N_ITER),
-    # LogisticRegression rejects NaN/inf y with a sklearn-accepted message (its
-    # y goes through check_array), so check_supervised_y_no_nan PASSES for it —
-    # it is NOT in LogReg's xfail map (would otherwise xpass). The other
-    # supervised estimators still xfail it.
+    # LogisticRegression's y (like every supervised estimator's) now goes
+    # through check_array in _io.normalize_y (WR-01), so check_supervised_y_no_nan
+    # PASSES; it is not in _SUPERVISED anymore so no per-estimator carve-out is
+    # needed here.
     "LogisticRegression": _merge(
         _COMMON,
-        {
-            k: v
-            for k, v in _SUPERVISED.items()
-            if k != "check_supervised_y_no_nan"
-        },
+        _SUPERVISED,
         _CLASSIFIER,
         _N_ITER,
         _FIT2D_1SAMPLE,
