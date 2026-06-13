@@ -55,6 +55,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::linear::logistic::LogisticRegression;
 use mlrs_algos::traits::{Fit, PredictLabels, PredictProba};
+use mlrs_algos::AlgoError;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -319,18 +320,25 @@ fn logistic_binary_predict_proba_match_sklearn_f64() {
 /// ## f32 multiclass uses a DOCUMENTED looser family tolerance (D-08 growth point)
 /// The f64 multiclass case (the cpu(f64) CORRECTNESS GATE) passes the STRICT 1e-5
 /// `predict_proba` bound — the symmetric-multinomial solver lands on the
-/// true-minimum sklearn fixture (`max|grad|` converges to ~9e-6). The f32 path
-/// CANNOT: the K-class softmax loss surface near the minimum is flat enough that
-/// the strong-Wolfe line search stalls on the relative-f floor at ~iter 51 with
-/// `max|grad|` ~1e-4 (an f32-precision limit — the f32 loss values cannot resolve
-/// finer decreases, NOT a solver bug), leaving `predict_proba` ~4e-5 from the
-/// true minimum. `predict` (the arg-max) is still EXACTLY correct, so f32
-/// classification is right; only the probability magnitudes carry the f32
-/// round-off. We therefore compare f32 multiclass `predict_proba` at a documented
-/// `5e-5` family bound (the observed f32 floor) via `Tolerance::for_family` D-08
-/// per-family growth point — f64 STAYS strict 1e-5. This mirrors the project gate
-/// (cpu(f64) is the correctness gate; rocm(f32) is the opportunistic build/runtime
-/// path). `predict` exact + the f64 strict-1e-5 pass are the load-bearing witness.
+/// true-minimum sklearn fixture: its gauge-null-space `max|grad|` floor is ~9.2e-6,
+/// just below the tightened gtol=1e-5, so f64 stops via the `max|grad| <= gtol`
+/// convergence test (~iter 61). The f32 path CANNOT: the f32 gauge-null-space
+/// `max|grad|` floor is ~9.93e-5 (~1e-4), a full DECADE ABOVE gtol=1e-5, so gtol is
+/// unreachable. The loss is flat near the minimum (rel-f ~1e-8/step, far above the
+/// `64·eps` ftol so the ftol stall never fires), and the strong-Wolfe line search
+/// runs out of acceptable steps → the solver exits via a LINE-SEARCH BREAKDOWN
+/// (`LbfgsStopReason::LineSearchFailed`) at ~iter 51 (NOT an ftol stall, NOT the
+/// 300-iter cap — both earlier docs were wrong). That breakdown sits exactly at the
+/// f32 precision floor (a genuine stationary point within f32 resolution), so the
+/// estimator's GAUGE-FLOOR ACCEPT rule (accept LineSearchFailed iff
+/// `max|grad| <= 0.5·sqrt(eps_f32)` ≈ 1.726e-4) treats it as converged, leaving
+/// `predict_proba` ~4e-5 from the true minimum. `predict` (the arg-max) is still
+/// EXACTLY correct, so f32 classification is right; only the probability magnitudes
+/// carry the f32 round-off. We therefore compare f32 multiclass `predict_proba` at a
+/// documented `5e-5` family bound (the observed f32 floor) — f64 STAYS strict 1e-5.
+/// This mirrors the project gate (cpu(f64) is the correctness gate; rocm(f32) is the
+/// opportunistic build/runtime path). `predict` exact + the f64 strict-1e-5 pass are
+/// the load-bearing witness.
 const LOG_MULTI_F32_TOL: Tolerance = Tolerance { abs: 5e-5, rel: 5e-5 };
 
 #[test]
@@ -353,4 +361,55 @@ fn logistic_multi_predict_proba_match_sklearn_f64() {
     }
     let case = load_npz(fixture("logistic_multi_f64_seed42.npz")).expect("load logistic_multi_f64");
     run_logistic_oracle::<f64>(&case, &F64_TOL, "logistic multi f64");
+}
+
+/// T-05-10-03 DoS / non-convergence guard: the GAUGE-FLOOR ACCEPT rule must NOT
+/// swallow a genuinely non-converged solve. A `max_iter = 1` cap forces the L-BFGS
+/// solver to stop at the iteration CAP (`iters >= maxiter`) far from any
+/// stationary point (after a single step the residual `max|grad|` is FAR above the
+/// dtype precision floor `0.5·sqrt(eps)`), so `fit` MUST still surface
+/// `AlgoError::NotConverged`. This pins the real divergence signal that the
+/// gauge-floor accept (which only accepts a LineSearchFailed stop AT/below the
+/// precision floor) must never weaken. Uses the multiclass fixture on f32 (the
+/// dtype whose gauge floor sits above gtol) to exercise the same path the accept
+/// rule touches, but with a cap so small the floor is never reached.
+#[test]
+fn logistic_cap_hit_still_not_converged_f32() {
+    let case = load_npz(fixture("logistic_multi_f32_seed42.npz")).expect("load logistic_multi_f32");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x64 = case.expect_f64("X");
+    let y64 = case.expect_f64("y");
+    let c = case.expect_f64("C")[0];
+    let n_samples = y64.len();
+    assert_eq!(x64.len(), n_samples * LOG_N_FEATURES, "X geometry");
+
+    let x_host: Vec<f32> = x64.iter().map(|&v| f64_to::<f32>(v)).collect();
+    let y_host: Vec<f32> = y64.iter().map(|&v| f64_to::<f32>(v)).collect();
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
+    let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y_host);
+
+    // max_iter = 1: the solver takes a single step and hits the cap nowhere near
+    // the gauge floor, so the gauge-floor accept must NOT fire.
+    let mut clf =
+        LogisticRegression::<f32>::with_opts(f64_to::<f32>(c), true, 1, f64_to::<f32>(1e-5));
+    // Map the Ok payload (`&mut Self`, not Debug) to `()` so we can match the error.
+    let res = clf
+        .fit(&mut pool, &x_dev, Some(&y_dev), (n_samples, LOG_N_FEATURES))
+        .map(|_| ());
+
+    match res {
+        Err(AlgoError::NotConverged {
+            estimator,
+            max_iter,
+        }) => {
+            assert_eq!(estimator, "logistic_regression");
+            assert_eq!(max_iter, 1);
+        }
+        other => panic!(
+            "expected NotConverged at a max_iter=1 cap (T-05-10-03 DoS guard), got {other:?}"
+        ),
+    }
 }

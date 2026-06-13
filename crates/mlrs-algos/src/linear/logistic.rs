@@ -69,11 +69,22 @@ use crate::traits::{Fit, PredictLabels, PredictProba};
 const LOG_DEFAULT_MAX_ITER: usize = 300;
 /// Default convergence tolerance (the L-BFGS `gtol` on `max|grad|`). sklearn's
 /// default `tol = 1e-4` stops ~3.2e-5 short of the minimum — borderline OVER the
-/// strict 1e-5 PRIMARY `predict_proba` gate. We tighten to `1e-5`: reachable in
-/// BOTH f32 (gradient floor ~9e-6 at the minimum) and f64 before the `ftol =
-/// 64·eps` relative-f stall, and deep enough that `predict_proba` lands within
-/// the 1e-5 (abs-OR-rel) gate against the now-true-minimum fixtures (sklearn
-/// multiclass + our binary self-reference, which agree to ~5e-8 at the minimum).
+/// strict 1e-5 PRIMARY `predict_proba` gate. We tighten to `1e-5`. This is
+/// reachable via the `max|grad| <= gtol` convergence test in **f64** (the
+/// gauge-null-space gradient floor is ~9.2e-6, just below gtol — f64 converges
+/// cleanly at ~iter 61), so the f64 fixtures (the cpu correctness gate) land
+/// within the strict 1e-5 gate.
+///
+/// In **f32** the gauge-null-space `max|grad|` floor is ~9.93e-5 (~1e-4) — a full
+/// DECADE ABOVE gtol=1e-5 — so `max|grad| <= gtol` can NEVER fire and the solver
+/// instead exits via a strong-Wolfe LINE-SEARCH BREAKDOWN at the floor (NOT an
+/// ftol stall, and NOT the 300-iter cap). The convergence decision in `fit`
+/// therefore ACCEPTS that f32 breakdown as converged when its residual `max|grad|`
+/// is at/below the dtype precision floor `0.5·sqrt(eps_F)` (≈1.726e-4 for f32) —
+/// the gauge-invariant `predict_proba` is fully converged there (within the
+/// documented 5e-5 f32 family bound), even though the gauge-VARIANT `max|grad|`
+/// scalar cannot reach gtol. A breakdown with `max|grad|` above that floor (a
+/// genuine non-stationary stop) is still surfaced as `NotConverged` (T-05-10-03).
 const LOG_DEFAULT_TOL: f64 = 1e-5;
 
 /// Multinomial (symmetric-softmax) logistic regression (LINEAR-05) fitted by the
@@ -366,29 +377,72 @@ where
         //     The 05-06 prim reports `converged` only on the `max|grad| <= gtol`
         //     test. But the symmetric K-full-weight form has a GAUGE NULL-SPACE
         //     (a per-class additive shift leaves the loss — and predict_proba —
-        //     unchanged): the gradient's null-space components never shrink, so in
-        //     f32 `max|grad|` plateaus ~1e-4 even though the loss has reached its
-        //     true minimum (the gauge-INVARIANT predict_proba is fully converged
-        //     to ~5e-8). The prim's strong-Wolfe loop then breaks EARLY on the
-        //     `ftol = 64·eps` relative-f stall (`iters < maxiter`) — a genuine
-        //     stationary point of this convex objective, NOT a hung solve.
+        //     unchanged): the gradient's null-space components never shrink, so
+        //     `max|grad|` plateaus at a dtype-precision FLOOR even though the loss
+        //     has reached its true minimum (the gauge-INVARIANT predict_proba is
+        //     fully converged). The floor depends on the float type:
+        //       - f64: floor ~9.2e-6, just BELOW gtol=1e-5 → the prim reaches
+        //         `max|grad| <= gtol` and stops via `Converged` (~iter 61).
+        //       - f32: floor ~9.93e-5 (~1e-4), a DECADE ABOVE gtol=1e-5 → gtol is
+        //         unreachable; the loss is flat (rel-f ~1e-8/step, far above
+        //         LBFGS_FTOL=1.42e-14 so the ftol stall never fires either), and the
+        //         strong-Wolfe line search runs out of acceptable steps → the prim
+        //         exits via `LineSearchFailed` at ~iter 51. (Empirically confirmed —
+        //         this is NOT an ftol stall and NOT the 300-iter cap.)
         //
-        //     So the real DoS / non-convergence signal (T-05-10-03) is hitting the
-        //     iteration CAP (`iters == maxiter`), not `max|grad| > gtol` at an
-        //     early ftol stall. We surface `NotConverged` ONLY when the cap is
-        //     reached without the prim flagging convergence; an early gtol/ftol
-        //     stop (either `result.converged` OR `iters < maxiter`) is accepted —
-        //     the primary `predict_proba` 1e-5 oracle is the correctness witness
-        //     that the accepted iterate is the right minimizer (Pitfall 5). ---
-        // WR-01: a line-search BREAKDOWN (`LbfgsStopReason::LineSearchFailed`) is a
-        // stop at a possibly NON-stationary point — a non-minimizer — and must be
-        // surfaced as NotConverged REGARDLESS of `iters` (it can happen well before
-        // the cap). It is NOT the benign ftol stall the Pitfall-5 comment accepts.
+        //     So the real DoS / non-convergence signal (T-05-10-03) is EITHER hitting
+        //     the iteration CAP (`iters == maxiter`) OR a LineSearchFailed at a point
+        //     whose residual `max|grad|` is ABOVE the dtype precision floor (a genuine
+        //     non-stationary breakdown). We accept an early gtol/ftol stop
+        //     (`result.converged` OR `iters < maxiter` with a Converged/FtolStall
+        //     reason) AND a LineSearchFailed whose `max|grad|` is at/below the gauge
+        //     floor `0.5·sqrt(eps_F)` (the f32 case above) — the primary
+        //     `predict_proba` 1e-5/5e-5 oracle is the correctness witness that the
+        //     accepted iterate is the right minimizer (Pitfall 5). ---
+        // WR-01 + GAUGE-FLOOR ACCEPT (05-10): a line-search BREAKDOWN
+        // (`LbfgsStopReason::LineSearchFailed`) is, in general, a stop at a possibly
+        // NON-stationary point — a non-minimizer — and must be rejected as
+        // NotConverged. BUT for the symmetric over-parameterized softmax (D-12)
+        // there is one legitimate exception: the gauge null-space pins the achievable
+        // `max|grad|` to a dtype-precision FLOOR. In f32 that floor is ~9.93e-5
+        // (measured), a full decade ABOVE the tightened gtol=1e-5 (LOG_DEFAULT_TOL),
+        // so `max|grad| <= gtol` can never fire and the ONLY available stop is this
+        // line-search breakdown — at a point that IS first-order stationary within
+        // f32 resolution (the gauge-invariant predict_proba is fully converged). f64's
+        // floor (~9.2e-6) sits just below gtol, so f64 converges via `Converged` and
+        // never reaches this branch.
+        //
+        // So we ACCEPT a LineSearchFailed stop as converged IFF its residual
+        // `max|grad|` is at or below the dtype's gauge-null-space precision floor,
+        // `k·sqrt(F::EPSILON)`. We use sqrt(eps) because the smallest gradient a
+        // floating-point loss can resolve near a minimum scales like sqrt(eps) (the
+        // loss is flat to first order, so the representable curvature step is ~sqrt(eps);
+        // this is the same scaling scipy uses for its default finite-difference step).
+        //   - f32: sqrt(eps_f32) ≈ 3.4527e-4; the measured floor 9.928e-5 is
+        //     ≈0.288·sqrt(eps_f32). We pick k = 0.5 → floor_accept = 1.726e-4, which
+        //     clears the measured 9.928e-5 with ~1.74× headroom yet stays a TIGHT
+        //     sub-multiple of sqrt(eps): a genuine non-convergent breakdown has
+        //     max|grad| >> floor (orders of magnitude), so this cannot mask the real
+        //     NotConverged / DoS signal (T-05-10-03).
+        //   - f64: sqrt(eps_f64) ≈ 1.4901e-8 → floor_accept ≈ 7.45e-9. The f64 path
+        //     already stops via `Converged` (max|grad| 9.24e-6 <= gtol), so this
+        //     branch is never entered for f64; f64 behavior is unchanged.
+        // A LineSearchFailed with `max|grad|` ABOVE this floor is STILL rejected as
+        // NotConverged — the genuine non-stationary breakdown.
+        const GAUGE_FLOOR_K: f64 = 0.5;
+        let gauge_floor_accept = GAUGE_FLOOR_K * f_epsilon::<F>().sqrt();
         if result.stop_reason == LbfgsStopReason::LineSearchFailed {
-            return Err(AlgoError::NotConverged {
-                estimator: "logistic_regression",
-                max_iter: maxiter,
-            });
+            if result.max_grad <= gauge_floor_accept {
+                // Stationary within dtype resolution (gauge floor) — accept as the
+                // converged minimizer; the predict_proba 1e-5/5e-5 oracle is the
+                // correctness witness (Pitfall 5).
+            } else {
+                // Genuine non-stationary breakdown — preserve the T-05-10-03 signal.
+                return Err(AlgoError::NotConverged {
+                    estimator: "logistic_regression",
+                    max_iter: maxiter,
+                });
+            }
         }
         let hit_cap = result.iters >= maxiter;
         if hit_cap && !result.converged {
@@ -620,6 +674,17 @@ fn f64_to_host<F: Pod>(v: f64) -> F {
     match size_of::<F>() {
         4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
         8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("logistic is f32/f64 only"),
+    }
+}
+
+/// Machine epsilon of `F` (f32 / f64) as an `f64`, for the gauge-null-space
+/// precision floor `k·sqrt(eps_F)` (mirrors the `svd.rs` / `eig.rs` per-dtype
+/// epsilon helper). Keeps the gauge-floor accept generic over the float type.
+fn f_epsilon<F: Pod>() -> f64 {
+    match size_of::<F>() {
+        4 => f32::EPSILON as f64,
+        8 => f64::EPSILON,
         _ => unreachable!("logistic is f32/f64 only"),
     }
 }
