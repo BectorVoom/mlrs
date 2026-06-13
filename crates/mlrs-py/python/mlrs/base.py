@@ -62,6 +62,48 @@ class MlrsBase(BaseEstimator):
         ot = self._resolve_output_type(input_obj)
         return _io.to_output(buf, shape, ot, dtype)
 
+    # -- _mlrs delegation (D-01 / D-06 dtype-suffix dispatch) -------------- #
+
+    @staticmethod
+    def _ext():
+        """The compiled ``_mlrs`` extension (lazy import).
+
+        Imported at call time (inside ``fit``) — never at family-module import
+        time — so the pure-Python shim package imports without the extension
+        (estimator construction / ``get_params`` work pre-build). Accessing it
+        on a not-yet-built tree raises the clear ``ImportError`` from the
+        package ``__getattr__``.
+        """
+        from . import _mlrs
+
+        return _mlrs
+
+    def _suffix(self):
+        """The ``"_f32"`` / ``"_f64"`` accessor suffix for the fitted arm (D-06).
+
+        The compiled wrapper splits dtype-generic outputs into ``*_f32`` /
+        ``*_f64`` methods (a ``#[pyclass]`` method cannot return a type generic
+        over ``F``); the shim reads the wrapper's ``dtype()`` to pick the suffix.
+        """
+        self._check_fitted()
+        dt = self._mlrs_obj.dtype()  # "f32" | "f64"
+        return "_" + dt
+
+    def _np_float(self):
+        """The numpy float dtype of the fitted arm (for egress materializing)."""
+        import numpy as np
+
+        return np.float32 if self._mlrs_obj.dtype() == "f32" else np.float64
+
+    def _suffixed(self, base_name):
+        """Bound dtype-suffixed accessor method on the fitted ``_mlrs`` wrapper.
+
+        e.g. ``self._suffixed("coef")`` -> ``self._mlrs_obj.coef_f32`` (or
+        ``coef_f64``) for the fitted dtype arm. Raises ``NotFittedError`` first.
+        """
+        suffix = self._suffix()  # runs _check_fitted before touching _mlrs_obj
+        return getattr(self._mlrs_obj, base_name + suffix)
+
     # -- fitted-state contract (T-06-13) ----------------------------------- #
 
     def _check_fitted(self):
