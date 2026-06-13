@@ -203,8 +203,29 @@ where
         for q in 0..n_query {
             for j in 0..k {
                 let train_idx = idx_host[q * k + j] as usize;
+                // WR-02: a corrupted/oversized neighbor index from top_k (or a
+                // k/n_train mismatch slipping past validation) must be a typed
+                // error at the gather site, NOT an unchecked panic (debug) or a
+                // silent wrong read (release).
+                if train_idx >= y_class.len() {
+                    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                        operand: "knn.train_idx",
+                        rows: train_idx,
+                        cols: 1,
+                        len: y_class.len(),
+                    }));
+                }
                 let class = y_class[train_idx];
-                debug_assert!((class as usize) < n_classes);
+                // WR-02: an out-of-range class id (test labels exceeding train
+                // max+1, or a negative id) must not write out of the proba row.
+                if class < 0 || (class as usize) >= n_classes {
+                    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                        operand: "knn.class_id",
+                        rows: class.max(0) as usize,
+                        cols: 1,
+                        len: n_classes,
+                    }));
+                }
                 let slot = q * n_classes + class as usize;
                 let cur = host_to_f64(proba[slot]) + inv_k;
                 proba[slot] = f64_to_host::<F>(cur);

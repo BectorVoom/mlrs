@@ -158,6 +158,17 @@ where
             let mut acc = 0.0f64;
             for j in 0..k {
                 let train_idx = idx_host[q * k + j] as usize;
+                // WR-02: a corrupted/oversized neighbor index from top_k must be a
+                // typed error at the gather site, not an unchecked panic (debug) or
+                // a silent wrong read (release).
+                if train_idx >= y_reg.len() {
+                    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                        operand: "knn.train_idx",
+                        rows: train_idx,
+                        cols: 1,
+                        len: y_reg.len(),
+                    }));
+                }
                 acc += host_to_f64(y_reg[train_idx]);
             }
             pred[q] = f64_to_host::<F>(acc * inv_k);
