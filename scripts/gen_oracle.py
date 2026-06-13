@@ -660,13 +660,97 @@ def gen_elastic_net(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
-def gen_logistic(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -> str:
-    """Generate one seeded LogisticRegression fixture (LINEAR-05, sklearn lbfgs).
+def _symmetric_multinomial_reference(x, y, xq, n_classes, c_inv, l2_reg):
+    """Hand-rolled SYMMETRIC-multinomial L-BFGS reference (D-12) via scipy.
 
-    Fits ``sklearn.linear_model.LogisticRegression(solver='lbfgs', C=LOG_C,
-    max_iter=LOG_MAX_ITER, tol=1e-4, fit_intercept=True)`` — the deprecated
-    ``multi_class`` argument is NOT passed (sklearn ≥1.5 multinomial by default).
-    Two fixture families per dtype: ``binary`` (2-class) and ``multi`` (3-class).
+    This is the EXACT objective ``crates/mlrs-algos/src/linear/logistic.rs`` and
+    the 05-06 ``softmax_loss_grad`` kernel minimize — K full weight vectors
+    (symmetric over-parameterization), NOT sklearn's binomial-sigmoid binary loss.
+    For ``raw[i,k] = x_i·W_k + b_k``:
+
+        loss(W,b) = (1/n)·Σ_i [ logsumexp_k(raw[i]) − raw[i, y_i] ]
+                    + ½·l2_reg·‖W‖²          (intercept b UNPENALIZED, Pitfall 3)
+
+    with ``l2_reg = 1/(C·n)`` (Pitfall 3). The parameter vector is
+    ``[W (k×d) | b (k)]`` flattened — exactly the Rust closure's layout. We
+    minimize with ``scipy.optimize.minimize(method="L-BFGS-B")`` from a zero start
+    (matching the Rust ``x0 = 0`` warm-start) at a TIGHT tolerance so the reference
+    is the true minimizer of OUR objective, and return ``(coef (k×d), intercept
+    (k), predict_proba(Xq) (nq×k), predict(Xq) (nq,))``.
+
+    sklearn 1.9 has NO symmetric-multinomial binary API (its K=2 path is the
+    binomial sigmoid, which differs from this objective by ~3.6e-3 under L2), so
+    the binary fixture is a deliberate, user-approved SELF-REFERENCE against this
+    hand-rolled trusted oracle — see the 05-10 SUMMARY / STATE decisions.
+    """
+    from scipy.optimize import minimize
+
+    n, d = x.shape
+    k = n_classes
+
+    def unpack(theta):
+        w = theta[: k * d].reshape(k, d)
+        b = theta[k * d :]
+        return w, b
+
+    def loss_and_grad(theta):
+        w, b = unpack(theta)
+        raw = x @ w.T + b  # (n, k)
+        row_max = raw.max(axis=1, keepdims=True)  # logsumexp stability (Pitfall 4)
+        ex = np.exp(raw - row_max)
+        lse = row_max[:, 0] + np.log(ex.sum(axis=1))  # (n,)
+        raw_y = raw[np.arange(n), y]  # (n,)
+        data_loss = (lse - raw_y).mean()
+        reg_loss = 0.5 * l2_reg * (w * w).sum()  # intercept UNPENALIZED
+        loss = data_loss + reg_loss
+
+        p = ex / ex.sum(axis=1, keepdims=True)  # softmax (n, k)
+        ind = np.zeros((n, k))
+        ind[np.arange(n), y] = 1.0
+        diff = (p - ind) / n  # (n, k)
+        grad_w = diff.T @ x + l2_reg * w  # (k, d)
+        grad_b = diff.sum(axis=0)  # (k,)
+        return loss, np.concatenate([grad_w.ravel(), grad_b])
+
+    theta0 = np.zeros(k * d + k)
+    res = minimize(
+        loss_and_grad,
+        theta0,
+        jac=True,
+        method="L-BFGS-B",
+        options={"gtol": 1e-10, "ftol": 1e-15, "maxiter": 2000},
+    )
+    w, b = unpack(res.x)
+
+    raw_q = xq @ w.T + b  # (nq, k)
+    raw_q -= raw_q.max(axis=1, keepdims=True)
+    ex_q = np.exp(raw_q)
+    proba = ex_q / ex_q.sum(axis=1, keepdims=True)
+    predict = proba.argmax(axis=1)
+    return w, b, proba, predict
+
+
+def gen_logistic(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -> str:
+    """Generate one seeded LogisticRegression fixture (LINEAR-05).
+
+    Two fixture families per dtype with DIFFERENT trusted references (a deliberate,
+    user-approved split — see the 05-10 SUMMARY / STATE decisions):
+
+      - ``multi`` (3-class): sklearn ``LogisticRegression(solver='lbfgs', C=LOG_C,
+        max_iter=LOG_MAX_ITER, tol=1e-4, fit_intercept=True)``. sklearn ≥1.5 is
+        multinomial-by-default (no deprecated ``multi_class`` arg) and its K≥3
+        multinomial loss IS the symmetric multinomial the Rust estimator minimizes
+        — so multiclass STAYS SKLEARN-FAITHFUL.
+      - ``binary`` (2-class): a hand-rolled SYMMETRIC-multinomial SELF-REFERENCE
+        (``_symmetric_multinomial_reference`` via ``scipy.optimize.minimize`` on the
+        EXACT D-12 objective the Rust kernel minimizes), NOT sklearn. sklearn's K=2
+        path is the BINOMIAL SIGMOID loss, which differs from the symmetric 2-class
+        multinomial under L2 by ~3.6e-3; the estimator deliberately keeps D-12
+        (symmetric multinomial for ALL K), so its binary ``predict_proba`` is
+        validated against OUR trusted reference at the strict 1e-5 gate, NOT against
+        sklearn's binomial fit. This is a user-approved correctness tradeoff
+        documented LOUDLY in the SUMMARY / STATE / REQUIREMENTS LINEAR-05 note.
+
     ``predict_proba``/``predict`` are the PRIMARY gauge-invariant gate (Pitfall 5
     — the symmetric over-parameterized softmax has gauge freedom in ``coef_``);
     ``coef_`` is the looser secondary reference. Stores ``X``, ``Xq``, ``y``,
@@ -674,8 +758,6 @@ def gen_logistic(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -
     (``predict(Xq)``, int), ``predict_proba`` (``predict_proba(Xq)``). Every array
     passes through ``c()``. Returns the path written.
     """
-    from sklearn.linear_model import LogisticRegression
-
     rng = np.random.default_rng(seed)
     n_classes = 3 if multiclass else 2
     # Well-separated class blobs so the fit converges cleanly and predict is
@@ -696,15 +778,41 @@ def gen_logistic(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -
         ]
     )
 
-    clf = LogisticRegression(
-        solver="lbfgs",
-        C=LOG_C,
-        max_iter=LOG_MAX_ITER,
-        tol=1e-4,
-        fit_intercept=True,
-    ).fit(x, y)
-    predict = clf.predict(xq)
-    predict_proba = clf.predict_proba(xq)
+    if multiclass:
+        # K≥3: sklearn multinomial == symmetric multinomial → SKLEARN-FAITHFUL.
+        # Fit at a TIGHT tolerance (tol=1e-10, generous max_iter) so the fixture is
+        # the TRUE MINIMUM of the (shared) multinomial objective, NOT sklearn's
+        # default early stop. At its default tol=1e-4 sklearn halts ~3.2e-5 short of
+        # the minimum, which would put predict_proba borderline OVER the strict 1e-5
+        # gate against our (more deeply converged) solver. At the true minimum our
+        # symmetric-multinomial solver and sklearn's multinomial agree to ~5e-8 —
+        # this stays fully sklearn-faithful (it IS sklearn, just fully converged).
+        from sklearn.linear_model import LogisticRegression
+
+        clf = LogisticRegression(
+            solver="lbfgs",
+            C=LOG_C,
+            max_iter=10000,
+            tol=1e-10,
+            fit_intercept=True,
+        ).fit(x, y)
+        coef = clf.coef_
+        intercept = clf.intercept_
+        predict = clf.predict(xq)
+        predict_proba = clf.predict_proba(xq)
+    else:
+        # K=2: hand-rolled symmetric-multinomial SELF-REFERENCE (NOT sklearn's
+        # binomial sigmoid). l2_reg = 1/(C·n) — the Rust estimator's exact scaling.
+        n_samples = x.shape[0]
+        l2_reg = 1.0 / (LOG_C * n_samples)
+        coef, intercept, predict_proba, predict = _symmetric_multinomial_reference(
+            x.astype(np.float64),
+            y.astype(np.int64),
+            xq.astype(np.float64),
+            n_classes,
+            LOG_C,
+            l2_reg,
+        )
 
     def c(arr):
         return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
@@ -721,8 +829,8 @@ def gen_logistic(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -
         Xq=c(xq),
         y=c(y),
         C=c([LOG_C]),
-        coef=c(clf.coef_),
-        intercept=c(clf.intercept_),
+        coef=c(coef),
+        intercept=c(intercept),
         predict=c(predict),
         predict_proba=c(predict_proba),
     )
