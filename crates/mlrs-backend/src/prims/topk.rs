@@ -172,6 +172,19 @@ fn validate_geometry(
             len: cols,
         });
     }
+    // WR-03: rows, cols, k are cast to u32 for the kernel launch geometry; reject
+    // an overflowing dimension BEFORE launch so the cast cannot silently truncate
+    // into an out-of-bounds device read.
+    for (operand, dim) in [("rows", rows), ("cols", cols), ("k", k)] {
+        if dim > u32::MAX as usize {
+            return Err(PrimError::ShapeMismatch {
+                operand,
+                rows: dim,
+                cols: 0,
+                len: u32::MAX as usize,
+            });
+        }
+    }
     let expect = rows * k;
     if let Some(o) = out_val_len {
         if o != expect {

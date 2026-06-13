@@ -532,6 +532,19 @@ fn validate_softmax_geometry(
             len: b_len,
         });
     }
+    // WR-03: n, d, k are cast to u32 for the kernel launch geometry; reject an
+    // overflowing dimension BEFORE launch so the cast cannot silently truncate
+    // into an out-of-bounds device read.
+    for (operand, dim) in [("lbfgs.n", n), ("lbfgs.d", d), ("lbfgs.k", k)] {
+        if dim > u32::MAX as usize {
+            return Err(PrimError::ShapeMismatch {
+                operand,
+                rows: dim,
+                cols: 0,
+                len: u32::MAX as usize,
+            });
+        }
+    }
     Ok(())
 }
 

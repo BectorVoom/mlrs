@@ -194,6 +194,25 @@ fn validate(
             len: x_len,
         });
     }
+    // WR-03: n (and d, via the distance prim) are cast to u32 for the kernel
+    // launch geometry; reject an overflowing dimension BEFORE launch so the cast
+    // cannot silently truncate into an out-of-bounds device read.
+    if n > u32::MAX as usize {
+        return Err(PrimError::ShapeMismatch {
+            operand: "n",
+            rows: n,
+            cols: 0,
+            len: u32::MAX as usize,
+        });
+    }
+    if d > u32::MAX as usize {
+        return Err(PrimError::ShapeMismatch {
+            operand: "d",
+            rows: d,
+            cols: 0,
+            len: u32::MAX as usize,
+        });
+    }
     // eps >= 0 and finite. PrimError has no dedicated InvalidEps variant
     // (distance.rs reports all operand violations as ShapeMismatch), so a bad eps
     // surfaces as a ShapeMismatch on the synthetic "eps" operand.

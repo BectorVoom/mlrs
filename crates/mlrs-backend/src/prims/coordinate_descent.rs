@@ -277,6 +277,25 @@ fn validate_geometry(x_len: usize, y_len: usize, n: usize, d: usize) -> Result<(
             len: y_len,
         });
     }
+    // WR-03: n, d (and the per-coordinate j ≤ d) are cast to u32 for the kernel
+    // launch geometry; reject an overflowing dimension BEFORE launch so the cast
+    // cannot silently truncate into an out-of-bounds device read.
+    if n > u32::MAX as usize {
+        return Err(PrimError::ShapeMismatch {
+            operand: "cd.n",
+            rows: n,
+            cols: 0,
+            len: u32::MAX as usize,
+        });
+    }
+    if d > u32::MAX as usize {
+        return Err(PrimError::ShapeMismatch {
+            operand: "cd.d",
+            rows: d,
+            cols: 0,
+            len: u32::MAX as usize,
+        });
+    }
     Ok(())
 }
 
