@@ -104,6 +104,57 @@ def label_perm_allclose(a, b):
     return True
 
 
+def label_perm_remap(pred, ref):
+    """Return ``pred`` relabeled so its cluster ids match ``ref``'s ids.
+
+    Companion to ``label_perm_allclose`` for the cases (KMeans
+    ``cluster_centers_``) where, after establishing the labelings agree up to a
+    permutation, we need the bijection itself to align the *per-cluster*
+    quantities (centers) before a numeric ``allclose``. Returns ``None`` when no
+    consistent bijection exists (the caller then fails the test).
+    """
+    pred = np.asarray(pred).astype(np.int64).ravel()
+    ref = np.asarray(ref).astype(np.int64).ravel()
+    if pred.shape != ref.shape:
+        return None
+    mapping = {}
+    for pv, rv in zip(pred, ref):
+        if pv == -1 or rv == -1:
+            if pv != rv:
+                return None
+            continue
+        if pv in mapping:
+            if mapping[pv] != rv:
+                return None
+        else:
+            mapping[pv] = rv
+    return mapping
+
+
+def proba_allclose(a, b, atol=1e-5):
+    """Compare two ``predict_proba`` matrices row-normalized (gauge-fixed).
+
+    LogisticRegression probabilities are the gauge-invariant gate (Phase-5
+    D-12): raw ``coef_`` is only defined up to the softmax gauge, but the
+    per-sample class probabilities are unique. Each row of a probability matrix
+    sums to 1, so a direct ``np.allclose`` already compares the gauge-fixed
+    quantity; this helper additionally re-normalizes each row (guarding against
+    a backend that returns un-normalized scores) before the ``atol`` check.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if a.shape != b.shape:
+        return False
+    a = a / np.clip(a.sum(axis=1, keepdims=True), 1e-300, None)
+    b = b / np.clip(b.sum(axis=1, keepdims=True), 1e-300, None)
+    return bool(np.allclose(a, b, atol=atol, rtol=0.0))
+
+
+def dtype_of(fixture_name):
+    """``np.float32`` / ``np.float64`` parsed from a fixture basename suffix."""
+    return np.float32 if "_f32_" in fixture_name else np.float64
+
+
 def _backend_supports_f64():
     """Query the surfaced capability flag; ``True`` if mlrs is not importable
     yet (so collection is not blocked at Wave 0)."""

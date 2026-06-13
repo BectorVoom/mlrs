@@ -63,9 +63,19 @@ def _load_ext():
 
     Importing ``_mlrs`` triggers the D-08 driver probe (wired in Plan 02), so a
     backend whose runtime is absent surfaces as an ``ImportError`` here too.
+
+    Uses ``importlib.import_module("mlrs._mlrs")`` rather than ``from . import
+    _mlrs``: the latter routes a *failed* submodule import back through this
+    module's ``__getattr__`` (``_handle_fromlist`` -> ``getattr(mlrs, "_mlrs")``
+    -> ``__getattr__("_mlrs")`` -> ``_load_ext()``), which recurses infinitely
+    when the ``.so`` is genuinely unimportable. ``import_module`` resolves the
+    submodule through the import system directly, so a real failure raises the
+    intended clear ``ImportError`` instead of a ``RecursionError`` that masks it.
     """
+    import importlib
+
     try:
-        from . import _mlrs as ext
+        ext = importlib.import_module("mlrs._mlrs")
     except ImportError as exc:  # pragma: no cover - exercised post-build
         raise ImportError(_EXT_MISSING_MSG) from exc
     return ext

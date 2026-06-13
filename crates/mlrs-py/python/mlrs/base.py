@@ -73,10 +73,16 @@ class MlrsBase(BaseEstimator):
         (estimator construction / ``get_params`` work pre-build). Accessing it
         on a not-yet-built tree raises the clear ``ImportError`` from the
         package ``__getattr__``.
-        """
-        from . import _mlrs
 
-        return _mlrs
+        Delegates to the package ``_load_ext`` (which uses
+        ``importlib.import_module``) instead of ``from . import _mlrs`` so a
+        genuinely-unimportable extension raises a clear ``ImportError`` rather
+        than recursing through the package ``__getattr__`` (see
+        ``mlrs.__init__._load_ext``).
+        """
+        from . import _load_ext
+
+        return _load_ext()
 
     def _suffix(self):
         """The ``"_f32"`` / ``"_f64"`` accessor suffix for the fitted arm (D-06).

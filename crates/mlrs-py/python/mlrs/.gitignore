@@ -1,0 +1,6 @@
+# Compiled extension dropped here by `maturin develop` (editable install).
+# The backend `_mlrs` is built per-wheel and must never be committed.
+_mlrs*.so
+_mlrs*.pyd
+*.abi3.so
+__pycache__/
