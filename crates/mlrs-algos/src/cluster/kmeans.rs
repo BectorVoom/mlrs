@@ -141,6 +141,28 @@ where
         }
     }
 
+    /// IN-03: like [`new`](Self::new) (k-means++ default init from `seed`) but with
+    /// explicit `max_iter` and `tol` overrides, for parity with
+    /// [`Lasso::with_opts`](crate::linear::lasso) /
+    /// [`LogisticRegression::with_opts`](crate::linear::logistic) — the other
+    /// iterative estimators expose the same two knobs. `max_iter` is the Lloyd
+    /// iteration cap (sklearn default 300) and `tol` is the unscaled convergence
+    /// tolerance (sklearn default 1e-4; scaled by the mean feature variance at
+    /// `fit`). A bad `n_clusters` is rejected at `fit` ([`AlgoError::InvalidK`]).
+    pub fn with_opts(n_clusters: usize, seed: u64, max_iter: usize, tol: f64) -> Self {
+        Self {
+            n_clusters,
+            max_iter,
+            tol,
+            seed,
+            init: None,
+            cluster_centers_: None,
+            labels_: None,
+            inertia_: None,
+            n_features_: 0,
+        }
+    }
+
     /// Host copy of the fitted `cluster_centers_` (`k × d` row-major). Errors
     /// with [`AlgoError::NotFitted`] before `fit`.
     pub fn cluster_centers(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
