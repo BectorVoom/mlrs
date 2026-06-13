@@ -47,9 +47,9 @@ Requirements for the initial release. Each maps to roadmap phases. The estimator
 
 ### Neighbors
 
-- [ ] **NEIGH-01**: User can fit `NearestNeighbors` (brute-force) and call `kneighbors` to get the k nearest distances and indices matching scikit-learn within 1e-5
-- [ ] **NEIGH-02**: User can use `KNeighborsClassifier` (`fit`/`predict`/`predict_proba`) matching scikit-learn
-- [ ] **NEIGH-03**: User can use `KNeighborsRegressor` (`fit`/`predict`) matching scikit-learn within tolerance
+- [x] **NEIGH-01**: User can fit `NearestNeighbors` (brute-force) and call `kneighbors` to get the k nearest distances and indices matching scikit-learn within 1e-5
+- [x] **NEIGH-02**: User can use `KNeighborsClassifier` (`fit`/`predict`/`predict_proba`) matching scikit-learn
+- [x] **NEIGH-03**: User can use `KNeighborsRegressor` (`fit`/`predict`) matching scikit-learn within tolerance
 
 ### Python Surface
 
@@ -119,9 +119,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | LINEAR-05 | Phase 5 | Pending |
 | CLUSTER-01 | Phase 5 | Complete |
 | CLUSTER-02 | Phase 5 | Complete |
-| NEIGH-01 | Phase 5 | Pending |
-| NEIGH-02 | Phase 5 | Pending |
-| NEIGH-03 | Phase 5 | Pending |
+| NEIGH-01 | Phase 5 | Complete (05-08) |
+| NEIGH-02 | Phase 5 | Complete (05-08) |
+| NEIGH-03 | Phase 5 | Complete (05-08) |
 | PY-01 | Phase 6 | Pending |
 | PY-02 | Phase 6 | Pending |
 | PY-03 | Phase 6 | Pending |
