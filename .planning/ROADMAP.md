@@ -160,7 +160,7 @@ Plans:
 **Wave 2** *(parallel — file-disjoint NEW primitives, D-01 primitive-first)*
 
 - [x] 05-02-PLAN.md — NEW top-k selection primitive (D-02, lowest-index tie) + standalone oracle (NEIGH-01/02/03) **[complete; select_k #[cube] selection-by-rank kernel + top_k validate-before-launch wrapper, oracle green cpu(f64) within 1e-5 + indices exact]**
-- [ ] 05-03-PLAN.md — NEW KMeans primitives: Lloyd centroid-update+inertia + k-means++ D²-sampling (host-seeded RNG D-09a/c) + standalone oracles (CLUSTER-01)
+- [x] 05-03-PLAN.md — NEW KMeans primitives: Lloyd centroid-update+inertia + k-means++ D²-sampling (host-seeded RNG D-09a/c) + standalone oracles (CLUSTER-01) **[complete; centroid_sumcount + inertia_rows #[cube] GATHER kernels + lloyd_update/inertia/kmeanspp_sample wrappers, lloyd oracle green cpu(f64) within 1e-5 + empty-cluster relocation + kmeanspp seed-reproducible invariant]**
 - [ ] 05-04-PLAN.md — NEW DBSCAN eps-region+core-mask primitive (D-04 device-compute half) + standalone oracle (CLUSTER-02)
 - [ ] 05-05-PLAN.md — NEW coordinate-descent step primitive + host CD loop (D-03/D-10, sklearn coef_+sparsity) + standalone oracle (LINEAR-03/04)
 - [ ] 05-06-PLAN.md — NEW L-BFGS solver primitive (highest risk): softmax loss/grad kernel + host two-loop (m=10) + convex-quadratic standalone validation (Pitfall 5) (LINEAR-05)
