@@ -56,9 +56,20 @@ use crate::runtime::ActiveRuntime;
 ///
 /// The device [`centroid_sumcount`] gather produces the per-centroid feature
 /// sums + counts; the host divides each sum by its count to form the mean. An
-/// EMPTY cluster (`count == 0`) is RELOCATED to the sample farthest from its
-/// current assigned center (sklearn `_k_means_common` relocation, T-05-03-02) so
-/// the mean is never a divide-by-zero NaN.
+/// EMPTY cluster (`count == 0`) is RELOCATED exactly like sklearn's
+/// `_relocate_empty_clusters_dense` (T-05-03-02): the empty clusters take, in
+/// order, the GLOBALLY-farthest samples (by `dist_to_assigned[i]` — the squared
+/// distance of sample `i` to ITS currently-assigned center, supplied by the
+/// caller). Relocating sample `i` to empty cluster `c` sets `centers[c] = X[i]`,
+/// moves `X[i]` from its donor cluster's running sum to `c`'s, increments `c`'s
+/// count and DECREMENTS the donor's. The mean is therefore never a
+/// divide-by-zero NaN, and the result matches sklearn (not the old "farthest from
+/// the nearest non-empty center" approximation, which had no sklearn analogue).
+///
+/// `dist_to_assigned` is the length-`n` per-sample squared distance to the
+/// assigned center under `labels` (compute it with [`inertia_rows_host`] against
+/// the SAME centers that produced `labels`). It is only consulted when an empty
+/// cluster exists; pass a correct slice regardless so the relocation is exact.
 ///
 /// Returns the `k × d` centroids as a device-resident [`DeviceArray`] (D-05).
 /// Generic over `F` (`f32` / `f64`); the f64 path is caller-gated by
@@ -67,6 +78,7 @@ pub fn lloyd_update<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
     labels: &[u32],
+    dist_to_assigned: &[f64],
     n: usize,
     d: usize,
     k: usize,
@@ -81,6 +93,14 @@ where
             rows: n,
             cols: 1,
             len: labels.len(),
+        });
+    }
+    if dist_to_assigned.len() != n {
+        return Err(PrimError::ShapeMismatch {
+            operand: "dist_to_assigned",
+            rows: n,
+            cols: 1,
+            len: dist_to_assigned.len(),
         });
     }
     // Defensive: every label must address a real centroid (0..k) so the device
@@ -133,66 +153,57 @@ where
     sums_dev.release_into(pool);
     counts_dev.release_into(pool);
 
-    // --- Host finalize: divide each sum by its count → mean; relocate empties. ---
+    // --- Host finalize: sklearn `_relocate_empty_clusters_dense` BEFORE the
+    //     divide, then divide each (possibly relocation-adjusted) sum by its count
+    //     → mean. The relocation mutates the running sums + counts so the donor
+    //     cluster correctly loses the moved point's contribution (T-05-03-02). ---
     let x_host: Vec<F> = x.to_host(pool);
-    let mut centers: Vec<F> = vec![F::from_int(0); sums_len];
-    for c in 0..k {
-        if counts_host[c] > 0 {
-            let inv = 1.0_f64 / counts_host[c] as f64;
+
+    // Promote the device sums to f64 + carry counts as i64 so the relocation can
+    // add/subtract a moved point's features and decrement a donor count exactly.
+    let mut sums_f64: Vec<f64> = sums_host.iter().map(|&s| host_to_f64(s)).collect();
+    let mut counts_i64: Vec<i64> = counts_host.iter().map(|&c| c as i64).collect();
+
+    let empties: Vec<usize> = (0..k).filter(|&c| counts_i64[c] == 0).collect();
+    if !empties.is_empty() {
+        // sklearn ranks ALL samples by their squared distance to the assigned
+        // center and gives the empty clusters the farthest points, in order
+        // (`np.argpartition(distances, -n_empty)[-n_empty:]`, then assigned to the
+        // empty clusters). We sort the indices by `dist_to_assigned` DESCENDING
+        // (stable lowest-index tie-break) and take the first `n_empty` — distinct
+        // by construction. For each, move the point from its donor to the empty
+        // cluster: fix the sums (add to new, subtract from donor) and the counts
+        // (increment new, decrement donor).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            dist_to_assigned[b]
+                .partial_cmp(&dist_to_assigned[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        for (rank, &c) in empties.iter().enumerate() {
+            let i = order[rank];
+            let donor = labels[i] as usize;
             for j in 0..d {
-                centers[c * d + j] = f64_to_host::<F>(host_to_f64(sums_host[c * d + j]) * inv);
+                let xij = host_to_f64(x_host[i * d + j]);
+                sums_f64[c * d + j] += xij;
+                sums_f64[donor * d + j] -= xij;
             }
+            counts_i64[c] += 1;
+            counts_i64[donor] -= 1;
         }
-        // Empty cluster handled in the relocation pass below (after we have the
-        // non-empty centers to measure farthest-point against).
     }
 
-    // sklearn empty-cluster relocation (T-05-03-02): an empty cluster is moved to
-    // the data point farthest (by squared distance) from ITS CURRENT center
-    // (here the previous-iteration center is unavailable to this stateless prim,
-    // so we relocate to the point with the largest squared distance to the
-    // NEAREST non-empty new center — the canonical "worst-served" sample). This
-    // guarantees a non-degenerate centroid without a divide-by-zero NaN.
-    let empties: Vec<usize> = (0..k).filter(|&c| counts_host[c] == 0).collect();
-    if !empties.is_empty() {
-        let nonempty: Vec<usize> = (0..k).filter(|&c| counts_host[c] > 0).collect();
-        let mut used: Vec<bool> = vec![false; n];
-        for &c in &empties {
-            // Find the sample with the max squared distance to the nearest
-            // non-empty center (and not already claimed by an earlier empty).
-            let mut best_i = 0usize;
-            let mut best_d2 = f64::NEG_INFINITY;
-            for i in 0..n {
-                if used[i] {
-                    continue;
-                }
-                let mut nearest = f64::INFINITY;
-                if nonempty.is_empty() {
-                    // Degenerate: no non-empty center at all (k clusters, all
-                    // empty is impossible for n>=k>=1, but guard anyway) — fall
-                    // back to ordinal point i.
-                    nearest = 0.0;
-                } else {
-                    for &nc in &nonempty {
-                        let mut acc = 0.0_f64;
-                        for j in 0..d {
-                            let diff =
-                                host_to_f64(x_host[i * d + j]) - host_to_f64(centers[nc * d + j]);
-                            acc += diff * diff;
-                        }
-                        if acc < nearest {
-                            nearest = acc;
-                        }
-                    }
-                }
-                if nearest > best_d2 {
-                    best_d2 = nearest;
-                    best_i = i;
-                }
-            }
-            used[best_i] = true;
+    let mut centers: Vec<F> = vec![F::from_int(0); sums_len];
+    for c in 0..k {
+        // After relocation every cluster has count >= 1 (each empty got a point;
+        // a donor only loses a point if it had >= 2, since sklearn's ranking never
+        // hands the same singleton's point away — but guard anyway: a 0 count
+        // leaves the center at the origin rather than a NaN).
+        if counts_i64[c] > 0 {
+            let inv = 1.0_f64 / counts_i64[c] as f64;
             for j in 0..d {
-                centers[c * d + j] = x_host[best_i * d + j];
+                centers[c * d + j] = f64_to_host::<F>(sums_f64[c * d + j] * inv);
             }
         }
     }
@@ -255,6 +266,9 @@ where
             });
         }
     }
+    // WR-03: n, d are cast to u32 for the launch.
+    guard_u32("n", n)?;
+    guard_u32("d", d)?;
 
     let labels_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(pool, labels);
     let out_handle = pool.acquire(n * size_of::<F>());
@@ -292,7 +306,11 @@ where
 ///   (`n * d == x.len()`, `1 <= k <= n`) BEFORE any launch (T-05-03-01).
 /// - `seed` seeds a HOST-side documented PRNG ([`SplitMix64`]) — never `OsRng`
 ///   (ASVS V6 / T-05-03-03), so the same `seed` yields the SAME indices across
-///   runs and backends (the seed-reproducibility invariant).
+///   runs and backends for THIS implementation (an mlrs-specific, deterministic
+///   sampler — NOT bit-identical to sklearn's MT19937 `randint`/weighted draw).
+///   The deterministic oracle injects a fixed init via [`KMeans::with_init`], so
+///   sklearn-parity does not depend on this sampler reproducing sklearn's stream;
+///   it only needs to be unbiased + reproducible for a given seed.
 ///
 /// The D² weights are computed ON-DEVICE via the [`distance`] prim (squared, no
 /// sqrt) and read back to the host ONCE PER CENTER — at INIT ONLY, not the Lloyd
@@ -317,8 +335,10 @@ where
     let mut rng = SplitMix64::new(seed);
     let mut chosen: Vec<usize> = Vec::with_capacity(k);
 
-    // Center 0: uniform over 0..n (host PRNG, not device).
-    let first = (rng.next_u64() % n as u64) as usize;
+    // Center 0: UNBIASED uniform over 0..n (host PRNG, not device). A plain
+    // `next_u64() % n` is biased for `n` not a power of two (CR-02); use
+    // rejection sampling so every index is equally likely.
+    let first = rng.next_below(n as u64) as usize;
     chosen.push(first);
 
     // Read the samples once to the host so we can build the running per-sample
@@ -354,6 +374,15 @@ where
                     break;
                 }
             }
+            // CR-02: under f64 rounding the accumulated `acc` can fall a few ULP
+            // short of `total`, so when `target` rounds to ~`total` the scan never
+            // triggers `acc >= target` and falls through to the `pick = n - 1`
+            // initializer — selecting the LAST sample regardless of its weight. If
+            // the picked sample has non-positive weight, fall back to the last
+            // POSITIVE-weight index (a real D²-weighted draw, not the fall-through).
+            if min_d2[pick] <= 0.0 {
+                pick = min_d2.iter().rposition(|&w| w > 0.0).unwrap_or(pick);
+            }
             // Guard against re-picking an already-chosen index (possible only via
             // a zero-weight rounding edge): walk forward to the next unused one.
             if chosen.contains(&pick) {
@@ -378,6 +407,89 @@ where
     }
 
     Ok(chosen)
+}
+
+/// Per-sample squared distance to the ASSIGNED center
+/// (`‖X_i − centers[labels_i]‖²` for every `i`), as a host `Vec<f64>` of length
+/// `n` (CLUSTER-01, the sklearn `_relocate_empty_clusters_dense` input).
+///
+/// This is the same device [`inertia_rows`] gather that [`inertia`] consumes, but
+/// the per-row distances are returned to the host UNSUMMED so the estimator's
+/// Lloyd loop can rank samples by their distance-to-assigned-center for sklearn's
+/// empty-cluster relocation. Geometry validated BEFORE launch exactly like
+/// [`inertia`].
+pub fn inertia_rows_host<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    centers: &DeviceArray<ActiveRuntime, F>,
+    labels: &[u32],
+    n: usize,
+    d: usize,
+) -> Result<Vec<f64>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if n.checked_mul(d).map(|v| v != x.len()).unwrap_or(true) {
+        return Err(PrimError::ShapeMismatch {
+            operand: "x",
+            rows: n,
+            cols: d,
+            len: x.len(),
+        });
+    }
+    if d == 0 || centers.len() % d != 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "centers",
+            rows: 0,
+            cols: d,
+            len: centers.len(),
+        });
+    }
+    let k = centers.len() / d;
+    if labels.len() != n {
+        return Err(PrimError::ShapeMismatch {
+            operand: "labels",
+            rows: n,
+            cols: 1,
+            len: labels.len(),
+        });
+    }
+    for (i, &l) in labels.iter().enumerate() {
+        if (l as usize) >= k {
+            return Err(PrimError::ShapeMismatch {
+                operand: "labels",
+                rows: i,
+                cols: l as usize,
+                len: k,
+            });
+        }
+    }
+    // WR-03: n, d are cast to u32 for the launch.
+    guard_u32("n", n)?;
+    guard_u32("d", d)?;
+
+    let labels_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(pool, labels);
+    let out_handle = pool.acquire(n * size_of::<F>());
+
+    let client = pool.client().clone();
+    let (count, dim) = launch_dims_1d(n);
+
+    // SAFETY: validated element counts; the kernel bounds-checks `i < n`.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let c_arg = unsafe { ArrayArg::from_raw_parts(centers.handle().clone(), centers.len()) };
+    let lab_arg = unsafe { ArrayArg::from_raw_parts(labels_dev.handle().clone(), n) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) };
+
+    inertia_rows::launch::<F, ActiveRuntime>(
+        &client, count, dim, x_arg, c_arg, lab_arg, out_arg, n as u32, d as u32,
+    );
+
+    let out_dev = DeviceArray::<ActiveRuntime, F>::from_raw(out_handle, n);
+    let parts: Vec<F> = out_dev.to_host(pool);
+    out_dev.release_into(pool);
+    labels_dev.release_into(pool);
+
+    Ok(parts.iter().map(|&p| host_to_f64(p)).collect())
 }
 
 /// Compute the squared distance from every sample row to a SINGLE center
@@ -427,6 +539,26 @@ fn validate_geometry(x_len: usize, n: usize, d: usize, k: usize) -> Result<(), P
             len: n,
         });
     }
+    // WR-03: every dimension cast to u32 for the kernel launch geometry (n, d, k)
+    // must fit in u32 or the cast silently truncates → an out-of-bounds device
+    // read. Reject the overflow as a typed ShapeMismatch BEFORE any launch.
+    guard_u32("n", n)?;
+    guard_u32("d", d)?;
+    guard_u32("k", k)?;
+    Ok(())
+}
+
+/// WR-03: reject a `usize` dimension that does not fit in the kernel-launch `u32`
+/// (an unguarded `dim as u32` truncation becomes an out-of-bounds device read).
+fn guard_u32(operand: &'static str, dim: usize) -> Result<(), PrimError> {
+    if dim > u32::MAX as usize {
+        return Err(PrimError::ShapeMismatch {
+            operand,
+            rows: dim,
+            cols: 0,
+            len: u32::MAX as usize,
+        });
+    }
     Ok(())
 }
 
@@ -472,6 +604,28 @@ impl SplitMix64 {
     fn next_f64(&mut self) -> f64 {
         // Top 53 bits → [0, 1) with full double mantissa.
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// UNBIASED uniform integer in `[0, bound)` via rejection sampling (CR-02).
+    /// A plain `next_u64() % bound` is biased whenever `bound` does not divide
+    /// `2^64`; we reject the top non-uniform residue so every value is equally
+    /// likely. `bound` must be `>= 1` (the caller guarantees `n >= k >= 1`).
+    fn next_below(&mut self, bound: u64) -> u64 {
+        debug_assert!(bound >= 1, "next_below requires a positive bound");
+        if bound == 1 {
+            return 0;
+        }
+        // Largest multiple of `bound` that fits in u64; values at or above it are
+        // the biased tail and get rejected. `zone = bound * (u64::MAX / bound)`
+        // rounded down to the last full block; use the (MAX - MAX % bound) form to
+        // avoid overflow.
+        let zone = u64::MAX - (u64::MAX % bound);
+        loop {
+            let v = self.next_u64();
+            if v < zone {
+                return v % bound;
+            }
+        }
     }
 }
 

@@ -15,8 +15,11 @@
 //!      sqrt=false)` (the Phase-2 prim, squared Euclidean, no boundary sqrt)
 //!      then [`argmin_rows`] (lowest-index tie-break, D-02).
 //!   2. UPDATE the centers as the per-label mean via [`lloyd_update`] (the
-//!      Phase-5 prim — empty-cluster relocation lives INSIDE the prim, never a
-//!      divide-by-zero NaN, T-05-03-02).
+//!      Phase-5 prim), passing the per-sample distance-to-assigned-center
+//!      ([`inertia_rows_host`]) so the prim can run sklearn's EXACT
+//!      `_relocate_empty_clusters_dense` (relocate an empty cluster to the
+//!      globally-farthest sample, decrementing its donor — never a
+//!      divide-by-zero NaN, CR-01 / T-05-03-02).
 //!   3. CONVERGENCE — first the STRICT `array_equal(labels, labels_old)` BREAK
 //!      (sklearn breaks the moment the labeling stops changing, BEFORE the tol
 //!      check — Pitfall 6); then `center_shift_tot <= tol_scaled` where
@@ -52,7 +55,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::distance;
-use mlrs_backend::prims::kmeans::{inertia, kmeanspp_sample, lloyd_update};
+use mlrs_backend::prims::kmeans::{inertia, inertia_rows_host, kmeanspp_sample, lloyd_update};
 use mlrs_backend::prims::reduce::argmin_rows;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
@@ -283,9 +286,26 @@ where
         let mut labels = Self::assign(pool, x, n_samples, n_features, &centers, k)?;
         let mut strict_converged = false;
         for _iter in 0..self.max_iter {
-            // UPDATE: per-label mean (empty-cluster relocation inside the prim).
-            let new_centers =
-                lloyd_update::<F>(pool, x, &labels, n_samples, n_features, k)?;
+            // sklearn empty-cluster relocation (CR-01) needs the per-sample squared
+            // distance to the CURRENTLY-assigned center (the same quantity inertia
+            // sums) so an empty cluster can take the globally-farthest sample and
+            // decrement its donor. Compute it against the CURRENT centers + labels
+            // (the assignment that produced the sums lloyd_update is about to form).
+            let dist_to_assigned =
+                inertia_rows_host::<F>(pool, x, &centers, &labels, n_samples, n_features)?;
+
+            // UPDATE: per-label mean with sklearn-exact empty-cluster relocation
+            // (CR-01: relocate to the farthest-from-assigned-center sample, fixing
+            // sums + counts + donor — lifted here where labels + centers exist).
+            let new_centers = lloyd_update::<F>(
+                pool,
+                x,
+                &labels,
+                &dist_to_assigned,
+                n_samples,
+                n_features,
+                k,
+            )?;
 
             // ASSIGN to the new centers.
             let new_labels =

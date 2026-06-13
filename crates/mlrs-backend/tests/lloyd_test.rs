@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::kmeans::{inertia, lloyd_update};
+use mlrs_backend::prims::kmeans::{inertia, inertia_rows_host, lloyd_update};
 use mlrs_backend::runtime::{self, ActiveRuntime};
 use mlrs_core::{load_npz, OracleCase};
 
@@ -96,11 +96,22 @@ where
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x);
 
+    // Per-sample distance to the assigned center (CR-01 relocation input). With
+    // this balanced fixture no cluster empties, so it is never consulted, but pass
+    // a correct slice (distances to the sklearn reference centers under labels).
+    let ref_centers_dev: DeviceArray<ActiveRuntime, F> =
+        DeviceArray::from_host(&mut pool, &fixture_vec::<F>(&case, "centers"));
+    let dist_to_assigned =
+        inertia_rows_host::<F>(&mut pool, &x_dev, &ref_centers_dev, &labels, KM_N_SAMPLES, KM_N_FEATURES)
+            .expect("inertia_rows_host on valid geometry");
+    ref_centers_dev.release_into(&mut pool);
+
     // --- lloyd_update: per-label means must equal sklearn cluster_centers_. ---
     let centers_dev = lloyd_update::<F>(
         &mut pool,
         &x_dev,
         &labels,
+        &dist_to_assigned,
         KM_N_SAMPLES,
         KM_N_FEATURES,
         KM_K,
@@ -201,10 +212,53 @@ fn lloyd_relocates_empty_cluster() {
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
     let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
 
+    // Cluster 0/1 means (the "current" centers under `labels`), then each sample's
+    // squared distance to its assigned center — the sklearn relocation input.
+    let mut means = vec![0.0f64; KM_K * KM_N_FEATURES];
+    let mut counts = [0u32; KM_K];
+    for i in 0..KM_N_SAMPLES {
+        let c = labels[i] as usize;
+        counts[c] += 1;
+        for j in 0..KM_N_FEATURES {
+            means[c * KM_N_FEATURES + j] += x[i * KM_N_FEATURES + j] as f64;
+        }
+    }
+    for c in 0..KM_K {
+        if counts[c] > 0 {
+            for j in 0..KM_N_FEATURES {
+                means[c * KM_N_FEATURES + j] /= counts[c] as f64;
+            }
+        }
+    }
+    let means_f32: Vec<f32> = means.iter().map(|&v| v as f32).collect();
+    let means_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &means_f32);
+    let dist_to_assigned = inertia_rows_host::<f32>(
+        &mut pool,
+        &x_dev,
+        &means_dev,
+        &labels,
+        KM_N_SAMPLES,
+        KM_N_FEATURES,
+    )
+    .expect("inertia_rows_host on the cluster 0/1 means");
+    means_dev.release_into(&mut pool);
+
+    // The sklearn relocation target for the single empty cluster is the GLOBALLY
+    // farthest sample (largest dist_to_assigned), lowest-index tie-break.
+    let mut far_i = 0usize;
+    let mut far_d = f64::NEG_INFINITY;
+    for i in 0..KM_N_SAMPLES {
+        if dist_to_assigned[i] > far_d {
+            far_d = dist_to_assigned[i];
+            far_i = i;
+        }
+    }
+
     let centers_dev = lloyd_update::<f32>(
         &mut pool,
         &x_dev,
         &labels,
+        &dist_to_assigned,
         KM_N_SAMPLES,
         KM_N_FEATURES,
         KM_K,
@@ -215,7 +269,7 @@ fn lloyd_relocates_empty_cluster() {
     x_dev.release_into(&mut pool);
 
     // Cluster 2's centroid (the relocated empty cluster) must be FINITE (no NaN /
-    // no divide-by-zero) — and must equal some real data row.
+    // no divide-by-zero).
     for j in 0..KM_N_FEATURES {
         let v = centers[2 * KM_N_FEATURES + j];
         assert!(
@@ -223,15 +277,16 @@ fn lloyd_relocates_empty_cluster() {
             "empty cluster 2 feature {j} must be finite after relocation, got {v}"
         );
     }
-    // The relocated centroid equals one of the sample rows.
+    // sklearn `_relocate_empty_clusters_dense`: the relocated centroid is EXACTLY
+    // the globally-farthest-from-assigned-center sample row (CR-01).
     let relocated = &centers[2 * KM_N_FEATURES..3 * KM_N_FEATURES];
-    let matches_a_row = (0..KM_N_SAMPLES).any(|i| {
-        (0..KM_N_FEATURES).all(|j| {
-            (relocated[j] - x[i * KM_N_FEATURES + j]).abs() <= 1e-6
-        })
-    });
-    assert!(
-        matches_a_row,
-        "relocated empty cluster 2 must coincide with a real data row (farthest-point), got {relocated:?}"
-    );
+    for j in 0..KM_N_FEATURES {
+        let expected = x[far_i * KM_N_FEATURES + j];
+        assert!(
+            (relocated[j] - expected).abs() <= 1e-6,
+            "relocated empty cluster 2 feature {j} must be the farthest sample row {far_i}: got {}, expected {}",
+            relocated[j],
+            expected
+        );
+    }
 }
