@@ -193,12 +193,27 @@ Plans:
   4. Per-backend wheels build via `maturin build --features <backend>` under distinct distribution names (`mlrs-cpu`, `mlrs-wgpu`, `mlrs-cuda`, `mlrs-rocm`) with `abi3-py312`; importing a wheel whose driver is absent fails with a clear error.
 
 **Plans**: 6 plans
+**Wave 1**
+
 - [ ] 06-01-PLAN.md — Wave-0 scaffold: pyo3 0.28 ABI pin, 4 per-backend pyproject templates, pure-Python mlrs package skeleton, pytest scaffold, arrow FromPyArrow symbol
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 06-02-PLAN.md — Core Rust plumbing: PyCapsule ingress (reuse validate bridge), egress, capability guard, dtype-dispatch macro, GIL release, catch_unwind import probe, global pool
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 06-03-PLAN.md — 12 #[pyclass] estimator wrappers (linear/cluster/decomposition/neighbors) + module registration
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 06-04-PLAN.md — Pure-Python sklearn shim: base/_io + 12 estimator classes (mixins, get_params/set_params, output_type), test_params
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 06-05-PLAN.md — Oracle pytest harness (1e-5 full-path, sign-flip/label-perm/gauge-fixed-proba) + f32/f64 dispatch + GIL-release tests
 - [ ] 06-06-PLAN.md — estimator_checks triage + four wheel builds (distinct dist names, abi3-py312) + driver-absent ImportError
+
 **Research flag**: Maturin per-feature distribution naming may need a small build-system spike — the multi-distribution pattern is undocumented in maturin's first-party docs. Otherwise standard patterns.
 
 ## Progress
