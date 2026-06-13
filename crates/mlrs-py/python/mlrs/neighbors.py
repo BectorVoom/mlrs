@@ -32,7 +32,9 @@ class NearestNeighbors(MlrsBase):
     def kneighbors(self, X=None, n_neighbors=None, return_distance=True):
         self._check_fitted()
         if X is None:
-            raise ValueError("mlrs NearestNeighbors.kneighbors requires X (v1)")
+            raise ValueError(
+                "mlrs NearestNeighbors.kneighbors requires X (v1)"
+            )
         k = self.n_neighbors if n_neighbors is None else n_neighbors
         xa, rows, cols = self._normalize(X, dtype=self._np_float())
         dist, idx = getattr(self._mlrs_obj, "kneighbors" + self._suffix())(

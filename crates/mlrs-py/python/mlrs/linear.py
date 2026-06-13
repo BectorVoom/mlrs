@@ -106,7 +106,9 @@ class Lasso(RegressorMixin, MlrsBase):
     def fit(self, X, y):
         xa, rows, cols = self._normalize(X)
         ya = self._normalize_y(y, dtype=LinearRegression._x_float(xa))
-        obj = self._ext().Lasso(self.alpha, self.fit_intercept, self.max_iter, self.tol)
+        obj = self._ext().Lasso(
+            self.alpha, self.fit_intercept, self.max_iter, self.tol
+        )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
         return self

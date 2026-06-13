@@ -11,7 +11,6 @@ delegation to ``_mlrs`` is exercised by the live-extension oracle gate.
 Req: PY-01 (fit returns self / NotFitted), PY-02 (sklearn names + get/set_params).
 """
 
-import numpy as np
 import pytest
 from sklearn.base import (
     ClassifierMixin,
@@ -93,9 +92,11 @@ def test_get_set_params_roundtrip():
 def test_clone_preserves_unfitted_params():
     c = clone(mlrs.KMeans(n_clusters=5))
     assert c.n_clusters == 5
-    assert not c.__sklearn_is_fitted__() if hasattr(
-        c, "__sklearn_is_fitted__"
-    ) else True
+    assert (
+        not c.__sklearn_is_fitted__()
+        if hasattr(c, "__sklearn_is_fitted__")
+        else True
+    )
 
 
 @pytest.mark.parametrize("name", ALL_12)
