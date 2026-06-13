@@ -207,7 +207,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 06-04-PLAN.md — Pure-Python sklearn shim: base/_io + 12 estimator classes (mixins, get_params/set_params, output_type), test_params
+- [x] 06-04-PLAN.md — Pure-Python sklearn shim: base/_io + 12 estimator classes (mixins, get_params/set_params, output_type), test_params **[complete — 12 sklearn BaseEstimator+family-mixin shims delegate to _mlrs (D-01/PY-01); faithful __init__ gives get_params/set_params/clone/__repr__ free (PY-02; LogReg C not c, KMeans random_state); _io.normalize_X = check_array(finite/2-D)→ascontiguousarray.ravel→fresh pyarrow + (rows,cols) (D-02/Pitfall3/T-06-11), pick_dtype f64/f32 via backend_supports_f64() (D-05/Pitfall5), resolve_output_type input-mirror (D-03), to_output int32 labels (D-06); MlrsBase _check_fitted→NotFittedError (T-06-13), __sklearn_tags__ sparse/nan/array-api off, dtype-suffix dispatch; DBSCAN/NearestNeighbors predict-less; lazy _mlrs import (PEP-562 __getattr__ + _ext()) so shim imports pre-build; Rule-3 deviation: lazy import unblocked pure-Python testing; Rule-1 fix: _suffixed evaluates _check_fitted before _mlrs_obj so coef_-before-fit raises NotFittedError not AttributeError; 109 pure-Python tests green (sklearn 1.9/numpy 2.4/pyarrow 24) — device fit/predict path deferred to Plan 05/06 oracle gate (no maturin in env); PY-01/02/03/05]**
 
 **Wave 5** *(blocked on Wave 4 completion)*
 

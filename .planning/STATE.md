@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 06 (python-surface-pyo3-estimators-per-backend-wheels) — EXECUTING
-Plan: 4 of 6
+Plan: 5 of 6
 Status: Executing Phase 06
-Last activity: 2026-06-13 -- Completed Phase 06 Plan 03 (12 PyO3 #[pyclass] estimator wrappers on _mlrs)
-Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-03-SUMMARY.md
+Last activity: 2026-06-13 -- Completed Phase 06 Plan 04 (12 pure-Python sklearn shims delegating to _mlrs; PY-01/02/03/05)
+Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-04-SUMMARY.md
 
-Progress: [████████▋░] 86% (5/6 phases; 35/37 plans complete)
+Progress: [█████████░] 89% (5/6 phases; 36/37 plans complete)
 
 ## Open Follow-ups (Phase 05)
 
