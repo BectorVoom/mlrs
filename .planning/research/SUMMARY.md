@@ -1,198 +1,159 @@
 # Project Research Summary
 
-**Project:** mlrs — Rust rewrite of RAPIDS cuML (CubeCL + Arrow + PyO3)
-**Domain:** GPU-accelerated, sklearn-compatible ML library; Rust CubeCL kernels generic over float type and runtime backend; Apache Arrow zero-copy data interchange; PyO3 per-backend Python wheels
-**Researched:** 2026-06-11
-**Confidence:** HIGH
+**Project:** mlrs — cuML in Rust (v2.0 Breadth Sweep milestone)
+**Domain:** scikit-learn-compatible ML estimator library (Rust/CubeCL rewrite of RAPIDS cuML)
+**Researched:** 2026-06-14
+**Confidence:** HIGH (three scoped MEDIUM unknowns to resolve at plan time)
 
 ## Executive Summary
 
-mlrs is a greenfield, ground-up Rust rewrite of RAPIDS cuML's core ML algorithms. Compute kernels are written once using CubeCL 0.10.0 and are generic over two independent dimensions: the floating-point type (`F: f32|f64`, resolved per-call at runtime by input dtype) and the compute runtime (`R: CpuRuntime|WgpuRuntime|CudaRuntime|...`, fixed at compile time per backend wheel). The codebase is structured as a five-crate Cargo workspace — `mlrs-core` (traits/types), `mlrs-kernels` (all `#[cube]` kernels, runtime-agnostic), `mlrs-backend` (the sole owner of Cargo backend features and the Arrow zero-copy bridge), `mlrs-algos` (estimator orchestration, generic `<F, R>`), and `mlrs-py` (cdylib, PyO3 bindings, monomorphizes `R` at build time). Python users `pip install` the wheel matching their hardware backend and use a fully sklearn-compatible `fit`/`predict`/`transform` API.
+v2.0 is a **breadth sweep**: ~16 sklearn-compatible estimators across five families (Covariance & Projection, Kernel, Spectral, SGD/linear-SVM, Naive Bayes) added on top of v1's shipped, validated five-crate stack. The single most important conclusion from all four research files is that **this milestone requires no new compute dependency**. Every estimator is *assembly* over v1's existing primitives (GEMM, reductions, pairwise distance, covariance/Gram, Jacobi SVD + symmetric eig, Cholesky/triangular-solve, top-k, L-BFGS, coordinate descent) plus exactly five new *feature-free* mlrs-authored CubeCL primitives — one (or zero) per phase: RNG-matrix + incremental-SVD (P7), kernel-matrix (P8), graph-Laplacian (P9), SGD solver (P10), and none for Naive Bayes (P11, reductions only). The workspace `Cargo.toml` is unchanged; pyo3 stays pinned at 0.28 (arrow-59 transitively pins it), `cubek-random` is rejected (no caller seed → breaks ASVS-V6 reproducibility; shared-memory Tausworthe → breaks cpu-MLIR), and sparse input is densified at the Python ingress rather than adding a CSR device path (a v3 line item).
 
-The recommended build strategy is strictly primitive-first: oracle harness and Arrow bridge in Phase 0, compute primitives (GEMM, reduce, pairwise distance, SVD/eig) validated standalone in Phase 1-2, then closed-form estimators (OLS, Ridge, PCA, TruncatedSVD) in Phase 3, distance-based and iterative-solver estimators in Phase 4, and the full PyO3 surface plus per-backend wheels in Phase 5. The SVD/eig primitive is the single highest-leverage gate: it blocks PCA, TruncatedSVD, OLS-svd, and Ridge-svd — build and validate it standalone before touching those estimators. The pairwise-distance primitive blocks three families (KMeans, DBSCAN, all KNN) and must be validated standalone with the `max(d2, 0)` clamp for f32 safety.
+The recommended approach reuses v1's proven discipline verbatim: **primitive-first** (land the prim + its build-failing PoolStats memory gate, then the estimators as thin assembly), **file-disjoint parallelism** (each estimator is a new file + one `pub mod`/`pub use` line; the only shared-edit points are `mlrs-py/src/lib.rs` registration and family `mod.rs` files), and **scikit-learn as the sole oracle** at abs/rel ≤ 1e-5 on f64. The build order from the seed roadmap is sound and dependency-correct: 7→8→9→10→11, with one dependency that must be made explicit — **P9 (Spectral) hard-depends on P8's kernel-matrix prim** because the graph affinity *is* `kernel_matrix(Rbf)`. P7 and P11 are pure assembly (lowest risk, ideal confidence-building bookends); P10 (the one genuinely new solver) is the highest risk and unblocks four estimators.
 
-The dominant correctness risk is solver/defaults mismatch: the oracle is scikit-learn on CPU, not cuML, yet the reference code is cuML — and their defaults differ on OLS (sklearn=SVD-based lstsq, cuML=eig), KMeans init (sklearn=k-means++, cuML=k-means||), TruncatedSVD algorithm (sklearn=randomized/stochastic, cuML=full), and PCA sign convention (sklearn applies `svd_flip`). Matching cuML defaults will fail the 1e-5 oracle gate. The mitigation is to encode the correct sklearn-matching solver for each estimator in the oracle harness at P0, and to build sign-flip and label-permutation comparison helpers before any estimator exists. A secondary risk is f64 absence on wgpu (the primary CI gate): capability-gate f64 paths at runtime using `client.properties().feature_enabled(...)` from Phase 0 so the wgpu CI job never hard-fails on adapter limitations.
+The risk profile is dominated by two cross-cutting concerns. First, **cpu-MLIR safety**: the new SGD, Naive-Bayes, and Laplacian kernels all have a naive formulation that wants cross-unit atomics or SharedMemory (scatter-add into weight/class/degree bins), which compiled-but-panicked-at-launch in v1. The fix is the v1 GATHER idiom — invert parallelism to one-thread-per-output-cell with F/u32 accumulators, if-guards, no `bool`/`F::INFINITY`/descending-shift loops, no SharedMemory, no atomics. Second, **oracle exceptions**: most estimators value-match sklearn at 1e-5, but RandomProjection is *property-gated* (Johnson–Lindenstrauss distortion + matrix distribution, NOT value-match, because mlrs's seeded PRNG ≠ NumPy MT19937), and SGD/LinearSVM need a *pinned deterministic self-reference oracle* (shuffle off, fixed schedule, fixed `max_iter`, `tol=0`) exactly as v1 did for LogReg's L-BFGS. cuML is NOT the oracle — it diverges from sklearn on the SGD loss set/schedule and on LinearSVC's solver. Three genuine unknowns (incremental-SVD f32 stability, smallest-eigenpair extraction, SGD under cpu-MLIR) must get a research spike before planning P7/P9/P10.
 
 ## Key Findings
 
 ### Recommended Stack
 
-The core stack is: `cubecl 0.10.0` (umbrella crate with `cpu`/`wgpu`/`cuda`/`rocm` features), `cubecl-matmul`/`cubecl-reduce`/`cubecl-std` all pinned to `0.10.0` (must match exactly to avoid macro/ABI errors), `pyo3 0.28` with `abi3-py312` (Python 3.12+ from one wheel per platform), `maturin 1.13` as the build backend, `arrow 59` (arrow-rs, not arrow2 which is archived), and `bytemuck 1` as the zero-copy glue between Arrow buffers and CubeCL `Bytes`. Supporting libraries: `mimalloc 0.1.52` as the global allocator (declared only in `mlrs-py` cdylib), `smallvec 1.15` for shapes/strides, `compact_str 0.8` for class labels and param keys, `thiserror 2` for library error types, and `rand 0.9` + `rand_distr 0.5` + `approx 0.5` as dev-only oracle-harness dependencies.
+No new runtime crate is added. All v2 compute composes from v1 prims plus five mlrs-authored, feature-free CubeCL primitives. RNG is host-side SplitMix64 (promoted from `prims/kmeans.rs` into a shared `prims/rng.rs`) generating the projection matrix / epoch-shuffle permutation on host and uploading once — reproducible (ASVS-V6), backend-independent, and cpu-MLIR-safe. Sparse input is densified at the Python wrapper before the existing dense Arrow ingress; a native CSR device path is explicitly deferred to v3. See [STACK.md](STACK.md).
 
-**Core technologies:**
-- `cubecl 0.10.0`: single-source GPU/CPU compute kernels via `#[cube]`/`#[cube(launch)]`; `Numeric`/`Float`/`CubeElement` trait bounds; backend selection via Cargo features — mandated by project, confirmed current
-- `pyo3 0.28` + `maturin 1.13`: Rust-Python FFI and wheel build; `abi3-py312` produces one wheel per (backend x platform) covering Python 3.12/3.13/3.14; Rust >=1.83 required
-- `arrow 59` (arrow-rs) + `bytemuck 1`: zero-copy Arrow->CubeCL bridge; `Float32/64Array::values()` -> `cast_slice::<T,u8>` -> `Bytes` is the load-bearing path from the zero-copy manuals
-- `mimalloc 0.1.52`: global allocator for low-fragmentation per-fit allocation churn; declared once in cdylib; switch to `tikv-jemallocator 0.7.0` when heap profiling is needed
-- `rand 0.9` + `approx 0.5`: seeded deterministic oracle inputs and `assert_abs_diff_eq!`/`assert_relative_eq!` with explicit epsilon; test-only dev dependencies
+**Core technologies (all UNCHANGED from v1):**
+- cubecl 0.10.0 (`default-features=false`): device-kernel layer, generic over float + runtime — entire v2 surface is feature-free kernels over the existing pattern.
+- cubek-matmul / cubek-reduce 0.2.0: GEMM and reductions backing KernelRidge, RandomProjection, SGD, the full Naive-Bayes family, and LedoitWolf shrinkage — already wired.
+- arrow 59 (`pyarrow`) + pyo3 0.28 (`abi3-py312`): dense Float32/Float64 ingress is sufficient (sparse densified at ingress). **pyo3 stays pinned at 0.28** — arrow-59 transitively pins it; bumping to 0.29 links a second PyInit ABI and crashes the wheel at import (D-09/PY-05).
+- **NOT used:** `cubek-random` (no caller seed → ASVS-V6 fail; shared-memory Tausworthe → cpu-MLIR fail), `rand`/`getrandom` (OsRng forbidden by ASVS-V6), `ndarray`/`nalgebra` (math runs on device via existing prims).
+
+**Five new mlrs-authored primitives (NOT crates):** `prims/rng.rs` (host PRNG, no device kernel), `prims/incremental_svd.rs` (glue over v1 `svd`), `prims/kernel_matrix.rs` (one elementwise map over distance/Gram → linear/RBF/poly/sigmoid), `prims/laplacian.rs` (reduce + elementwise over affinity), `prims/sgd.rs` (host epoch loop + GATHER per-minibatch device passes).
 
 ### Expected Features
 
-The v1 feature surface spans four algorithm families: linear models (LinearRegression/OLS, Ridge, Lasso, ElasticNet, LogisticRegression), clustering (KMeans, DBSCAN), decomposition (PCA, TruncatedSVD), and neighbors (NearestNeighbors, KNeighborsClassifier, KNeighborsRegressor). Every estimator implements the full sklearn API contract: `fit`/`predict`/`transform` with `fit` returning `self`, `get_params`/`set_params`, trailing-underscore fitted attributes lazily materialized on access, `n_features_in_`, and mixin `score` semantics.
+The oracle is **scikit-learn**, not cuML. Where cuML diverges (SGD loss set/schedule, LinearSVC solver), match sklearn. Every estimator exposes sklearn-named params/defaults, the appropriate `fit`/`predict`/`transform`/`score` surface, sklearn fitted attributes (trailing-underscore), `n_features_in_`, and passes the v1 `estimator_checks` harness. See [FEATURES.md](FEATURES.md).
 
-**Must have (table stakes):**
-- Oracle harness with sign-flip helpers (PCA/TSVD components) and label-permutation helpers (KMeans/DBSCAN labels) — gates all correctness tests; P0 prerequisite before any estimator
-- Arrow zero-copy ingest with offset/nullability/alignment validation — memory-efficiency spine; P0
-- f64 capability gating per backend (`feature_enabled(FloatKind::F64)`) with xfail/skip on unsupported adapters — P0; without this wgpu CI silently hides f64 failures
-- Per-backend wheel distribution naming (distinct names: `mlrs-cpu`, `mlrs-wgpu`, etc.) — decided P0 even though wheels ship in Phase 5
-- GEMM (via `cubecl-matmul`), reductions (sum/mean/argmin/L2-norm), pairwise Euclidean distance — underpin all four estimator families
-- SVD (full, Jacobi) and symmetric eigendecomposition — gates PCA, TruncatedSVD, OLS-svd, Ridge-svd; highest-priority single primitive
-- Coordinate-descent solver (Lasso and ElasticNet share it; Lasso = `l1_ratio==1` special case)
-- Quasi-Newton L-BFGS/OWL-QN solver (LogisticRegression; highest correctness risk in the project)
-- All 11 v1 estimators with sklearn-matching default solvers/init — not cuML defaults
+**Must have (the 16 firm estimators = the MVP):**
+- Covariance: EmpiricalCovariance, LedoitWolf (ddof=0 MLE covariance; LW shrinkage clipped to [0,1]).
+- Projection: IncrementalPCA (incremental-SVD merge, V-based `svd_flip`, ddof=1 explained_variance), Gaussian/SparseRandomProjection (property-gated).
+- Kernel: KernelRidge (Cholesky dual solve), KernelDensity (brute-force kernel-sum, log-sum-exp).
+- Spectral: SpectralEmbedding, SpectralClustering (full-spectrum eig → take smallest nontrivial → KMeans).
+- SGD/linear-SVM: MBSGDClassifier/Regressor (sklearn schedules incl. `optimal` + Bottou t0), LinearSVC/SVR (sklearn liblinear objective: `squared_hinge`/`squared_epsilon_insensitive` defaults, regularized intercept via `intercept_scaling`).
+- Naive Bayes: Gaussian/Multinomial/Bernoulli/Complement/CategoricalNB (per-variant smoothing; log-sum-exp predict_proba).
 
-**Should have (v1.x differentiators after oracle passes):**
-- Additional solver variants: `jacobi` SVD, `lsmr`, `qr` for OLS; L1/elasticnet penalties for LogisticRegression
-- Distance-weighted KNN (`weights='distance'`)
-- Additional distance metrics: cosine, Minkowski-p, Manhattan across KMeans/DBSCAN/KNN
-- `class_weight='balanced'` for LogisticRegression
-- k-means|| scalable init (cuML fidelity, once k-means++ oracle path passes)
-- `rbc` (random ball cover) acceleration for DBSCAN/KNN
+**Should have (differentiators):** f64 device path for all 16 (most GPU libs are f32-only); a single generic kernel-matrix prim reused by KRR/KDE and future kernel-SVM; exact (not approximate) spectral.
 
-**Defer (v2+):**
-- Approximate KNN (ivfflat/ivfpq) — breaks exact 1e-5 oracle; needs separate approximate-tolerance test design
-- Sparse-input paths (TruncatedSVD on TF-IDF, sparse Lasso)
-- IncrementalPCA, MiniBatchKMeans, multi-task linear models
-- f16/bf16 validated precision paths
-- Multi-GPU/distributed (cuml.dask, NCCL/UCX, `*_mg` paths)
-- cuml.accel transparent acceleration (import-hook proxying)
+**Defer (v3):** `crammer_singer` multiclass, callable/numba kernels, KDE `sample`, spectral `discretize`/`cluster_qr`, tree-based KDE, native sparse interchange, Lanczos/shift-invert smallest-eigenpair solver, Nyström kernel approximation.
 
 ### Architecture Approach
 
-The architecture is a five-crate Cargo workspace with a strictly acyclic dependency chain and a clean two-generic boundary. The key architectural insight: `R: Runtime` (backend) is resolved at compile time — one wheel per backend, `R` monomorphized in `mlrs-py` by the enabled Cargo feature — while `F: Float` (float type) is resolved at runtime by the input array's dtype, so every wheel ships both f32 and f64 monomorphizations. The backend feature flags live in exactly one crate (`mlrs-backend`); `mlrs-kernels` has zero feature flags so kernels compile once and are reused across all backends. Fitted state (`coef_`, `components_`, `cluster_centers_`) is stored as device `ServerHandle` values inside the estimator struct and only materialized host-side lazily on Python attribute access, mirroring cuML's `CumlArrayDescriptor` pattern to avoid unnecessary device->host copies.
+The v1 five-crate seam is REUSED unchanged and the dependency graph stays acyclic. Every v2 addition is a new file plus a `pub mod`/`pub use` line; no v2 work edits a v1 estimator file. Two new traits are added (`PartialFit<F>` for IncrementalPCA, `ScoreSamples<F>` for KernelDensity); all other traits (`Fit`, `Predict`, `Transform`, `PredictLabels`, `PredictProba`) are reused, and covariance estimators need no new trait (`Fit` + accessors, no `predict`). See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Major components:**
-1. `mlrs-core` — backend-agnostic vocabulary: `Estimator`/`Fit`/`Predict`/`Transform`/`Score` traits, `Params` (get/set), `Shape`/`Strides` (smallvec), `MlrsError` (thiserror), `DType` enum, sign-flip/label-permutation comparison contracts shared between `mlrs-algos` and `tests/`
-2. `mlrs-kernels` — all `#[cube]`/`#[cube(launch)]` compute primitives generic over `<F: Float>` only: GEMM wrapper (cubecl-matmul), reduce, pairwise distance, SVD/eig (`decomp.rs`), coordinate descent, quasi-Newton, top-k selection, scatter-mean, elementwise ops; no backend features; compiles once
-3. `mlrs-backend` — sole owner of `cpu`/`wgpu`/`cuda`/`rocm` Cargo features; `DeviceArray<R,F>` buffer abstraction; `arrow_bridge.rs` (Arrow->Bytes zero-copy with offset/nullability/alignment validation); buffer pool / `ExclusivePages` tuning; `caps.rs` capability queries (f64, plane/subgroup support)
-4. `mlrs-algos` — estimator orchestration generic over `<F: Float, R: Runtime>`; composes primitives from `mlrs-kernels` over device arrays from `mlrs-backend`; implements `mlrs-core` traits; all four algorithm families
-5. `mlrs-py` — cdylib; `#[pyclass]`/`#[pymethods]` sklearn estimators; Arrow PyCapsule + numpy adapters; f32/f64 dispatch by input dtype; concrete `R` fixed at compile time by feature; `#[global_allocator]` = mimalloc; one wheel per backend
-
-**Dependency direction (strictly acyclic):**
-`mlrs-py` -> `mlrs-algos` -> {`mlrs-kernels`, `mlrs-backend`} -> `mlrs-core`
+1. `mlrs-kernels` — feature-free `#[cube]` kernels (new: kernel-matrix elementwise map, Laplacian D^{-1/2} scale, SGD per-minibatch grad/update, NB per-class reductions).
+2. `mlrs-backend/src/prims/` — the only kernel-launch site (D-13); five new prim files following the `validate_geometry → compose prims → in-place scale on reused out → return exact handle` contract, each with a PoolStats memory gate.
+3. `mlrs-algos` — estimator structs that COMPOSE prims (never launch kernels); new modules `covariance/`, `projection/`, `kernel/`, `manifold/`, + spectral in `cluster/`, MBSGD/SVM in `linear/`, `naive_bayes/`.
+4. `mlrs-py` — `#[pyclass]` via `any_estimator!` enum (Unfit/F32/F64), dtype-suffixed accessors, `py.detach` + `guard_f64`, pure-Python sklearn shim reusing `MlrsBase`.
+5. `scripts/gen_oracle.py` + committed `tests/fixtures/*.npz` — per-estimator fixtures, with the RandomProjection property-gate exception.
 
 ### Critical Pitfalls
 
-1. **Solver/defaults mismatch vs. sklearn oracle** — The oracle is scikit-learn, not cuML. Porting cuML's defaults (OLS=eig, KMeans=k-means||, TruncatedSVD=randomized, PCA without svd_flip) produces 1e-2..1e-1 errors that look like kernel bugs but are not. Mitigation: encode sklearn-matching defaults per the FEATURES.md solver table from P0; build sign-flip and label-permutation oracle helpers before any estimator.
+Top pitfalls, all grounded in v1 idioms + project memory. See [PITFALLS.md](PITFALLS.md).
 
-2. **f64 absent on wgpu (the primary CI gate)** — WebGPU/WGSL has no 64-bit float; wgpu's `SHADER_F64` is native-only, absent on many Vulkan/Metal/DX12 adapters and all browser WebGPU. Building on f64 and assuming wgpu support causes CI to silently skip or hard-fail all f64 tests. Mitigation: capability-gate f64 via `feature_enabled(FloatKind::F64)` in P0; f32 is the portable correctness baseline.
+1. **cpu-MLIR scatter-add panic (SGD/NB/Laplacian)** — naive kernels accumulate into shared weight/class/degree bins (cross-unit atomics or SharedMemory) → compiles under cuda/wgpu but PANICS at launch under `--features cpu`. **Avoid:** GATHER rewrite — one thread per output cell (weight coord / (class,feature) / row), ascending scan, F/u32 accumulators, if-guards, no SharedMemory/atomics.
+2. **RandomProjection value-unmatchable (wrong oracle)** — mlrs's seeded PRNG ≠ NumPy MT19937, so a value oracle reports total failure on correct code. **Avoid:** property gate (JL distortion within `eps`, matrix distribution, seed-reproducibility, `transform == X@components_.T` self-consistency); value-match only `johnson_lindenstrauss_min_dim` (pure arithmetic).
+3. **SGD oracle nondeterminism (and using cuML)** — shuffle RNG + `optimal` schedule + early-stop make a default-config oracle a moving target; cuML diverges. **Avoid:** pinned self-reference oracle (`shuffle=False`, fixed `eta0`/schedule, fixed `max_iter`, `tol=0`, `n_iter_no_change=max_iter`) referencing sklearn, mirroring v1 LogReg; separate looser convergence property test.
+4. **Spectral takes the WRONG eigenvectors** — v1 eig returns full *descending* spectrum; spectral needs *smallest* nontrivial. **Avoid:** sort ascending, drop index 0 (trivial ≈0 vector), take next k; `_deterministic_vector_sign_flip` for embedding output; clustering is sign-immune via `label_perm`; subspace test for degenerate spectra.
+5. **f64-on-rocm runs instead of skipping (gate violation)** — every new f64 oracle case must begin `if capability::skip_f64_with_log() { return; }` (cubecl-cpp 0.10 has F64 unregistered for HIP). Hits EVERY new test file in P7–11; make it a per-file checklist line.
 
-3. **SVD/eig primitive gates two estimator families** — PCA, TruncatedSVD, OLS-svd, and Ridge-svd are unbuildable until a validated SVD/eig exists. This primitive is also the hardest single kernel in the project. Mitigation: build and validate SVD standalone with sign-flip oracle comparison before touching any of those estimators; give it a dedicated phase.
-
-4. **Arrow zero-copy soundness on sliced/nullable/offset inputs** — `Float32Array::values()` returns the full backing buffer ignoring the array's logical offset; sliced arrays upload the wrong data window. Nullable arrays silently feed garbage/NaN into math. `bytemuck::cast_slice` panics on misaligned buffers. Mitigation: centralize the bridge in `mlrs-backend/arrow_bridge.rs`; validate offset, nullability, and alignment before upload; use PyCapsule ownership transfer (not bare `&[u8]` borrows) across the Python FFI boundary.
-
-5. **LogisticRegression QN convergence parity is the highest correctness risk among estimators** — Quasi-Newton (L-BFGS/OWL-QN) convergence to match sklearn `lbfgs` requires careful penalty normalization and multinomial formulation. Mitigation: flag for deeper research before Phase 4 implementation; do not attempt without a research phase.
-
-6. **Per-backend wheel naming collision** — maturin derives wheel name from the Cargo package name; four backend feature variants produce four wheels with identical names that overwrite each other on PyPI. Mitigation: assign distinct distribution names (`mlrs-cpu`, `mlrs-wgpu`, `mlrs-cuda`, `mlrs-rocm`) in workspace/pyproject.toml at P0.
-
-7. **CubeCL `#[cube]` IR constraints fail in non-obvious ways** — `#[cube]` is a proc-macro rewriting to CubeCL IR: calling plain Rust helpers (E0433), `if`-expressions (E0308 ExpandElementTyped), method-style math (`x.exp()` -> E0599), raw numeric literals in generic kernels, and `u64`/`usize` device arithmetic all fail. AGENTS.md mandates reading the CubeCL error guideline before any fix. Mitigation: adopt guideline conventions from the first kernel; never apply a blind fix.
+Additional recurring traps: IncrementalPCA merge (mean-correction factor, stack order, V-based `svd_flip`, ddof=1) — test with 2+ batches; LedoitWolf/EmpCov ddof=0 normalization + `shrinkage_ ∈ [0,1]`; NB underflow/smoothing/`var_smoothing` from *global* feature variance; large n×n kernel/Gram/Laplacian tiles overflowing gfx1100 LDS (65536 B) → keep big operands in global memory; per-family f32-on-rocm bands (classifiers/clusterers keep exact label/argmax as the hard gate).
 
 ## Implications for Roadmap
 
-Based on the combined research, the primitive dependency graph, and the pitfall phase-to-address map, the recommended phase structure is:
+Build order 7→8→9→10→11, continuing v1's phase numbering. The seed roadmap order is dependency-correct; the one addition is making the P8→P9 dependency explicit.
 
-### Phase 0: Foundation — Oracle Harness, Backend Abstraction, Arrow Bridge
-**Rationale:** Five of the seven critical pitfalls require a P0 design decision or are prevented here. Nothing downstream can be tested correctly without the oracle harness (sign-flip/label-permutation helpers), the Arrow bridge with validation, and the f64 capability-gate policy. The per-backend wheel naming scheme must also be locked now to avoid restructuring the workspace later.
-**Delivers:** Complete workspace scaffolding; `mlrs-core` (all traits, types, oracle comparison contracts in `oracle.rs`); `mlrs-backend` skeleton with `DeviceArray<R,F>`, `arrow_bridge.rs` (offset/nullability/alignment validation), `caps.rs` (f64/plane capability gates), buffer pool skeleton; `mlrs-py` architecture with concrete `R` type alias per feature; oracle test harness with sign-flip and label-permutation helpers, seeded RNG fixtures (`StdRng::seed_from_u64`), `approx` 1e-5 (f64) and documented f32 tolerance policy; CI matrix (`--features cpu`, `--features wgpu`); one trivial end-to-end kernel to prove the generic R/F spine, zero-copy ingest, read-back, and oracle comparison all work; distinct distribution names and `available_backends()` contract.
-**Features from FEATURES.md:** Cross-cutting sklearn API skeleton; Arrow zero-copy ingest infrastructure; oracle-test contract; f32/f64 dtype dispatch infrastructure.
-**Avoids:** Pitfall 1 (solver table + oracle helpers codified before any estimator), Pitfall 4 (f64 capability gate policy), Pitfall 6 (Arrow offset/nullable/alignment validation), Pitfall 7 (wheel naming decided before packaging phase).
-**Research flag:** Standard patterns — no deeper research needed for Phase 0.
+### Phase 7: Covariance & Projection
+**Rationale:** Pure assembly on v1 covariance + SVD — lowest-risk opener, builds confidence and lands the reusable RNG-matrix prim early. First introduces the `PartialFit` trait.
+**Delivers:** `prims/rng.rs` (host PRNG), `prims/incremental_svd.rs` (glue over v1 svd), `PartialFit<F>` trait; EmpiricalCovariance, LedoitWolf, IncrementalPCA, GaussianRandomProjection, SparseRandomProjection.
+**Addresses (FEATURES):** Covariance + Projection families.
+**Avoids (PITFALLS):** RandomProjection wrong-oracle (set property-gate contract up front); IncrementalPCA merge (V-based svd_flip, ddof=1, 2+ batch oracle); LedoitWolf ddof=0 + shrinkage∈[0,1]; f64-on-rocm skip guard.
 
-### Phase 1: Core Compute Primitives — GEMM, Reductions, Pairwise Distance, Covariance
-**Rationale:** Every estimator depends on at least one of these primitives. Validating them standalone means each downstream estimator is "mostly assembly." The f32 accumulation-drift risk (Pitfall 2) and plane/subgroup portability risk (Pitfall 5) must be addressed here or they force kernel rewrites later.
-**Delivers:** `mlrs-kernels` with: GEMM wrapper around `cubecl-matmul` (`Strategy::Auto`); reductions (sum/mean/argmin/L2-norm) with stable tree-reduction pattern and shared-memory fallback for adapters without subgroups (never hardcode plane=32; always use `PLANE_DIM`); pairwise squared Euclidean distance with `max(d2, 0)` clamp (GEMM-based for large N; direct `||a-b||^2` for DBSCAN range-query path); covariance/Gram (XtX via GEMM); scatter-mean (KMeans centroid update); top-k selection. Each primitive has a standalone oracle test vs. a host reference, validating both f32 and f64, on both `cpu` and `wgpu`.
-**Uses:** `cubecl-matmul`, `cubecl-reduce`, `cubecl-std` (all at 0.10.0); `bytemuck` for read-back; `approx` for tolerance checks.
-**Avoids:** Pitfall 2 (f32 accumulation drift, stable tree reduction, distance clamp), Pitfall 3 (CubeCL IR conventions established on first kernel), Pitfall 5 (plane gating + shared-memory fallback).
-**Research flag:** Standard patterns for GEMM and tree reductions (fully documented in provided CubeCL manuals). Flag the wgpu workgroup-storage limit if hit during distance kernel development.
+### Phase 8: Kernel Family
+**Rationale:** Lands the keystone kernel-matrix prim (linear/RBF/poly/sigmoid) that P9 and future kernel-SVM reuse. Introduces the `ScoreSamples` trait.
+**Delivers:** `prims/kernel_matrix.rs` (one elementwise map over distance/Gram), `ScoreSamples<F>` trait; KernelRidge (reuses `cholesky_solve`), KernelDensity (reuses distance + log-sum-exp).
+**Uses (STACK):** existing distance/gemm/cholesky prims + one new elementwise kernel.
+**Implements (ARCH):** `prims/kernel_matrix.rs` + `kernel/` estimator module.
+**Avoids (PITFALLS):** per-kernel log-norm constants (KDE); singular-K fallback (KRR); LDS budget overflow on dense Gram tiles (keep in global); f64-on-rocm skip guard.
 
-### Phase 2: Decomposition Primitive — SVD/Eig (the Hard Gate)
-**Rationale:** SVD (full + Jacobi) and/or symmetric eigendecomposition of the covariance matrix is the single highest-risk, highest-leverage primitive. It gates PCA, TruncatedSVD, OLS-svd path, and Ridge-svd path — four estimators in two families. Building and validating it standalone (with sign-flip oracle helpers from Phase 0) before any estimator exists means those estimators are cheap to assemble. Giving it a dedicated phase prevents it from being rushed inside a larger estimator phase.
-**Delivers:** `mlrs-kernels/decomp.rs`: Jacobi SVD for general matrices; symmetric eigendecomposition of the covariance matrix (PCA `full` solver path); standalone oracle tests with sign-flip normalization (svd_flip convention); validated on both `cpu` and `wgpu`, both f32 and f64 (capability-gate skip on wgpu adapters lacking f64).
-**Avoids:** Pitfall 1 (SVD sign ambiguity — `svd_flip` convention applied and oracle-tested here before any estimator uses it); Pitfall 3 (most complex kernel, highest CubeCL IR risk — requires the error guideline).
-**Research flag:** NEEDS DEEPER RESEARCH — Jacobi SVD on GPU in CubeCL is not a pre-built `cubecl-matmul` primitive; the iterative Jacobi rotation kernel design for `#[cube]` requires domain research. Run `/gsd-plan-phase --research-phase 2` before writing any Phase 2 code.
+### Phase 9: Spectral Family [HARD DEP on Phase 8]
+**Rationale:** Cashes in v1's hardest-won prim (`eig`) for two estimators cheaply; the Laplacian's affinity *is* `kernel_matrix(Rbf)` from P8 — order is mandatory, not just convenient.
+**Delivers:** `prims/laplacian.rs` (affinity → degree row-reduction → normalized Laplacian); SpectralEmbedding (Fit+Transform), SpectralClustering (Fit+PredictLabels, reuses v1 KMeans).
+**Uses (STACK):** P8 kernel_matrix + v1 eig + v1 kmeans.
+**Avoids (PITFALLS):** Laplacian degree scatter + zero-degree (`d_inv_sqrt` guard, NO `F::INFINITY`); wrong/sign eigenvectors (ascending + drop-0 + sign_flip; clustering via label_perm); LDS overflow on dense Laplacian; f64-on-rocm skip guard.
 
-### Phase 3: Closed-Form Estimators — LinearRegression, Ridge, PCA, TruncatedSVD
-**Rationale:** These four estimators are "mostly assembly" once GEMM, covariance/XtX, and SVD/eig from Phases 1-2 are validated. They exercise the full pipeline (Arrow->kernel->device state->lazy materialize->oracle compare) with no convergence subtlety, de-risking the spine before the delicate iterative-solver work. PCA and TruncatedSVD are built together since TSVD is PCA minus centering over the same SVD primitive.
-**Delivers:** `mlrs-algos/linear/ols.rs` (svd path as v1 default for sklearn match; eig as fast option); `mlrs-algos/linear/ridge.rs` (regularized eig/svd); `mlrs-algos/decomp/pca.rs` (center + eig/SVD + svd_flip sign convention; `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`; transform/inverse_transform); `mlrs-algos/decomp/truncated_svd.rs` (SVD without centering; oracle compared against sklearn `algorithm='arpack'` not the stochastic `randomized` default). Full fitted attributes, oracle tests with sign-flip normalization, both dtypes.
-**Avoids:** Pitfall 1 (OLS=svd default, not eig; TruncatedSVD oracle vs sklearn `arpack`; PCA with `svd_flip`).
-**Research flag:** Standard patterns — closed-form assembly on validated primitives is straightforward.
+### Phase 10: SGD / Linear-SVM
+**Rationale:** The single genuinely new solver; unblocks four estimators at once and carries the highest cpu-MLIR risk. Budget a research spike before planning.
+**Delivers:** `prims/sgd.rs` (hinge/log/squared/ε-insensitive losses; l1/l2/elasticnet; LR schedules incl. `optimal` + Bottou t0); MBSGDClassifier/Regressor, LinearSVC, LinearSVR (sklearn liblinear converged-optimum via v1 CD).
+**Uses (STACK):** gemm + reductions + host SplitMix64 shuffle.
+**Avoids (PITFALLS):** SGD cross-unit atomics (two-pass GATHER kernel); nondeterministic oracle (pinned shuffle=False/fixed-schedule self-reference, sklearn NOT cuML); squared_hinge default + regularized intercept (LinearSVC); f64-on-rocm skip guard; named f32 band with exact predicted labels as hard gate.
 
-### Phase 4: Distance-Based Estimators + Iterative-Solver Estimators
-**Rationale:** Two sub-tracks that can proceed in parallel after Phase 3 validates the pipeline. Distance-based estimators (KNN, KMeans, DBSCAN) all reuse the pairwise-distance primitive from Phase 1. KMeans must use k-means++ init (not k-means||) to match sklearn within 1e-5; labels require permutation-invariant comparison. Iterative-solver estimators (Lasso/ElasticNet via CD; LogisticRegression via QN) own their solver kernels and carry the convergence-parity risk. Lasso and ElasticNet are one feature — they share the CD kernel; Lasso = `l1_ratio==1`.
-**Delivers:**
-- `mlrs-kernels/coord_descent.rs` (CD step + soft-threshold); `mlrs-algos/linear/lasso_enet.rs` (single file, Lasso and ElasticNet together); both validated vs. sklearn coordinate-descent default at 1e-5.
-- `mlrs-kernels/quasi_newton.rs` (L-BFGS inner kernels); `mlrs-algos/linear/logistic.rs` (QN solver, predict/predict_proba, `coef_`/`intercept_`/`classes_`/`n_iter_`, binary + softmax multiclass).
-- `mlrs-algos/neighbors/nearest.rs` (brute exact kNN, Euclidean, `kneighbors` returning sorted distance+index, `kneighbors_graph`); `knn_classifier.rs` (uniform + distance-weighted vote, `predict_proba`); `knn_regressor.rs` (uniform + distance-weighted mean).
-- `mlrs-algos/cluster/kmeans.rs` (Lloyd + k-means++ init; `cluster_centers_`/`labels_`/`inertia_`/`n_iter_`; predict/transform; label-permutation oracle compare); `dbscan.rs` (brute range query + BFS/union-find connected-components; `labels_` with -1 noise; `core_sample_indices_`).
-**Avoids:** Pitfall 1 (KMeans k-means++ not k-means||; label-permutation oracle for KMeans/DBSCAN); Pitfall 2 (distance clamp in range-query path).
-**Research flag:** LogisticRegression QN convergence parity NEEDS DEEPER RESEARCH — matching sklearn `lbfgs` within 1e-5 across penalty types and multinomial formulations is the highest correctness risk in the project. Run `/gsd-plan-phase --research-phase 4` for the LogisticRegression sub-task before implementation. CD convergence for Lasso/ElasticNet is medium-risk; validate tolerance during implementation.
-
-### Phase 5: Python Surface — PyO3 Estimators, Per-Backend Wheels, sklearn Checks
-**Rationale:** `mlrs-py` scaffolding can begin during Phase 3 (one estimator as the test scaffold), but the full surface is completed here. Finalizing Arrow PyCapsule ingest, GIL release, NotFittedError mapping, and per-backend wheel build completes the user-facing product.
-**Delivers:** All `#[pyclass]`/`#[pymethods]` sklearn estimators; f32/f64 dispatch by input dtype; `fit` returns `self`; `get/set_params` for all estimators; `NotFittedError` mapping; Arrow PyCapsule ownership transfer + numpy adapter; `Python::allow_threads` around device compute; per-backend wheel build (`mlrs-cpu`, `mlrs-wgpu`, `mlrs-cuda`, `mlrs-rocm`) via `maturin build --features <backend>`; `abi3-py312`; `available_backends()` probe with clear no-driver import errors for cuda/rocm; `pytest` oracle tests + `sklearn.utils.estimator_checks` pass.
-**Avoids:** Pitfall 6 (PyCapsule ownership transfer, lifetime soundness; no bare `&[u8]` borrows into Python-owned buffers); Pitfall 7 (distinct distribution names, no-driver clear error, GIL released around compute).
-**Research flag:** Maturin per-feature distribution naming may need a small spike — the multi-distribution pattern is undocumented in maturin's first-party docs. Otherwise standard patterns.
+### Phase 11: Naive Bayes
+**Rationale:** Wide-but-shallow (reductions only) — highest coverage per unit effort, ideal closing bookend. Five mutually-independent, parallel-buildable estimators.
+**Delivers:** Gaussian/Multinomial/Bernoulli/Complement/CategoricalNB (all Fit+PredictLabels+PredictProba); no new prim.
+**Avoids (PITFALLS):** per-class scatter-add (one-owner-per-(class,feature) GATHER); underflow/smoothing/`var_smoothing` from global variance; log-sum-exp predict_proba (rows sum to 1); per-variant quirks (Bernoulli `(1-x)log(1-p)`, Complement argmin/L1-norm, Categorical ragged list); f64-on-rocm skip guard.
 
 ### Phase Ordering Rationale
 
-- **Primitives before estimators** (Phases 0-2 before Phases 3-4): SVD/eig gates two families, pairwise-distance gates three; validating standalone turns each downstream estimator into "assembly" rather than a debugging exercise.
-- **Oracle harness in Phase 0, not Phase 1+**: without sign-flip and label-permutation helpers, PCA/SVD/KMeans/DBSCAN tests fail at 1e-5 for non-bugs; this is a P0 prerequisite per both FEATURES.md and PITFALLS.md.
-- **SVD in its own phase (Phase 2)**: the single hardest primitive and the single most critical gate; a dedicated phase prevents it from being rushed inside a larger estimator phase and makes the decomposition-family unblocker explicit.
-- **Closed-form estimators (Phase 3) before iterative (Phase 4)**: closed-form paths exercise the full pipeline with no convergence risk, catching Arrow bridge and oracle harness bugs cheaply before the delicate CD/QN convergence work.
-- **Distance-based and iterative estimators in the same phase (Phase 4)**: they share no primitive dependencies with each other and can proceed in parallel sub-tracks; grouping them minimizes phase count without creating blocking dependencies.
-- **Memory-efficiency is per-phase, not deferred**: buffer reuse (`client.empty` retain across iterations), `ExclusivePages` allocator tuning, and lazy fitted-state materialization are implemented in each phase where the relevant estimator is built — PROJECT.md constraint.
+- **Dependency-driven:** RNG/incremental-SVD (P7) → IncrementalPCA/RandomProjection; kernel-matrix (P8) → spectral affinity (P9) AND future kernel-SVM; Laplacian+eig (P9) reuse v1 eig/KMeans; SGD solver (P10) → all four SGD/SVM estimators; reductions-only (P11) needs nothing new.
+- **Risk-tiered:** P7 and P11 are pure assembly (confidence bookends); P8/P9 are MEDIUM (kernel-matrix + smallest-eig); P10 is the HIGH-risk single new solver isolated to one phase.
+- **Pitfall-driven:** the P8→P9 hard dependency prevents duplicating the kernel-matrix map in the Laplacian; isolating SGD in P10 contains the cpu-MLIR GATHER risk; bookending with assembly phases keeps momentum either side of the hard solver.
 
 ### Research Flags
 
-Phases needing `/gsd-plan-phase --research-phase` before coding:
-- **Phase 2 (SVD/eig primitive):** Jacobi SVD on GPU in CubeCL is not a pre-built `cubecl-matmul` primitive; the iterative Jacobi rotation kernel design for `#[cube]` requires dedicated domain research. This is the highest-risk single deliverable in the project.
-- **Phase 4 — LogisticRegression sub-task:** Quasi-Newton (L-BFGS) convergence parity with sklearn `lbfgs` within 1e-5 across penalty types and multinomial formulations; requires research into penalty normalization, step-size schedule, and convergence criteria matching sklearn's internal implementation.
+Phases needing a research spike during planning (the three genuine unknowns from `research/questions.md`):
+- **Phase 7:** `[v2-P1]` incremental-SVD merge — settle "full Jacobi per batch vs dedicated rank-update kernel" and the f32-on-rocm stability of the stacked re-SVD.
+- **Phase 9:** `[v2-P3]` smallest-eigenpair extraction — confirm full-spectrum-then-slice is acceptable at v2 sizes (vs Lanczos/shift-invert); document the problem-size cap.
+- **Phase 10:** `[v2-P4]` SGD under cpu-MLIR — spike the two-pass GATHER kernel and the pinned deterministic oracle before wiring any of the four estimators.
 
-Phases with well-documented patterns (skip research-phase):
-- **Phase 0:** Cargo workspace setup, CubeCL generics spine, Arrow->bytemuck->Bytes bridge, PyO3 architecture — fully documented in provided manuals and crates.io docs.
-- **Phase 1:** GEMM via cubecl-matmul, tree reductions via shared-memory manual, pairwise distance — well-documented CubeCL patterns with authoritative manual coverage.
-- **Phase 3:** Closed-form assembly (OLS, Ridge, PCA, TSVD) on validated primitives — straightforward once primitives exist.
-- **Phase 5:** PyO3 + maturin packaging — well-documented; the multi-distribution spike is small.
+Phases with standard/established patterns (research-phase can be skipped):
+- **Phase 8:** kernel-matrix is a known elementwise map over distance/Gram; design is settled in research.
+- **Phase 11:** Naive Bayes is reductions-only over the validated v1 reduce prim; per-variant math is fully specified in FEATURES.md.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Versions verified via crates.io API (cubecl 0.10.0, pyo3 0.28.3, maturin 1.13.3, arrow 59.0.0); provided CubeCL and optimisor manuals are authoritative. Maturin multi-backend wheel naming is MEDIUM — no first-party recipe exists. |
-| Features | HIGH | Grounded in cuML v26.08 source signatures read directly + sklearn public API conventions. Solver-default mismatch table is the load-bearing correctness claim and is high-confidence documented risk. |
-| Architecture | HIGH | Five-crate layout, generic R/F boundary, and Arrow zero-copy flow are grounded in provided CubeCL generics/matmul/slicing/allocator and zero-copy manuals which all agree. Estimator-trait exact shape is MEDIUM — synthesized from sklearn + cuML, no first-party prescription. |
-| Pitfalls | HIGH | CubeCL error guideline is authoritative project canon; wgpu f64 absence confirmed via WebGPU spec and wgpu docs; cuML CONCERNS.md read directly (17 warp-size sites, int32 overflow, host-device debt). Arrow slicing/nullability pitfall grounded in `values()` semantics documentation. |
+| Stack | HIGH | crates.io versions verified 2026-06-14; cubek-random/pyo3 decisions grounded in Context7 + transitive-pin analysis + direct source reads. |
+| Features | HIGH | sklearn semantics verified live against docs + cuML source; parity-sensitive defaults (SGD `optimal`/t0, LinearSVC `squared_hinge`/`dual='auto'`, NB smoothing) explicitly confirmed. |
+| Architecture | HIGH for placement/signatures/traits/dispatch/oracle (mirrors shipped files); MEDIUM for incremental-SVD merge stability, SGD-under-cpu-MLIR, smallest-eigenpair — the three open questions. |
+| Pitfalls | HIGH for backend/cpu-MLIR + oracle traps (v1 idioms + memory) and sklearn parity math; MEDIUM for exact f32-on-rocm band magnitudes (must be measured empirically per family, as in v1). |
 
 **Overall confidence:** HIGH
 
 ### Gaps to Address
 
-- **Jacobi SVD CubeCL implementation strategy**: no pre-built cubecl-matmul SVD kernel exists; the specific iterative Jacobi rotation design for `#[cube]` needs research during Phase 2 planning before any code is written.
-- **LogisticRegression QN convergence**: the exact penalty normalization and multinomial formulation that matches sklearn `lbfgs` within 1e-5 is not documented with sklearn-parity focus in the cuML source; needs research before Phase 4 implementation.
-- **Maturin per-feature distribution naming**: the multi-distribution wheel pattern is undocumented in maturin first-party docs; a small build-system spike in Phase 0 or Phase 5 planning should validate the `pyproject.toml` structure for four distinct package names from one workspace.
-- **f32 tolerance policy per estimator family**: f64 maps cleanly to 1e-5; the justified f32 tolerance for each algorithm family needs to be decided and documented in the oracle harness during Phase 0. cuML uses `unit_tol=1e-4` as a reference point.
-- **wgpu f64 adapter coverage in CI**: the CI hardware's wgpu adapter may or may not expose `SHADER_F64`; Phase 0 CI setup should log which dtypes actually ran on which backend to make partial f64 coverage visible rather than silently passing.
+- **Incremental-SVD f32 stability (P7):** the stacked re-SVD merge may compound f32 error on rocm. Handle: research spike at plan time; reuse v1 Jacobi SVD; expect a documented f32 band for components/explained_variance; gate with a 2+ batch oracle.
+- **Smallest-eigenpair extraction (P9):** full-spectrum-then-slice is the v2 decision but has an O(n³) size ceiling. Handle: confirm and document the `n_samples` cap during planning; Lanczos/shift-invert deferred to v3.
+- **SGD under cpu-MLIR (P10):** the two-pass GATHER kernel is designed but unproven on the MLIR backend. Handle: spike the cpu launch (not just compile) before wiring estimators; verify no Atomic/SharedMemory imports.
+- **f32-on-rocm band magnitudes (P7–11):** predicted per-family (LedoitWolf, IncrementalPCA, KernelRidge/Density, Spectral, SGD/SVM, GaussianNB likely need bands) but actual magnitudes must be measured on hardware. Handle: measure during each phase's validation; classifiers/clusterers keep exact label/argmax as the hard gate; never loosen the global tolerance.
+- **Sparse densify memory cost:** densifying large term-count matrices can blow the per-phase memory gate. Handle: document in estimator docstrings; let the existing BufferPool gate catch regressions; native CSR is v3.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- Provided CubeCL manuals (`Cubecl_generics.md`, `Cubecl_basic_operations.md`, `Cubecl_plane.md`, `Cubecl_shared_memory.md`, `Cubecl_dynamic_vectorization.md`, `cubecl_matmul_gemm_example.md`, `Tuning_ExclusivePages_Allocator.md`, `Backend-Agnostic_Buffer_Slicing.md`, `cubecl_error_guideline.md`, error solution guides) — kernel generics, trait bounds, launch ordering, GEMM, reductions, buffer slicing, allocator tuning, IR failure modes
-- Provided optimisor manuals (`ZERO_COPY_ARROW_CUBECL.md`, `ZERO_COPY_TRANSMUTATION_CUBECL.md`, `HALF_PRECISION_CUBECL.md`, `MIMALLOC_MANUAL.md`, `JEMALLOC_MANUAL.md`, `SMALLVEC_MANUAL.md`, `COMPACT_STR_OPTIMIZATION_EN.md`) — Arrow->bytemuck->CubeCL path, allocator pinning, smallvec/compact_str patterns
-- `/tracel-ai/cubecl` (Context7) — Runtime trait, `client.features()`/`feature_enabled`, `#[comptime]` specialization
-- crates.io API — verified current versions: cubecl 0.10.0 (2026-05-07), pyo3 0.28.3 (2026-04-02), maturin 1.13.3 (2026-05-11), arrow 59.0.0 (2026-06-09), tikv-jemallocator 0.7.0 (2026-05-25)
-- `.planning/PROJECT.md`, `AGENTS.md` — scope, constraints, 1e-5 oracle, source/test separation, CubeCL error-guideline protocol
-- `.planning/codebase/ARCHITECTURE.md`, `CONCERNS.md`, `TESTING.md` — cuML `CumlArray`/`Base`/`@reflect` patterns, int32 overflow bug, 17 warp-size sites, `assert_dbscan_equal`, fuzzy `array_equal`
-- cuML v26.08 estimator sources (read directly) — estimator signatures, hyperparameters, fitted attributes, `_get_param_names`
+- Context7 `/tracel-ai/cubek` + `/tracel-ai/cubecl` — cubek-random API (no seed arg; shared-memory Tausworthe); CubeCL 0.10 multi-runtime.
+- crates.io API (2026-06-14) — cubecl 0.10.0, cubek-matmul/reduce 0.2.0, arrow 59.0.0, pyo3 0.28/0.29.
+- scikit-learn docs verified live 2026-06-14 — SGDClassifier (optimal/t0/schedules/stopping), LinearSVC/LinearSVR (squared_hinge/dual/liblinear), IncrementalPCA merge, LedoitWolf shrinkage, RandomProjection JL + sparse density, KDE kernels, spectral normalized-Laplacian + deterministic sign flip.
+- cuML v26.08 source (read-only reference) — ledoit_wolf, kernel_ridge, sgd.pyx (confirms cuML is a *subset* of sklearn), naive_bayes, manifold, svm, linear_model.
+- mlrs shipped code — `traits.rs`, `prims/{covariance,distance,kmeans,lbfgs,cholesky,reduce}.rs`, `dispatch.rs`, `estimators/decomposition.rs`, `python/mlrs/{base,decomposition,linear}.py`, `gen_oracle.py`, `Cargo.toml`.
+- Project memory (HIGH) — cubecl-cpu no-SharedMemory/no-atomics; rocm f64-unsupported gate; gfx1100 LDS 65536 B; f32 band policy; oracle /tmp-venv regen; cuML diverges from sklearn.
 
 ### Secondary (MEDIUM confidence)
-- https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html — Arrow PyCapsule Interface for zero-copy Python-Rust ownership transfer
-- https://docs.rs/pyo3-arrow / https://docs.rs/arrow-pyarrow — Rust-side PyArrow FFI conversion patterns
-- wgpu `Features` docs, WebGPU issue #2805 — confirms SHADER_F64 native-only, absent in browser/many adapters
-- maturin Distribution guide — wheel name from Cargo package name; no first-party multi-feature recipe
+- `research/questions.md` open unknowns `[v2-P1]`/`[v2-P3]`/`[v2-P4]` — incremental-SVD merge stability, smallest-eigenpair approach, SGD-under-cpu-MLIR — to resolve before P7/P9/P10.
+- Predicted f32-on-rocm band needs per family — must be measured empirically on rocm hardware during each phase (as in v1).
+- RAPIDS issues #2113/#2114 — cuML MBSGD default-schedule divergence from sklearn.
 
 ### Tertiary (LOW confidence)
-- scikit-learn default-solver behavior (training-data knowledge, cross-validated against cuML CONCERNS/FEATURES research) — needs runtime oracle validation to confirm 1e-5 achievable for each estimator family
+- None — all findings traced to verified sources, shipped code, or scoped open questions.
 
 ---
-*Research completed: 2026-06-11*
+*Research completed: 2026-06-14*
 *Ready for roadmap: yes*

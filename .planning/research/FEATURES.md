@@ -1,451 +1,337 @@
-# Feature Research
+# Feature Research — mlrs v2.0 Breadth Sweep
 
-**Domain:** sklearn-compatible GPU ML library (Rust/CubeCL rewrite of RAPIDS cuML), v1 algorithm surface
-**Researched:** 2026-06-11
-**Confidence:** HIGH (grounded in cuML v26.08 source signatures + scikit-learn public API conventions)
+**Domain:** scikit-learn-compatible ML estimators (Rust/CubeCL rewrite of cuML)
+**Researched:** 2026-06-14
+**Confidence:** HIGH (sklearn algorithm semantics are stable, documented, and confirmed against cuML source + scikit-learn docs; the parity-sensitive defaults — SGD `optimal` schedule, LinearSVC `dual='auto'`/`squared_hinge`, NB smoothing — were verified against the live scikit-learn docs)
 
----
-
-## How to read this document
-
-The "product" here is a set of estimators. "Table stakes" means *the estimator is wrong or
-unusable without it* — a missing `coef_` or an init that silently differs from sklearn breaks
-the 1e-5 oracle contract. "Differentiators" are fidelity-to-cuML or quality-of-life features
-that are not required for correctness. "Anti-features" are things we deliberately do NOT build
-in v1 (either out of PROJECT scope, or sklearn knobs that add surface area without algorithmic
-value at the 1e-5 tolerance).
-
-Every algorithm section enumerates: **methods**, **hyperparameters**, **fitted attributes**,
-**solver/variant choices**, then the three feature categories with complexity.
-
-**The single hardest cross-cutting constraint:** the oracle compares against *scikit-learn on
-CPU*, not cuML. So for each estimator the table-stakes solver is "whatever variant makes the
-result match sklearn's default within 1e-5", which is sometimes NOT cuML's default solver.
-This is called out per algorithm below (it is the biggest correctness risk in the whole project).
+> **Framing.** The oracle is **scikit-learn** (abs/rel ≤ 1e-5 on f64), *not* cuML. Where cuML and
+> sklearn diverge in algorithm/objective (notably LinearSVC/SVR and the SGD learning-rate schedule),
+> **match sklearn**, not cuML. cuML is reference for API shape and kernel structure only. Each
+> estimator below pins (a) table-stakes behavior, (b) exact objective/formula/defaults, (c) fitted
+> attributes, (d) complexity + primitive reuse vs new kernel, and flags subtle parity risks.
 
 ---
 
-## Cross-Cutting Feature Surface (applies to all estimators)
+## Feature Landscape
 
-### sklearn API conventions — TABLE STAKES
+### Table Stakes (Users Expect These)
 
-| Convention | Requirement | Complexity | Notes |
-|------------|-------------|------------|-------|
-| `fit(X, y=None)` returns `self` | Mandatory sklearn contract; enables chaining and pipelines | LOW | Trivial in Rust→PyO3 (`return slf`) but must be wired through every estimator |
-| `get_params()` / `set_params()` | Required for clone, grid search, pipelines | MEDIUM | Must expose every constructor hyperparameter by name; cuML uses `_get_param_names()` returning the exact list per estimator (see per-algo sections) |
-| Constructor stores params unchanged | sklearn rule: `__init__` does no validation/transformation, only assignment | LOW | Validation happens in `fit`, not `__init__` — important for `clone()` round-trip |
-| Trailing-underscore fitted attributes | `coef_`, `labels_`, etc. only exist after `fit`; accessing before raises `NotFittedError` | MEDIUM | cuML uses `CumlArrayDescriptor`; mlrs must lazily materialize device→host on attribute access |
-| `n_features_in_` set at fit | sklearn ≥1.0 convention; checked by `check_is_fitted` patterns | LOW | Simple integer attribute |
-| Mixin tags (`RegressorMixin`/`ClassifierMixin`/`ClusterMixin`) | Determine default `score()` semantics and estimator type checks | LOW | cuML inherits these; mlrs replicates the `score()` defaults (R² for regressors, accuracy for classifiers) |
+Every v2 estimator must expose the sklearn-named constructor params (defaults below), the
+`fit`/`predict`/`transform`/`score` surface appropriate to its mixin, the sklearn fitted attributes
+(trailing-underscore), `n_features_in_`, and pass the v1 `estimator_checks` harness. The 1e-5 oracle
+gate (f64 strict; f32 documented epsilon band) is the non-negotiable.
 
-### dtype handling (f32/f64) — TABLE STAKES
+| Family | Estimators | Surface | Complexity |
+|--------|-----------|---------|------------|
+| Covariance | EmpiricalCovariance, LedoitWolf | `fit`, `score`, `get_precision`, `mahalanobis`, `error_norm` | LOW |
+| Projection | IncrementalPCA, Gaussian/SparseRandomProjection | `fit`, `partial_fit` (IPCA), `transform`, `inverse_transform` (IPCA) | LOW–MEDIUM |
+| Kernel | KernelRidge, KernelDensity | KRR: `fit`/`predict`; KDE: `fit`/`score_samples`/`score`/`sample` | LOW–MEDIUM |
+| Spectral | SpectralEmbedding, SpectralClustering | SE: `fit`/`fit_transform`; SC: `fit`/`fit_predict` | MEDIUM |
+| SGD / linear-SVM | MBSGD{Classifier,Regressor}, LinearSVC, LinearSVR | `fit`/`predict` (+`decision_function`, `partial_fit`) | MEDIUM–HIGH |
+| Naive Bayes | Gaussian/Multinomial/Bernoulli/Complement/Categorical NB | `fit`/`partial_fit`/`predict`/`predict_proba`/`predict_log_proba` | LOW–MEDIUM |
 
-| Feature | Requirement | Complexity | Notes |
-|---------|-------------|------------|-------|
-| Accept f32 and f64 input, dispatch to matching kernel | PROJECT mandates both validated; kernels generic over float | MEDIUM | CubeCL kernels are generic-over-float; the binding picks `f32`/`f64` codepath by input dtype |
-| `convert_dtype=True` behavior | cuML auto-casts mismatched dtypes (e.g. predict input cast to fit dtype) | MEDIUM | Present on nearly every cuML `fit`/`predict`/`transform`; v1 should honor it for sklearn-like leniency |
-| Output dtype matches input dtype | f32 in → f32 out; preserves the 1e-5 budget (f64 makes tolerance comfortable, f32 is tighter) | LOW | f32 paths are the *risky* ones for 1e-5 — accumulate reductions in higher precision where needed |
-| Reject/handle non-finite (NaN/Inf) | sklearn raises on NaN by default | LOW–MEDIUM | Input validation step; cuML's `check_inputs()` analog |
+### Differentiators (vs the surrounding ecosystem)
 
-### Input validation & interchange — TABLE STAKES
+| Feature | Value Proposition | Complexity | Notes |
+|---------|-------------------|------------|-------|
+| f64 device path for all 16 | sklearn parity is *comfortable* at 1e-5; most GPU libs are f32-only | — | cpu gates f64; rocm gates f32 |
+| Single generic kernel-matrix prim | linear/RBF/poly/sigmoid reused by KRR, KDE (+ future kernel SVM) | MEDIUM | Phase-8 keystone |
+| Exact spectral (no approximation) | sklearn parity, not approximate ANN-graph spectral | MEDIUM | full-spectrum eig then take smallest |
 
-| Feature | Requirement | Complexity | Notes |
-|---------|-------------|------------|-------|
-| Shape/contiguity validation | Reject ragged, wrong-ndim, mismatched `X`/`y` lengths | LOW | At the PyO3 boundary before device upload |
-| Arrow zero-copy ingest → device buffer | PROJECT foundation requirement | HIGH | Memory-efficiency priority; the buffer abstraction feeds every algorithm |
-| C/F-contiguity awareness | cuML stores several attrs in F-order (`components_`, ElasticNet `coef_`); GEMM/SVD primitives are layout-sensitive | MEDIUM | Layout mistakes are a top correctness/perf pitfall |
+### Anti-Features (Avoid)
 
-### Oracle-test contract — TABLE STAKES
-
-| Feature | Requirement | Complexity | Notes |
-|---------|-------------|------------|-------|
-| Random-data generation matching sklearn fixtures | `make_blobs`/`make_regression`/random uniform, fixed seed | LOW | Mirror cuML's `testing/datasets.py` approach |
-| abs/rel error ≤ 1e-5 vs sklearn | The core correctness gate | — | Per-estimator tolerance realities documented below |
-| Sign/permutation invariance helpers | PCA/SVD components have sign ambiguity; KMeans/DBSCAN labels are permutation-invariant | MEDIUM | cuML ships `assert_dbscan_equal` (label-order-independent) and array fuzzy-compare; mlrs needs the same harness or 1e-5 fails spuriously |
-| Both f32 and f64 tested | PROJECT requirement | LOW | Parameterize oracle over dtype |
-
-### Shared compute primitives (dependency backbone)
-
-These are not user-facing features but every algorithm depends on them; ordering the roadmap
-around them is essential.
-
-| Primitive | Used by | Complexity | Notes |
-|-----------|---------|------------|-------|
-| GEMM / matmul | LinearRegression, Ridge, PCA, TSVD, all KNN brute distance | HIGH | CubeCL matmul manual; foundational |
-| Reductions (sum/mean/L2/argmin) | KMeans (assign), variance/mean centering (PCA), norms | MEDIUM | CubeCL reduce manual |
-| Pairwise distance (Euclidean/L2, cosine) | KMeans, DBSCAN, all KNN | HIGH | Shared by 3 of 4 families; build once, well |
-| SVD (full + Jacobi) and/or symmetric eigendecomposition | PCA, TSVD, OLS (`svd` algo), Ridge (`svd`/`eig`) | HIGH | Hardest primitive; gates two whole families |
-| Covariance / Gram matrix (XᵀX) | PCA (`full` via eig of covariance), Ridge `eig`, OLS `eig` | MEDIUM | Built from GEMM + reductions |
-| Top-k selection / sort | KNN neighbor selection, DBSCAN core detection | MEDIUM | CubeCL selection pattern |
-| Coordinate descent solver | Lasso, ElasticNet | MEDIUM | Iterative; soft-thresholding |
-| Quasi-Newton (L-BFGS / OWL-QN) | LogisticRegression (and cuML's Lasso/ENet `qn`) | HIGH | Required for LogisticRegression; convergence to match sklearn `lbfgs`/`liblinear` is delicate |
+| Feature | Why Requested | Why Problematic | Alternative |
+|---------|---------------|-----------------|-------------|
+| Bit-exact cuML reproduction | "match the reference" | cuML's LinearSVC=L-BFGS, SGD lacks schedules — diverges from sklearn oracle | Match **sklearn** objective; cuML is API-shape reference only |
+| Callable/numba custom kernels (KRR/KDE) | cuML supports device-fn kernels | No numba on CubeCL; huge surface, no oracle | Fixed string kernels only (linear/rbf/poly/sigmoid/laplacian) |
+| `kd_tree`/`ball_tree` for KDE | sklearn default `algorithm='auto'`→tree | Tree builds fight cpu-MLIR no-SharedMemory; v1 KNN is brute-force | Brute-force kernel-sum KDE; identical to sklearn within 1e-5 |
+| liblinear's exact dual-CD iterate path (LinearSVC) | "match sklearn iteration-for-iteration" | liblinear shrinking/working-set is host-serial, not portable to CubeCL | Match the **converged optimum** of the same regularized objective (1e-5), not the iterate trajectory |
+| `crammer_singer` multiclass (LinearSVC) | sklearn option | Rarely used, separate joint QP | Implement `ovr` only (sklearn default); raise on `crammer_singer` |
+| Iterate-exact SGD via RNG-shuffle reproduction | sklearn `shuffle=True` default | t0 heuristic + per-epoch NumPy shuffle make iterate-exact parity infeasible across PRNGs | Gate on converged optimum (oracle with `shuffle=False`, fixed `max_iter`, `tol=0`) + f32 band |
 
 ---
 
-## Linear Models
+## Per-Family Detail
 
-### LinearRegression (OLS) — `RegressorMixin`
+### Family 1 — Covariance & Projection (Phase 7)
 
-**Methods:** `fit(X, y)`, `predict(X)`, `score(X, y)` (R²), `get_params`/`set_params`.
-**Hyperparameters (sklearn):** `fit_intercept=True`, `copy_X=True`, `positive=False`, `n_jobs`.
-cuML adds `algorithm={'auto','eig','svd','qr','svd-qr','svd-jacobi','lsmr'}`.
-**Fitted attributes:** `coef_` (shape `(n_features,)` or `(n_targets, n_features)`), `intercept_` (float or array), `n_features_in_`, `rank_`/`singular_` (sklearn has them; low value).
-**Solvers:** `eig` (normal equations via XᵀX eigendecomp — cuML default, fast) vs `svd` (numerically robust, matches sklearn's LAPACK `gelsd` more closely).
+**New shared primitive:** seeded device RNG-matrix generator (Gaussian + sparse-ternary); incremental-SVD merge step.
+**Reuses:** v1 covariance/Gram prim, Jacobi SVD, GEMM, reductions, Cholesky/pinv.
 
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | `coef_`, `intercept_`; `fit_intercept`; `predict`; `score` (R²); a solver producing ≤1e-5 vs sklearn (sklearn uses SVD-based lstsq → **`svd` path is the safest match**); multi-target `y` (2D) since sklearn supports it | MEDIUM (GEMM + one of eig/SVD) |
-| **Differentiators** | Multiple solver choices (`eig`/`svd`/`qr`) à la cuML; `lsmr` for tall-skinny; sample-weight passthrough | MEDIUM |
-| **Anti-features** | `positive=True` (NNLS — out of scope, separate solver); `n_jobs` (meaningless on GPU); sparse-X OLS in v1 | — |
+#### EmpiricalCovariance
+- **(a) Table stakes:** MLE covariance of centered (or assume-centered) data; `get_precision`, `mahalanobis`, `error_norm`, `score` (Gaussian log-likelihood).
+- **(b) Objective/defaults pinned:**
+  - `covariance_ = (Xc.T @ Xc) / n_samples` (**ddof=0 / divide by n, not n−1** — sklearn MLE).
+  - `location_ = mean(X, axis=0)` unless `assume_centered=True` → zeros.
+  - `precision_ = pinv(covariance_)` (sklearn uses `linalg.pinvh`; Moore–Penrose pseudo-inverse of the SPD covariance).
+  - `score(X_test)` = mean Gaussian log-likelihood: `-0.5*(n_features*log(2π) − logdet(precision) + mean(mahalanobis))` (matches LedoitWolf.score in cuML source lines 335–339).
+  - Defaults: `store_precision=True`, `assume_centered=False`.
+- **(c) Fitted attrs:** `covariance_` (d×d), `location_` (d), `precision_` (if stored), `n_features_in_`.
+- **(d) Complexity:** O(n·d²). Pure assembly on covariance prim + pinv (eig/SVD-based). No new kernel.
 
-**Dependency:** GEMM + (eig or SVD primitive). The cheapest correct v1 path is `eig` on XᵀX, but
-SVD is what makes f32 tolerance comfortable on ill-conditioned data.
+#### LedoitWolf
+- **(a) Table stakes:** shrinkage-regularized covariance toward scaled identity; same `score`/`mahalanobis`/`get_precision` surface.
+- **(b) Objective/defaults pinned** (sklearn formula, confirmed in cuML `_ledoit_wolf_shrinkage`, lines 18–86):
+  - `emp_cov = (Xc.T @ Xc)/n`, `mu = trace(emp_cov)/n_features`.
+  - `beta_ = Σ(X²ᵀ X²)`, `delta_ = Σ(XᵀX)² / n²`.
+  - `beta = (1/(n_features·n))·(beta_/n − delta_)`; `delta = (delta_ − 2·mu·Σ(diag emp_cov) + n_features·mu²)/n_features`.
+  - `beta = min(beta, delta)`; **`shrinkage = 0` if `beta==0` else `beta/delta`** (∈[0,1] since β≤δ).
+  - `covariance_ = (1−shrinkage)·emp_cov`, then `diag += shrinkage·mu` in-place (cuML line 273).
+  - Defaults: `store_precision=True`, `assume_centered=False`, `block_size=1000` (memory tiling only — must not change result).
+  - **Single-feature special case:** `shrinkage=0`, `emp_cov = cov(X, ddof=0)` (cuML lines 43–48).
+- **(c) Fitted attrs:** `covariance_`, `location_`, `precision_`, **`shrinkage_`** (float ∈[0,1]), `n_features_in_`.
+- **(d) Complexity:** O(n·d²). Assembly on covariance prim + reductions. No new kernel.
+- **⚠ Parity risk:** the `beta`/`delta` accumulations sum `Σ(XᵀX)²` over the full Gram — f32 accumulation order matters; accumulate in f32→f32 carefully or document the f32 band. `block_size` tiling must be result-invariant.
 
-### Ridge — `RegressorMixin`
+#### IncrementalPCA
+- **(a) Table stakes:** batched/streaming PCA via `partial_fit`; identical `transform`/`inverse_transform`/`components_` semantics to PCA; supports out-of-core and `n_samples < n_features`.
+- **(b) Objective/defaults pinned (sklearn `IncrementalPCA`):**
+  - Maintains running `mean_`, `var_`, `n_samples_seen_`. Per batch: update mean/var via **batch merge** (sklearn `_incremental_mean_and_var`).
+  - Augment current factors: stack `[ sqrt(n_seen)·diag(S)·Vᵀ ; Xc_batch ; mean-correction row ]`, SVD that small matrix → new `components_ = Vᵀ[:n_components]`.
+  - Mean-correction row = `sqrt(n_seen·n_batch / (n_seen+n_batch)) · (batch_mean − running_mean)`.
+  - **`svd_flip(U, V, u_based_decision=False)`** sign convention: force sign by the largest-abs entry of each **right** singular vector. Must replicate exactly.
+  - `explained_variance_ = S²/(n_total−1)` (**ddof=1**, unlike covariance estimators), `explained_variance_ratio_`, `noise_variance_` = mean of discarded eigenvalues.
+  - Defaults: `n_components=None` (→ min(batch, n_features)), `whiten=False`, `batch_size=None` (→ `5·n_features`), `copy=True`.
+- **(c) Fitted attrs:** `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`, `var_`, `noise_variance_`, `n_components_`, `n_samples_seen_`, `batch_size_`, `n_features_in_`.
+- **(d) Complexity:** O(batch·d·k) per step + small SVD of (k+batch)×d. Reuses Jacobi SVD; **needs incremental-SVD merge prim** (stack-and-resvd). See `research/questions.md [v2-P1]`.
+- **⚠ Parity risk (HIGH):** (1) **`svd_flip(u_based_decision=False)`** sign — wrong convention flips `components_` signs (harness has sign-flip helper, but be deliberate). (2) **ddof=1** for explained_variance vs ddof=0 covariance MLE. (3) f32 stability of the stacked-resvd merge on rocm — open research question.
 
-**Methods:** `fit`, `predict`, `score`, params.
-**Hyperparameters:** `alpha=1.0` (scalar or per-target array), `fit_intercept=True`, `copy_X`,
-`solver={'auto','eig','svd','lsmr'}` (cuML), sklearn adds `'cholesky','lsqr','sag','saga'` + `max_iter`, `tol`.
-**Fitted attributes:** `coef_`, `intercept_`, `solver_` (which solver ran), `n_iter_` (for iterative solvers, else `None`).
-**Solvers:** `eig`/`svd` closed-form (default) match sklearn `cholesky`/`svd` within 1e-5.
-
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | `alpha` (scalar minimum), `fit_intercept`, `coef_`/`intercept_`, closed-form solver matching sklearn default; multi-target | MEDIUM |
-| **Differentiators** | Per-target `alpha` array; `lsmr` iterative solver + `n_iter_`/`solver_` reporting (cuML fidelity) | MEDIUM |
-| **Anti-features** | `sag`/`saga` stochastic solvers; sparse paths; `positive=True` | — |
-
-**Dependency:** XᵀX + regularized eig/SVD (same primitive as OLS).
-
-### Lasso — `RegressorMixin`
-
-**Methods:** `fit`, `predict`, `score`, params.
-**Hyperparameters:** `alpha=1.0`, `fit_intercept=True`, `max_iter=1000`, `tol=1e-3`,
-`selection={'cyclic','random'}`. cuML exposes `solver={'cd','qn'}` (default `cd`).
-**Fitted attributes:** `coef_`, `intercept_`, `n_iter_`, `dual_gap_` (sklearn), `sparse_coef_` (sklearn convenience).
-**Solver:** Coordinate descent (`cd`) is the table-stakes solver — it is what sklearn uses, so
-it is the one that hits 1e-5. cuML's `qn` is an alternative but converges to a *different*
-point at loose tolerance.
-
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | Coordinate-descent solver (matches sklearn), `alpha`, `fit_intercept`, `max_iter`, `tol`, `coef_`/`intercept_`, `n_iter_` | MEDIUM–HIGH (CD on GPU, soft-thresholding, convergence parity is delicate) |
-| **Differentiators** | `selection='random'`; `qn` solver option; `dual_gap_` reporting | MEDIUM |
-| **Anti-features** | `sparse_coef_` materialization; multi-target Lasso (`MultiTaskLasso`); `precompute`/`warm_start`; positive constraint | — |
-
-**Dependency:** Coordinate-descent solver primitive (shared with ElasticNet). CD convergence to
-sklearn within 1e-5 is a known correctness risk — flag for deeper research.
-
-### ElasticNet — `RegressorMixin`
-
-**Methods/attributes:** same as Lasso plus `l1_ratio`.
-**Hyperparameters:** `alpha=1.0`, `l1_ratio=0.5`, `fit_intercept=True`, `max_iter=1000`,
-`tol=1e-4`, `selection={'cyclic','random'}`. cuML stores `coef_` in F-order.
-**Solver:** Coordinate descent (Lasso is the `l1_ratio=1` special case; both share the CD kernel).
-
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | `alpha`, `l1_ratio`, CD solver, `coef_`/`intercept_`, `n_iter_`, `fit_intercept` | MEDIUM–HIGH (shares Lasso CD) |
-| **Differentiators** | `selection='random'`, `qn` solver, `dual_gap_` | MEDIUM |
-| **Anti-features** | Multi-task variant; sparse coef; `precompute`/`warm_start`; positive constraint | — |
-
-**Dependency:** Same CD solver as Lasso — build Lasso and ElasticNet together.
-
-### LogisticRegression — `ClassifierMixin`
-
-**Methods:** `fit`, `predict`, `predict_proba`, `predict_log_proba`, `decision_function`, `score` (accuracy), params.
-**Hyperparameters (sklearn):** `penalty={'l1','l2','elasticnet',None}` (default `'l2'`), `C=1.0`,
-`fit_intercept=True`, `class_weight`, `max_iter=1000` (cuML), `tol=1e-4`, `l1_ratio`,
-`solver={'lbfgs','liblinear','newton-cg','sag','saga'}` (sklearn) — **cuML supports only `solver='qn'`**.
-cuML extra: `linesearch_max_iter`, `penalty_normalized`.
-**Fitted attributes:** `coef_` (`(n_classes, n_features)`), `intercept_`, `classes_`, `n_iter_`.
-**Solver:** Quasi-Newton (L-BFGS for L2/none, OWL-QN for L1/elasticnet). Multiclass via softmax
-(cuML) — note sklearn's default historically was OvR/multinomial depending on version; matching
-1e-5 requires care over which multinomial formulation is used.
-
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | QN solver (L-BFGS), `C`/`penalty` (`l2` minimum), `fit_intercept`, `predict`, `predict_proba`, `coef_`/`intercept_`/`classes_`, binary classification; multinomial/softmax for multiclass | HIGH (QN optimizer + numerically stable logistic loss/grad; convergence parity with sklearn `lbfgs` is the trickiest 1e-5 target in the project) |
-| **Differentiators** | `l1`/`elasticnet` penalties (OWL-QN); `class_weight='balanced'`; `decision_function`; `predict_log_proba`; `n_iter_` reporting | HIGH |
-| **Anti-features** | `liblinear`/`sag`/`saga`/`newton-cg` solvers (cuML itself drops these — only `qn`); `multi_class` legacy param; `warm_start`; `intercept_scaling`; sample-weight in v1 (optional) | — |
-
-**Dependency:** Quasi-Newton solver primitive + stable softmax/sigmoid + cross-entropy gradient
-(GEMM for the linear term). Flag for deeper research — this is the highest correctness risk.
+#### GaussianRandomProjection / SparseRandomProjection
+- **(a) Table stakes:** `fit` builds a random projection matrix; `transform = X @ components_.T`; auto-dim via Johnson–Lindenstrauss.
+- **(b) Objective/defaults pinned (sklearn `random_projection`):**
+  - `n_components='auto'` → `johnson_lindenstrauss_min_dim(n_samples, eps) = (4·ln(n_samples))/(eps²/2 − eps³/3)`, ceil'd; **`eps=0.1`** default.
+  - **Gaussian:** entries iid `N(0, 1/n_components)`.
+  - **Sparse:** density `s`; default `density='auto' = 1/sqrt(n_features)`. Entries from `{−sqrt(1/(s·n_components)), 0, +sqrt(1/(s·n_components))}` with prob `{s/2, 1−s, s/2}` (Achlioptas/Li). sklearn stores sparse `components_`; mlrs may densify (small) or keep CSR.
+  - `compute_inverse_components=False` default; `transform` does **not** center.
+  - **RNG:** sklearn uses NumPy MT19937 via `check_random_state`. mlrs must use a **seeded reproducible PRNG** (ASVS V6 — no OsRng); exact value-parity with NumPy MT is **not** achievable.
+- **(c) Fitted attrs:** `components_` (n_components×n_features), `n_components_`, `density_` (sparse), `n_features_in_`; `inverse_components_` if requested.
+- **(d) Complexity:** O(n·d·k) transform GEMM + matrix gen. Reuses GEMM; **needs RNG-matrix prim** (`research/questions.md [v2-P1]`).
+- **⚠ Parity risk (HIGH — no value oracle):** because mlrs's PRNG ≠ NumPy MT, the projection matrix can't be value-matched at 1e-5. Gate instead on (i) correct `n_components_` from the JL formula, (ii) JL pairwise-distance distortion bound within `eps` on a test set, (iii) shape/dtype/density. **This is the one v2 family where the elementwise 1e-5 gate does not apply** — requirements must state property-based acceptance.
 
 ---
 
-## Clustering
+### Family 2 — Kernel (Phase 8)
 
-### KMeans — `ClusterMixin`
+**New shared primitive:** kernel-matrix prim covering linear/RBF/poly/sigmoid (+laplacian for KDE) over pairwise distance.
+**Reuses:** v1 pairwise-distance prim, Cholesky/`posv`, GEMM, reductions, log-sum-exp.
 
-**Methods:** `fit`, `predict`, `transform` (distance to centers), `fit_predict`, `fit_transform`, `score`, params.
-**Hyperparameters (sklearn):** `n_clusters=8`, `init={'k-means++','random',array,callable}`,
-`n_init='auto'`, `max_iter=300`, `tol=1e-4`, `random_state`, `algorithm={'lloyd','elkan'}`.
-cuML defaults `init='scalable-k-means++'` (k-means||), `oversampling_factor=2.0`.
-**Fitted attributes:** `cluster_centers_`, `labels_`, `inertia_`, `n_iter_`, `n_features_in_`.
-**Variants:** Lloyd's iteration (assignment + update) is table-stakes. Init: **k-means++ is the
-sklearn default and what the oracle expects** — cuML's k-means|| (scalable) gives statistically
-similar but not identical centers, so to hit 1e-5 against sklearn the v1 default init should be
-deterministic k-means++ (or seeded `init='random'`/explicit array for the strictest tests).
+#### KernelRidge
+- **(a) Table stakes:** dual-space ridge with kernel trick; multi-output; `fit`/`predict`.
+- **(b) Objective/defaults pinned (sklearn `KernelRidge`, confirmed cuML `_solve_cholesky_kernel`):**
+  - Solve `(K + α·I)·dual_coef = y`, `K = kernel(X_fit, X_fit)`.
+  - Solver: **Cholesky** (`posv`) on `K + αI`; on singularity fall back to least-squares (`lstsq`) with a warning (cuML `_safe_solve`, lines 34–52).
+  - Per-target α (array): loop adding/subtracting α on the diagonal per target (cuML lines 81–95).
+  - `sample_weight`: `K *= outer(sqrt(sw), sqrt(sw))`, `y *= sqrt(sw)`, un-scale dual after (cuML lines 66–78).
+  - `predict(X) = kernel(X, X_fit) @ dual_coef`.
+  - Defaults: `alpha=1.0`, `kernel='linear'`, `gamma=None` (→ `1/n_features` for rbf/poly/sigmoid), `degree=3`, `coef0=1`.
+  - Kernel formulas: linear `XYᵀ`; rbf `exp(−γ‖x−y‖²)`; poly `(γ·XYᵀ + coef0)^degree`; sigmoid `tanh(γ·XYᵀ + coef0)`.
+- **(c) Fitted attrs:** `dual_coef_` (n_samples or n_samples×n_targets), `X_fit_` (training data, needed at predict), `n_features_in_`.
+- **(d) Complexity:** O(n²·d) kernel build + O(n³) Cholesky. Reuses distance/Cholesky; needs **kernel-matrix prim** (`research/questions.md [v2-P2]`).
+- **⚠ Parity risk:** singular-K fallback (lstsq) — decide whether to replicate warn+lstsq or always regularize; document. f64 Cholesky hits 1e-5 easily; f32 large-n may trigger fallback more often.
 
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | Lloyd iteration; `n_clusters`; `cluster_centers_`/`labels_`/`inertia_`/`n_iter_`; `predict`/`transform`; `random_state` for reproducibility; **k-means++ init** (to match sklearn) OR explicit-array init for oracle determinism; `tol`/`max_iter` convergence | MEDIUM–HIGH (assignment = pairwise distance + argmin; update = scatter-mean) |
-| **Differentiators** | k-means\|\| / scalable init (`oversampling_factor`) for cuML fidelity + large-data quality; `n_init` multi-restart; `sample_weight`; Elkan-style triangle-inequality pruning | MEDIUM–HIGH |
-| **Anti-features** | `MiniBatchKMeans`; callable init; `copy_x`; bisecting k-means | — |
-
-**Dependency:** Pairwise-distance primitive + argmin reduction + scatter-mean update.
-**Oracle note:** labels are permutation-invariant — need label-matching comparison, and centers
-compared up to permutation. Init choice is the dominant determinant of 1e-5 agreement.
-
-### DBSCAN — `ClusterMixin`
-
-**Methods:** `fit`, `fit_predict`, params. (No `predict` — DBSCAN cannot label new points; sklearn also omits it.)
-**Hyperparameters (sklearn):** `eps=0.5`, `min_samples=5`, `metric={'euclidean','cosine','precomputed',...}`,
-`metric_params`, `algorithm`, `leaf_size`, `p`. cuML: `metric={'euclidean','cosine','precomputed'}`,
-`algorithm={'brute','rbc'}`, `max_mbytes_per_batch`, `calc_core_sample_indices`.
-**Fitted attributes:** `labels_` (−1 = noise), `core_sample_indices_`, `components_` (the core samples themselves).
-**Variants:** Brute-force neighborhood (range query within `eps`) is table-stakes.
-
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | `eps`, `min_samples`, Euclidean metric, brute neighborhood + connected-components labeling, `labels_` with `-1` noise convention, `fit_predict` | HIGH (range query at scale + union-find/BFS expansion on GPU) |
-| **Differentiators** | `core_sample_indices_` + `components_` (cuML `calc_core_sample_indices`); cosine metric; `precomputed` distance matrix; batched distance (`max_mbytes_per_batch`) for memory limits; `rbc` (random ball cover) acceleration | MEDIUM–HIGH |
-| **Anti-features** | KD-tree/ball-tree `algorithm` variants (CPU-tree concepts); `leaf_size`; arbitrary Minkowski `p`; OPTICS/HDBSCAN | — |
-
-**Dependency:** Pairwise/range-distance primitive (shared with KMeans/KNN) + connected-components.
-**Oracle note:** cuML ships `assert_dbscan_equal` because cluster IDs and noise handling differ in
-ordering — mlrs must replicate this label-agnostic comparison or oracle tests fail spuriously.
+#### KernelDensity
+- **(a) Table stakes:** `fit` (store training pts); `score_samples` (per-point log-density), `score` (total log-likelihood), `sample` (draw from KDE).
+- **(b) Objective/defaults pinned (sklearn `neighbors.KernelDensity`):**
+  - `log_density(x) = logsumexp_i( log_kernel(‖x − Xᵢ‖/h) ) − log(n) + log_norm(kernel, h, d)` — normalization is kernel- and dimension-specific.
+  - Kernels: **gaussian** `exp(−d²/(2h²))`, tophat, epanechnikov, exponential, linear, cosine. mlrs MVP: gaussian + at least tophat/exponential; document supported set.
+  - **Per-kernel log-normalization constants** (sklearn `_kernels`): gaussian `−0.5·d·log(2π) − d·log(h)`; tophat/epanechnikov use the unit d-ball volume via `lgamma`. **Must match sklearn exactly.**
+  - Defaults: `bandwidth=1.0` (also `'scott' = n^(−1/(d+4))`, `'silverman' = (n·(d+2)/4)^(−1/(d+4))` since sklearn 1.0), `kernel='gaussian'`, `metric='euclidean'`, `atol=0`, `rtol=0`, `algorithm='auto'` (mlrs brute-force; identical result).
+  - `score_samples` returns **log** density.
+- **(c) Fitted attrs:** training data (mlrs stores `X` in place of `tree_`), `bandwidth_` (resolved float, sklearn 1.x), `n_features_in_`.
+- **(d) Complexity:** O(m·n·d) brute-force. Reuses distance prim + log-sum-exp reduction; needs kernel-matrix (distance variant) + numerically-stable logsumexp.
+- **⚠ Parity risk:** (1) **per-kernel log-norm constants** (esp. d-ball volume via `lgamma` for tophat/epanechnikov). (2) logsumexp f32 stability. (3) `sample()` needs the RNG-matrix prim (gaussian only) — may defer `sample`, gate only `score_samples`/`score`.
 
 ---
 
-## Decomposition
+### Family 3 — Spectral (Phase 9)
 
-### PCA — transformer
+**New shared primitive:** graph-Laplacian builder (affinity → degree → normalized Laplacian).
+**Reuses:** v1 symmetric **eig**, pairwise distance, KMeans (SpectralClustering), GEMM.
 
-**Methods:** `fit`, `transform`, `inverse_transform`, `fit_transform`, `score`/`score_samples` (sklearn), params.
-**Hyperparameters (sklearn):** `n_components` (int/float/'mle'/None), `whiten=False`,
-`svd_solver={'auto','full','covariance_eigh','randomized','arpack'}`, `tol`, `iterated_power`, `random_state`, `copy`.
-cuML: `n_components`, `whiten`, `svd_solver={'full','jacobi','auto'}`, `tol=1e-7`, `iterated_power=15`, `copy`.
-**Fitted attributes:** `components_`, `explained_variance_`, `explained_variance_ratio_`,
-`singular_values_`, `mean_`, `noise_variance_`, `n_components_`, `n_features_in_`.
-**Variants:** `full` (mean-center → covariance eigendecomp or full SVD; **this is the sklearn-match
-path**) vs `jacobi` (iterative, faster, cuML's accelerated option). sklearn's `randomized` is its
-own thing — match `full` for the oracle.
+#### SpectralEmbedding
+- **(a) Table stakes:** `fit_transform` → low-dim embedding from the smallest nontrivial eigenvectors of the graph Laplacian.
+- **(b) Objective/defaults pinned (sklearn `manifold.SpectralEmbedding`):**
+  - Affinity `W`: default **`affinity='nearest_neighbors'`** → kNN graph (`n_neighbors=max(n_samples//10, 1)`), symmetrized `0.5(W+Wᵀ)`; or `affinity='rbf'` → `exp(−γ‖x−y‖²)`, `gamma=None`→`1/n_features`.
+  - Degree `D=diag(rowsum W)`; **normalized Laplacian** `L_sym = I − D^{−1/2} W D^{−1/2}` (`norm_laplacian=True` default).
+  - Take eigenvectors of the **`n_components` smallest** eigenvalues, **drop the trivial first**, then **recover** `embedding = eigvec / sqrt(degree)` (`drop_first=True`).
+  - Deterministic sign flip (`_deterministic_vector_sign_flip`: sign of the max-abs entry per vector). **Must replicate.**
+  - Defaults: `n_components=2`, `affinity='nearest_neighbors'`, `gamma=None`, `n_neighbors=None`, `eigen_solver=None`.
+- **(c) Fitted attrs:** `embedding_` (n×n_components), `affinity_matrix_`, `n_features_in_`, `n_neighbors_`.
+- **(d) Complexity:** O(n²) affinity + O(n³) dense eig (fine at v2 sizes). Reuses eig + distance; needs **Laplacian prim**.
+- **⚠ Parity risk (HIGH):** (1) **smallest** eigenvectors — v1 Jacobi eig returns full spectrum descending; take the tail. Full-spectrum-then-take-smallest acceptable at v2 sizes (`research/questions.md [v2-P3]`); document the size ceiling. (2) **deterministic sign flip** must match sklearn's convention. (3) the `embedding /= sqrt(degree)` recovery step is easy to omit. (4) disconnected-graph warning behavior for nearest_neighbors.
 
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | Mean-centering + `full` SVD/eig; `n_components` (int); `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`; `transform`/`inverse_transform`; `whiten` | HIGH (SVD/eig primitive is the gate) |
-| **Differentiators** | `jacobi` solver (cuML); `noise_variance_`; `n_components` as float (variance ratio) or None; `randomized` SVD for tall data | MEDIUM–HIGH |
-| **Anti-features** | `n_components='mle'` (cuML explicitly rejects it); `arpack` solver; `IncrementalPCA`; sparse PCA; `score`/`score_samples` log-likelihood (low value for v1) | — |
-
-**Dependency:** SVD (full) and/or symmetric eigendecomposition of covariance + mean reduction + GEMM.
-**Oracle note:** component sign ambiguity — sklearn applies `svd_flip` sign convention; mlrs must
-match it (deterministic sign) or compare up to sign per component.
-
-### TruncatedSVD — transformer
-
-**Methods:** `fit`, `transform`, `inverse_transform`, `fit_transform`, params.
-**Hyperparameters (sklearn):** `n_components=2`, `algorithm={'randomized','arpack'}`, `n_iter=5`,
-`n_oversamples`, `power_iteration_normalizer`, `random_state`, `tol`.
-cuML: `n_components=1`, `algorithm={'full','jacobi','auto'}`, `n_iter=15`, `tol=1e-7`, `random_state`.
-**Fitted attributes:** `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`.
-**Difference from PCA:** NO mean-centering (works on raw/sparse matrices, e.g. TF-IDF). Otherwise
-shares the SVD primitive.
-
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | SVD without centering; `n_components`; `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`; `transform`/`inverse_transform` | HIGH (shares PCA's SVD primitive) |
-| **Differentiators** | `jacobi` solver; `n_iter` control for iterative path | MEDIUM |
-| **Anti-features** | Sparse-matrix input in v1 (TruncatedSVD's main sklearn use case is sparse TF-IDF — defer); `arpack`; `randomized` exact-match to sklearn default | — |
-
-**Dependency:** Same SVD/eig primitive as PCA (build PCA + TSVD together; TSVD ≈ PCA minus centering).
-**Oracle note:** sklearn TruncatedSVD's default `algorithm='randomized'` is stochastic — for the
-1e-5 oracle, compare against sklearn with `algorithm='arpack'` (deterministic) or use a tolerance/
-sign-aware comparison. This solver-default mismatch is a documented gotcha.
+#### SpectralClustering
+- **(a) Table stakes:** `fit_predict` → labels via spectral embedding + KMeans on the embedding.
+- **(b) Objective/defaults pinned (sklearn `cluster.SpectralClustering`):**
+  - Build affinity (default **`affinity='rbf'`**, *unlike* SpectralEmbedding's nearest_neighbors), normalized Laplacian, `n_clusters` smallest eigenvectors → `maps`.
+  - **`assign_labels='kmeans'`** default → KMeans (k-means++, `n_init=10`) on the embedding rows. (`'discretize'`/`'cluster_qr'` deferred.)
+  - Pin sklearn's `spectral_clustering` exact pipeline (the embedding is passed to KMeans without per-row L2 normalization for the kmeans path).
+  - Defaults: `n_clusters=8`, `eigen_solver=None`, `n_components=n_clusters`, **`gamma=1.0`** (rbf gamma default is 1.0 here, **not** 1/n_features), `affinity='rbf'`, `n_neighbors=10`, `assign_labels='kmeans'`, `n_init=10`.
+- **(c) Fitted attrs:** `labels_`, `affinity_matrix_`, `n_features_in_`.
+- **(d) Complexity:** SpectralEmbedding + KMeans. Reuses Laplacian prim + eig + **KMeans**.
+- **⚠ Parity risk (HIGH):** (1) **label permutation** (use harness label-perm helper — KMeans labels arbitrary up to permutation). (2) `gamma` default differs from SpectralEmbedding (1.0 vs 1/n_features). (3) KMeans seed-sensitivity — gate on ARI / clustering agreement, possibly not exact labels under f32.
 
 ---
 
-## Neighbors
+### Family 4 — SGD / Linear-SVM (Phase 10)
 
-### NearestNeighbors — unsupervised base
+**New shared primitive:** minibatch SGD solver (hinge / log / squared_loss / squared_hinge / epsilon_insensitive losses; l1/l2/elasticnet penalties; learning-rate schedules).
+**Reuses:** reductions, GEMM/GEMV, v1 coordinate descent (for LinearSVC/SVR converged-optimum path).
 
-**Methods:** `fit`, `kneighbors(X, n_neighbors, return_distance)`, `kneighbors_graph`,
-`radius_neighbors` (sklearn), params.
-**Hyperparameters (sklearn):** `n_neighbors=5`, `radius`, `algorithm={'auto','ball_tree','kd_tree','brute'}`,
-`leaf_size`, `metric`, `p`, `metric_params`. cuML: `n_neighbors`, `algorithm={'brute','rbc','ivfflat','ivfpq'}`,
-`metric`, `p`, `metric_params`.
-**Fitted attributes:** the stored training set (`_fit_X`), `n_features_in_`, `effective_metric_`.
-**Variants:** **Brute-force exact is table-stakes and the oracle match** (sklearn returns exact
-neighbors regardless of tree algorithm). Approximate (IVF/RBC) changes results → cannot match 1e-5.
+> **Critical divergence from cuML.** cuML's `SGD` (source read) supports only
+> `{squared_loss, log, hinge}` losses, `{constant, invscaling, adaptive}` schedules, **no
+> averaging, no `optimal` schedule, no squared_hinge/epsilon_insensitive**. And cuML's
+> **LinearSVC uses L-BFGS/OWL-QN**, not liblinear. The oracle is **sklearn**, so mlrs implements
+> the **sklearn** objectives/schedules below (richer than cuML's). cuML `sgd.pyx` = API-shape reference only.
 
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | Brute-force exact kNN; Euclidean metric; `n_neighbors`; `kneighbors` returning sorted (distance, index); `kneighbors_graph` | MEDIUM (pairwise distance + top-k selection) |
-| **Differentiators** | Additional metrics (cosine, Minkowski-`p`, Manhattan); `radius_neighbors`; `rbc` random ball cover acceleration | MEDIUM |
-| **Anti-features** | `kd_tree`/`ball_tree` (CPU tree structures — cuML doesn't implement them either); approximate `ivfflat`/`ivfpq` (break exact 1e-5 oracle — defer to a later "approximate" milestone); `leaf_size` | — |
+#### MBSGDClassifier / MBSGDRegressor (mlrs-named; sklearn analog = SGDClassifier / SGDRegressor)
+- **(a) Table stakes:** minibatch SGD over a linear model; `fit`/`predict` (+`decision_function`, `partial_fit`).
+- **(b) Objective/defaults pinned (sklearn SGD*, verified live):**
+  - **Losses** — Classifier: `hinge`(default, linear SVM), `log_loss`, `modified_huber`, `squared_hinge`, `perceptron`; Regressor: `squared_error`(default), `huber`, `epsilon_insensitive`, `squared_epsilon_insensitive`. mlrs MVP covers ≥ `hinge`, `log_loss`, `squared_error`, `epsilon_insensitive` (the four named in the seed).
+  - **Penalty:** `l2`(default), `l1`, `elasticnet`; `alpha=0.0001`, `l1_ratio=0.15`. Term = `alpha·(l1_ratio·‖w‖₁ + (1−l1_ratio)·0.5·‖w‖₂²)`.
+  - **Learning-rate schedules** (`learning_rate` default **`'optimal'`** for Classifier, **`'invscaling'`** for Regressor — *they differ*):
+    - `optimal`: `η(t) = 1/(alpha·(t + t0))`, `t0` from Bottou's heuristic (`typw = sqrt(1/sqrt(alpha))`; `eta0_init = 1/(typw·max(1,−dloss(−typw)))`; `t0 = 1/(alpha·eta0_init)`). **Replicate this t0 formula for parity.**
+    - `constant`: `η = eta0`. `invscaling`: `η(t) = eta0/t^power_t`. `adaptive`: start `eta0`, ÷5 when no improvement for `n_iter_no_change` epochs.
+    - Defaults: `eta0=0.0` (must be >0 for constant/invscaling/adaptive), `power_t=0.5`.
+  - **Stopping:** `max_iter=1000`, `tol=1e-3`; stop when `loss > best_loss − tol` for `n_iter_no_change=5` consecutive epochs (vs **training** loss unless `early_stopping=True`).
+  - **Averaging:** `average=False` default; if True/int → `coef_` is the running ASGD average of weights. Implement to match when set.
+  - **`t_`** (weight-update counter) drives the `optimal` schedule: `t_ = n_iter_·n_samples + 1`.
+  - **Intercept** updated at full η; `fit_intercept=True`. **Multiclass:** OvR (one binary SGD per class).
+- **(c) Fitted attrs:** `coef_` ((1,d) binary / (n_classes,d) multiclass / (d,) regressor), `intercept_`, `n_iter_`, `t_`, `classes_` (classifier), `n_features_in_`.
+- **(d) Complexity:** O(epochs·n·d). New SGD solver prim (`research/questions.md [v2-P4]`); reuses GEMV/reductions.
+- **⚠ Parity risk (HIGH — hardest in v2):**
+  1. **`optimal` schedule + Bottou `t0`** — exact replication needed or iterate path / fixed-epoch optimum drifts.
+  2. **Per-epoch shuffle uses RNG** — NumPy permutation ≠ mlrs PRNG, so the iterate trajectory can't be value-matched. Gate on **converged optimum** (oracle `shuffle=False`, fixed `max_iter`, `tol=0`) OR a generous f32 band. Document the oracle harness setup explicitly.
+  3. **Loss derivatives** — hinge subgradient (0 inside margin), modified_huber, squared_hinge must match sklearn `_sgd_fast` piecewise definitions.
+  4. **Regressor default schedule `invscaling` vs classifier `optimal`** — easy to conflate.
+  5. cpu-MLIR: minibatch update loop must avoid SharedMemory / cross-unit atomics (cf. v1 GATHER idiom).
 
-**Dependency:** Pairwise-distance primitive (shared with KMeans/DBSCAN) + top-k selection.
+#### LinearSVC
+- **(a) Table stakes:** large-margin linear classifier; `fit`/`predict`/`decision_function`; OvR multiclass.
+- **(b) Objective/defaults pinned (sklearn liblinear, verified live):**
+  - Objective (default `squared_hinge`, `l2`): minimize `0.5‖w‖² + C·Σ max(0, 1 − yᵢ(wᵀxᵢ+b))²`.
+  - Defaults: **`penalty='l2'`, `loss='squared_hinge'` (NOT hinge), `dual='auto'`, `C=1.0`, `tol=1e-4`, `max_iter=1000`, `multi_class='ovr'`, `fit_intercept=True`, `intercept_scaling=1.0`.**
+  - `dual='auto'`: choose dual vs primal by n_samples vs n_features + penalty/loss combo (prefers `dual=False` when n_samples>n_features). Combos: `l1`+`hinge` unsupported; `l1`+`squared_hinge` primal-only; `l2`+`hinge` dual-only; `l2`+`squared_hinge` both.
+  - **Intercept regularization quirk:** liblinear augments X with a constant `intercept_scaling` column and **regularizes the intercept** (part of `‖w‖²`, scaled by intercept_scaling). Pin this — it's the known sklearn-vs-clean-SVM difference.
+  - solver = liblinear CD. **mlrs matches the converged optimum of the objective (1e-5), NOT liblinear's iterate path.**
+- **(c) Fitted attrs:** `coef_` ((1,d) binary / (n_classes,d)), `intercept_`, `classes_`, `n_iter_`, `n_features_in_`.
+- **(d) Complexity:** convex QP via coordinate descent (reuse v1 CD adapted to hinge/squared_hinge) or dual CD. New: hinge/squared_hinge loss path.
+- **⚠ Parity risk (HIGH):** (1) default loss is **squared_hinge** (frequent mistake). (2) **regularized intercept via intercept_scaling** — without it the intercept differs from sklearn. (3) `dual='auto'` resolution. (4) OvR label/sign conventions.
 
-### KNeighborsClassifier — `ClassifierMixin`
+#### LinearSVR
+- **(a) Table stakes:** linear ε-insensitive regression; `fit`/`predict`.
+- **(b) Objective/defaults pinned (sklearn liblinear, verified live):**
+  - Objective (default `squared_epsilon_insensitive`): minimize `0.5‖w‖² + C·Σ max(0, |yᵢ − (wᵀxᵢ+b)| − ε)²`.
+  - Defaults: **`epsilon=0.0`, `loss='squared_epsilon_insensitive'` (NOT epsilon_insensitive), `dual=True`, `C=1.0`, `tol=1e-4`, `max_iter=1000`, `fit_intercept=True`, `intercept_scaling=1.0`.**
+  - `epsilon_insensitive` (L1) uses the non-squared residual hinge. Same liblinear intercept-reg quirk.
+- **(c) Fitted attrs:** `coef_` ((d,)/(1,d)), `intercept_`, `n_iter_`, `n_features_in_`.
+- **(d) Complexity:** convex; CD on ε-insensitive objective. New: ε-insensitive loss path (shared with MBSGDRegressor's `epsilon_insensitive`).
+- **⚠ Parity risk (MED-HIGH):** (1) default loss **squared_epsilon_insensitive** + default **`epsilon=0.0`** (behaves like squared error + intercept quirk). (2) `dual=True` default (no auto). (3) intercept regularization.
 
-**Methods:** `fit(X, y)`, `predict`, `predict_proba`, `score` (accuracy), params.
-**Hyperparameters:** inherits NearestNeighbors params + `weights={'uniform','distance',callable}`.
-**Fitted attributes:** `classes_`, plus the stored training set + labels.
-**Logic:** kNN search → weighted majority vote (uniform or inverse-distance weights).
+---
 
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | Brute kNN + uniform-weight majority vote; `predict`; `predict_proba`; `classes_`; `n_neighbors`; `score` | MEDIUM (vote/tally over neighbor labels) |
-| **Differentiators** | `weights='distance'` (inverse-distance vote); multi-output `y`; additional metrics | MEDIUM |
-| **Anti-features** | Callable `weights` (cuML rejects for CPU conversion); tree algorithms; approximate search; `RadiusNeighborsClassifier` | — |
+### Family 5 — Naive Bayes (Phase 11)
 
-**Dependency:** NearestNeighbors brute search + label-gather + weighted mode reduction.
+**New shared primitive:** none (reductions only — class-conditional sums/counts).
+**Reuses:** reductions, log/exp, segment-by-class grouped reductions, log-sum-exp.
 
-### KNeighborsRegressor — `RegressorMixin`
+All five share: `fit`/`partial_fit`/`predict`/`predict_proba`/`predict_log_proba`/`score`; predict = argmax of joint log-likelihood `log P(y) + Σ log P(xⱼ|y)`; `predict_proba` = log-sum-exp normalize of the joint LL. `fit_prior=True` default → empirical priors; else uniform. Common attrs: `classes_`, `class_count_`, `class_log_prior_`, `n_features_in_`.
 
-**Methods:** `fit(X, y)`, `predict`, `score` (R²), params.
-**Hyperparameters:** same as classifier (`weights` etc.).
-**Fitted attributes:** stored training set + targets.
-**Logic:** kNN search → (weighted) mean of neighbor targets.
+#### GaussianNB
+- **(b) Pinned:** per-class `theta_` (mean), `var_` (variance). **`var_smoothing=1e-9`** default: `epsilon_ = var_smoothing · max_j(Var(X[:,j]) over whole dataset)` added to all variances (sklearn: `var_smoothing * X.var(axis=0).max()`). LL = `−0.5·Σ[log(2π·var) + (x−mean)²/var]`. `priors=None`→empirical.
+- **(c) Attrs:** `theta_` (n_classes×d), `var_` (n_classes×d), `class_prior_`, `class_count_`, `epsilon_`, `classes_`.
+- **⚠ Parity risk:** `epsilon_` from **global** feature variance (max over features), not per-class — common bug. `partial_fit` uses running-variance merge.
 
-| Category | Items | Complexity |
-|----------|-------|------------|
-| **Table stakes** | Brute kNN + uniform-weight mean; `predict`; `score` (R²); `n_neighbors`; multi-target `y` | MEDIUM |
-| **Differentiators** | `weights='distance'` (inverse-distance weighted mean); additional metrics | MEDIUM |
-| **Anti-features** | Callable weights; tree/approximate algorithms; `RadiusNeighborsRegressor` | — |
+#### MultinomialNB
+- **(b) Pinned:** `feature_log_prob_[c,j] = log((count[c,j] + alpha)/(Σ_j count[c,j] + alpha·n_features))` (Lidstone/Laplace). **`alpha=1.0`**, `force_alpha=True` default. `fit_prior=True`, `class_prior=None`. Joint LL = `class_log_prior_ + X @ feature_log_prob_.T`.
+- **(c) Attrs:** `feature_log_prob_` (n_classes×d), `feature_count_`, `class_log_prior_`, `class_count_`, `classes_`.
+- **⚠ Parity risk:** smoothing denominator uses `alpha·n_features`, not `alpha·1`.
 
-**Dependency:** NearestNeighbors brute search + target-gather + weighted-mean reduction.
+#### BernoulliNB
+- **(b) Pinned:** **`binarize=0.0`** default → X>binarize → 1 (None skips, assumes binary). `feature_log_prob_[c,j] = log((count[c,j]+alpha)/(class_count[c]+2·alpha))`. **alpha=1.0**. Decision uses explicit non-occurrence term: `LL = class_log_prior + Σ_j[ x_j·log p_cj + (1−x_j)·log(1−p_cj) ]` (`neg_prob`). `fit_prior=True`.
+- **(c) Attrs:** `feature_log_prob_`, `feature_count_`, `class_log_prior_`, `class_count_`, `classes_`.
+- **⚠ Parity risk:** the `(1−x)·log(1−p)` non-occurrence term is what distinguishes Bernoulli from Multinomial — must include it.
+
+#### ComplementNB
+- **(b) Pinned:** complement-class stats: `weights = log((complement_count + alpha)/(complement_count.sum() + alpha·n_features))` (counts from **all classes except c**), then if **`norm=True`** L1-normalize the weights (default `norm=False`). **alpha=1.0**, `fit_prior=True`. Decision: `argmin` of `X @ weights` (CNB picks the class whose *complement* fits worst — note the sign).
+- **(c) Attrs:** `feature_log_prob_`, `feature_all_` (=`feature_count_.sum(axis=0)`), `feature_count_`, `class_log_prior_`, `class_count_`, `classes_`.
+- **⚠ Parity risk:** the **complement** weighting + optional L1 norm (`norm`) + sign/argmin convention are CNB-specific — do not copy MNB.
+
+#### CategoricalNB
+- **(b) Pinned:** each feature categorical with `n_categories_[j]` levels; per-(class, feature, category) counts. `feature_log_prob_[j][c,k] = log((count + alpha)/(class_count[c] + alpha·n_categories_j))`. **alpha=1.0**, `fit_prior=True`, **`min_categories=None`** (infer per feature, or pad). Inputs must be non-negative integer-encoded categories. Joint LL sums per-feature looked-up log-probs.
+- **(c) Attrs:** `category_count_` (list per feature), `feature_log_prob_` (list of n_classes×n_categories_j), `class_log_prior_`, `class_count_`, `n_categories_`, `classes_`.
+- **⚠ Parity risk:** `feature_log_prob_` is a **ragged list** (one matrix per feature, variable category count) — not a single tensor; unseen categories at predict map to a smoothed prob. `min_categories` padding.
 
 ---
 
 ## Feature Dependencies
 
 ```
-GEMM / matmul (CubeCL)
-   ├──> Pairwise distance ──┬──> KMeans (assign+argmin, scatter-mean update)
-   │                        ├──> DBSCAN (range query) ──> connected-components
-   │                        └──> NearestNeighbors (+ top-k select)
-   │                                  ├──> KNeighborsClassifier (weighted vote)
-   │                                  └──> KNeighborsRegressor (weighted mean)
-   ├──> Covariance / XtX ──┬──> OLS (eig path)
-   │                       ├──> Ridge (regularized eig/svd)
-   │                       └──> PCA (full = center + eig of covariance)
-   └──> SVD (full + jacobi) ──┬──> OLS (svd path, best 1e-5 match)
-                              ├──> PCA (full SVD path)
-                              └──> TruncatedSVD (SVD, no centering)
+[RNG-matrix prim (P7)] ──required──> [Gaussian/SparseRandomProjection]
+                       ──enhances──> [KernelDensity.sample], [SGD shuffle]
 
-Coordinate-descent solver ──┬──> Lasso
-                            └──> ElasticNet   (Lasso = l1_ratio==1 special case)
+[incremental-SVD merge (P7)] ──required──> [IncrementalPCA]   (reuses Jacobi SVD)
 
-Quasi-Newton (L-BFGS / OWL-QN) ──> LogisticRegression
+[covariance prim (v1)] ──required──> [EmpiricalCovariance] ──required──> [LedoitWolf]
 
-Reductions (sum/mean/norm/argmin) ──> underpins KMeans, PCA centering, KNN, all norms
+[kernel-matrix prim (P8)] ──required──> [KernelRidge], [KernelDensity]
+                          ──enables──> [future kernel SVM (v3)]
 
-Sign-flip / label-permutation oracle helpers ──> PCA, TSVD, KMeans, DBSCAN tests
+[graph-Laplacian prim (P9)] ──required──> [SpectralEmbedding] ──required──> [SpectralClustering]
+[v1 eig]    ──required──> [SpectralEmbedding/Clustering]
+[v1 KMeans] ──required──> [SpectralClustering]
+
+[SGD solver (P10)] ──required──> [MBSGDClassifier], [MBSGDRegressor]
+[epsilon-insensitive loss] ──shared by──> [MBSGDRegressor], [LinearSVR]
+[hinge/squared_hinge loss] ──shared by──> [MBSGDClassifier], [LinearSVC]
+[v1 coordinate descent] ──reused by──> [LinearSVC], [LinearSVR]  (converged-optimum parity)
+
+[reductions (v1)] ──required──> [all 5 Naive Bayes]
 ```
 
 ### Dependency Notes
+- **EmpiricalCovariance before LedoitWolf:** LW = EmpiricalCovariance + a shrinkage scalar; validate the empirical path first.
+- **SpectralEmbedding before SpectralClustering:** SC = SE-embedding + KMeans; share the Laplacian+eig core.
+- **MBSGD before LinearSVC/SVR is optional:** LinearSVC/SVR can target the converged objective via v1 CD instead of SGD; the SGD solver is required only for the MBSGD* pair. The hinge / ε-insensitive *loss definitions* are shared either way.
+- **Naive Bayes are mutually independent** — five parallel-buildable estimators sharing only reductions; lowest-risk family.
 
-- **SVD primitive gates two families:** PCA and TruncatedSVD are both unbuildable until a working
-  SVD (or covariance-eigendecomposition) exists; OLS/Ridge `svd`/`eig` paths reuse it. Build the
-  decomposition primitive once, validate it standalone, then both estimators are mostly assembly.
-- **Pairwise distance gates three families:** KMeans, DBSCAN, and all KNN share it. It is the
-  highest-leverage primitive after GEMM — prioritize it.
-- **Lasso and ElasticNet are one feature:** they share the coordinate-descent kernel; Lasso is the
-  `l1_ratio=1` case. Sequence them together.
-- **PCA depends on Ridge/OLS's eig path conceptually** (covariance eigendecomposition) — if you
-  build the eig primitive for linear models first, PCA's `full` solver follows cheaply.
-- **Oracle helpers are a prerequisite, not an afterthought:** without sign-flip and
-  label-permutation comparison, PCA/SVD/KMeans/DBSCAN tests will fail at 1e-5 for non-bugs.
+## MVP Definition (this milestone = the 16 firm estimators)
 
----
+### Launch With (v2.0)
+- [ ] EmpiricalCovariance, LedoitWolf — covariance + pinv + score path
+- [ ] IncrementalPCA — incremental-SVD merge prim (flag svd_flip sign / ddof parity)
+- [ ] Gaussian/SparseRandomProjection — RNG-matrix prim (property-gated, not 1e-5)
+- [ ] KernelRidge, KernelDensity — kernel-matrix prim
+- [ ] SpectralEmbedding, SpectralClustering — Laplacian prim (cash in v1 eig + KMeans)
+- [ ] MBSGDClassifier, MBSGDRegressor — SGD solver
+- [ ] LinearSVC, LinearSVR — hinge/squared_hinge/ε-insensitive losses (sklearn liblinear objective)
+- [ ] Gaussian/Multinomial/Bernoulli/Complement/Categorical NB — reductions only
 
-## MVP Definition
-
-### Launch With (v1) — the fixed PROJECT scope
-
-- [ ] **Foundation primitives first:** GEMM, reductions, pairwise distance, SVD/eig, CD solver, QN solver — each validated standalone before the estimator that needs it.
-- [ ] **LinearRegression (OLS)** — `svd` path for sklearn match; `coef_`/`intercept_`; multi-target.
-- [ ] **Ridge** — closed-form eig/svd; `alpha`, `coef_`/`intercept_`.
-- [ ] **Lasso + ElasticNet** — shared CD solver; `alpha`(+`l1_ratio`), `coef_`/`intercept_`, `n_iter_`.
-- [ ] **LogisticRegression** — QN solver, `predict`/`predict_proba`, `coef_`/`intercept_`/`classes_` (highest risk; research-flagged).
-- [ ] **KMeans** — Lloyd + k-means++ init; `cluster_centers_`/`labels_`/`inertia_`/`n_iter_`; predict/transform.
-- [ ] **DBSCAN** — brute range query + components labeling; `labels_` with noise; `core_sample_indices_`/`components_`.
-- [ ] **PCA** — full SVD/eig + centering; all five fitted attributes + `mean_`; transform/inverse_transform.
-- [ ] **TruncatedSVD** — SVD without centering; four fitted attributes.
-- [ ] **NearestNeighbors / KNeighborsClassifier / KNeighborsRegressor** — brute exact + uniform & distance weights.
-- [ ] **Cross-cutting:** f32/f64 dispatch, `get/set_params`, `fit`-returns-`self`, Arrow zero-copy ingest, oracle harness with sign/permutation helpers.
-
-### Add After Validation (v1.x)
-
-- [ ] Extra solver variants per estimator (`jacobi` SVD, `lsmr`, `qr`) — once `full`/closed-form paths pass oracle.
-- [ ] Additional distance metrics (cosine, Minkowski-p, Manhattan) across KMeans/DBSCAN/KNN.
-- [ ] `class_weight='balanced'`, L1/elasticnet penalties for LogisticRegression.
-- [ ] Sample-weight support across estimators.
-- [ ] `rbc` (random ball cover) acceleration for DBSCAN/KNN (still exact).
-
-### Future Consideration (v2+ / explicitly later milestones)
-
-- [ ] Approximate KNN (`ivfflat`/`ivfpq`) — breaks exact 1e-5 oracle; needs its own approximate-tolerance test design.
-- [ ] Sparse-input paths (TruncatedSVD on TF-IDF, sparse Lasso).
-- [ ] IncrementalPCA, MiniBatchKMeans, multi-task linear models.
-- [ ] f16/bf16 validated precision paths (PROJECT marks infra-allowed, not v1).
-
----
+### Future Consideration (v3)
+- [ ] `crammer_singer` multiclass, callable kernels, KDE `sample`, spectral `discretize`/`cluster_qr`, tree-based KDE — deferred (see Anti-Features)
 
 ## Feature Prioritization Matrix
 
-| Feature | User Value | Implementation Cost | Priority |
-|---------|------------|---------------------|----------|
-| Pairwise-distance primitive | HIGH (3 families) | HIGH | P1 |
-| SVD/eig primitive | HIGH (2 families + linear) | HIGH | P1 |
-| GEMM + reductions | HIGH (everything) | MEDIUM | P1 |
-| Oracle harness w/ sign+permutation helpers | HIGH (gates all tests) | MEDIUM | P1 |
-| OLS / Ridge closed-form | HIGH | MEDIUM | P1 |
-| Lasso/ElasticNet CD solver | HIGH | MEDIUM-HIGH | P1 |
-| LogisticRegression QN | HIGH | HIGH | P1 (research-flag) |
-| KMeans (Lloyd + ++) | HIGH | MEDIUM-HIGH | P1 |
-| DBSCAN brute + components | HIGH | HIGH | P1 |
-| PCA / TruncatedSVD | HIGH | HIGH | P1 |
-| KNN brute (NN/clf/reg) | HIGH | MEDIUM | P1 |
-| Distance-weighted KNN | MEDIUM | LOW-MEDIUM | P2 |
-| Extra solver variants (jacobi/lsmr/qr) | MEDIUM | MEDIUM | P2 |
-| Extra metrics (cosine/minkowski) | MEDIUM | MEDIUM | P2 |
-| L1/elasticnet LogisticRegression | MEDIUM | HIGH | P2 |
-| Approximate KNN (IVF) | LOW (v1) | HIGH | P3 |
-| Sparse-input paths | LOW (v1) | HIGH | P3 |
-
-**Priority key:** P1 = must have for v1; P2 = add after core passes oracle; P3 = future/out-of-scope-v1.
-
----
-
-## Competitor Feature Analysis
-
-| Feature | scikit-learn (oracle) | RAPIDS cuML (reference) | mlrs v1 approach |
-|---------|----------------------|--------------------------|------------------|
-| OLS solver | SVD-based lstsq | `eig` default (+ svd/qr/lsmr) | `svd` path for 1e-5 match; `eig` as fast option |
-| LogisticRegression solver | `lbfgs`/`liblinear`/`saga` | `qn` only | `qn` (L-BFGS) — match sklearn `lbfgs` no-penalty case |
-| KMeans init | `k-means++` default | `scalable-k-means++` (k-means\|\|) default | **k-means++ default** to match oracle; k-means\|\| as differentiator |
-| PCA solver | `auto`→full/covariance_eigh/randomized | `full`/`jacobi` | `full` for oracle; `jacobi` differentiator; reject `mle` |
-| TruncatedSVD default | `randomized` (stochastic) | `full`/`jacobi` | `full`; oracle compares vs sklearn `arpack` (deterministic) |
-| KNN algorithm | tree + brute | brute/rbc/ivf | brute exact only in v1 |
-| DBSCAN labels comparison | deterministic-ish ordering | label-agnostic helper | replicate `assert_dbscan_equal` |
-| Multi-GPU / accel | n/a | Dask + cuml.accel | **out of scope** (PROJECT) |
-
----
+| Family | User Value | Implementation Cost | Priority | Parity risk |
+|--------|------------|---------------------|----------|-------------|
+| Naive Bayes (5) | HIGH | LOW | P1 | LOW (per-variant smoothing nuances) |
+| Covariance (2) | MEDIUM | LOW | P1 | LOW |
+| KernelRidge | MEDIUM | LOW | P1 | LOW–MED (singular fallback) |
+| KernelDensity | MEDIUM | MEDIUM | P1 | MED (log-norm constants) |
+| SpectralEmbedding/Clustering | MEDIUM | MEDIUM | P1 | HIGH (smallest-eig, sign, label-perm) |
+| IncrementalPCA | MEDIUM | MEDIUM | P1 | HIGH (svd_flip sign, ddof, f32 merge) |
+| RandomProjection (2) | MEDIUM | LOW | P1 | HIGH (no value oracle — property-gate) |
+| MBSGD (2) | MEDIUM | HIGH | P1 | HIGH (optimal schedule, shuffle RNG) |
+| LinearSVC/SVR | HIGH | HIGH | P1 | HIGH (squared_hinge default, intercept reg) |
 
 ## Sources
 
-- cuML v26.08 estimator sources (signatures, hyperparameters, fitted attributes, `_get_param_names`):
-  `cuml-main/python/cuml/cuml/{linear_model,cluster,decomposition,neighbors}/*.pyx,*.py` (HIGH confidence — read directly)
-- `.planning/PROJECT.md` (v1 scope, out-of-scope, 1e-5 oracle constraint)
-- `.planning/codebase/{ARCHITECTURE,TESTING,STRUCTURE}.md` (cuML Base/CumlArray patterns, oracle/test harness)
-- scikit-learn public estimator API conventions (`fit` returns self, `get/set_params`, mixin `score` defaults,
-  fitted-attribute naming, solver defaults) — established API, MEDIUM-HIGH confidence from training; the
-  *solver-default mismatches* (sklearn OLS=SVD, KMeans=k-means++, TruncatedSVD=randomized) are the
-  load-bearing claims and are the documented oracle risks.
+- cuML v26.08 source (read-only reference): `covariance/ledoit_wolf.py`, `kernel_ridge/kernel_ridge.py`, `solvers/sgd.pyx` — confirms LW shrinkage formula, KRR Cholesky dual solve, and that cuML's SGD is a *subset* of sklearn's (no optimal/averaging/squared_hinge). [HIGH]
+- scikit-learn docs (verified live 2026-06-14): [SGDClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDClassifier.html) — optimal/invscaling/constant/adaptive schedules, t0 heuristic, tol/n_iter_no_change stopping, `average`. [HIGH]
+- scikit-learn docs (verified live 2026-06-14): [LinearSVC](https://scikit-learn.org/stable/modules/generated/sklearn.svm.LinearSVC.html) — `squared_hinge`/`dual='auto'` defaults; LinearSVR `squared_epsilon_insensitive`/`epsilon=0.0`/`dual=True`, liblinear solver. [HIGH]
+- scikit-learn algorithm semantics (NB smoothing, IncrementalPCA merge/svd_flip, RandomProjection JL min-dim + sparse density, KDE kernels/bandwidth, spectral normalized-Laplacian + deterministic sign flip): stable documented API, knowledge cutoff Jan 2026, cross-checked against cuML where overlapping. [HIGH]
+- Project context: `.planning/PROJECT.md`, `seeds/v2-breadth-roadmap.md`, `notes/cuml-mlrs-gap-inventory.md`, `research/questions.md`. [HIGH]
 
 ---
-*Feature research for: sklearn-compatible GPU ML estimators (mlrs v1)*
-*Researched: 2026-06-11*
+*Feature research for: scikit-learn-compatible ML estimators (mlrs v2.0)*
+*Researched: 2026-06-14*
