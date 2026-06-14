@@ -1,11 +1,11 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.0
-milestone_name: milestone
-status: executing
-stopped_at: Completed 06-06-PLAN.md (Phase 06 done — milestone v1.0 ready for close)
+milestone_name: Core ML Library
+status: shipped
+stopped_at: v1.0 SHIPPED 2026-06-14 — archived; planning v2.0 Breadth Sweep next
 last_updated: "2026-06-14T00:00:00.000Z"
-last_activity: 2026-06-14 -- Completed Phase 06 Plan 06 (estimator_checks triage: 475 passed/102 by-design xfailed/0 unexpected over 12 estimators on real cpu/f64 _mlrs; four per-backend wheels build cp312-abi3 mlrs_cpu/wgpu/cuda/rocm, each `import mlrs`; driver-absent ImportError asserted clean; cuda live-import + cross-hardware checks deferred to a CUDA host per user approval; PY-04)
+last_activity: 2026-06-14 -- Closed v1.0 milestone (6 phases / 38 plans / 12 estimators / 27 requirements; archived ROADMAP+REQUIREMENTS to milestones/, tagged v1.0). Next: /gsd-new-milestone for v2.0 Breadth Sweep.
 progress:
   total_phases: 6
   completed_phases: 6
@@ -21,7 +21,7 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 06 — python-surface-pyo3-estimators-per-backend-wheels
+**Current focus:** v1.0 shipped — planning v2.0 Breadth Sweep (`/gsd-new-milestone`)
 
 ## Current Position
 

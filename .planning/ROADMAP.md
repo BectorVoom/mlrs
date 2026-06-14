@@ -1,231 +1,38 @@
 # Roadmap: mlrs — cuML in Rust
 
-## Overview
+## Milestones
 
-mlrs is built primitive-first along a strictly acyclic five-crate workspace. The foundation phase lands the spine that makes everything else testable: the scikit-learn oracle harness (sign-flip + label-permutation helpers + f32 tolerance policy), the Arrow zero-copy bridge with validation, the f64 capability gate, and per-backend wheel naming. From there, compute primitives are validated standalone before any estimator exists — GEMM/reductions/distance/covariance, then the SVD/eig hard gate in its own phase. Estimators are then "mostly assembly": closed-form models (OLS, Ridge, PCA, TruncatedSVD) first to exercise the full pipeline with no convergence risk, then distance-based and iterative-solver estimators, then the complete PyO3 Python surface and per-backend wheels. Correctness against scikit-learn within 1e-5 is the gate at every phase: through Phase 2 this ran on `cpu` and `wgpu`; **from Phase 3 the gate moves to `cpu` + `rocm`** (D-07), with `f64` validated on `cpu` and `f32` on `rocm` (f64-on-rocm skips-with-log — cubecl-cpp 0.10 does not register F64 for the HIP backend; wgpu is opportunistic only).
+- ✅ **v1.0 Core ML Library** — Phases 1–6 (shipped 2026-06-14) → [archive](milestones/v1.0-ROADMAP.md)
+- 📋 **v2.0 Breadth Sweep** — planned (run `/gsd-new-milestone`; seed: [v2-breadth-roadmap](seeds/v2-breadth-roadmap.md))
 
 ## Phases
 
-**Phase Numbering:**
+<details>
+<summary>✅ v1.0 Core ML Library (Phases 1–6) — SHIPPED 2026-06-14 — 38 plans, 12 estimators</summary>
 
-- Integer phases (1, 2, 3): Planned milestone work
-- Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
+- [x] Phase 1: Foundation — Oracle, Backend Abstraction, Arrow Bridge (5/5 plans) — completed 2026-06-11
+- [x] Phase 2: Core Compute Primitives (5/5 plans) — completed 2026-06-12
+- [x] Phase 3: SVD / Eigendecomposition Primitive — Hard Gate (5/5 plans) — completed 2026-06-12
+- [x] Phase 4: Closed-Form Estimators (5/5 plans) — completed 2026-06-12
+- [x] Phase 5: Distance-Based & Iterative-Solver Estimators (11/11 plans) — completed 2026-06-13
+- [x] Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels (6/6 plans) — completed 2026-06-14
 
-Decimal phases appear between their surrounding integers in numeric order.
+Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md)
 
-- [x] **Phase 1: Foundation — Oracle, Backend Abstraction, Arrow Bridge** - Workspace, generic R/F spine, oracle harness, Arrow zero-copy bridge, f64 capability gate, allocator (completed 2026-06-11)
-- [x] **Phase 2: Core Compute Primitives** - GEMM, reductions, pairwise distance, covariance/XᵀX validated standalone on cpu+wgpu; D-10 build-failing memory gate green (completed 2026-06-12)
-- [x] **Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)** - GPU Jacobi SVD + symmetric eig, sign-flip oracle-validated, gates four estimators; D-11 build-failing memory gate (bounded Jacobi scratch + eig buffer reuse + no mid-sweep read-back) green on cpu+rocm (completed 2026-06-12)
-- [x] **Phase 4: Closed-Form Estimators** - LinearRegression, Ridge, PCA, TruncatedSVD assembled on validated primitives
-- [x] **Phase 5: Distance-Based & Iterative-Solver Estimators** - KMeans, DBSCAN, KNN×3, Lasso, ElasticNet, LogisticRegression
-- [x] **Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels** - sklearn-compatible pyclass estimators, Arrow PyCapsule, maturin per-backend wheels (completed 2026-06-14)
+</details>
 
-## Phase Details
+### 📋 v2.0 Breadth Sweep (Planned)
 
-### Phase 1: Foundation — Oracle, Backend Abstraction, Arrow Bridge
-
-**Goal**: The generic compute spine, oracle harness, and data bridge exist so every downstream primitive and estimator can be validated against scikit-learn within 1e-5 on cpu and wgpu.
-**Depends on**: Nothing (first phase)
-**Requirements**: FOUND-01, FOUND-02, FOUND-03, FOUND-04, FOUND-05, FOUND-06, FOUND-07, FOUND-08, FOUND-09
-**Success Criteria** (what must be TRUE):
-
-  1. The five-crate workspace (`mlrs-core`, `mlrs-kernels`, `mlrs-backend`, `mlrs-algos`, `mlrs-py`) compiles with `--features cpu` and `--features wgpu`, and `--features cuda` compiles (without running); `mlrs-kernels` carries zero backend feature flags.
-  2. A trivial end-to-end `#[cube]` kernel generic over `<F: Float>` runs on both cpu and wgpu, ingests an Arrow `Float32Array`/`Float64Array` zero-copy through the validated bridge, reads back, and the oracle harness asserts equality vs. a NumPy reference within 1e-5.
-  3. The Arrow bridge rejects (does not silently upload) sliced/offset arrays, nullable arrays with set null bits, and misaligned buffers before any unsafe transmutation.
-  4. The capability layer reports whether the active backend supports f64 (`feature_enabled(FloatKind::F64)`); f64 oracle tests skip/xfail with a logged reason on wgpu adapters lacking `SHADER_F64`, and the CI log shows which dtype ran on which backend.
-  5. The oracle harness provides seeded-RNG fixtures, sign-flip and label-permutation comparison helpers, and a documented per-estimator-family f32 tolerance policy; the mimalloc global allocator is wired in `mlrs-py` with source/test code in separate files.
-
-**Plans**: 5 plans
-Plans:
-
-- [x] 01-01-PLAN.md — Wave 0: scaffold five-crate workspace + toolchain/API spike (resolve CubeCL 0.10 symbols A1–A7)
-- [x] 01-02-PLAN.md — mlrs-core oracle harness: assert_close, sign-flip, label-perm, npz loader, tolerance policy, BridgeError
-- [x] 01-03-PLAN.md — Arrow zero-copy bridge (hard-reject validation) + f64 capability gate
-- [x] 01-04-PLAN.md — DeviceArray + buffer-reuse pool with logged counters
-- [x] 01-05-PLAN.md — end-to-end pipeline test (Arrow→kernel→oracle) + gen_oracle.py fixtures + mimalloc allocator
-
-### Phase 2: Core Compute Primitives
-
-**Goal**: GEMM, reductions, pairwise distance, and covariance/XᵀX are validated standalone so downstream estimators reuse trusted kernels rather than debugging math inside estimators.
-**Depends on**: Phase 1
-**Requirements**: PRIM-01, PRIM-02, PRIM-03, PRIM-04
-**Success Criteria** (what must be TRUE):
-
-  1. ✅ A GEMM primitive (substrate resolved in Plan 02-01: WRAPS `cubek-matmul` 0.2.0 — the cubecl-0.10-compatible matmul source in tracel-ai/cubek; `cubecl-matmul`/`cubecl-linalg` are abandoned on incompatible cubecl lines) matches a host reference within tolerance for f32 and f64 on both cpu and wgpu. **[Plan 02-01 complete; wording updated from "cubecl-matmul" → "cubek-matmul".]**
-  2. ✅ Reduction primitives (sum/mean/min/max/argmin/L2-norm) pass on wgpu via both a plane/subgroup path and a shared-memory fallback, with no hardcoded plane width (uses `PLANE_DIM`), numerically stable on large inputs. **[Plan 02-02 complete; BOTH paths green on wgpu (plane genuinely exercised) + cpu, f32/f64, within 1e-5; argmin lowest-index tie-break pinned by numpy fixture.]**
-  3. ✅ A pairwise squared-Euclidean distance primitive with a `max(d², 0)` clamp produces no negative distances under f32 and matches the host reference within tolerance. **[Plan 02-03 complete; GEMM-expansion + statement-form clamp, min>=0 property pinned on f32 cancellation, squared/sqrt fixtures, green cpu+wgpu.]**
-  4. ✅ A covariance / XᵀX (Gram) primitive built on GEMM matches the host reference within tolerance for both dtypes on cpu and wgpu. **[Plan 02-04 complete; column-mean center + GEMM(transa) AᵀA + 1/(n-ddof) scale, ddof=0/1 match np.cov, green cpu+wgpu. Plan 02-05 D-10 memory gate proves the device-resident composition (reuse>0/bounded, read_backs==1, Gram reuses GEMM buffer) end-to-end.]**
-
-**Plans**: 5 plansPlans:
-**Wave 1**
-
-- [x] 02-01-PLAN.md — Wave 1: Wave-0 infra (PoolStats.read_backs, subgroup probe, GEMM fixtures) + GEMM substrate decision + GEMM primitive (PRIM-01) ✅ (cubek-matmul wrap; 4/4 oracle green cpu+wgpu)
-
-**Wave 2**
-
-- [x] 02-02-PLAN.md — Wave 2: dual-path reductions sum/mean/min/max/L2-norm + argmin/argmax (plane + shared, PLANE_DIM, lowest-index tie-break) (PRIM-02) ✅ (both paths green cpu+wgpu, f32/f64; argmin tie fixture)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 02-03-PLAN.md — Wave 3: pairwise squared-Euclidean distance via GEMM-expansion + max(d²,0) clamp + optional sqrt (PRIM-03) ✅ (distance host API composes gemm+row-SumSq+clamp+optional sqrt, device-resident; min>=0 property holds on f32 cancellation; squared/sqrt npz fixtures; green cpu+wgpu)
-
-**Wave 4** *(blocked on Wave 3 completion)*
-
-- [x] 02-04-PLAN.md — Wave 4: covariance / XᵀX via GEMM(transa) + ddof=0/1 normalization (PRIM-04) ✅ (covariance host API composes column-mean center + device center_columns kernel + gemm(transa) AᵀA + 1/(n-ddof) scale in place over the GEMM output buffer — D-10 gate-3 reuse achieved; ddof=0 population + ddof=1 sample match np.cov(rowvar=False) fixtures + direct host ref, f32+f64, green cpu+wgpu)
-
-**Wave 5** *(blocked on Wave 4 completion)*
-
-- [x] 02-05-PLAN.md — Wave 5: D-10 build-failing memory gate (reuse>0/bounded, no mid-pipeline read-back, Gram reuses GEMM buffer) ✅ (memory_gate_test.rs: 3 HARD PoolStats assertions — FIRST_ITER_ALLOCS=15/reuses=62, read_backs==1 for GEMM→reduce→distance, free-list probe confirms 0 parallel Gram allocs; green cpu+wgpu, identical figures; zero new deps, zero source-symbol changes)
-
-### Phase 3: SVD / Eigendecomposition Primitive (Hard Gate)
-
-**Goal**: A validated SVD / symmetric-eigendecomposition primitive exists with the `svd_flip` sign convention, unblocking PCA, TruncatedSVD, and the OLS/Ridge SVD solver paths.
-**Depends on**: Phase 2
-**Requirements**: PRIM-05
-**Success Criteria** (what must be TRUE):
-
-  1. A Jacobi SVD for general matrices matches a host/NumPy reference within tolerance after sign-flip normalization, for f32 and f64. The correctness gate is **cpu + rocm** (D-07): f64 validates on cpu; rocm validates f32; f64-on-rocm SKIPS-with-log because cubecl-cpp 0.10 does not register F64 for the HIP backend (empirically confirmed, RESEARCH 03 CRITICAL FINDING 2 — not a defect). wgpu is opportunistic only.
-  2. A symmetric eigendecomposition of a covariance matrix (PCA `full` solver path) matches the reference eigenvalues/eigenvectors within tolerance after sign alignment.
-  3. The SVD/eig oracle tests pass on the **cpu + rocm** gate (with documented f32 tolerance), proving the primitive before any estimator consumes it — f64 validates on cpu, f32 validates on rocm, and f64-on-rocm skips-with-log (cubecl-cpp 0.10 F64 unregistered).
-
-**Plans**: 5 plans
-Plans:
-**Wave 1**
-
-- [x] 03-01-PLAN.md — ROCm/HIP bring-up (runtime.rs hip path + rocm Cargo feature) + saxpy gate on gfx1100 + cpu+rocm doc reconciliation (D-07) ✅ (cubecl::hip re-export + cubecl/std,cubecl/default; spike_saxpy runs real HIP kernel on gfx1100; capability split confirmed rocm f32=true/f64=false, cpu f64=true; ROADMAP/PROJECT/03-CONTEXT reconciled)
-- [x] 03-02-PLAN.md — Wave-0 scaffold: PrimError NotSquare/NotConverged + gen_oracle.py svd/eigh fixtures + committed .npz + svd_test/eig_test skeletons (D-06/D-09/D-12) ✅ (PrimError +NotSquare/+NotConverged; gen_svd/gen_eigh; five fixtures svd_tall f32+f64/svd_wide f32/eigh f32+f64; svd_test 7 fns + eig_test 4 fns compile on cpu, ignored until 03-03/04 land the prims)
-
-**Wave 2**
-
-- [x] 03-03-PLAN.md — one-sided Jacobi SVD kernel + svd() prim (thin-U, tall+wide Aᵀ-swap, descending sort) + SVD oracle/invariant tests (D-01..D-05) ✅ (jacobi_svd_sweep single-cube in-kernel convergence, A in global for gfx1100 LDS budget, two-threshold skip/break convergence; svd() validate+wide-swap+gemm thin-U+descending sort; 7 svd_test green on cpu f32+f64 and rocm f32, f64 skip-with-log)
-
-**Wave 3**
-
-- [x] 03-04-PLAN.md — two-sided Jacobi symmetric-eig kernel + eig() prim (validate-square, descending, buffer reuse) + eigh oracle/residual tests (D-01/D-04/D-06) ✅ (jacobi_eig_sweep single-cube #[cube] Jᵀ·A·J via single-acting-unit sequential cyclic pairs — two-sided rotations are not footprint-disjoint so the SVD parallel schedule races; in-kernel post-sweep off-diagonal-norm convergence; eig() validate-square→NotSquare pre-launch, covariance/GEMM out-buffer reuse D-11 gate 2, descending sort D-04, NotConverged on cap; 4 eig_test green on cpu f32+f64 and rocm f32, f64 skip-with-log; svd_test still 7/7. PRIM-05 eig half complete)
-
-**Wave 4**
-
-- [x] 03-05-PLAN.md — D-11 build-failing memory gate: bounded Jacobi scratch + eig buffer reuse + no mid-sweep read-back ✅ (three HARD PoolStats gates extending the Phase-2 gate to the iterative Jacobi sweep — memory_gate_jacobi_scratch_bounded: svd() per-call fresh-alloc delta flat after warmup + live/peak return to baseline; memory_gate_eig_reuses_gram_buffer: eig(out=Some) peak live rise <2·n² → reuses the threaded covariance/GEMM buffer, no parallel n² matrix; memory_gate_svd_no_midsweep_readback: read_backs==0 after svd(), ==1 after the single terminal to_host_metered. All six gates green on cpu f32+f64 and rocm f32; svd_test 7/7 + eig_test 4/4 green on both. Gate 2 used peak-live-bytes rise rather than the free-list probe because eig releases the threaded buffer after use. PRIM-05 complete — Phase 3 DONE)
-
-**Research flag**: NEEDS DEEPER RESEARCH — Jacobi SVD on GPU in CubeCL is not a pre-built `cubecl-matmul` primitive; the iterative Jacobi-rotation kernel design for `#[cube]` requires domain research. Run `/gsd-plan-phase --research-phase 3` before writing any code.
-
-### Phase 4: Closed-Form Estimators
-
-**Goal**: A data scientist can fit LinearRegression, Ridge, PCA, and TruncatedSVD and get results matching scikit-learn within 1e-5, exercising the full Arrow→kernel→device-state→materialize→oracle pipeline with no convergence risk.
-**Depends on**: Phase 3
-**Requirements**: LINEAR-01, LINEAR-02, DECOMP-01, DECOMP-02
-**Success Criteria** (what must be TRUE):
-
-  1. `LinearRegression` (SVD-based, matching sklearn's default lstsq) fits and exposes `coef_`/`intercept_`, predicting within 1e-5 of scikit-learn on random data via cpu and wgpu.
-  2. `Ridge` with an `alpha` penalty produces `coef_`/`intercept_` matching scikit-learn within tolerance.
-  3. `PCA` with `n_components` exposes `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`, and `transform`/`inverse_transform`, matching scikit-learn after `svd_flip` sign alignment.
-  4. `TruncatedSVD` (no centering) exposes `components_`/`explained_variance_`/`singular_values_`/`transform`, matching scikit-learn's deterministic `arpack` path after sign alignment.
-
-**Note**: Success criterion 1 "via cpu and wgpu" is superseded by Phase-3 D-07 — the runnable gate is cpu(f64) + rocm(f32); f64-on-rocm skips-with-log. wgpu is opportunistic only.
-
-**Plans**: 5 plans
-Plans:
-**Wave 1**
-
-- [x] 04-01-PLAN.md — Wave-0 scaffold: mlrs-algos deps + Fit/Predict/Transform traits (D-04) + module stubs + PrimError::NotPositiveDefinite + gen_oracle.py sklearn fixtures + 5 #[ignore] Nyquist test stubs **[complete — compiles cpu+rocm; AlgoError + traits re-exported; 14 f32/f64 fixtures committed; 5 test crates list (30 fns), fixture_loads passes --ignored]**
-
-**Wave 2** *(parallel — file-disjoint)*
-
-- [x] 04-02-PLAN.md — NEW Cholesky + triangular-solve primitive (kernel + prim wrapper, jacobi_eig blueprint) validated standalone f32+f64 cpu+rocm (D-02; the highest-risk sub-deliverable) **[complete — single-cube in-kernel cholesky_solve (factor+fwd+back, D-11 gate 3); prims::cholesky validate-before-launch + out=Some Gram reuse + NotPositiveDefinite non-SPD guard; ‖A·x−b‖/‖L·Lᵀ−A‖/non-SPD pass cpu(f64+f32)+rocm(f32; f64 skip-with-log), 6/6 each gate]**
-- [x] 04-03-PLAN.md — LinearRegression (SVD pseudo-inverse + small-σ cutoff + center-then-solve intercept) (LINEAR-01) **[complete — coef = V·diag(σ⁺)·Uᵀ·y_centered via svd+gemm(transa, no transpose buffer)+column_reduce, NO Cholesky (D-02); cutoff pinned RCOND=1e-6 = sklearn LinearRegression.tol→scipy lstsq cond (numpy ε·max(m,n) explodes the f64 collinear case); intercept ȳ−x̄·coef_ (D-05); device-resident coef_/intercept_ (D-03); 6/6 oracle pass cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5 incl. collinear cutoff]**
-- [x] 04-04-PLAN.md — PCA (center→SVD, S²/(n−1), svd_flip) + TruncatedSVD (uncentered arpack, var(transform)) (DECOMP-01, DECOMP-02) **[complete — Pca/TruncatedSvd share one svd+align_rows skeleton with three documented differences (PCA centers + S²/(n−1) + inverse_transform; TSVD uncentered + var(transform cols) + Unsupported inverse); svd_flip estimator-side via align_rows (primitive raw, D-01/D-03); transform via gemm transb (no transpose buffer, D-06); n_components/n_samples guarded before launch; Rule-1 fix: gen_oracle.py c() forces C-contiguous (sklearn PCA components_ was Fortran-order → load_npz read transposed), 6 PCA fixtures regenerated; 10+6 oracle tests pass cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5 incl. PCA wide Aᵀ-swap case]**
-
-**Wave 3** *(blocked on Cholesky prim + linear/mod.rs)*
-
-- [x] 04-05-PLAN.md — Ridge (raw Gram via gemm(transa) + diagonal-α + Cholesky solve, intercept unpenalized) (LINEAR-02) + D-03 fit→predict/transform memory gate extension **[complete — Ridge<F> Fit+Predict solves (XᵀX+αI)·coef=Xᵀy via the 04-02 cholesky_solve (D-02, NOT SVD); raw centered Gram via gemm(transa=true) (Open Q1, not scaled covariance); α on the Gram diagonal only, intercept recovered via center-then-solve (never penalized, D-05); regularized Gram threaded through cholesky_solve out so the factor reuses it (D-11 gate 2); InvalidAlpha + geometry validated before launch; ridge_test alpha-sweep {0.1,1,10} + intercept-not-penalized + predict-consistency green cpu(f64)+rocm(f32; f64 skip-with-log) within 1e-5; 3 new D-03 estimator memory gates (bounded reuse / Ridge Gram reuse / no mid-pipeline readback) composed from prims since mlrs-backend cannot dev-dep mlrs-algos (dep cycle), 9/9 gates green both backends]**
-
-### Phase 5: Distance-Based & Iterative-Solver Estimators
-
-**Goal**: A data scientist can fit the clustering, neighbors, and iterative-solver linear models matching scikit-learn within tolerance (up to label permutation where applicable), completing the v1 algorithm surface in Rust.
-**Depends on**: Phase 4
-**Requirements**: LINEAR-03, LINEAR-04, LINEAR-05, CLUSTER-01, CLUSTER-02, NEIGH-01, NEIGH-02, NEIGH-03
-**Success Criteria** (what must be TRUE):
-
-  1. `KMeans` (k-means++ init, sklearn default) exposes `cluster_centers_`/`labels_`/`inertia_` and predicts new points, matching scikit-learn up to label permutation; `DBSCAN` (`eps`/`min_samples`) exposes `labels_` (noise = -1) and `core_sample_indices_`, matching scikit-learn up to label permutation.
-  2. `NearestNeighbors` (brute-force) returns k nearest distances and indices within 1e-5; `KNeighborsClassifier` (`predict`/`predict_proba`) and `KNeighborsRegressor` (`predict`) match scikit-learn within tolerance.
-  3. `Lasso` and `ElasticNet` share a coordinate-descent kernel (Lasso = `l1_ratio==1`) and produce `coef_` matching scikit-learn's CD solver within tolerance.
-  4. `LogisticRegression` (quasi-Newton/L-BFGS) with stable softmax handles binary and multiclass, with `predict`/`predict_proba` matching scikit-learn's `lbfgs` solver within tolerance.
-
-**Plans**: 11 plans
-Plans:
-**Wave 1**
-
-- [x] 05-01-PLAN.md — Wave-0 scaffold: traits (PredictLabels/KNeighbors/PredictProba D-05/D-07) + AlgoError variants (D-06) + cluster/neighbors module stubs + 10 kernel/prim stub modules + gen_oracle.py 6 generators + 14 committed fixtures (KMeans injected init D-09) + 14 #[ignore] oracle test stubs + i32 DeviceArray confirmation
-
-**Wave 2** *(parallel — file-disjoint NEW primitives, D-01 primitive-first)*
-
-- [x] 05-02-PLAN.md — NEW top-k selection primitive (D-02, lowest-index tie) + standalone oracle (NEIGH-01/02/03) **[complete; select_k #[cube] selection-by-rank kernel + top_k validate-before-launch wrapper, oracle green cpu(f64) within 1e-5 + indices exact]**
-- [x] 05-03-PLAN.md — NEW KMeans primitives: Lloyd centroid-update+inertia + k-means++ D²-sampling (host-seeded RNG D-09a/c) + standalone oracles (CLUSTER-01) **[complete; centroid_sumcount + inertia_rows #[cube] GATHER kernels + lloyd_update/inertia/kmeanspp_sample wrappers, lloyd oracle green cpu(f64) within 1e-5 + empty-cluster relocation + kmeanspp seed-reproducible invariant]**
-- [x] 05-04-PLAN.md — NEW DBSCAN eps-region+core-mask primitive (D-04 device-compute half) + standalone oracle (CLUSTER-02) **[complete; eps_core_count #[cube] GATHER kernel (no atomics/no SharedMemory, cpu-MLIR-safe) + eps_core_mask wrapper (n² distance reuse + eps² threshold → D-04 host readback of is_core/counts/n×n adjacency), oracle green cpu(f64) 5/5: is_core integer-exact vs sklearn core_sample_indices_ (f32+f64) + self-inclusivity + bad-input guards]**
-- [x] 05-05-PLAN.md — NEW coordinate-descent step primitive + host CD loop (D-03/D-10, sklearn coef_+sparsity) + standalone oracle (LINEAR-03/04) **[complete; col_dot + residual_axpy + enet_gap #[cube] kernels (single-cube GATHER, cpu-MLIR-safe) + cd_solve host cyclic loop (R/x/y reused, host soft-threshold, ONE scalar gap/iter via device enet_gap, tol·‖y‖² stop, norm2_cols[j]==0 skip), oracle green cpu(f64) 5/5: coef + exact sparsity within 1e-5 on lasso + elastic_net {f32,f64}]**
-- [x] 05-06-PLAN.md — NEW L-BFGS solver primitive (highest risk): softmax loss/grad kernel + host two-loop (m=10) + convex-quadratic standalone validation (Pitfall 5) (LINEAR-05) **[complete; softmax_loss_grad #[cube] kernel (symmetric multinomial D-12, logsumexp row-max-before-exp Pitfall 4, intercept unpenalized Pitfall 3, cpu-MLIR-safe single-cube) + lbfgs_minimize host two-loop m=10 + strong-Wolfe (gtol=1e-4/ftol=64·eps/maxls=50/maxiter=100, (s,y)+grad reused, ONE scalar max|grad|/iter D-10) + softmax_loss_grad launcher (validate-before-launch, one metered scalar). Oracle green cpu(f64) 9/9: convex-quadratic x*=A⁻¹b within 1e-5 (Pitfall 5 standalone) + softmax loss/grad vs host ref + finite-diff grad (binary+multi, f32/f64) + no-NaN L-BFGS+softmax smoke]**
-
-**Wave 3** *(parallel — estimators on validated prims, file-disjoint by module)*
-
-- [x] 05-07-PLAN.md — KMeans (k-means++ + Lloyd, PredictLabels) + DBSCAN (host index-ordered DFS, noise=-1) up to label permutation (CLUSTER-01/02) **[complete; KMeans<F> Fit (injected/k-means++ init + Lloyd loop reproducing sklearn strict-OR-tol convergence Pitfall 6: array_equal break THEN center_shift<=tol·mean(var(X)), final assign pass, empty-cluster relocation in prim) + PredictLabels (i32 new-point assign, NOT Predict<F> D-08) + fit_predict; cluster_centers_/labels_(i32)/inertia_ device-resident. DBSCAN<F> Fit (eps_core_mask device prim D-04 → host index-ordered LIFO DFS exactly _dbscan_inner.pyx, expand only from core points, label_num++ per seed Pitfall 7) + fit_predict; labels_(i32 noise=-1)+core_sample_indices_; no standalone predict D-08. Validate-before-launch InvalidK/InvalidEps/InvalidMinSamples (ASVS V5). Oracle green cpu f32+f64 9/9: KMeans centers/labels up to permutation (best_match_accuracy==1.0) + inertia within 1e-5 from injected init; DBSCAN core_sample_indices_ exact + labels up to permutation. rocm(f32) test build green]**
-- [x] 05-08-PLAN.md — NearestNeighbors (KNeighbors trait) + KNeighborsClassifier (predict/predict_proba) + KNeighborsRegressor (predict) (NEIGH-01/02/03) **[complete; brute-force on validated top_k, shared neighbor_indices core, oracles green cpu(f64) within 1e-5 + indices/predict exact, rocm(f32) build green]**
-- [x] 05-09-PLAN.md — Lasso + ElasticNet (shared CD helper, penalty map + center-then-solve intercept) coef_+sparsity (LINEAR-03/04) **[complete; coordinate_descent::cd_fit shared host helper (validate alpha/l1_ratio before launch, center-then-solve D-13, penalty map l1_reg=α·l1_ratio·n / l2_reg=α·(1−l1_ratio)·n Pitfall 1, cd_solve, intercept=ȳ−x̄·coef); ElasticNet<F> Fit+Predict; Lasso<F> = ElasticNet(l1_ratio=1) thin wrapper (no duplicate CD loop, D-03); oracles green cpu f32+f64 within 1e-5 incl. exact sparsity, rocm(f32) build green]**
-
-**Wave 4** *(blocked on the iterative-solver/DBSCAN prims)*
-
-- [x] 05-10-PLAN.md — LogisticRegression (L-BFGS over symmetric softmax, l2_reg=1/(C·n)) predict_proba primary gauge-invariant gate (LINEAR-05) **[complete; LogisticRegression<F> Fit+PredictLabels+PredictProba via lbfgs_minimize over softmax (D-12 symmetric multinomial all K). Oracle green cpu(f32+f64) 5/5: predict_proba PRIMARY 1e-5 (binary f32/f64 + multiclass f64 STRICT) + predict exact + coef_ gauge-fixed secondary. BINARY = symmetric-multinomial SELF-REFERENCE (scipy on exact objective, NOT sklearn binomial — differs ~3.6e-3 under L2, user-approved D-12 tradeoff); MULTICLASS sklearn-faithful, fixture refit at true minimum (tol=1e-10, agreement ~5e-8). ftol-stall = functional convergence for the gauge-redundant objective (only iteration-cap is NotConverged). f32 multiclass on documented 5e-5 family bound (predict argmax exact). rocm tests build green]**
-- [x] 05-11-PLAN.md — memory-gate extensions: D-10 iterative-solver bounded-allocation + 1-scalar/iter readback (CD+L-BFGS) + D-04 DBSCAN n²-bound (documented exceptions) **[complete; two HARD build-failing PoolStats gates in memory_gate_test.rs (+510 lines, 1 file, zero source edits). memory_gate_iterative_solver_bounded ENCODES the gate-2 EXCEPTION: CD (cd_solve N=5×) allocations delta==0 after warmup + read_backs 1≤delta≤50/call (one device-assembled duality-gap scalar per outer check, steady delta=1, never per-iter array); L-BFGS (lbfgs_minimize on a strongly-convex quadratic, loss via length-1 from_host→to_host_metered→release) allocations_during==0 ((s,y)+grad host-reused) + read_backs_during==eval_count (one scalar/eval). memory_gate_dbscan_n2_bounded ENCODES the D-04 exception: eps_core_mask (N=5×) n² matrix allocated-once+reused (alloc delta==0, live/peak conserved) + metered read_backs delta==0/call (core-mask readback is the documented UNMETERED plain-to_host single round-trip). Doc comments label both as bounded-allocation-form exceptions, not regressions. Full memory_gate suite 11/11 green cpu(f32); rocm test target builds. T-05-11-01/02 mitigated]**
-
-**Research flag**: COMPLETED — `/gsd-plan-phase --research-phase 5` done; 05-RESEARCH.md pins sklearn 1.9.0 / scipy 1.17.1 solver objectives, penalty scalings, and stopping criteria verbatim. LogReg L-BFGS remains the highest correctness risk (gated on gauge-invariant predict_proba per Pitfall 5); CD convergence validated against committed Lasso/ElasticNet fixtures.
-
-### Phase 6: Python Surface — PyO3 Estimators & Per-Backend Wheels
-
-**Goal**: A Python ≥ 3.12 data scientist can `pip install` the wheel matching their backend and use all 12 v1 estimators through a sklearn-compatible API with zero-copy Arrow ingest and the GIL released during compute.
-
-> **Estimator count note (reconciled 2026-06-13):** `mlrs-algos` ships **12** estimator structs — LinearRegression, Ridge, Lasso, **ElasticNet** (LINEAR-04), LogisticRegression, PCA, TruncatedSVD, KMeans, DBSCAN, NearestNeighbors, KNeighborsClassifier, KNeighborsRegressor. Earlier "11 estimators" narrative undercounted by folding ElasticNet into the Lasso shared-CD family; the Python surface wraps all 12 (dropping ElasticNet would drop LINEAR-04).
-**Depends on**: Phase 5
-**Requirements**: PY-01, PY-02, PY-03, PY-04, PY-05
-**Success Criteria** (what must be TRUE):
-
-  1. All 12 v1 estimators are `#[pyclass]`-backed objects with sklearn-compatible `fit`/`predict`/`transform`/`score` (`fit` returns `self`) and pass `pytest` oracle tests plus relevant `sklearn.utils.estimator_checks`.
-  2. Estimators support `get_params`/`set_params` with constructor hyperparameters matching scikit-learn naming, and accept f32 and f64 NumPy/Arrow inputs via runtime dtype dispatch.
-  3. NumPy/Arrow inputs cross the boundary via the Arrow PyCapsule interface with correct ownership/lifetime handling (no bare `&[u8]` borrows into Python-owned buffers), and `Python::allow_threads` releases the GIL around device compute.
-  4. Per-backend wheels build via `maturin build --features <backend>` under distinct distribution names (`mlrs-cpu`, `mlrs-wgpu`, `mlrs-cuda`, `mlrs-rocm`) with `abi3-py312`; importing a wheel whose driver is absent fails with a clear error.
-
-**Plans**: 6 plans
-**Wave 1**
-
-- [x] 06-01-PLAN.md — Wave-0 scaffold: pyo3 0.28 ABI pin, 4 per-backend pyproject templates, pure-Python mlrs package skeleton, pytest scaffold, arrow FromPyArrow symbol ✅ (4/4 tasks; numpy>2.0.0/pyarrow>=14/scikit-learn>=1.6 floors; FromPyArrow=ArrayData::from_pyarrow_bound)
-
-**Wave 2** *(blocked on Wave 1 completion)*
-
-- [x] 06-02-PLAN.md — Core Rust plumbing: PyCapsule ingress (reuse validate bridge), egress, capability guard, dtype-dispatch macro, GIL release, catch_unwind import probe, global pool ✅ (2/2 tasks; owned ArrayRef ingress no &[u8] borrow, guard_f64→PyValueError + backend_supports_f64(), #[pymodule] _mlrs catch_unwind→PyImportError, OnceLock<Mutex<BufferPool>>, any_estimator! skeleton; extension-module gated as a feature so cargo test links libpython; 14 Rust tests green cpu; PY-03/04/05)
-
-**Wave 3** *(blocked on Wave 2 completion)*
-
-- [x] 06-03-PLAN.md — 12 #[pyclass] estimator wrappers (linear/cluster/decomposition/neighbors) + module registration **[complete — all 12 mlrs-algos estimators wrapped as #[pyclass] on _mlrs (add_class=12, PY-01); each drives a macro-emitted Any<Name> Unfit/F32/F64 dispatch enum (D-06/PY-05) with sklearn-named #[new] ctors stored verbatim (PY-02; LogReg C→c, KMeans random_state→seed); every fit/predict/transform/kneighbors/predict_proba runs the device trait call inside py.detach (PY-03) with guard_f64()? before the F64 arm (D-04); dtype-suffixed accessors materialize host Vec<f32|f64|i32> (D-03); DBSCAN predict-less (D-08); pyclass_smoke_test constructs all 12 Unfit without an interpreter; 16 Rust tests green cpu, both cpu & cpu,extension-module compile]**
-
-**Wave 4** *(blocked on Wave 3 completion)*
-
-- [x] 06-04-PLAN.md — Pure-Python sklearn shim: base/_io + 12 estimator classes (mixins, get_params/set_params, output_type), test_params **[complete — 12 sklearn BaseEstimator+family-mixin shims delegate to _mlrs (D-01/PY-01); faithful __init__ gives get_params/set_params/clone/__repr__ free (PY-02; LogReg C not c, KMeans random_state); _io.normalize_X = check_array(finite/2-D)→ascontiguousarray.ravel→fresh pyarrow + (rows,cols) (D-02/Pitfall3/T-06-11), pick_dtype f64/f32 via backend_supports_f64() (D-05/Pitfall5), resolve_output_type input-mirror (D-03), to_output int32 labels (D-06); MlrsBase _check_fitted→NotFittedError (T-06-13), __sklearn_tags__ sparse/nan/array-api off, dtype-suffix dispatch; DBSCAN/NearestNeighbors predict-less; lazy _mlrs import (PEP-562 __getattr__ + _ext()) so shim imports pre-build; Rule-3 deviation: lazy import unblocked pure-Python testing; Rule-1 fix: _suffixed evaluates _check_fitted before _mlrs_obj so coef_-before-fit raises NotFittedError not AttributeError; 109 pure-Python tests green (sklearn 1.9/numpy 2.4/pyarrow 24) — device fit/predict path deferred to Plan 05/06 oracle gate (no maturin in env); PY-01/02/03/05]**
-
-**Wave 5** *(blocked on Wave 4 completion)*
-
-- [x] 06-05-PLAN.md — Oracle pytest harness (1e-5 full-path, sign-flip/label-perm/gauge-fixed-proba) + f32/f64 dispatch + GIL-release tests **[complete — 34 oracle cases re-validate 1e-5 for all 12 estimators through the FULL numpy->pyarrow->PyCapsule->Rust FFI->validate->device->host->numpy path (criterion 1/PY-01), replaying the committed tests/fixtures/*.npz as a SECOND consumer on a REAL cpu _mlrs (maturin develop 1.14 + LD_PRELOAD for mimalloc static-TLS): linear coef_/intercept_ direct (Ridge 3-alpha sweep); LogisticRegression gauge-fixed predict_proba (D-12, NOT raw coef_) fit at fixture tight tol + exact labels; KMeans labels_ (label-perm) + centers (remapped) + inertia_; DBSCAN labels_ (label-perm) + core_sample_indices_; PCA/TSVD components_ (sign-flip) + transform (same-sign cols) + mean_/explained_variance_/singular_values_; k-NN distances(1e-5)+indices(exact), classifier predict/proba, regressor predict. test_dtype: f32/f64 preservation + int->f64 default via backend_supports_f64() (PY-05/D-05); f64-on-incapable raise skipif-gated to rocm (D-04/T-06-15); subprocess-isolated GIL-release smoke (worker .fit advances main-thread counter ~1e7 iters; cpu client is thread-affine). Rule-3 fix: recursion-safe lazy _mlrs loader (importlib.import_module). f64 strict 1e-5, f32 documented 1e-4 epsilon band w/ exact labels. 147 passed/1 skipped(f64-raise on cpu)/12 xfailed(estimator_checks, Plan 06). PY-01/03/05]**
-- [x] 06-06-PLAN.md — estimator_checks triage + four wheel builds (distinct dist names, abi3-py312) + driver-absent ImportError **[complete — parametrize_with_checks over all 12 estimators on the real cpu/f64 _mlrs: 475 passed / 102 by-design xfailed (sklearn-native expected_failed_checks + checks_triage.md companion) / 19 skipped / 0 unexpected failures / 0 xpassed across 597 cases (criterion 1 = relevant subset, NOT all). Three genuine failures fixed in the shim during triage (Rule 2 n_features_in_/_post_fit; Rule 1 _check_predict_X NotFittedError-first; Rule 2 predict feature-count validation), not masked. DBSCAN/NearestNeighbors predict-less → no predict-based checks generated (Open Q3 resolved). Four wheels build cp312-abi3 under distinct dist names mlrs_cpu(51MB)/wgpu(7.5MB)/cuda(6.2MB compile-only)/rocm(21MB), each ships mlrs/_mlrs.abi3.so and is `import mlrs`; mimalloc local_dynamic_tls lets the cpu wheel import with NO LD_PRELOAD; rocm imports live (backend_supports_f64()==False, f64-incapable raise live). Driver-absent ImportError asserted clean in-process+subprocess (no abort, D-08/T-06-16). Task 3 human-verify resolved by user approval; live cuda import + cross-hardware absent-driver + two-wheel-overwrite DEFERRED to a CUDA host (opportunistic, recorded honestly). PY-04]**
-
-**Research flag**: Maturin per-feature distribution naming may need a small build-system spike — the multi-distribution pattern is undocumented in maturin's first-party docs. Otherwise standard patterns.
+Defined via `/gsd-new-milestone`. Scope sketched in [seeds/v2-breadth-roadmap.md](seeds/v2-breadth-roadmap.md):
+Covariance/projection → Kernel family → Spectral family → SGD/linear-SVM → Naive Bayes (+ stretch).
 
 ## Progress
 
-**Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
-
-| Phase | Plans Complete | Status | Completed |
-|-------|----------------|--------|-----------|
-| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | 5/5 | Complete    | 2026-06-11 |
-| 2. Core Compute Primitives | 5/5 | Complete    | 2026-06-12 |
-| 3. SVD / Eigendecomposition Primitive (Hard Gate) | 5/5 | Complete    | 2026-06-12 |
-| 4. Closed-Form Estimators | 5/5 | Complete    | 2026-06-12 |
-| 5. Distance-Based & Iterative-Solver Estimators | 11/11 | Complete    | 2026-06-13 |
-| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | 6/6 | Complete    | 2026-06-14 |
+| Phase | Milestone | Plans Complete | Status | Completed |
+|-------|-----------|----------------|--------|-----------|
+| 1. Foundation — Oracle, Backend Abstraction, Arrow Bridge | v1.0 | 5/5 | Complete | 2026-06-11 |
+| 2. Core Compute Primitives | v1.0 | 5/5 | Complete | 2026-06-12 |
+| 3. SVD / Eigendecomposition Primitive (Hard Gate) | v1.0 | 5/5 | Complete | 2026-06-12 |
+| 4. Closed-Form Estimators | v1.0 | 5/5 | Complete | 2026-06-12 |
+| 5. Distance-Based & Iterative-Solver Estimators | v1.0 | 11/11 | Complete | 2026-06-13 |
+| 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
