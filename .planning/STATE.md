@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: Core ML Library
-status: shipped
-stopped_at: v1.0 SHIPPED 2026-06-14 — archived; planning v2.0 Breadth Sweep next
+milestone: v2.0
+milestone_name: Breadth Sweep
+status: planning
+stopped_at: v2.0 started — defining requirements
 last_updated: "2026-06-14T00:00:00.000Z"
-last_activity: 2026-06-14 -- Closed v1.0 milestone (6 phases / 38 plans / 12 estimators / 27 requirements; archived ROADMAP+REQUIREMENTS to milestones/, tagged v1.0). Next: /gsd-new-milestone for v2.0 Breadth Sweep.
+last_activity: 2026-06-14 -- Started v2.0 Breadth Sweep milestone (research-first; defining requirements across 5 estimator families).
 progress:
-  total_phases: 6
-  completed_phases: 6
-  total_plans: 38
-  completed_plans: 38
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -25,13 +25,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 06 (python-surface-pyo3-estimators-per-backend-wheels) — COMPLETE
-Plan: 6 of 6 (DONE)
-Status: Phase 06 complete — milestone v1.0 ready for close
-Last activity: 2026-06-14 -- Completed Phase 06 Plan 06 (estimator_checks triage over the 12 estimators: 475 passed/102 by-design xfailed/19 skipped/0 unexpected/0 xpassed across 597 cases on the real cpu/f64 _mlrs; four per-backend wheels build cp312-abi3 under distinct dist names mlrs_cpu/wgpu/cuda/rocm each importable as `import mlrs`, cpu imports with NO LD_PRELOAD after the mimalloc local_dynamic_tls fix; driver-absent ImportError asserted clean in-process+subprocess; three cuda-hardware items — live cuda import, cross-hardware absent-driver, two-wheel-overwrite — DEFERRED to a CUDA host per user approval, not fabricated; PY-04)
-Resume file: .planning/phases/06-python-surface-pyo3-estimators-per-backend-wheels/06-06-SUMMARY.md
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-06-14 — Milestone v2.0 Breadth Sweep started (research-first)
+Resume file: —
 
-Progress: [██████████] 100% (6/6 phases; 38/38 plans complete; Phase 06 done)
+Progress: [          ] 0% (v2.0 — requirements being defined)
 
 ## Open Follow-ups (Phase 05)
 

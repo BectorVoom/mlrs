@@ -15,6 +15,19 @@ install` the package for their backend and use familiar `fit`/`predict`/`transfo
 CubeCL backend from a single generic codebase.** If everything else fails, the numerical results
 must be right and the backend abstraction must hold.
 
+## Current Milestone: v2.0 Breadth Sweep
+
+**Goal:** Roughly double the scikit-learn-compatible estimator surface with low-risk algorithms that reuse v1's validated primitive base, deferring hard Tier-3 work (RandomForest, UMAP, HDBSCAN, ARIMA, kernel-SVM) to v3.
+
+**Target features:**
+- Covariance & projection: EmpiricalCovariance, LedoitWolf, IncrementalPCA, GaussianRandomProjection, SparseRandomProjection
+- Kernel family: KernelRidge, KernelDensity
+- Spectral family: SpectralEmbedding, SpectralClustering (leverages v1 `eig`)
+- SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR
+- Naive Bayes: GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB
+
+**Key context:** Same oracle (scikit-learn ≤1e-5) and gate (cpu f64 + rocm f32) as v1. Primitive-first discipline continues — each phase lands one reusable primitive (RNG-matrix/incremental-SVD, kernel-matrix, graph-Laplacian, SGD solver) then the estimators that consume it. Genuine unknowns tracked in `research/questions.md`. Phase numbering continues from v1.0 (next phase = 7).
+
 ## Requirements
 
 ### Validated
