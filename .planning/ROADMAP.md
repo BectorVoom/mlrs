@@ -45,7 +45,15 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
   5. A user can fit `GaussianRandomProjection` and `SparseRandomProjection` (`n_components='auto'` via `johnson_lindenstrauss_min_dim`) and `transform` — **property-gated** (JL distortion bound, matrix-distribution stats, seed-reproducibility, `transform == X·componentsᵀ` self-consistency), NOT a 1e-5 value match; `johnson_lindenstrauss_min_dim` itself value-matched. Sparse input densified at the Python ingress.
 **Recurring gates**: `skip_f64_with_log` on every f64 oracle case; documented f32-on-rocm band for LedoitWolf/IncrementalPCA (components band + sign; explained_variance band); **RandomProjection property-gate exception** (the one v2 estimator whose correctness gate is structurally not the 1e-5 value oracle); per-prim PoolStats memory gate.
 **Research flag**: `[v2-P1]` incremental-SVD merge — settle "full Jacobi per batch vs dedicated rank-update kernel" and the f32-on-rocm stability of the stacked re-SVD. Run a research spike before planning.
-**Plans**: TBD
+**Plans**: 7 plans (4 waves)
+Plans:
+- [ ] 07-01-PLAN.md — Wave-0 scaffold: PartialFit trait + AlgoError guards + module index + 6 #[ignore] tests + 4 oracle generators
+- [ ] 07-02-PLAN.md — PRIM-06 rng.rs (promote SplitMix64, Gaussian/Achlioptas/permutation) + PoolStats gate
+- [ ] 07-03-PLAN.md — PRIM-07 incremental_svd.rs (stacked re-SVD merge over v1 svd, ddof=1, svd_flip) + PoolStats gate
+- [ ] 07-04-PLAN.md — COV-01 EmpiricalCovariance (ddof=0, eig-pinvh precision_) + COV-02 LedoitWolf
+- [ ] 07-05-PLAN.md — DECOMP-03 IncrementalPCA (PartialFit + sklearn-faithful fit + whiten + transform/inverse)
+- [ ] 07-06-PLAN.md — PROJ-01/02 Gaussian/SparseRandomProjection + johnson_lindenstrauss_min_dim (property-gated)
+- [ ] 07-07-PLAN.md — PyO3 wrappers for all 5 estimators + IncrementalPCA partial_fit + jl_min_dim pyfunction + Python shims
 
 ### Phase 8: Kernel Family
 **Goal**: A data scientist can fit kernel-based regression and density estimators built on a new keystone kernel-matrix primitive (linear/RBF/poly/sigmoid) that Phase 9 and future kernel-SVM reuse; introduces the `ScoreSamples` trait.
@@ -109,7 +117,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 | 4. Closed-Form Estimators | v1.0 | 5/5 | Complete | 2026-06-12 |
 | 5. Distance-Based & Iterative-Solver Estimators | v1.0 | 11/11 | Complete | 2026-06-13 |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
-| 7. Covariance & Projection | v2.0 | 0/? | Not started | - |
+| 7. Covariance & Projection | v2.0 | 0/7 | Planned | - |
 | 8. Kernel Family | v2.0 | 0/? | Not started | - |
 | 9. Spectral Family | v2.0 | 0/? | Not started | - |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
