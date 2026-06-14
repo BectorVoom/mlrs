@@ -416,19 +416,19 @@ fn jl_min_dim(n_samples: f64, eps: f64) -> usize {
 | A4 | Exact f32 tolerance band numbers (components/explained_variance) and the property-gate trial count are Claude's-discretion, to be pinned by the planner from the standalone prim test, following the v1 per-family band precedent. | Validation Architecture | Too-tight → flaky; too-loose → misses regressions. Mitigation: measure on the standalone prim, then set with margin (v1 precedent). |
 | A5 | `_incremental_mean_and_var` returns `col_var` as the per-feature variance used directly in the ratio denominator `sum(col_var·n_total)`; mlrs reimplements the Chan-Golub-LeVeque update host-side. | Pattern 1 / Pitfall 6 | A wrong variance update fails `var_` and the ratio at 1e-5. Mitigation: quoted formula from extmath.py; oracle pins `var_` and `explained_variance_ratio_`. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Exact scipy `pinvh` cutoff constant (A1).**
+1. **Exact scipy `pinvh` cutoff constant (A1).** — **RESOLVED:** reuse the v1 04-03 σ⁺ RCOND convention (D-05) and pin it with the near-singular covariance oracle fixture (already produced by the COV-01 generator); only read scipy's exact `pinvh` default if that fixture misses 1e-5.
    - What we know: pinvh eigendecomposes + inverts eigenvalues above `rcond·max|λ|`; default `rcond` is dtype-eps-scaled.
-   - What's unclear: whether to reuse the v1 04-03 σ⁺ RCOND constant verbatim or read scipy's exact default.
-   - Recommendation: reuse the v1 σ⁺ RCOND convention (D-05 says to), and pin with a near-singular covariance oracle fixture; if it misses 1e-5, read scipy's `pinvh` default and match it.
+   - What's unclear (now settled): whether to reuse the v1 04-03 σ⁺ RCOND constant verbatim or read scipy's exact default — settled in favor of the v1 convention pinned by the near-singular fixture.
+   - Resolution: reuse the v1 σ⁺ RCOND convention (D-05 says to), and pin with the near-singular covariance oracle fixture (in the COV-01 generator); if it misses 1e-5, read scipy's `pinvh` default and match it.
 
-2. **Whether to expose `error_norm`/`mahalanobis` (Claude's discretion).**
+2. **Whether to expose `error_norm`/`mahalanobis` (Claude's discretion).** — **RESOLVED:** defer — these are not in the COV-01/COV-02 surface (Claude's discretion); keep the phase lean.
    - What we know: cheap to add; within the sklearn covariance surface.
-   - Recommendation: defer unless trivially free — COV-01/02 only require `covariance_`/`location_`/`precision_`/`shrinkage_`. Keep the phase lean.
+   - Resolution: defer unless trivially free — COV-01/02 only require `covariance_`/`location_`/`precision_`/`shrinkage_`. Keep the phase lean.
 
-3. **`MAX_ROWS`/`MAX_COLS` headroom for the stacked matrix (A2).**
-   - Recommendation: planner reads the constants from `mlrs-kernels` and sizes the IncrementalPCA fixtures (and the standalone PRIM-07 fixture) so `k + batch_size + 1 ≤ MAX_ROWS` and `n_features ≤ MAX_COLS`.
+3. **`MAX_ROWS`/`MAX_COLS` headroom for the stacked matrix (A2).** — **RESOLVED:** the planner reads `MAX_ROWS`/`MAX_COLS` from the SVD kernel constants and sizes the IncrementalPCA fixtures so `k + batch_size + 1 ≤ MAX_ROWS` and `n_features ≤ MAX_COLS` — already encoded in the Plan 07-01 / 07-05 actions.
+   - Resolution: planner reads the constants from `mlrs-kernels` (the SVD kernel constants) and sizes the IncrementalPCA fixtures (and the standalone PRIM-07 fixture) so `k + batch_size + 1 ≤ MAX_ROWS` and `n_features ≤ MAX_COLS` (already encoded in Plan 07-01/07-05 actions).
 
 ## Environment Availability
 
