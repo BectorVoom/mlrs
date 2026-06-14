@@ -75,7 +75,33 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (populated by roadmapper) | | |
+| PRIM-06 | Phase 7 | Pending |
+| PRIM-07 | Phase 7 | Pending |
+| COV-01 | Phase 7 | Pending |
+| COV-02 | Phase 7 | Pending |
+| DECOMP-03 | Phase 7 | Pending |
+| PROJ-01 | Phase 7 | Pending |
+| PROJ-02 | Phase 7 | Pending |
+| PRIM-08 | Phase 8 | Pending |
+| KERNEL-01 | Phase 8 | Pending |
+| KERNEL-02 | Phase 8 | Pending |
+| PRIM-09 | Phase 9 | Pending |
+| SPECTRAL-01 | Phase 9 | Pending |
+| SPECTRAL-02 | Phase 9 | Pending |
+| PRIM-10 | Phase 10 | Pending |
+| SGDSVM-01 | Phase 10 | Pending |
+| SGDSVM-02 | Phase 10 | Pending |
+| SGDSVM-03 | Phase 10 | Pending |
+| SGDSVM-04 | Phase 10 | Pending |
+| NB-01 | Phase 11 | Pending |
+| NB-02 | Phase 11 | Pending |
+| NB-03 | Phase 11 | Pending |
+| NB-04 | Phase 11 | Pending |
+| NB-05 | Phase 11 | Pending |
+| PY-06 | Phase 11 (cross-cutting; estimators wrapped incrementally per phase) | Pending |
+
+**Coverage:** 24/24 v2 requirements mapped, each to exactly one phase. No orphans, no duplicates.
 
 ---
 *Requirements defined: 2026-06-14 for v2.0 Breadth Sweep (research-backed: .planning/research/SUMMARY.md)*
+*Traceability populated by roadmapper: 2026-06-14 (Phases 7–11)*

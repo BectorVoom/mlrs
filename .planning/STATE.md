@@ -3,11 +3,11 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: planning
-stopped_at: v2.0 started — defining requirements
+stopped_at: v2.0 roadmap created (Phases 7–11) — ready to plan Phase 7
 last_updated: "2026-06-14T00:00:00.000Z"
-last_activity: 2026-06-14 -- Started v2.0 Breadth Sweep milestone (research-first; defining requirements across 5 estimator families).
+last_activity: 2026-06-14 -- Created v2.0 roadmap: 5 phases (7–11), 24 requirements mapped, research-backed. Ready to plan Phase 7.
 progress:
-  total_phases: 0
+  total_phases: 5
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -25,13 +25,14 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 7 (Covariance & Projection) — not started
 Plan: —
-Status: Defining requirements
-Last activity: 2026-06-14 — Milestone v2.0 Breadth Sweep started (research-first)
+Status: Roadmap complete — ready to plan Phase 7
+Last activity: 2026-06-14 — v2.0 roadmap created (Phases 7–11, 24 requirements, research-backed)
 Resume file: —
+Next: /gsd-discuss-phase 7 (or /gsd-plan-phase 7)
 
-Progress: [          ] 0% (v2.0 — requirements being defined)
+Progress: [          ] 0% (v2.0 — 0/5 phases; roadmap ready)
 
 ## Open Follow-ups (Phase 05)
 
