@@ -71,6 +71,20 @@ pub fn not_fitted(estimator: &str, operation: &str) -> PyErr {
     ))
 }
 
+/// Build the `PyErr` raised when a `partial_fit` stream mixes float dtypes — a
+/// batch's dtype disagrees with the dtype the estimator's first batch fixed.
+///
+/// Streaming `partial_fit` builds the fitted arm (`F32`/`F64`) from the FIRST
+/// batch's dtype; a later batch of the other dtype cannot be merged into that
+/// monomorphization. This is a caller *value* problem, so it maps to
+/// `PyValueError` (the same class as the other ingress/usage errors).
+pub fn dtype_mismatch_in_stream(estimator: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "{estimator}: partial_fit batch dtype disagrees with the dtype fixed by \
+         the first batch; keep every batch the same float dtype"
+    ))
+}
+
 /// Map an opaque boundary [`anyhow::Error`] to a `PyErr`.
 ///
 /// Used for the few failures that arrive as `anyhow` at the binding boundary

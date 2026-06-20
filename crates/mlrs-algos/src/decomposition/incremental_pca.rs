@@ -110,6 +110,22 @@ where
         self.state.as_ref().map(|s| s.n_samples_seen_).unwrap_or(0)
     }
 
+    /// The configured `n_components` hyperparameter (sklearn `__init__` arg).
+    pub fn n_components(&self) -> usize {
+        self.n_components
+    }
+
+    /// The configured `whiten` hyperparameter (sklearn `__init__` arg).
+    pub fn whiten(&self) -> bool {
+        self.whiten
+    }
+
+    /// The configured `batch_size` hyperparameter (`None` → `5·n_features` at
+    /// fit; sklearn `__init__` arg).
+    pub fn batch_size(&self) -> Option<usize> {
+        self.batch_size
+    }
+
     /// Host copy of `components_` (`n_components × n_features`, row-major), in the
     /// estimator precision `F`.
     pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
