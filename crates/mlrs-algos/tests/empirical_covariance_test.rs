@@ -1,18 +1,15 @@
 //! Plan 07-04 — EmpiricalCovariance (COV-01) sklearn oracle tests.
 //!
-//! WAVE-0 SCAFFOLD (this file is created by plan 07-01). Every test function is
-//! `#[ignore]` and asserts ONLY fixture-load + shape well-formedness — it makes
-//! NO reference to the not-yet-existent
-//! `mlrs_algos::covariance::empirical_covariance` estimator (the module is an
-//! empty stub until plan 07-04). This is the 04-01 / 05-01 Wave-0 pattern: the
-//! test crate must COMPILE today; plan 07-04 removes the `#[ignore]`, wires the
-//! real `EmpiricalCovariance::fit`, and turns each stub into the 1e-5 oracle
-//! compare of `covariance_` / `location_` / `precision_`.
+//! Activated from the 07-01 Nyquist `#[ignore]` scaffold: each function now loads
+//! its committed `sklearn.covariance.EmpiricalCovariance` fixture, fits the device
+//! estimator, and asserts `covariance_` (ddof=0 MLE) / `location_` / `precision_`
+//! (eig-based pinvh, D-05) against the sklearn reference within the 1e-5 abs+rel
+//! contract (f64) or the documented `EMPCOV_F32_BAND` (f32).
 //!
-//! Two size families: a well-conditioned FULL-RANK case (`empirical_covariance_
-//! fullrank_*`, 16×5) and a RANK-DEFICIENT case (`empirical_covariance_rankdef_*`,
-//! 4×6 — n ≤ p, so `covariance_` is singular and `precision_ = pinvh(cov)` via
-//! the symmetric eig must hold without a Cholesky inverse, D-05).
+//! Two size families: a well-conditioned FULL-RANK case (16×5) and a
+//! RANK-DEFICIENT case (4×6 — n ≤ p, so `covariance_` is singular and
+//! `precision_ = pinvh(cov)` via the symmetric eig must hold without a Cholesky
+//! inverse, D-05; the floored-eigenvalue pseudo-inverse must be finite).
 //!
 //! f64 cases carry the `skip_f64_with_log` capability gate verbatim (cpu runs
 //! f64; rocm skips-with-log, D-07). f32 stays a documented per-family band. Per
@@ -20,8 +17,16 @@
 
 use std::path::PathBuf;
 
+use bytemuck::Pod;
+use cubecl::prelude::{CubeElement, Float};
+
+use mlrs_algos::covariance::EmpiricalCovariance;
+use mlrs_algos::traits::Fit;
 use mlrs_backend::capability;
-use mlrs_core::{load_npz, Tolerance, F32_TOL, F64_TOL};
+use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::runtime::{self, ActiveRuntime};
+use mlrs_core::{load_npz, OracleCase, Tolerance, F32_TOL, F64_TOL};
 
 /// Full-rank geometry (gen_oracle.py `EMPCOV_FULLRANK` = 16×5).
 const FR_N: usize = 16;
@@ -31,10 +36,10 @@ const RD_N: usize = 4;
 const RD_P: usize = 6;
 
 /// f32-on-rocm per-family tolerance band for EmpiricalCovariance, pinned from the
-/// standalone-estimator measurement in plan 07-04 (Claude's-discretion, D-08
-/// growth point). f64 stays strict `F64_TOL` (1e-5); this is the f32 placeholder
-/// the estimator plan replaces with the measured band.
-#[allow(dead_code)]
+/// standalone-estimator measurement in plan 07-04. f64 stays strict `F64_TOL`
+/// (1e-5). The covariance/precision host finalize accumulates only modest f32
+/// round-off, so the strict `F32_TOL` band holds (measured max_abs well within
+/// `F32_TOL` on cpu f32).
 const EMPCOV_F32_BAND: Tolerance = F32_TOL;
 
 fn fixture(name: &str) -> PathBuf {
@@ -46,36 +51,113 @@ fn fixture(name: &str) -> PathBuf {
     workspace_root.join("tests").join("fixtures").join(name)
 }
 
+fn host_to_f64<F: Pod>(v: F) -> f64 {
+    match std::mem::size_of::<F>() {
+        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("empirical_covariance fixtures are f32/f64 only"),
+    }
+}
+
+fn f64_to<F: Pod>(v: f64) -> F {
+    match std::mem::size_of::<F>() {
+        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("empirical_covariance fixtures are f32/f64 only"),
+    }
+}
+
+/// numpy-`allclose` element compare: pass if `|got − exp| ≤ atol + rtol·|exp|`
+/// (abs-OR-rel), the strict 1e-5 ABSOLUTE arm never loosened.
+fn assert_close(got: &[f64], expected: &[f64], tol: &Tolerance, what: &str) {
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "{what}: length mismatch got={} expected={}",
+        got.len(),
+        expected.len()
+    );
+    for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+        let abs_err = (g - e).abs();
+        let allclose = abs_err <= tol.abs + tol.rel * e.abs();
+        assert!(
+            allclose,
+            "{what}: allclose failed at {i}: got={g:e} expected={e:e} \
+             abs_err={abs_err:e} (atol={:e}, rtol={:e})",
+            tol.abs, tol.rel
+        );
+    }
+}
+
+/// Fitted EmpiricalCovariance host attributes for an oracle compare.
+struct EmpCovFit {
+    covariance: Vec<f64>,
+    location: Vec<f64>,
+    precision: Vec<f64>,
+}
+
+/// Load the fixture `X`, fit `EmpiricalCovariance(assume_centered=false,
+/// store_precision=true)`, and return the fitted attributes host-promoted to f64.
+fn fit_empcov<F>(case: &OracleCase, n_samples: usize, n_features: usize) -> EmpCovFit
+where
+    F: Float + CubeElement + Pod,
+{
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_f64 = case.expect_f64("X").to_vec();
+    let x_host: Vec<F> = x_f64.iter().map(|&v| f64_to::<F>(v)).collect();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
+
+    let mut est = EmpiricalCovariance::<F>::new(false, true);
+    est.fit(&mut pool, &x_dev, None, (n_samples, n_features))
+        .expect("EmpiricalCovariance::fit on a valid shape");
+
+    let promote = |v: Vec<F>| v.iter().map(|&x| host_to_f64(x)).collect::<Vec<f64>>();
+    EmpCovFit {
+        covariance: promote(est.covariance_(&pool).expect("covariance_ after fit")),
+        location: promote(est.location_(&pool).expect("location_ after fit")),
+        precision: promote(est.precision_(&pool).expect("precision_ after fit")),
+    }
+}
+
+// ===========================================================================
+// Full-rank case (16×5)
+// ===========================================================================
+
 /// `covariance_`/`location_`/`precision_` vs sklearn EmpiricalCovariance, full
 /// rank, f32 (cpu + rocm).
-///
-/// WAVE-0 STUB. Plan 07-04 removes `#[ignore]` and wires `EmpiricalCovariance::
-/// new(false).fit(X)` → 1e-5/`EMPCOV_F32_BAND` compare.
 #[test]
-#[ignore = "wave-0 scaffold: covariance::empirical_covariance lands in plan 07-04"]
 fn empirical_covariance_attrs_f32() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
     let case = load_npz(fixture("empirical_covariance_fullrank_f32_seed42.npz"))
         .expect("load empirical_covariance_fullrank_f32");
-    assert_eq!(case.shape("X").expect("X").to_vec(), vec![FR_N as u64, FR_P as u64]);
-    assert_eq!(
-        case.shape("covariance_").expect("covariance_").to_vec(),
-        vec![FR_P as u64, FR_P as u64]
+    let fit = fit_empcov::<f32>(&case, FR_N, FR_P);
+
+    assert_close(
+        &fit.covariance,
+        case.expect_f64("covariance_"),
+        &EMPCOV_F32_BAND,
+        "covariance_ f32",
     );
-    assert_eq!(case.expect_f64("location_").len(), FR_P);
-    assert_eq!(
-        case.shape("precision_").expect("precision_").to_vec(),
-        vec![FR_P as u64, FR_P as u64]
+    assert_close(
+        &fit.location,
+        case.expect_f64("location_"),
+        &EMPCOV_F32_BAND,
+        "location_ f32",
+    );
+    assert_close(
+        &fit.precision,
+        case.expect_f64("precision_"),
+        &EMPCOV_F32_BAND,
+        "precision_ f32",
     );
 }
 
 /// `covariance_`/`location_`/`precision_` vs sklearn, full rank, f64 (cpu runs;
 /// rocm skips-with-log).
-///
-/// WAVE-0 STUB. Plan 07-04 wires the f64 `EmpiricalCovariance::fit` 1e-5 compare.
 #[test]
-#[ignore = "wave-0 scaffold: covariance::empirical_covariance lands in plan 07-04"]
 fn empirical_covariance_attrs_f64() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
@@ -85,19 +167,37 @@ fn empirical_covariance_attrs_f64() {
     }
     let case = load_npz(fixture("empirical_covariance_fullrank_f64_seed42.npz"))
         .expect("load empirical_covariance_fullrank_f64");
-    assert_eq!(case.shape("X").expect("X").to_vec(), vec![FR_N as u64, FR_P as u64]);
-    assert_eq!(case.expect_f64("covariance_").len(), FR_P * FR_P);
-    assert_eq!(case.expect_f64("precision_").len(), FR_P * FR_P);
-    let _ = &F64_TOL; // 1e-5 contract used by plan 07-04's compare.
+    let fit = fit_empcov::<f64>(&case, FR_N, FR_P);
+
+    assert_close(
+        &fit.covariance,
+        case.expect_f64("covariance_"),
+        &F64_TOL,
+        "covariance_ f64",
+    );
+    assert_close(
+        &fit.location,
+        case.expect_f64("location_"),
+        &F64_TOL,
+        "location_ f64",
+    );
+    assert_close(
+        &fit.precision,
+        case.expect_f64("precision_"),
+        &F64_TOL,
+        "precision_ f64",
+    );
 }
 
+// ===========================================================================
+// Rank-deficient case (4×6, n ≤ p) — the eig-based pinvh floor (D-05)
+// ===========================================================================
+
 /// `precision_ = pinvh(covariance_)` on a RANK-DEFICIENT (n ≤ p) covariance:
-/// the eig-based pseudo-inverse floor must hold where a Cholesky inverse would
-/// fail (D-05), f64 (cpu runs; rocm skips-with-log).
-///
-/// WAVE-0 STUB. Plan 07-04 wires the rank-deficient `precision_` 1e-5 compare.
+/// the eig-based pseudo-inverse floor must be FINITE (no inf/NaN) and match
+/// sklearn's pinvh where a Cholesky inverse would fail (D-05), f64 (cpu runs;
+/// rocm skips-with-log).
 #[test]
-#[ignore = "wave-0 scaffold: covariance::empirical_covariance lands in plan 07-04"]
 fn empirical_covariance_precision_rank_deficient_f64() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
@@ -105,23 +205,52 @@ fn empirical_covariance_precision_rank_deficient_f64() {
         println!("empirical_covariance rank-deficient f64 backend={backend}: SKIPPED (no f64 support on this adapter)");
         return;
     }
+    assert!(RD_N <= RD_P, "rank-deficient fixture must satisfy n <= p");
     let case = load_npz(fixture("empirical_covariance_rankdef_f64_seed42.npz"))
         .expect("load empirical_covariance_rankdef_f64");
-    assert_eq!(case.shape("X").expect("X").to_vec(), vec![RD_N as u64, RD_P as u64]);
-    assert!(RD_N <= RD_P, "rank-deficient fixture must satisfy n <= p");
-    assert_eq!(case.expect_f64("precision_").len(), RD_P * RD_P);
+    let fit = fit_empcov::<f64>(&case, RD_N, RD_P);
+
+    // The floored pseudo-inverse must be finite (the whole point of D-05).
+    for (i, &v) in fit.precision.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "rank-deficient precision_ must be finite, got {v} at {i}"
+        );
+    }
+    assert_close(
+        &fit.covariance,
+        case.expect_f64("covariance_"),
+        &F64_TOL,
+        "covariance_ rank-deficient f64",
+    );
+    assert_close(
+        &fit.precision,
+        case.expect_f64("precision_"),
+        &F64_TOL,
+        "precision_ rank-deficient f64",
+    );
 }
 
 /// Rank-deficient `precision_`, f32 (cpu + rocm) — the f32 arm of the pinvh floor.
-///
-/// WAVE-0 STUB. Plan 07-04 wires the f32 rank-deficient `precision_` band compare.
 #[test]
-#[ignore = "wave-0 scaffold: covariance::empirical_covariance lands in plan 07-04"]
 fn empirical_covariance_precision_rank_deficient_f32() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
+    assert!(RD_N <= RD_P, "rank-deficient fixture must satisfy n <= p");
     let case = load_npz(fixture("empirical_covariance_rankdef_f32_seed42.npz"))
         .expect("load empirical_covariance_rankdef_f32");
-    assert_eq!(case.shape("X").expect("X").to_vec(), vec![RD_N as u64, RD_P as u64]);
-    assert_eq!(case.expect_f64("precision_").len(), RD_P * RD_P);
+    let fit = fit_empcov::<f32>(&case, RD_N, RD_P);
+
+    for (i, &v) in fit.precision.iter().enumerate() {
+        assert!(
+            v.is_finite(),
+            "rank-deficient precision_ must be finite, got {v} at {i}"
+        );
+    }
+    assert_close(
+        &fit.precision,
+        case.expect_f64("precision_"),
+        &EMPCOV_F32_BAND,
+        "precision_ rank-deficient f32",
+    );
 }
