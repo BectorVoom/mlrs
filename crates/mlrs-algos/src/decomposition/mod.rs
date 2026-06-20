@@ -23,3 +23,5 @@ pub mod pca;
 pub mod truncated_svd;
 
 pub use incremental_pca::IncrementalPCA;
+pub use pca::Pca;
+pub use truncated_svd::TruncatedSvd;
