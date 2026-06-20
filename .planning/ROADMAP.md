@@ -92,7 +92,7 @@ Plans:
 - [x] 08-02-PLAN.md — PRIM-08 kernel_matrix.rs keystone prim (linear/rbf/poly/sigmoid map over v1 distance/gemm) + PoolStats memory gate [3/3 tasks; f64 ≤2.2e-16, f32 ≤2.4e-7 vs sklearn; memory gate green; wave gate satisfied]
 
 **Wave 2** *(blocked on Wave 1)*
-- [ ] 08-03-PLAN.md — KERNEL-01 KernelRidge (dual (K+αI) Cholesky multi-RHS solve over kernel_matrix; no centering/intercept)
+- [x] 08-03-PLAN.md — KERNEL-01 KernelRidge (dual (K+αI) Cholesky multi-RHS solve over kernel_matrix; no centering/intercept) [2/2 tasks; f64 ≤5.6e-16, f32 ≤3.6e-7 vs sklearn across 4 kernels + multi-target + both gamma paths]
 - [ ] 08-04-PLAN.md — KERNEL-02 KernelDensity (6 KD kernels + scott/silverman; device log-sum-exp over v1 distance/reduce; ScoreSamples<F> impl)
 
 **Wave 3** *(blocked on Wave 2)*

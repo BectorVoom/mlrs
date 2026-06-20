@@ -26,13 +26,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 08 (kernel-family) — EXECUTING
-Plan: 3 of 5
-Status: Executing Phase 08 (Wave-1 kernel_matrix prim 08-02 complete — wave gate satisfied)
-Last activity: 2026-06-21 -- Phase 08 plan 02 (kernel_matrix prim PRIM-08) complete
-Resume file: .planning/phases/08-kernel-family/08-03-PLAN.md
-Next: 08-03 Wave-2 — KernelRidge dual solve on top of the validated kernel_matrix prim
+Plan: 4 of 5
+Status: Executing Phase 08 (Wave-2 KernelRidge 08-03 complete — KERNEL-01 oracle-validated)
+Last activity: 2026-06-20 -- Phase 08 plan 03 (KernelRidge KERNEL-01) complete
+Resume file: .planning/phases/08-kernel-family/08-04-PLAN.md
+Next: 08-04 Wave-2 — KernelDensity (KERNEL-02) on the kernel_matrix prim + ScoreSamples<F>
 
-Progress: [##        ] 22% (v2.0 — 1/5 phases; phase 08 plan 2/5 done)
+Progress: [###       ] 24% (v2.0 — 1/5 phases; phase 08 plan 3/5 done)
 
 ## Open Follow-ups (Phase 05)
 
@@ -102,6 +102,7 @@ Progress: [##        ] 22% (v2.0 — 1/5 phases; phase 08 plan 2/5 done)
 | Phase 07 P07 | 18 | 2 tasks | 13 files |
 | Phase 08 P01 | 13 | 3 tasks | 17 files |
 | Phase 08 P02 | 9 | 3 tasks | 4 files |
+| Phase 08 P03 | 4 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
