@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
-status: verifying
-stopped_at: Phase 8 context gathered
-last_updated: "2026-06-20T22:43:59.878Z"
-last_activity: 2026-06-20 -- Phase 08 planning complete
+status: executing
+stopped_at: Completed 08-01-PLAN.md (Kernel-Family Wave-0 scaffold)
+last_updated: "2026-06-20T23:13:10Z"
+last_activity: 2026-06-20 -- Phase 08 plan 01 (Wave-0 scaffold) complete
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 7
-  completed_plans: 7
+  total_plans: 12
+  completed_plans: 8
   percent: 20
 ---
 
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 07 — covariance-projection
+**Current focus:** Phase 08 — kernel-family
 
 ## Current Position
 
-Phase: 8
-Plan: Not started
-Status: Phase 07 plans complete — ready for phase verification / transition
-Last activity: 2026-06-20 -- Phase 08 planning complete
-Resume file: .planning/phases/08-kernel-family/08-CONTEXT.md
-Next: Phase 07 verification / transition (all of COV-01/COV-02/DECOMP-03/PROJ-01/PROJ-02 wrapped + shimmed)
+Phase: 08 (kernel-family) — EXECUTING
+Plan: 2 of 5
+Status: Executing Phase 08 (Wave-0 scaffold 08-01 complete)
+Last activity: 2026-06-20 -- Phase 08 plan 01 (Wave-0 scaffold) complete
+Resume file: .planning/phases/08-kernel-family/08-02-PLAN.md
+Next: 08-02 Wave-1 — fill kernel_matrix.rs compute path (mlrs-kernels map kernel + base-op dispatch) + flip kernel_matrix_test #[ignore]s
 
-Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 7/7 done)
+Progress: [##        ] 20% (v2.0 — 1/5 phases; phase 08 plan 1/5 done)
 
 ## Open Follow-ups (Phase 05)
 
@@ -44,7 +44,7 @@ Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 7/7 done)
 
 **Velocity:**
 
-- Total plans completed: 37
+- Total plans completed: 38
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -100,6 +100,7 @@ Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 7/7 done)
 | Phase 07 P04 | 11 | 2 tasks | 5 files |
 | Phase 07 P05 | 16 | 2 tasks | 3 files |
 | Phase 07 P07 | 18 | 2 tasks | 13 files |
+| Phase 08 P01 | 13 | 3 tasks | 17 files |
 
 ## Accumulated Context
 
@@ -107,6 +108,8 @@ Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 7/7 done)
 
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
+
+- [08-01]: Phase-8 Wave-0 scaffold mirrors 07-01: front-loads ALL shared-file edits (lib.rs/traits.rs/error.rs/prims/mod.rs) + test scaffolding into one wave so Wave-1/2/3 are file-disjoint and parallel-safe. Lands the ScoreSamples<F> trait (D-12, per-sample log-density — DISTINCT from Predict, returns length-n not a regression target), three AlgoError guards (InvalidBandwidth/InvalidDegree/InvalidKernel; alpha>=0 REUSES InvalidAlpha), the typed Kernel<F> enum (D-01: Linear/Rbf{gamma}/Poly{gamma,degree,coef0}/Sigmoid{gamma,coef0}, degree stored as real F for sklearn-faithful powf) + kernel_matrix host signature (D-02 general K(X,Y), rows_x×rows_y) with REAL geometry validation but todo!() compute path (Wave-1 08-02 fills it), and the kernel_ridge//density/ module homes (KD gets its OWN density/ home per RESEARCH Open Q2 — it implements ScoreSamples, NOT KNeighbors/PredictLabels). Rule 2: kernel_matrix::validate_geometry adds a DimMismatch on cols==cols_y (K(X,Y) needs a shared feature space, T-08-01-01 validate-before-launch). Three #[ignore] Nyquist test scaffolds assert fixture-load+shape ONLY (compile today, no compute symbols) carrying the skip_f64_with_log gate verbatim; six committed sklearn oracle fixtures (kernel_matrix via pairwise_kernels, kernel_ridge via KernelRidge, kernel_density via KernelDensity atol=0/rtol=0 forced-exact, both dtypes seed42) store both default+explicit-gamma and resolved scott/silverman bandwidth_ so Wave-2 pins D-05/D-09 directly. Fixtures regen in a /tmp venv (numpy 2.4.6/sklearn 1.9.0, PEP 668), run in isolation to avoid churning other phase blobs.
 
 - [07-07]: The five Phase-7 estimators are wrapped on `_mlrs` with ZERO new binding infra — they reuse the shipped `any_estimator!` macro + ingress/egress/capability/errors verbatim (RESEARCH). IncrementalPCA introduces the first v2 `partial_fit`: the `#[pyclass]` constructs the F32/F64 arm from the stored Unfit hyperparameters on the first batch and MUTATES it in place after; the Python shim builds the `_mlrs` object once and reuses it across the stream. A mixed-dtype partial_fit stream is a hard `PyValueError` (errors::dtype_mismatch_in_stream, Rule 2 — the fitted arm is one monomorphization). `n_components='auto'`/`density='auto'` map to Option None sentinels at the Rust boundary; `random_state→u64 seed`. Scalar attrs (shrinkage_/n_components_/density_/n_samples_seen) are single-typed; only array attrs are dtype-suffixed _f32/_f64. SparseRandomProjection densifies sparse input at the Python ingress (D-12/PROJ-02). guard_f64() gates every F64 fit/partial_fit arm (statically grep-verified — the Unfit-arm smoke test never runs live F64 dispatch, WARNING 2). pyo3 stays 0.28 (single ABI). Added pub n_components()/whiten()/batch_size() to algos IncrementalPCA for the re-fit path (Rule 3). This is the incremental per-phase Python wrapping; PY-06 final sign-off stays Phase 11.
 - [06-06]: estimator_checks criterion 1 is the RELEVANT subset, not "all checks pass" — parametrize_with_checks over all 12 instances on the real cpu/f64 _mlrs gives 475 passed / 102 by-design xfailed / 19 skipped / 0 unexpected failures / 0 xpassed across 597 cases. By-design gaps (sparse, object-dtype, pickle, NaN/allow_nan-off, supervised-2d-y warning, n_iter_, 1-sample special-case, string class labels) are declared via sklearn-native expected_failed_checks (_EXPECTED keyed by type(estimator).__name__) with a per-check reason, mirrored in checks_triage.md (the two MUST stay in sync — a stale xfail surfaces as xpassed). Three genuine failures were FIXED in the shim during triage (Rule 2: n_features_in_/_post_fit; Rule 1: _check_predict_X NotFittedError-before-AttributeError; Rule 2: predict feature-count validation), not masked. DBSCAN/NearestNeighbors are predict-less (sklearn-faithful) so no predict-based checks are generated for them — RESEARCH Open Q3 resolved.

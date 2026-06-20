@@ -86,7 +86,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 
 Plans:
 **Wave 0**
-- [ ] 08-01-PLAN.md — Wave-0 scaffold: ScoreSamples<F> trait + 3 AlgoError guards + Kernel<F> enum/kernel_matrix signature + kernel_ridge//density/ module homes + 3 #[ignore] test scaffolds + 3 oracle generators
+- [x] 08-01-PLAN.md — Wave-0 scaffold: ScoreSamples<F> trait + 3 AlgoError guards + Kernel<F> enum/kernel_matrix signature + kernel_ridge//density/ module homes + 3 #[ignore] test scaffolds + 3 oracle generators
 
 **Wave 1** *(blocked on Wave 0)*
 - [ ] 08-02-PLAN.md — PRIM-08 kernel_matrix.rs keystone prim (linear/rbf/poly/sigmoid map over v1 distance/gemm) + PoolStats memory gate
@@ -157,7 +157,7 @@ Plans:
 | 5. Distance-Based & Iterative-Solver Estimators | v1.0 | 11/11 | Complete | 2026-06-13 |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
 | 7. Covariance & Projection | v2.0 | 7/7 | Complete    | 2026-06-20 |
-| 8. Kernel Family | v2.0 | 0/5 | Planned | - |
+| 8. Kernel Family | v2.0 | 1/5 | Executing | - |
 | 9. Spectral Family | v2.0 | 0/? | Not started | - |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
 | 11. Naive Bayes | v2.0 | 0/? | Not started | - |
