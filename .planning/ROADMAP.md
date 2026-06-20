@@ -51,7 +51,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 **Plans**: 7 plans (4 waves)Plans:
 **Wave 1**
 
-- [ ] 07-01-PLAN.md — Wave-0 scaffold: PartialFit trait + AlgoError guards + module index + 6 #[ignore] tests + 4 oracle generators
+- [x] 07-01-PLAN.md — Wave-0 scaffold: PartialFit trait + AlgoError guards + module index + 6 #[ignore] tests + 4 oracle generators
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -142,7 +142,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 | 4. Closed-Form Estimators | v1.0 | 5/5 | Complete | 2026-06-12 |
 | 5. Distance-Based & Iterative-Solver Estimators | v1.0 | 11/11 | Complete | 2026-06-13 |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
-| 7. Covariance & Projection | v2.0 | 0/7 | Planned | - |
+| 7. Covariance & Projection | v2.0 | 1/7 | Executing | - |
 | 8. Kernel Family | v2.0 | 0/? | Not started | - |
 | 9. Spectral Family | v2.0 | 0/? | Not started | - |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
