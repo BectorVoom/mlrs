@@ -111,7 +111,8 @@ impl SplitMix64 {
 // ===========================================================================
 
 /// Generate the `n_components × n_features` Gaussian random-projection matrix,
-/// each entry `~ N(0, 1/n_components)` (RESEARCH Pattern 4), row-major flat
+/// each entry `~ N(0, 1/n_components)` (RESEARCH Pattern 5 — the Gaussian
+/// projection; Pattern 4 is the Achlioptas SPARSE matrix below), row-major flat
 /// layout. Box–Muller from pairs of [`SplitMix64::next_f64`] uniforms scaled by
 /// `1/sqrt(n_components)` (i.e. a standard-normal sample divided by
 /// `sqrt(n_components)`).
