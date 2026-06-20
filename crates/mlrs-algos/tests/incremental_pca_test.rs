@@ -208,7 +208,11 @@ where
 
     let mut pca = IncrementalPCA::<F>::new(IPCA_N_COMPONENTS, whiten, Some(IPCA_BATCH_SIZE));
 
-    // Stream gen_batches(n, batch_size) exactly as sklearn fit() does.
+    // Naive equal chunking (== sklearn gen_batches ONLY when
+    // IPCA_N % IPCA_BATCH_SIZE == 0, which holds here: 30 % 10 == 0). For a
+    // non-divisible geometry this would emit a SHORT trailing batch, whereas
+    // the real gen_batches(min_batch=n_components) FOLDS the remainder into the
+    // prior batch — a different stream and a different merged state (WR-04).
     let mut start = 0usize;
     while start < IPCA_N {
         let b = IPCA_BATCH_SIZE.min(IPCA_N - start);

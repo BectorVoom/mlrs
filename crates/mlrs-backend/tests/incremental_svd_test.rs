@@ -81,7 +81,11 @@ where
     let client = runtime::active_client();
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
-    // --- Incremental: stream `gen_batches(n, bs)` exactly as sklearn fit(). ---
+    // --- Incremental: naive equal chunking (== sklearn gen_batches ONLY when
+    //     n % bs == 0, which holds for this 30x6 / bs=10 fixture). A
+    //     non-divisible geometry would emit a SHORT trailing batch here, whereas
+    //     the real gen_batches(min_batch=nc) FOLDS the remainder into the prior
+    //     batch — a different stream and merged state (WR-04). ---
     let mut state: Option<IncrementalSvdState> = None;
     let mut start = 0usize;
     while start < n {
