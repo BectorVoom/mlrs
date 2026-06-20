@@ -94,6 +94,18 @@ class IncrementalPCA(TransformerMixin, MlrsBase):
         self.output_type = output_type
 
     def fit(self, X, y=None):
+        """Fit the decomposition on ``X`` in one shot.
+
+        RESETS all running state: a FRESH ``_mlrs`` object is built on every
+        call, so ``fit`` is NOT cumulative and ``n_samples_seen_`` reflects only
+        the rows of THIS ``X`` (sklearn ``IncrementalPCA.fit`` semantics).
+
+        Note the asymmetry with :meth:`partial_fit`, which CONTINUES the stream:
+        calling ``fit(X1)`` then ``partial_fit(X2)`` merges ``X2`` into the
+        ``X1``-fitted running state and bumps ``n_samples_seen_`` past
+        ``len(X1)`` — matching sklearn, but easy to misjudge when mixing the two
+        entry points.
+        """
         xa, rows, cols = self._normalize(X)
         obj = self._ext().IncrementalPCA(
             self.n_components, self.whiten, self.batch_size
@@ -109,6 +121,12 @@ class IncrementalPCA(TransformerMixin, MlrsBase):
         Constructs the compiled ``_mlrs`` object on the FIRST call (from the
         stored hyperparameters) and reuses it on subsequent calls so the running
         SVD state accumulates across the stream.
+
+        Unlike :meth:`fit`, ``partial_fit`` does NOT reset: it CONTINUES the
+        existing stream when ``_mlrs_obj`` is already present. A ``fit(X1)``
+        followed by ``partial_fit(X2)`` therefore merges ``X2`` into the
+        ``X1``-fitted state and advances ``n_samples_seen_`` to
+        ``len(X1) + len(X2)`` (sklearn-faithful, but asymmetric with ``fit``).
         """
         xa, rows, cols = self._normalize(X)
         if getattr(self, "_mlrs_obj", None) is None:
