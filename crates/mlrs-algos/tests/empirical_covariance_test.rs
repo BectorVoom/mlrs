@@ -96,9 +96,14 @@ struct EmpCovFit {
     precision: Vec<f64>,
 }
 
-/// Load the fixture `X`, fit `EmpiricalCovariance(assume_centered=false,
+/// Load the fixture `X`, fit `EmpiricalCovariance(assume_centered,
 /// store_precision=true)`, and return the fitted attributes host-promoted to f64.
-fn fit_empcov<F>(case: &OracleCase, n_samples: usize, n_features: usize) -> EmpCovFit
+fn fit_empcov_with<F>(
+    case: &OracleCase,
+    n_samples: usize,
+    n_features: usize,
+    assume_centered: bool,
+) -> EmpCovFit
 where
     F: Float + CubeElement + Pod,
 {
@@ -109,7 +114,7 @@ where
     let x_host: Vec<F> = x_f64.iter().map(|&v| f64_to::<F>(v)).collect();
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut est = EmpiricalCovariance::<F>::new(false, true);
+    let mut est = EmpiricalCovariance::<F>::new(assume_centered, true);
     est.fit(&mut pool, &x_dev, None, (n_samples, n_features))
         .expect("EmpiricalCovariance::fit on a valid shape");
 
@@ -119,6 +124,14 @@ where
         location: promote(est.location_(&pool).expect("location_ after fit")),
         precision: promote(est.precision_(&pool).expect("precision_ after fit")),
     }
+}
+
+/// `assume_centered=false` convenience wrapper (the default fit path).
+fn fit_empcov<F>(case: &OracleCase, n_samples: usize, n_features: usize) -> EmpCovFit
+where
+    F: Float + CubeElement + Pod,
+{
+    fit_empcov_with::<F>(case, n_samples, n_features, false)
 }
 
 // ===========================================================================
@@ -252,5 +265,89 @@ fn empirical_covariance_precision_rank_deficient_f32() {
         case.expect_f64("precision_"),
         &EMPCOV_F32_BAND,
         "precision_ rank-deficient f32",
+    );
+}
+
+// ===========================================================================
+// assume_centered=True case (16×5) — the SEPARATE uncentered host-Gram branch
+// (WR-02: `mle_gram_uncentered`, Xᵀ·X/n, location_ all-zero)
+// ===========================================================================
+
+/// `covariance_`/`location_`/`precision_` vs sklearn
+/// `EmpiricalCovariance(assume_centered=True)`, f32 (cpu + rocm). This is the
+/// only test that value-gates the uncentered host-Gram branch (WR-02).
+#[test]
+fn empirical_covariance_assume_centered_attrs_f32() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "assume_centered");
+    let case = load_npz(fixture("empirical_covariance_centered_f32_seed42.npz"))
+        .expect("load empirical_covariance_centered_f32");
+    let fit = fit_empcov_with::<f32>(&case, FR_N, FR_P, true);
+
+    // assume_centered ⇒ location_ is the all-zero vector.
+    for (i, &v) in fit.location.iter().enumerate() {
+        assert!(
+            v.abs() <= EMPCOV_F32_BAND.abs,
+            "assume_centered location_ must be ~0, got {v} at {i}"
+        );
+    }
+    assert_close(
+        &fit.covariance,
+        case.expect_f64("covariance_"),
+        &EMPCOV_F32_BAND,
+        "covariance_ assume_centered f32",
+    );
+    assert_close(
+        &fit.location,
+        case.expect_f64("location_"),
+        &EMPCOV_F32_BAND,
+        "location_ assume_centered f32",
+    );
+    assert_close(
+        &fit.precision,
+        case.expect_f64("precision_"),
+        &EMPCOV_F32_BAND,
+        "precision_ assume_centered f32",
+    );
+}
+
+/// `covariance_`/`location_`/`precision_` vs sklearn
+/// `EmpiricalCovariance(assume_centered=True)`, f64 (cpu runs; rocm
+/// skips-with-log) — value-gates the uncentered host-Gram branch (WR-02).
+#[test]
+fn empirical_covariance_assume_centered_attrs_f64() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "assume_centered");
+    if capability::skip_f64_with_log() {
+        println!("empirical_covariance assume_centered f64 backend={backend}: SKIPPED (no f64 support on this adapter)");
+        return;
+    }
+    let case = load_npz(fixture("empirical_covariance_centered_f64_seed42.npz"))
+        .expect("load empirical_covariance_centered_f64");
+    let fit = fit_empcov_with::<f64>(&case, FR_N, FR_P, true);
+
+    for (i, &v) in fit.location.iter().enumerate() {
+        assert!(
+            v.abs() <= F64_TOL.abs,
+            "assume_centered location_ must be ~0, got {v} at {i}"
+        );
+    }
+    assert_close(
+        &fit.covariance,
+        case.expect_f64("covariance_"),
+        &F64_TOL,
+        "covariance_ assume_centered f64",
+    );
+    assert_close(
+        &fit.location,
+        case.expect_f64("location_"),
+        &F64_TOL,
+        "location_ assume_centered f64",
+    );
+    assert_close(
+        &fit.precision,
+        case.expect_f64("precision_"),
+        &F64_TOL,
+        "precision_ assume_centered f64",
     );
 }

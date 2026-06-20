@@ -1388,6 +1388,10 @@ def main() -> None:
         print(f"wrote {gen_empirical_covariance(dtype=dtype, shape=EMPCOV_FULLRANK, kind='fullrank')}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_empirical_covariance(dtype=dtype, shape=EMPCOV_RANKDEF, kind='rankdef')}")
+    # WR-02: assume_centered=True drives the SEPARATE uncentered host-Gram
+    # branch (Xᵀ·X/n, location_ all-zero) that the centered fixtures never reach.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_empirical_covariance(dtype=dtype, shape=EMPCOV_FULLRANK, kind='centered', assume_centered=True)}")
     # LedoitWolf (COV-02): TWO sample counts n (ROADMAP criterion 3).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_ledoit_wolf(dtype=dtype, n=LW_N_SMALL)}")
