@@ -459,7 +459,7 @@ InvalidKernel    { estimator: &'static str, kernel: String },    // unknown kern
 
 **Everything else in this research was read directly from the local sklearn 1.9.0 source or the repo and is VERIFIED.**
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Is the D-11 reduce-max rescale needed, or does a plain linear reduce-sum suffice?**
    - What we know: CONTEXT D-11 marks this Claude's discretion; decide from numerical testing.

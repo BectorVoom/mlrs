@@ -82,7 +82,21 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 
 **Recurring gates**: `skip_f64_with_log` on every f64 oracle case; documented f32-on-rocm band for KernelRidge (predictions) and KernelDensity (log-density — large dynamic range); LDS-budget audit on any SharedMemory tile; per-prim PoolStats memory gate.
 **Research flag**: None — kernel-matrix is a known elementwise map over distance/Gram; design settled in research. Standard pattern, research-phase can be skipped.
-**Plans**: TBD
+**Plans**: 5 plans (4 waves)
+
+Plans:
+**Wave 0**
+- [ ] 08-01-PLAN.md — Wave-0 scaffold: ScoreSamples<F> trait + 3 AlgoError guards + Kernel<F> enum/kernel_matrix signature + kernel_ridge//density/ module homes + 3 #[ignore] test scaffolds + 3 oracle generators
+
+**Wave 1** *(blocked on Wave 0)*
+- [ ] 08-02-PLAN.md — PRIM-08 kernel_matrix.rs keystone prim (linear/rbf/poly/sigmoid map over v1 distance/gemm) + PoolStats memory gate
+
+**Wave 2** *(blocked on Wave 1)*
+- [ ] 08-03-PLAN.md — KERNEL-01 KernelRidge (dual (K+αI) Cholesky multi-RHS solve over kernel_matrix; no centering/intercept)
+- [ ] 08-04-PLAN.md — KERNEL-02 KernelDensity (6 KD kernels + scott/silverman; device log-sum-exp over v1 distance/reduce; ScoreSamples<F> impl)
+
+**Wave 3** *(blocked on Wave 2)*
+- [ ] 08-05-PLAN.md — PY-06 (share) PyO3 wrappers PyKernelRidge/PyKernelDensity (any_estimator! + score_samples) + py smoke test
 
 ### Phase 9: Spectral Family
 
@@ -143,7 +157,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 | 5. Distance-Based & Iterative-Solver Estimators | v1.0 | 11/11 | Complete | 2026-06-13 |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
 | 7. Covariance & Projection | v2.0 | 7/7 | Complete    | 2026-06-20 |
-| 8. Kernel Family | v2.0 | 0/? | Not started | - |
+| 8. Kernel Family | v2.0 | 0/5 | Planned | - |
 | 9. Spectral Family | v2.0 | 0/? | Not started | - |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
 | 11. Naive Bayes | v2.0 | 0/? | Not started | - |
