@@ -156,6 +156,9 @@ where
         &mut self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
+        // `_y` is unused: the retained `Fit`-trait slot for Phase-10 MBSGD reuse
+        // (this estimator is unsupervised; see traits.rs) — not unfinished wiring
+        // (IN-02).
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<&mut Self, AlgoError> {
