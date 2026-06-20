@@ -109,6 +109,19 @@ IPCA_BATCH_SIZE = 10
 JL_N_SAMPLES = (100, 1000, 10000)
 JL_EPS = (0.1, 0.2, 0.5)
 
+# ---- Phase-8 kernel-family fixture sizes ----
+# kernel_matrix (PRIM-08, D-01/D-02). Small NON-square X/Y sharing a feature
+# dimension so the fixture pins the general K(X, Y) (rows_x × rows_y) for all
+# four kernels (linear/rbf/poly/sigmoid).
+KM_ROWS_X, KM_ROWS_Y, KM_COLS = 5, 4, 3
+# KernelRidge (KERNEL-01, D-04/D-05). n_samples <= 64 (A2 — the n×n training
+# Gram clears the Phase-3/4 MAX_DIM cap so the dual Cholesky solve stays in
+# range). A handful of test rows + a 2-target multi-RHS case (D-04).
+KR_N_SAMPLES, KR_N_FEATURES, KR_N_TEST = 12, 4, 5
+# KernelDensity (KERNEL-02, D-10). Tiny n so the brute-force density matches
+# sklearn's exact-forced (atol=0, rtol=0) tree; a small query set Q.
+KD_N_SAMPLES, KD_N_FEATURES, KD_N_QUERY = 10, 3, 6
+
 
 def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
     """Generate one seeded saxpy fixture and write it to ``tests/fixtures``.
@@ -1303,6 +1316,218 @@ def gen_jl_min_dim(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+def gen_kernel_matrix(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded kernel-matrix fixture (PRIM-08, D-01/D-02).
+
+    Emits row-major ``X`` (``KM_ROWS_X × KM_COLS``) and ``Y`` (``KM_ROWS_Y ×
+    KM_COLS``) plus the host-reference kernel matrix ``K`` for each of the four
+    kernels, computed with ``sklearn.metrics.pairwise.pairwise_kernels``:
+      - ``K_linear``  = ``X·Yᵀ``.
+      - ``K_rbf``     = ``exp(-γ·‖xᵢ − yⱼ‖²)`` with γ resolved to the sklearn
+        ``None`` default ``1/n_features`` PLUS a second explicit-γ matrix
+        ``K_rbf_gamma`` (γ = 0.5) so both the resolved-default and explicit paths
+        are pinned (D-05).
+      - ``K_poly``    = ``(γ·⟨xᵢ, yⱼ⟩ + coef0)^degree`` with γ = 1/n_features,
+        degree = 3, coef0 = 1 (the sklearn defaults).
+      - ``K_sigmoid`` = ``tanh(γ·⟨xᵢ, yⱼ⟩ + coef0)`` with γ = 1/n_features,
+        coef0 = 1.
+
+    All arrays ``np.ascontiguousarray(...).astype(dtype)`` (row-major — the PCA
+    fix). The resolved γ is stored as ``gamma_default`` for the Rust side to
+    reconstruct the default-γ case. Returns the path.
+    """
+    from sklearn.metrics.pairwise import pairwise_kernels
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((KM_ROWS_X, KM_COLS))
+    y = rng.standard_normal((KM_ROWS_Y, KM_COLS))
+    gamma_default = 1.0 / KM_COLS
+    degree = 3
+    coef0 = 1.0
+    gamma_explicit = 0.5
+
+    k_linear = pairwise_kernels(x, y, metric="linear")
+    k_rbf = pairwise_kernels(x, y, metric="rbf", gamma=gamma_default)
+    k_rbf_gamma = pairwise_kernels(x, y, metric="rbf", gamma=gamma_explicit)
+    k_poly = pairwise_kernels(
+        x, y, metric="poly", gamma=gamma_default, degree=degree, coef0=coef0
+    )
+    k_sigmoid = pairwise_kernels(
+        x, y, metric="sigmoid", gamma=gamma_default, coef0=coef0
+    )
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"kernel_matrix_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        Y=c(y),
+        gamma_default=c([gamma_default]),
+        gamma_explicit=c([gamma_explicit]),
+        degree=c([degree]),
+        coef0=c([coef0]),
+        K_linear=c(k_linear),
+        K_rbf=c(k_rbf),
+        K_rbf_gamma=c(k_rbf_gamma),
+        K_poly=c(k_poly),
+        K_sigmoid=c(k_sigmoid),
+    )
+    return out_path
+
+
+def gen_kernel_ridge(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded KernelRidge fixture (KERNEL-01, D-04/D-05).
+
+    Emits row-major ``X`` / ``y`` / ``X_test`` plus ``reg.predict(X_test)`` for
+    each case (one per kernel + a multi-target + a gamma=None + an explicit-gamma
+    case). sklearn ``KernelRidge`` fits RAW data with NO intercept (D-06):
+      - ``y_linear`` / ``y_rbf`` / ``y_poly`` / ``y_sigmoid``: one case per kernel
+        (alpha=1.0, gamma=1/n_features default, degree=3, coef0=1).
+      - ``y_multi``: a 2-target (multi-RHS, D-04) rbf case → predictions are
+        ``KR_N_TEST × 2``.
+      - ``y_rbf_gamma``: an EXPLICIT gamma (0.5) rbf case (D-05) so the
+        resolved-default (``y_rbf``) and explicit paths are both pinned.
+
+    ``n_samples ≤ 64`` (A2 — the n×n Gram clears the MAX_DIM cap). All arrays
+    ``np.ascontiguousarray(...).astype(dtype)`` (row-major). Returns the path.
+    """
+    from sklearn.kernel_ridge import KernelRidge
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((KR_N_SAMPLES, KR_N_FEATURES))
+    true_coef = rng.standard_normal(KR_N_FEATURES)
+    y = x @ true_coef + 0.1 * rng.standard_normal(KR_N_SAMPLES)
+    y2 = np.column_stack(
+        [y, x @ rng.standard_normal(KR_N_FEATURES) + 0.1 * rng.standard_normal(KR_N_SAMPLES)]
+    )
+    x_test = rng.standard_normal((KR_N_TEST, KR_N_FEATURES))
+
+    alpha = 1.0
+    gamma_default = 1.0 / KR_N_FEATURES
+    gamma_explicit = 0.5
+    degree = 3
+    coef0 = 1.0
+
+    def fit_predict(kernel, target, **kw):
+        reg = KernelRidge(alpha=alpha, kernel=kernel, **kw).fit(x, target)
+        return reg.predict(x_test)
+
+    y_linear = fit_predict("linear", y)
+    y_rbf = fit_predict("rbf", y, gamma=gamma_default)
+    y_poly = fit_predict("poly", y, gamma=gamma_default, degree=degree, coef0=coef0)
+    y_sigmoid = fit_predict("sigmoid", y, gamma=gamma_default, coef0=coef0)
+    y_multi = fit_predict("rbf", y2, gamma=gamma_default)        # KR_N_TEST × 2
+    y_rbf_gamma = fit_predict("rbf", y, gamma=gamma_explicit)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"kernel_ridge_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        y2=c(y2),
+        X_test=c(x_test),
+        alpha=c([alpha]),
+        gamma_default=c([gamma_default]),
+        gamma_explicit=c([gamma_explicit]),
+        degree=c([degree]),
+        coef0=c([coef0]),
+        y_linear=c(y_linear),
+        y_rbf=c(y_rbf),
+        y_poly=c(y_poly),
+        y_sigmoid=c(y_sigmoid),
+        y_multi=c(y_multi),
+        y_rbf_gamma=c(y_rbf_gamma),
+    )
+    return out_path
+
+
+def gen_kernel_density(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one seeded KernelDensity fixture (KERNEL-02, D-10).
+
+    Emits row-major ``X`` (training) / ``Q`` (queries) plus
+    ``kde.score_samples(Q)`` (length-``KD_N_QUERY`` log-densities) for each of
+    sklearn's six kernels, all fit with ``atol=0, rtol=0`` (D-10 forced-exact so
+    the brute-force tree matches a direct sum), plus two bandwidth-rule cases:
+      - ``ld_gaussian`` / ``ld_tophat`` / ``ld_epanechnikov`` / ``ld_exponential``
+        / ``ld_linear`` / ``ld_cosine``: per-kernel at a fixed numeric bandwidth.
+      - ``ld_scott`` / ``ld_silverman``: gaussian kernel with the ``'scott'`` /
+        ``'silverman'`` bandwidth rules (D-09) so the host bandwidth-resolution
+        closed form is pinned. The resolved bandwidths are stored as
+        ``bw_scott`` / ``bw_silverman`` for the Rust side.
+
+    Tiny ``n`` so brute force matches the exact-forced tree. All arrays
+    ``np.ascontiguousarray(...).astype(dtype)`` (row-major). Returns the path.
+    """
+    from sklearn.neighbors import KernelDensity
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((KD_N_SAMPLES, KD_N_FEATURES))
+    q = rng.standard_normal((KD_N_QUERY, KD_N_FEATURES))
+    bandwidth = 1.0
+
+    kernels = (
+        "gaussian",
+        "tophat",
+        "epanechnikov",
+        "exponential",
+        "linear",
+        "cosine",
+    )
+
+    def score(bw):
+        kde = KernelDensity(
+            bandwidth=bw, kernel="gaussian", atol=0, rtol=0
+        ).fit(x)
+        return kde, kde.score_samples(q)
+
+    arrays = {}
+    for k in kernels:
+        kde = KernelDensity(
+            bandwidth=bandwidth, kernel=k, atol=0, rtol=0
+        ).fit(x)
+        arrays[f"ld_{k}"] = kde.score_samples(q)
+
+    # Bandwidth-rule cases (D-09): sklearn resolves the string rule into the
+    # numeric `bandwidth_` attribute at fit; store both the log-density and the
+    # resolved bandwidth so the Rust host closed form can be pinned directly.
+    kde_scott, ld_scott = score("scott")
+    kde_silverman, ld_silverman = score("silverman")
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"kernel_density_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        Q=c(q),
+        bandwidth=c([bandwidth]),
+        bw_scott=c([kde_scott.bandwidth_]),
+        bw_silverman=c([kde_silverman.bandwidth_]),
+        ld_scott=c(ld_scott),
+        ld_silverman=c(ld_silverman),
+        **{k: c(v) for k, v in arrays.items()},
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -1406,6 +1631,21 @@ def main() -> None:
     # johnson_lindenstrauss_min_dim (PROJ-01/02, D-12): the ONE value oracle.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_jl_min_dim(dtype=dtype)}")
+
+    # ---- Phase-8 kernel-family fixtures ----
+    # Each generator writes BOTH f32 (rocm gate) and f64 (cpu gate) blobs.
+    # kernel_matrix (PRIM-08): the 4 kernels (linear/rbf/poly/sigmoid) + a
+    # default-gamma and explicit-gamma RBF case (D-01/D-02/D-05).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_kernel_matrix(dtype=dtype)}")
+    # KernelRidge (KERNEL-01): one case per kernel + 2-target multi-RHS (D-04) +
+    # gamma None/explicit (D-05) + degree=3/coef0=1 poly/sigmoid defaults.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_kernel_ridge(dtype=dtype)}")
+    # KernelDensity (KERNEL-02): all 6 kernels forced-exact (atol=0, rtol=0) +
+    # scott/silverman bandwidth rules (D-09/D-10).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_kernel_density(dtype=dtype)}")
 
 
 if __name__ == "__main__":
