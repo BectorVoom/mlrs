@@ -61,7 +61,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 07-05-PLAN.md — DECOMP-03 IncrementalPCA (PartialFit + sklearn-faithful fit + whiten + transform/inverse)
+- [x] 07-05-PLAN.md — DECOMP-03 IncrementalPCA (PartialFit + sklearn-faithful fit + whiten + transform/inverse)
 - [ ] 07-06-PLAN.md — PROJ-01/02 Gaussian/SparseRandomProjection + johnson_lindenstrauss_min_dim (property-gated)
 
 **Wave 4** *(blocked on Wave 3 completion)*
@@ -142,7 +142,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 | 4. Closed-Form Estimators | v1.0 | 5/5 | Complete | 2026-06-12 |
 | 5. Distance-Based & Iterative-Solver Estimators | v1.0 | 11/11 | Complete | 2026-06-13 |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
-| 7. Covariance & Projection | v2.0 | 3/7 | Executing | - |
+| 7. Covariance & Projection | v2.0 | 5/7 | Executing | - |
 | 8. Kernel Family | v2.0 | 0/? | Not started | - |
 | 9. Spectral Family | v2.0 | 0/? | Not started | - |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |

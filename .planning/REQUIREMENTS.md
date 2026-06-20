@@ -23,7 +23,7 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 ### Decomposition
 
-- [ ] **DECOMP-03**: A data scientist can fit `IncrementalPCA` (including via `partial_fit` over batches) and get `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`, `var_`, and `transform`/`inverse_transform` matching scikit-learn within 1e-5 after `svd_flip` sign alignment
+- [x] **DECOMP-03**: A data scientist can fit `IncrementalPCA` (including via `partial_fit` over batches) and get `components_`, `explained_variance_`, `explained_variance_ratio_`, `singular_values_`, `mean_`, `var_`, and `transform`/`inverse_transform` matching scikit-learn within 1e-5 after `svd_flip` sign alignment
 
 ### Random Projection
 
@@ -79,7 +79,7 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | PRIM-07 | Phase 7 | Complete (07-03) |
 | COV-01 | Phase 7 | Complete (07-04) |
 | COV-02 | Phase 7 | Complete (07-04) |
-| DECOMP-03 | Phase 7 | Pending |
+| DECOMP-03 | Phase 7 | Complete (07-05) |
 | PROJ-01 | Phase 7 | Pending |
 | PROJ-02 | Phase 7 | Pending |
 | PRIM-08 | Phase 8 | Pending |
