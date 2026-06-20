@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: executing
-stopped_at: Completed 07-06-PLAN.md (PROJ-01/02 RandomProjection)
-last_updated: "2026-06-20T13:56:00.000Z"
-last_activity: 2026-06-20 -- Completed Phase 07 Plan 06 (PROJ-01/02 Gaussian + Sparse RandomProjection)
+stopped_at: Completed 07-07-PLAN.md (PyO3 wrappers for the covariance/projection family)
+last_updated: "2026-06-20T14:30:00.000Z"
+last_activity: 2026-06-20 -- Completed Phase 07 Plan 07 (PyO3 wrappers + Python shims for the five Phase-7 estimators)
 progress:
   total_phases: 5
   completed_phases: 0
   total_plans: 7
-  completed_plans: 6
+  completed_plans: 7
   percent: 0
 ---
 
@@ -25,14 +25,14 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 07 (covariance-projection) — EXECUTING
-Plan: 7 of 7 (07-01, 07-02, 07-03, 07-04, 07-05, 07-06 complete)
-Status: Executing Phase 07
-Last activity: 2026-06-20 -- Completed Phase 07 Plan 06 (PROJ-01/02 RandomProjection)
-Resume file: .planning/phases/07-covariance-projection/07-06-SUMMARY.md
-Next: Execute Plan 07-07 (PyO3 wrappers for the covariance/projection family)
+Phase: 07 (covariance-projection) — EXECUTING (all 7 plans complete)
+Plan: 7 of 7 (07-01 … 07-07 complete)
+Status: Phase 07 plans complete — ready for phase verification / transition
+Last activity: 2026-06-20 -- Completed Phase 07 Plan 07 (PyO3 wrappers + Python shims for the five Phase-7 estimators)
+Resume file: .planning/phases/07-covariance-projection/07-07-SUMMARY.md
+Next: Phase 07 verification / transition (all of COV-01/COV-02/DECOMP-03/PROJ-01/PROJ-02 wrapped + shimmed)
 
-Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 6/7 done)
+Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 7/7 done)
 
 ## Open Follow-ups (Phase 05)
 
@@ -98,6 +98,7 @@ Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 6/7 done)
 | Phase 07 P03 | 18 | 2 tasks | 2 files |
 | Phase 07 P04 | 11 | 2 tasks | 5 files |
 | Phase 07 P05 | 16 | 2 tasks | 3 files |
+| Phase 07 P07 | 18 | 2 tasks | 13 files |
 
 ## Accumulated Context
 
@@ -106,6 +107,7 @@ Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 6/7 done)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [07-07]: The five Phase-7 estimators are wrapped on `_mlrs` with ZERO new binding infra — they reuse the shipped `any_estimator!` macro + ingress/egress/capability/errors verbatim (RESEARCH). IncrementalPCA introduces the first v2 `partial_fit`: the `#[pyclass]` constructs the F32/F64 arm from the stored Unfit hyperparameters on the first batch and MUTATES it in place after; the Python shim builds the `_mlrs` object once and reuses it across the stream. A mixed-dtype partial_fit stream is a hard `PyValueError` (errors::dtype_mismatch_in_stream, Rule 2 — the fitted arm is one monomorphization). `n_components='auto'`/`density='auto'` map to Option None sentinels at the Rust boundary; `random_state→u64 seed`. Scalar attrs (shrinkage_/n_components_/density_/n_samples_seen) are single-typed; only array attrs are dtype-suffixed _f32/_f64. SparseRandomProjection densifies sparse input at the Python ingress (D-12/PROJ-02). guard_f64() gates every F64 fit/partial_fit arm (statically grep-verified — the Unfit-arm smoke test never runs live F64 dispatch, WARNING 2). pyo3 stays 0.28 (single ABI). Added pub n_components()/whiten()/batch_size() to algos IncrementalPCA for the re-fit path (Rule 3). This is the incremental per-phase Python wrapping; PY-06 final sign-off stays Phase 11.
 - [06-06]: estimator_checks criterion 1 is the RELEVANT subset, not "all checks pass" — parametrize_with_checks over all 12 instances on the real cpu/f64 _mlrs gives 475 passed / 102 by-design xfailed / 19 skipped / 0 unexpected failures / 0 xpassed across 597 cases. By-design gaps (sparse, object-dtype, pickle, NaN/allow_nan-off, supervised-2d-y warning, n_iter_, 1-sample special-case, string class labels) are declared via sklearn-native expected_failed_checks (_EXPECTED keyed by type(estimator).__name__) with a per-check reason, mirrored in checks_triage.md (the two MUST stay in sync — a stale xfail surfaces as xpassed). Three genuine failures were FIXED in the shim during triage (Rule 2: n_features_in_/_post_fit; Rule 1: _check_predict_X NotFittedError-before-AttributeError; Rule 2: predict feature-count validation), not masked. DBSCAN/NearestNeighbors are predict-less (sklearn-faithful) so no predict-based checks are generated for them — RESEARCH Open Q3 resolved.
 - [06-06]: Four per-backend wheels build via maturin under distinct dist names mlrs_cpu/wgpu/cuda/rocm, all cp312-abi3, each shipping mlrs/_mlrs.abi3.so and importable as the constant `import mlrs` (PY-04/D-07/D-09). mimalloc built with local_dynamic_tls closes the 06-05 static-TLS item so the cpu wheel imports in a fresh venv with NO LD_PRELOAD. cuda is compile-only in this environment: the wheel builds with the right name+tag but its live `import mlrs`, the cross-hardware foreign-driver-absent ImportError, and the two-wheel-namespace-overwrite check are DEFERRED to a CUDA host as opportunistic checks (user-approved; recorded honestly, NOT fabricated as passed). The driver-absent ImportError path is asserted clean (in-process + subprocess, no abort) for the runnable backends (D-08/T-06-16).
 - [06-05]: The Python oracle harness (criterion 1 / PY-01) re-validates 1e-5 through the FULL numpy->pyarrow->PyCapsule->Rust FFI->validate->device->host->numpy path for all 12 estimators by replaying the committed tests/fixtures/*.npz blobs as a SECOND consumer — 34 cases green on a REAL cpu _mlrs (maturin develop). LogisticRegression compares the gauge-fixed predict_proba (Phase-5 D-12), fit at the fixture's tight tol (default tol halts 3-6e-5 short); f64 holds strict 1e-5, f32 uses a documented 1e-4 band (epsilon, not a contract loosening) with exact labels as the hard gate. KMeans centers aligned via the recovered label permutation; PCA/TSVD components sign-flipped.

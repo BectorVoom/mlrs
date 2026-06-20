@@ -66,7 +66,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 07-07-PLAN.md — PyO3 wrappers for all 5 estimators + IncrementalPCA partial_fit + jl_min_dim pyfunction + Python shims
+- [x] 07-07-PLAN.md — PyO3 wrappers for all 5 estimators + IncrementalPCA partial_fit + jl_min_dim pyfunction + Python shims
 
 ### Phase 8: Kernel Family
 
