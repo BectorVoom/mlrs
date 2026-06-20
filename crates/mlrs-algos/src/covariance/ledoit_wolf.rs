@@ -189,9 +189,9 @@ where
             }
         }
         // ddof=0 MLE normalisation: divide the centered Gram by n (NOT n−1,
-        // RESEARCH Pitfall 1). This is the ddof=0 emp_cov the β/δ form requires.
-        let ddof: u32 = 0;
-        let emp_cov: Vec<f64> = gram.iter().map(|&g| g / (n - ddof as f64)).collect();
+        // RESEARCH Pitfall 1). ddof is hard-pinned to 0 for the MLE the β/δ form
+        // requires — there is no configurable ddof here (IN-04).
+        let emp_cov: Vec<f64> = gram.iter().map(|&g| g / n).collect();
 
         // emp_cov_trace = sum(X2, axis=0) / n  (length p) — the per-feature mean
         // of the squared centered entries (= diag(emp_cov)).
