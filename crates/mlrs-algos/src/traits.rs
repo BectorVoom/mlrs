@@ -212,6 +212,38 @@ where
     >;
 }
 
+/// Compute the per-sample LOG-DENSITY for new samples (D-12). This is the
+/// density-estimation surface implemented by `KernelDensity.score_samples`: given
+/// an `n_samples × n_features` query matrix it returns a length-`n_samples` buffer
+/// of natural-log probability densities `log p(xᵢ)` evaluated under the fitted
+/// kernel density model.
+///
+/// Distinct from [`Predict`] — this is NOT a regression target. The output is a
+/// length-`n_samples` log-density vector (one scalar per query row), not an
+/// `n_samples × n_features` reconstruction or an `n_samples`-length regression
+/// prediction. The semantic difference (a probability density, evaluated in the
+/// log domain for numerical stability) is why it is its own trait rather than a
+/// reuse of `Predict` (D-12).
+///
+/// Runs device-side from the device-resident fitted training matrix / bandwidth
+/// (D-03); the returned buffer is host-materialized only at a Rust accessor /
+/// oracle-comparison boundary, exactly like [`Predict`].
+pub trait ScoreSamples<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Compute the length-`n_samples` log-density `log p(xᵢ)` for each row of `x`
+    /// (`shape = (n_samples, n_features)`, row-major) under the fitted kernel
+    /// density model. Errors if the estimator is unfitted or the geometry
+    /// disagrees with the fitted `n_features`.
+    fn score_samples(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
+}
+
 /// Predict per-class membership probabilities for new samples (D-07). Returns the
 /// `n_samples × n_classes` row-major matrix of class fractions (each row sums to
 /// 1) — the `predict_proba` surface implemented by `KNeighborsClassifier`

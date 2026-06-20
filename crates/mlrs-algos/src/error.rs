@@ -211,6 +211,55 @@ pub enum AlgoError {
         eps: f64,
     },
 
+    /// A kernel-density estimator (KernelDensity) was given a non-positive
+    /// `bandwidth`. The kernel bandwidth `h` scales the per-sample distances and
+    /// must be `h > 0` (sklearn's contract — `Interval(Real, 0, None,
+    /// closed='neither')`); a non-positive bandwidth makes the density
+    /// normalization (which divides by a power of `h`) undefined. Rejected at
+    /// `fit` *before* any kernel launch so an untrusted hyperparameter becomes a
+    /// typed error, not a divide-by-zero / out-of-bounds device read (T-08-01-01 /
+    /// ASVS V5).
+    #[error(
+        "estimator '{estimator}': bandwidth = {bandwidth} is invalid (must be > 0)"
+    )]
+    InvalidBandwidth {
+        /// Which estimator rejected the value (e.g. `"kernel_density"`).
+        estimator: &'static str,
+        /// The offending bandwidth.
+        bandwidth: f64,
+    },
+
+    /// A polynomial-kernel estimator (KernelRidge with `kernel="poly"`) was given
+    /// a `degree` below 1. The polynomial kernel `(γ·⟨x,y⟩ + coef0)^degree`
+    /// requires `degree ≥ 1` (sklearn's contract — `Interval(Real, 1, None,
+    /// closed='left')`); a degree below 1 is not a valid polynomial-kernel order.
+    /// Rejected at `fit` *before* any kernel launch (T-08-01-01 / ASVS V5).
+    #[error(
+        "estimator '{estimator}': degree = {degree} is invalid (must be >= 1)"
+    )]
+    InvalidDegree {
+        /// Which estimator rejected the value (e.g. `"kernel_ridge"`).
+        estimator: &'static str,
+        /// The offending polynomial degree.
+        degree: f64,
+    },
+
+    /// A kernel estimator (KernelRidge / KernelDensity) was given an unrecognised
+    /// `kernel` name. Only the supported kernel families are accepted
+    /// (KernelRidge: `linear`/`rbf`/`poly`/`sigmoid`; KernelDensity:
+    /// `gaussian`/`tophat`/`epanechnikov`/`exponential`/`linear`/`cosine`); any
+    /// other name is rejected at `fit` *before* any kernel launch so an untrusted
+    /// string becomes a typed error, not a silent fall-through (T-08-01-01 /
+    /// ASVS V5). Carries the offending (owned) name for diagnosis.
+    #[error("estimator '{estimator}': kernel '{kernel}' is not supported")]
+    InvalidKernel {
+        /// Which estimator rejected the value (e.g. `"kernel_ridge"` /
+        /// `"kernel_density"`).
+        estimator: &'static str,
+        /// The unrecognised kernel name the caller supplied.
+        kernel: String,
+    },
+
     /// An iterative solver (coordinate descent for Lasso/ElasticNet, L-BFGS for
     /// LogisticRegression) failed to reach its convergence tolerance within the
     /// `max_iter` cap. Surfaced as a typed error rather than silently returning a

@@ -25,6 +25,11 @@
 //!   (07-04). Registered as an empty stub here by the 07-01 Wave-0 scaffold.
 //! - [`projection`] — `GaussianRandomProjection` / `SparseRandomProjection`
 //!   (PROJ-01/02) (07-06). Registered as an empty stub here by 07-01.
+//! - [`kernel_ridge`] — `KernelRidge` (KERNEL-01) (Wave-2, 08-03). Registered as
+//!   an empty stub here by the 08-01 Wave-0 scaffold.
+//! - [`density`] — `KernelDensity` (KERNEL-02) (Wave-2, 08-04). New `density/`
+//!   home (RESEARCH Open Q2 — KD is not a neighbor estimator in mlrs's trait
+//!   sense). Registered as an empty stub here by the 08-01 Wave-0 scaffold.
 //!
 //! The estimator plans edit ONLY their own estimator file and the relevant
 //! module-index `mod.rs` (`linear/mod.rs` / `decomposition/mod.rs` /
@@ -37,7 +42,9 @@
 pub mod cluster;
 pub mod covariance;
 pub mod decomposition;
+pub mod density;
 pub mod error;
+pub mod kernel_ridge;
 pub mod linear;
 pub mod neighbors;
 pub mod projection;
@@ -48,5 +55,6 @@ pub mod traits;
 // KNeighbors, PredictProba, AlgoError};` directly.
 pub use error::AlgoError;
 pub use traits::{
-    Fit, KNeighbors, PartialFit, Predict, PredictLabels, PredictProba, Transform,
+    Fit, KNeighbors, PartialFit, Predict, PredictLabels, PredictProba,
+    ScoreSamples, Transform,
 };
