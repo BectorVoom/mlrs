@@ -151,10 +151,15 @@ where
             Some(z1) => z1,
             None => {
                 let mut u1 = rng.next_f64();
-                if u1 <= f64::MIN_POSITIVE {
-                    // next_f64() ∈ [0,1); avoid ln(0) = -inf on the (vanishingly
-                    // rare) exact-zero draw. Deterministic, seed-stable.
-                    u1 = f64::MIN_POSITIVE;
+                // WR-06: floor at the stream's own resolution (next_f64 quantizes
+                // to multiples of 2^-53), NOT f64::MIN_POSITIVE (~2.2e-308). The
+                // old floor only fired on an exact 0.0 draw and then injected
+                // r = sqrt(-2·ln(2.2e-308)) ≈ 37.6 — a 37σ outlier that skews the
+                // moment statistics. Flooring at 2^-53 bounds the worst-case
+                // r to ~8.6σ. Deterministic, seed-stable.
+                let min_u1 = 2.0_f64.powi(-53);
+                if u1 < min_u1 {
+                    u1 = min_u1;
                 }
                 let u2 = rng.next_f64();
                 let r = (-2.0_f64 * u1.ln()).sqrt();
