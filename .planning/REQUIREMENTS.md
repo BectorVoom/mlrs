@@ -27,8 +27,8 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 ### Random Projection
 
-- [ ] **PROJ-01**: A data scientist can fit `GaussianRandomProjection` (`n_components='auto'` via `johnson_lindenstrauss_min_dim`) and `transform` inputs — **property-gated** (JL distance-preservation/distortion bound, matrix-distribution stats, seed-reproducibility, `transform == X·componentsᵀ` self-consistency), NOT a 1e-5 value match (mlrs RNG ≠ NumPy MT19937); `johnson_lindenstrauss_min_dim` itself is value-matched
-- [ ] **PROJ-02**: A data scientist can fit `SparseRandomProjection` (Achlioptas sparse matrix with configurable `density`) and `transform`, property-gated as PROJ-01; sparse input is accepted by densifying at the Python ingress boundary
+- [x] **PROJ-01**: A data scientist can fit `GaussianRandomProjection` (`n_components='auto'` via `johnson_lindenstrauss_min_dim`) and `transform` inputs — **property-gated** (JL distance-preservation/distortion bound, matrix-distribution stats, seed-reproducibility, `transform == X·componentsᵀ` self-consistency), NOT a 1e-5 value match (mlrs RNG ≠ NumPy MT19937); `johnson_lindenstrauss_min_dim` itself is value-matched
+- [x] **PROJ-02**: A data scientist can fit `SparseRandomProjection` (Achlioptas sparse matrix with configurable `density`) and `transform`, property-gated as PROJ-01; sparse input is accepted by densifying at the Python ingress boundary
 
 ### Kernel
 
@@ -80,8 +80,8 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | COV-01 | Phase 7 | Complete (07-04) |
 | COV-02 | Phase 7 | Complete (07-04) |
 | DECOMP-03 | Phase 7 | Complete (07-05) |
-| PROJ-01 | Phase 7 | Pending |
-| PROJ-02 | Phase 7 | Pending |
+| PROJ-01 | Phase 7 | Complete |
+| PROJ-02 | Phase 7 | Complete |
 | PRIM-08 | Phase 8 | Pending |
 | KERNEL-01 | Phase 8 | Pending |
 | KERNEL-02 | Phase 8 | Pending |
