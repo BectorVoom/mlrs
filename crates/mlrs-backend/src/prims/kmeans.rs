@@ -44,6 +44,7 @@ use mlrs_kernels::kmeans::{centroid_sumcount, inertia_rows};
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
 use crate::prims::distance::distance;
+use crate::prims::rng::SplitMix64;
 use crate::runtime::ActiveRuntime;
 
 /// Recompute the `k × d` centroids as the per-label MEAN of the assigned rows of
@@ -654,60 +655,13 @@ fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
 
 // ===========================================================================
 // Host-side documented seeded PRNG (ASVS V6 — NEVER OsRng; T-05-03-03)
+//
+// The `SplitMix64` PRNG was PROMOTED to `crate::prims::rng` (PRIM-06, plan
+// 07-02) where it now also backs the Gaussian/Achlioptas/permutation generators.
+// `kmeanspp_sample` consumes the SAME struct verbatim via `use
+// crate::prims::rng::SplitMix64` (top of this file) — the mix is byte-frozen so
+// the k-means++ stream is unchanged (RESEARCH Pitfall 7 / `kmeanspp_test.rs`).
 // ===========================================================================
-
-/// SplitMix64 — a small, well-documented, fully-deterministic seeded PRNG
-/// (Steele, Lea & Flood, 2014). Used HOST-SIDE only for the k-means++ draw so
-/// the sampler is seed-reproducible across runs and backends. It is NOT a CSPRNG
-/// and is NEVER seeded from `OsRng` — the seed is the caller's documented `u64`
-/// (T-05-03-03 / RESEARCH "host-side documented seeded RNG").
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    /// Seed the generator with the caller's documented `u64`.
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    /// Next 64-bit value (the canonical SplitMix64 mix).
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Next `f64` in `[0, 1)` (53-bit mantissa precision).
-    fn next_f64(&mut self) -> f64 {
-        // Top 53 bits → [0, 1) with full double mantissa.
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// UNBIASED uniform integer in `[0, bound)` via rejection sampling (CR-02).
-    /// A plain `next_u64() % bound` is biased whenever `bound` does not divide
-    /// `2^64`; we reject the top non-uniform residue so every value is equally
-    /// likely. `bound` must be `>= 1` (the caller guarantees `n >= k >= 1`).
-    fn next_below(&mut self, bound: u64) -> u64 {
-        debug_assert!(bound >= 1, "next_below requires a positive bound");
-        if bound == 1 {
-            return 0;
-        }
-        // Largest multiple of `bound` that fits in u64; values at or above it are
-        // the biased tail and get rejected. `zone = bound * (u64::MAX / bound)`
-        // rounded down to the last full block; use the (MAX - MAX % bound) form to
-        // avoid overflow.
-        let zone = u64::MAX - (u64::MAX % bound);
-        loop {
-            let v = self.next_u64();
-            if v < zone {
-                return v % bound;
-            }
-        }
-    }
-}
 
 // ===========================================================================
 // f32/f64 host bit-cast helpers (mirror reduce.rs — F is f32/f64 only)
