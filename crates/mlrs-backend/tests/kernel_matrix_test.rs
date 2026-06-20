@@ -198,12 +198,84 @@ fn kernel_matrix_all_kernels_f32() {
 /// precedent, mirror `incremental_svd_memory_gate`). Wave-1 (08-02) removes
 /// `#[ignore]` and drives the real `kernel_matrix`.
 #[test]
-#[ignore = "Wave-0 scaffold: kernel_matrix memory gate lands in plan 08-02"]
 fn kernel_matrix_memory_gate() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
-    // Wave-1: drive kernel_matrix N times at a fixed shape; assert
-    // live_after[w] <= live_after[1] and peak_after plateaus.
-    println!("kernel_matrix_memory_gate backend={backend}: scaffold (no-op until 08-02)");
+
+    const N: usize = 5;
+    // Fixed square shape so the distance base AND the in-place map both run at a
+    // constant n×n footprint each call. Rbf is chosen so BOTH the distance base op
+    // and the rbf_map exercise the pool (the in-place map reuses the base buffer —
+    // no parallel allocation, T-08-02-02).
+    let rows = 8usize;
+    let cols = 4usize;
+    let gamma = 0.5f32;
+
+    // Deterministic input (the gate asserts on POOL COUNTERS, not values).
+    let make = |seed: usize| -> Vec<f32> {
+        (0..rows * cols)
+            .map(|i| (((i + seed) % 11) as f32) * 0.1 - 0.5)
+            .collect()
+    };
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let mut live_after: Vec<u64> = Vec::with_capacity(N);
+    let mut peak_after: Vec<u64> = Vec::with_capacity(N);
+
+    for iter in 0..N {
+        let x = make(iter);
+        let y = make(iter + 3);
+        let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+        let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+
+        let k = kernel_matrix::<f32>(
+            &mut pool,
+            &x_dev,
+            (rows, cols),
+            &y_dev,
+            (rows, cols),
+            Kernel::Rbf { gamma },
+            None,
+        )
+        .expect("kernel_matrix in memory gate");
+
+        // Release this call's transient operands + the produced K so the steady
+        // state is the empty free-list (the prim itself releases its internal
+        // distance scratch; the in-place map allocates nothing).
+        x_dev.release_into(&mut pool);
+        y_dev.release_into(&mut pool);
+        k.release_into(&mut pool);
+
+        let stats = pool.stats();
+        live_after.push(stats.live_bytes);
+        peak_after.push(stats.peak_bytes);
+    }
+
+    // After a warmup iteration the live footprint must CONSERVE: the distance
+    // base op releases its own XYᵀ / norm scratch and the rbf_map runs IN PLACE
+    // over the base buffer (no parallel n×n allocation). A monotone climb is the
+    // RED-if-removed signal that a release went missing (build-failing).
+    for w in 2..N {
+        assert!(
+            live_after[w] <= live_after[1],
+            "live_bytes must not grow after warmup: iter {w} = {} > iter 1 = {}",
+            live_after[w],
+            live_after[1]
+        );
+    }
+    // peak_bytes plateaus after warmup (released scratch reused in place).
+    for w in 2..N {
+        assert_eq!(
+            peak_after[w], peak_after[N - 1],
+            "peak_bytes must plateau after warmup (iter {w} vs final)"
+        );
+    }
+
+    println!(
+        "kernel_matrix_memory_gate backend={backend}: live={:?} peak={:?} (N={N})",
+        live_after, peak_after
+    );
 }
