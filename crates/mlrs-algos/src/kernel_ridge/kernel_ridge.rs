@@ -47,6 +47,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::cholesky::cholesky_solve;
+use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::kernel_matrix::{kernel_matrix, Kernel};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
@@ -298,6 +299,90 @@ where
         self.fit_shape_ = Some((n_samples, n_features));
         self.n_targets_ = Some(n_targets);
         Ok(self)
+    }
+
+    /// Predict `y = K(X_test, X_fit_) · dual_coef_` (D-06).
+    ///
+    /// `x_test` is `(n_test × n_features)` row-major. Builds `K_test =
+    /// kernel_matrix(X_test, X_fit_, kernel)` (`m×n`) with the RESOLVED fit-time
+    /// kernel (gamma reused, Pitfall 5), then `y_pred = K_test · dual_coef_`
+    /// (`m×t`) via [`gemm`]. NO intercept broadcast (D-06). Returns the row-major
+    /// `(n_test × n_targets)` predictions; for a single target this is length
+    /// `n_test`. Errors with [`AlgoError::NotFitted`] before `fit`, or
+    /// [`PrimError`] on a geometry / feature-count mismatch.
+    pub fn predict(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x_test: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_test, n_features) = shape;
+
+        let kernel = self.kernel_.ok_or(AlgoError::NotFitted {
+            estimator: "kernel_ridge",
+            operation: "predict",
+        })?;
+        let dual_coef = self.dual_coef_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "kernel_ridge",
+            operation: "predict",
+        })?;
+        let x_fit = self.x_fit_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "kernel_ridge",
+            operation: "predict",
+        })?;
+        let (n_samples, fit_features) = self.fit_shape_.ok_or(AlgoError::NotFitted {
+            estimator: "kernel_ridge",
+            operation: "predict",
+        })?;
+        let n_targets = self.n_targets_.ok_or(AlgoError::NotFitted {
+            estimator: "kernel_ridge",
+            operation: "predict",
+        })?;
+
+        // --- T-08-03-01 / ASVS V5: geometry + fitted-n_features consistency. ---
+        if n_test == 0 || n_features == 0 || x_test.len() != n_test * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x_test",
+                rows: n_test,
+                cols: n_features,
+                len: x_test.len(),
+            }));
+        }
+        if n_features != fit_features {
+            return Err(AlgoError::Prim(PrimError::DimMismatch {
+                dim: "n_features",
+                lhs: n_features,
+                rhs: fit_features,
+            }));
+        }
+
+        // --- K_test = kernel_matrix(X_test, X_fit_, kernel) (m×n): the cross
+        //     kernel against the stored training matrix, reusing the resolved
+        //     fit-time kernel (identical gamma, Pitfall 5). ---
+        let k_test = kernel_matrix::<F>(
+            pool,
+            x_test,
+            (n_test, n_features),
+            x_fit,
+            (n_samples, fit_features),
+            kernel,
+            None,
+        )?;
+
+        // --- y_pred = K_test · dual_coef_ (m×t) via gemm. NO intercept broadcast
+        //     (D-06 — the normal matrix was K, not XᵀX; there is no bias). ---
+        let pred = gemm::<F>(
+            pool,
+            &k_test,
+            (n_test, n_samples),
+            dual_coef,
+            (n_samples, n_targets),
+            false,
+            false,
+            None,
+        )?;
+        k_test.release_into(pool);
+        Ok(pred)
     }
 }
 
