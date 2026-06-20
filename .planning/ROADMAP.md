@@ -89,7 +89,7 @@ Plans:
 - [x] 08-01-PLAN.md — Wave-0 scaffold: ScoreSamples<F> trait + 3 AlgoError guards + Kernel<F> enum/kernel_matrix signature + kernel_ridge//density/ module homes + 3 #[ignore] test scaffolds + 3 oracle generators
 
 **Wave 1** *(blocked on Wave 0)*
-- [ ] 08-02-PLAN.md — PRIM-08 kernel_matrix.rs keystone prim (linear/rbf/poly/sigmoid map over v1 distance/gemm) + PoolStats memory gate
+- [x] 08-02-PLAN.md — PRIM-08 kernel_matrix.rs keystone prim (linear/rbf/poly/sigmoid map over v1 distance/gemm) + PoolStats memory gate [3/3 tasks; f64 ≤2.2e-16, f32 ≤2.4e-7 vs sklearn; memory gate green; wave gate satisfied]
 
 **Wave 2** *(blocked on Wave 1)*
 - [ ] 08-03-PLAN.md — KERNEL-01 KernelRidge (dual (K+αI) Cholesky multi-RHS solve over kernel_matrix; no centering/intercept)

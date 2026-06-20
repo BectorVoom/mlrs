@@ -12,7 +12,7 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 - [x] **PRIM-06**: A reproducible seeded RNG-matrix primitive (host SplitMix64 promoted to `prims/rng.rs`, no `OsRng` per ASVS V6) generates Gaussian and Achlioptas-sparse projection matrices and shuffle permutations, validated for distribution + seed-reproducibility
 - [x] **PRIM-07**: An incremental-SVD merge primitive composes over the existing Jacobi `svd` to update a running decomposition with a new batch (mean-correction row, `svd_flip(u_based_decision=False)`, ddof=1), serving IncrementalPCA
-- [ ] **PRIM-08**: A kernel-matrix primitive (linear / RBF / polynomial / sigmoid) composes over the existing pairwise-distance/GEMM prims, validated against a host reference within tolerance for f32/f64 — serving KernelRidge, KernelDensity, and the spectral affinity
+- [x] **PRIM-08**: A kernel-matrix primitive (linear / RBF / polynomial / sigmoid) composes over the existing pairwise-distance/GEMM prims, validated against a host reference within tolerance for f32/f64 — serving KernelRidge, KernelDensity, and the spectral affinity
 - [ ] **PRIM-09**: A graph-Laplacian primitive (normalized Laplacian with GATHER degree-normalization, no atomics) composes the kernel/affinity matrix, serving the spectral estimators
 - [ ] **PRIM-10**: A minibatch SGD solver primitive (hinge / log / squared / squared-hinge / epsilon-insensitive losses; learning-rate schedules; GATHER two-pass margin+gradient update, cpu-MLIR-safe) is validated standalone on a convex objective before any estimator consumes it
 
@@ -82,7 +82,7 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | DECOMP-03 | Phase 7 | Complete (07-05) |
 | PROJ-01 | Phase 7 | Complete |
 | PROJ-02 | Phase 7 | Complete |
-| PRIM-08 | Phase 8 | Pending |
+| PRIM-08 | Phase 8 | Complete (08-02) |
 | KERNEL-01 | Phase 8 | Pending |
 | KERNEL-02 | Phase 8 | Pending |
 | PRIM-09 | Phase 9 | Pending |
