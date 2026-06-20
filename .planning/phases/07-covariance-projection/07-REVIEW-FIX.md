@@ -4,9 +4,9 @@ fixed_at: 2026-06-21T00:00:00Z
 review_path: .planning/phases/07-covariance-projection/07-REVIEW.md
 iteration: 1
 findings_in_scope: 12
-fixed: 10
-skipped: 2
-status: partial
+fixed: 12
+skipped: 0
+status: all_fixed
 ---
 
 # Phase 7: Code Review Fix Report
@@ -17,8 +17,8 @@ status: partial
 
 **Summary:**
 - Findings in scope: 12 (7 warning + 5 info; fix_scope = all)
-- Fixed: 10
-- Skipped: 2 (both reviewer-classified "None required" — intentional design)
+- Fixed: 12 (10 in the initial pass + IN-02/IN-05 in a follow-up at user request)
+- Skipped: 0
 
 All fixes were applied in an isolated git worktree, committed atomically per
 finding, fast-forwarded onto `main`, and the worktree torn down via the
@@ -135,27 +135,40 @@ Compiles with no unused/conflict warnings.
 **Applied fix:** Removed the misleading `let ddof: u32 = 0;` local and inlined
 `g / n`, with a comment stating ddof is hard-pinned to 0 for the MLE.
 
-## Skipped Issues
+## Follow-up Fixes (initially skipped, then fixed at user request)
+
+The reviewer marked IN-02 and IN-05 as "None required" (intentional design /
+out of v1 perf scope), so the initial pass skipped them. The user subsequently
+asked for both to be fixed; they were applied in a follow-up.
 
 ### IN-02: Dead `_y` parameter on every unsupervised `fit`
 
-**File:** `crates/mlrs-algos/src/covariance/empirical_covariance.rs:139` (and
-`ledoit_wolf.rs:126`, `projection/gaussian.rs:159`, `projection/sparse.rs:131`)
-**Reason:** No action required — the reviewer classified this as intentional
-(trait uniformity for Phase-10 MBSGD reuse) and the `_` prefix already documents
-intent. The review's own Fix line is "None required".
-**Original issue:** Unsupervised estimators take and ignore `_y` per the shared
-`Fit` trait; noted only so a reader does not mistake it for unfinished wiring.
+**Files modified:** `crates/mlrs-algos/src/covariance/empirical_covariance.rs`,
+`ledoit_wolf.rs`, `projection/gaussian.rs`, `projection/sparse.rs`
+**Commit:** 162ec90
+**Applied fix:** Added a one-line comment at each of the four unsupervised
+`fit()` sites noting `_y` is the retained `Fit`-trait slot for Phase-10 MBSGD
+reuse (documented in `traits.rs`) — so a reader does not mistake it for
+unfinished wiring. The `_` prefix and trait contract are unchanged; this is a
+readability clarification only (no logic change — removing `_y` would break the
+trait-uniformity design).
 
 ### IN-05: host accessors run a device→host copy per call
 
-**File:** `crates/mlrs-algos/src/covariance/empirical_covariance.rs:101-128`
-(and `ledoit_wolf.rs:86-115`)
-**Reason:** No action required — explicitly out of v1 perf scope; the reviewer's
-Fix line is "None required for v1; consider memoizing if profiling shows a
-hotspot". Flagged for awareness only.
-**Original issue:** `covariance_()`/`location_()`/`precision_()` each run a
-device→host copy on every call, which a `@property` in a loop can surprise.
+**Files modified:** `crates/mlrs-algos/src/covariance/empirical_covariance.rs`,
+`ledoit_wolf.rs`
+**Commit:** c40c3b8
+**Applied fix:** Memoized the host materialization in the `attr()` helper behind
+a per-attribute `std::sync::OnceLock<Vec<F>>` (`cov_host`/`loc_host`/`prec_host`
+on `EmpiricalCovariance`, `cov_host`/`loc_host` on `LedoitWolf`). The first
+accessor call downloads from the device and caches the `Vec<F>`; subsequent
+calls (e.g. the Python `@property` getters in a loop) serve the cached host copy
+with no device round-trip. The caches are reset to fresh `OnceLock`s at the end
+of every `fit()`, so a re-fit on the same instance never serves stale state.
+`OnceLock<Vec<F>>` keeps the concrete f32/f64 instantiations `Sync`, so the
+`#[pyclass]` wrappers still compile. **Verified by running:** `cargo check -p
+mlrs-algos -p mlrs-py --features cpu` clean; the 10 `empirical_covariance` +
+`ledoit_wolf` tests pass on cpu within 1e-5 (values unchanged by the cache).
 
 ## Partial Notes
 
