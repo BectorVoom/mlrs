@@ -19,8 +19,15 @@
 
 use std::path::PathBuf;
 
+use bytemuck::Pod;
+use cubecl::prelude::*;
+
 use mlrs_backend::capability;
-use mlrs_core::{load_npz, OracleCase, Tolerance, F64_TOL};
+use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::kernel_matrix::{kernel_matrix, Kernel};
+use mlrs_backend::runtime::{self, ActiveRuntime};
+use mlrs_core::{assert_slice_close, load_npz, OracleCase, Tolerance, F64_TOL};
 
 /// kernel_matrix fixture geometry (gen_oracle.py `KM_ROWS_X` × `KM_COLS`,
 /// `KM_ROWS_Y` × `KM_COLS`): K is `rows_x × rows_y`.
@@ -31,8 +38,97 @@ const COLS: usize = 3;
 /// Documented f32 band for the PRIM-08 kernel matrix (set FROM the measurement
 /// printed by the Wave-1 value test). f64 stays strict `F64_TOL` (1e-5). Carried
 /// here so the Wave-1 plan only flips `#[ignore]`.
-#[allow(dead_code)]
 const KM_F32_BAND: Tolerance = Tolerance::new(1e-4, 1e-4);
+
+/// Build an `F` (f32/f64) from an `f64` (mirrors incremental_svd_test::from_f64).
+fn from_f64<F: Pod>(v: f64) -> F {
+    match std::mem::size_of::<F>() {
+        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("kernel_matrix is f32/f64 only"),
+    }
+}
+
+/// Compute `K(X, Y)` on the device for `kernel`, read it back to host `f64`.
+fn compute_km<F>(case: &OracleCase, kernel: Kernel<F>) -> Vec<f64>
+where
+    F: Float + CubeElement + Pod,
+{
+    let x_f: Vec<F> = case.expect_f64("X").iter().map(|&v| from_f64::<F>(v)).collect();
+    let y_f: Vec<F> = case.expect_f64("Y").iter().map(|&v| from_f64::<F>(v)).collect();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_f);
+    let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_f);
+
+    let k = kernel_matrix::<F>(
+        &mut pool,
+        &x_dev,
+        (ROWS_X, COLS),
+        &y_dev,
+        (ROWS_Y, COLS),
+        kernel,
+        None,
+    )
+    .expect("kernel_matrix computes");
+
+    let host: Vec<F> = k.to_host(&pool);
+    // Reinterpret F -> f64 for the comparison (works for both f32 and f64).
+    host.iter()
+        .map(|&v| match std::mem::size_of::<F>() {
+            4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+            8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+/// Resolved-default γ = 1/n_features (sklearn `gamma=None` default, D-05) at the
+/// test precision; matches `gen_oracle.py`'s `gamma_default = 1.0/KM_COLS`.
+fn gamma_default<F: Pod>() -> F {
+    from_f64::<F>(1.0 / COLS as f64)
+}
+
+/// Drive all four kernels (linear/rbf/poly/sigmoid) at precision `F` and assert
+/// each against its committed sklearn `pairwise_kernels` reference within `tol`.
+/// The kernel hyperparameters match the fixture generator exactly: γ = 1/cols
+/// (default), degree = 3, coef0 = 1 (the sklearn poly/sigmoid defaults).
+fn run_all_kernels<F>(case: &OracleCase, tol: &Tolerance, dtype: &str)
+where
+    F: Float + CubeElement + Pod,
+{
+    let degree = from_f64::<F>(3.0);
+    let coef0 = from_f64::<F>(1.0);
+    let gamma = gamma_default::<F>();
+
+    let cases: [(&str, Kernel<F>); 4] = [
+        ("K_linear", Kernel::Linear),
+        ("K_rbf", Kernel::Rbf { gamma }),
+        ("K_poly", Kernel::Poly { gamma, degree, coef0 }),
+        ("K_sigmoid", Kernel::Sigmoid { gamma, coef0 }),
+    ];
+
+    for (name, kernel) in cases {
+        let got = compute_km::<F>(case, kernel);
+        let expected = case.expect_f64(name);
+        let mut max_abs = 0.0f64;
+        let mut max_rel = 0.0f64;
+        for (g, &e) in got.iter().zip(expected.iter()) {
+            let abs = (g - e).abs();
+            max_abs = max_abs.max(abs);
+            if e.abs() > 1e-8 {
+                max_rel = max_rel.max(abs / e.abs());
+            }
+        }
+        println!(
+            "kernel_matrix[{dtype}] {name}: max_abs={max_abs:e} max_rel={max_rel:e} \
+             (tol.abs={:e} tol.rel={:e})",
+            tol.abs, tol.rel
+        );
+        assert_slice_close(&got, expected, tol);
+    }
+}
 
 fn fixture(name: &str) -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -72,7 +168,6 @@ fn assert_fixture_well_formed(name: &str) -> OracleCase {
 /// sigmoid), f64 strict `F64_TOL`. Gated by `skip_f64_with_log` (cpu runs; rocm
 /// skips). Wave-1 (08-02) removes `#[ignore]` and wires the real `kernel_matrix`.
 #[test]
-#[ignore = "Wave-0 scaffold: kernel_matrix compute path lands in plan 08-02"]
 fn kernel_matrix_all_kernels_f64() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
@@ -81,19 +176,20 @@ fn kernel_matrix_all_kernels_f64() {
         println!("kernel_matrix f64 backend={backend}: SKIPPED (no f64 support on this adapter)");
         return;
     }
-    let _ = (assert_fixture_well_formed("kernel_matrix_f64_seed42.npz"), &F64_TOL);
+    let case = assert_fixture_well_formed("kernel_matrix_f64_seed42.npz");
+    run_all_kernels::<f64>(&case, &F64_TOL, "f64");
 }
 
 /// PRIM-08 kernel-matrix values vs sklearn at the documented f32 band
 /// (`KM_F32_BAND`). Runs on every backend (the f32 gate is rocm; cpu also
 /// exercises f32). Wave-1 (08-02) removes `#[ignore]` and wires the real call.
 #[test]
-#[ignore = "Wave-0 scaffold: kernel_matrix compute path lands in plan 08-02"]
 fn kernel_matrix_all_kernels_f32() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
-    let _ = assert_fixture_well_formed("kernel_matrix_f32_seed42.npz");
+    let case = assert_fixture_well_formed("kernel_matrix_f32_seed42.npz");
+    run_all_kernels::<f32>(&case, &KM_F32_BAND, "f32");
 }
 
 /// PoolStats memory gate for `kernel_matrix.rs` (PRIM-08): driving `kernel_matrix`

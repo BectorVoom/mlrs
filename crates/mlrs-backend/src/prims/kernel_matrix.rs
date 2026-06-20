@@ -43,9 +43,12 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use mlrs_core::PrimError;
+use mlrs_kernels::{poly_map, rbf_map, sigmoid_map};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
+use crate::prims::distance::distance;
+use crate::prims::gemm::gemm;
 use crate::runtime::ActiveRuntime;
 
 /// The typed kernel-family selector (D-01) `kernel_matrix` matches on to pick the
@@ -138,15 +141,100 @@ where
         out.as_ref().map(DeviceArray::len),
     )?;
 
-    // --- Wave-1 (08-02) fills the base-op dispatch + in-place map here:
+    // --- Base-op dispatch + in-place map (the covariance.rs:151-204 idiom).
     //       linear  → gemm(x, y, transb=true), return directly (identity map).
     //       rbf     → distance(x, y, sqrt=false), then exp(-gamma··) map in place.
     //       poly    → gemm(x, y, transb=true), then powf(gamma·g+coef0, degree).
     //       sigmoid → gemm(x, y, transb=true), then tanh(gamma·g+coef0).
-    //     The map runs IN PLACE over the base buffer (covariance.rs:190-204);
-    //     the result IS the base buffer, mapped in place (D-02/D-03). ---
-    let _ = (pool, kernel, out);
-    todo!("kernel_matrix compute path is filled by Wave-1 plan 08-02")
+    //     The map runs IN PLACE over the base buffer (covariance.rs:190-204) —
+    //     the result IS the base buffer, mapped in place (D-02/D-03). The full
+    //     general rows_x × rows_y K(X, Y) is always computed (D-02 — no symmetry
+    //     special-case). The n×n operand stays in GLOBAL memory (no SharedMemory
+    //     tile; gfx1100 LDS ≤ 65536 B — T-08-02-02). ---
+    match kernel {
+        // Linear: K = X·Yᵀ. The GEMM buffer IS the kernel matrix (identity map),
+        // so we return it directly with NO map launch.
+        Kernel::Linear => {
+            // logical lhs (m, k) = (rows_x, cols); rhs (k, n) = (cols, rows_y),
+            // transb=true ⇒ stored y is (rows_y, cols) = `y`'s layout.
+            gemm::<F>(pool, x, (rows_x, cols), y, (cols, rows_y), false, true, out)
+        }
+        // RBF: squared-euclidean base (sqrt=false ⇒ ‖xᵢ − yⱼ‖²), then the
+        // exp(-γ··) map in place over that base buffer (D-03 / Pitfall 4).
+        Kernel::Rbf { gamma } => {
+            let base = distance::<F>(pool, x, (rows_x, cols), y, (rows_y, cols_y), false, out)?;
+            launch_map_in_place(pool, &base, rows_x * rows_y, |client, count, dim, in_arg, out_arg| {
+                rbf_map::launch::<F, ActiveRuntime>(client, count, dim, in_arg, out_arg, gamma);
+            });
+            Ok(base)
+        }
+        // Poly: XYᵀ Gram base, then powf(γ·g + coef0, degree) map in place.
+        Kernel::Poly { gamma, degree, coef0 } => {
+            let base =
+                gemm::<F>(pool, x, (rows_x, cols), y, (cols, rows_y), false, true, out)?;
+            launch_map_in_place(pool, &base, rows_x * rows_y, |client, count, dim, in_arg, out_arg| {
+                poly_map::launch::<F, ActiveRuntime>(
+                    client, count, dim, in_arg, out_arg, gamma, coef0, degree,
+                );
+            });
+            Ok(base)
+        }
+        // Sigmoid: XYᵀ Gram base, then tanh(γ·g + coef0) map in place.
+        Kernel::Sigmoid { gamma, coef0 } => {
+            let base =
+                gemm::<F>(pool, x, (rows_x, cols), y, (cols, rows_y), false, true, out)?;
+            launch_map_in_place(pool, &base, rows_x * rows_y, |client, count, dim, in_arg, out_arg| {
+                sigmoid_map::launch::<F, ActiveRuntime>(
+                    client, count, dim, in_arg, out_arg, gamma, coef0,
+                );
+            });
+            Ok(base)
+        }
+    }
+}
+
+/// Launch a per-element map IN PLACE over `base` (input handle == output handle),
+/// the covariance.rs:190-204 scale-in-place idiom. `n` is the element count
+/// (`rows_x · rows_y`); the closure receives the client + launch dims + the
+/// in/out `ArrayArg`s (both wrapping the SAME `base` handle) so the map rewrites
+/// the base buffer with no parallel allocation (T-08-02-02 — the in-place map
+/// reuses the base buffer).
+fn launch_map_in_place<F, L>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    base: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    launch: L,
+) where
+    F: Float + CubeElement + Pod,
+    L: FnOnce(
+        &cubecl::client::ComputeClient<ActiveRuntime>,
+        CubeCount,
+        CubeDim,
+        ArrayArg<ActiveRuntime>,
+        ArrayArg<ActiveRuntime>,
+    ),
+{
+    let client = pool.client().clone();
+    let (count, dim) = launch_dims_1d(n);
+    // SAFETY: `n` is the carried base-op output element count (rows_x · rows_y,
+    // itself derived from the validated geometry); each map kernel bounds-checks
+    // `tid < input.len()` (T-08-02-01). input and output are the SAME handle so
+    // the map is applied in place over the reused base buffer (no parallel
+    // allocation — T-08-02-02).
+    let in_arg = unsafe { ArrayArg::from_raw_parts(base.handle().clone(), n) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(base.handle().clone(), n) };
+    launch(&client, count, dim, in_arg, out_arg);
+}
+
+/// Standard ceiling-division 1D launch config for the in-place map pass (the
+/// `elementwise` per-element launch idiom, copied from covariance.rs:266-273).
+fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
+    let block = 256u32;
+    let cubes = ((n as u32) + block - 1) / block;
+    (
+        CubeCount::Static(cubes.max(1), 1, 1),
+        CubeDim { x: block, y: 1, z: 1 },
+    )
 }
 
 /// Validate the kernel-matrix operand geometry (ASVS V5 / T-08-01-01). `x` is
