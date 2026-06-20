@@ -57,7 +57,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 
 - [x] 07-02-PLAN.md — PRIM-06 rng.rs (promote SplitMix64, Gaussian/Achlioptas/permutation) + PoolStats gate
 - [x] 07-03-PLAN.md — PRIM-07 incremental_svd.rs (stacked re-SVD merge over v1 svd, ddof=1, svd_flip) + PoolStats gate
-- [ ] 07-04-PLAN.md — COV-01 EmpiricalCovariance (ddof=0, eig-pinvh precision_) + COV-02 LedoitWolf
+- [x] 07-04-PLAN.md — COV-01 EmpiricalCovariance (ddof=0, eig-pinvh precision_) + COV-02 LedoitWolf
 
 **Wave 3** *(blocked on Wave 2 completion)*
 

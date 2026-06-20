@@ -18,8 +18,8 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 ### Covariance
 
-- [ ] **COV-01**: A data scientist can fit `EmpiricalCovariance` and get `covariance_`, `location_`, and `precision_` matching scikit-learn within 1e-5 (MLE / ddof=0)
-- [ ] **COV-02**: A data scientist can fit `LedoitWolf` and get the shrinkage-regularized `covariance_` and `shrinkage_` (clipped to [0,1]) matching scikit-learn within 1e-5
+- [x] **COV-01**: A data scientist can fit `EmpiricalCovariance` and get `covariance_`, `location_`, and `precision_` matching scikit-learn within 1e-5 (MLE / ddof=0)
+- [x] **COV-02**: A data scientist can fit `LedoitWolf` and get the shrinkage-regularized `covariance_` and `shrinkage_` (clipped to [0,1]) matching scikit-learn within 1e-5
 
 ### Decomposition
 
@@ -77,8 +77,8 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 |-------------|-------|--------|
 | PRIM-06 | Phase 7 | Done (07-02) |
 | PRIM-07 | Phase 7 | Complete (07-03) |
-| COV-01 | Phase 7 | Pending |
-| COV-02 | Phase 7 | Pending |
+| COV-01 | Phase 7 | Complete (07-04) |
+| COV-02 | Phase 7 | Complete (07-04) |
 | DECOMP-03 | Phase 7 | Pending |
 | PROJ-01 | Phase 7 | Pending |
 | PROJ-02 | Phase 7 | Pending |
