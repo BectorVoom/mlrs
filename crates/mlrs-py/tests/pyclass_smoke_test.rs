@@ -16,12 +16,16 @@
 //! exist.
 
 use mlrs_py::estimators::cluster::{PyDBSCAN, PyKMeans};
-use mlrs_py::estimators::decomposition::{PyPCA, PyTruncatedSVD};
+use mlrs_py::estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
+use mlrs_py::estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
 use mlrs_py::estimators::linear::{
     PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge,
 };
 use mlrs_py::estimators::neighbors::{
     PyKNeighborsClassifier, PyKNeighborsRegressor, PyNearestNeighbors,
+};
+use mlrs_py::estimators::projection::{
+    PyGaussianRandomProjection, PySparseRandomProjection,
 };
 
 /// Every wrapper constructs with default hyperparameters and starts `Unfit`.
@@ -46,6 +50,22 @@ fn all_twelve_estimators_construct_unfit() {
     assert!(PyNearestNeighbors::unfit_default().is_unfit(), "NearestNeighbors");
     assert!(PyKNeighborsClassifier::unfit_default().is_unfit(), "KNeighborsClassifier");
     assert!(PyKNeighborsRegressor::unfit_default().is_unfit(), "KNeighborsRegressor");
+}
+
+/// The five Phase-7 wrappers (COV-01/COV-02/DECOMP-03/PROJ-01/PROJ-02) also
+/// construct in the `Unfit` arm without a Python interpreter or live device.
+#[test]
+fn five_phase7_estimators_construct_unfit() {
+    // covariance (2)
+    assert!(PyEmpiricalCovariance::unfit_default().is_unfit(), "EmpiricalCovariance");
+    assert!(PyLedoitWolf::unfit_default().is_unfit(), "LedoitWolf");
+
+    // decomposition — streaming (1)
+    assert!(PyIncrementalPCA::unfit_default().is_unfit(), "IncrementalPCA");
+
+    // projection (2)
+    assert!(PyGaussianRandomProjection::unfit_default().is_unfit(), "GaussianRandomProjection");
+    assert!(PySparseRandomProjection::unfit_default().is_unfit(), "SparseRandomProjection");
 }
 
 /// Re-constructing does not panic and yields an independent `Unfit` instance —

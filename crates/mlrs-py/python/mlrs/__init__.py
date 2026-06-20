@@ -20,7 +20,8 @@ This file:
 """
 
 from .cluster import DBSCAN, KMeans
-from .decomposition import PCA, TruncatedSVD
+from .covariance import EmpiricalCovariance, LedoitWolf
+from .decomposition import PCA, IncrementalPCA, TruncatedSVD
 from .linear import (
     ElasticNet,
     Lasso,
@@ -33,6 +34,11 @@ from .neighbors import (
     KNeighborsRegressor,
     NearestNeighbors,
 )
+from .random_projection import (
+    GaussianRandomProjection,
+    SparseRandomProjection,
+    johnson_lindenstrauss_min_dim,
+)
 
 __all__ = [
     "LinearRegression",
@@ -44,9 +50,15 @@ __all__ = [
     "DBSCAN",
     "PCA",
     "TruncatedSVD",
+    "IncrementalPCA",
     "NearestNeighbors",
     "KNeighborsClassifier",
     "KNeighborsRegressor",
+    "EmpiricalCovariance",
+    "LedoitWolf",
+    "GaussianRandomProjection",
+    "SparseRandomProjection",
+    "johnson_lindenstrauss_min_dim",
     "backend_supports_f64",
 ]
 
