@@ -31,6 +31,8 @@
 //! Tests live in `crates/mlrs-algos/tests/empirical_covariance_test.rs`
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
+use std::sync::OnceLock;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -75,6 +77,13 @@ pub struct EmpiricalCovariance<F> {
     /// `precision_` (`n_features × n_features`), device-resident; `None` unless
     /// `store_precision`.
     precision_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Memoized host copies of the device-resident attrs (IN-05). The host
+    /// accessors download from the device once, then serve the cached `Vec<F>`
+    /// on repeated access — the Python `@property` getters read these in loops,
+    /// so a per-call device→host copy is wasteful. Reset on every `fit`.
+    cov_host: OnceLock<Vec<F>>,
+    loc_host: OnceLock<Vec<F>>,
+    prec_host: OnceLock<Vec<F>>,
 }
 
 impl<F> EmpiricalCovariance<F>
@@ -94,37 +103,45 @@ where
             covariance_: None,
             location_: None,
             precision_: None,
+            cov_host: OnceLock::new(),
+            loc_host: OnceLock::new(),
+            prec_host: OnceLock::new(),
         }
     }
 
     /// Host copy of `covariance_` (`n_features × n_features`, row-major).
+    /// Memoized after the first call (IN-05).
     pub fn covariance_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.covariance_, pool, "covariance_")
+        self.attr(&self.covariance_, &self.cov_host, pool, "covariance_")
     }
 
-    /// Host copy of `location_` (length `n_features`).
+    /// Host copy of `location_` (length `n_features`). Memoized (IN-05).
     pub fn location_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.location_, pool, "location_")
+        self.attr(&self.location_, &self.loc_host, pool, "location_")
     }
 
     /// Host copy of `precision_` (`n_features × n_features`). Errors with
-    /// `NotFitted` when `store_precision` was `false`.
+    /// `NotFitted` when `store_precision` was `false`. Memoized (IN-05).
     pub fn precision_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.precision_, pool, "precision_")
+        self.attr(&self.precision_, &self.prec_host, pool, "precision_")
     }
 
+    /// Materialize a device-resident attr to the host, caching the result so
+    /// repeated accesses (e.g. the Python `@property` getters in a loop) skip the
+    /// device→host copy after the first call (IN-05). The cache is reset on every
+    /// `fit`, so it never serves stale state.
     fn attr(
         &self,
         slot: &Option<DeviceArray<ActiveRuntime, F>>,
+        cache: &OnceLock<Vec<F>>,
         pool: &BufferPool<ActiveRuntime>,
         operation: &'static str,
     ) -> Result<Vec<F>, AlgoError> {
-        slot.as_ref()
-            .map(|a| a.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "empirical_covariance",
-                operation,
-            })
+        let arr = slot.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "empirical_covariance",
+            operation,
+        })?;
+        Ok(cache.get_or_init(|| arr.to_host(pool)).clone())
     }
 }
 
@@ -136,6 +153,9 @@ where
         &mut self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
+        // `_y` is unused: the retained `Fit`-trait slot for Phase-10 MBSGD reuse
+        // (this estimator is unsupervised; see traits.rs) — not unfinished wiring
+        // (IN-02).
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<&mut Self, AlgoError> {
@@ -194,6 +214,11 @@ where
         self.covariance_ = Some(covariance_dev);
         self.location_ = Some(location_dev);
         self.precision_ = precision_dev;
+        // Invalidate any memoized host copies from a previous fit (IN-05) so a
+        // re-fit on the same instance never serves stale cached attrs.
+        self.cov_host = OnceLock::new();
+        self.loc_host = OnceLock::new();
+        self.prec_host = OnceLock::new();
         Ok(self)
     }
 }
