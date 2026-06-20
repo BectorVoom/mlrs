@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
-status: executing
-stopped_at: Completed 07-07-PLAN.md (PyO3 wrappers for the covariance/projection family)
-last_updated: "2026-06-20T14:30:00.000Z"
-last_activity: 2026-06-20 -- Completed Phase 07 Plan 07 (PyO3 wrappers + Python shims for the five Phase-7 estimators)
+status: verifying
+stopped_at: Completed 07-06-PLAN.md (PROJ-01/02 RandomProjection)
+last_updated: "2026-06-20T14:24:03.709Z"
+last_activity: 2026-06-20
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 7
   completed_plans: 7
-  percent: 0
+  percent: 20
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 07 (covariance-projection) — EXECUTING (all 7 plans complete)
-Plan: 7 of 7 (07-01 … 07-07 complete)
+Phase: 8
+Plan: Not started
 Status: Phase 07 plans complete — ready for phase verification / transition
-Last activity: 2026-06-20 -- Completed Phase 07 Plan 07 (PyO3 wrappers + Python shims for the five Phase-7 estimators)
+Last activity: 2026-06-20
 Resume file: .planning/phases/07-covariance-projection/07-07-SUMMARY.md
 Next: Phase 07 verification / transition (all of COV-01/COV-02/DECOMP-03/PROJ-01/PROJ-02 wrapped + shimmed)
 
@@ -44,7 +44,7 @@ Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 7/7 done)
 
 **Velocity:**
 
-- Total plans completed: 30
+- Total plans completed: 37
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -55,6 +55,7 @@ Progress: [          ] 0% (v2.0 — 0/5 phases; phase 07 plan 7/7 done)
 | 01 | 5 | - | - |
 | 3 | 5 | - | - |
 | 04 | 5 | - | - |
+| 07 | 7 | - | - |
 
 **Recent Trend:**
 
