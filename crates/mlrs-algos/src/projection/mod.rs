@@ -25,6 +25,11 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — no in-source
 //! `#[cfg(test)] mod tests`).
 
-// Phase-7 random-projection estimators (filled by plan 07-06 — file-disjoint):
-// pub mod gaussian; // GaussianRandomProjection (PROJ-01), plan 07-06
-// pub mod sparse;   // SparseRandomProjection (PROJ-02), plan 07-06
+// Phase-7 random-projection estimators (plan 07-06 — file-disjoint):
+pub mod gaussian; // GaussianRandomProjection (PROJ-01) + johnson_lindenstrauss_min_dim
+pub mod sparse; // SparseRandomProjection (PROJ-02, Achlioptas dense)
+
+pub use gaussian::{
+    johnson_lindenstrauss_min_dim, GaussianRandomProjection, NComponents,
+};
+pub use sparse::SparseRandomProjection;
