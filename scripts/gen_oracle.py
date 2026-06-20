@@ -81,6 +81,34 @@ SVD_TALL_ODD = (9, 5)
 # committed fixture stays tiny while still exercising sort/sign handling.
 EIG_N = 4
 
+# ---- Phase-7 covariance & projection fixture sizes ----
+# EmpiricalCovariance (COV-01). Two cases: a well-conditioned full-rank case
+# (n > p) and a RANK-DEFICIENT case (n <= p) so the `precision_ = pinvh(cov)`
+# floor (eig-based pseudo-inverse, NOT Cholesky — must tolerate a singular
+# covariance, D-05) is actually exercised. p <= 64 keeps the symmetric-eig
+# `precision_` path inside the Phase-3 MAX_DIM cap.
+EMPCOV_FULLRANK = (16, 5)   # n=16 > p=5
+EMPCOV_RANKDEF = (4, 6)     # n=4 <= p=6 → covariance is singular (rank <= 4)
+
+# LedoitWolf (COV-02). TWO sample counts per ROADMAP criterion 3 so the
+# shrinkage_ closed form is pinned across n; p <= 64.
+LW_N_SMALL, LW_N_LARGE, LW_P = 12, 40, 5
+
+# IncrementalPCA (DECOMP-03). Sized so the per-batch STACKED matrix clears the
+# Phase-3 SVD caps: the merge stacks `n_components` running-basis rows + a
+# `batch_size` batch + 1 mean-correction row, so `n_components + batch_size + 1`
+# must be <= MAX_ROWS (256) and `n_features` <= MAX_COLS (64) (RESEARCH A2 /
+# Open Q3). 30 samples, 6 features, n_components=3, batch_size=10 →
+# 3 + 10 + 1 = 14 <= 256 and 6 <= 64.
+IPCA_SHAPE = (30, 6)
+IPCA_N_COMPONENTS = 3
+IPCA_BATCH_SIZE = 10
+
+# johnson_lindenstrauss_min_dim (PROJ-01/02, D-12 — the ONE RandomProjection
+# value oracle). A small (n_samples, eps) grid; eps strictly in (0, 1).
+JL_N_SAMPLES = (100, 1000, 10000)
+JL_EPS = (0.1, 0.2, 0.5)
+
 
 def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
     """Generate one seeded saxpy fixture and write it to ``tests/fixtures``.
@@ -1085,6 +1113,196 @@ def gen_truncated_svd(seed: int = SEED, dtype=np.float32, shape=TSVD_SHAPE,
     return out_path
 
 
+def gen_empirical_covariance(seed: int = SEED, dtype=np.float32,
+                             shape=EMPCOV_FULLRANK, kind: str = "fullrank",
+                             assume_centered: bool = False) -> str:
+    """Generate one seeded EmpiricalCovariance fixture (COV-01).
+
+    Stores ``X`` (``shape = (n, p)``), ``covariance_``, ``location_`` and
+    ``precision_`` from ``sklearn.covariance.EmpiricalCovariance(
+    assume_centered).fit(X)``. ``covariance_`` is the biased (``ddof=0``)
+    empirical covariance of the (optionally centered) data; ``location_`` is the
+    column-mean vector (all-zero when ``assume_centered``); ``precision_`` is the
+    pseudo-inverse ``pinvh(covariance_)`` — which for the RANK-DEFICIENT
+    (``n <= p``) ``kind="rankdef"`` case exercises the eig-based pinvh floor (the
+    covariance is singular, so a Cholesky inverse would fail — D-05). ``p <= 64``
+    keeps the symmetric-eig ``precision_`` path inside the MAX_DIM cap.
+    VALUE-matched 1e-5. Returns the absolute path written.
+    """
+    from sklearn.covariance import EmpiricalCovariance
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(shape)
+    est = EmpiricalCovariance(assume_centered=assume_centered).fit(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR,
+        f"empirical_covariance_{kind}_{dtype_tag}_seed{seed}.npz",
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        covariance_=c(est.covariance_),
+        location_=c(est.location_),
+        precision_=c(est.precision_),
+        assume_centered=c([1 if assume_centered else 0]),
+    )
+    return out_path
+
+
+def gen_ledoit_wolf(seed: int = SEED, dtype=np.float32,
+                    n: int = LW_N_SMALL, p: int = LW_P) -> str:
+    """Generate one seeded LedoitWolf fixture (COV-02).
+
+    Stores ``X`` (``shape = (n, p)``), ``covariance_`` and ``shrinkage_`` (as a
+    length-1 array) from ``sklearn.covariance.LedoitWolf().fit(X)``. The
+    Ledoit–Wolf estimator shrinks the empirical covariance toward a
+    scaled-identity target by the closed-form optimal ``shrinkage_ ∈ [0, 1]``
+    (RESEARCH Pattern 3). Emitted at TWO sample counts ``n`` (ROADMAP criterion 3)
+    so the shrinkage closed form is pinned across n. ``p <= 64``. VALUE-matched
+    1e-5. Returns the absolute path written.
+
+    The design is a low-rank-plus-noise CORRELATED matrix (2 latent factors +
+    small isotropic noise), NOT pure ``standard_normal`` — an identity-covariance
+    Gaussian drives ``shrinkage_`` to the degenerate ``1.0`` (full shrink to the
+    identity target), which makes a weak oracle; correlated data lands
+    ``shrinkage_`` strictly inside ``(0, 1)`` so the closed-form β/δ arithmetic is
+    actually exercised.
+    """
+    from sklearn.covariance import LedoitWolf
+
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((n, 2))
+    loadings = rng.standard_normal((2, p))
+    x = z @ loadings + 0.3 * rng.standard_normal((n, p))
+    est = LedoitWolf().fit(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"ledoit_wolf_n{n}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        covariance_=c(est.covariance_),
+        shrinkage_=c([est.shrinkage_]),
+        location_=c(est.location_),
+    )
+    return out_path
+
+
+def gen_incremental_pca(seed: int = SEED, dtype=np.float32,
+                        shape=IPCA_SHAPE,
+                        n_components: int = IPCA_N_COMPONENTS,
+                        batch_size: int = IPCA_BATCH_SIZE,
+                        whiten: bool = False) -> str:
+    """Generate one seeded IncrementalPCA fixture (DECOMP-03).
+
+    Stores ``X`` (``shape``), the hyperparameters ``n_components`` / ``batch_size``
+    / ``whiten``, and the sklearn ``IncrementalPCA(n_components, whiten,
+    batch_size).fit(X)`` fitted attributes — ``components_``,
+    ``explained_variance_``, ``explained_variance_ratio_``, ``singular_values_``,
+    ``mean_``, ``var_``, ``n_samples_seen_`` — plus ``transform(X)`` and
+    ``inverse_transform(transform(X))``.
+
+    ``components_`` is forced C-contiguous (sklearn's is Fortran-order; without
+    this the committed flat blob would be the column-major ravel and silently
+    transpose — the 04-04 Rule-1 pitfall). The Rust test sign-aligns
+    ``components_`` rows with ``align_rows`` before comparing (DECOMP-03). Sized
+    so the per-batch stacked SVD matrix clears the Phase-3 caps
+    (``n_components + batch_size + 1 <= 256`` and ``n_features <= 64``).
+    Emitted with ``whiten=False`` AND ``whiten=True``. VALUE-matched 1e-5 after
+    align_rows. Returns the absolute path written.
+    """
+    from sklearn.decomposition import IncrementalPCA
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(shape)
+    ipca = IncrementalPCA(
+        n_components=n_components, whiten=whiten, batch_size=batch_size
+    ).fit(x)
+    transformed = ipca.transform(x)
+    reconstructed = ipca.inverse_transform(transformed)
+
+    def c(arr):
+        # Force C-contiguous (row-major) so the committed flat buffer matches the
+        # row-major `n_components x n_features` convention every Rust consumer
+        # assumes (sklearn `components_` is Fortran-order — 04-04 Rule-1 fix).
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    whiten_tag = "whiten" if whiten else "nowhiten"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR,
+        f"incremental_pca_{whiten_tag}_{dtype_tag}_seed{seed}.npz",
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        n_components=c([n_components]),
+        batch_size=c([batch_size]),
+        whiten=c([1 if whiten else 0]),
+        components_=c(ipca.components_),
+        explained_variance_=c(ipca.explained_variance_),
+        explained_variance_ratio_=c(ipca.explained_variance_ratio_),
+        singular_values_=c(ipca.singular_values_),
+        mean_=c(ipca.mean_),
+        var_=c(ipca.var_),
+        n_samples_seen_=c([ipca.n_samples_seen_]),
+        transform=c(transformed),
+        inverse_transform=c(reconstructed),
+    )
+    return out_path
+
+
+def gen_jl_min_dim(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the johnson_lindenstrauss_min_dim value oracle (PROJ-01/02, D-12).
+
+    Emits ``sklearn.random_projection.johnson_lindenstrauss_min_dim(n_samples,
+    eps)`` over the small ``(n_samples, eps)`` grid (eps strictly in ``(0, 1)``)
+    as a value oracle: stores the ``n_samples`` grid, the ``eps`` grid, and the
+    resulting INTEGER ``min_dim`` matrix (row i / col j = min_dim(n_samples[i],
+    eps[j])). This is the ONLY RandomProjection value oracle (D-12 — the RNG is
+    SplitMix64, not MT19937, so NO matrix/transform oracle is value-matched; only
+    this closed-form JL bound is). VALUE-matched 1e-5 (the values are integers).
+    The ``seed`` is unused (the bound is deterministic) but kept for the uniform
+    generator signature / file-name convention. Returns the absolute path.
+    """
+    from sklearn.random_projection import johnson_lindenstrauss_min_dim
+
+    n_samples = np.asarray(JL_N_SAMPLES, dtype=np.int64)
+    eps = np.asarray(JL_EPS, dtype=np.float64)
+    min_dim = np.empty((len(n_samples), len(eps)), dtype=np.int64)
+    for i, ns in enumerate(n_samples):
+        for j, ep in enumerate(eps):
+            min_dim[i, j] = int(
+                johnson_lindenstrauss_min_dim(int(ns), eps=float(ep))
+            )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"jl_min_dim_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        n_samples=np.ascontiguousarray(n_samples).astype(dtype),
+        eps=np.ascontiguousarray(eps).astype(dtype),
+        min_dim=np.ascontiguousarray(min_dim).astype(dtype),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -1161,6 +1379,29 @@ def main() -> None:
         print(f"wrote {gen_logistic(dtype=dtype, multiclass=False)}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_logistic(dtype=dtype, multiclass=True)}")
+
+    # ---- Phase-7 covariance & projection fixtures ----
+    # Each VALUE-matched generator writes BOTH f32 (rocm gate) and f64 (cpu gate)
+    # blobs. EmpiricalCovariance (COV-01): full-rank (n>p) + RANK-DEFICIENT (n<=p)
+    # so the eig-based pinvh `precision_` floor is exercised.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_empirical_covariance(dtype=dtype, shape=EMPCOV_FULLRANK, kind='fullrank')}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_empirical_covariance(dtype=dtype, shape=EMPCOV_RANKDEF, kind='rankdef')}")
+    # LedoitWolf (COV-02): TWO sample counts n (ROADMAP criterion 3).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_ledoit_wolf(dtype=dtype, n=LW_N_SMALL)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_ledoit_wolf(dtype=dtype, n=LW_N_LARGE)}")
+    # IncrementalPCA (DECOMP-03): whiten=False AND whiten=True; stacked SVD
+    # matrix sized under MAX_ROWS/MAX_COLS.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_incremental_pca(dtype=dtype, whiten=False)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_incremental_pca(dtype=dtype, whiten=True)}")
+    # johnson_lindenstrauss_min_dim (PROJ-01/02, D-12): the ONE value oracle.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_jl_min_dim(dtype=dtype)}")
 
 
 if __name__ == "__main__":
