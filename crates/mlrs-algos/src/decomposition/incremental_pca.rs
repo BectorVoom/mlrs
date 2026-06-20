@@ -463,6 +463,13 @@ where
     /// `1/sqrt(explained_variance_[i])` when `whiten=True`, else `1.0`. A
     /// (near-)zero variance is floored so the scale stays finite (it never occurs
     /// on a fitted component).
+    ///
+    /// WR-03: the `ev <= WHITEN_VAR_FLOOR` branch below is DEFENSIVE-ONLY and is
+    /// unreachable on fitted data — every RETAINED component carries non-trivial
+    /// explained variance (a component with ~0 variance would not be selected by
+    /// the truncated SVD), so no committed oracle fixture exercises it. It guards
+    /// purely against a non-finite `1/sqrt(0)` should a degenerate retained
+    /// component ever arise.
     fn whiten_scales(&self, s: &IncrementalSvdState) -> Vec<f64> {
         if !self.whiten {
             return vec![1.0; s.n_components];
