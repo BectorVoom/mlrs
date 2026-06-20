@@ -14,7 +14,9 @@
 //!      read BEFORE the running-stats update.
 //!   2. Chan-Golub-LeVeque running update ([`incremental_mean_var`], f64) →
 //!      `(col_mean, col_var, n_total)`.
-//!   3. Center the batch by the UPDATED running `col_mean`.
+//!   3. Center the batch: FIRST batch by the running `col_mean`; a SUBSEQUENT
+//!      batch by its OWN `col_batch_mean` (sklearn `partial_fit` — the
+//!      running-mean shift is carried by the mean_correction row, not the batch).
 //!   4. FIRST batch (k == 0): the stack is the centered batch alone (b×p).
 //!      SUBSEQUENT: the `(k+b+1) × p` host stack
 //!        rows `0..k`     = `singular_values_[i] * components_[i, :]`  (Σ·Vᵀ),
@@ -207,11 +209,18 @@ where
     let (col_mean, col_var, n_total) =
         incremental_mean_var(&prev_mean, &prev_var, prev_count, &x64, b, p);
 
-    // --- 3. Center the batch by the UPDATED running col_mean. ---
+    // --- 3. Center the batch (sklearn `_incremental_pca.partial_fit`): the FIRST
+    //        batch is centered by the UPDATED running `col_mean` (== this batch's
+    //        own mean when n_seen==0); a SUBSEQUENT batch is centered by THIS
+    //        batch's OWN mean `col_batch_mean`, NOT the running `col_mean`. The
+    //        running-mean shift for the prior basis is carried by the
+    //        mean_correction row, so double-shifting the batch by `col_mean` here
+    //        would over-correct (it does NOT reproduce sklearn's IncrementalPCA).
+    let center_by = if state.is_some() { &col_batch_mean } else { &col_mean };
     let mut x_centered = vec![0.0f64; b * p];
     for r in 0..b {
         for c in 0..p {
-            x_centered[r * p + c] = x64[r * p + c] - col_mean[c];
+            x_centered[r * p + c] = x64[r * p + c] - center_by[c];
         }
     }
 
