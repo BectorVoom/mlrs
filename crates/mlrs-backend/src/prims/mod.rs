@@ -17,6 +17,11 @@ pub mod covariance;
 // launch/host-glue wrapper + a `pub use` of its symbol INSIDE that file.
 pub mod incremental_svd;
 pub mod rng;
+// Phase-8 prim stub (Wave-0 scaffold 08-01 owns this registration; the Wave-1
+// plan 08-02 fills the file body — file-disjoint, parallel-safe). The
+// `Kernel<F>` enum + `kernel_matrix` host-fn signature compile today (geometry
+// validation real; compute path `todo!()` until 08-02).
+pub mod kernel_matrix;
 // Phase-5 prim stubs (Wave-0 scaffold owns these registrations; plans
 // 05-02..06 fill their own file body — file-disjoint, parallel-safe). Each is an
 // empty compiling module until its plan adds the launch wrapper + a `pub use` of
