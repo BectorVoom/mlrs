@@ -85,7 +85,11 @@ impl SplitMix64 {
     /// likely. `bound` must be `>= 1` (the caller guarantees `n >= k >= 1`).
     pub fn next_below(&mut self, bound: u64) -> u64 {
         debug_assert!(bound >= 1, "next_below requires a positive bound");
-        if bound == 1 {
+        // WR-07: enforce the contract in release too. A `bound == 0` would skip
+        // the (release no-op) debug_assert and the `== 1` branch and reach
+        // `u64::MAX % bound` below — an opaque divide-by-zero arithmetic panic.
+        // The only sensible value in `[0, 0)` is the empty-range degenerate `0`.
+        if bound <= 1 {
             return 0;
         }
         // Largest multiple of `bound` that fits in u64; values at or above it are
