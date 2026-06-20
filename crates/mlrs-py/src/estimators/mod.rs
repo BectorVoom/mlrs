@@ -29,6 +29,8 @@
 //! `#[cfg(test)] mod tests`).
 
 pub mod cluster;
+pub mod covariance;
 pub mod decomposition;
 pub mod linear;
 pub mod neighbors;
+pub mod projection;

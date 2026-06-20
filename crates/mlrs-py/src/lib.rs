@@ -134,12 +134,16 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register all 12 estimator `#[pyclass]` wrappers (PY-01). The pure-Python
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.
     use estimators::cluster::{PyDBSCAN, PyKMeans};
-    use estimators::decomposition::{PyPCA, PyTruncatedSVD};
+    use estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
+    use estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
     use estimators::linear::{
         PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge,
     };
     use estimators::neighbors::{
         PyKNeighborsClassifier, PyKNeighborsRegressor, PyNearestNeighbors,
+    };
+    use estimators::projection::{
+        johnson_lindenstrauss_min_dim, PyGaussianRandomProjection, PySparseRandomProjection,
     };
     m.add_class::<PyLinearRegression>()?;
     m.add_class::<PyRidge>()?;
@@ -153,5 +157,13 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNearestNeighbors>()?;
     m.add_class::<PyKNeighborsClassifier>()?;
     m.add_class::<PyKNeighborsRegressor>()?;
+
+    // Phase-7 covariance / projection / IncrementalPCA wrappers (PY-06 incr.).
+    m.add_class::<PyEmpiricalCovariance>()?;
+    m.add_class::<PyLedoitWolf>()?;
+    m.add_class::<PyIncrementalPCA>()?;
+    m.add_class::<PyGaussianRandomProjection>()?;
+    m.add_class::<PySparseRandomProjection>()?;
+    m.add_function(wrap_pyfunction!(johnson_lindenstrauss_min_dim, m)?)?;
     Ok(())
 }
