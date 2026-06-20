@@ -21,6 +21,8 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — no in-source
 //! `#[cfg(test)] mod tests`).
 
-// Phase-8 kernel ridge estimator (filled by plan 08-03 — file-disjoint):
-// the Wave-2 plan adds `pub mod kernel_ridge;` + `pub use
-// kernel_ridge::KernelRidge;` here and creates the matching estimator file.
+// Phase-8 kernel ridge estimator (plan 08-03 — file-disjoint): this module
+// owns its own `pub mod` + `pub use`; it does NOT edit lib.rs (owned by the
+// 08-01 Wave-0 scaffold).
+pub mod kernel_ridge;
+pub use kernel_ridge::{KernelKind, KernelRidge};
