@@ -2,7 +2,12 @@
 //! `sqrt_elem`, `scale`, `center_columns`, the `dist_combine_clamp`
 //! distance-combine kernel, and the kernel-family maps `rbf_map` / `poly_map` /
 //! `sigmoid_map` (PRIM-08, the `kernel_matrix` in-place maps over the
-//! distance/GEMM base).
+//! distance/GEMM base), and the six KernelDensity density-value maps
+//! `kde_gaussian_map` / `kde_epanechnikov_map` / `kde_tophat_map` /
+//! `kde_exponential_map` / `kde_linear_map` / `kde_cosine_map` plus the
+//! `div_by_row` log-sum-exp rescale helper (KERNEL-02, the linear-domain density
+//! maps over the v1 distance base — compact-support kernels yield exact 0 out of
+//! support via STATEMENT-form guards, never the infinity constant, D-11).
 //!
 //! All four are `#[cube(launch)]` functions generic over `<F: Float +
 //! CubeElement>`, following the `smoke.rs` `saxpy_kernel` shape exactly: one
@@ -154,6 +159,156 @@ pub fn sigmoid_map<F: Float + CubeElement>(
     let tid = ABSOLUTE_POS;
     if tid < input.len() {
         output[tid] = F::tanh(gamma * input[tid] + coef0);
+    }
+}
+
+/// KernelDensity gaussian map (PRIM-08 / KERNEL-02, D-07): `out[i] =
+/// exp(−0.5·sqdist/h²)`, where `in` is the already-computed SQUARED-euclidean
+/// distance `‖qᵢ − xⱼ‖²` (the `distance(.., sqrt=false)` base, Pitfall 4 — gaussian
+/// uses SQUARED distance). One unit per element at `ABSOLUTE_POS`, bounds-checked.
+///
+/// `h` is the bandwidth passed by value (A6). The transcendental is the STATIC
+/// associated fn `F::exp(..)`, never the instance form (Pitfall 7). Gaussian has
+/// NO compact support — it is finite and positive everywhere. Shared-memory-free,
+/// atomics-free, no infinity constant (cpu-MLIR-safe, D-11).
+#[cube(launch)]
+pub fn kde_gaussian_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, h: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        let inv_h2 = F::new(1.0) / (h * h);
+        output[tid] = F::exp(F::new(-0.5) * input[tid] * inv_h2);
+    }
+}
+
+/// KernelDensity epanechnikov map (PRIM-08 / KERNEL-02, D-07/D-11): `out[i] =
+/// 1 − sqdist/h²` inside support, exact `0` outside, where `in` is the SQUARED
+/// distance (Pitfall 4). Compact support: the value is zero when `dist ≥ h`, i.e.
+/// `sqdist ≥ h²`. One unit per element at `ABSOLUTE_POS`, bounds-checked.
+///
+/// The compact-support guard is the STATEMENT form (`let mut val = …; if sqdist
+/// >= h² { val = zero; }`) per `Cubecl_conditionals.md`, mirroring the
+/// `clamp_nonneg` / `dist_combine_clamp` idiom — NEVER an if-expression, NEVER
+/// the infinity constant / `−∞` (D-11 / Pitfall 3 — out-of-support yields EXACT 0 in the
+/// linear domain, the `log` is applied once at the very end host/estimator-side).
+/// Shared-memory-free, atomics-free, no infinity constant.
+#[cube(launch)]
+pub fn kde_epanechnikov_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, h: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        let h2 = h * h;
+        let sqdist = input[tid];
+        let zero = F::from_int(0i64);
+        let mut val = F::new(1.0) - sqdist / h2;
+        if sqdist >= h2 {
+            val = zero;
+        }
+        output[tid] = val;
+    }
+}
+
+/// KernelDensity tophat map (PRIM-08 / KERNEL-02, D-07/D-11): `out[i] = 1` inside
+/// support (`dist < h`), exact `0` outside, where `in` is the RAW euclidean
+/// distance (Pitfall 4 — the `distance(.., sqrt=true)` base). One unit per element
+/// at `ABSOLUTE_POS`, bounds-checked.
+///
+/// STATEMENT-form compact-support guard (D-11 / Pitfall 3 — exact 0 outside, never
+/// the infinity constant). Shared-memory-free, atomics-free, no infinity constant.
+#[cube(launch)]
+pub fn kde_tophat_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, h: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        let dist = input[tid];
+        let zero = F::from_int(0i64);
+        let mut val = F::new(1.0);
+        if dist >= h {
+            val = zero;
+        }
+        output[tid] = val;
+    }
+}
+
+/// KernelDensity exponential map (PRIM-08 / KERNEL-02, D-07): `out[i] =
+/// exp(−dist/h)`, where `in` is the RAW euclidean distance (Pitfall 4 — the
+/// `distance(.., sqrt=true)` base). One unit per element at `ABSOLUTE_POS`,
+/// bounds-checked.
+///
+/// The exponential kernel has NO compact support — it is finite and positive
+/// everywhere. Transcendental via the STATIC `F::exp(..)` (Pitfall 7).
+/// Shared-memory-free, atomics-free, no infinity constant (D-11).
+#[cube(launch)]
+pub fn kde_exponential_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, h: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        output[tid] = F::exp(-input[tid] / h);
+    }
+}
+
+/// KernelDensity linear map (PRIM-08 / KERNEL-02, D-07/D-11): `out[i] = 1 −
+/// dist/h` inside support (`dist < h`), exact `0` outside, where `in` is the RAW
+/// euclidean distance (Pitfall 4). One unit per element at `ABSOLUTE_POS`,
+/// bounds-checked.
+///
+/// STATEMENT-form compact-support guard (D-11 / Pitfall 3 — exact 0 outside, never
+/// the infinity constant). Shared-memory-free, atomics-free, no infinity constant.
+#[cube(launch)]
+pub fn kde_linear_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, h: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        let dist = input[tid];
+        let zero = F::from_int(0i64);
+        let mut val = F::new(1.0) - dist / h;
+        if dist >= h {
+            val = zero;
+        }
+        output[tid] = val;
+    }
+}
+
+/// KernelDensity cosine map (PRIM-08 / KERNEL-02, D-07/D-11): `out[i] =
+/// cos(0.5·π·dist/h)` inside support (`dist < h`), exact `0` outside, where `in`
+/// is the RAW euclidean distance (Pitfall 4). One unit per element at
+/// `ABSOLUTE_POS`, bounds-checked.
+///
+/// The half-π constant is `π/2 ≈ 1.5707963267948966`. Transcendental via the
+/// STATIC `F::cos(..)` (Pitfall 7). STATEMENT-form compact-support guard (D-11 /
+/// Pitfall 3 — exact 0 outside, never the infinity constant). Shared-memory-free,
+/// atomics-free, no infinity constant.
+#[cube(launch)]
+pub fn kde_cosine_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, h: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        let dist = input[tid];
+        let zero = F::from_int(0i64);
+        let half_pi = F::new(1.570_796_326_794_896_6);
+        let mut val = F::cos(half_pi * dist / h);
+        if dist >= h {
+            val = zero;
+        }
+        output[tid] = val;
+    }
+}
+
+/// Element-wise reciprocal-scale map (KERNEL-02 log-sum-exp rescale helper, D-11):
+/// `out[i] = in[i] / divisor[row(i)]`, dividing each element by the per-row scalar
+/// in `divisor` (length `rows`; `cols` columns per row, broadcast across the row).
+/// One unit per element at `ABSOLUTE_POS`, bounds-checked.
+///
+/// This is the OPTIONAL reduce-max rescale step of the linear-domain log-sum-exp
+/// (divide each row's kernel values by that row's max before summing, then add
+/// `log(max)` back once at the end). `cols` is a scalar `u32` by value (cubecl
+/// 0.10). Shared-memory-free, atomics-free, no infinity constant — division by a
+/// strictly-positive per-row max never produces `±∞`.
+#[cube(launch)]
+pub fn div_by_row<F: Float + CubeElement>(
+    input: &Array<F>,
+    divisor: &Array<F>,
+    output: &mut Array<F>,
+    cols: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        let r = tid / cols as usize;
+        output[tid] = input[tid] / divisor[r];
     }
 }
 

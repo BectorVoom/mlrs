@@ -23,8 +23,9 @@ pub mod topk;
 
 pub use cholesky::cholesky_solve;
 pub use elementwise::{
-    center_columns, clamp_nonneg, dist_combine_clamp, poly_map, rbf_map, scale, sigmoid_map,
-    sqrt_elem,
+    center_columns, clamp_nonneg, dist_combine_clamp, div_by_row, kde_cosine_map,
+    kde_epanechnikov_map, kde_exponential_map, kde_gaussian_map, kde_linear_map, kde_tophat_map,
+    poly_map, rbf_map, scale, sigmoid_map, sqrt_elem,
 };
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
