@@ -1,5 +1,8 @@
-//! Per-element map kernels (PRIM-03 / PRIM-04) — `clamp_nonneg`, `sqrt_elem`,
-//! `scale`, and the `dist_combine_clamp` distance-combine kernel.
+//! Per-element map kernels (PRIM-03 / PRIM-04 / PRIM-08) — `clamp_nonneg`,
+//! `sqrt_elem`, `scale`, `center_columns`, the `dist_combine_clamp`
+//! distance-combine kernel, and the kernel-family maps `rbf_map` / `poly_map` /
+//! `sigmoid_map` (PRIM-08, the `kernel_matrix` in-place maps over the
+//! distance/GEMM base).
 //!
 //! All four are `#[cube(launch)]` functions generic over `<F: Float +
 //! CubeElement>`, following the `smoke.rs` `saxpy_kernel` shape exactly: one
@@ -89,6 +92,68 @@ pub fn center_columns<F: Float + CubeElement>(
     if tid < a.len() {
         let c = tid % cols as usize;
         output[tid] = a[tid] - mean[c];
+    }
+}
+
+/// RBF (Gaussian) kernel map (PRIM-08): `out[i] = exp(-γ·in[i])`, where `in` is
+/// the already-computed squared-Euclidean distance `‖xᵢ − yⱼ‖²` (the
+/// `distance(.., sqrt=false)` base, D-03). One unit per element at
+/// `ABSOLUTE_POS`, bounds-checked so the ceiling-division launch may
+/// over-provision safely (T-08-02-01).
+///
+/// `gamma` is a scalar `F` passed by value (A6 — like [`scale`]'s `factor`),
+/// hence the `CubeElement` bound. The transcendental is the STATIC associated fn
+/// `F::exp(..)`, NEVER the `x.exp()` instance form (Pitfall 7 — the instance form
+/// can mis-lower in the `#[cube]` IR). Shared-memory-free, atomics-free, and free
+/// of the infinity constant (cpu-MLIR-safe — module doc precedent).
+#[cube(launch)]
+pub fn rbf_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, gamma: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        output[tid] = F::exp(-gamma * input[tid]);
+    }
+}
+
+/// Polynomial kernel map (PRIM-08): `out[i] = (γ·in[i] + coef0)^degree`, where
+/// `in` is the `XYᵀ` Gram entry `⟨xᵢ, yⱼ⟩` (the `gemm(.., transb=true)` base,
+/// D-03). One unit per element at `ABSOLUTE_POS`, bounds-checked (T-08-02-01).
+///
+/// `gamma` / `coef0` / `degree` are scalar `F` by value (A6). `degree` is a REAL
+/// `F` (not an integer) and the exponent is the STATIC `F::powf(base, degree)` —
+/// the sklearn-faithful real-exponent form (A3 / Pitfall 7), never the `x.powf()`
+/// instance form. Shared-memory-free, atomics-free, no infinity constant.
+#[cube(launch)]
+pub fn poly_map<F: Float + CubeElement>(
+    input: &Array<F>,
+    output: &mut Array<F>,
+    gamma: F,
+    coef0: F,
+    degree: F,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        output[tid] = F::powf(gamma * input[tid] + coef0, degree);
+    }
+}
+
+/// Sigmoid kernel map (PRIM-08): `out[i] = tanh(γ·in[i] + coef0)`, where `in` is
+/// the `XYᵀ` Gram entry `⟨xᵢ, yⱼ⟩` (the `gemm(.., transb=true)` base, D-03). One
+/// unit per element at `ABSOLUTE_POS`, bounds-checked (T-08-02-01).
+///
+/// `gamma` / `coef0` are scalar `F` by value (A6). The transcendental is the
+/// STATIC `F::tanh(..)`, never the `x.tanh()` instance form (Pitfall 7).
+/// Shared-memory-free, atomics-free, no infinity constant — `tanh` is a bounded
+/// finite transcendental over the finite Gram base (T-08-02-03).
+#[cube(launch)]
+pub fn sigmoid_map<F: Float + CubeElement>(
+    input: &Array<F>,
+    output: &mut Array<F>,
+    gamma: F,
+    coef0: F,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        output[tid] = F::tanh(gamma * input[tid] + coef0);
     }
 }
 

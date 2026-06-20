@@ -22,7 +22,10 @@ pub mod smoke;
 pub mod topk;
 
 pub use cholesky::cholesky_solve;
-pub use elementwise::{center_columns, clamp_nonneg, dist_combine_clamp, scale, sqrt_elem};
+pub use elementwise::{
+    center_columns, clamp_nonneg, dist_combine_clamp, poly_map, rbf_map, scale, sigmoid_map,
+    sqrt_elem,
+};
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
 pub use reduce::{
