@@ -56,7 +56,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 **Wave 2** *(blocked on Wave 1 completion)*
 
 - [x] 07-02-PLAN.md — PRIM-06 rng.rs (promote SplitMix64, Gaussian/Achlioptas/permutation) + PoolStats gate
-- [ ] 07-03-PLAN.md — PRIM-07 incremental_svd.rs (stacked re-SVD merge over v1 svd, ddof=1, svd_flip) + PoolStats gate
+- [x] 07-03-PLAN.md — PRIM-07 incremental_svd.rs (stacked re-SVD merge over v1 svd, ddof=1, svd_flip) + PoolStats gate
 - [ ] 07-04-PLAN.md — COV-01 EmpiricalCovariance (ddof=0, eig-pinvh precision_) + COV-02 LedoitWolf
 
 **Wave 3** *(blocked on Wave 2 completion)*
@@ -142,7 +142,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 | 4. Closed-Form Estimators | v1.0 | 5/5 | Complete | 2026-06-12 |
 | 5. Distance-Based & Iterative-Solver Estimators | v1.0 | 11/11 | Complete | 2026-06-13 |
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
-| 7. Covariance & Projection | v2.0 | 1/7 | Executing | - |
+| 7. Covariance & Projection | v2.0 | 3/7 | Executing | - |
 | 8. Kernel Family | v2.0 | 0/? | Not started | - |
 | 9. Spectral Family | v2.0 | 0/? | Not started | - |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
