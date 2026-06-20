@@ -290,6 +290,20 @@ where
             None => 5 * n_features,
         };
 
+        // --- WR-01: reject n_components > batch_size up front, matching
+        //     sklearn's "n_components=L must be <= batch number of samples B".
+        //     Without this, gen_batches emits a leading size-`batch_size` batch
+        //     that fails inside validate_batch with a `max` referencing the
+        //     batch row count, not the n_components/batch_size relationship the
+        //     caller got wrong. ---
+        if self.n_components > batch_size {
+            return Err(AlgoError::InvalidNComponents {
+                estimator: "incremental_pca",
+                requested: self.n_components,
+                max: batch_size,
+            });
+        }
+
         // --- sklearn-faithful fit (D-02): RESET all fitted state, then loop
         //     partial_fit over gen_batches(n_samples, batch_size). The whole
         //     matrix is already on-device; slice each batch on the host and
