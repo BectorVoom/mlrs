@@ -157,6 +157,60 @@ pub enum AlgoError {
         c: f64,
     },
 
+    /// A random-projection estimator (Gaussian/Sparse) — specifically the sparse
+    /// Achlioptas path — was given an out-of-range `density`. The density is the
+    /// expected fraction of non-zero entries in the projection matrix and must lie
+    /// in `(0, 1]` (`density = 1` is the fully-dense Gaussian-style limit; a
+    /// non-positive or `> 1` density is meaningless). Rejected at `fit`/construction
+    /// *before* any RNG matrix allocation so an untrusted hyperparameter becomes a
+    /// typed error, not an out-of-bounds device write (T-07-01 / ASVS V5).
+    #[error(
+        "estimator '{estimator}': density = {density} is invalid \
+         (must be 0 < density <= 1)"
+    )]
+    InvalidDensity {
+        /// Which estimator rejected the value (e.g. `"sparse_random_projection"`).
+        estimator: &'static str,
+        /// The offending sparsity density.
+        density: f64,
+    },
+
+    /// A streaming estimator (IncrementalPCA) was given an invalid `batch_size`.
+    /// Each `partial_fit` batch must contain at least one sample, so
+    /// `batch_size ≥ 1`. Rejected at `fit`/construction *before* any kernel launch
+    /// (T-07-01 / ASVS V5).
+    #[error(
+        "estimator '{estimator}': batch_size = {batch_size} is invalid \
+         (must be >= 1)"
+    )]
+    InvalidBatchSize {
+        /// Which estimator rejected the value (e.g. `"incremental_pca"`).
+        estimator: &'static str,
+        /// The offending batch size.
+        batch_size: usize,
+    },
+
+    /// The Johnson–Lindenstrauss `johnson_lindenstrauss_min_dim` helper (and the
+    /// `n_components='auto'` random-projection path that calls it) was given an
+    /// out-of-range distortion `eps`. The maximum-distortion parameter must lie in
+    /// the open interval `(0, 1)` (sklearn's contract); `eps ≤ 0` or `eps ≥ 1`
+    /// makes the JL minimum-dimension bound undefined. Rejected *before* any
+    /// computation (T-07-01 / ASVS V5).
+    ///
+    /// NOTE: this is the projection-domain `eps` (distortion) — DISTINCT from the
+    /// DBSCAN neighborhood-radius `InvalidEps` above, which has a different valid
+    /// range (`eps ≥ 0`) and a different meaning. Both keep their own variant.
+    #[error(
+        "estimator '{estimator}': eps = {eps} is invalid \
+         (must be 0 < eps < 1)"
+    )]
+    InvalidEpsDistortion {
+        /// Which estimator rejected the value (e.g. `"random_projection"`).
+        estimator: &'static str,
+        /// The offending distortion bound.
+        eps: f64,
+    },
+
     /// An iterative solver (coordinate descent for Lasso/ElasticNet, L-BFGS for
     /// LogisticRegression) failed to reach its convergence tolerance within the
     /// `max_iter` cap. Surfaced as a typed error rather than silently returning a

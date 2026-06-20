@@ -67,6 +67,42 @@ where
     ) -> Result<&mut Self, AlgoError>;
 }
 
+/// Incrementally fit an estimator to a single batch of training data, returning
+/// `&mut self` (sklearn `partial_fit` convention) so calls can be chained across
+/// a stream of batches. The estimator accumulates running state (e.g.
+/// IncrementalPCA's `n_samples_seen_` / `mean_` / `var_` plus the running
+/// SVD basis) across successive `partial_fit` calls rather than re-fitting from
+/// scratch (D-01).
+///
+/// `y` mirrors [`Fit`]'s slot: IncrementalPCA — the only Phase-7 consumer —
+/// passes `y: None` (it is unsupervised), but the `Option<&DeviceArray>` slot is
+/// RETAINED per the D-01 cross-cutting contract so the Phase-10 mini-batch SGD
+/// estimators (`MBSGDClassifier` / `MBSGDRegressor`) can reuse this exact trait
+/// surface for supervised streaming without a signature change. `shape` is the
+/// explicit `(n_batch_samples, n_features)` geometry of THIS batch's `x` (the
+/// `DeviceArray` is a flat row-major buffer — D-08; `n_features` must agree with
+/// the running state after the first batch). Accumulated attributes are stored
+/// device-resident on `self` (D-03).
+pub trait PartialFit<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Fit to a single batch `x` (`shape = (n_batch_samples, n_features)`,
+    /// row-major), merging it into the running fitted state. `y` is
+    /// `None` for IncrementalPCA (unsupervised) — the slot is retained per the
+    /// D-01 cross-cutting contract for Phase-10 MBSGD reuse. Returns `&mut Self`
+    /// on success or an [`AlgoError`] on an invalid hyperparameter / geometry /
+    /// primitive failure (e.g. a batch whose `n_features` disagrees with the
+    /// running state).
+    fn partial_fit(
+        &mut self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<&mut Self, AlgoError>;
+}
+
 /// Predict targets for new samples from a fitted regressor (LinearRegression /
 /// Ridge). Runs device-side from the device-resident fitted `coef_`/`intercept_`
 /// (D-03); the returned buffer is the length-`n_samples` prediction.

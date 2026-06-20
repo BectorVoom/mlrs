@@ -16,10 +16,15 @@
 //! - [`linear`] — `LinearRegression` (04-03) + `Ridge` (04-05) + the Phase-5
 //!   iterative linear models `Lasso` / `ElasticNet` / `LogisticRegression`
 //!   (05-07/08/09).
-//! - [`decomposition`] — `PCA` + `TruncatedSVD` (04-04).
+//! - [`decomposition`] — `PCA` + `TruncatedSVD` (04-04) + `IncrementalPCA`
+//!   (DECOMP-03, 07-05).
 //! - [`cluster`] — `KMeans` (CLUSTER-01) + `DBSCAN` (CLUSTER-02) (05-07/08).
 //! - [`neighbors`] — `NearestNeighbors` / `KNeighborsClassifier` /
 //!   `KNeighborsRegressor` (NEIGH-01/02/03) (05-10).
+//! - [`covariance`] — `EmpiricalCovariance` (COV-01) + `LedoitWolf` (COV-02)
+//!   (07-04). Registered as an empty stub here by the 07-01 Wave-0 scaffold.
+//! - [`projection`] — `GaussianRandomProjection` / `SparseRandomProjection`
+//!   (PROJ-01/02) (07-06). Registered as an empty stub here by 07-01.
 //!
 //! The estimator plans edit ONLY their own estimator file and the relevant
 //! module-index `mod.rs` (`linear/mod.rs` / `decomposition/mod.rs` /
@@ -30,14 +35,18 @@
 //! `#[cfg(test)] mod tests`).
 
 pub mod cluster;
+pub mod covariance;
 pub mod decomposition;
 pub mod error;
 pub mod linear;
 pub mod neighbors;
+pub mod projection;
 pub mod traits;
 
 // Re-export the estimator surface so downstream crates/tests write
-// `use mlrs_algos::{Fit, Predict, Transform, PredictLabels, KNeighbors,
-// PredictProba, AlgoError};` directly.
+// `use mlrs_algos::{Fit, PartialFit, Predict, Transform, PredictLabels,
+// KNeighbors, PredictProba, AlgoError};` directly.
 pub use error::AlgoError;
-pub use traits::{Fit, KNeighbors, Predict, PredictLabels, PredictProba, Transform};
+pub use traits::{
+    Fit, KNeighbors, PartialFit, Predict, PredictLabels, PredictProba, Transform,
+};

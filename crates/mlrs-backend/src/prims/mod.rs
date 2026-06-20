@@ -11,6 +11,12 @@
 
 pub mod cholesky;
 pub mod covariance;
+// Phase-7 prim stubs (Wave-0 scaffold owns these registrations; plans 07-02
+// (rng) / 07-03 (incremental_svd) fill their own file body — file-disjoint,
+// parallel-safe). Each is an empty compiling module until its plan adds the
+// launch/host-glue wrapper + a `pub use` of its symbol INSIDE that file.
+pub mod incremental_svd;
+pub mod rng;
 // Phase-5 prim stubs (Wave-0 scaffold owns these registrations; plans
 // 05-02..06 fill their own file body — file-disjoint, parallel-safe). Each is an
 // empty compiling module until its plan adds the launch wrapper + a `pub use` of

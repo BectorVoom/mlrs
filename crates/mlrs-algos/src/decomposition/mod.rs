@@ -20,3 +20,6 @@
 
 pub mod pca;
 pub mod truncated_svd;
+// pub mod incremental_pca; // IncrementalPCA (DECOMP-03), plan 07-05 — the file
+// is created by 07-05; left commented here by the 07-01 Wave-0 scaffold so this
+// index stays file-disjoint from the estimator plan.
