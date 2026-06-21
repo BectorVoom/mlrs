@@ -93,6 +93,27 @@ pub(crate) fn global_pool() -> &'static Mutex<BufferPool<ActiveRuntime>> {
     GLOBAL_POOL.get_or_init(|| Mutex::new(BufferPool::new(active_client())))
 }
 
+/// Lock the process-global pool, RECOVERING from mutex poisoning (WR-02).
+///
+/// A device fault / OOM / unsupported-op panic inside a `py.detach` closure that
+/// holds the [`global_pool`] guard would otherwise POISON the mutex, after which
+/// every plain `.lock().expect("pool mutex")` in the whole module panics —
+/// converting one recoverable device error into a permanent process-wide brick
+/// (a robustness/DoS-class regression the infinity-free/SharedMemory-free cpu-MLIR
+/// kernels make more likely to surface). The pool data is NOT left torn by a
+/// panicked compute call (the cubecl handles are ref-counted and the panic
+/// unwinds before any half-written pool mutation), so `into_inner()` recovery is
+/// safe: a single bad `fit` no longer kills the interpreter session. Prefer this
+/// over `global_pool().lock().expect(...)` in any `fit`/accessor that can panic.
+#[allow(dead_code)]
+pub(crate) fn lock_pool(
+) -> std::sync::MutexGuard<'static, BufferPool<ActiveRuntime>> {
+    match global_pool().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Is float64 compute supported on the backend this wheel was built for? (D-05)
 ///
 /// Exposed to Python as `mlrs._mlrs.backend_supports_f64()` so the pure-Python

@@ -129,7 +129,7 @@ impl PySpectralEmbedding {
             _ => (2, "nearest_neighbors".to_string(), None, 10),
         };
         let fitted = py.detach(|| -> PyResult<AnySpectralEmbedding> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -159,7 +159,7 @@ impl PySpectralEmbedding {
     /// Host copy of the fitted `embedding_` (row-major `n × n_components`), f32
     /// arm. `NotFitted` if not in the f32 arm.
     fn embedding_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnySpectralEmbedding::F32(e) => e.embedding(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("spectral_embedding", "embedding_ (f32)")),
@@ -168,7 +168,7 @@ impl PySpectralEmbedding {
 
     /// Host copy of the fitted `embedding_`, f64 arm.
     fn embedding_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnySpectralEmbedding::F64(e) => e.embedding(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("spectral_embedding", "embedding_ (f64)")),
@@ -288,7 +288,7 @@ impl PySpectralClustering {
             _ => (8, None, "rbf".to_string(), 1.0, 10, 0),
         };
         let fitted = py.detach(|| -> PyResult<AnySpectralClustering> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -325,7 +325,7 @@ impl PySpectralClustering {
 
     /// Fitted `labels_` (i32), either dtype arm. `NotFitted` if unfit.
     fn labels_(&self) -> PyResult<Vec<i32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnySpectralClustering::F32(e) => e.labels(&pool).map_err(algo_err_to_py),
             AnySpectralClustering::F64(e) => e.labels(&pool).map_err(algo_err_to_py),
