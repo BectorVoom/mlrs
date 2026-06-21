@@ -5,7 +5,8 @@
 //! minibatch SGD step; the host owns the per-sample `dloss` table, the learning-
 //! rate schedule (`optimal` t0 / `invscaling`), and the intercept update (all
 //! f64 scalars). The two-pass split keeps every device write SINGLE-OWNER (no
-//! atomics / no scatter), mirroring the shipped `coordinate.rs` GATHER idiom:
+//! lock-free reductions / no scatter), mirroring the shipped `coordinate.rs`
+//! GATHER idiom:
 //!
 //! 1. [`sgd_margin`] (pass 1, per-sample) computes the linear margin
 //!    `p[i] = Σ_j x[i*d + j]·w[j] + bias` over the `b` minibatch rows — the
@@ -22,7 +23,8 @@
 //! `bool` flags + the floating infinity constant + descending-shift loops (plan
 //! 05-02 hit this). Both kernels here use ONLY `F`/`u32` accumulators and
 //! `if`-guarded forward loops — no shared-memory tile, no `bool`, no infinity
-//! sentinel, no atomics/scatter (each GATHERS into one accumulator the owning
+//! sentinel, single-owner reductions/no scatter (each GATHERS into one
+//! accumulator the owning
 //! unit writes). The margin pass is the standard over-provisioned per-element map
 //! (`ABSOLUTE_POS`, bounds-checked); the update pass runs one unit per coordinate.
 //!
@@ -95,7 +97,7 @@ pub fn sgd_margin<F: Float + CubeElement>(
 /// One unit handles one coordinate at `ABSOLUTE_POS`; bounds-checked on `j < d`.
 /// The minibatch gradient is a forward `while` GATHER seeded `F::from_int(0i64)`
 /// — single-owner (each unit reduces its own column and writes its own `w[j]`),
-/// no atomics/scatter, no shared-memory tile, no `bool`, no infinity sentinel
+/// no cross-unit reduction/scatter, no shared-memory tile, no `bool`, no infinity sentinel
 /// (cubecl-cpu MLIR-safe).
 #[cube(launch)]
 pub fn sgd_weight_update<F: Float + CubeElement>(
