@@ -170,7 +170,7 @@ Plans:
 
 **Wave 5 — gap closure** *(blocked on Wave 1+2; closes 10-VERIFICATION.md truth #2 / CR-01 + WR-01)*
 
-- [ ] 10-06-PLAN.md — SGDSVM-01 `optimal`-schedule oracle gap closure: move L2 wscale shrink AFTER the gradient step (WR-01, RESEARCH §Per-sample update sequence) + pre-update convergence snapshot (WR-02), then add `oracle_optimal`/`oracle_optimal_f32` tests loading the committed `_optimal` fixtures, fitting `LearningRate::Optimal`, asserting coef band + exact predict labels; re-pin/tighten COEF_BAND_F64
+- [x] 10-06-PLAN.md — SGDSVM-01 `optimal`-schedule oracle gap closure: move L2 wscale shrink AFTER the gradient step (WR-01, RESEARCH §Per-sample update sequence) + pre-update convergence snapshot (WR-02), then add `oracle_optimal`/`oracle_optimal_f32` tests loading the committed `_optimal` fixtures, fitting `LearningRate::Optimal`, asserting coef band + exact predict labels; re-pin/tighten COEF_BAND_F64 ✅ (2 commits, 2 files; COEF_BAND_F64 5e-3→1e-3, COEF_BAND_F32 2e-2→1e-3; constant-schedule coef abs_err ~3e-7 post-WR-01; SUMMARY 10-06)
 
 ### Phase 11: Naive Bayes
 
