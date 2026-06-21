@@ -1,246 +1,191 @@
 ---
 phase: 09-spectral-family
-reviewed: 2026-06-21T03:32:40Z
+reviewed: 2026-06-21T04:30:00Z
 depth: standard
-files_reviewed: 11
+files_reviewed: 18
 files_reviewed_list:
-  - crates/mlrs-algos/src/error.rs
   - crates/mlrs-algos/src/cluster/mod.rs
-  - crates/mlrs-algos/src/cluster/spectral_embedding.rs
   - crates/mlrs-algos/src/cluster/spectral_clustering.rs
-  - crates/mlrs-backend/src/prims/mod.rs
+  - crates/mlrs-algos/src/cluster/spectral_embedding.rs
+  - crates/mlrs-algos/src/cluster/spectral.rs
+  - crates/mlrs-algos/src/error.rs
+  - crates/mlrs-algos/tests/spectral_clustering_test.rs
+  - crates/mlrs-algos/tests/spectral_embedding_test.rs
   - crates/mlrs-backend/src/prims/laplacian.rs
+  - crates/mlrs-backend/src/prims/mod.rs
+  - crates/mlrs-backend/tests/laplacian_test.rs
   - crates/mlrs-kernels/src/elementwise.rs
   - crates/mlrs-kernels/src/lib.rs
+  - crates/mlrs-py/Cargo.toml
   - crates/mlrs-py/src/estimators/mod.rs
   - crates/mlrs-py/src/estimators/spectral.rs
   - crates/mlrs-py/src/lib.rs
+  - crates/mlrs-py/tests/spectral_smoke_test.rs
+  - scripts/gen_oracle.py
 findings:
   critical: 0
-  warning: 6
-  info: 5
-  total: 11
+  warning: 4
+  info: 3
+  total: 7
 status: issues_found
 ---
 
 # Phase 9: Code Review Report
 
-**Reviewed:** 2026-06-21T03:32:40Z
+**Reviewed:** 2026-06-21
 **Depth:** standard
-**Files Reviewed:** 11
+**Files Reviewed:** 18 (the spectral-family slice plus the shared `cluster/spectral.rs` helper pulled in via `mod.rs`, and the three test files)
 **Status:** issues_found
 
 ## Summary
 
-Reviewed the Phase-09 "Spectral Family" source: the `laplacian` prim (PRIM-09)
-plus its three new elementwise kernels, the `SpectralEmbedding` /
-`SpectralClustering` estimators (SPECTRAL-01/02), the `NSamplesExceedsMaxDim`
-error variant, and the two PyO3 wrappers. The numerical core — the scipy
-`_laplacian_dense` reproduction, the typed-zero degree guard, the pinned
-sklearn `_spectral_embedding` recovery order, and the descending-to-ascending
-eig slice — is implemented carefully and is well-corroborated by the committed
-oracle gates (f64 ≈1e-15, f32 inside band, exact labels up to permutation).
+The Phase-9 spectral family (`SpectralEmbedding` SPECTRAL-01, `SpectralClustering`
+SPECTRAL-02, the `laplacian` PRIM-09 primitive, the three new map kernels
+`zero_diag_copy`/`degree_guard`/`laplacian_map`, the shared host-recovery helper
+`cluster/spectral.rs`, and the PyO3 wrappers) was reviewed at standard depth. Both
+`mlrs-algos` and `mlrs-py` type-check clean under `--features cpu --tests`.
 
-No BLOCKER-class correctness, security, or data-loss defects were proven. The
-findings below are robustness, buffer-accounting, and sklearn-parity concerns.
-Two are worth fixing before this ships beyond the n≤64 cap: an inner-KMeans
-buffer-accounting leak in `SpectralClustering::fit` (WR-01) and the
-mutex-poisoning failure mode where a single device error during `fit`
-permanently bricks the process-global pool (WR-02). The remaining warnings are
-sklearn-semantics divergences (n_neighbors clamp, gamma=0) and a fragile
-aliased-handle eig-reuse pattern that is sound today but easy to break.
+The numerical core is sound. I traced the validate-before-launch ordering (the
+`n_samples > 64` cap and geometry guards genuinely precede every affinity / Laplacian
+/ eig / KMeans launch in both estimators), the typed-zero `degree_guard` (no
+division by zero, no NaN/inf on isolated nodes — confirmed against the
+`laplacian_map` divisor `dd[i]*dd[j]` which is always `>= 1*1`), the `/dd`
+recovery + deterministic sign flip + drop-first order in `recover`, and the WR-05
+eig out-buffer aliasing (sound against the eig.rs read-only-input / acquire-before-
+release invariants). The oracle fixtures exist and the generators match the estimator
+defaults (SE rbf gamma `1/n_features`, SC rbf gamma `1.0` literal). No injection,
+secret, or unsafe-launch defect found — hence no Critical (BLOCKER).
+
+The four warnings are robustness/correctness-adjacent. The two highest-value: WR-01
+(the mutex-poison recovery preserves memory safety but leaks the `live_bytes`
+accounting the memory-gate invariant depends on, contradicting its own doc), and
+WR-02 (re-`fit` of an already-fitted PyO3 wrapper silently discards the user's
+hyperparameters and reverts to hardcoded defaults).
+
+## Narrative Findings (AI reviewer)
 
 ## Warnings
 
-### WR-01: Inner KMeans device buffers leak the pool accounting in `SpectralClustering::fit`
+### WR-01: Mutex-poison recovery silently corrupts pool accounting (contradicts its own safety doc)
 
-**File:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs:268-274`
-**Issue:** `let mut kmeans = KMeans::<F>::new(...)` is a function-local that, after
-`kmeans.fit(...)`, owns fitted device buffers — `cluster_centers_`
-(`k × n_components`) and its internal `labels_` (`DeviceArray<.., i32>`, length
-`n`) — see `kmeans.rs:92-95`. `DeviceArray` has no `Drop` impl
-(`device_array.rs`), so when `kmeans` falls out of scope at the end of `fit`
-those buffers are dropped WITHOUT `release_into(pool)`. Their `acquire`d bytes
-are never returned to the free-list and `live_bytes` is never decremented, so a
-re-fit (or a long-lived estimator looped over data) monotonically grows
-`live_bytes` and forfeits buffer reuse — the FOUND-05 memory invariant this
-phase is supposed to uphold. Every other buffer in `fit` (`a`, `dd`, `l`,
-`maps_dev`, the prior `labels_`) is explicitly released; only the inner KMeans'
-state is silently dropped.
-**Fix:** Release the inner KMeans' device state before it drops, e.g. take its
-labels and centers and `release_into(pool)` (or give `KMeans` a `release(pool)`
-teardown that the composing estimator calls). Concretely, after copying labels:
+**File:** `crates/mlrs-py/src/lib.rs:96-115`
+**Issue:** `lock_pool()` recovers a poisoned mutex via `poisoned.into_inner()`. The
+doc asserts: *"The pool data is NOT left torn by a panicked compute call … so
+`into_inner()` recovery is safe."* That holds for **memory safety**, not for the
+pool's accounting invariant. `BufferPool::acquire` (`pool.rs:107-118`) bumps
+`live_bytes`/`peak_bytes` at acquisition time, and a spectral `fit` acquires many
+buffers (affinity `A`, `L`, `dd`, eig `w`/`V`/`info`, `maps`, the inner KMeans
+buffers) and releases them incrementally across the function. If a panic unwinds the
+`py.detach` closure mid-`fit` while the guard is held (a device fault, eig assertion,
+OOM, or the cpu-MLIR SharedMemory panic the project memory notes warn about), every
+buffer acquired-but-not-yet-released leaves its bytes permanently added to
+`live_bytes`. After recovery, `live_bytes` is monotonically inflated for the rest of
+the process — the exact FOUND-05 conservation property the `laplacian_test.rs`
+`memory_gate` and the kmeans/embedding re-fit gates assert. The recovery thus turns a
+recoverable device error into permanent silent corruption of the leak-detection
+metric, directly contradicting the "not left torn" claim.
+**Fix:** Either qualify the doc (state that accounting counters may be left inflated
+after a recovered poison and must not be trusted), or reconcile on recovery — rebuild
+`live_bytes` from the live free-list/handle truth rather than the running counter:
 ```rust
-let labels_host = kmeans.labels(pool)?;
-kmeans.release_into(pool); // new: returns cluster_centers_/labels_ to the pool
+Err(poisoned) => {
+    let mut guard = poisoned.into_inner();
+    guard.reconcile_live_bytes(); // recompute from live handles, not the counter
+    guard
+}
 ```
-Confirm with the PoolStats `live_bytes`-conserved gate across a repeated
-`SpectralClustering::fit`, mirroring the laplacian memory gate.
 
-### WR-02: A device error during `fit` poisons the process-global pool mutex permanently
+### WR-02: Re-`fit` of a fitted PyO3 wrapper discards user hyperparameters and reverts to defaults
 
-**File:** `crates/mlrs-py/src/estimators/spectral.rs:132,162,171,291,328`
-**Issue:** Every accessor and `fit` body locks the process-global pool with
-`crate::global_pool().lock().expect("pool mutex")`. The new `fit` paths can
-panic while holding that lock — `laplacian.rs:128-129`
-`row_reduce(...).expect("shared path is never plane-gated to None")`,
-`device_array.rs:117` `read_one(...).expect("device read-back ...")`, and the
-several `unsafe { ArrayArg::from_raw_parts(...) }` launches — on a real device
-fault, OOM, or unsupported-op. A panic inside the `py.detach` closure while the
-`MutexGuard` is held POISONS the mutex; thereafter every `.expect("pool mutex")`
-in the whole module (all estimators, not just spectral) panics, converting one
-recoverable device error into a permanent process-wide brick. This is a
-robustness/DoS-class regression that the new infinity-free/SharedMemory-free
-kernels make MORE likely to surface (the cpu-MLIR backend panics on unsupported
-shapes per the project memory notes).
-**Fix:** Recover from poisoning instead of `.expect()`: `match
-global_pool().lock() { Ok(g) => g, Err(p) => p.into_inner() }`, or translate the
-poison into a typed `PyErr`. The pool data itself is not left in a torn state by
-a panicked compute call (handles are ref-counted), so `into_inner()` recovery is
-safe and keeps a single bad `fit` from killing the interpreter session.
+**File:** `crates/mlrs-py/src/estimators/spectral.rs:122-130` and `272-289`
+**Issue:** Both `fit` methods read hyperparameters out of `self.inner` only in the
+`Unfit` arm; the catch-all arm fabricates the sklearn defaults:
+```rust
+_ => (2, "nearest_neighbors".to_string(), None, 10),          // SE
+_ => (8, None, "rbf".to_string(), 1.0, 10, 0),                // SC
+```
+The catch-all is reached whenever `self.inner` is already `F32(..)`/`F64(..)` — i.e.
+on a **second** `fit` of the same object. The user's constructor arguments
+(`n_components`, `affinity`, `gamma`, `n_clusters`, `seed`, …) are then silently
+discarded and the estimator re-fits with the defaults, producing a wrong model with
+no error. sklearn semantics require `est.fit(X1); est.fit(X2)` to honor the
+constructor params on every call. This follows a pre-existing pattern in
+`kernel.rs:179`/`kernel.rs:370`, so it is a latent issue carried into the new
+wrappers rather than introduced fresh — but the compiled surface is wrong on its own
+terms regardless of whether the Python shim happens to always construct fresh objects.
+**Fix:** Persist the constructor hyperparameters on the `#[pyclass]` struct (not only
+in the `Unfit` enum arm) so they survive into the fitted arms, and read them from
+there on every `fit`. At minimum the catch-all must not fabricate defaults — re-extract
+from a persisted params field or return a typed error rather than silently mis-fitting.
 
-### WR-03: `n_neighbors > n_samples` is a hard error; sklearn silently clamps
+### WR-03: `fit_predict` round-trips labels host→device→host→device needlessly
 
-**File:** `crates/mlrs-algos/src/cluster/spectral_embedding.rs:195-201` and
-`crates/mlrs-algos/src/cluster/spectral_clustering.rs:214-220`
-**Issue:** The `"nearest_neighbors"` path rejects `self.n_neighbors > n_samples`
-with `InvalidK`. sklearn's `kneighbors_graph` does NOT error here — for the
-default `n_neighbors=10` and any `n_samples <= 10` it effectively uses all
-available neighbors (NearestNeighbors caps at `n_samples`). With the SE default
-`n_neighbors=10`, ANY dataset with `n_samples <= 10` (well within the n≤64 cap)
-that a user runs through the default constructor will raise instead of producing
-the sklearn-equivalent embedding. The committed oracle (n=12) dodges this by one
-row, so the gate does not catch it. This is a real default-path parity divergence
-for small inputs, not a theoretical edge.
-**Fix:** Clamp rather than reject: `let k = self.n_neighbors.min(n_samples);` and
-validate only `k >= 1`. Match sklearn's "use min(n_neighbors, n_samples)"
-behavior so the default constructor works for all `n_samples` in `[1, 64]`.
+**File:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs:323-332`
+**Issue:** `fit` already materializes `labels_host` on the host (line 301), uploads it
+to `labels_dev` (lines 309-310), and stores it. `fit_predict` then calls
+`self.labels(pool)` which copies that device buffer **back** to the host (line 330),
+and `DeviceArray::from_host` re-uploads it (line 331) — two extra full round-trips of
+the label vector per call. The project treats copy efficiency as a first-class,
+per-phase-verified constraint (CLAUDE.md "Memory: zero-copy, buffer reuse, minimal
+copies … verified per phase"). Not a correctness bug, but it violates the stated
+efficiency contract on a convenience path.
+**Fix:** Have `fit_predict` build the returned device buffer directly from the
+`labels_host` `fit` already holds (e.g. an internal helper that returns a device clone
+of `self.labels_`), avoiding the host hop.
 
-### WR-04: `gamma == 0.0` (and negative gamma) pass the `is_finite()` validation
+### WR-04: Inconsistent pool-lock helper undermines the WR-01 poison recovery
 
-**File:** `crates/mlrs-algos/src/cluster/spectral_embedding.rs:176-181` and
-`crates/mlrs-algos/src/cluster/spectral_clustering.rs:195-200`
-**Issue:** The rbf gamma guard only rejects non-finite values (`!gamma64.is_finite()`).
-`gamma = 0.0` passes, producing `exp(-0·d²) = 1` for ALL pairs — a constant
-all-ones affinity → a degenerate fully-connected graph whose normalized
-Laplacian spectrum is meaningless (every off-diagonal `−1/(n-1)`), silently
-yielding garbage embeddings/labels rather than an error. A negative gamma
-(`exp(+|γ|·d²)`) blows the affinity up monotonically with distance — also
-silently wrong. sklearn's contract for the kernel coefficient is
-`Interval(Real, 0, None, closed='neither')` (strictly positive), which the
-sibling `KernelRidge`/`KernelDensity` guards in `error.rs` cite but this path
-does not enforce. `SpectralEmbedding`'s `None → 1/n_features` default is always
-positive, but a user-supplied or `SpectralClustering` literal gamma can be `0`
-or negative.
-**Fix:** Tighten the guard to sklearn's contract: reject `gamma <= 0.0` (not just
-non-finite). Reuse `InvalidGamma` with a message naming the `> 0` requirement, or
-add the positivity check alongside the finiteness one.
-
-### WR-05: eig `out`-reuse aliases the same handle as `&l` — sound today, silently breakable
-
-**File:** `crates/mlrs-algos/src/cluster/spectral_embedding.rs:225-230` and
-`crates/mlrs-algos/src/cluster/spectral_clustering.rs:244-249`
-**Issue:** `l_out = DeviceArray::from_raw(l.handle().clone(), n*n)` then
-`eig(pool, &l, n, Some(l_out))` passes TWO `DeviceArray`s (`&l` and `l_out`)
-that wrap the SAME ref-counted cubecl handle. eig reads `a` (=`&l`) in
-`compute_thresholds` AND uses `out` (=`l_out`) as the kernel working input, then
-`l_out.release_into(pool)` files that handle into the free-list; the subsequent
-`drop(l)` drops the second clone. This is correct ONLY because (a) eig's kernel
-reads `a_in` and never writes it, and (b) eig acquires its `w/v/info` outputs
-BEFORE releasing `l_out`, so the freed handle is not re-handed mid-call. Both are
-load-bearing internal invariants of `eig.rs` that are undocumented at this call
-site; if eig ever writes its working input in place, or reorders the
-acquire/release, this becomes a use-after-free / aliased-write with no
-compile-time signal. The `drop(l); // released by eig` comment also
-mis-describes the mechanics (eig releases the CLONE `l_out`, not `l`; `l`'s
-handle clone is merely dropped).
-**Fix:** Either (a) stop aliasing — pass `None` for `out` and let eig read `&l`
-directly (the n≤64 working buffer is tiny; the `out`-reuse saves one `n²`
-allocation that the memory gate does not require here), or (b) add an assertion
-/ comment block documenting the "eig reads-only its input and acquires outputs
-first" invariant this reuse depends on, and correct the misleading `drop(l)`
-comment.
-
-### WR-06: `recover_embedding` / `recover_maps` are duplicated verbatim except one slice bound
-
-**File:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs:362-417` vs
-`crates/mlrs-algos/src/cluster/spectral_embedding.rs:321-377`
-**Issue:** The two host recovery helpers (slice-smallest → `/dd` → sign-flip →
-transpose) plus the `host_to_f64`/`f64_to_host` bytemuck pair are copy-pasted
-across both files; they differ ONLY by `m = n_components + 1` (drop_first=true)
-vs `m = n_components` and the kept-row offset. The sign-flip, the `col = n-1-r`
-descending-slice math, and the `/dd` step — the exact pieces the SUMMARY calls
-"load-bearing, a wrong order fails the value match" — now exist in two places
-that must be kept bit-identical by hand. A future fix to the pinned sklearn order
-(or a `dd==0` edge) applied to one and not the other silently desynchronizes the
-embedding vs the clustering path. The 09-04 SUMMARY acknowledges the deliberate
-duplication for file-disjointness, but the parallel-safety rationale expired once
-both files landed.
-**Fix:** Factor the shared recovery into one `pub(crate)` helper taking a
-`drop_first: bool` (the only real difference), e.g. in a `cluster/spectral.rs`
-or as `recover(v, dd, n, n_components, drop_first)`. Collapse the two
-`host_to_f64`/`f64_to_host` copies into a shared `mlrs-algos` util (they are
-already triplicated with `eig.rs`).
+**File:** `crates/mlrs-py/src/estimators/spectral.rs:132, 163, 171, 291, 328` vs `crates/mlrs-py/src/estimators/kernel.rs:183, 375` and `crates/mlrs-py/src/dispatch.rs:33, 184`
+**Issue:** The poison-recovering `lock_pool()` was added (prior WR-02 fix) so a
+panicked `fit` cannot permanently brick the interpreter. The new spectral wrappers
+correctly use `crate::lock_pool()` everywhere. But the recovery only delivers its
+benefit if **every** lock site uses it: a single surviving
+`global_pool().lock().expect("pool mutex")` will panic-on-poison and re-brick. Grep
+shows `kernel.rs` and the canonical `dispatch.rs` doc example still use the panicking
+`.lock().expect(...)` form, so the codebase is inconsistent about which lock helper is
+authoritative and the brick-prevention is only partial.
+**Fix:** Make `lock_pool` the single sanctioned lock path project-wide — replace the
+remaining `global_pool().lock().expect(...)` sites (including `kernel.rs` and the
+`dispatch.rs` doc skeleton) — or explicitly document that mixing lock helpers defeats
+the recovery. Pairs with WR-01's accounting reconcile.
 
 ## Info
 
-### IN-01: Stale module doc claims KMeans init is "injected for the oracle"
+### IN-01: Unused `rng` binding on the degenerate SpectralEmbedding fixture path
 
-**File:** `crates/mlrs-algos/src/cluster/mod.rs:9-10`
-**Issue:** The doc says `KMeans` uses "k-means++ init (injected for the oracle,
-D-09)". Phase-9 D-10 explicitly REJECTS init-injection for SpectralClustering and
-uses `KMeans::new` (no injection); the comment predates Phase 9 and now
-contradicts the spectral usage a reader arrives from.
-**Fix:** Note that SpectralClustering reuses `KMeans::new` with the non-injected
-kmeans++ path (D-10), or drop the "(injected for the oracle)" parenthetical.
+**File:** `scripts/gen_oracle.py:1631-1643`
+**Issue:** `rng = np.random.default_rng(seed)` is created unconditionally, but the
+`degenerate=True` branch builds `x` from `np.linspace`/`np.cos`/`np.sin` and never
+uses `rng`. Dead assignment on that path (harmless; the non-degenerate path uses it).
+**Fix:** Move the `rng` creation into the `else` branch, or comment that it is
+intentionally seeded-but-unused for the degenerate geometry.
 
-### IN-02: Stale "Wave-0 scaffold status" block describes `todo!()` bodies that are now filled
+### IN-02: `knn_connectivity_affinity` duplicated verbatim across the two estimators
 
-**File:** `crates/mlrs-py/src/estimators/spectral.rs:26-33`
-**Issue:** The module doc still says "This is the 09-01 Wave-0 COMPILING STUB ...
-every device-compute body delegates to the algos `fit`/accessor stubs, which are
-`todo!()` until the Wave-2/3 plans". Both algos bodies and the PyO3 bodies are
-fully implemented as of 09-03/09-04; the doc misleads anyone auditing whether
-the surface is live.
-**Fix:** Update the status block to "filled (09-03/09-04)" and remove the
-`todo!()` language.
+**File:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs:340-384` and `crates/mlrs-algos/src/cluster/spectral_embedding.rs:296-340`
+**Issue:** `knn_connectivity_affinity` is byte-for-byte identical between the two
+estimators (the comment literally says "Mirrors SpectralEmbedding verbatim"). WR-06
+already factored the host recovery math into the shared `cluster/spectral.rs` module
+*precisely* because verbatim duplication risks silent desync on a future fix; this
+connectivity builder is the remaining duplicated block of the same character.
+**Fix:** Move it into `crate::cluster::spectral` as a free function
+`knn_connectivity_affinity::<F>(pool, x, n, d, k)` and call from both estimators, so
+the two affinity builders cannot drift.
 
-### IN-03: `error.rs` enum-level doc omits the Phase-9 variant from its summary
+### IN-03: SC gamma underflow accepted (sklearn-parity question)
 
-**File:** `crates/mlrs-algos/src/error.rs:18-28`
-**Issue:** The `AlgoError` doc comment enumerates the failure classes
-(InvalidNComponents, InvalidAlpha, InvalidK, ... NotConverged) but never mentions
-`NSamplesExceedsMaxDim`, added in this phase. Minor doc drift; the variant itself
-is well-documented inline.
-**Fix:** Add `NSamplesExceedsMaxDim` (the spectral dense-eig cap) to the
-enum-level summary list.
-
-### IN-04: `prims/mod.rs` / `lib.rs` comments still describe `laplacian` as a `todo!()` stub
-
-**File:** `crates/mlrs-backend/src/prims/mod.rs:25-29` and
-`crates/mlrs-py/src/lib.rs:62,134` ("12 estimator wrappers")
-**Issue:** `prims/mod.rs:28` says the `laplacian` "compute path `todo!()` until
-09-02"; it is filled. Separately, `lib.rs:62`/`:134` and the `estimators/mod.rs`
-header still say "12 `#[pyclass]` estimator wrappers" while the module now
-registers 19 (the original 12 plus Phase-7/8/9 additions, including the two
-spectral classes registered at `lib.rs:176-177`). Comment-vs-code count drift.
-**Fix:** Update the `laplacian` stub comment to "filled (09-02)" and correct the
-estimator count (or make it non-numeric, e.g. "all estimator wrappers").
-
-### IN-05: `fit_predict` round-trips labels host→device→host needlessly
-
-**File:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs:287-296`
-**Issue:** `fit_predict` calls `self.fit(...)`, then `self.labels(pool)?` (a
-device→host read-back), then `DeviceArray::from_host(pool, &labels)` (a
-host→device upload) to return a fresh device buffer. The labels were already
-device-resident in `self.labels_` immediately after `fit`. The extra read-back +
-re-upload is wasted work (and an extra unmetered copy) on every `fit_predict`.
-Not incorrect — the values are identical — but avoidable.
-**Fix:** Return a clone/handle of the already-resident `labels_` (or document why
-a detached fresh buffer is required for the sklearn `fit_predict` contract).
+**File:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs:202-207`, `crates/mlrs-algos/src/cluster/spectral_embedding.rs:184-189`
+**Issue:** The rbf branch rejects `!(gamma64 > 0.0)` (catching `0`, NaN, ±inf — good),
+but a finite-positive f32 gamma that underflows to effective-zero in
+`F::exp(-gamma*dist)` yields a near-constant all-ones affinity (the same degenerate
+graph the `gamma == 0` rejection targets). The exact-zero boundary is guarded;
+effective-zero underflow is not. sklearn also only rejects `gamma <= 0`, so this is
+likely intended parity, not a defect.
+**Fix:** No action required if sklearn parity is the contract (leave as-is). Flagged
+so the contract is an explicit decision rather than an accident.
 
 ---
 
-_Reviewed: 2026-06-21T03:32:40Z_
+_Reviewed: 2026-06-21_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
