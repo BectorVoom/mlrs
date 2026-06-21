@@ -327,3 +327,112 @@ pub enum AlgoError {
     #[error("estimator primitive error: {0}")]
     Prim(#[from] PrimError),
 }
+
+/// Construction-time (data-INDEPENDENT) hyperparameter errors for the Phase-10
+/// builder-fronted estimators (D-08 split validation / D-09 single PyO3 mapping).
+///
+/// `BuildError` is the second, sibling failure class to [`AlgoError`]: where
+/// `AlgoError` carries the data-DEPENDENT failures raised at `fit` (geometry,
+/// label integrality, convergence), `BuildError` carries the data-INDEPENDENT
+/// hyperparameter validation that the Phase-10 builders perform at
+/// `build() -> Result<Estimator, BuildError>` (D-01/D-08) BEFORE any data is
+/// seen. It also folds the enum `TryFrom<&str>` failures
+/// (`UnknownLoss`/`UnknownPenalty`/`UnknownLearningRate`) so a SINGLE
+/// `build_err_to_py` mapper at the PyO3 boundary covers every construction
+/// failure as a `PyValueError` (D-09 — mirrors the single-site `algo_err_to_py`
+/// rationale; sklearn raises these at construction, mlrs at the first `fit`
+/// because the Unfit arm stores the raw strings until then).
+///
+/// `thiserror` in libraries (project convention; `anyhow` is reserved for the
+/// PyO3 boundary). The two enums are deliberately separate types so the prim /
+/// fit layer cannot accidentally surface a construction error and vice versa.
+#[derive(Debug, Error)]
+pub enum BuildError {
+    /// A penalized estimator was given a negative `alpha`. Every Phase-10
+    /// estimator requires `alpha >= 0` (`alpha = 0` degenerates to the
+    /// unpenalized objective); a negative penalty is undefined. Rejected at
+    /// `build()` (T-10-01-01).
+    #[error("estimator '{estimator}': alpha = {alpha} is invalid (must be >= 0)")]
+    InvalidAlpha {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending penalty value.
+        alpha: f64,
+    },
+
+    /// An ElasticNet-penalty estimator was given an `l1_ratio` outside `[0, 1]`.
+    /// The mixing parameter blends the L1 and L2 penalties so it must lie in the
+    /// closed unit interval. Rejected at `build()` (T-10-01-01).
+    #[error(
+        "estimator '{estimator}': l1_ratio = {l1_ratio} is invalid \
+         (must be 0 <= l1_ratio <= 1)"
+    )]
+    InvalidL1Ratio {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending mixing parameter.
+        l1_ratio: f64,
+    },
+
+    /// An SGD estimator was given a non-positive initial learning rate `eta0`.
+    /// The `constant` / `invscaling` schedules require `eta0 > 0`; a non-positive
+    /// initial rate makes the schedule degenerate. Rejected at `build()`
+    /// (T-10-01-01).
+    #[error("estimator '{estimator}': eta0 = {eta0} is invalid (must be > 0)")]
+    InvalidEta0 {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending initial learning rate.
+        eta0: f64,
+    },
+
+    /// An epsilon-insensitive estimator was given a negative `epsilon`. The
+    /// insensitivity margin must be `epsilon >= 0`. Rejected at `build()`
+    /// (T-10-01-01).
+    #[error("estimator '{estimator}': epsilon = {epsilon} is invalid (must be >= 0)")]
+    InvalidEpsilon {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending insensitivity margin.
+        epsilon: f64,
+    },
+
+    /// An unrecognised `loss` string was supplied (the
+    /// [`TryFrom<&str>`](core::convert::TryFrom) enum-parse failure folded into
+    /// `BuildError` so a single mapper covers it, D-09). Carries the offending
+    /// (owned) name for diagnosis.
+    #[error("unknown loss '{value}'")]
+    UnknownLoss {
+        /// The unrecognised loss name the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `penalty` string was supplied (the enum-parse failure
+    /// folded into `BuildError`, D-09).
+    #[error("unknown penalty '{value}'")]
+    UnknownPenalty {
+        /// The unrecognised penalty name the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `learning_rate` string was supplied (the enum-parse
+    /// failure folded into `BuildError`, D-09).
+    #[error("unknown learning_rate '{value}'")]
+    UnknownLearningRate {
+        /// The unrecognised learning-rate schedule name the caller supplied.
+        value: String,
+    },
+
+    /// A `loss` value was supplied that is not valid for the target estimator
+    /// (e.g. a regression loss on a classifier builder). The loss family must
+    /// match the estimator's task. Rejected at `build()` (T-10-01-01).
+    #[error(
+        "estimator '{estimator}': loss '{loss}' is not valid for this estimator"
+    )]
+    InvalidLossForEstimator {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending (owned) loss name.
+        loss: String,
+    },
+}
