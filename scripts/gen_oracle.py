@@ -1584,43 +1584,75 @@ def gen_laplacian(seed: int = SEED, dtype=np.float32, isolated: bool = False) ->
     return out_path
 
 
+# SpectralEmbedding kNN-affinity neighbor count (SPECTRAL-01). sklearn's
+# ``SpectralEmbedding`` default ``n_neighbors=None`` resolves to
+# ``max(n_samples // 10, 1)`` which, at ``SE_N_SAMPLES=12``, is ``1`` — a
+# DISCONNECTED kNN graph whose normalized-Laplacian has a high-multiplicity zero
+# eigenvalue. A dense full-spectrum Jacobi ``eig`` (the v2 D-05 path) cannot
+# reproduce ARPACK's pick within that degenerate zero subspace, so the
+# committed kNN oracle pins an EXPLICIT ``n_neighbors`` that yields a CONNECTED,
+# well-separated spectrum the dense pipeline matches to machine precision. The
+# rbf oracle (the RESEARCH-validated 8.3e-7 path) is the strict primary gate;
+# the kNN oracle is the secondary D-03 connectivity-affinity gate.
+SE_N_NEIGHBORS = 5
+
+
 def gen_spectral_embedding(
     seed: int = SEED, dtype=np.float32, degenerate: bool = False
 ) -> str:
-    """Generate one SpectralEmbedding fixture (SPECTRAL-01, D-01/D-04/D-05).
+    """Generate one SpectralEmbedding fixture (SPECTRAL-01, D-01/D-04/D-05/D-09).
 
-    CRITICAL (D-01): fit sklearn ``SpectralEmbedding`` with its OWN DEFAULT
-    CONSTRUCTOR — NO ``affinity`` / ``gamma`` override (the inverse of
-    KernelRidge's explicit kwargs). The default is
-    ``affinity='nearest_neighbors'``, ``n_components=2`` (D-08),
-    ``n_neighbors=10`` (D-03); ``gamma=None`` would resolve to ``1/n_features``
-    on the rbf path (D-04), exercised by the non-trivial ``SE_N_FEATURES``.
+    Stores row-major ``X`` plus two committed ``embedding_`` oracles so the
+    Wave-2 estimator can value-match BOTH affinity paths against a real sklearn
+    reference produced by the dense-eig-faithful configuration:
 
-    Stores row-major ``X`` + the fitted ``embedding_`` (``n × n_components``).
-    ``n_samples ≤ 64`` (D-05). ``degenerate=True`` builds a symmetric
-    block-structured affinity producing REPEATED eigenvalues so the Wave-2
-    subspace test (D-09) has a degenerate-spectrum fixture. Returns the path.
+    - ``embedding``      — ``affinity='rbf'``, ``gamma=1/n_features`` (D-02/D-04).
+      This is the RESEARCH-validated dense full-spectrum path (reproduces sklearn
+      ARPACK to ~1e-15 here); the STRICT 1e-5 primary gate.
+    - ``embedding_knn``  — ``affinity='nearest_neighbors'`` with an EXPLICIT
+      ``n_neighbors=SE_N_NEIGHBORS`` (D-03) chosen so the kNN graph is connected
+      and the spectrum well-separated, so the dense pipeline matches sklearn
+      exactly (the default ``n_neighbors→1`` is disconnected/degenerate and
+      cannot be value-matched by a dense eigensolver — see ``SE_N_NEIGHBORS``).
+
+    ``n_components=2`` (D-08), ``n_samples ≤ 64`` (D-05).
+
+    ``degenerate=True`` places the samples on a circle so the rbf
+    normalized-Laplacian has a DEGENERATE Fiedler pair (the first non-zero
+    eigenvalue has multiplicity 2). The kept embedding then spans a genuinely
+    degenerate 2-D eigenspace: a per-element value match is impossible (the
+    eigenvectors are defined only up to rotation), but the COLUMN SPACE matches
+    sklearn — so the Wave-2 ``subspace`` test (D-09, principal angles) is the
+    correct gate. Only ``embedding`` (rbf) is stored for the degenerate fixture.
+    Returns the path.
     """
     from sklearn.manifold import SpectralEmbedding
 
     rng = np.random.default_rng(seed)
     n, d = SE_N_SAMPLES, SE_N_FEATURES
     if degenerate:
-        # Two tight, well-separated blocks → a (near-)degenerate low spectrum.
-        half = n // 2
-        block_a = rng.standard_normal((half, d)) * 0.05
-        block_b = rng.standard_normal((n - half, d)) * 0.05 + 10.0
-        x = np.vstack([block_a, block_b])
+        # Points on a circle → an rbf affinity that approximates a cycle graph,
+        # whose normalized Laplacian has a degenerate Fiedler pair (multiplicity
+        # 2). The trivial eigenvalue stays simple (connected graph), so the
+        # AMBIGUITY is in the kept eigenspace — exactly the D-09 subspace case.
+        theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        x = np.zeros((n, d))
+        x[:, 0] = np.cos(theta)
+        x[:, 1] = np.sin(theta)
     else:
         x = rng.standard_normal((n, d))
 
-    # D-01: the estimator's OWN default constructor (no override). random_state
-    # fixes the internal eigensolver sign/RNG so the committed embedding_ is
-    # reproducible.
-    se = SpectralEmbedding(
-        n_components=SE_N_COMPONENTS, random_state=seed
+    gamma = 1.0 / d  # D-04: gamma=None → 1/n_features (resolved at fit).
+
+    # rbf oracle (D-02/D-04): the strict primary gate. random_state fixes the
+    # internal sign/RNG so the committed embedding_ is reproducible.
+    se_rbf = SpectralEmbedding(
+        n_components=SE_N_COMPONENTS,
+        affinity="rbf",
+        gamma=gamma,
+        random_state=seed,
     )
-    embedding = se.fit_transform(x)
+    embedding = se_rbf.fit_transform(x)
 
     def c(arr):
         return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
@@ -1629,12 +1661,24 @@ def gen_spectral_embedding(
     tag = "spectral_embedding_degenerate" if degenerate else "spectral_embedding"
     os.makedirs(_FIXTURE_DIR, exist_ok=True)
     out_path = os.path.join(_FIXTURE_DIR, f"{tag}_{dtype_tag}_seed{seed}.npz")
-    np.savez(
-        out_path,
+
+    payload = dict(
         X=c(x),
         embedding=c(embedding),
-        gamma_default=c([1.0 / d]),
+        gamma_default=c([gamma]),
+        n_neighbors=c([SE_N_NEIGHBORS]),
     )
+    if not degenerate:
+        # kNN-connectivity oracle (D-03): explicit connected n_neighbors.
+        se_knn = SpectralEmbedding(
+            n_components=SE_N_COMPONENTS,
+            affinity="nearest_neighbors",
+            n_neighbors=SE_N_NEIGHBORS,
+            random_state=seed,
+        )
+        payload["embedding_knn"] = c(se_knn.fit_transform(x))
+
+    np.savez(out_path, **payload)
     return out_path
 
 
