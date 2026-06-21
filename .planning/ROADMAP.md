@@ -187,7 +187,22 @@ Plans:
 **Recurring gates**: `skip_f64_with_log` on every f64 oracle case; documented f32-on-rocm band for GaussianNB (log-proba), **exact labels** the hard gate for all five; **GATHER idiom + cpu-launch verification** per Pitfall 2; log-sum-exp + `var_smoothing` per Pitfall 9; PoolStats memory gate per estimator.
 **Research flag**: None — Naive Bayes is reductions-only over the validated v1 reduce prim; per-variant math fully specified in FEATURES.md. Standard pattern, research-phase can be skipped.
 **PY-06 placement decision**: PY-06 spans all v2 estimators. **Each phase wraps its own estimators incrementally** (reusing the shipped PyO3 `any_estimator!` machinery — v2 adds zero binding infrastructure), and PY-06 is formally assigned to Phase 11 as the final cross-cutting Python-surface sign-off (all v2 `#[pyclass]` estimators registered, dtype-suffixed accessors complete, the two new methods `partial_fit`/`score_samples` exposed, and `estimator_checks` re-triaged across the full v2 surface). This differs from v1's dedicated Phase-6 Python phase because v2 reuses the shipped binding layer rather than building it.
-**Plans**: TBD
+**Plans**: 5 plans (3 waves)
+
+Plans:
+**Wave 1**
+
+- [ ] 11-01-PLAN.md — Wave-0 scaffold: PredictLogProba trait (D-07) + nb_common free functions incl. the class_grouped_sum GATHER (standalone-validated, no new kernel) + NB BuildError/AlgoError variants + MinCategories enum (D-04) + five compiling estimator stubs (sklearn-default builders, D-02/D-09) + gen_oracle.py generators + 10 committed fixtures + 5 #[ignore] oracle test scaffolds; resolves A1/A5
+
+**Wave 2** *(blocked on Wave 1; 11-02 + 11-03 + 11-04 file-disjoint -> parallel)*
+
+- [ ] 11-02-PLAN.md — NB-01 GaussianNB (continuous; global var_smoothing epsilon_ per Pitfall 3, per-class mean/var via GATHER, host log-sum-exp, exact-labels hard gate)
+- [ ] 11-03-PLAN.md — NB-02 MultinomialNB + NB-03 BernoulliNB + NB-04 ComplementNB (three independent count-based structs sharing the GEMM joint-LL; per-variant denominators, Bernoulli non-occurrence term + binarize, Complement complement-weights + norm + argmin)
+- [ ] 11-04-PLAN.md — NB-05 CategoricalNB (ragged Vec<Vec<f64>> feature_log_prob_ + MinCategories padding + integer-input validation + unseen-category-safe lookup)
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 11-05-PLAN.md — PY-06 final cross-cutting sign-off: five #[pyclass] NB wrappers (any_estimator! reuse, sklearn-named D-09, dtype dispatch, GIL release, MultinomialNB sparse densify) + registration (25->30) + Rust/Python smoke + estimator_checks re-triage across the full v2 surface
 
 ## Progress
 
@@ -203,4 +218,4 @@ Plans:
 | 8. Kernel Family | v2.0 | 1/5 | Executing | - |
 | 9. Spectral Family | v2.0 | 4/4 | Complete    | 2026-06-21 |
 | 10. SGD / Linear-SVM | v2.0 | 6/6 | Complete    | 2026-06-21 |
-| 11. Naive Bayes | v2.0 | 0/? | Not started | - |
+| 11. Naive Bayes | v2.0 | 0/5 | Planned | - |
