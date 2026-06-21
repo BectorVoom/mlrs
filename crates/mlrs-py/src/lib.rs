@@ -117,29 +117,42 @@ pub(crate) fn global_pool() -> &'static Mutex<BufferPool<ActiveRuntime>> {
 /// pre-existing, tracked migration; mixing the two helpers defeats the recovery on
 /// those estimators until they are converted.)
 ///
-/// ## ACCOUNTING CAVEAT after a recovered poison (WR-01)
+/// ## ACCOUNTING RE-BASELINE after a recovered poison (WR-01 / WR-06)
 /// "Not left torn" is a **memory-safety** statement, NOT an accounting one. The
 /// `BufferPool` counters (`live_bytes`/`peak_bytes`) are bumped at `acquire` and
 /// decremented at `release` ([`BufferPool::acquire`]/[`BufferPool::release`]). A
 /// `fit` acquires many buffers and releases them incrementally; if a panic unwinds
 /// the `py.detach` closure mid-`fit` while this guard is held, every
 /// acquired-but-not-yet-released buffer leaves its bytes permanently added to
-/// `live_bytes`. After `into_inner()` recovery, `live_bytes` (and therefore
-/// `peak_bytes`) may be monotonically INFLATED for the rest of the process.
+/// `live_bytes`, so the raw counters would be monotonically INFLATED for the rest
+/// of the process. To keep the FOUND-05 conservation gate meaningful, this path
+/// RE-BASELINES the counters on recovery via
+/// [`BufferPool::reset_after_poison`] (WR-06) — see below.
 ///
-/// The pool cannot self-reconcile this: its free-list only knows about *released*
-/// handles, and the *live* handles are owned by `DeviceArray`s outside the pool —
-/// so there is no in-pool truth source to recompute `live_bytes` from. Callers and
-/// the FOUND-05 leak-detection gates MUST therefore treat the conservation
-/// property (`live_bytes` returns to its pre-`fit` baseline) as VOID once a poison
-/// has been recovered through this path. Memory safety holds; the accounting
-/// counters do not.
+/// The pool cannot self-reconcile the *inflated* `live_bytes` from in-pool truth
+/// (the *live* handles are owned by `DeviceArray`s outside the pool), so on poison
+/// recovery this path RE-BASELINES the accounting via
+/// [`BufferPool::reset_after_poison`] (WR-06): the stale free-list is dropped and
+/// the counters are reset to zero, so subsequent `acquire`/`release` cycles
+/// re-establish a meaningful conservation baseline and the FOUND-05 memory gate
+/// can still detect a genuine post-recovery leak rather than being permanently
+/// blinded by the one-time poison inflation. Memory safety holds (dropping the
+/// free-list only releases the pool's OWN handle references; any handle still live
+/// in a surviving `DeviceArray` is kept alive by that array's ref-count), and the
+/// accounting is meaningful again from the recovery point forward.
 #[allow(dead_code)]
 pub(crate) fn lock_pool(
 ) -> std::sync::MutexGuard<'static, BufferPool<ActiveRuntime>> {
     match global_pool().lock() {
         Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+        Err(poisoned) => {
+            // Recover the guard, then re-baseline the (now inflated) accounting so
+            // the conservation property stays meaningful for the rest of the
+            // process (WR-06).
+            let mut guard = poisoned.into_inner();
+            guard.reset_after_poison();
+            guard
+        }
     }
 }
 

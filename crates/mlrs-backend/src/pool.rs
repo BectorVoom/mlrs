@@ -98,6 +98,30 @@ impl<R: cubecl::Runtime> BufferPool<R> {
         self.stats
     }
 
+    /// Reset the pool to a fresh conservation baseline after a recovered mutex
+    /// poison (WR-06).
+    ///
+    /// A panic that unwinds a compute call mid-`fit` while the pool guard is held
+    /// leaves every acquired-but-not-yet-released buffer's bytes permanently added
+    /// to `live_bytes`, so after `into_inner()` poison recovery the counters are
+    /// monotonically INFLATED and the FOUND-05 conservation property is void.
+    ///
+    /// The pool cannot recompute `live_bytes` from in-pool truth (the live handles
+    /// are owned by `DeviceArray`s outside the pool), so this method instead
+    /// RE-BASELINES the accounting: the stale free-list (handles that may alias
+    /// device memory still referenced by leaked `DeviceArray`s from the panicked
+    /// `fit`) is dropped, and all counters are reset to zero. Subsequent
+    /// `acquire`/`release` cycles then re-establish a meaningful conservation
+    /// baseline so the memory gate can detect a genuine post-recovery leak rather
+    /// than being permanently blinded by the one-time poison inflation. Memory
+    /// safety is unaffected — dropping the free-list only releases the pool's OWN
+    /// references; any handle still live in a surviving `DeviceArray` is kept alive
+    /// by that array's own ref-count.
+    pub fn reset_after_poison(&mut self) {
+        self.free.clear();
+        self.stats = PoolStats::default();
+    }
+
     /// Acquire a device buffer of `size_bytes`.
     ///
     /// Reuses a released handle of the exact same byte size if one is available
