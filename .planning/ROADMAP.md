@@ -161,7 +161,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1; 10-03 + 10-04 file-disjoint → parallel)*
 
-- [ ] 10-03-PLAN.md — SGDSVM-01 MBSGDClassifier + SGDSVM-02 MBSGDRegressor on the validated prim + pinned oracle (exact-label hard gate, log-loss proba, D-03 default litmus, D-08 split validation)
+- [x] 10-03-PLAN.md — SGDSVM-01 MBSGDClassifier + SGDSVM-02 MBSGDRegressor on the validated prim + pinned oracle (exact-label hard gate, log-loss proba, D-03 default litmus, D-08 split validation) ✓ Plan 03
 - [x] 10-04-PLAN.md — SGDSVM-03 LinearSVC + SGDSVM-04 LinearSVR (Open-Q1 RESOLVED → L-BFGS squared-hinge/squared-eps-insensitive primal, NOT cd_fit; dual='auto' internal, intercept_scaling synthetic-feature; exact predict labels hard gate) ✓ Plan 04
 
 **Wave 3** *(blocked on Wave 2)*

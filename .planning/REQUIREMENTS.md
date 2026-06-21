@@ -42,8 +42,8 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 ### SGD / Linear SVM
 
-- [ ] **SGDSVM-01**: A data scientist can fit `MBSGDClassifier` (sklearn `SGDClassifier` objectives: hinge / log / squared-hinge; learning-rate schedules incl. `optimal`) with `predict`/`predict_proba`, matching scikit-learn within tolerance under a pinned deterministic oracle (`shuffle=False`, fixed schedule/epochs)
-- [ ] **SGDSVM-02**: A data scientist can fit `MBSGDRegressor` (squared-loss / epsilon-insensitive; `invscaling` default) with `predict`, matching scikit-learn within tolerance under the pinned deterministic oracle
+- [x] **SGDSVM-01**: A data scientist can fit `MBSGDClassifier` (sklearn `SGDClassifier` objectives: hinge / log / squared-hinge; learning-rate schedules incl. `optimal`) with `predict`/`predict_proba`, matching scikit-learn within tolerance under a pinned deterministic oracle (`shuffle=False`, fixed schedule/epochs)
+- [x] **SGDSVM-02**: A data scientist can fit `MBSGDRegressor` (squared-loss / epsilon-insensitive; `invscaling` default) with `predict`, matching scikit-learn within tolerance under the pinned deterministic oracle
 - [x] **SGDSVM-03**: A data scientist can fit `LinearSVC` (`loss='squared_hinge'` default, `penalty`, `dual='auto'`, `intercept_scaling`) with `predict`, matching scikit-learn within tolerance — Phase 10 Plan 04 (L-BFGS squared-hinge primal, exact predict labels hard gate)
 - [x] **SGDSVM-04**: A data scientist can fit `LinearSVR` (`loss='squared_epsilon_insensitive'` default, `epsilon`) with `predict`, matching scikit-learn within tolerance — Phase 10 Plan 04 (shared L-BFGS squared-eps-insensitive primal)
 
@@ -89,8 +89,8 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | SPECTRAL-01 | Phase 9 | Complete |
 | SPECTRAL-02 | Phase 9 | Complete (09-04) |
 | PRIM-10 | Phase 10 | Complete (10-02) |
-| SGDSVM-01 | Phase 10 | Pending |
-| SGDSVM-02 | Phase 10 | Pending |
+| SGDSVM-01 | Phase 10 | Complete |
+| SGDSVM-02 | Phase 10 | Complete |
 | SGDSVM-03 | Phase 10 | Complete (Plan 04) |
 | SGDSVM-04 | Phase 10 | Complete (Plan 04) |
 | NB-01 | Phase 11 | Pending |
