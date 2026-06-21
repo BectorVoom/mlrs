@@ -36,7 +36,13 @@
 //! A non-SPD `(K + αI)` surfaces [`PrimError::NotPositiveDefinite`] from the
 //! primitive (propagated as [`AlgoError`] via `#[from]`), never a NaN
 //! `dual_coef_`. With `α ≥ 0` on an SPD kernel diagonal the system stays
-//! well-conditioned.
+//! well-conditioned. A NaN reaching the Cholesky diagonal does NOT reliably
+//! trip the primitive's `pivot <= 0` test (`NaN <= 0` is `false`) — e.g. a poly
+//! kernel with a negative base (`γ·g + coef0 < 0`, non-integer degree) yields a
+//! NaN Gram entry — so `fit` ALSO validates the resolved `gamma` is finite
+//! before launch ([`AlgoError::InvalidGamma`]) and performs a post-solve
+//! finiteness check on the produced duals, returning
+//! [`PrimError::NotPositiveDefinite`] rather than storing a NaN `dual_coef_`.
 //!
 //! Tests live in `crates/mlrs-algos/tests/kernel_ridge_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
@@ -177,8 +183,10 @@ where
         // --- T-08-03-01 / ASVS V5: validate the untrusted hyperparameters and
         //     geometry BEFORE any prim launch. alpha < 0 makes (K + αI)
         //     indefinite (Cholesky undefined); degree < 1 is not a valid poly
-        //     order; the kernel name is fixed by KernelKind (always valid here,
-        //     but the guard mirrors the threat register T-08-03-01). ---
+        //     order; a non-finite resolved gamma (checked once gamma is resolved,
+        //     below) drives the device kernels to NaN; the kernel name is fixed by
+        //     KernelKind (always valid here, but the guard mirrors the threat
+        //     register T-08-03-01). ---
         let alpha64 = host_to_f64(self.alpha);
         if alpha64 < 0.0 {
             return Err(AlgoError::InvalidAlpha {
@@ -230,6 +238,18 @@ where
             Some(g) => g,
             None => f64_to_host::<F>(1.0 / n_features as f64),
         };
+        // Validate-before-launch (T-08-03-01 / ASVS V5): the resolved gamma is
+        // baked into the typed Kernel and consumed on device by rbf/poly/sigmoid
+        // (`exp`/`powf`/`tanh`); a non-finite user-supplied gamma (or a degenerate
+        // resolved default) drives those device ops to NaN. Reject it here so the
+        // untrusted hyperparameter becomes a typed error, never NaN duals.
+        let gamma64 = host_to_f64(gamma);
+        if !gamma64.is_finite() {
+            return Err(AlgoError::InvalidGamma {
+                estimator: "kernel_ridge",
+                gamma: gamma64,
+            });
+        }
         let kernel = match self.kernel_kind {
             KernelKind::Linear => Kernel::Linear,
             KernelKind::Rbf => Kernel::Rbf { gamma },
@@ -282,6 +302,27 @@ where
         );
         let dual_coef =
             cholesky_solve::<F>(pool, &k_reg, y, n_samples, n_targets, Some(k_out))?;
+
+        // --- Post-solve finiteness guard (CR-01 / T-08-03-02). A non-SPD pivot
+        //     normally surfaces NotPositiveDefinite from the primitive, but a NaN
+        //     reaching the Cholesky diagonal does NOT reliably trip the `pivot <= 0`
+        //     test (`NaN <= 0` is `false`), so a poly kernel with a negative base
+        //     (`gamma·g + coef0 < 0`, non-integer degree) can produce NaN duals
+        //     silently. Read the small n×t duals back and reject any non-finite
+        //     value as NotPositiveDefinite so the module-doc "never a NaN
+        //     dual_coef_" guarantee actually holds. ---
+        let duals_host = dual_coef.to_host(pool);
+        if let Some(idx) = duals_host
+            .iter()
+            .position(|&v| !host_to_f64(v).is_finite())
+        {
+            dual_coef.release_into(pool);
+            return Err(AlgoError::Prim(PrimError::NotPositiveDefinite {
+                operand: "kernel_ridge",
+                pivot_index: idx,
+                pivot_value: host_to_f64(duals_host[idx]),
+            }));
+        }
 
         // --- Store device-resident fitted state. The K buffer was consumed (its
         //     cloned handle threaded through `out` and released by the Cholesky

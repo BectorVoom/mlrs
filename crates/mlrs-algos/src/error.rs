@@ -244,6 +244,26 @@ pub enum AlgoError {
         degree: f64,
     },
 
+    /// A kernel estimator (KernelRidge) was given a non-finite resolved `gamma`.
+    /// The kernel coefficient `γ` scales the inner-product / squared-distance
+    /// argument of every kernel that uses it (`rbf`/`poly`/`sigmoid`); sklearn's
+    /// contract is `Interval(Real, 0, None, closed='neither')` (a positive finite
+    /// value), and either an explicit user-supplied `gamma` or the resolved
+    /// `1/n_features` default must be finite. A non-finite `gamma` (NaN / ±inf)
+    /// reaches the device kernels unguarded and drives `powf`/`exp` to NaN — the
+    /// same untrusted-hyperparameter class the validate-before-launch contract
+    /// covers — so it is rejected at `fit` *before* any kernel launch (T-08-01-01 /
+    /// ASVS V5).
+    #[error(
+        "estimator '{estimator}': gamma = {gamma} is invalid (must be finite)"
+    )]
+    InvalidGamma {
+        /// Which estimator rejected the value (e.g. `"kernel_ridge"`).
+        estimator: &'static str,
+        /// The offending (non-finite) kernel coefficient.
+        gamma: f64,
+    },
+
     /// A kernel estimator (KernelRidge / KernelDensity) was given an unrecognised
     /// `kernel` name. Only the supported kernel families are accepted
     /// (KernelRidge: `linear`/`rbf`/`poly`/`sigmoid`; KernelDensity:
