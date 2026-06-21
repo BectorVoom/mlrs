@@ -220,8 +220,11 @@ where
             BandwidthSpec::Silverman => (n * (d + 2.0) / 4.0).powf(-1.0 / (d + 4.0)),
         };
         // Validate-before-launch: a non-positive bandwidth makes the −d·log(h)
-        // normalization undefined (T-08-04-01).
-        if !(bandwidth > 0.0) {
+        // normalization undefined (T-08-04-01). Require FINITE as well —
+        // `inf > 0.0` passes the positivity check but drives `−d·h.ln()` → −inf
+        // and `exp(−0.5·sqdist/inf²) = exp(0) = 1` on device, producing a
+        // finite-but-meaningless log-density instead of a typed rejection (WR-03).
+        if !(bandwidth > 0.0 && bandwidth.is_finite()) {
             return Err(AlgoError::InvalidBandwidth {
                 estimator: "kernel_density",
                 bandwidth,
