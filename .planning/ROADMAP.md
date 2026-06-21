@@ -197,7 +197,7 @@ Plans:
 **Wave 2** *(blocked on Wave 1; 11-02 + 11-03 + 11-04 file-disjoint -> parallel)*
 
 - [x] 11-02-PLAN.md — NB-01 GaussianNB (continuous; global var_smoothing epsilon_ per Pitfall 3, per-class mean/var via GATHER, host log-sum-exp, exact-labels hard gate) — DONE 2026-06-21 (1eb7aa9, 96bcfaf); gaussian_nb_test 7/7 (0 ignored), exact labels f32+f64 hard gate, proba band f64 1e-5/f32 1e-3 with rows-sum-to-1, refit leak-free
-- [ ] 11-03-PLAN.md — NB-02 MultinomialNB + NB-03 BernoulliNB + NB-04 ComplementNB (three independent count-based structs sharing the GEMM joint-LL; per-variant denominators, Bernoulli non-occurrence term + binarize, Complement complement-weights + norm + argmin)
+- [x] 11-03-PLAN.md — NB-02 MultinomialNB + NB-03 BernoulliNB + NB-04 ComplementNB (three independent count-based structs sharing the GEMM joint-LL; per-variant denominators, Bernoulli non-occurrence term + binarize, Complement complement-weights + norm + argmin) — DONE 2026-06-21 (5171820, f9bf26c, a63c911); 24/24 oracle tests (8 each, 0 ignored), exact labels f32+f64 hard gate all three (CNB argmin not sign-flipped), proba rows-sum-to-1, force_alpha_clip/binarize_none/norm_true green, refit leak-free
 - [ ] 11-04-PLAN.md — NB-05 CategoricalNB (ragged Vec<Vec<f64>> feature_log_prob_ + MinCategories padding + integer-input validation + unseen-category-safe lookup)
 
 **Wave 3** *(blocked on Wave 2)*
@@ -218,4 +218,4 @@ Plans:
 | 8. Kernel Family | v2.0 | 1/5 | Executing | - |
 | 9. Spectral Family | v2.0 | 4/4 | Complete    | 2026-06-21 |
 | 10. SGD / Linear-SVM | v2.0 | 6/6 | Complete    | 2026-06-21 |
-| 11. Naive Bayes | v2.0 | 0/5 | Planned | - |
+| 11. Naive Bayes | v2.0 | 3/5 | Executing | - |

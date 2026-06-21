@@ -50,9 +50,9 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 ### Naive Bayes
 
 - [x] **NB-01**: A data scientist can fit `GaussianNB` (per-class Gaussian likelihood with `var_smoothing`, log-sum-exp) with `predict`/`predict_proba` matching scikit-learn within tolerance
-- [ ] **NB-02**: A data scientist can fit `MultinomialNB` (multinomial likelihood, `alpha` smoothing) with `predict`/`predict_proba` matching scikit-learn within tolerance; sparse input accepted via ingress densify
-- [ ] **NB-03**: A data scientist can fit `BernoulliNB` (binary likelihood with the `(1−x)·log(1−p)` non-occurrence term, `binarize`) matching scikit-learn within tolerance
-- [ ] **NB-04**: A data scientist can fit `ComplementNB` (complement-class weights, argmin decision) matching scikit-learn within tolerance
+- [x] **NB-02**: A data scientist can fit `MultinomialNB` (multinomial likelihood, `alpha` smoothing) with `predict`/`predict_proba` matching scikit-learn within tolerance; sparse input accepted via ingress densify
+- [x] **NB-03**: A data scientist can fit `BernoulliNB` (binary likelihood with the `(1−x)·log(1−p)` non-occurrence term, `binarize`) matching scikit-learn within tolerance
+- [x] **NB-04**: A data scientist can fit `ComplementNB` (complement-class weights, argmin decision) matching scikit-learn within tolerance
 - [ ] **NB-05**: A data scientist can fit `CategoricalNB` (per-feature categorical likelihood, `alpha`) on categorical-encoded integer features, matching scikit-learn within tolerance
 
 ### Python Surface
@@ -94,9 +94,9 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | SGDSVM-03 | Phase 10 | Complete (Plan 04) |
 | SGDSVM-04 | Phase 10 | Complete (Plan 04) |
 | NB-01 | Phase 11 | Complete (11-02) |
-| NB-02 | Phase 11 | Pending |
-| NB-03 | Phase 11 | Pending |
-| NB-04 | Phase 11 | Pending |
+| NB-02 | Phase 11 | Complete |
+| NB-03 | Phase 11 | Complete |
+| NB-04 | Phase 11 | Complete |
 | NB-05 | Phase 11 | Pending |
 | PY-06 | Phase 11 (cross-cutting; estimators wrapped incrementally per phase) | Pending |
 
