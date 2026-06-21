@@ -121,6 +121,14 @@ KR_N_SAMPLES, KR_N_FEATURES, KR_N_TEST = 12, 4, 5
 # KernelDensity (KERNEL-02, D-10). Tiny n so the brute-force density matches
 # sklearn's exact-forced (atol=0, rtol=0) tree; a small query set Q.
 KD_N_SAMPLES, KD_N_FEATURES, KD_N_QUERY = 10, 3, 6
+# Spectral family (PRIM-09 / SPECTRAL-01/02). n_samples <= 64 (D-05 — the n×n
+# Laplacian clears the v1 eig MAX_DIM=64 cap). SE_N_FEATURES is chosen so the
+# `gamma=None -> 1/n_features` default (D-04) is a non-trivial value the oracle
+# exercises. SE_N_COMPONENTS=2 is the sklearn default (D-08). SC clusters are
+# WELL-SEPARATED (D-10) so the partition is unique up to permutation.
+LAP_N = 8
+SE_N_SAMPLES, SE_N_FEATURES, SE_N_COMPONENTS = 12, 5, 2
+SC_N_SAMPLES, SC_N_FEATURES, SC_N_CLUSTERS = 12, 2, 3
 
 
 def gen_saxpy(seed: int = SEED, n: int = N, dtype=np.float32) -> str:
@@ -1528,6 +1536,156 @@ def gen_kernel_density(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+def gen_laplacian(seed: int = SEED, dtype=np.float32, isolated: bool = False) -> str:
+    """Generate one normalized-graph-Laplacian fixture (PRIM-09).
+
+    Emits a ready ``n×n`` affinity ``A`` plus the host-reference symmetric
+    normalized Laplacian ``L = I − D^-1/2 A D^-1/2`` and the degree-normalization
+    vector ``dd[i] = sqrt(degree_i)`` (or ``1`` for an isolated/zero-degree node —
+    the typed-zero guard, so ``L`` is finite everywhere and ``L[i,i] = 0`` for an
+    isolated node). The Laplacian reproduces scipy's ``_laplacian_dense``
+    (``normed=True``) form: the affinity diagonal is zeroed BEFORE the degree
+    reduction.
+
+    ``isolated=True`` forces one node's row/column to zero (a zero-degree node) so
+    the no-NaN / no-infinite-value guard is exercised. All arrays
+    ``np.ascontiguousarray(...).astype(dtype)`` (row-major). Returns the path.
+    """
+    rng = np.random.default_rng(seed)
+    n = LAP_N
+    # Symmetric non-negative affinity with a zero diagonal (an rbf-style graph).
+    raw = rng.random((n, n))
+    a = 0.5 * (raw + raw.T)
+    np.fill_diagonal(a, 0.0)
+    if isolated:
+        # Force the last node to be isolated (zero degree): zero its row + column.
+        a[n - 1, :] = 0.0
+        a[:, n - 1] = 0.0
+
+    # scipy _laplacian_dense (normed=True): degree on the diagonal-zeroed affinity,
+    # dd = sqrt(degree) with a typed-zero guard (dd=1 where degree==0).
+    degree = a.sum(axis=1)
+    dd = np.sqrt(degree)
+    dd_guard = np.where(degree == 0.0, 1.0, dd)
+    # L = I − D^-1/2 A D^-1/2; the isolated-node diagonal is 0 (1 - isolated).
+    inv = 1.0 / dd_guard
+    lap = -a * np.outer(inv, inv)
+    diag = np.where(degree == 0.0, 0.0, 1.0)
+    np.fill_diagonal(lap, diag)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    tag = "laplacian_isolated" if isolated else "laplacian"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"{tag}_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, A=c(a), L=c(lap), dd=c(dd_guard))
+    return out_path
+
+
+def gen_spectral_embedding(
+    seed: int = SEED, dtype=np.float32, degenerate: bool = False
+) -> str:
+    """Generate one SpectralEmbedding fixture (SPECTRAL-01, D-01/D-04/D-05).
+
+    CRITICAL (D-01): fit sklearn ``SpectralEmbedding`` with its OWN DEFAULT
+    CONSTRUCTOR — NO ``affinity`` / ``gamma`` override (the inverse of
+    KernelRidge's explicit kwargs). The default is
+    ``affinity='nearest_neighbors'``, ``n_components=2`` (D-08),
+    ``n_neighbors=10`` (D-03); ``gamma=None`` would resolve to ``1/n_features``
+    on the rbf path (D-04), exercised by the non-trivial ``SE_N_FEATURES``.
+
+    Stores row-major ``X`` + the fitted ``embedding_`` (``n × n_components``).
+    ``n_samples ≤ 64`` (D-05). ``degenerate=True`` builds a symmetric
+    block-structured affinity producing REPEATED eigenvalues so the Wave-2
+    subspace test (D-09) has a degenerate-spectrum fixture. Returns the path.
+    """
+    from sklearn.manifold import SpectralEmbedding
+
+    rng = np.random.default_rng(seed)
+    n, d = SE_N_SAMPLES, SE_N_FEATURES
+    if degenerate:
+        # Two tight, well-separated blocks → a (near-)degenerate low spectrum.
+        half = n // 2
+        block_a = rng.standard_normal((half, d)) * 0.05
+        block_b = rng.standard_normal((n - half, d)) * 0.05 + 10.0
+        x = np.vstack([block_a, block_b])
+    else:
+        x = rng.standard_normal((n, d))
+
+    # D-01: the estimator's OWN default constructor (no override). random_state
+    # fixes the internal eigensolver sign/RNG so the committed embedding_ is
+    # reproducible.
+    se = SpectralEmbedding(
+        n_components=SE_N_COMPONENTS, random_state=seed
+    )
+    embedding = se.fit_transform(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    tag = "spectral_embedding_degenerate" if degenerate else "spectral_embedding"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"{tag}_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        embedding=c(embedding),
+        gamma_default=c([1.0 / d]),
+    )
+    return out_path
+
+
+def gen_spectral_clustering(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one SpectralClustering fixture (SPECTRAL-02, D-01/D-10).
+
+    CRITICAL (D-01): fit sklearn ``SpectralClustering`` with its OWN DEFAULT
+    constructor for affinity/gamma — the default is ``affinity='rbf'``,
+    ``gamma=1.0`` (literal, D-04). Only ``n_clusters`` (and ``random_state`` for
+    reproducibility) is set; affinity/gamma are NOT overridden.
+
+    The fixture data is WELL-SEPARATED (D-10) so the partition is UNIQUE up to a
+    permutation → any KMeans converges to the same labels (the exact-labels gate
+    is sign-/init-immune). Stores row-major ``X`` + the fitted ``labels_``.
+    ``n_samples ≤ 64`` (D-05). Returns the path.
+    """
+    from sklearn.cluster import SpectralClustering
+
+    rng = np.random.default_rng(seed)
+    n, d, k = SC_N_SAMPLES, SC_N_FEATURES, SC_N_CLUSTERS
+    # k well-separated blobs (centers 12 units apart) so the embedding partition
+    # is unambiguous (D-10) — the v2 spectral analogue of the tuned DBSCAN fixture.
+    per = n // k
+    centers = np.array([[12.0 * i, 12.0 * i] for i in range(k)])
+    blocks = []
+    for i in range(k):
+        cnt = per if i < k - 1 else n - per * (k - 1)
+        blocks.append(rng.standard_normal((cnt, d)) * 0.2 + centers[i])
+    x = np.vstack(blocks)
+
+    # D-01: own default affinity ('rbf', gamma=1.0); D-10: well-separated so the
+    # inner KMeans (default kmeans++) lands on the unique partition.
+    sc = SpectralClustering(n_clusters=k, random_state=seed)
+    labels = sc.fit_predict(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"spectral_clustering_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        labels=c(labels),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -1646,6 +1804,24 @@ def main() -> None:
     # scott/silverman bandwidth rules (D-09/D-10).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_kernel_density(dtype=dtype)}")
+
+    # ---- Phase-9 spectral-family fixtures ----
+    # laplacian (PRIM-09): the normalized-graph-Laplacian value fixture + an
+    # isolated-node (zero-degree) fixture for the no-NaN/no-infinite-value guard.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_laplacian(dtype=dtype, isolated=False)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_laplacian(dtype=dtype, isolated=True)}")
+    # SpectralEmbedding (SPECTRAL-01): the default-constructor embedding (D-01) +
+    # a degenerate-spectrum fixture for the subspace test (D-09).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_spectral_embedding(dtype=dtype, degenerate=False)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_spectral_embedding(dtype=dtype, degenerate=True)}")
+    # SpectralClustering (SPECTRAL-02): default-constructor labels on a
+    # well-separated fixture (D-01/D-10) — exact labels up to permutation.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_spectral_clustering(dtype=dtype)}")
 
 
 if __name__ == "__main__":
