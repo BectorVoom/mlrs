@@ -118,7 +118,7 @@ Plans:
 - [x] 09-01-wave0-scaffold-PLAN.md — Wave-0 scaffold: AlgoError::NSamplesExceedsMaxDim (D-06) + laplacian prim/kernel stubs + 2 estimator homes + PyO3 spectral.rs stub + 5 #[ignore] test scaffolds + gen_spectral_embedding/clustering oracle generators (committed .npz, default constructors per D-01) — DONE 2026-06-21 (5c5e763, 2b1e4bd)
 
 **Wave 1** *(blocked on Wave 0)*
-- [ ] 09-02-laplacian-prim-PLAN.md — PRIM-09 laplacian.rs (zero-diag → row_reduce(Sum) degree GATHER → typed-zero dd guard → SharedMemory-free laplacian_map: L = I − D^-1/2 A D^-1/2) standalone-validated f32+f64, zero-degree no-NaN/inf, PoolStats memory gate
+- [x] 09-02-laplacian-prim-PLAN.md — PRIM-09 laplacian.rs (zero-diag → row_reduce(Sum) degree GATHER → typed-zero dd guard → SharedMemory-free laplacian_map: L = I − D^-1/2 A D^-1/2) standalone-validated f32+f64, zero-degree no-NaN/inf, PoolStats memory gate — DONE 2026-06-21 (c2ec4fb, 545d5b7); f64 max_abs 5.6e-17 / f32 2.98e-8
 
 **Wave 2** *(blocked on Wave 1)*
 - [ ] 09-03-spectral-embedding-PLAN.md — SPECTRAL-01 SpectralEmbedding (rbf + nearest_neighbors-default affinity → laplacian → eig reverse→ascending → /dd recovery → sign-flip → drop-trivial; gamma None→1/n_features D-04; degenerate subspace test D-09; reject n_samples>64 D-06)

@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: executing
-stopped_at: Phase 09 (spectral-family) context gathered — ready for planning
-last_updated: "2026-06-21T02:42:05.342Z"
-last_activity: 2026-06-21 -- Phase 09 execution started
+stopped_at: Completed 09-02-PLAN.md (PRIM-09 laplacian filled + validated)
+last_updated: "2026-06-21T03:02:21.000Z"
+last_activity: 2026-06-21 -- Completed 09-02-PLAN.md (PRIM-09)
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 16
-  completed_plans: 12
-  percent: 40
+  completed_plans: 13
+  percent: 43
 ---
 
 # Project State
@@ -26,13 +26,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 09 (spectral-family) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Executing Phase 09
-Last activity: 2026-06-21 -- Completed 09-01-PLAN.md (Wave-0 scaffold)
-Resume file: .planning/phases/09-spectral-family/09-01-SUMMARY.md
-Next: Phase 09 Wave-1 — plan 09-02 fills laplacian.rs + laplacian_map (PRIM-09)
+Last activity: 2026-06-21 -- Completed 09-02-PLAN.md (PRIM-09 laplacian)
+Resume file: .planning/phases/09-spectral-family/09-02-SUMMARY.md
+Next: Phase 09 Wave-2 — plan 09-03 fills SpectralEmbedding (SPECTRAL-01)
 
-Progress: [####      ] 40% (v2.0 — 2/5 phases complete)
+Progress: [####      ] 43% (v2.0 — 2/5 phases complete)
 
 ## Open Follow-ups (Phase 05)
 
@@ -105,6 +105,7 @@ Progress: [####      ] 40% (v2.0 — 2/5 phases complete)
 | Phase 08 P03 | 4 | 2 tasks | 3 files |
 | Phase 08 P05 | 9 | 2 tasks | 5 files |
 | Phase 09 P01 | 12 | 2 tasks | 19 files |
+| Phase 09 P02 | 5 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -114,6 +115,7 @@ Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
 - [09-01]: Phase-9 Wave-0 scaffold mirrors 08-01: front-loads ALL shared-file edits (error.rs/prims-mod.rs/cluster-mod.rs/estimators-mod.rs/lib.rs×2/kernels-lib.rs) + every compiling stub + the test scaffolding into one wave so Waves 1/2/3 are file-disjoint and parallel-safe. Lands the typed `AlgoError::NSamplesExceedsMaxDim` (D-06, n_samples>64 → names the dense-eig MAX_DIM=64 cap; reuses InvalidK for n_clusters/n_neighbors + InvalidGamma for non-finite gamma — no new variants for those), the `laplacian(pool, A, n) -> (L, dd)` host signature (RESEARCH Open Q2: estimator builds the affinity, prim returns Laplacian + degree-norm vector dd) with a REAL geometry guard but a `todo!()` compute body (Wave-1 09-02 fills it), the `laplacian_map` `#[cube(launch)]` stub (placeholder body, real launch shape + per-index dd gather like div_by_row; shared-memory-free, atomics-free, no infinite-value constant — the cpu-MLIR-safe profile Wave-1 inherits, T-9-LAP), both estimator struct homes (SpectralEmbedding default affinity=nearest_neighbors/gamma=None/n_components=2; SpectralClustering default affinity=rbf/gamma=1.0/n_clusters=8 — the D-01 per-estimator default DISAGREEMENT honored verbatim in struct defaults + pyclass `#[pyo3(signature)]` + oracle constructors), and the two PyO3 `any_estimator!` pyclass stubs registered on `_mlrs` (zero new binding infra). Five #[ignore] Nyquist scaffolds compile + collect (laplacian value/zero_degree/memory_gate; SE rbf/knn/subspace/reject_oversize; SC labels-up-to-permutation; py-smoke construct+fit) asserting fixture-load+shape only; reject_oversize asserts the typed variant message STRUCTURALLY (fit is todo!() in Wave-0). 10 committed `.npz` fixtures generated with each estimator's OWN DEFAULT constructor (D-01, the inverse of Phase-7 oracle-injection) — default + degenerate-spectrum SE (subspace test), value + isolated-node laplacian (zero-degree guard), well-separated SC (D-10 unique partition); regen in the /tmp venv (numpy 2.4.6/scipy 1.18.0/sklearn 1.9.0, PEP 668), run in isolation so other phase blobs do not churn. laplacian.rs stays n<=64 cap-agnostic (like kernel_matrix.rs) — the cap is the estimator's job (D-06). Wave gate satisfied: 09-02/03/04 each edit only their own files.
+- [09-02]: PRIM-09 laplacian compute FILLED + standalone-validated (primitive-first gate). `laplacian(pool, A, n) -> (L, dd)` is a 4-step host orchestration over `row_reduce(Sum)` + three NEW SharedMemory-free/atomics-free/infinity-free map kernels: (1) `zero_diag_copy` (non-in-place `np.fill_diagonal(m,0)` so the caller's affinity A is never mutated — the degree must exclude the self edge, scipy order); (2) `row_reduce(Sum, Shared)` degree GATHER (single-owner, no scatter/atomics); (3) `degree_guard` = `dd = where(w==0, 1, sqrt(w))` typed-zero guard (T-9-LAP — replaces the would-be `1/sqrt(0)` infinite value with typed 1, STATEMENT-form per Cubecl_conditionals.md, NO F::INFINITY); (4) `laplacian_map` = off-diag `-a/(dd_i·dd_j)` (dd GATHERed by row/col index, div_by_row idiom) + diagonal `1 - isolated`. KEY: `laplacian_map` threads the DEGREE vector `w` alongside `dd` so the diagonal uses the TRUE `w[i]==0` isolated test (not a `dd==1` heuristic, which is ambiguous for degree==1) — byte-exact diagonal vs scipy. The transient working buffer + degree vector are released (memory gate: live conserves, peak plateaus, read_backs==0); `dd` is RETURNED alongside `L` (the D-07 recovery in 09-03 divides each recovered eigenvector by it). Values vs scipy `_laplacian_dense`: f64 L max_abs 5.6e-17 (strict 1e-5), f32 2.98e-8 (band 1e-4). Zero-degree node: dd==1, L row all-zero, L diag 0, all-finite (no NaN/inf). 4 laplacian_test fns green cpu(f32+f64); INFINITY + SharedMemory grep gates clean on the new sources. NOTE: `mlrs-kernels` is feature-free so Task-1's `cargo build --features cpu -p mlrs-kernels` is wrong (no cpu feature) — build with bare `cargo build -p mlrs-kernels`; the launch-codegen gate is the backend test. zero_diag_copy was added under Task 2 (the host-orchestration step-1 — no existing diag-zero idiom in the codebase).
 - [08-05]: KernelRidge + KernelDensity wrapped on `_mlrs` with ZERO new binding infra — reuse the shipped any_estimator! macro + ingress/egress/capability/errors verbatim (the 07-07 incremental-wrap precedent). Unfit stores the kernel NAME (String) + raw scalar hyperparameters (alpha/gamma/degree/coef0 for KR; bandwidth spec for KD); the precision-typed Kernel<F>/KdKernel/BandwidthSpec is built at fit, where the algos estimator resolves gamma=None→1/n_features (D-05) and scott/silverman from n_features (D-09) — Open Q3. Output methods are dtype-suffixed (predict_f32/_f64, score_samples_f32/_f64; dual_coef_f32/_f64, log_density_f32/_f64) mirroring linear.rs (a #[pyclass] method can't be return-type-generic); bandwidth_ is single-typed f64. score_samples is the ONE new exposed method (D-12). guard_f64() gates BOTH F64 fit arms BEFORE upload (statically grep-verified, WARNING 2); py.detach releases the GIL around every device call. The PYTHON SMOKE TEST drives the LOW-LEVEL mlrs._mlrs.KernelRidge/KernelDensity classes DIRECTLY via pyarrow capsules (the pure-Python mlrs/ shim has no kernel-family module — that shim work is Plan-04/Phase-11 PY-06-final scope, out of this incremental wrapper share); it proved fit/predict + fit/score_samples across f32+f64 green 4/4 via maturin develop --release on cpu (cpu supports f64 so both arms ran; f64 cases are backend_supports_f64()-gated to skip on rocm). pyo3 stays 0.28. This is the incremental per-phase Python wrapping; PY-06 final sign-off stays Phase 11.
 - [08-02]: kernel_matrix (PRIM-08) is the base-op→in-place-map idiom (covariance.rs:151-204) applied to the kernel family: Linear→gemm(transb=true) returned directly (identity); Rbf→distance(sqrt=false) squared base then rbf_map=exp(-γ·sqdist) in place; Poly→gemm base then poly_map=powf(γ·g+coef0, degree) (real F degree, sklearn-faithful); Sigmoid→gemm base then sigmoid_map=tanh(γ·g+coef0). The three map kernels are STATIC-transcendental (F::exp/F::powf/F::tanh, Pitfall 7), bounds-checked, shared-memory-free, atomics-free, no infinity constant (cpu-MLIR-safe). The map runs IN PLACE (input handle == output handle via launch_map_in_place) so no parallel n×n allocation — the PoolStats gate (Rbf branch, N=5) observed live=[0;5] peak=[272;5] on cpu. Values match sklearn pairwise_kernels: f64 ≤2.2e-16 (strict 1e-5), f32 ≤2.4e-7 (1e-4 band). Rule 3: map-kernel doc-comments reworded to avoid the literal tokens `SharedMemory`/`F::INFINITY` so the plan's literal grep gates pass (the code constructs were never present). Wave gate satisfied — Plan 03 KernelRidge may now wire its dual solve on the validated prim.
 - [08-01]: Phase-8 Wave-0 scaffold mirrors 07-01: front-loads ALL shared-file edits (lib.rs/traits.rs/error.rs/prims/mod.rs) + test scaffolding into one wave so Wave-1/2/3 are file-disjoint and parallel-safe. Lands the ScoreSamples<F> trait (D-12, per-sample log-density — DISTINCT from Predict, returns length-n not a regression target), three AlgoError guards (InvalidBandwidth/InvalidDegree/InvalidKernel; alpha>=0 REUSES InvalidAlpha), the typed Kernel<F> enum (D-01: Linear/Rbf{gamma}/Poly{gamma,degree,coef0}/Sigmoid{gamma,coef0}, degree stored as real F for sklearn-faithful powf) + kernel_matrix host signature (D-02 general K(X,Y), rows_x×rows_y) with REAL geometry validation but todo!() compute path (Wave-1 08-02 fills it), and the kernel_ridge//density/ module homes (KD gets its OWN density/ home per RESEARCH Open Q2 — it implements ScoreSamples, NOT KNeighbors/PredictLabels). Rule 2: kernel_matrix::validate_geometry adds a DimMismatch on cols==cols_y (K(X,Y) needs a shared feature space, T-08-01-01 validate-before-launch). Three #[ignore] Nyquist test scaffolds assert fixture-load+shape ONLY (compile today, no compute symbols) carrying the skip_f64_with_log gate verbatim; six committed sklearn oracle fixtures (kernel_matrix via pairwise_kernels, kernel_ridge via KernelRidge, kernel_density via KernelDensity atol=0/rtol=0 forced-exact, both dtypes seed42) store both default+explicit-gamma and resolved scott/silverman bandwidth_ so Wave-2 pins D-05/D-09 directly. Fixtures regen in a /tmp venv (numpy 2.4.6/sklearn 1.9.0, PEP 668), run in isolation to avoid churning other phase blobs.
@@ -227,6 +229,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-21T00:00:00Z
-Stopped at: Phase 09 (spectral-family) context gathered — ready for planning
-Resume file: .planning/phases/09-spectral-family/09-CONTEXT.md
+Last session: 2026-06-21T03:02:21Z
+Stopped at: Completed 09-02-PLAN.md (PRIM-09 laplacian filled + validated)
+Resume file: .planning/phases/09-spectral-family/09-02-SUMMARY.md
