@@ -374,6 +374,20 @@ pub enum BuildError {
         l1_ratio: f64,
     },
 
+    /// A linear-SVM estimator (LinearSVC / LinearSVR) was given a non-positive
+    /// inverse-regularization `C`. `C` scales the data-fit (hinge / epsilon-tube)
+    /// term against the L2 penalty and must be `C > 0` (sklearn's contract); a
+    /// non-positive `C` makes the regularized objective degenerate. Rejected at
+    /// `build()` (T-10-04-01) — the construction-time (data-INDEPENDENT) sibling
+    /// of [`AlgoError::InvalidC`], which the fit-time solvers raise.
+    #[error("estimator '{estimator}': C = {c} is invalid (must be > 0)")]
+    InvalidC {
+        /// Which estimator's builder rejected the value (e.g. `"linear_svc"`).
+        estimator: &'static str,
+        /// The offending inverse-regularization strength.
+        c: f64,
+    },
+
     /// An SGD estimator was given a non-positive initial learning rate `eta0`.
     /// The `constant` / `invscaling` schedules require `eta0 > 0`; a non-positive
     /// initial rate makes the schedule degenerate. Rejected at `build()`
