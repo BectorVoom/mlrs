@@ -4,9 +4,9 @@ fixed_at: 2026-06-21T00:00:00Z
 review_path: .planning/phases/10-sgd-linear-svm/10-REVIEW.md
 iteration: 1
 findings_in_scope: 14
-fixed: 13
-skipped: 1
-status: partial
+fixed: 14
+skipped: 0
+status: all_fixed
 ---
 
 # Phase 10: Code Review Fix Report
@@ -17,8 +17,8 @@ status: partial
 
 **Summary:**
 - Findings in scope: 14 (fix_scope = all — CR + WR + IN)
-- Fixed: 13
-- Skipped: 1
+- Fixed: 14
+- Skipped: 0
 
 All Phase-10 oracle/build tests were re-run after the fixes and pass:
 `mlrs-backend` `sgd_test` (6), `mlrs-algos` `mbsgd_classifier_test` (10),
@@ -169,26 +169,32 @@ sklearn's `optimal_init`).
 
 ## Skipped Issues
 
-### IN-02: redundant per-crate duplication of `host_to_f64` / `f64_to_host` / `narrow`
+None — all 14 findings in scope were fixed.
 
-**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:654-679`,
-`linear_svr.rs:348-354`, `mbsgd_classifier.rs:551-565`,
-`crates/mlrs-backend/src/prims/sgd.rs:473-488`
-**Reason:** skipped — the dedup is module-wide and crosses a crate boundary, so a
-faithful "single `pub(crate)` helper" fix is out of the narrow per-finding scope.
-The identical helper bodies exist in NINE `mlrs-algos/src/linear/` files
-(`linear_regression`, `ridge`, `lasso`, `elastic_net`, `coordinate_descent`,
-`logistic`, plus the four Phase-10 files) AND independently in `mlrs-backend`'s
-`prims/sgd.rs`. A single `pub(crate)` helper cannot span the two crates (it would
-have to move to `mlrs-core`), and consolidating only the Phase-10 files would not
-achieve the finding's "single helper" goal while still editing 5+ non-Phase-10
-estimator files unrelated to this phase — violating the narrow-scope rule and
-risking regressions in estimators outside this review. This is an Info-level
-cosmetic finding already acknowledged in-code as accepted copy-paste; the proper
-fix is a dedicated module-wide refactor task.
-**Original issue:** The same `size_of::<F>()` bit-reinterpret helper is
-re-implemented in at least six places with identical bodies and `unreachable!`
-arms; it remains copy-paste that will drift.
+### IN-02 (resolved in a dedicated follow-up refactor)
+
+**Original issue:** The same `size_of::<F>()` bit-reinterpret helper
+(`host_to_f64` / `f64_to_host` / the `narrow` clone) was re-implemented with
+identical bodies in ~30 source files across two crates and would drift.
+
+**Resolution:** Initially skipped in the per-finding fix pass (the dedup is
+workspace-wide and crosses the `mlrs-algos`/`mlrs-backend` crate boundary, which
+a single `pub(crate)` helper cannot span). It was then resolved as the
+user-requested module-wide refactor:
+
+- Added a shared `pub` `float_cast` module to `mlrs-core` (the crate both
+  algorithm crates already depend on), re-exporting `host_to_f64` / `f64_to_host`
+  at the crate root — commit `a62d81f`.
+- Deleted the 30 byte-identical local copies across `mlrs-algos/src` and
+  `mlrs-backend/src` and migrated every call site to the shared pair, folding
+  `sgd.rs`'s `narrow` into `f64_to_host` and redirecting the spectral
+  cross-module imports — commit `21ca8dc`. Net −490 lines.
+
+**Verification:** `cargo check --features cpu` clean across `mlrs-core`,
+`mlrs-algos`, and `mlrs-backend`; `mlrs-core` `float_cast` unit tests (5) pass;
+`sgd_test` (6), `mbsgd_classifier_test` (10), `pca_test` (10),
+`spectral_embedding_test` (5), and `logistic_test` (6) all pass. Behavior is
+unchanged — the bodies were identical bar the `unreachable!` message.
 
 ---
 
