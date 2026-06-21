@@ -21,12 +21,16 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
-use crate::naive_bayes::multinomial_nb::validate_discrete_alpha;
-use crate::traits::Fit;
+use crate::naive_bayes::multinomial_nb::{
+    decode_classes, resolve_class_log_prior, validate_discrete_alpha,
+};
+use crate::naive_bayes::nb_common::{argmax_decode, class_grouped_sum, log_sum_exp_normalize};
+use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
 
 /// Bernoulli Naive Bayes (NB-03). Construct via [`BernoulliNB::builder`], then
 /// [`Fit::fit`] + (Wave-1) the predict surface. Fitted `feature_log_prob_` /
@@ -35,6 +39,8 @@ pub struct BernoulliNB<F> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is when `< 1e-10` (D-02 default `true`); else clip (D-06).
+    /// Retained as fitted-config provenance; the clip already applied at `build()`.
+    #[allow(dead_code)]
     force_alpha: bool,
     /// Threshold for binarizing the input; `None` disables binarization (assumes
     /// already-binary), `Some(t)` maps `x > t → 1` (D-02 default `Some(0.0)`).
@@ -48,7 +54,14 @@ pub struct BernoulliNB<F> {
     /// Feature count inferred at `fit`.
     n_features: usize,
     /// Fitted `feature_log_prob_` (`n_classes × n_features`), device-resident.
+    /// This is the GEMM operand `log p − log(1 − p)` (Pitfall 5), NOT the raw
+    /// `log p` — the non-occurrence term is folded in so the device matvec is a
+    /// single GEMM. The raw `log p` is recoverable but never needed at predict.
     feature_log_prob_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Per-class non-occurrence constant `Σ_j log(1 − p_cj)` (sklearn `neg_prob`
+    /// row-sum), host f64, length `n_classes`, `None` until `fit`. Added to the
+    /// joint LL bias alongside `class_log_prior_` (Pitfall 5).
+    neg_prob_sum_: Option<Vec<f64>>,
     /// Per-class log-prior (host f64), `None` until `fit`.
     class_log_prior_: Option<Vec<f64>>,
 }
@@ -70,6 +83,25 @@ where
     /// The per-class log-prior (`None` until `fit`).
     pub fn class_log_prior(&self) -> Option<&[f64]> {
         self.class_log_prior_.as_deref()
+    }
+
+    /// Host-materialized GEMM operand `log p − log(1 − p)` (`n_classes ×
+    /// n_features` row-major), `None` until `fit`. NOTE this is the folded
+    /// operand, not the raw `feature_log_prob_` (= `log p`).
+    pub fn feature_log_prob_delta(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<f64>> {
+        self.feature_log_prob_
+            .as_ref()
+            .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
+    }
+}
+
+/// Apply the D-04 binarization to a host f64 buffer: `Some(t)` maps `x > t → 1.0`
+/// else `0.0`; `None` assumes the input is already binary and passes it through.
+fn binarize_host(buf: &mut [f64], binarize: Option<f64>) {
+    if let Some(t) = binarize {
+        for v in buf.iter_mut() {
+            *v = if *v > t { 1.0 } else { 0.0 };
+        }
     }
 }
 
@@ -148,6 +180,7 @@ impl BernoulliNBBuilder {
             classes_: Vec::new(),
             n_features: 0,
             feature_log_prob_: None,
+            neg_prob_sum_: None,
             class_log_prior_: None,
         })
     }
@@ -159,7 +192,7 @@ where
 {
     fn fit(
         &mut self,
-        _pool: &mut BufferPool<ActiveRuntime>,
+        pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
@@ -185,14 +218,207 @@ where
                 len: y.len(),
             }));
         }
-        let _ = (
-            self.alpha,
-            self.force_alpha,
-            self.binarize,
+
+        let (classes_, class_of_row, n_classes) = decode_classes(pool, y, n_samples)?;
+
+        // --- D-04 binarize: apply x>t → 1 on a host copy BEFORE the GATHER so the
+        //     per-(class, feature) counts are occurrence counts. binarize=None
+        //     assumes the input is already binary (pass-through). ---
+        let mut x_bin: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        binarize_host(&mut x_bin, self.binarize);
+        let x_bin_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
+            pool,
+            &x_bin.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
+        );
+
+        // feature_count_[c,j] = Σ over class-c rows of binarized x[i,j].
+        let feature_count =
+            class_grouped_sum::<F>(pool, &x_bin_dev, shape, &class_of_row, n_classes)?;
+        x_bin_dev.release_into(pool);
+
+        let mut class_count_: Vec<f64> = vec![0.0; n_classes];
+        for &c in &class_of_row {
+            class_count_[c] += 1.0;
+        }
+
+        // --- feature_log_prob_[c,j] = log((count+alpha)/(class_count[c]+2·alpha))
+        //     (Pitfall 4: the Bernoulli denominator smoothing is 2·alpha). The GEMM
+        //     operand is the DELTA log p − log(1−p) and the per-class const
+        //     Σ_j log(1−p_cj) becomes the bias (Pitfall 5). ---
+        let alpha = self.alpha;
+        let mut flp_delta: Vec<f64> = vec![0.0; n_classes * n_features];
+        let mut neg_prob_sum: Vec<f64> = vec![0.0; n_classes];
+        for c in 0..n_classes {
+            let denom = class_count_[c] + 2.0 * alpha;
+            for j in 0..n_features {
+                let p = (feature_count[c][j] + alpha) / denom;
+                let log_p = p.ln();
+                let log_1mp = (1.0 - p).ln();
+                flp_delta[c * n_features + j] = log_p - log_1mp;
+                neg_prob_sum[c] += log_1mp;
+            }
+        }
+
+        let class_log_prior_ = resolve_class_log_prior(
+            "bernoulli_nb",
             self.fit_prior,
             &self.class_prior,
+            &class_count_,
+            n_classes,
+        )?;
+
+        if let Some(old) = self.feature_log_prob_.take() {
+            old.release_into(pool);
+        }
+        let flp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
+            pool,
+            &flp_delta.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
         );
-        let _ = (&self.feature_log_prob_, &self.class_log_prior_, &self.n_features);
-        todo!("BernoulliNB::fit compute body — Wave 1 (11-03)")
+
+        self.classes_ = classes_;
+        self.n_features = n_features;
+        self.feature_log_prob_ = Some(flp_dev);
+        self.neg_prob_sum_ = Some(neg_prob_sum);
+        self.class_log_prior_ = Some(class_log_prior_);
+        Ok(self)
+    }
+}
+
+impl<F> BernoulliNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Per-query-row joint log-likelihood (`n_query × n_classes`, host f64). The
+    /// query X is binarized the SAME way as fit, then
+    /// `LL[i,c] = class_log_prior_[c] + Σ_j log(1−p_cj)
+    ///          + Σ_j x_ij·(log p_cj − log(1−p_cj))` — the Σ_j x·delta term is the
+    /// device `gemm(X_bin @ flp_delta.T)` (Pitfall 5), the rest the per-class bias.
+    fn joint_log_likelihood(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<Vec<f64>, AlgoError> {
+        let (n_query, n_features) = shape;
+        let flp = self.feature_log_prob_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "bernoulli_nb",
+            operation: "predict (call fit first)",
+        })?;
+        let neg_prob_sum = self.neg_prob_sum_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "bernoulli_nb",
+            operation: "predict (call fit first)",
+        })?;
+        let class_log_prior = self.class_log_prior_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "bernoulli_nb",
+            operation: "predict (call fit first)",
+        })?;
+        if n_query == 0 || n_features != self.n_features || x.len() != n_query * n_features {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "bernoulli_nb",
+                reason: format!(
+                    "predict geometry: got {n_query}x{n_features}, fitted n_features={}",
+                    self.n_features
+                ),
+            });
+        }
+        let n_classes = self.classes_.len();
+
+        // Binarize the query the same way as fit BEFORE the GEMM.
+        let mut xq_bin: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        binarize_host(&mut xq_bin, self.binarize);
+        let xq_bin_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
+            pool,
+            &xq_bin.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
+        );
+
+        let raw = gemm::<F>(
+            pool,
+            &xq_bin_dev,
+            (n_query, n_features),
+            flp,
+            (n_features, n_classes),
+            false,
+            true,
+            None,
+        )?;
+        let raw_host = raw.to_host(pool);
+        raw.release_into(pool);
+        xq_bin_dev.release_into(pool);
+
+        let mut jll = vec![0.0f64; n_query * n_classes];
+        for i in 0..n_query {
+            for c in 0..n_classes {
+                jll[i * n_classes + c] = class_log_prior[c]
+                    + neg_prob_sum[c]
+                    + host_to_f64(raw_host[i * n_classes + c]);
+            }
+        }
+        Ok(jll)
+    }
+}
+
+impl<F> PredictLabels<F> for BernoulliNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_labels(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let labels = argmax_decode(&jll, &self.classes_);
+        Ok(DeviceArray::from_host(pool, &labels))
+    }
+}
+
+impl<F> PredictProba<F> for BernoulliNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_query, _n_features) = shape;
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let n_classes = self.classes_.len();
+        let mut proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        for r in 0..n_query {
+            let row = &jll[r * n_classes..(r + 1) * n_classes];
+            let (p, _lp) = log_sum_exp_normalize(row, n_classes);
+            for (c, &pv) in p.iter().enumerate() {
+                proba[r * n_classes + c] = f64_to_host::<F>(pv);
+            }
+        }
+        Ok(DeviceArray::from_host(pool, &proba))
+    }
+}
+
+impl<F> PredictLogProba<F> for BernoulliNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_log_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_query, _n_features) = shape;
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let n_classes = self.classes_.len();
+        let mut log_proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        for r in 0..n_query {
+            let row = &jll[r * n_classes..(r + 1) * n_classes];
+            let (_p, lp) = log_sum_exp_normalize(row, n_classes);
+            for (c, &lpv) in lp.iter().enumerate() {
+                log_proba[r * n_classes + c] = f64_to_host::<F>(lpv);
+            }
+        }
+        Ok(DeviceArray::from_host(pool, &log_proba))
     }
 }
