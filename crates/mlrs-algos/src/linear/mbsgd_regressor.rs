@@ -17,17 +17,21 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::sgd::sgd_solve;
 use mlrs_backend::runtime::ActiveRuntime;
+use mlrs_core::PrimError;
 
-use crate::error::BuildError;
+use crate::error::{AlgoError, BuildError};
+use crate::linear::elastic_net::predict_linear;
+use crate::linear::mbsgd_classifier::lower_config;
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
+use crate::traits::{Fit, Predict};
 
 /// Minibatch-SGD linear regressor (SGDSVM-02). Construct via
-/// [`MBSGDRegressor::builder`].
-///
-/// Wave-0 scaffold: the fitted-state fields are written by the Wave-1 `fit`
-/// body, hence `allow(dead_code)` until then.
-#[allow(dead_code)]
+/// [`MBSGDRegressor::builder`], then [`Fit::fit`] + [`Predict::predict`]. Fitted
+/// `coef_` (length `n_features`) / `intercept_` (length 1) are device-resident
+/// (D-03).
 pub struct MBSGDRegressor<F> {
     /// The lowered, validated hyperparameter bundle (D-06).
     config: SgdConfig,
@@ -50,6 +54,30 @@ where
     /// The lowered configuration (D-06).
     pub fn config(&self) -> &SgdConfig {
         &self.config
+    }
+
+    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
+    /// [`AlgoError::NotFitted`] before `fit`.
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+        self.coef_
+            .as_ref()
+            .map(|c| c.to_host(pool))
+            .ok_or(AlgoError::NotFitted {
+                estimator: "mbsgd_regressor",
+                operation: "coef_",
+            })
+    }
+
+    /// Host copy of the fitted `intercept_` (scalar). Errors with
+    /// [`AlgoError::NotFitted`] before `fit`.
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
+        self.intercept_
+            .as_ref()
+            .map(|i| i.to_host(pool)[0])
+            .ok_or(AlgoError::NotFitted {
+                estimator: "mbsgd_regressor",
+                operation: "intercept_",
+            })
     }
 }
 
@@ -169,12 +197,61 @@ impl MBSGDRegressorBuilder {
     }
 
     /// Build the estimator, validating the data-INDEPENDENT hyperparameters
-    /// (D-08). The SIGNATURE is final (Wave-0); the validation predicates land in
-    /// Wave-1.
+    /// (D-08, T-10-03-01) BEFORE any data is seen (the data-DEPENDENT geometry
+    /// check lives in [`Fit::fit`]):
+    ///
+    /// - `alpha >= 0` ([`BuildError::InvalidAlpha`]).
+    /// - `l1_ratio ∈ [0, 1]` ([`BuildError::InvalidL1Ratio`]) when the penalty is
+    ///   `ElasticNet`.
+    /// - `eta0 > 0` ([`BuildError::InvalidEta0`]) unless the schedule is `Optimal`.
+    /// - `epsilon >= 0` ([`BuildError::InvalidEpsilon`]).
+    /// - the loss must be valid for a REGRESSOR ({`SquaredLoss`,
+    ///   `EpsilonInsensitive`, `SquaredEpsilonInsensitive`}); a classification loss
+    ///   (`Hinge` / `Log` / `SquaredHinge`) is
+    ///   [`BuildError::InvalidLossForEstimator`].
     pub fn build<F>(self) -> Result<MBSGDRegressor<F>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
+        // --- T-10-03-01 / ASVS V5: validate the data-INDEPENDENT hyperparameters
+        //     at build() BEFORE any data is seen (D-08). ---
+        if !(self.alpha >= 0.0) {
+            return Err(BuildError::InvalidAlpha {
+                estimator: "mbsgd_regressor",
+                alpha: self.alpha,
+            });
+        }
+        if self.penalty == Penalty::ElasticNet
+            && !(self.l1_ratio >= 0.0 && self.l1_ratio <= 1.0)
+        {
+            return Err(BuildError::InvalidL1Ratio {
+                estimator: "mbsgd_regressor",
+                l1_ratio: self.l1_ratio,
+            });
+        }
+        if self.learning_rate != LearningRate::Optimal && !(self.eta0 > 0.0) {
+            return Err(BuildError::InvalidEta0 {
+                estimator: "mbsgd_regressor",
+                eta0: self.eta0,
+            });
+        }
+        if !(self.epsilon >= 0.0) {
+            return Err(BuildError::InvalidEpsilon {
+                estimator: "mbsgd_regressor",
+                epsilon: self.epsilon,
+            });
+        }
+        match self.loss {
+            Loss::SquaredLoss
+            | Loss::EpsilonInsensitive
+            | Loss::SquaredEpsilonInsensitive => {}
+            other => {
+                return Err(BuildError::InvalidLossForEstimator {
+                    estimator: "mbsgd_regressor",
+                    loss: other.name().to_string(),
+                });
+            }
+        }
         let config = SgdConfig {
             loss: self.loss,
             penalty: self.penalty,
@@ -196,5 +273,79 @@ impl MBSGDRegressorBuilder {
             coef_: None,
             intercept_: None,
         })
+    }
+}
+
+impl<F> Fit<F> for MBSGDRegressor<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn fit(
+        &mut self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<&mut Self, AlgoError> {
+        let (n_samples, n_features) = shape;
+
+        // --- T-10-03-02 / ASVS V5: data-DEPENDENT geometry guard BEFORE any launch
+        //     (D-08 — the data-INDEPENDENT params were validated at build()). ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "mbsgd_regressor",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+
+        // --- Lower the validated SgdConfig into the prim-local flat SgdParams
+        //     (D-06; shared lowering with the classifier) and delegate to the
+        //     validated PRIM-10 prim (10-02). The regressor target `y` is the raw
+        //     continuous response (no ±1 remap). A device failure is a typed
+        //     PrimError wrapped via `?` (never a panic — T-10-03-03). ---
+        let params = lower_config(&self.config);
+        let (coef, intercept) = sgd_solve::<F>(pool, x, y, shape, &params)?;
+
+        self.coef_ = Some(coef);
+        self.intercept_ = Some(intercept);
+        Ok(self)
+    }
+}
+
+impl<F> Predict<F> for MBSGDRegressor<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Predict via the shared `X·coef_ + intercept_` path (the `elastic_net.rs`
+    /// [`predict_linear`] GEMM-then-broadcast — reused so the regression predict
+    /// surface is implemented once, D-03). No duplicated GEMM path.
+    fn predict(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        predict_linear(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            "mbsgd_regressor",
+            pool,
+            x,
+            shape,
+        )
     }
 }
