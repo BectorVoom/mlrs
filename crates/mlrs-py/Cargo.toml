@@ -48,6 +48,12 @@ mlrs-backend = { path = "../mlrs-backend" }
 # interpreter on first `Python::attach`.
 [dev-dependencies]
 pyo3 = { workspace = true, features = ["abi3-py312", "macros", "auto-initialize"] }
+# Device-kernel trait bounds (`Float` / `CubeElement`) for the generic device
+# fit/accessor smoke in `tests/spectral_smoke_test.rs`; default-features=false
+# (the backend feature arrives through the mlrs-backend dependency chain).
+cubecl = { workspace = true }
+# Test-scoped logger init for the spectral device smoke (mirrors the algos tests).
+env_logger = { workspace = true }
 
 # Backend selection forwards to the sub-crate features; exactly one is chosen at
 # wheel-build time via the per-backend pyproject `[tool.maturin].features`.
