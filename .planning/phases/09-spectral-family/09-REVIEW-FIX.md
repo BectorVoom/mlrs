@@ -1,114 +1,146 @@
 ---
 phase: 09-spectral-family
-fixed_at: 2026-06-21T00:00:00Z
+fixed_at: 2026-06-21T05:10:00Z
 review_path: .planning/phases/09-spectral-family/09-REVIEW.md
-iteration: 1
-findings_in_scope: 6
-fixed: 6
+iteration: 2
+findings_in_scope: 7
+fixed: 7
 skipped: 0
 status: all_fixed
 ---
 
 # Phase 9: Code Review Fix Report
 
-**Fixed at:** 2026-06-21
+**Fixed at:** 2026-06-21T05:10:00Z
 **Source review:** .planning/phases/09-spectral-family/09-REVIEW.md
-**Iteration:** 1
+**Iteration:** 2
+
+> Note: a prior fix report (iteration 1, for an earlier review pass covering
+> WR-01-old/WR-05/WR-06/WR-07) is preserved in git history at commit `cecd1de`.
+> This iteration-2 report covers the fresh `09-REVIEW.md` pass (reviewed
+> 2026-06-21T04:30, 4 Warnings + 3 Info).
 
 **Summary:**
-- Findings in scope: 6 (WR-01..WR-06; 0 Critical)
-- Fixed: 6
+- Findings in scope: 7 (4 Warning + 3 Info; fix_scope = "all")
+- Fixed: 7
 - Skipped: 0
 
-All five required correctness gates stayed green on `--features cpu` after every
-fix:
-`laplacian_test` (4), `spectral_embedding_test` (5), `spectral_clustering_test` (3),
-`spectral_smoke_test` (2), `kmeans_test` (6). No numerical output changed; the
-exact-label and embedding value/subspace gates still pass.
+All in-scope findings were fixed and committed atomically. Spectral algo tests
+(`spectral_clustering_test`, `spectral_embedding_test` — 8 tests incl.
+`knn_affinity` and the clustering `fit_predict` path) pass post-fix, and both
+`mlrs-algos` and `mlrs-py` type-check clean under `--features cpu --tests`.
+
+## Human-verification flags
+
+Three fixes change runtime behaviour or data flow (not just docs) and are flagged
+`fixed: requires human verification` per the logic-bug limitation — syntax/parse
+checks and the targeted test run pass, but a human should confirm the semantics:
+
+- **WR-02** — re-fit now reads persisted params (behavioural change to fit path).
+- **WR-03** — `fit_predict` now sources labels from a retained host buffer.
+- **IN-02** — affinity builder moved to a shared function (behaviour-preserving
+  move; validated by the passing `knn_affinity` + clustering tests).
 
 ## Fixed Issues
 
-### WR-01: Inner KMeans device buffers leak the pool accounting in `SpectralClustering::fit`
+### WR-01: Mutex-poison recovery silently corrupts pool accounting
 
-**Files modified:** `crates/mlrs-algos/src/cluster/kmeans.rs`, `crates/mlrs-algos/src/cluster/spectral_clustering.rs`
-**Commit:** 7f620bf
-**Applied fix:** Added a `KMeans::release_into(pool)` teardown that consumes
-`self` and returns `cluster_centers_` + `labels_` to the pool free-list (both
-`Option`-guarded; `DeviceArray` has no `Drop`). `SpectralClustering::fit` now
-calls `kmeans.release_into(pool)` after copying the labels to the host and before
-the function-local KMeans drops, so the inner KMeans' acquired bytes no longer leak
-`live_bytes` across re-fits (the FOUND-05 invariant). `kmeans_test` (incl.
-predict/inertia) and `spectral_clustering_test` both stay green — no regression.
+**Files modified:** `crates/mlrs-py/src/lib.rs`
+**Commit:** 2b34701
+**Status:** fixed
+**Applied fix:** Qualified the `lock_pool` doc (the reviewer's first option).
+Documented that "not left torn" is a memory-safety statement only; after a
+recovered poison, `live_bytes`/`peak_bytes` may be permanently inflated, and the
+FOUND-05 conservation property is VOID. The reviewer's alternative
+(`reconcile_live_bytes`) is not implementable: the pool's free-list only tracks
+released handles, while live handles are owned by `DeviceArray`s outside the pool,
+so there is no in-pool truth source to recompute `live_bytes` from. The honest doc
+qualification is the correct fix.
 
-### WR-02: A device error during `fit` poisons the process-global pool mutex permanently
+### WR-02: Re-`fit` discards user hyperparameters and reverts to defaults
 
-**Files modified:** `crates/mlrs-py/src/lib.rs`, `crates/mlrs-py/src/estimators/spectral.rs`
-**Commit:** 9c00da3
-**Applied fix:** Added a `pub(crate) fn lock_pool()` helper next to `global_pool()`
-that recovers from poisoning via `match global_pool().lock() { Ok(g) => g, Err(p) =>
-p.into_inner() }`. Replaced all 5 `global_pool().lock().expect("pool mutex")` sites
-in `spectral.rs` (`fit` ×2, the `embedding_f32`/`_f64` and `labels_` accessors) with
-`crate::lock_pool()`. A panicking device call inside `py.detach` no longer bricks the
-interpreter session — the pool data is not torn (ref-counted handles unwind before
-any half-write), so `into_inner()` recovery is sound. Scoped to the spectral module
-per the review (the other estimators' `.expect("pool mutex")` sites were left
-unchanged — out of this finding's scope).
+**Files modified:** `crates/mlrs-py/src/estimators/spectral.rs`
+**Commit:** 5b59088
+**Status:** fixed: requires human verification
+**Applied fix:** Added a persisted `params` field (`SpectralEmbeddingParams` /
+`SpectralClusteringParams`) to each `#[pyclass]` struct, populated in
+`new`/`unfit_default`, and read in `fit` via a destructuring of `self.params`
+instead of the `Unfit`-arm match with a hardcoded-defaults catch-all. A second
+`fit` of the same object now honours the user's constructor params (sklearn
+semantics). The shared `any_estimator!` macro was deliberately NOT modified (used
+by 12 estimators); this leaves the `Unfit` enum fields unread, producing 2 benign
+`dead_code` warnings on those macro-generated fields (no `deny(warnings)` in the
+project; build passes).
 
-### WR-03: `n_neighbors > n_samples` is a hard error; sklearn silently clamps
+### WR-03: `fit_predict` round-trips labels host→device→host→device needlessly
 
-**Files modified:** `crates/mlrs-algos/src/cluster/spectral_embedding.rs`, `crates/mlrs-algos/src/cluster/spectral_clustering.rs`
-**Commit:** d36c46f
-**Applied fix:** The `"nearest_neighbors"` path now clamps `let k =
-self.n_neighbors.min(n_samples)` and only rejects `k < 1` (instead of hard-erroring
-on `n_neighbors > n_samples`). Threaded the clamped `k` into
-`knn_connectivity_affinity` as a parameter (was reading `self.n_neighbors`). Matches
-sklearn's `kneighbors_graph` "use min(n_neighbors, n_samples)" behavior, so the SE
-default constructor (`n_neighbors=10`) now works for all `n_samples` in `[1, 64]`.
-`knn_affinity` and the SE/SC value gates stay green.
+**Files modified:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs`
+**Commit:** 60b334b
+**Status:** fixed: requires human verification
+**Applied fix:** Added a private `labels_host_: Option<Vec<i32>>` field that `fit`
+populates from the `labels_host` it already materializes. `fit_predict` now builds
+its returned device buffer directly from that retained host vector, eliminating the
+extra device→host read-back that `self.labels(pool)` incurred. The returned buffer
+is an independent allocation (no aliasing of `self.labels_`). Verified by the
+passing clustering tests.
 
-### WR-04: `gamma == 0.0` (and negative gamma) pass the `is_finite()` validation
+### WR-04: Inconsistent pool-lock helper undermines the poison recovery
 
-**Files modified:** `crates/mlrs-algos/src/cluster/spectral_embedding.rs`, `crates/mlrs-algos/src/cluster/spectral_clustering.rs`, `crates/mlrs-algos/src/error.rs`
-**Commit:** f863f15
-**Applied fix:** Tightened the rbf gamma guard in both estimators from
-`!gamma64.is_finite()` to `!(gamma64 > 0.0)` (which also subsumes the non-finite
-case — NaN and ±inf both fail `> 0.0`), reusing `AlgoError::InvalidGamma` per
-sklearn's `Interval(Real, 0, None, closed='neither')` contract. Broadened the
-`InvalidGamma` error message to "must be a finite value > 0" so it reads correctly
-for both the spectral (`> 0`) and the pre-existing KernelRidge (finite) callers.
+**Files modified:** `crates/mlrs-py/src/estimators/kernel.rs`,
+`crates/mlrs-py/src/dispatch.rs`, `crates/mlrs-py/src/lib.rs`
+**Commit:** adc0979
+**Status:** fixed
+**Applied fix:** Converted all 8 `kernel.rs` lock sites (the named sibling file the
+spectral wrappers copy structure from) from the panicking
+`global_pool().lock().expect(...)` form to the poison-recovering
+`crate::lock_pool()`. Updated the `dispatch.rs` doc skeleton + extension comment to
+show `lock_pool` as the sanctioned path, and documented in `lib.rs` that `lock_pool`
+is the single authoritative lock path — explicitly noting the remaining
+`linear`/`cluster`/`decomposition`/`covariance`/`neighbors`/`projection` wrappers
+as a tracked legacy migration (the reviewer's "or explicitly document" alternative).
+Those ~110 sites across unrelated, out-of-phase estimators were intentionally NOT
+bulk-converted in this spectral-phase fix to keep the change scoped; the policy is
+now documented so the migration is an explicit decision.
 
-### WR-05: eig `out`-reuse aliases the same handle as `&l` — sound today, silently breakable
+### IN-01: Unused `rng` binding on the degenerate SpectralEmbedding fixture path
 
-**Files modified:** `crates/mlrs-algos/src/cluster/spectral_embedding.rs`, `crates/mlrs-algos/src/cluster/spectral_clustering.rs`
-**Commit:** 2a7d420
-**Applied fix:** Chose review option (b) — documentation-only, zero behavior change
-(the safest choice for the verified phase; option (a)'s extra n² allocation was
-avoided). Added a comment block at both call sites naming the two load-bearing
-eig-internal invariants the aliasing reuse depends on: (1) eig READS `a_in` and never
-writes it, and (2) eig ACQUIRES its `w/V/info` outputs BEFORE releasing the `out`
-working buffer. Both were verified against the current `eig.rs` source (the
-`a_in_owned.release_into(pool)` happens after the `pool.acquire` calls; the kernel
-only reads `a_in`). Corrected the misleading `drop(l)` comment — eig releases the
-CLONE threaded through `out`, and `drop(l)` releases `l`'s remaining handle clone.
+**Files modified:** `scripts/gen_oracle.py`
+**Commit:** 655ce21
+**Status:** fixed
+**Applied fix:** Moved `rng = np.random.default_rng(seed)` into the `else`
+(non-degenerate) branch that actually consumes it, with a comment noting the
+degenerate path is deterministic. Python AST parse check passes.
 
-### WR-06: `recover_embedding` / `recover_maps` are duplicated verbatim except one slice bound
+### IN-02: `knn_connectivity_affinity` duplicated verbatim across the two estimators
 
-**Files modified:** `crates/mlrs-algos/src/cluster/spectral.rs` (new), `crates/mlrs-algos/src/cluster/mod.rs`, `crates/mlrs-algos/src/cluster/spectral_embedding.rs`, `crates/mlrs-algos/src/cluster/spectral_clustering.rs`
-**Commit:** baf21e6
-**Applied fix:** Created a new `pub(crate)` module `cluster/spectral.rs` holding a
-single `recover(v_host, dd, n, n_components, drop_first)` helper (the `drop_first:
-bool` is the only real difference — `m = n_components + 1` & row offset 1 for SE,
-`m = n_components` & offset 0 for SC) plus the shared `host_to_f64`/`f64_to_host`
-bytemuck pair. Both estimators now import and call the shared helper; their local
-`recover_embedding`/`recover_maps` and the duplicated conversion helpers were
-removed. The load-bearing recovery ORDER (slice ascending → `/dd` → sign-flip →
-drop-first/transpose) is now defined once, so the embedding and clustering paths
-stay bit-identical by construction. Registered the module as `pub(crate) mod
-spectral;` in `cluster/mod.rs`. The SE/SC value + exact-label gates confirm identical
-numerical output (no behavior change).
+**Files modified:** `crates/mlrs-algos/src/cluster/spectral.rs`,
+`crates/mlrs-algos/src/cluster/spectral_embedding.rs`,
+`crates/mlrs-algos/src/cluster/spectral_clustering.rs`
+**Commit:** 4e0c451
+**Status:** fixed: requires human verification
+**Applied fix:** Moved the byte-identical builder into
+`crate::cluster::spectral::knn_connectivity_affinity::<F>` (alongside `recover`),
+called from both estimators, and dropped the now-unused `distance`/`top_k`/
+`f64_to_host` imports. Behaviour-preserving; validated by the passing
+`knn_affinity` and clustering tests.
+
+### IN-03: SC gamma underflow accepted (sklearn-parity question)
+
+**Files modified:** `crates/mlrs-algos/src/cluster/spectral_clustering.rs`,
+`crates/mlrs-algos/src/cluster/spectral_embedding.rs`
+**Commit:** 6536974
+**Status:** fixed
+**Applied fix:** The reviewer asked for an explicit decision, not a code change.
+Added comments at both rbf gamma guards recording that accepting a finite-positive
+gamma which underflows to an effective-constant affinity (rejecting only
+`gamma <= 0` / non-finite) is intentional sklearn parity, not an oversight.
+
+## Skipped Issues
+
+None — all in-scope findings were fixed.
 
 ---
 
-_Fixed: 2026-06-21_
+_Fixed: 2026-06-21T05:10:00Z_
 _Fixer: Claude (gsd-code-fixer)_
-_Iteration: 1_
+_Iteration: 2_
