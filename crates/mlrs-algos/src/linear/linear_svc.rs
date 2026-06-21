@@ -376,6 +376,7 @@ where
             self.intercept_scaling,
             self.config.fit_intercept,
             self.config.max_iter,
+            self.config.tol,
             "linear_svc",
             |margin, target| {
                 // target is ±1; squared-hinge in the margin m = target·pred form
@@ -500,6 +501,7 @@ pub(crate) fn svm_lbfgs_fit<F>(
     intercept_scaling: f64,
     fit_intercept: bool,
     max_iter: usize,
+    gtol: f64,
     estimator: &'static str,
     margin_loss: impl Fn(f64, f64) -> (f64, f64),
 ) -> Result<
@@ -612,7 +614,8 @@ where
     };
 
     let x0 = vec![0.0f64; d_aug];
-    // gtol 1e-9 / a generous line-search budget so the convex objective reaches the
+    // gtol = the caller-configured `tol` (clamped, WR-01) / a generous line-search
+    // budget so the convex objective reaches the
     // converged optimum the liblinear oracle compares against (the SVM objective is
     // strictly convex — a unique global minimum, like the lbfgs convex-quadratic
     // standalone gate — so a deep solve lands ON the optimum, not past it). In f64
@@ -624,7 +627,12 @@ where
     // or below the dtype floor `k·sqrt(eps_F)` (the smallest gradient a flat-near-
     // minimum float loss can resolve); a residual ABOVE the floor is a genuine
     // non-stationary breakdown and stays `NotConverged` (T-10-04-03 DoS signal).
-    let result = lbfgs_minimize(x0, closure, 1e-9, LBFGS_FTOL, LBFGS_MAXLS, max_iter)?;
+    // WR-01: thread the caller-configured L-BFGS gradient tolerance through
+    // (sklearn `tol`), clamped to a sane positive floor so a `tol = 0` (the pinned
+    // deterministic-epochs oracle override) still requests a deep converged solve
+    // rather than gtol=0 (which can never fire).
+    let gtol = gtol.max(1e-12);
+    let result = lbfgs_minimize(x0, closure, gtol, LBFGS_FTOL, LBFGS_MAXLS, max_iter)?;
     if let Some(e) = prim_err {
         x_aug_dev.release_into(pool);
         return Err(AlgoError::Prim(e));

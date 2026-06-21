@@ -302,6 +302,7 @@ where
             self.intercept_scaling,
             self.config.fit_intercept,
             self.config.max_iter,
+            self.config.tol,
             "linear_svr",
             |margin, target| {
                 let r = target - margin;
