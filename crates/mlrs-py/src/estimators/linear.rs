@@ -804,3 +804,132 @@ impl PyLogisticRegression {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase-10 SGD / linear-SVM dtype-dispatch enums (SGDSVM-01..04, Wave-0 stubs).
+//
+// The 10-01 Wave-0 scaffold lands ONLY the `any_estimator!` Unfit{} stub blocks
+// (the dtype-dispatch enum the macro emits — the macro needs NO extension,
+// RESEARCH §Builder-API). Each `Unfit` arm stores the sklearn-named STRINGS +
+// scalars verbatim (loss/penalty/learning_rate strings, alpha/eta0/epsilon
+// scalars), exactly as `kernel.rs` stores `kernel: String`. The hand-written
+// `#[pymethods]` fit bodies — `Loss::try_from(s).map_err(build_err_to_py)?` →
+// `Estimator::<F>::builder()...build().map_err(build_err_to_py)?` →
+// `est.fit(...).map_err(algo_err_to_py)?` — and the `#[pyclass]` registration on
+// the `_mlrs` module are owned by the Wave-3 plan (so this scaffold compiles
+// WITHOUT the estimator bodies). The `unfit_default_*` helpers below are the
+// Wave-3 promotion seam (they exercise the `Unfit` arm exactly like
+// `PyLinearRegression::unfit_default`); `#[allow(dead_code)]` until Wave 3 wires
+// the pyclasses that consume the F32/F64 arms.
+// ---------------------------------------------------------------------------
+
+crate::any_estimator! {
+    any:   AnyMBSGDClassifier,
+    algo:  mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier,
+    unfit: {
+        loss: String, penalty: String, alpha: f64, l1_ratio: f64,
+        fit_intercept: bool, max_iter: usize, tol: f64,
+        learning_rate: String, eta0: f64, power_t: f64,
+        batch_size: usize, shuffle: bool, seed: u64,
+    },
+}
+
+crate::any_estimator! {
+    any:   AnyMBSGDRegressor,
+    algo:  mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor,
+    unfit: {
+        loss: String, penalty: String, alpha: f64, l1_ratio: f64,
+        fit_intercept: bool, max_iter: usize, tol: f64,
+        learning_rate: String, eta0: f64, power_t: f64, epsilon: f64,
+        batch_size: usize, shuffle: bool, seed: u64,
+    },
+}
+
+crate::any_estimator! {
+    any:   AnyLinearSVC,
+    algo:  mlrs_algos::linear::linear_svc::LinearSVC,
+    unfit: {
+        loss: String, penalty: String, c: f64, intercept_scaling: f64,
+        fit_intercept: bool, max_iter: usize, tol: f64,
+    },
+}
+
+crate::any_estimator! {
+    any:   AnyLinearSVR,
+    algo:  mlrs_algos::linear::linear_svr::LinearSVR,
+    unfit: {
+        loss: String, penalty: String, c: f64, epsilon: f64,
+        intercept_scaling: f64, fit_intercept: bool, max_iter: usize, tol: f64,
+    },
+}
+
+/// Wave-3 promotion seam: construct the unfit `MBSGDClassifier` dispatch arm
+/// from sklearn defaults (Wave 3 turns this into the `#[pyclass]` `#[new]`).
+#[allow(dead_code)]
+fn unfit_default_mbsgd_classifier() -> AnyMBSGDClassifier {
+    AnyMBSGDClassifier::Unfit {
+        loss: "hinge".to_string(),
+        penalty: "l2".to_string(),
+        alpha: 1e-4,
+        l1_ratio: 0.15,
+        fit_intercept: true,
+        max_iter: 1000,
+        tol: 1e-3,
+        learning_rate: "optimal".to_string(),
+        eta0: 0.01,
+        power_t: 0.5,
+        batch_size: 1,
+        shuffle: true,
+        seed: 0,
+    }
+}
+
+/// Wave-3 promotion seam for `MBSGDRegressor`.
+#[allow(dead_code)]
+fn unfit_default_mbsgd_regressor() -> AnyMBSGDRegressor {
+    AnyMBSGDRegressor::Unfit {
+        loss: "squared_error".to_string(),
+        penalty: "l2".to_string(),
+        alpha: 1e-4,
+        l1_ratio: 0.15,
+        fit_intercept: true,
+        max_iter: 1000,
+        tol: 1e-3,
+        learning_rate: "invscaling".to_string(),
+        eta0: 0.01,
+        power_t: 0.25,
+        epsilon: 0.1,
+        batch_size: 1,
+        shuffle: true,
+        seed: 0,
+    }
+}
+
+/// Wave-3 promotion seam for `LinearSVC`.
+#[allow(dead_code)]
+fn unfit_default_linear_svc() -> AnyLinearSVC {
+    AnyLinearSVC::Unfit {
+        loss: "squared_hinge".to_string(),
+        penalty: "l2".to_string(),
+        c: 1.0,
+        intercept_scaling: 1.0,
+        fit_intercept: true,
+        max_iter: 1000,
+        tol: 1e-4,
+    }
+}
+
+/// Wave-3 promotion seam for `LinearSVR`.
+#[allow(dead_code)]
+fn unfit_default_linear_svr() -> AnyLinearSVR {
+    AnyLinearSVR::Unfit {
+        loss: "squared_epsilon_insensitive".to_string(),
+        penalty: "l2".to_string(),
+        c: 1.0,
+        epsilon: 0.0,
+        intercept_scaling: 1.0,
+        fit_intercept: true,
+        max_iter: 1000,
+        tol: 1e-4,
+    }
+}

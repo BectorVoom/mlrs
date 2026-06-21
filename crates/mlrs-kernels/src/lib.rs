@@ -18,6 +18,11 @@ pub mod jacobi_svd;
 pub mod kmeans;
 pub mod lbfgs;
 pub mod reduce;
+// Phase-10 SGD kernels (Wave-0 scaffold plan 10-01 owns this registration; the
+// Wave-1 plan drives them from `prims/sgd.rs` — file-disjoint, parallel-safe).
+// `sgd_margin` (pass 1) + `sgd_weight_update` (pass 2) are the two-pass GATHER
+// idiom (single-owner, cubecl-cpu MLIR-safe); `sgd.rs` adds its own `pub use`.
+pub mod sgd;
 pub mod smoke;
 pub mod topk;
 

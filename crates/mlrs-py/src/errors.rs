@@ -16,6 +16,7 @@
 //! | unsupported / non-float Arrow dtype            | `PyTypeError`    |
 //! | f64-on-incapable-backend capability failure    | `PyValueError`   |
 //! | `AlgoError` (hyperparameter / not-fitted / …)  | `PyValueError`   |
+//! | `BuildError` (Phase-10 construction / enum)    | `PyValueError`   |
 //! | opaque `anyhow::Error`                          | `PyRuntimeError` |
 //!
 //! Rationale: a malformed/aliased buffer or an out-of-range hyperparameter is a
@@ -24,7 +25,7 @@
 //! classify falls back to `RuntimeError` rather than silently masquerading as a
 //! more specific class.
 
-use mlrs_algos::error::AlgoError;
+use mlrs_algos::error::{AlgoError, BuildError};
 use mlrs_core::error::BridgeError;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::PyErr;
@@ -53,6 +54,21 @@ pub fn bridge_err_to_py(err: BridgeError) -> PyErr {
 /// the Rust boundary surfaces it as a clear `ValueError` and the shim can refine
 /// it — Plan 03/04.)
 pub fn algo_err_to_py(err: AlgoError) -> PyErr {
+    PyValueError::new_err(err.to_string())
+}
+
+/// Map a [`BuildError`] (a Phase-10 construction-time hyperparameter / invalid
+/// enum-string failure from a builder `build()` or a `Loss`/`Penalty`/
+/// `LearningRate` `TryFrom<&str>`) to a `PyErr` (D-09).
+///
+/// These are all data-INDEPENDENT, caller-supplied-value problems, so they map
+/// to `PyValueError` with the typed error's `Display` text preserved — the same
+/// class `algo_err_to_py` uses. sklearn raises these at construction; mlrs
+/// surfaces them at the first `fit` (the Unfit arm stores the raw strings until
+/// then). Folding the enum-parse failures into `BuildError` means this SINGLE
+/// mapper covers every construction failure (mirrors the single-site
+/// `algo_err_to_py` rationale).
+pub fn build_err_to_py(err: BuildError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
