@@ -1628,18 +1628,20 @@ def gen_spectral_embedding(
     """
     from sklearn.manifold import SpectralEmbedding
 
-    rng = np.random.default_rng(seed)
     n, d = SE_N_SAMPLES, SE_N_FEATURES
     if degenerate:
         # Points on a circle → an rbf affinity that approximates a cycle graph,
         # whose normalized Laplacian has a degenerate Fiedler pair (multiplicity
         # 2). The trivial eigenvalue stays simple (connected graph), so the
         # AMBIGUITY is in the kept eigenspace — exactly the D-09 subspace case.
+        # IN-01: this geometry is deterministic (linspace/cos/sin), so no `rng`
+        # is needed here; it is created only on the non-degenerate path below.
         theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
         x = np.zeros((n, d))
         x[:, 0] = np.cos(theta)
         x[:, 1] = np.sin(theta)
     else:
+        rng = np.random.default_rng(seed)
         x = rng.standard_normal((n, d))
 
     gamma = 1.0 / d  # D-04: gamma=None → 1/n_features (resolved at fit).
