@@ -28,7 +28,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 - [x] **Phase 7: Covariance & Projection** — RNG-matrix + incremental-SVD prims, PartialFit trait; EmpiricalCovariance, LedoitWolf, IncrementalPCA, Gaussian/SparseRandomProjection (completed 2026-06-20)
 - [x] **Phase 8: Kernel Family** — kernel-matrix prim (linear/RBF/poly/sigmoid), ScoreSamples trait; KernelRidge, KernelDensity (completed 2026-06-21; verified 4/4 must-haves, UAT passed)
 - [x] **Phase 9: Spectral Family** — graph-Laplacian prim (hard dep on Phase 8 kernel-matrix); SpectralEmbedding, SpectralClustering (completed 2026-06-21)
-- [ ] **Phase 10: SGD / Linear-SVM** — SGD solver prim (the one new device solver, highest cpu-MLIR risk); MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR
+- [x] **Phase 10: SGD / Linear-SVM** — SGD solver prim (the one new device solver, highest cpu-MLIR risk); MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR (completed 2026-06-21)
 - [ ] **Phase 11: Naive Bayes** — reductions-only closing bookend; GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB
 
 ## Phase Details
@@ -202,5 +202,5 @@ Plans:
 | 7. Covariance & Projection | v2.0 | 7/7 | Complete    | 2026-06-20 |
 | 8. Kernel Family | v2.0 | 1/5 | Executing | - |
 | 9. Spectral Family | v2.0 | 4/4 | Complete    | 2026-06-21 |
-| 10. SGD / Linear-SVM | v2.0 | 0/5 | Planned | - |
+| 10. SGD / Linear-SVM | v2.0 | 6/6 | Complete    | 2026-06-21 |
 | 11. Naive Bayes | v2.0 | 0/? | Not started | - |
