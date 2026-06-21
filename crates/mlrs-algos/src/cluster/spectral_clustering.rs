@@ -80,6 +80,13 @@ where
     /// Fitted length-`n` integer labels (`i32`, the KMeans idiom), device-resident,
     /// `None` until `fit`.
     labels_: Option<DeviceArray<ActiveRuntime, i32>>,
+    /// WR-03: the host copy of `labels_` produced by the most recent `fit`, kept so
+    /// `fit_predict` can build its returned device buffer WITHOUT the extra
+    /// device→host read-back that calling `self.labels(pool)` would incur. `fit`
+    /// already materializes these labels on the host before uploading to
+    /// `labels_`, so retaining them is free; the only cost is `n` i32s of host
+    /// memory, which is reclaimed on the next `fit`.
+    labels_host_: Option<Vec<i32>>,
 }
 
 impl<F> SpectralClustering<F>
@@ -109,6 +116,7 @@ where
             n_neighbors,
             seed,
             labels_: None,
+            labels_host_: None,
         }
     }
 
@@ -315,11 +323,21 @@ where
             old.release_into(pool);
         }
         self.labels_ = Some(labels_dev);
+        // WR-03: retain the host labels (already materialized above) so a following
+        // `fit_predict` can rebuild a fresh device buffer without a redundant
+        // device→host read-back of `labels_`.
+        self.labels_host_ = Some(labels_host);
         Ok(self)
     }
 
     /// Convenience `fit_predict` (sklearn `ClusterMixin`): fit to `x` then return
     /// the fitted `labels_` as a fresh device-resident `i32` buffer.
+    ///
+    /// WR-03: builds the returned buffer directly from the host labels `fit` just
+    /// materialized (`labels_host_`), avoiding the extra device→host→device round
+    /// trip that calling `self.labels(pool)` (a fresh read-back of `labels_`) would
+    /// incur. The returned buffer is an INDEPENDENT device allocation — it does not
+    /// alias `self.labels_`, so the caller may `release_into` it freely.
     pub fn fit_predict(
         &mut self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -327,8 +345,16 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
         self.fit(pool, x, shape)?;
-        let labels = self.labels(pool)?;
-        Ok(DeviceArray::from_host(pool, &labels))
+        // `fit` always sets `labels_host_` on success; the `ok_or` is a defensive
+        // fallback that cannot trigger on the post-`fit` path.
+        let labels = self
+            .labels_host_
+            .as_ref()
+            .ok_or(AlgoError::NotFitted {
+                estimator: "spectral_clustering",
+                operation: "labels_",
+            })?;
+        Ok(DeviceArray::from_host(pool, labels))
     }
 
     /// Build the sklearn-exact binary kNN-connectivity affinity (D-03, RESEARCH
