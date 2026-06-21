@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: executing
-stopped_at: Completed 10-05-PLAN.md
-last_updated: "2026-06-21T07:56:38.000Z"
-last_activity: 2026-06-21 -- Completed Phase 10 Plan 05 (SGD/linear-SVM PyO3 wrap, SGDSVM-01..04 on _mlrs)
+stopped_at: Planned 10-06-PLAN.md (gap closure)
+last_updated: "2026-06-21T08:35:00.000Z"
+last_activity: 2026-06-21 -- Planned Phase 10 gap closure 10-06 (CR-01 optimal-schedule oracle + WR-01 L2 ordering); ready to execute
 progress:
   total_phases: 5
   completed_phases: 3
-  total_plans: 21
+  total_plans: 22
   completed_plans: 21
   percent: 76
 ---
@@ -25,14 +25,14 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 10 (sgd-linear-svm) — EXECUTING (all 5 plans complete; phase wrap-up pending)
-Plan: 5 of 5 complete (10-01 scaffold, 10-02 prim, 10-03 MBSGD*, 10-04 LinearSVC/SVR, 10-05 PyO3 wrap all done)
-Status: Executing Phase 10 (Plan 05 PyO3 wrap complete — SGDSVM-01..04 registered on _mlrs with builder-chain fit bodies; all four estimators fit→predict green on cpu)
-Last activity: 2026-06-21 -- Completed Phase 10 Plan 05 (four #[pyclass] estimators wired on _mlrs, end-to-end FFI smoke green)
-Resume file: .planning/phases/10-sgd-linear-svm/10-05-SUMMARY.md
-Next: Phase 10 plans complete — run the phase verifier / wrap-up (10-05 was the last plan; SGDSVM-01..04 + PRIM-10 all met)
+Phase: 10 (sgd-linear-svm) — EXECUTING (5 plans complete; gap-closure plan 10-06 planned, ready to execute)
+Plan: 5 of 6 complete (10-01 scaffold, 10-02 prim, 10-03 MBSGD*, 10-04 LinearSVC/SVR, 10-05 PyO3 wrap done; 10-06 gap closure planned)
+Status: Gap closure planned — verification (10-VERIFICATION.md) found truth #2 FAILED (CR-01: `optimal` LR schedule never validated against the sklearn oracle; WR-01: L2 wscale shrink applied before, not after, the gradient step). 10-06-PLAN.md closes both; plan-checker PASSED (0 blockers/0 warnings).
+Last activity: 2026-06-21 -- Planned Phase 10 gap closure 10-06 (CR-01 + WR-01); plan-checker verified
+Resume file: .planning/phases/10-sgd-linear-svm/10-06-PLAN.md
+Next: Execute the gap-closure plan — /gsd-execute-phase 10
 
-Progress: [#######   ] 76% (v2.0 — 3/5 phases complete, 21/21 plans)
+Progress: [#######   ] 76% (v2.0 — 3/5 phases complete, 21/22 plans)
 
 ## Open Follow-ups (Phase 05)
 
