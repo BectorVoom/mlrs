@@ -51,14 +51,25 @@ const SGD_ALPHA: f64 = 1e-4;
 const SGD_ETA0: f64 = 0.01;
 const SGD_MAX_ITER: usize = 50;
 
-/// f64 coef/intercept band. The host-driven minibatch SGD drives the same epoch
-/// schedule sklearn runs, but the order-of-operations (host f64 dloss/penalty vs
-/// sklearn's Cython `_sgd_fast`) differs in the last-bit accumulation, so the
-/// converged iterate agrees to a documented band rather than strict 1e-5. The
-/// EXACT predict labels (the hard gate) are the correctness witness.
-const COEF_BAND_F64: f64 = 5e-3;
-/// f32 coef/intercept band (round-off over the per-batch matvec accumulations).
-const COEF_BAND_F32: f64 = 2e-2;
+/// f64 coef/intercept band (relative-scaled: `band + band·|expected|`).
+///
+/// Re-pinned from 5e-3 → 1e-3 after the WR-01 ordering fix (the L2 `wscale`
+/// shrink now follows the gradient step, matching sklearn `_plain_sgd`). The
+/// CONSTANT schedule now agrees to ~3e-7 abs (effectively 1e-5). The binding
+/// constraint is the `optimal` (Bottou) schedule: its large effective step
+/// `eta = 1/(alpha·(t0+t−1))` drives `coef_` to magnitude ~28, where the
+/// per-sample minibatch order-of-operations vs sklearn's Cython `_sgd_fast`
+/// last-bit accumulation (WR-01/WR-07) leaves a residual ~2.8e-2 abs (~1e-3
+/// relative). The EXACT predict labels (the hard gate in both oracle_optimal
+/// tests) are the strict correctness witness; the band only bounds the
+/// last-bit iterate drift.
+const COEF_BAND_F64: f64 = 1e-3;
+/// f32 coef/intercept band (relative-scaled). Re-pinned 2e-2 → 1e-3: the
+/// CONSTANT schedule agrees to ~1e-5 abs (f32 round-off over the f64 result);
+/// the `optimal` schedule carries the SAME ~2.8e-2 abs / ~1e-3 relative
+/// residual as f64 (the residual is the per-sample ordering vs sklearn's
+/// last-bit accumulation, NOT f32 round-off — WR-01/WR-07). Exact labels gate.
+const COEF_BAND_F32: f64 = 1e-3;
 /// predict_proba band (the log-loss sigmoid over the decision margin).
 const PROBA_BAND_F64: f64 = 1e-2;
 const PROBA_BAND_F32: f64 = 3e-2;
@@ -107,8 +118,24 @@ fn assert_band(got: &[f64], expected: &[f64], band: f64, what: &str) {
 
 /// Build + fit a hinge `MBSGDClassifier` on the fixture with the EXPLICIT pinned
 /// (constant-schedule) hyperparameters and return host
-/// `(coef_, intercept_, predict_labels(Xq))`.
+/// `(coef_, intercept_, predict_labels(Xq))`. Delegates to [`fit_hinge_sched`]
+/// with `LearningRate::Constant` so the existing constant-schedule tests are
+/// unchanged in behavior.
 fn fit_hinge<F>(case: &OracleCase) -> (Vec<f64>, f64, Vec<i32>)
+where
+    F: Float + CubeElement + Pod,
+{
+    fit_hinge_sched::<F>(case, LearningRate::Constant)
+}
+
+/// Build + fit a hinge `MBSGDClassifier` on the fixture with the supplied
+/// learning-rate schedule. Identical to the pinned constant-schedule fit EXCEPT
+/// that the `optimal` schedule OMITS the `.eta0(SGD_ETA0)` setter: sklearn's
+/// optimal (Bottou) schedule ignores `eta0`, and the `_optimal` fixtures were
+/// generated with no `eta0` (gen_oracle.py only sets `kwargs["eta0"]` on the
+/// constant branch). All other setters stay pinned: hinge/l2, alpha,
+/// max_iter, tol=0, shuffle=false, batch_size=1, fit_intercept=true.
+fn fit_hinge_sched<F>(case: &OracleCase, lr: LearningRate) -> (Vec<f64>, f64, Vec<i32>)
 where
     F: Float + CubeElement + Pod,
 {
@@ -123,19 +150,23 @@ where
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq_host);
 
-    // EXPLICIT pinned setters (Pitfall 7) — hinge/l2, constant schedule, eta0,
-    // alpha, max_iter, tol=0, shuffle=false, batch_size=1 (sklearn SGD default).
-    let mut clf = MBSGDClassifier::<F>::builder()
+    // EXPLICIT pinned setters (Pitfall 7) — hinge/l2, alpha, max_iter, tol=0,
+    // shuffle=false, batch_size=1 (sklearn SGD default). The schedule is the
+    // parameter; eta0 is set ONLY for non-optimal schedules (optimal ignores it).
+    let mut builder = MBSGDClassifier::<F>::builder()
         .loss(Loss::Hinge)
         .penalty(Penalty::L2)
         .alpha(SGD_ALPHA)
-        .learning_rate(LearningRate::Constant)
-        .eta0(SGD_ETA0)
+        .learning_rate(lr)
         .max_iter(SGD_MAX_ITER)
         .tol(0.0)
         .shuffle(false)
         .batch_size(1)
-        .fit_intercept(true)
+        .fit_intercept(true);
+    if lr != LearningRate::Optimal {
+        builder = builder.eta0(SGD_ETA0);
+    }
+    let mut clf = builder
         .build::<F>()
         .expect("MBSGDClassifier builds with valid hyperparameters");
 
@@ -241,6 +272,76 @@ fn oracle() {
         &[intercept_ref[0]],
         COEF_BAND_F64,
         "MBSGDClassifier f64 intercept_",
+    );
+}
+
+/// CR-01 (closes truth #2): the `optimal` (Bottou) schedule — the sklearn
+/// `SGDClassifier()` default — matches the pinned oracle, f32. Loads the
+/// `_optimal` fixture, fits `LearningRate::Optimal` (no eta0), and asserts BOTH
+/// the coef/intercept band AND the EXACT predict labels (the hard gate proving
+/// the t0/schedule math regardless of the documented coef band). f32 runs on
+/// all backends (no skip gate).
+#[test]
+fn oracle_optimal_f32() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "optimal");
+    let case = load_npz(fixture("mbsgd_classifier_optimal_f32_seed42.npz"))
+        .expect("load mbsgd_classifier_optimal_f32");
+    let coef_ref = case.expect_f64("coef");
+    let intercept_ref = case.expect_f64("intercept");
+    let predict_ref: Vec<i32> = case
+        .expect_f64("predict")
+        .iter()
+        .map(|&v| v.round() as i32)
+        .collect();
+    let (coef, intercept, labels) = fit_hinge_sched::<f32>(&case, LearningRate::Optimal);
+    assert_band(&coef, coef_ref, COEF_BAND_F32, "MBSGDClassifier f32 optimal coef_");
+    assert_band(
+        &[intercept],
+        &[intercept_ref[0]],
+        COEF_BAND_F32,
+        "MBSGDClassifier f32 optimal intercept_",
+    );
+    assert_eq!(
+        labels, predict_ref,
+        "MBSGDClassifier f32 optimal exact predict labels (HARD gate)"
+    );
+}
+
+/// CR-01 (closes truth #2): the `optimal` (Bottou) schedule matches the pinned
+/// oracle, f64 (cpu runs; rocm skips per the CubeCL-HIP F64 gap). Exercises the
+/// default `SGDClassifier()` solver path (LearningRate::Optimal, no eta0
+/// override) against a real sklearn fit — coef/intercept band AND exact labels.
+#[test]
+fn oracle_optimal() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "optimal");
+    if capability::skip_f64_with_log() {
+        println!("mbsgd_classifier(optimal) f64 backend={backend}: SKIPPED (no f64 support)");
+        return;
+    }
+    let case = load_npz(fixture("mbsgd_classifier_optimal_f64_seed42.npz"))
+        .expect("load mbsgd_classifier_optimal_f64");
+    let coef_ref = case.expect_f64("coef");
+    let intercept_ref = case.expect_f64("intercept");
+    assert_eq!(coef_ref.len(), N_FEATURES, "fixture coef length");
+    assert_eq!(intercept_ref.len(), 1, "fixture intercept length");
+    let predict_ref: Vec<i32> = case
+        .expect_f64("predict")
+        .iter()
+        .map(|&v| v.round() as i32)
+        .collect();
+    let (coef, intercept, labels) = fit_hinge_sched::<f64>(&case, LearningRate::Optimal);
+    assert_band(&coef, coef_ref, COEF_BAND_F64, "MBSGDClassifier f64 optimal coef_");
+    assert_band(
+        &[intercept],
+        &[intercept_ref[0]],
+        COEF_BAND_F64,
+        "MBSGDClassifier f64 optimal intercept_",
+    );
+    assert_eq!(
+        labels, predict_ref,
+        "MBSGDClassifier f64 optimal exact predict labels (HARD gate)"
     );
 }
 
