@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: executing
-stopped_at: Completed 08-05-PLAN.md (PyKernelRidge + PyKernelDensity PyO3 wrappers)
+stopped_at: Phase 08 (kernel-family) complete — verified 4/4 must-haves, UAT passed, code-review blocker+correctness fixes merged
 last_updated: "2026-06-21T00:00:00Z"
-last_activity: 2026-06-21 -- Phase 08 plan 05 (kernel-family Python wrappers) complete
+last_activity: 2026-06-21 -- Phase 08 verified and closed (kernel-family)
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 12
-  completed_plans: 10
-  percent: 24
+  completed_plans: 12
+  percent: 40
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 08 — kernel-family
+**Current focus:** Phase 09 — spectral-family (next)
 
 ## Current Position
 
-Phase: 08 (kernel-family) — ALL PLANS COMPLETE (ready for verification/close)
+Phase: 08 (kernel-family) — COMPLETE (verified 4/4 must-haves, UAT passed)
 Plan: 5 of 5
-Status: Phase 08 plans complete (Wave-3 Python wrappers 08-05 done — PyKernelRidge/PyKernelDensity exposed, smoke test green)
-Last activity: 2026-06-21 -- Phase 08 plan 05 (kernel-family Python wrappers) complete
-Resume file: .planning/phases/08-kernel-family/08-05-SUMMARY.md
-Next: Phase 08 verification / close (all 5 plans complete)
+Status: Phase 08 closed — kernel_matrix prim (PRIM-08), KernelRidge (KERNEL-01), KernelDensity (KERNEL-02) + ScoreSamples trait shipped; code-review blocker CR-01 + correctness/memory warnings (WR-02/03/05/07) fixed and merged
+Last activity: 2026-06-21 -- Phase 08 verified and closed (kernel-family)
+Resume file: .planning/phases/08-kernel-family/08-VERIFICATION.md
+Next: Phase 09 (spectral-family) — reuses the Phase-8 kernel_matrix prim; start with /gsd-discuss-phase 9 or /gsd-plan-phase 9
 
-Progress: [#####     ] 30% (v2.0 — 1/5 phases; phase 08 plan 5/5 done)
+Progress: [####      ] 40% (v2.0 — 2/5 phases complete)
 
 ## Open Follow-ups (Phase 05)
 

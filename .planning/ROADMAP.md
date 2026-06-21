@@ -26,7 +26,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 ~16 sklearn-compatible estimators across five families, built as assembly on v1's validated primitive base plus five new feature-free CubeCL primitives — one (or zero) per phase. **No new compute dependency** (workspace `Cargo.toml` unchanged; pyo3 stays 0.28). Oracle = scikit-learn ≤ 1e-5; gate = cpu(f64) + rocm(f32), f64-on-rocm skips-with-log. Build order **7 → 8 → 9 → 10 → 11** is dependency-correct (P9 hard-depends on P8's kernel-matrix prim). Each phase keeps the v1 primitive-first shape: land + standalone-validate the new prim with its build-failing PoolStats memory gate, then assemble estimators on it.
 
 - [x] **Phase 7: Covariance & Projection** — RNG-matrix + incremental-SVD prims, PartialFit trait; EmpiricalCovariance, LedoitWolf, IncrementalPCA, Gaussian/SparseRandomProjection (completed 2026-06-20)
-- [~] **Phase 8: Kernel Family** — kernel-matrix prim (linear/RBF/poly/sigmoid), ScoreSamples trait; KernelRidge, KernelDensity (all 5 plans complete; pending phase verification/close)
+- [x] **Phase 8: Kernel Family** — kernel-matrix prim (linear/RBF/poly/sigmoid), ScoreSamples trait; KernelRidge, KernelDensity (completed 2026-06-21; verified 4/4 must-haves, UAT passed)
 - [ ] **Phase 9: Spectral Family** — graph-Laplacian prim (hard dep on Phase 8 kernel-matrix); SpectralEmbedding, SpectralClustering
 - [ ] **Phase 10: SGD / Linear-SVM** — SGD solver prim (the one new device solver, highest cpu-MLIR risk); MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR
 - [ ] **Phase 11: Naive Bayes** — reductions-only closing bookend; GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB

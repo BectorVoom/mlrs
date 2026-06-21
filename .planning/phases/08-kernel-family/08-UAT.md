@@ -1,5 +1,5 @@
 ---
-status: testing
+status: passed
 phase: 08-kernel-family
 source: [08-VERIFICATION.md]
 started: 2026-06-21T00:00:00Z
@@ -15,13 +15,13 @@ expected: |
   `pytest crates/mlrs-py/tests/test_kernel.py -v` reports 4 passed:
   test_kernel_ridge_predict[f32], [f64], test_kernel_density_score_samples[f32], [f64].
   Shapes correct, log-densities finite, f32/f64 dtype dispatch works (f64 arms RUN on cpu, not skipped).
-awaiting: user response
+awaiting: none — user approved (prior 4/4 from 08-05 execution accepted)
 
 ## Tests
 
 ### 1. Python FFI smoke test (PyKernelRidge / PyKernelDensity)
 expected: maturin builds cpu extension; pytest test_kernel.py → 4 passed (f32+f64 × predict + score_samples); shapes correct; log-densities finite; dtype dispatch works.
-result: [pending]
+result: passed (user approved 2026-06-21 — prior 4/4 from 08-05 execution accepted; not re-run due to disk/maturin-rebuild cost)
 
 note: |
   This was already run GREEN 4/4 during plan 08-05 execution
@@ -43,9 +43,9 @@ note: |
 ## Summary
 
 total: 1
-passed: 0
+passed: 1
 issues: 0
-pending: 1
+pending: 0
 skipped: 0
 blocked: 0
 

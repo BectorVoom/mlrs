@@ -1,9 +1,10 @@
 ---
 phase: 08-kernel-family
 verified: 2026-06-21T10:30:00Z
-status: human_needed
+status: passed
 score: 4/4 must-haves verified
 overrides_applied: 0
+human_verification_result: passed (user approved 2026-06-21 — Python FFI smoke test 4/4 from 08-05 execution accepted; see 08-UAT.md)
 human_verification:
   - test: "Run Python smoke test: cd <repo> && maturin develop --features cpu -m crates/mlrs-py/Cargo.toml && pytest crates/mlrs-py/tests/test_kernel.py -v"
     expected: "4 tests pass (test_kernel_ridge_predict[f32], test_kernel_ridge_predict[f64], test_kernel_density_score_samples[f32], test_kernel_density_score_samples[f64]); all assertions pass with the correct shapes and log-density finiteness"
