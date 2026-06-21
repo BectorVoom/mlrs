@@ -57,13 +57,30 @@ crate::any_estimator! {
 /// sklearn-compatible `SpectralEmbedding` (graph-Laplacian spectral embedding,
 /// SPECTRAL-01).
 ///
-/// The raw `n_components`/`affinity`/`gamma`/`n_neighbors` are stored in the
-/// `Unfit` arm; the precision-typed `SpectralEmbedding<F>` (with `gamma=None →
-/// 1/n_features`, D-04) is built by the algos estimator at `fit` once
-/// `n_features` is known.
+/// The constructor hyperparameters are persisted in [`SpectralEmbeddingParams`]
+/// (NOT only in the `Unfit` enum arm — WR-02) so a SECOND `fit` of the same object
+/// honors the user's params instead of silently reverting to sklearn defaults. The
+/// precision-typed `SpectralEmbedding<F>` (with `gamma=None → 1/n_features`, D-04)
+/// is built by the algos estimator at every `fit` once `n_features` is known.
 #[pyclass(name = "SpectralEmbedding")]
 pub struct PySpectralEmbedding {
+    /// Constructor hyperparameters, persisted across fits (WR-02). Read on EVERY
+    /// `fit`, so `est.fit(X1); est.fit(X2)` re-fits with the SAME params (sklearn
+    /// semantics) rather than the `Unfit`-only defaults.
+    params: SpectralEmbeddingParams,
     inner: AnySpectralEmbedding,
+}
+
+/// The persisted constructor hyperparameters for `SpectralEmbedding` (WR-02).
+///
+/// Held on the `#[pyclass]` struct itself so they survive into the fitted
+/// (`F32`/`F64`) arms and drive every `fit`, not just the first.
+#[derive(Clone)]
+struct SpectralEmbeddingParams {
+    n_components: usize,
+    affinity: String,
+    gamma: Option<f64>,
+    n_neighbors: usize,
 }
 
 impl PySpectralEmbedding {
@@ -71,13 +88,20 @@ impl PySpectralEmbedding {
     /// `n_components=2`, `affinity="nearest_neighbors"`, `gamma=None`,
     /// `n_neighbors=10`).
     pub fn unfit_default() -> Self {
+        let params = SpectralEmbeddingParams {
+            n_components: 2,
+            affinity: "nearest_neighbors".to_string(),
+            gamma: None,
+            n_neighbors: 10,
+        };
         Self {
             inner: AnySpectralEmbedding::Unfit {
-                n_components: 2,
-                affinity: "nearest_neighbors".to_string(),
-                gamma: None,
-                n_neighbors: 10,
+                n_components: params.n_components,
+                affinity: params.affinity.clone(),
+                gamma: params.gamma,
+                n_neighbors: params.n_neighbors,
             },
+            params,
         }
     }
 
@@ -98,13 +122,20 @@ impl PySpectralEmbedding {
         gamma: Option<f64>,
         n_neighbors: usize,
     ) -> Self {
+        let params = SpectralEmbeddingParams {
+            n_components,
+            affinity,
+            gamma,
+            n_neighbors,
+        };
         Self {
             inner: AnySpectralEmbedding::Unfit {
-                n_components,
-                affinity,
-                gamma,
-                n_neighbors,
+                n_components: params.n_components,
+                affinity: params.affinity.clone(),
+                gamma: params.gamma,
+                n_neighbors: params.n_neighbors,
             },
+            params,
         }
     }
 
@@ -119,15 +150,15 @@ impl PySpectralEmbedding {
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (n_components, affinity, gamma, n_neighbors) = match &self.inner {
-            AnySpectralEmbedding::Unfit {
-                n_components,
-                affinity,
-                gamma,
-                n_neighbors,
-            } => (*n_components, affinity.clone(), *gamma, *n_neighbors),
-            _ => (2, "nearest_neighbors".to_string(), None, 10),
-        };
+        // WR-02: read the persisted constructor params (NOT the `Unfit` arm), so a
+        // re-`fit` of an already-fitted object honors the user's hyperparameters
+        // instead of reverting to sklearn defaults.
+        let SpectralEmbeddingParams {
+            n_components,
+            affinity,
+            gamma,
+            n_neighbors,
+        } = self.params.clone();
         let fitted = py.detach(|| -> PyResult<AnySpectralEmbedding> {
             let mut pool = crate::lock_pool();
             match dt {
@@ -201,13 +232,33 @@ crate::any_estimator! {
 /// sklearn-compatible `SpectralClustering` (spectral embedding → KMeans,
 /// SPECTRAL-02).
 ///
-/// The raw `n_clusters`/`n_components`/`affinity`/`gamma`/`n_neighbors`/`seed` are
-/// stored in the `Unfit` arm; the precision-typed `SpectralClustering<F>` (with
-/// `n_components=None → n_clusters`, D-11, and the literal `gamma` default, D-04)
-/// is built by the algos estimator at `fit`.
+/// The constructor hyperparameters are persisted in [`SpectralClusteringParams`]
+/// (NOT only in the `Unfit` enum arm — WR-02) so a SECOND `fit` of the same object
+/// honors the user's params instead of silently reverting to sklearn defaults. The
+/// precision-typed `SpectralClustering<F>` (with `n_components=None → n_clusters`,
+/// D-11, and the literal `gamma` default, D-04) is built by the algos estimator at
+/// every `fit`.
 #[pyclass(name = "SpectralClustering")]
 pub struct PySpectralClustering {
+    /// Constructor hyperparameters, persisted across fits (WR-02). Read on EVERY
+    /// `fit`, so `est.fit(X1); est.fit(X2)` re-fits with the SAME params (sklearn
+    /// semantics) rather than the `Unfit`-only defaults.
+    params: SpectralClusteringParams,
     inner: AnySpectralClustering,
+}
+
+/// The persisted constructor hyperparameters for `SpectralClustering` (WR-02).
+///
+/// Held on the `#[pyclass]` struct itself so they survive into the fitted
+/// (`F32`/`F64`) arms and drive every `fit`, not just the first.
+#[derive(Clone)]
+struct SpectralClusteringParams {
+    n_clusters: usize,
+    n_components: Option<usize>,
+    affinity: String,
+    gamma: f64,
+    n_neighbors: usize,
+    seed: u64,
 }
 
 impl PySpectralClustering {
@@ -215,15 +266,24 @@ impl PySpectralClustering {
     /// `n_clusters=8`, `n_components=None`, `affinity="rbf"`, `gamma=1.0`,
     /// `n_neighbors=10`, `seed=0`).
     pub fn unfit_default() -> Self {
+        let params = SpectralClusteringParams {
+            n_clusters: 8,
+            n_components: None,
+            affinity: "rbf".to_string(),
+            gamma: 1.0,
+            n_neighbors: 10,
+            seed: 0,
+        };
         Self {
             inner: AnySpectralClustering::Unfit {
-                n_clusters: 8,
-                n_components: None,
-                affinity: "rbf".to_string(),
-                gamma: 1.0,
-                n_neighbors: 10,
-                seed: 0,
+                n_clusters: params.n_clusters,
+                n_components: params.n_components,
+                affinity: params.affinity.clone(),
+                gamma: params.gamma,
+                n_neighbors: params.n_neighbors,
+                seed: params.seed,
             },
+            params,
         }
     }
 
@@ -246,15 +306,24 @@ impl PySpectralClustering {
         n_neighbors: usize,
         seed: u64,
     ) -> Self {
+        let params = SpectralClusteringParams {
+            n_clusters,
+            n_components,
+            affinity,
+            gamma,
+            n_neighbors,
+            seed,
+        };
         Self {
             inner: AnySpectralClustering::Unfit {
-                n_clusters,
-                n_components,
-                affinity,
-                gamma,
-                n_neighbors,
-                seed,
+                n_clusters: params.n_clusters,
+                n_components: params.n_components,
+                affinity: params.affinity.clone(),
+                gamma: params.gamma,
+                n_neighbors: params.n_neighbors,
+                seed: params.seed,
             },
+            params,
         }
     }
 
@@ -269,24 +338,17 @@ impl PySpectralClustering {
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (n_clusters, n_components, affinity, gamma, n_neighbors, seed) = match &self.inner {
-            AnySpectralClustering::Unfit {
-                n_clusters,
-                n_components,
-                affinity,
-                gamma,
-                n_neighbors,
-                seed,
-            } => (
-                *n_clusters,
-                *n_components,
-                affinity.clone(),
-                *gamma,
-                *n_neighbors,
-                *seed,
-            ),
-            _ => (8, None, "rbf".to_string(), 1.0, 10, 0),
-        };
+        // WR-02: read the persisted constructor params (NOT the `Unfit` arm), so a
+        // re-`fit` of an already-fitted object honors the user's hyperparameters
+        // instead of reverting to sklearn defaults.
+        let SpectralClusteringParams {
+            n_clusters,
+            n_components,
+            affinity,
+            gamma,
+            n_neighbors,
+            seed,
+        } = self.params.clone();
         let fitted = py.detach(|| -> PyResult<AnySpectralClustering> {
             let mut pool = crate::lock_pool();
             match dt {
