@@ -107,6 +107,17 @@ pub struct SgdParams {
     /// Epsilon-insensitive margin.
     pub epsilon: f64,
     /// Minibatch size.
+    ///
+    /// WR-03 — NOT sklearn-equivalent for `batch_size > 1`: sklearn's
+    /// `SGDClassifier`/`SGDRegressor` are strictly PER-SAMPLE (effective batch of
+    /// 1) and re-read the margin between every sample. This prim, for
+    /// `batch_size > 1`, takes a SINGLE averaged gradient step per minibatch
+    /// (summed gradient scaled by `1/bsz`) and does NOT re-margin between samples
+    /// within the batch. The L2 / L1 penalty budgets are compounded per sample
+    /// (CR-01 / CR-02) so the penalty path tracks the sample count, but the
+    /// averaged-gradient + no-mid-batch-re-margin model is a DIFFERENT algorithm
+    /// from sklearn for `batch_size > 1`. Only `batch_size == 1` reproduces
+    /// sklearn's `coef_`/`intercept_` to the oracle tolerance.
     pub batch_size: usize,
     /// Epoch cap.
     pub max_iter: usize,
@@ -175,6 +186,9 @@ where
     } else {
         params.max_iter
     };
+    // WR-03: `batch > 1` is NOT sklearn-equivalent — the summed gradient is
+    // averaged by `1/bsz` and the margin is not re-read mid-batch (see the
+    // `SgdParams::batch_size` doc). Only `batch == 1` matches sklearn.
     let batch = params.batch_size.clamp(1, n);
     let inv_b = 1.0 / batch as f64;
 
