@@ -312,36 +312,61 @@ pub fn div_by_row<F: Float + CubeElement>(
     }
 }
 
-/// Normalized-Laplacian build map (PRIM-09, Wave-0 stub): given the affinity
-/// `a` (`n×n` row-major, diagonal already zeroed by the host orchestration) and
-/// the typed-zero guard vector `dd` (length `n`, `dd[i] = sqrt(degree_i)` or `1`
-/// for an isolated node), the FILLED (Wave-1) kernel writes
+/// Typed-zero degree guard (PRIM-09, T-9-LAP): `out[i] = if w[i] == 0 { 1 } else
+/// { sqrt(w[i]) }`, the `dd = where(w == 0, 1, sqrt(w))` step of the normalized
+/// Laplacian. `w` is the length-`n` degree (row-sum) vector; `out` is the
+/// length-`n` degree-normalization vector `dd`. One unit per element at
+/// `ABSOLUTE_POS`, bounds-checked.
+///
+/// The guard is the STATEMENT form (`let mut val = sqrt(w); if w == 0 { val = 1
+/// }`) per `Cubecl_conditionals.md`, mirroring the `kde_epanechnikov_map` /
+/// `clamp_nonneg` idiom — the would-be `1/sqrt(0)` infinite value is REPLACED by
+/// the typed-zero `1`, NEVER materialized. `F::sqrt` is applied to the raw
+/// degree (always `>= 0` for a non-negative affinity); the isolated branch
+/// overwrites it with `1` so the `sqrt(0) = 0` never reaches a downstream
+/// divisor. Shared-memory-free, atomics-free, no infinity constant — the
+/// cpu-MLIR-safe profile.
+#[cube(launch)]
+pub fn degree_guard<F: Float + CubeElement>(w: &Array<F>, output: &mut Array<F>) {
+    let tid = ABSOLUTE_POS;
+    if tid < w.len() {
+        let deg = w[tid];
+        let zero = F::from_int(0i64);
+        let mut val = F::sqrt(deg);
+        if deg == zero {
+            val = F::new(1.0);
+        }
+        output[tid] = val;
+    }
+}
+
+/// Normalized-Laplacian build map (PRIM-09): given the affinity `a` (`n×n`
+/// row-major, diagonal already zeroed by the host orchestration), the degree
+/// vector `w` (length `n`, the row-sum), and the typed-zero guard vector `dd`
+/// (length `n`, `dd[i] = sqrt(degree_i)` or `1` for an isolated node), write
 ///   `out[i*n+j] = -a[i*n+j] / (dd[i]*dd[j])`   for `i != j`
-///   `out[i*n+i] = if degree_i == 0 { 0 } else { 1 }`   (`= 1 - isolated`)
-/// reproducing the scipy `_laplacian_dense` normalized form. The diagonal of an
-/// isolated (zero-degree) node is EXACTLY `0`, never the reciprocal of a zero
-/// degree — this is the "no NaN / no infinite value on zero-degree nodes"
-/// success criterion (PRIM-09). The off-diagonal divisor is a GATHER of the
-/// length-`n` `dd` vector by the element's row/column index (the
+///   `out[i*n+i] = if w[i] == 0 { 0 } else { 1 }`   (`= 1 - isolated`)
+/// reproducing the scipy `_laplacian_dense` normalized form `I − D^-1/2 A
+/// D^-1/2`. The diagonal of an isolated (zero-degree) node is EXACTLY `0`, never
+/// the reciprocal of a zero degree — the "no NaN / no infinite value on
+/// zero-degree nodes" success criterion (T-9-LAP). The off-diagonal divisor is a
+/// GATHER of the length-`n` `dd` vector by the element's row/column index (the
 /// [`div_by_row`]-style per-index divisor pattern), so there is NO edge-scatter
-/// and NO atomic accumulation.
+/// and NO atomic accumulation. Because `dd` is the GUARDED vector (never `0`),
+/// the off-diagonal division `-a/(dd_i·dd_j)` is always well-defined (an isolated
+/// node has `a[i,j] = 0` for all `j` anyway, so its whole row of `L` is `0`).
 ///
-/// ## Wave-0 stub body
-/// This is the 09-01 Wave-0 COMPILING STUB: the signature, the bounds check, and
-/// the row/column decomposition are real (so the prim and the kernel re-export
-/// type-check today), but the body writes a placeholder (it copies `a` through)
-/// pending the Wave-1 plan (09-02), which fills the real `-a/(dd_i*dd_j)` +
-/// diagonal logic. The `dd` gather is referenced (length-checked) so the stub
-/// exercises the same argument arity the filled kernel uses.
-///
-/// `n` is a scalar `u32` passed by value (cubecl 0.10). The guard that replaces
-/// the would-be `1/sqrt(0)` is computed host-side into `dd` (the typed-zero
-/// guard), so this kernel never needs the infinite-value constant. Written to be
-/// shared-memory-free and atomics-free (the cpu-MLIR-safe profile), in the
-/// STATEMENT-guard style of [`kde_epanechnikov_map`] / [`clamp_nonneg`].
+/// The diagonal-vs-off-diagonal selection and the isolated-diagonal value are
+/// both STATEMENT-form guards (`let mut val = …; if cond { val = … }`) per
+/// `Cubecl_conditionals.md`, mirroring [`kde_epanechnikov_map`] / [`clamp_nonneg`]
+/// — NEVER an `if`-expression. `n` is a scalar `u32` passed by value (cubecl
+/// 0.10). Written shared-memory-free and atomics-free (the cpu-MLIR-safe
+/// profile); no infinite-value constant — the typed-zero guard on `dd` makes it
+/// unnecessary.
 #[cube(launch)]
 pub fn laplacian_map<F: Float + CubeElement>(
     a: &Array<F>,
+    w: &Array<F>,
     dd: &Array<F>,
     output: &mut Array<F>,
     n: u32,
@@ -350,16 +375,22 @@ pub fn laplacian_map<F: Float + CubeElement>(
     if tid < a.len() {
         let i = tid / n as usize;
         let j = tid % n as usize;
-        // Wave-0 placeholder: pass the affinity through, gathering `dd` by row so
-        // the stub uses the same argument arity (a, dd, output, n) the Wave-1
-        // filled kernel will use. The real -a/(dd_i*dd_j) + diagonal build lands
-        // in plan 09-02; this body only proves the launch shape + the per-index
-        // `dd` gather compile cpu-MLIR-safe (no shared memory, no atomics, no
-        // infinite-value constant).
-        let gathered = dd[i] * dd[j];
-        let mut val = a[tid];
-        if gathered != F::from_int(0i64) {
-            val = a[tid];
+        let zero = F::from_int(0i64);
+
+        // Off-diagonal value: -a[i,j] / (dd[i]·dd[j]). `dd` is the guarded vector
+        // (never 0), so this division never produces an infinite value.
+        let off = -a[tid] / (dd[i] * dd[j]);
+
+        // Diagonal value: 1 - isolated = (w[i] == 0 ? 0 : 1). STATEMENT-form.
+        let mut diag = F::new(1.0);
+        if w[i] == zero {
+            diag = zero;
+        }
+
+        // Select diagonal vs off-diagonal (STATEMENT-form, default off-diagonal).
+        let mut val = off;
+        if i == j {
+            val = diag;
         }
         output[tid] = val;
     }
