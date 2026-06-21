@@ -32,6 +32,10 @@ pub mod kmeans;
 // - `SpectralClustering` (SPECTRAL-02) — spectral embedding → v1 KMeans;
 //   `labels_` matches sklearn up to label permutation (exact-labels gate, D-10).
 //   Added by plan **09-04**.
+// Shared spectral-family host recovery math (WR-06): the `recover` helper (with a
+// `drop_first` param) + the `host_to_f64`/`f64_to_host` bytemuck pair, formerly
+// duplicated verbatim across spectral_embedding / spectral_clustering.
+pub(crate) mod spectral;
 pub mod spectral_clustering;
 pub mod spectral_embedding;
 

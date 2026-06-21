@@ -23,8 +23,6 @@
 //! Tests live in `crates/mlrs-algos/tests/spectral_clustering_test.rs`
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
 
-use std::mem::size_of;
-
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -39,6 +37,8 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
 
 use crate::cluster::kmeans::KMeans;
+// WR-06: shared spectral host recovery math (formerly duplicated in this file).
+use crate::cluster::spectral::{f64_to_host, host_to_f64, recover};
 use crate::error::AlgoError;
 use crate::traits::Fit;
 
@@ -285,7 +285,9 @@ where
         // --- Post-eig recovery host math (D-07/D-11): slice the smallest
         //     n_components → /dd → sign-flip → KEEP row 0 (drop_first = FALSE for
         //     SC) → transpose into the n × n_components `maps`. ---
-        let maps_host = recover_maps::<F>(&v_host, &dd_host, n_samples, n_components);
+        // WR-06: drop_first = FALSE for SpectralClustering (D-11) — KEEP the trivial
+        // ≈0 eigenvector as a KMeans feature. Shared recovery helper (was recover_maps).
+        let maps_host = recover::<F>(&v_host, &dd_host, n_samples, n_components, false);
         let maps_dev = DeviceArray::from_host(pool, &maps_host);
 
         // --- v1 KMeans on the embedding (D-10): KMeans::new (kmeans++, n_init=1;
@@ -382,91 +384,6 @@ where
     }
 }
 
-/// Reproduce the pinned sklearn `_spectral_embedding` recovery on the host with
-/// `drop_first = FALSE` (the SpectralClustering `maps`, D-11). `v_host` is the
-/// DESCENDING eig `V` column-major (`v_host[col*n + r] = V[r, col]`); `dd` is the
-/// length-`n` degree vector the Laplacian returned. Returns the row-major
-/// `n × n_components` `maps` INCLUDING the trivial ≈0 eigenvector (row 0).
-///
-/// ORDER (load-bearing — a wrong order fails the value/label match):
-///   1. slice the smallest `n_components` eigenvectors (ascending; the `r`-th
-///      smallest is descending column `n - 1 - r`) into an `n_components × n`
-///      array;
-///   2. `emb[r][i] /= dd[i]` — the `D^-1/2` recovery, BEFORE the sign flip (D-07);
-///   3. `_deterministic_vector_sign_flip` per ROW (argmax|row| → sign → multiply);
-///   4. KEEP all rows (drop_first = FALSE, D-11); transpose → `n × n_components`.
-fn recover_maps<F>(v_host: &[f64], dd: &[f64], n: usize, n_components: usize) -> Vec<F>
-where
-    F: Float + CubeElement + Pod,
-{
-    let m = n_components; // drop_first = FALSE for SpectralClustering (D-11).
-
-    // 1. Slice the m smallest eigenvectors into an m × n row-major array. v1 eig
-    //    sorts w DESCENDING, so the r-th SMALLEST eigenvector is descending column
-    //    (n - 1 - r) (RESEARCH Pitfall 3 / Eig column snippet).
-    let mut emb = vec![0.0f64; m * n];
-    for r in 0..m {
-        let col = n - 1 - r;
-        for i in 0..n {
-            emb[r * n + i] = v_host[col * n + i];
-        }
-    }
-
-    // 2. /dd recovery (D-07) — BEFORE the sign flip. dd is the Laplacian's
-    //    returned degree vector (NOT a fresh sqrt).
-    for r in 0..m {
-        for i in 0..n {
-            emb[r * n + i] /= dd[i];
-        }
-    }
-
-    // 3. _deterministic_vector_sign_flip on the m × n array (per ROW): the
-    //    largest-magnitude element of each eigenvector is made positive
-    //    (sklearn extmath, exact). Lowest-index tie-break on equal magnitudes.
-    for r in 0..m {
-        let row = &emb[r * n..(r + 1) * n];
-        let mut max_idx = 0usize;
-        let mut max_abs = row[0].abs();
-        for (i, &val) in row.iter().enumerate().skip(1) {
-            if val.abs() > max_abs {
-                max_abs = val.abs();
-                max_idx = i;
-            }
-        }
-        let sign = if emb[r * n + max_idx] < 0.0 { -1.0 } else { 1.0 };
-        if sign < 0.0 {
-            for i in 0..n {
-                emb[r * n + i] = -emb[r * n + i];
-            }
-        }
-    }
-
-    // 4. KEEP every row (drop_first = FALSE, D-11) and transpose rows 0..n_components
-    //    into a row-major n × n_components `maps` (the KMeans input).
-    let mut out = vec![F::from_int(0i64); n * n_components];
-    for c in 0..n_components {
-        for i in 0..n {
-            out[i * n_components + c] = f64_to_host::<F>(emb[c * n + i]);
-        }
-    }
-    out
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine (mirrors the
-/// `spectral_embedding.rs` helper).
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("spectral_clustering is f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
-fn f64_to_host<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("spectral_clustering is f32/f64 only"),
-    }
-}
+// WR-06: `recover_maps` (now `recover(.., drop_first = false)`), `host_to_f64`, and
+// `f64_to_host` moved to the shared `crate::cluster::spectral` module (imported
+// above) so the embedding and clustering recovery paths stay bit-identical.
