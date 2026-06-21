@@ -100,15 +100,48 @@ fn build_default_lowers_sklearn_defaults() {
     assert_eq!(cfg.l1_ratio, 0.15);
 }
 
-/// Wave-1 SUCCESS CRITERION (D-08): `build()` rejects a negative `alpha` with
-/// `BuildError::InvalidAlpha` BEFORE any data is seen. `#[ignore]` until the
-/// Wave-1 plan fills the validation predicates (the Wave-0 stub `build()` does
-/// not yet validate — the SIGNATURE is final, the body is a stub).
+/// SUCCESS CRITERION (D-08): `build()` rejects a negative `alpha` with
+/// `BuildError::InvalidAlpha` BEFORE any data is seen. Activated in plan 10-03 —
+/// the `build()` validation predicates are now filled (the SIGNATURE was final at
+/// Wave-0; the predicates land here).
 #[test]
-#[ignore = "Wave-1 (plan 10-02) fills build() validation predicates (D-08)"]
 fn build_rejects_bad_alpha() {
     match MBSGDClassifier::<f32>::builder().alpha(-1.0).build::<f32>() {
         Err(BuildError::InvalidAlpha { alpha, .. }) => assert_eq!(alpha, -1.0),
         other => panic!("expected InvalidAlpha, got {:?}", other.is_ok()),
+    }
+}
+
+/// D-08: `build()` rejects an out-of-range `eta0` (non-positive with a
+/// non-`Optimal` schedule), an out-of-range `l1_ratio` under the ElasticNet
+/// penalty, and a regression loss on the classifier builder — the full
+/// data-INDEPENDENT validation surface.
+#[test]
+fn build_rejects_bad_hyperparams() {
+    // eta0 <= 0 with a constant schedule (the Optimal schedule ignores eta0).
+    match MBSGDClassifier::<f32>::builder()
+        .learning_rate(LearningRate::Constant)
+        .eta0(0.0)
+        .build::<f32>()
+    {
+        Err(BuildError::InvalidEta0 { eta0, .. }) => assert_eq!(eta0, 0.0),
+        other => panic!("expected InvalidEta0, got {:?}", other.is_ok()),
+    }
+    // l1_ratio out of [0,1] under ElasticNet.
+    match MBSGDClassifier::<f32>::builder()
+        .penalty(Penalty::ElasticNet)
+        .l1_ratio(1.5)
+        .build::<f32>()
+    {
+        Err(BuildError::InvalidL1Ratio { l1_ratio, .. }) => assert_eq!(l1_ratio, 1.5),
+        other => panic!("expected InvalidL1Ratio, got {:?}", other.is_ok()),
+    }
+    // A regression loss on the classifier builder.
+    match MBSGDClassifier::<f32>::builder()
+        .loss(Loss::SquaredEpsilonInsensitive)
+        .build::<f32>()
+    {
+        Err(BuildError::InvalidLossForEstimator { .. }) => {}
+        other => panic!("expected InvalidLossForEstimator, got {:?}", other.is_ok()),
     }
 }

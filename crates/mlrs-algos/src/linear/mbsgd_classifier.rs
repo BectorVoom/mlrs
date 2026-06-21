@@ -16,18 +16,21 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::gemm::gemm;
+use mlrs_backend::prims::sgd::{sgd_solve, SgdLoss, SgdParams, SgdSchedule};
 use mlrs_backend::runtime::ActiveRuntime;
+use mlrs_core::PrimError;
 
-use crate::error::BuildError;
+use crate::error::{AlgoError, BuildError};
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
+use crate::traits::{Fit, PredictLabels, PredictProba};
 
 /// Minibatch-SGD linear classifier (SGDSVM-01). Construct via
-/// [`MBSGDClassifier::builder`].
-///
-/// Wave-0 scaffold: the fitted-state fields (`n_features` / `coef_` /
-/// `intercept_`) are written by the Wave-1 `fit` body, hence `allow(dead_code)`
-/// until then.
-#[allow(dead_code)]
+/// [`MBSGDClassifier::builder`], then [`Fit::fit`] +
+/// [`PredictLabels::predict_labels`] / [`PredictProba::predict_proba`]. Fitted
+/// `coef_` (length `n_features`) / `intercept_` (length 1) are device-resident
+/// (D-03).
 pub struct MBSGDClassifier<F> {
     /// The lowered, validated hyperparameter bundle (D-06).
     config: SgdConfig,
@@ -59,6 +62,30 @@ where
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
+    }
+
+    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
+    /// [`AlgoError::NotFitted`] before `fit`.
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+        self.coef_
+            .as_ref()
+            .map(|c| c.to_host(pool))
+            .ok_or(AlgoError::NotFitted {
+                estimator: "mbsgd_classifier",
+                operation: "coef_",
+            })
+    }
+
+    /// Host copy of the fitted `intercept_` (scalar). Errors with
+    /// [`AlgoError::NotFitted`] before `fit`.
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
+        self.intercept_
+            .as_ref()
+            .map(|i| i.to_host(pool)[0])
+            .ok_or(AlgoError::NotFitted {
+                estimator: "mbsgd_classifier",
+                operation: "intercept_",
+            })
     }
 }
 
@@ -171,16 +198,57 @@ impl MBSGDClassifierBuilder {
     }
 
     /// Build the estimator, validating the data-INDEPENDENT hyperparameters
-    /// (D-08). The SIGNATURE is final (Wave-0); the validation predicates land in
-    /// Wave-1. On success the lowered [`SgdConfig`] is stored and the fitted
-    /// state is `None`.
+    /// (D-08, T-10-03-01). The data-INDEPENDENT predicates are checked HERE,
+    /// BEFORE any data is seen (the data-DEPENDENT geometry / label checks live in
+    /// [`Fit::fit`], D-08):
+    ///
+    /// - `alpha >= 0` ([`BuildError::InvalidAlpha`]) — a negative penalty is
+    ///   undefined.
+    /// - `l1_ratio ∈ [0, 1]` ([`BuildError::InvalidL1Ratio`]) when the penalty is
+    ///   `ElasticNet` (the mixing parameter blends L1/L2).
+    /// - `eta0 > 0` ([`BuildError::InvalidEta0`]) unless the schedule is `Optimal`
+    ///   (the Bottou schedule does not read `eta0`).
+    /// - the loss must be valid for a CLASSIFIER ({`Hinge`, `Log`,
+    ///   `SquaredHinge`}); a regression loss (`EpsilonInsensitive` /
+    ///   `SquaredEpsilonInsensitive`) is [`BuildError::InvalidLossForEstimator`].
+    ///
+    /// On success the lowered [`SgdConfig`] is stored and the fitted state is
+    /// `None`.
     pub fn build<F>(self) -> Result<MBSGDClassifier<F>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
-        // Wave-1 fills the `alpha >= 0` / `l1_ratio ∈ [0,1]` / `eta0 > 0` /
-        // valid-loss-for-classifier checks here, returning the matching
-        // `BuildError`. The Wave-0 stub lowers the (default-valid) params.
+        // --- T-10-03-01 / ASVS V5: validate the data-INDEPENDENT hyperparameters
+        //     at build() BEFORE any data is seen (D-08). ---
+        if !(self.alpha >= 0.0) {
+            return Err(BuildError::InvalidAlpha {
+                estimator: "mbsgd_classifier",
+                alpha: self.alpha,
+            });
+        }
+        if self.penalty == Penalty::ElasticNet
+            && !(self.l1_ratio >= 0.0 && self.l1_ratio <= 1.0)
+        {
+            return Err(BuildError::InvalidL1Ratio {
+                estimator: "mbsgd_classifier",
+                l1_ratio: self.l1_ratio,
+            });
+        }
+        if self.learning_rate != LearningRate::Optimal && !(self.eta0 > 0.0) {
+            return Err(BuildError::InvalidEta0 {
+                estimator: "mbsgd_classifier",
+                eta0: self.eta0,
+            });
+        }
+        match self.loss {
+            Loss::Hinge | Loss::Log | Loss::SquaredHinge => {}
+            other => {
+                return Err(BuildError::InvalidLossForEstimator {
+                    estimator: "mbsgd_classifier",
+                    loss: other.name().to_string(),
+                });
+            }
+        }
         let config = SgdConfig {
             loss: self.loss,
             penalty: self.penalty,
@@ -204,5 +272,295 @@ impl MBSGDClassifierBuilder {
             coef_: None,
             intercept_: None,
         })
+    }
+}
+
+impl<F> Fit<F> for MBSGDClassifier<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn fit(
+        &mut self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<&mut Self, AlgoError> {
+        let (n_samples, n_features) = shape;
+
+        // --- T-10-03-02 / ASVS V5: data-DEPENDENT geometry guard BEFORE any
+        //     launch (D-08 — the data-INDEPENDENT params were validated at
+        //     build()). ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "mbsgd_classifier",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+
+        // --- Pitfall 4: distinct-sorted classes_ (logistic.rs precedent), binary
+        //     ±1 remap for the margin loss. Phase-10 scope is the binary linear
+        //     classifier (A6); a non-binary target is rejected. ---
+        let y_host = y.to_host(pool);
+        let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
+        for &yv in y_host.iter() {
+            let lf = host_to_f64(yv);
+            let li = lf.round();
+            if (li - lf).abs() > 1e-6 {
+                return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                    operand: "mbsgd_classifier.y (labels must be integers)",
+                    rows: n_samples,
+                    cols: 1,
+                    len: y.len(),
+                }));
+            }
+            raw_labels.push(li as i64);
+        }
+        let mut classes_: Vec<i64> = raw_labels.clone();
+        classes_.sort_unstable();
+        classes_.dedup();
+        if classes_.len() != 2 {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "mbsgd_classifier.y (binary classifier needs exactly 2 classes)",
+                rows: n_samples,
+                cols: classes_.len(),
+                len: y.len(),
+            }));
+        }
+        // classes_[0] → −1, classes_[1] → +1 (sklearn maps the higher class to +1).
+        let yp: Vec<F> = raw_labels
+            .iter()
+            .map(|&l| f64_to_host::<F>(if l == classes_[1] { 1.0 } else { -1.0 }))
+            .collect();
+        let yp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &yp);
+
+        // --- Lower the validated SgdConfig into the prim-local flat SgdParams
+        //     (D-06; the prim cannot take the algos SgdConfig — circular
+        //     dependency). The classifier never uses epsilon (regression-only). ---
+        let params = lower_config(&self.config);
+
+        // Delegate to the validated PRIM-10 prim (10-02). A device failure is a
+        // typed PrimError, wrapped into AlgoError::Prim via `?` (never a panic
+        // across the estimator boundary — T-10-03-03).
+        let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params)?;
+
+        // The ±1 target buffer is only needed during the solve (WR-07 re-fit
+        // buffer release).
+        yp_dev.release_into(pool);
+
+        self.classes_ = classes_;
+        self.n_features = n_features;
+        self.coef_ = Some(coef);
+        self.intercept_ = Some(intercept);
+        Ok(self)
+    }
+}
+
+impl<F> PredictLabels<F> for MBSGDClassifier<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_labels(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
+        let (n_query, _n_features) = shape;
+
+        // The signed decision margin per query row (X·coef + intercept).
+        let margins = self.decision_margin(pool, x, shape)?;
+
+        // sign of the margin selects the class: >= 0 → classes_[1] (the +1 class),
+        // else classes_[0] (the −1 class) — sklearn's `decision >= 0 → +1`.
+        let mut labels: Vec<i32> = vec![0i32; n_query];
+        for (r, label) in labels.iter_mut().enumerate() {
+            *label = if margins[r] >= 0.0 {
+                self.classes_[1] as i32
+            } else {
+                self.classes_[0] as i32
+            };
+        }
+        Ok(DeviceArray::from_host(pool, &labels))
+    }
+}
+
+impl<F> PredictProba<F> for MBSGDClassifier<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Per-class probabilities from the log-loss sigmoid `1/(1 + exp(−margin))`
+    /// (sklearn's `SGDClassifier(loss="log_loss").predict_proba`). The returned
+    /// matrix is `n_query × 2` (`[P(class₀), P(class₁)]` per row); `P(class₁) =
+    /// σ(margin)`, `P(class₀) = 1 − σ(margin)`. For a non-log loss this sigmoid is
+    /// NOT a calibrated probability (sklearn raises); mlrs returns the same sigmoid
+    /// shape over the decision margin (the caller pins the log-loss fixture).
+    fn predict_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_query, _n_features) = shape;
+        let margins = self.decision_margin(pool, x, shape)?;
+
+        let mut proba: Vec<F> = vec![F::from_int(0i64); n_query * 2];
+        for (r, &m) in margins.iter().enumerate() {
+            // Numerically-stable logistic sigmoid σ(m) = 1/(1 + exp(−m)).
+            let p1 = if m >= 0.0 {
+                1.0 / (1.0 + (-m).exp())
+            } else {
+                let e = m.exp();
+                e / (1.0 + e)
+            };
+            proba[r * 2] = f64_to_host::<F>(1.0 - p1);
+            proba[r * 2 + 1] = f64_to_host::<F>(p1);
+        }
+        Ok(DeviceArray::from_host(pool, &proba))
+    }
+}
+
+impl<F> MBSGDClassifier<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host-materialized signed decision margin `X·coef_ + intercept_` (length
+    /// `n_query`), shared by `predict_labels` (sign) and `predict_proba`
+    /// (sigmoid). Runs the on-device matvec GEMM, then broadcasts the scalar
+    /// intercept host-side (the small predict geometry; the fitted state stays
+    /// device-resident until here). Validates geometry / fitted-`n_features`
+    /// (ASVS V5).
+    fn decision_margin(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<Vec<f64>, AlgoError> {
+        let (n_query, n_features) = shape;
+
+        let coef = self.coef_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "mbsgd_classifier",
+            operation: "predict",
+        })?;
+        let intercept = self.intercept_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "mbsgd_classifier",
+            operation: "predict",
+        })?;
+
+        if n_query == 0 || n_features == 0 || x.len() != n_query * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_query,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if n_features != self.n_features {
+            return Err(AlgoError::Prim(PrimError::DimMismatch {
+                dim: "n_features",
+                lhs: n_features,
+                rhs: self.n_features,
+            }));
+        }
+
+        let raw = gemm::<F>(
+            pool,
+            x,
+            (n_query, n_features),
+            coef,
+            (n_features, 1),
+            false,
+            false,
+            None,
+        )?;
+        let bias = host_to_f64(intercept.to_host(pool)[0]);
+        let raw_host = raw.to_host(pool);
+        raw.release_into(pool);
+
+        Ok((0..n_query)
+            .map(|r| host_to_f64(raw_host[r]) + bias)
+            .collect())
+    }
+}
+
+/// Lower a validated [`SgdConfig`] into the prim-local flat [`SgdParams`] the
+/// PRIM-10 `sgd_solve` consumes (D-06; the prim cannot take the algos
+/// `SgdConfig` — circular dependency, so the estimator lowers at the call site,
+/// the cd_solve flat-scalar precedent). Shared by both SGD estimators.
+pub(crate) fn lower_config(cfg: &SgdConfig) -> SgdParams {
+    let loss = match cfg.loss {
+        Loss::Hinge => SgdLoss::Hinge,
+        Loss::Log => SgdLoss::Log,
+        Loss::SquaredHinge => SgdLoss::SquaredHinge,
+        Loss::SquaredLoss => SgdLoss::SquaredError,
+        Loss::EpsilonInsensitive => SgdLoss::EpsilonInsensitive,
+        Loss::SquaredEpsilonInsensitive => SgdLoss::SquaredEpsilonInsensitive,
+    };
+    let schedule = match cfg.learning_rate {
+        LearningRate::Optimal => SgdSchedule::Optimal,
+        LearningRate::InvScaling => SgdSchedule::InvScaling,
+        LearningRate::Constant => SgdSchedule::Constant,
+        LearningRate::Adaptive => SgdSchedule::Adaptive,
+    };
+    // The host applies the L1 cumulative soft-shrink only when the penalty
+    // includes an L1 term (L1 or ElasticNet with l1_ratio > 0).
+    let apply_l1 = match cfg.penalty {
+        Penalty::L1 => true,
+        Penalty::ElasticNet => true,
+        Penalty::L2 => false,
+    };
+    // L2-only / ElasticNet lower `l1_ratio` straight through; a pure-L1 penalty is
+    // the `l1_ratio = 1` case of the elastic-net shrink math the prim runs.
+    let l1_ratio = match cfg.penalty {
+        Penalty::L1 => 1.0,
+        Penalty::L2 => 0.0,
+        Penalty::ElasticNet => cfg.l1_ratio,
+    };
+    SgdParams {
+        loss,
+        schedule,
+        alpha: cfg.alpha,
+        l1_ratio,
+        apply_l1,
+        fit_intercept: cfg.fit_intercept,
+        eta0: cfg.eta0,
+        power_t: cfg.power_t,
+        epsilon: cfg.epsilon,
+        batch_size: cfg.batch_size,
+        max_iter: cfg.max_iter,
+        tol: cfg.tol,
+    }
+}
+
+/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine (mirrors the
+/// `logistic.rs` helper).
+fn host_to_f64<F: Pod>(v: F) -> f64 {
+    match size_of::<F>() {
+        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("mbsgd_classifier is f32/f64 only"),
+    }
+}
+
+/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
+fn f64_to_host<F: Pod>(v: f64) -> F {
+    match size_of::<F>() {
+        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("mbsgd_classifier is f32/f64 only"),
     }
 }
