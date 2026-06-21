@@ -148,7 +148,7 @@ Plans:
 
 **Recurring gates**: `skip_f64_with_log` on every f64 oracle case; documented f32-on-rocm band for weights, **exact predicted labels** the hard gate for the classifiers; pinned-deterministic oracle (shuffle off, fixed schedule/iters, sklearn ref) per Pitfall 7; **GATHER idiom + cpu-launch verification** per Pitfall 1; per-prim PoolStats memory gate.
 **Research flag**: `[v2-P4]` SGD under cpu-MLIR — spike the two-pass GATHER kernel and the pinned deterministic oracle before wiring any of the four estimators. Run a research spike before planning. **Highest-risk phase.**
-**Plans**: 5 plans (4 waves)
+**Plans**: 6 plans (5 waves)
 
 Plans:
 **Wave 0**
@@ -167,6 +167,10 @@ Plans:
 **Wave 3** *(blocked on Wave 2)*
 
 - [x] 10-05-PLAN.md — PyO3 wrappers for all four estimators (builder-chain fit, TryFrom/BuildError → ValueError D-05/D-09, dtype dispatch, GIL release, f64 guard) + maturin-develop smoke test; ZERO new binding infra, pyo3 0.28; Rust smoke green cpu 3/3 (fit→predict f32+f64), test_sgd.py live FFI harness ✓ Plan 05
+
+**Wave 5 — gap closure** *(blocked on Wave 1+2; closes 10-VERIFICATION.md truth #2 / CR-01 + WR-01)*
+
+- [ ] 10-06-PLAN.md — SGDSVM-01 `optimal`-schedule oracle gap closure: move L2 wscale shrink AFTER the gradient step (WR-01, RESEARCH §Per-sample update sequence) + pre-update convergence snapshot (WR-02), then add `oracle_optimal`/`oracle_optimal_f32` tests loading the committed `_optimal` fixtures, fitting `LearningRate::Optimal`, asserting coef band + exact predict labels; re-pin/tighten COEF_BAND_F64
 
 ### Phase 11: Naive Bayes
 
