@@ -25,6 +25,14 @@ use std::mem::size_of;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::distance::distance;
+use mlrs_backend::prims::topk::top_k;
+use mlrs_backend::runtime::ActiveRuntime;
+
+use crate::error::AlgoError;
+
 /// Reproduce the pinned sklearn `_spectral_embedding` recovery on the host
 /// (RESEARCH §D-07/D-08). `v_host` is the DESCENDING eig `V` column-major
 /// (`v_host[col*n + r] = V[r, col]`); `dd` is the length-`n` degree vector the
@@ -113,6 +121,67 @@ where
         }
     }
     out
+}
+
+/// Build the sklearn-exact binary kNN-connectivity affinity (D-03, RESEARCH
+/// Pattern 3), shared by both spectral estimators (IN-02 — formerly duplicated
+/// verbatim in `spectral_embedding.rs` and `spectral_clustering.rs`).
+///
+/// `distance(X, X, sqrt=false)` → `top_k(k = n_neighbors)` → set `A[i, j] = 1` for
+/// the `k` smallest-distance columns of row `i` (the self `d(i, i) = 0` is the row
+/// minimum, so `include_self=True` is automatic) → symmetrize `A = 0.5·(A + Aᵀ)`.
+/// Binary weights `0/1`, NOT distance weights.
+///
+/// The top-k indices are read back to the host for the small `n × k` binarize +
+/// symmetrize; the resulting `n × n` affinity is uploaded device-resident for the
+/// Laplacian (which consumes it on-device). `k` is the CLAMPED neighbor count
+/// (`min(n_neighbors, n_samples)`, WR-03), passed in by the caller rather than read
+/// from `self.n_neighbors`. Factoring this into one function keeps the two affinity
+/// builders bit-identical by construction (they must not silently desync on a
+/// future fix — the same rationale as [`recover`]).
+pub(crate) fn knn_connectivity_affinity<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+    k: usize,
+) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    // Squared-euclidean distance (sqrt=false is order-preserving for top-k).
+    let dist = distance::<F>(pool, x, (n, d), x, (n, d), false, None)?;
+    // k smallest per row + their column indices (lowest-index tie-break).
+    let (vals, idx) = top_k::<F>(pool, &dist, n, n, k, false, None, None)?;
+    dist.release_into(pool);
+    let idx_host = idx.to_host(pool);
+    idx.release_into(pool);
+    vals.release_into(pool);
+
+    // Binarize: A[i, j] = 1 for the k nearest columns of row i (self included).
+    let one = F::from_int(1i64);
+    let zero = F::from_int(0i64);
+    let mut a = vec![zero; n * n];
+    for i in 0..n {
+        for t in 0..k {
+            let j = idx_host[i * k + t] as usize;
+            a[i * n + j] = one;
+        }
+    }
+    // Symmetrize A = 0.5·(A + Aᵀ): one-directional edges → 0.5, mutual → 1.0.
+    let mut sym = vec![zero; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let s = host_to_f64(a[i * n + j]) + host_to_f64(a[j * n + i]);
+            sym[i * n + j] = if s == 0.0 {
+                zero
+            } else {
+                f64_to_host::<F>(0.5 * s)
+            };
+        }
+    }
+
+    Ok(DeviceArray::from_host(pool, &sym))
 }
 
 /// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine. Shared by the

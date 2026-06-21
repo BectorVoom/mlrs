@@ -34,11 +34,9 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::distance::distance;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::kernel_matrix::{kernel_matrix, Kernel};
 use mlrs_backend::prims::laplacian::laplacian;
-use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
 
@@ -214,7 +212,10 @@ where
                         n_samples,
                     });
                 }
-                self.knn_connectivity_affinity(pool, x, n_samples, n_features, k)?
+                // IN-02: shared free function (was a verbatim per-estimator method).
+                crate::cluster::spectral::knn_connectivity_affinity::<F>(
+                    pool, x, n_samples, n_features, k,
+                )?
             }
             // Any other affinity string is out of scope (CONTEXT — precomputed /
             // precomputed_nearest_neighbors deferred). Fail loud with a typed error.
@@ -282,61 +283,6 @@ where
         }
         self.embedding_ = Some(embedding_dev);
         Ok(self)
-    }
-
-    /// Build the sklearn-exact binary kNN-connectivity affinity (D-03, RESEARCH
-    /// Pattern 3): `distance(X, X, sqrt=false)` → `top_k(k = n_neighbors)` → set
-    /// `A[i, j] = 1` for the `k` smallest-distance columns of row `i` (the self
-    /// `d(i, i) = 0` is the row minimum, so `include_self=True` is automatic) →
-    /// symmetrize `A = 0.5·(A + Aᵀ)`. Binary weights `0/1`, NOT distance weights.
-    ///
-    /// The top-k indices are read back to the host for the small `n × k` binarize
-    /// + symmetrize; the resulting `n × n` affinity is uploaded device-resident
-    /// for the Laplacian (which consumes it on-device).
-    fn knn_connectivity_affinity(
-        &self,
-        pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        n: usize,
-        d: usize,
-        k: usize,
-    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
-        // `k` is the CLAMPED neighbor count (min(n_neighbors, n_samples), WR-03),
-        // passed in by the caller rather than read from `self.n_neighbors`.
-
-        // Squared-euclidean distance (sqrt=false is order-preserving for top-k).
-        let dist = distance::<F>(pool, x, (n, d), x, (n, d), false, None)?;
-        // k smallest per row + their column indices (lowest-index tie-break).
-        let (vals, idx) = top_k::<F>(pool, &dist, n, n, k, false, None, None)?;
-        dist.release_into(pool);
-        let idx_host = idx.to_host(pool);
-        idx.release_into(pool);
-        vals.release_into(pool);
-
-        // Binarize: A[i, j] = 1 for the k nearest columns of row i (self included).
-        let one = F::from_int(1i64);
-        let zero = F::from_int(0i64);
-        let mut a = vec![zero; n * n];
-        for i in 0..n {
-            for t in 0..k {
-                let j = idx_host[i * k + t] as usize;
-                a[i * n + j] = one;
-            }
-        }
-        // Symmetrize A = 0.5·(A + Aᵀ): one-directional edges → 0.5, mutual → 1.0.
-        let mut sym = vec![zero; n * n];
-        for i in 0..n {
-            for j in 0..n {
-                let s = host_to_f64(a[i * n + j]) + host_to_f64(a[j * n + i]);
-                sym[i * n + j] = if s == 0.0 {
-                    zero
-                } else {
-                    f64_to_host::<F>(0.5 * s)
-                };
-            }
-        }
-
-        Ok(DeviceArray::from_host(pool, &sym))
     }
 }
 
