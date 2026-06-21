@@ -7,6 +7,12 @@ description = "sklearn-compatible ML estimators for mlrs (Phase 4: LinearRegress
 [dependencies]
 mlrs-core = { path = "../mlrs-core" }
 mlrs-backend = { path = "../mlrs-backend" }
+# Feature-free generic CubeCL kernels (KERNEL-02): KernelDensity launches the six
+# density-value maps + the div_by_row log-sum-exp rescale helper from
+# mlrs-kernels::elementwise directly over the v1 distance base (D-08 — KD does NOT
+# route through kernel_matrix). mlrs-kernels never pulls a backend runtime
+# (Criterion 1); the concrete ActiveRuntime comes through mlrs-backend.
+mlrs-kernels = { path = "../mlrs-kernels" }
 # CubeCL: device-element trait surface (`Float` / `CubeElement`) the estimators
 # are generic over (D-08). default-features=false so this crate never pulls a
 # backend runtime — the active backend is selected through the `mlrs-backend`

@@ -24,6 +24,8 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — no in-source
 //! `#[cfg(test)] mod tests`).
 
-// Phase-8 kernel density estimator (filled by plan 08-04 — file-disjoint):
-// the Wave-2 plan adds `pub mod kernel_density;` + `pub use
-// kernel_density::KernelDensity;` here and creates the matching estimator file.
+// Phase-8 kernel density estimator (plan 08-04 — file-disjoint): the Wave-2 plan
+// adds its `pub mod` + re-export here and creates the matching estimator file; it
+// does NOT edit `lib.rs` (owned by the 08-01 Wave-0 scaffold).
+pub mod kernel_density;
+pub use kernel_density::{BandwidthSpec, KdKernel, KernelDensity};
