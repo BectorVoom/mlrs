@@ -329,19 +329,32 @@ where
             }
 
             // --- Host cumulative-L1 soft-shrink (sklearn `l1penalty`): u grows by
-            //     l1_ratio·eta·alpha; each w_j is pulled toward 0 by the budget. ---
+            //     l1_ratio·eta·alpha; each w_j is pulled toward 0 by the budget.
+            //
+            //     CR-02: sklearn advances the cumulative L1 budget `u` and applies
+            //     `l1penalty` ONCE PER SAMPLE inside its per-sample loop, so over a
+            //     batch of `bsz` samples `u` grows by `bsz·l1_ratio·eta·alpha` and
+            //     the soft-shrink is applied `bsz` times. This averaged-batch model
+            //     applies the gradient once per batch but advances the L1 budget /
+            //     soft-shrink per sample so the cumulative budget `u` tracks the
+            //     number of samples consumed (the sample clock `t` is incremented by
+            //     `bsz`). The `bsz == 1` case is unchanged. NOTE: the margin is NOT
+            //     re-read between samples within a batch (see the WR-03
+            //     batch_size>1 divergence note above). ---
             if params.apply_l1 && params.l1_ratio > 0.0 && params.alpha > 0.0 {
-                u_l1 += params.l1_ratio * eta * params.alpha;
                 let mut w_after: Vec<f64> =
                     w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-                for j in 0..d {
-                    let z = w_after[j];
-                    if w_after[j] > 0.0 {
-                        w_after[j] = (w_after[j] - (u_l1 + q[j])).max(0.0);
-                    } else if w_after[j] < 0.0 {
-                        w_after[j] = (w_after[j] + (u_l1 - q[j])).min(0.0);
+                for _ in 0..bsz {
+                    u_l1 += params.l1_ratio * eta * params.alpha;
+                    for j in 0..d {
+                        let z = w_after[j];
+                        if w_after[j] > 0.0 {
+                            w_after[j] = (w_after[j] - (u_l1 + q[j])).max(0.0);
+                        } else if w_after[j] < 0.0 {
+                            w_after[j] = (w_after[j] + (u_l1 - q[j])).min(0.0);
+                        }
+                        q[j] += w_after[j] - z;
                     }
-                    q[j] += w_after[j] - z;
                 }
                 let w_l1: Vec<F> = w_after.iter().map(|&v| narrow::<F>(v)).collect();
                 let w_re2 = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_l1);
