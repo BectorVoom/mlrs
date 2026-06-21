@@ -1,13 +1,14 @@
 //! `MBSGDClassifier` (SGDSVM-01) — minibatch-SGD linear classifier, ≈
 //! `sklearn.linear_model.SGDClassifier`.
 //!
-//! Phase-10 Wave-0 scaffold (plan 10-01): the struct, the
-//! [`MBSGDClassifierBuilder`] (D-01/D-03 — sklearn-default field initializers),
-//! and the `build() -> Result<MBSGDClassifier<F>, BuildError>` SIGNATURE are
-//! final now; the validation predicates and the `fit`/`predict` bodies land in
-//! the Wave-1/Wave-3 plans. The closest analog is `logistic.rs` (classifier:
-//! `classes_` remap + `PredictLabels` + `PredictProba`); the construction surface
-//! switches from `new()`/`with_opts()` to the builder (D-01).
+//! The struct, the [`MBSGDClassifierBuilder`] (D-01/D-03 — sklearn-default field
+//! initializers), the `build() -> Result<MBSGDClassifier<F>, BuildError>`
+//! validation, and the `fit`/`predict` bodies are all SHIPPED: `fit` lowers the
+//! validated `SgdConfig` into the flat `SgdParams` and drives the PRIM-10
+//! `sgd_solve` minibatch-SGD solver; `predict_labels`/`predict_proba` run the
+//! on-device decision-margin matvec. The closest analog is `logistic.rs`
+//! (classifier: `classes_` remap + `PredictLabels` + `PredictProba`); the
+//! construction surface switches from `new()`/`with_opts()` to the builder (D-01).
 //!
 //! Tests live in `crates/mlrs-algos/tests/mbsgd_classifier_test.rs`
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.

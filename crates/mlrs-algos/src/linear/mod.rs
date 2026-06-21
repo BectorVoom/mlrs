@@ -41,16 +41,17 @@ pub mod linear_regression;
 pub mod logistic;
 pub mod ridge;
 
-// Phase-10 SGD / linear-SVM (SGDSVM-01..04). The Wave-0 scaffold (plan 10-01)
-// owns this index: it lands the shared `sgd_config` (typed Loss/Penalty/
-// LearningRate enums + `SgdConfig` lowering target, D-04/D-06) and the four
-// builder-fronted estimator homes. `MBSGDClassifier`/`MBSGDRegressor` are
-// minibatch-SGD models (the new `sgd_solve` prim, Wave-1); `LinearSVC`/`LinearSVR`
-// reuse the v1 coordinate-descent solver (D-07 — liblinear CD, converged). Each
+// Phase-10 SGD / linear-SVM (SGDSVM-01..04). This index lands the shared
+// `sgd_config` (typed Loss/Penalty/LearningRate enums + `SgdConfig` lowering
+// target, D-04/D-06) and the four builder-fronted estimator homes.
+// `MBSGDClassifier`/`MBSGDRegressor` are minibatch-SGD models (the `sgd_solve`
+// prim, PRIM-10); `LinearSVC`/`LinearSVR` solve the L2-regularized squared-hinge /
+// squared-epsilon-insensitive PRIMAL via the validated L-BFGS primitive
+// (Open-Q1 resolution — NOT the coordinate-descent solver; the SVM objective is
+// smooth+convex but not the Lasso/ElasticNet soft-threshold CD objective). Each
 // estimator is constructed via its `*Builder` + `build() -> Result<_, BuildError>`
 // (D-01 — Phase-10 INTRODUCES the builder pattern; existing low-arity estimators
-// are NOT retrofitted, D-02). The Wave-1/2/3 plans fill their own file bodies and
-// do NOT edit this index (file-disjoint, parallel-safe).
+// are NOT retrofitted, D-02).
 pub mod sgd_config;
 pub mod mbsgd_classifier;
 pub mod mbsgd_regressor;

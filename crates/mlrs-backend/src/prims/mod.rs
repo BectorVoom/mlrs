@@ -39,11 +39,12 @@ pub mod gemm;
 pub mod kmeans;
 pub mod lbfgs;
 pub mod reduce;
-// Phase-10 SGD solver prim stub (Wave-0 scaffold plan 10-01 owns this
-// registration; the Wave-1 plan fills the file body — file-disjoint,
-// parallel-safe). The `sgd_solve` host-fn signature compiles today (geometry
-// validation real; compute path `todo!()` until Wave-1). It takes FLAT scalar
-// params, NOT the algos `SgdConfig` (mlrs-backend does not depend on mlrs-algos).
+// Phase-10 SGD solver prim (PRIM-10). `sgd_solve` is fully implemented: a
+// validate-before-launch geometry guard fronts a host epoch loop that drives the
+// two SharedMemory-free `sgd_margin` / `sgd_weight_update` kernels per minibatch,
+// with host-side dloss / schedule / L2+L1 penalty arithmetic. It takes FLAT
+// scalar params, NOT the algos `SgdConfig` (mlrs-backend does not depend on
+// mlrs-algos).
 pub mod sgd;
 pub mod svd;
 pub mod topk;

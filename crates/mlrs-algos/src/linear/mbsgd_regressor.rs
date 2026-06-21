@@ -1,12 +1,13 @@
 //! `MBSGDRegressor` (SGDSVM-02) — minibatch-SGD linear regressor, ≈
 //! `sklearn.linear_model.SGDRegressor`.
 //!
-//! Phase-10 Wave-0 scaffold (plan 10-01): the struct, the
-//! [`MBSGDRegressorBuilder`] (D-01/D-03 — sklearn-default field initializers),
-//! and the `build() -> Result<MBSGDRegressor<F>, BuildError>` SIGNATURE are final
-//! now; the validation predicates and the `fit`/`predict` bodies land in the
-//! Wave-1/Wave-3 plans. The closest analog is `elastic_net.rs` (regressor: `Fit`
-//! + `Predict`, alpha/l1_ratio penalty); the construction surface switches from
+//! The struct, the [`MBSGDRegressorBuilder`] (D-01/D-03 — sklearn-default field
+//! initializers), the `build() -> Result<MBSGDRegressor<F>, BuildError>`
+//! validation, and the `fit`/`predict` bodies are all SHIPPED: `fit` lowers the
+//! validated `SgdConfig` into the flat `SgdParams` and drives the PRIM-10
+//! `sgd_solve` minibatch-SGD solver; `predict` runs the on-device linear matvec.
+//! The closest analog is `elastic_net.rs` (regressor: `Fit` + `Predict`,
+//! alpha/l1_ratio penalty); the construction surface switches from
 //! `new()`/`with_opts()` to the builder (D-01). Unlike the classifier, the
 //! regressor exposes an `epsilon` setter (for the epsilon-insensitive losses).
 //!
