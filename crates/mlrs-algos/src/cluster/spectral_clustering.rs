@@ -251,14 +251,29 @@ where
 
         // --- Full symmetric spectrum via v1 eig (DESCENDING, V col-major). Thread
         //     the Laplacian buffer through `out` so eig reuses it as its working
-        //     input (eig.rs consumes/releases `out` after launch); `l` is not read
-        //     again afterwards. Mirrors spectral_embedding.rs:225-237. ---
+        //     input — saving one n² allocation. Mirrors spectral_embedding.rs.
+        //
+        //     WR-05: `&l` (the eig `a` input) and `l_out` (the eig `out`) wrap the
+        //     SAME ref-counted cubecl handle (l.handle().clone()). This aliasing is
+        //     SOUND only because of two load-bearing, eig-internal invariants:
+        //       (1) eig READS `a_in` (= the `out` handle) and NEVER writes it — it
+        //           writes its separate w/V/info outputs (eig.rs jacobi_eig_sweep);
+        //       (2) eig ACQUIRES w/V/info from the pool BEFORE it releases the `out`
+        //           working buffer (eig.rs: acquire happens before the
+        //           `a_in_owned.release_into(pool)` post-launch), so the freed
+        //           handle is never re-handed mid-call.
+        //     If eig ever writes its working input in place, or reorders the
+        //     acquire/release, this reuse becomes an aliased-write / use-after-free
+        //     with NO compile-time signal — keep those invariants if eig changes.
         let l_out = DeviceArray::<ActiveRuntime, F>::from_raw(
             l.handle().clone(),
             n_samples * n_samples,
         );
         let (w_desc, v_desc) = eig::<F>(pool, &l, n_samples, Some(l_out))?;
-        drop(l); // the cloned handle was threaded through `out` and released by eig.
+        // eig released the CLONE threaded through `out`; this drops `l`'s remaining
+        // handle clone (the ref-counted buffer's last owner returns it to the pool).
+        // `l` is not read again afterwards.
+        drop(l);
         w_desc.release_into(pool);
         let v_host: Vec<f64> = v_desc
             .to_host(pool)
