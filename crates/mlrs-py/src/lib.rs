@@ -136,6 +136,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::cluster::{PyDBSCAN, PyKMeans};
     use estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
     use estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
+    use estimators::kernel::{PyKernelDensity, PyKernelRidge};
     use estimators::linear::{
         PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge,
     };
@@ -165,5 +166,9 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGaussianRandomProjection>()?;
     m.add_class::<PySparseRandomProjection>()?;
     m.add_function(wrap_pyfunction!(johnson_lindenstrauss_min_dim, m)?)?;
+
+    // Phase-8 kernel-family wrappers (KERNEL-01 / KERNEL-02 — PY-06 incr.).
+    m.add_class::<PyKernelRidge>()?;
+    m.add_class::<PyKernelDensity>()?;
     Ok(())
 }
