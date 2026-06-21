@@ -84,7 +84,7 @@ impl PyLinearRegression {
             _ => true,
         };
         let fitted = py.detach(|| -> PyResult<AnyLinearRegression> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -111,7 +111,7 @@ impl PyLinearRegression {
     fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| -> PyResult<Vec<f32>> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLinearRegression::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -126,7 +126,7 @@ impl PyLinearRegression {
     fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| -> PyResult<Vec<f64>> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLinearRegression::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -140,28 +140,28 @@ impl PyLinearRegression {
 
     /// Host `coef_` (f32 arm) or `NotFitted`.
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLinearRegression::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("linear_regression", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLinearRegression::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("linear_regression", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLinearRegression::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("linear_regression", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLinearRegression::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("linear_regression", "intercept_ (f64)")),
@@ -238,7 +238,7 @@ impl PyRidge {
             _ => (1.0, true),
         };
         let fitted = py.detach(|| -> PyResult<AnyRidge> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -264,7 +264,7 @@ impl PyRidge {
     fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyRidge::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -277,7 +277,7 @@ impl PyRidge {
     fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyRidge::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -289,28 +289,28 @@ impl PyRidge {
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyRidge::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("ridge", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyRidge::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("ridge", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyRidge::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("ridge", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyRidge::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("ridge", "intercept_ (f64)")),
@@ -384,7 +384,7 @@ impl PyLasso {
             _ => (1.0, true, 1000, 1e-4),
         };
         let fitted = py.detach(|| -> PyResult<AnyLasso> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -410,7 +410,7 @@ impl PyLasso {
     fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLasso::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -423,7 +423,7 @@ impl PyLasso {
     fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLasso::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -435,28 +435,28 @@ impl PyLasso {
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLasso::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("lasso", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLasso::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("lasso", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLasso::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("lasso", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLasso::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("lasso", "intercept_ (f64)")),
@@ -540,7 +540,7 @@ impl PyElasticNet {
             _ => (1.0, 0.5, true, 1000, 1e-4),
         };
         let fitted = py.detach(|| -> PyResult<AnyElasticNet> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -566,7 +566,7 @@ impl PyElasticNet {
     fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyElasticNet::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -579,7 +579,7 @@ impl PyElasticNet {
     fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyElasticNet::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -591,28 +591,28 @@ impl PyElasticNet {
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyElasticNet::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("elastic_net", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyElasticNet::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("elastic_net", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyElasticNet::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("elastic_net", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyElasticNet::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("elastic_net", "intercept_ (f64)")),
@@ -691,7 +691,7 @@ impl PyLogisticRegression {
             _ => (1.0, true, 100, 1e-4),
         };
         let fitted = py.detach(|| -> PyResult<AnyLogisticRegression> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -718,7 +718,7 @@ impl PyLogisticRegression {
     fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLogisticRegression::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -737,7 +737,7 @@ impl PyLogisticRegression {
     fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLogisticRegression::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -750,7 +750,7 @@ impl PyLogisticRegression {
     fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLogisticRegression::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -771,28 +771,28 @@ impl PyLogisticRegression {
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLogisticRegression::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("logistic_regression", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLogisticRegression::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("logistic_regression", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLogisticRegression::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("logistic_regression", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLogisticRegression::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("logistic_regression", "intercept_ (f64)")),
