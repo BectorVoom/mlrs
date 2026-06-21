@@ -312,6 +312,32 @@ pub fn div_by_row<F: Float + CubeElement>(
     }
 }
 
+/// Zero-diagonal copy (PRIM-09): copy the `n×n` row-major affinity `a` into
+/// `output`, writing EXACTLY `0` on the diagonal (`output[i*n+i] = 0`,
+/// `output[i*n+j] = a[i*n+j]` for `i != j`). This is the scipy
+/// `np.fill_diagonal(m, 0)` step that MUST precede the degree row-sum (an
+/// isolated/self edge is excluded from the degree — RESEARCH "Affinity diagonal
+/// handling"). Done as a non-in-place copy so the caller's affinity buffer is
+/// never mutated. One unit per element at `ABSOLUTE_POS`, bounds-checked.
+///
+/// The diagonal-vs-off-diagonal selection is the STATEMENT form (`let mut val =
+/// a[tid]; if i == j { val = 0 }`) per `Cubecl_conditionals.md`. `n` is a scalar
+/// `u32` by value (cubecl 0.10). Shared-memory-free, atomics-free, no infinity
+/// constant.
+#[cube(launch)]
+pub fn zero_diag_copy<F: Float + CubeElement>(a: &Array<F>, output: &mut Array<F>, n: u32) {
+    let tid = ABSOLUTE_POS;
+    if tid < a.len() {
+        let i = tid / n as usize;
+        let j = tid % n as usize;
+        let mut val = a[tid];
+        if i == j {
+            val = F::from_int(0i64);
+        }
+        output[tid] = val;
+    }
+}
+
 /// Typed-zero degree guard (PRIM-09, T-9-LAP): `out[i] = if w[i] == 0 { 1 } else
 /// { sqrt(w[i]) }`, the `dd = where(w == 0, 1, sqrt(w))` step of the normalized
 /// Laplacian. `w` is the length-`n` degree (row-sum) vector; `out` is the
