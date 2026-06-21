@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: executing
-stopped_at: Phase 08 (kernel-family) complete — verified 4/4 must-haves, UAT passed, code-review blocker+correctness fixes merged
+stopped_at: Phase 09 (spectral-family) context gathered — 4 gray areas resolved (affinity scope/gamma, eigensolver n≤64 cap, embedding D^-1/2 recovery, exact-label fixture design)
 last_updated: "2026-06-21T00:00:00Z"
-last_activity: 2026-06-21 -- Phase 08 verified and closed (kernel-family)
+last_activity: 2026-06-21 -- Phase 09 context gathered (spectral-family)
 progress:
   total_phases: 5
   completed_phases: 2
@@ -226,5 +226,5 @@ Items acknowledged and carried forward from previous milestone close:
 ## Session Continuity
 
 Last session: 2026-06-21T00:00:00Z
-Stopped at: Completed 08-05-PLAN.md (kernel-family Python wrappers — Phase 08 all plans done)
-Resume file: .planning/phases/08-kernel-family/08-05-SUMMARY.md
+Stopped at: Phase 09 (spectral-family) context gathered — ready for planning
+Resume file: .planning/phases/09-spectral-family/09-CONTEXT.md
