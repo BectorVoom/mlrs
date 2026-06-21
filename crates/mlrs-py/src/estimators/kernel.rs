@@ -180,7 +180,7 @@ impl PyKernelRidge {
         };
         let kind = parse_kernel_kind(&kernel)?;
         let fitted = py.detach(|| -> PyResult<AnyKernelRidge> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -223,7 +223,7 @@ impl PyKernelRidge {
     ) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| -> PyResult<Vec<f32>> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKernelRidge::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -247,7 +247,7 @@ impl PyKernelRidge {
     ) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| -> PyResult<Vec<f64>> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKernelRidge::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -264,7 +264,7 @@ impl PyKernelRidge {
     /// Host copy of the fitted `dual_coef_` (row-major `n_samples × n_targets`),
     /// f32 arm. `NotFitted` if not in the f32 arm.
     fn dual_coef_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyKernelRidge::F32(e) => e.dual_coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("kernel_ridge", "dual_coef_ (f32)")),
@@ -272,7 +272,7 @@ impl PyKernelRidge {
     }
     /// Host copy of the fitted `dual_coef_`, f64 arm.
     fn dual_coef_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyKernelRidge::F64(e) => e.dual_coef(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("kernel_ridge", "dual_coef_ (f64)")),
@@ -372,7 +372,7 @@ impl PyKernelDensity {
         let kd_kernel = parse_kd_kernel(&kernel)?;
         let spec = parse_bandwidth(&bandwidth_rule, bandwidth)?;
         let fitted = py.detach(|| -> PyResult<AnyKernelDensity> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -405,7 +405,7 @@ impl PyKernelDensity {
     ) -> PyResult<Vec<f32>> {
         let qa = capsule_to_array(q)?;
         py.detach(|| -> PyResult<Vec<f32>> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKernelDensity::F32(est) => {
                     let qd = validated_f32(as_f32(&qa)?, &mut pool)?;
@@ -429,7 +429,7 @@ impl PyKernelDensity {
     ) -> PyResult<Vec<f64>> {
         let qa = capsule_to_array(q)?;
         py.detach(|| -> PyResult<Vec<f64>> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKernelDensity::F64(est) => {
                     let qd = validated_f64(as_f64(&qa)?, &mut pool)?;

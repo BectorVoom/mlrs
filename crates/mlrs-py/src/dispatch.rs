@@ -26,9 +26,15 @@
 //!    pool ([`crate::global_pool`]), runs the `mlrs_algos` call, and returns a
 //!    plain-Rust `Result`. The canonical shape is:
 //!
+//!    The sanctioned lock path is [`crate::lock_pool`], which RECOVERS from mutex
+//!    poisoning (WR-02/WR-04) so a single panicked `fit` cannot permanently brick
+//!    the interpreter. Do NOT use `global_pool().lock().expect(...)` directly in a
+//!    panic-prone `fit`/accessor — that form re-panics on a poisoned mutex and
+//!    defeats the recovery `lock_pool` provides.
+//!
 //!    ```ignore
 //!    let out = py.detach(|| {
-//!        let mut pool = crate::global_pool().lock().expect("pool mutex");
+//!        let mut pool = crate::lock_pool();
 //!        let arr = /* the owned ingress::ArrayRef */;
 //!        match $crate::ingress::float_dtype(&arr)? {
 //!            $crate::ingress::FloatDtype::F32 => {
@@ -101,7 +107,8 @@ macro_rules! any_estimator {
         }
         // NOTE (Plan 03): the `#[pymethods] impl PyEstimator { fn fit(...) {...} }`
         // block — with `float_dtype` dispatch, `guard_f64()?` on the F64 arm, and
-        // the `py.detach(|| { global_pool().lock()... })` device call — extends
+        // the `py.detach(|| { crate::lock_pool()... })` device call (the
+        // poison-recovering sanctioned lock path, WR-04) — extends
         // this enum. The skeleton fixes the enum shape + the two contracts
         // (GIL release, f64 guard) documented at the module level above.
     };

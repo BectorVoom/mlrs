@@ -103,8 +103,19 @@ pub(crate) fn global_pool() -> &'static Mutex<BufferPool<ActiveRuntime>> {
 /// kernels make more likely to surface). The pool data is NOT left torn by a
 /// panicked compute call (the cubecl handles are ref-counted and the panic
 /// unwinds before any half-written pool mutation), so `into_inner()` recovery is
-/// safe: a single bad `fit` no longer kills the interpreter session. Prefer this
-/// over `global_pool().lock().expect(...)` in any `fit`/accessor that can panic.
+/// safe: a single bad `fit` no longer kills the interpreter session.
+///
+/// ## This is the SANCTIONED lock path (WR-04)
+/// `lock_pool` is the single authoritative lock path for the binding layer. The
+/// poison recovery only delivers its benefit if EVERY lock site uses it: one
+/// surviving `global_pool().lock().expect("pool mutex")` re-panics on a poisoned
+/// mutex and re-bricks the interpreter, making the brick-prevention only partial.
+/// The spectral wrappers ([`crate::estimators::spectral`]) and the kernel wrappers
+/// ([`crate::estimators::kernel`]) use `lock_pool` exclusively; new estimators MUST
+/// do the same. (The remaining `linear`/`cluster`/`decomposition`/`covariance`/
+/// `neighbors`/`projection` wrappers still carry the legacy panicking form — a
+/// pre-existing, tracked migration; mixing the two helpers defeats the recovery on
+/// those estimators until they are converted.)
 ///
 /// ## ACCOUNTING CAVEAT after a recovered poison (WR-01)
 /// "Not left torn" is a **memory-safety** statement, NOT an accounting one. The
