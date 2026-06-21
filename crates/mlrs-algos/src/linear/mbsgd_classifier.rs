@@ -321,12 +321,10 @@ where
             let lf = host_to_f64(yv);
             let li = lf.round();
             if (li - lf).abs() > 1e-6 {
-                return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                    operand: "mbsgd_classifier.y (labels must be integers)",
-                    rows: n_samples,
-                    cols: 1,
-                    len: y.len(),
-                }));
+                return Err(AlgoError::InvalidLabels {
+                    estimator: "mbsgd_classifier",
+                    reason: format!("labels must be integers (got {lf})"),
+                });
             }
             raw_labels.push(li as i64);
         }
@@ -334,12 +332,13 @@ where
         classes_.sort_unstable();
         classes_.dedup();
         if classes_.len() != 2 {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "mbsgd_classifier.y (binary classifier needs exactly 2 classes)",
-                rows: n_samples,
-                cols: classes_.len(),
-                len: y.len(),
-            }));
+            return Err(AlgoError::InvalidLabels {
+                estimator: "mbsgd_classifier",
+                reason: format!(
+                    "binary classifier needs exactly 2 classes, found {}",
+                    classes_.len()
+                ),
+            });
         }
         // classes_[0] → −1, classes_[1] → +1 (sklearn maps the higher class to +1).
         let yp: Vec<F> = raw_labels

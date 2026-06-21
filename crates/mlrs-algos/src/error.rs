@@ -320,6 +320,24 @@ pub enum AlgoError {
         max_iter: usize,
     },
 
+    /// A classifier (LinearSVC / MBSGDClassifier) was given a label vector that
+    /// is not a valid CLASSIFICATION target: a non-integer label value, or a
+    /// class count that does not match the estimator's task (the binary linear
+    /// classifiers require EXACTLY 2 distinct classes). This is a data-VALIDITY
+    /// failure, distinct from a geometry [`PrimError::ShapeMismatch`] (WR-07):
+    /// the labels have the right SHAPE, their CONTENT is invalid. Rejected at
+    /// `fit` *before* the solve, carrying an honest reason string rather than a
+    /// fabricated row/col/len shape error.
+    #[error("estimator '{estimator}': invalid labels — {reason}")]
+    InvalidLabels {
+        /// Which estimator rejected the labels (e.g. `"linear_svc"` /
+        /// `"mbsgd_classifier"`).
+        estimator: &'static str,
+        /// The data-validity reason (e.g. `"labels must be integers"` or
+        /// `"binary classifier needs exactly 2 classes, found 3"`).
+        reason: String,
+    },
+
     /// A primitive-layer failure (geometry / squareness / convergence /
     /// non-SPD pivot) surfaced from a `mlrs-backend` prim call the estimator
     /// composed. Transparent `#[from]` so estimator methods can `?` a prim
