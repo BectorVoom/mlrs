@@ -365,7 +365,8 @@ where
         //     term carries `C`; the regularizer is the plain ½‖w‖² (synthetic
         //     column included). The per-sample margin loss/grad is squared-hinge:
         //       z = 1 − yᵢ·mᵢ ;  ℓ = max(0, z)² ;  dℓ/dmᵢ = −2·yᵢ·max(0, z). ---
-        let c = host_to_f64(self.c);
+        // IN-03: `self.c` is already `f64`; use it directly (no identity cast).
+        let c = self.c;
         let (coef, intercept) = svm_lbfgs_fit::<F>(
             pool,
             x,

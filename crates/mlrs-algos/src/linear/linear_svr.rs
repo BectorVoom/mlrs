@@ -290,7 +290,8 @@ where
         //   ∂r/∂m = −1, so ∂viol/∂m = −sign(r). Hence dℓ/dm = −2·sign(r)·viol.
         let targets = y.to_host(pool);
         let targets_f64: Vec<f64> = targets.iter().map(|&v| host_to_f64(v)).collect();
-        let c = host_to_f64(self.c);
+        // IN-03: `self.c` is already `f64`; use it directly (no identity cast).
+        let c = self.c;
         let eps = self.config.epsilon;
         let (coef, intercept) = svm_lbfgs_fit::<F>(
             pool,
