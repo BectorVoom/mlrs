@@ -443,6 +443,23 @@ impl<F> KMeans<F>
 where
     F: Float + CubeElement + Pod,
 {
+    /// WR-01: Return this KMeans' fitted device buffers (`cluster_centers_` and
+    /// `labels_`) to the pool free-list, consuming `self`. `DeviceArray` has no
+    /// `Drop` (`device_array.rs`), so a composing estimator that builds a
+    /// function-local KMeans (e.g. [`SpectralClustering::fit`]) MUST call this
+    /// before the KMeans drops — otherwise the acquired bytes are never returned
+    /// and `live_bytes` grows monotonically across re-fits, forfeiting buffer
+    /// reuse (the FOUND-05 memory invariant). No-op for buffers still `None`
+    /// (unfitted). The scalar `inertia_` / `n_features_` carry no device memory.
+    pub fn release_into(self, pool: &mut BufferPool<ActiveRuntime>) {
+        if let Some(centers) = self.cluster_centers_ {
+            centers.release_into(pool);
+        }
+        if let Some(labels) = self.labels_ {
+            labels.release_into(pool);
+        }
+    }
+
     /// Convenience `fit_predict` (sklearn `ClusterMixin`): fit to `x` then return
     /// the fitted `labels_` as a fresh device-resident `i32` buffer. Equivalent
     /// to `fit` followed by reading `labels_`.

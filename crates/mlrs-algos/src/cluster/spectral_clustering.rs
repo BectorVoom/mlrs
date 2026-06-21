@@ -282,6 +282,13 @@ where
         maps_dev.release_into(pool);
 
         let labels_host = kmeans.labels(pool)?;
+        // WR-01: the function-local KMeans owns fitted device buffers
+        // (cluster_centers_ k×n_components, labels_ i32 length n). DeviceArray has
+        // no Drop, so return them to the pool before `kmeans` falls out of scope —
+        // otherwise their acquired bytes leak the pool accounting (live_bytes grows
+        // monotonically across re-fits, the FOUND-05 invariant). Done AFTER copying
+        // the labels to the host.
+        kmeans.release_into(pool);
         let labels_dev: DeviceArray<ActiveRuntime, i32> =
             DeviceArray::from_host(pool, &labels_host);
 
