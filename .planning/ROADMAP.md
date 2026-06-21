@@ -111,7 +111,20 @@ Plans:
 
 **Recurring gates**: `skip_f64_with_log` on every f64 oracle case; documented f32-on-rocm band for SpectralEmbedding (embedding band + sign, or subspace test), **exact labels** the hard gate for SpectralClustering; LDS-budget audit on dense Laplacian; per-prim PoolStats memory gate.
 **Research flag**: `[v2-P3]` smallest-eigenpair extraction — confirm full-spectrum-then-slice is acceptable at v2 sizes (vs Lanczos/shift-invert) and document the `n_samples` problem-size cap. Run a research spike before planning.
-**Plans**: TBD
+**Plans**: 4 plans (4 waves)
+
+Plans:
+**Wave 0**
+- [ ] 09-01-wave0-scaffold-PLAN.md — Wave-0 scaffold: AlgoError::NSamplesExceedsMaxDim (D-06) + laplacian prim/kernel stubs + 2 estimator homes + PyO3 spectral.rs stub + 5 #[ignore] test scaffolds + gen_spectral_embedding/clustering oracle generators (committed .npz, default constructors per D-01)
+
+**Wave 1** *(blocked on Wave 0)*
+- [ ] 09-02-laplacian-prim-PLAN.md — PRIM-09 laplacian.rs (zero-diag → row_reduce(Sum) degree GATHER → typed-zero dd guard → SharedMemory-free laplacian_map: L = I − D^-1/2 A D^-1/2) standalone-validated f32+f64, zero-degree no-NaN/inf, PoolStats memory gate
+
+**Wave 2** *(blocked on Wave 1)*
+- [ ] 09-03-spectral-embedding-PLAN.md — SPECTRAL-01 SpectralEmbedding (rbf + nearest_neighbors-default affinity → laplacian → eig reverse→ascending → /dd recovery → sign-flip → drop-trivial; gamma None→1/n_features D-04; degenerate subspace test D-09; reject n_samples>64 D-06)
+
+**Wave 3** *(blocked on Wave 2)*
+- [ ] 09-04-spectral-clustering-pyo3-PLAN.md — SPECTRAL-02 SpectralClustering (rbf default + drop_first=FALSE + n_components=n_clusters D-11 → KMeans::new exact labels up to perm on well-separated fixture D-10) + PyO3 PySpectralEmbedding/PySpectralClustering (any_estimator! ×2, GIL release, f64 guard) + smoke test
 
 ### Phase 10: SGD / Linear-SVM
 
