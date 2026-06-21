@@ -264,24 +264,13 @@ where
                 t0,
             );
 
-            // --- Host lazy-L2 shrink BEFORE the gradient step (the wscale trick):
-            //     w_j *= max(0, 1 - (1 - l1_ratio)·eta·alpha). Applied directly to
-            //     the device w via a host round-trip (small d; the convergence
-            //     delta needs the host copy anyway). ---
-            let mut w_host: Vec<f64> =
+            // --- WR-02: snapshot the TRUE start-of-batch weights (BEFORE any
+            //     gradient step or penalty shrink this batch). The convergence
+            //     delta is diffed against this pristine snapshot so `max_change`
+            //     reflects the FULL per-batch update (gradient + penalty) and the
+            //     `tol`-based early stop does not fire prematurely. ---
+            let w_start: Vec<f64> =
                 w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-            let l2_factor = (1.0 - (1.0 - params.l1_ratio) * eta * params.alpha).max(0.0);
-            if params.alpha > 0.0 && l2_factor != 1.0 {
-                for wj in w_host.iter_mut() {
-                    *wj *= l2_factor;
-                }
-            }
-            // Upload the shrunk w back before the gradient kernel.
-            let w_shrunk: Vec<F> = w_host.iter().map(|&v| narrow::<F>(v)).collect();
-            let w_re = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_shrunk);
-            // Swap the device w to the freshly-shrunk buffer (release the old).
-            let old_w = std::mem::replace(&mut w_dev, w_re);
-            old_w.release_into(pool);
 
             // --- Pass 2: w[j] -= eta·inv_b·Σ_i g[i]·x[i,j]. ---
             let g_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &g);
@@ -306,6 +295,26 @@ where
                 bsz as u32,
             );
             g_dev.release_into(pool);
+
+            // --- Host lazy-L2 `wscale` shrink applied AFTER the gradient step:
+            //     w_j *= max(0, 1 - (1 - l1_ratio)·eta·alpha). Order matches
+            //     sklearn `_plain_sgd` / RESEARCH §Per-sample update sequence
+            //     (the penalty shrink follows the gradient step, before the L1
+            //     cumulative soft-shrink). Applied to the RESULTING w via a host
+            //     round-trip (small d). ---
+            let l2_factor = (1.0 - (1.0 - params.l1_ratio) * eta * params.alpha).max(0.0);
+            if params.alpha > 0.0 && l2_factor != 1.0 {
+                let mut w_host: Vec<f64> =
+                    w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+                for wj in w_host.iter_mut() {
+                    *wj *= l2_factor;
+                }
+                let w_shrunk: Vec<F> = w_host.iter().map(|&v| narrow::<F>(v)).collect();
+                let w_re = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_shrunk);
+                // Swap the device w to the freshly-shrunk buffer (release the old).
+                let old_w = std::mem::replace(&mut w_dev, w_re);
+                old_w.release_into(pool);
+            }
 
             // --- Host cumulative-L1 soft-shrink (sklearn `l1penalty`): u grows by
             //     l1_ratio·eta·alpha; each w_j is pulled toward 0 by the budget. ---
@@ -335,11 +344,14 @@ where
                 bias -= eta * binv * g_sum;
             }
 
-            // --- Convergence bookkeeping: max |Δw| this batch. ---
+            // --- Convergence bookkeeping: max |Δw| this batch, measured against
+            //     the pristine start-of-batch snapshot (WR-02) so the delta
+            //     reflects the FULL update (gradient + L2 + L1), not a
+            //     penalty-mutated intermediate. ---
             let w_new: Vec<f64> =
                 w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
             for j in 0..d {
-                let change = (w_new[j] - w_host[j]).abs();
+                let change = (w_new[j] - w_start[j]).abs();
                 if change > max_change {
                     max_change = change;
                 }
