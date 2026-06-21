@@ -200,14 +200,21 @@ where
             // nearest_neighbors (DEFAULT, D-03): the sklearn-exact binary
             // connectivity builder (RESEARCH Pattern 3).
             "nearest_neighbors" => {
-                if self.n_neighbors < 1 || self.n_neighbors > n_samples {
+                // WR-03: sklearn's kneighbors_graph does NOT error when
+                // n_neighbors > n_samples — NearestNeighbors silently caps at
+                // n_samples (effectively "use all available neighbors"). With the
+                // SE default n_neighbors=10, ANY n_samples <= 10 (well within the
+                // n<=64 cap) would otherwise raise on the default constructor.
+                // Clamp to min(n_neighbors, n_samples); only reject k < 1.
+                let k = self.n_neighbors.min(n_samples);
+                if k < 1 {
                     return Err(AlgoError::InvalidK {
                         estimator: "spectral_embedding",
                         k: self.n_neighbors,
                         n_samples,
                     });
                 }
-                self.knn_connectivity_affinity(pool, x, n_samples, n_features)?
+                self.knn_connectivity_affinity(pool, x, n_samples, n_features, k)?
             }
             // Any other affinity string is out of scope (CONTEXT — precomputed /
             // precomputed_nearest_neighbors deferred). Fail loud with a typed error.
@@ -275,8 +282,10 @@ where
         x: &DeviceArray<ActiveRuntime, F>,
         n: usize,
         d: usize,
+        k: usize,
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
-        let k = self.n_neighbors;
+        // `k` is the CLAMPED neighbor count (min(n_neighbors, n_samples), WR-03),
+        // passed in by the caller rather than read from `self.n_neighbors`.
 
         // Squared-euclidean distance (sqrt=false is order-preserving for top-k).
         let dist = distance::<F>(pool, x, (n, d), x, (n, d), false, None)?;
