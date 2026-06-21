@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: executing
-stopped_at: Completed 10-02-PLAN.md
-last_updated: "2026-06-21T07:23:00.000Z"
-last_activity: 2026-06-21 -- Completed Phase 10 Plan 02 (PRIM-10 sgd_solve compute)
+stopped_at: Completed 10-04-PLAN.md
+last_updated: "2026-06-21T08:30:00.000Z"
+last_activity: 2026-06-21 -- Completed Phase 10 Plan 04 (LinearSVC/LinearSVR, Q1 resolved)
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 21
-  completed_plans: 18
-  percent: 64
+  completed_plans: 19
+  percent: 67
 ---
 
 # Project State
@@ -26,13 +26,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 10 (sgd-linear-svm) — EXECUTING
-Plan: 3 of 5
-Status: Executing Phase 10 (Plan 02 PRIM-10 sgd_solve compute complete)
-Last activity: 2026-06-21 -- Completed Phase 10 Plan 02 (PRIM-10 sgd_solve compute)
-Resume file: .planning/phases/10-sgd-linear-svm/10-02-SUMMARY.md
-Next: Execute Wave-2 (plan 10-03 — MBSGDClassifier/Regressor) — lower SgdConfig into SgdParams and wire the validated sgd_solve
+Plan: 4 of 5 (10-04 LinearSVC/SVR complete; 10-03 MBSGD* still pending)
+Status: Executing Phase 10 (Plan 04 LinearSVC/LinearSVR complete — SGDSVM-03/04 met, Q1 resolved)
+Last activity: 2026-06-21 -- Completed Phase 10 Plan 04 (LinearSVC/LinearSVR, Q1 resolved L-BFGS not cd_fit)
+Resume file: .planning/phases/10-sgd-linear-svm/10-04-SUMMARY.md
+Next: Execute the remaining Wave-2 plan 10-03 (MBSGDClassifier/Regressor) — lower SgdConfig into SgdParams and wire the validated sgd_solve; then Wave-3 10-05 PyO3 wrap
 
-Progress: [######    ] 64% (v2.0 — 3/5 phases complete, 18/21 plans)
+Progress: [######    ] 67% (v2.0 — 3/5 phases complete, 19/21 plans)
 
 ## Open Follow-ups (Phase 05)
 
@@ -109,6 +109,7 @@ Progress: [######    ] 64% (v2.0 — 3/5 phases complete, 18/21 plans)
 | Phase 09 P02 | 5 | 2 tasks | 4 files |
 | Phase 10 P01 | 50 | 3 tasks | 22 files |
 | Phase 10 P02 | 18 | 2 tasks (TDD: 3 commits) | 4 files |
+| Phase 10 P04 | 60 | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -117,6 +118,7 @@ Progress: [######    ] 64% (v2.0 — 3/5 phases complete, 18/21 plans)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [10-04]: LinearSVC (SGDSVM-03) + LinearSVR (SGDSVM-04) wired — Open Question Q1 RESOLVED. The SVM squared-hinge / squared-epsilon-insensitive primals are SMOOTH + CONVEX but are NOT the Lasso/ElasticNet soft-threshold CD objective (squared-error vs hinge loss), so they reuse the validated 05-06 `lbfgs_minimize` prim (option b — a thin SVM solver), NOT `cd_fit` and NOT the SGD prim. A shared `pub(crate) svm_lbfgs_fit` helper (in linear_svc.rs) minimizes `½‖w‖² + C·Σℓ` over the synthetic-feature-augmented design, host-orchestrating the margin matvec (`X̃·w`) and gradient (`w + C·X̃ᵀg`) over the device GEMM (transa for the second), recovering `intercept_ = intercept_scaling·w_last` (Pitfall 5 — NOT center-then-solve); SVR reuses it with a different per-sample margin-loss closure. An early Python/scipy spike against the pinned fixtures CONFIRMED the primal reproduces sklearn (SVC coef diff 8e-5 + EXACT labels; SVR coef diff 1.7e-5 + predict 3.3e-5) before any Rust. `dual='auto'` is resolved INTERNALLY (primal for the n_samples≥n_features fixtures; never a builder knob, D-07). f64 oracle uses a 2e-4 BAND (liblinear stops at its own tol=1e-4 short of the true optimum; both are valid near-optima) with EXACT predict labels as the strict hard gate (SVC); f32 carries the convex-minimum precision-floor accept `0.5·sqrt(eps_F)` mirroring logistic.rs (f32 gtol unreachable → accept the line-search/cap stop at the dtype floor). Added `BuildError::InvalidC` (Rule 2, the construction-time sibling of AlgoError::InvalidC). build() validates C>0 / epsilon>=0 / loss-for-estimator / l1-l2-penalty. Tests: linear_svc_test 6/6 + linear_svr_test 5/5 green cpu(f32+f64); no new clippy warnings; D-03 default litmus holds for both. The shared helper lives in linear_svc.rs (not a new svm.rs) to honor the plan's file boundary (no linear/mod.rs edit).
 - [10-02]: PRIM-10 sgd_solve compute FILLED + standalone-validated (primitive-first gate). The two-pass GATHER kernels (sgd_margin per-sample, sgd_weight_update per-coordinate — real bodies from 10-01) LAUNCH on cpu-MLIR (not just compile; sgd_cpu_launch green f32+f64, matching a host dot/axpy reference). sgd_solve is the cd_solve host-loop shape specialized to minibatch SGD: validate-before-launch -> epoch loop over max_iter -> per minibatch (natural row order, shuffle=false): sgd_margin::launch -> read p[] -> host g[i]=dloss(p_i,y_i) clipped +/-1e12 -> eta=schedule_eta(t) -> host lazy-L2 wscale shrink (w*=max(0,1-(1-l1_ratio)*eta*alpha)) -> sgd_weight_update::launch -> host cumulative-L1 soft-shrink -> host intercept b-=eta*inv_b*Σg (intercept_decay=1.0 dense) -> tol-scaled host stop, else cap. The six-loss dloss table + optimal_t0 (Bottou) + schedule_eta (optimal/invscaling/constant/adaptive) host helpers match RESEARCH §SGD-Math; the schedule unit test isolates the CONSTANT case FIRST (A1/Pitfall 3) before optimal. sgd_convex_objective reaches a known squared-error system's host optimum (f64 strict 1e-5, f32 1e-3 band). memory_gate_sgd_bounded green (alloc-delta==0 after warmup, live=0/peak=192 conserved, metered read_backs==0 — the [05-11] iterative-solver bounded-allocation form). KEY DEVIATIONS (Rule 3): (a) cubecl 0.10 ArrayArg has NO from_raw_parts_offset, and the kernels index from row 0, so each minibatch's contiguous row block is uploaded into a bounded reused from_host buffer (used for both passes, released at batch end — the memory gate proves the reuse); (b) optimal_t0 short-circuits to 1.0 for alpha<=0 (divide-by-zero guard; the convex gate uses alpha~1e-9 with a constant schedule so t0 is unused). Kernel docs reworded to avoid the literal 'atomic' token (08-02 precedent) so the non-comment-filtered grep gate passes. Grep gates clean: SharedMemory/INFINITY/atomic==0 (kernel), OsRng==0 (prim). Wave gate satisfied — 10-03 MBSGDClassifier/Regressor may now lower SgdConfig into SgdParams and wire the validated sgd_solve. DEFERRED (out of scope): a pre-existing clippy::approx_constant error in elementwise.rs:282 (FRAC_PI_2 literal) — logged to deferred-items.md, not fixed.
 - [10-01]: Phase-10 Wave-0 scaffold mirrors 07-01/08-01/09-01: front-loads ALL shared-file edits (error.rs/linear-mod.rs/kernels-lib.rs/prims-mod.rs/errors.rs/estimators-linear.rs/memory_gate_test.rs/gen_oracle.py) + every compiling stub + the six #[ignore] Nyquist test scaffolds into one wave so Waves 1/2/3 are file-disjoint and parallel-safe. Lands the typed Loss/Penalty/LearningRate enums (D-04) with single-source TryFrom<&str> accepting sklearn spellings + legacy aliases (log/log_loss, squared_error/squared_loss, D-05), the 14-field SgdConfig lowering target (D-06), the sibling BuildError enum (InvalidAlpha/L1Ratio/Eta0/Epsilon + Unknown{Loss,Penalty,LearningRate} + InvalidLossForEstimator, D-08) folding the enum-parse failures so a SINGLE build_err_to_py maps to PyValueError (D-09), and the four builder-fronted estimator homes (MBSGDClassifier/Regressor + LinearSVC/SVR) whose default field initializers encode sklearn defaults (D-01/D-03 — Phase-10 INTRODUCES the builder via ONLY the four new estimators; existing low-arity estimators NOT retrofitted, D-02). build() SIGNATURE is final; validation predicates land Wave-1/2. KEY DEVIATION (Rule 3): sgd_solve takes a FLAT SgdParams (prim-local SgdLoss/SgdSchedule enums) NOT the algos SgdConfig — mlrs-backend does not depend on mlrs-algos (the plan's literal config: &SgdConfig is a circular dependency); the estimator lowers SgdConfig into the flat params at the call site, exactly the cd_solve flat-scalar precedent. The two sgd_margin (pass-1 per-sample) / sgd_weight_update (pass-2 per-coordinate) #[cube(launch)] kernels are the SharedMemory/INFINITY-free two-pass GATHER (single-owner, cpu-MLIR-safe; the coordinate.rs idiom); sgd_solve has a REAL geometry guard (x.len()!=n*d / y.len()!=n) before its todo!() body (T-10-01-02). Four any_estimator! Unfit dispatch enums store sklearn STRINGS + scalars; the #[pyclass] registrations are Wave-3 (zero new binding infra; the macro needs no extension). 12 committed pinned-deterministic .npz fixtures (shuffle=False/tol=0/fixed max_iter/explicit schedule — Pitfall 2/7) regen in the /tmp venv (numpy 2.4.6/scipy 1.18.0/sklearn 1.9.0) in isolation; the MBSGDClassifier hinge fixture emits constant + optimal schedule variants (A1/Pitfall 3 t0 isolation) + a log-loss variant for predict_proba; ConvergenceWarning is EXPECTED (tol=0 runs all epochs deterministically). sgd_config_test runs LIVE (3 TryFrom/default tests green, build_rejects_bad_alpha #[ignore] until Wave-1). Wave gate satisfied: 10-02/03/04/05 each edit only their own files.
 - [09-01]: Phase-9 Wave-0 scaffold mirrors 08-01: front-loads ALL shared-file edits (error.rs/prims-mod.rs/cluster-mod.rs/estimators-mod.rs/lib.rs×2/kernels-lib.rs) + every compiling stub + the test scaffolding into one wave so Waves 1/2/3 are file-disjoint and parallel-safe. Lands the typed `AlgoError::NSamplesExceedsMaxDim` (D-06, n_samples>64 → names the dense-eig MAX_DIM=64 cap; reuses InvalidK for n_clusters/n_neighbors + InvalidGamma for non-finite gamma — no new variants for those), the `laplacian(pool, A, n) -> (L, dd)` host signature (RESEARCH Open Q2: estimator builds the affinity, prim returns Laplacian + degree-norm vector dd) with a REAL geometry guard but a `todo!()` compute body (Wave-1 09-02 fills it), the `laplacian_map` `#[cube(launch)]` stub (placeholder body, real launch shape + per-index dd gather like div_by_row; shared-memory-free, atomics-free, no infinite-value constant — the cpu-MLIR-safe profile Wave-1 inherits, T-9-LAP), both estimator struct homes (SpectralEmbedding default affinity=nearest_neighbors/gamma=None/n_components=2; SpectralClustering default affinity=rbf/gamma=1.0/n_clusters=8 — the D-01 per-estimator default DISAGREEMENT honored verbatim in struct defaults + pyclass `#[pyo3(signature)]` + oracle constructors), and the two PyO3 `any_estimator!` pyclass stubs registered on `_mlrs` (zero new binding infra). Five #[ignore] Nyquist scaffolds compile + collect (laplacian value/zero_degree/memory_gate; SE rbf/knn/subspace/reject_oversize; SC labels-up-to-permutation; py-smoke construct+fit) asserting fixture-load+shape only; reject_oversize asserts the typed variant message STRUCTURALLY (fit is todo!() in Wave-0). 10 committed `.npz` fixtures generated with each estimator's OWN DEFAULT constructor (D-01, the inverse of Phase-7 oracle-injection) — default + degenerate-spectrum SE (subspace test), value + isolated-node laplacian (zero-degree guard), well-separated SC (D-10 unique partition); regen in the /tmp venv (numpy 2.4.6/scipy 1.18.0/sklearn 1.9.0, PEP 668), run in isolation so other phase blobs do not churn. laplacian.rs stays n<=64 cap-agnostic (like kernel_matrix.rs) — the cap is the estimator's job (D-06). Wave gate satisfied: 09-02/03/04 each edit only their own files.

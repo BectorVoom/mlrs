@@ -44,8 +44,8 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 - [ ] **SGDSVM-01**: A data scientist can fit `MBSGDClassifier` (sklearn `SGDClassifier` objectives: hinge / log / squared-hinge; learning-rate schedules incl. `optimal`) with `predict`/`predict_proba`, matching scikit-learn within tolerance under a pinned deterministic oracle (`shuffle=False`, fixed schedule/epochs)
 - [ ] **SGDSVM-02**: A data scientist can fit `MBSGDRegressor` (squared-loss / epsilon-insensitive; `invscaling` default) with `predict`, matching scikit-learn within tolerance under the pinned deterministic oracle
-- [ ] **SGDSVM-03**: A data scientist can fit `LinearSVC` (`loss='squared_hinge'` default, `penalty`, `dual='auto'`, `intercept_scaling`) with `predict`, matching scikit-learn within tolerance
-- [ ] **SGDSVM-04**: A data scientist can fit `LinearSVR` (`loss='squared_epsilon_insensitive'` default, `epsilon`) with `predict`, matching scikit-learn within tolerance
+- [x] **SGDSVM-03**: A data scientist can fit `LinearSVC` (`loss='squared_hinge'` default, `penalty`, `dual='auto'`, `intercept_scaling`) with `predict`, matching scikit-learn within tolerance — Phase 10 Plan 04 (L-BFGS squared-hinge primal, exact predict labels hard gate)
+- [x] **SGDSVM-04**: A data scientist can fit `LinearSVR` (`loss='squared_epsilon_insensitive'` default, `epsilon`) with `predict`, matching scikit-learn within tolerance — Phase 10 Plan 04 (shared L-BFGS squared-eps-insensitive primal)
 
 ### Naive Bayes
 
@@ -91,8 +91,8 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | PRIM-10 | Phase 10 | Complete (10-02) |
 | SGDSVM-01 | Phase 10 | Pending |
 | SGDSVM-02 | Phase 10 | Pending |
-| SGDSVM-03 | Phase 10 | Pending |
-| SGDSVM-04 | Phase 10 | Pending |
+| SGDSVM-03 | Phase 10 | Complete (Plan 04) |
+| SGDSVM-04 | Phase 10 | Complete (Plan 04) |
 | NB-01 | Phase 11 | Pending |
 | NB-02 | Phase 11 | Pending |
 | NB-03 | Phase 11 | Pending |
