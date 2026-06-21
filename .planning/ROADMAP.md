@@ -153,7 +153,7 @@ Plans:
 Plans:
 **Wave 0**
 
-- [ ] 10-01-PLAN.md — Wave-0 scaffold: Loss/Penalty/LearningRate enums + TryFrom + SgdConfig + BuildError (D-04..D-09) + sgd kernel/prim stubs + four builder-fronted estimator homes + PyO3 Unfit stubs + build_err_to_py + 6 #[ignore] Nyquist scaffolds + 4 pinned-deterministic oracle generators
+- [x] 10-01-PLAN.md — Wave-0 scaffold: Loss/Penalty/LearningRate enums + TryFrom + SgdConfig + BuildError (D-04..D-09) + sgd kernel/prim stubs + four builder-fronted estimator homes + PyO3 Unfit stubs + build_err_to_py + 6 #[ignore] Nyquist scaffolds + 4 pinned-deterministic oracle generators ✅ (3 commits, 22 files; SUMMARY 10-01)
 
 **Wave 1** *(blocked on Wave 0)*
 

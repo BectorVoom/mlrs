@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
 status: executing
-stopped_at: Phase 10 context gathered
-last_updated: "2026-06-21T06:42:24.156Z"
-last_activity: 2026-06-21 -- Phase 10 planning complete
+stopped_at: Completed 10-01-PLAN.md
+last_updated: "2026-06-21T07:00:00.000Z"
+last_activity: 2026-06-21 -- Completed Phase 10 Plan 01 (Wave-0 scaffold)
 progress:
   total_phases: 5
   completed_phases: 3
-  total_plans: 16
-  completed_plans: 16
-  percent: 60
+  total_plans: 21
+  completed_plans: 17
+  percent: 62
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 10 — sgd-/-linear-svm (next)
+**Current focus:** Phase 10 — sgd-linear-svm
 
 ## Current Position
 
-Phase: 10
-Plan: Not started
-Status: Ready to execute
-Last activity: 2026-06-21 -- Phase 10 planning complete
-Resume file: .planning/phases/10-sgd-linear-svm/10-CONTEXT.md
-Next: Plan Phase 10 (sgd-/-linear-svm); optionally address the 6 Warning-level code-review findings from 09-REVIEW.md first
+Phase: 10 (sgd-linear-svm) — EXECUTING
+Plan: 2 of 5
+Status: Executing Phase 10 (Plan 01 Wave-0 scaffold complete)
+Last activity: 2026-06-21 -- Completed Phase 10 Plan 01 (Wave-0 scaffold)
+Resume file: .planning/phases/10-sgd-linear-svm/10-01-SUMMARY.md
+Next: Execute Wave-1 (plan 10-02 — sgd_solve compute + MBSGD estimators) on the file-disjoint scaffold
 
-Progress: [######    ] 60% (v2.0 — 3/5 phases complete, 16/16 plans)
+Progress: [######    ] 62% (v2.0 — 3/5 phases complete, 17/21 plans)
 
 ## Open Follow-ups (Phase 05)
 
@@ -107,6 +107,7 @@ Progress: [######    ] 60% (v2.0 — 3/5 phases complete, 16/16 plans)
 | Phase 08 P05 | 9 | 2 tasks | 5 files |
 | Phase 09 P01 | 12 | 2 tasks | 19 files |
 | Phase 09 P02 | 5 | 2 tasks | 4 files |
+| Phase 10 P01 | 50 | 3 tasks | 22 files |
 
 ## Accumulated Context
 
@@ -115,6 +116,7 @@ Progress: [######    ] 60% (v2.0 — 3/5 phases complete, 16/16 plans)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [10-01]: Phase-10 Wave-0 scaffold mirrors 07-01/08-01/09-01: front-loads ALL shared-file edits (error.rs/linear-mod.rs/kernels-lib.rs/prims-mod.rs/errors.rs/estimators-linear.rs/memory_gate_test.rs/gen_oracle.py) + every compiling stub + the six #[ignore] Nyquist test scaffolds into one wave so Waves 1/2/3 are file-disjoint and parallel-safe. Lands the typed Loss/Penalty/LearningRate enums (D-04) with single-source TryFrom<&str> accepting sklearn spellings + legacy aliases (log/log_loss, squared_error/squared_loss, D-05), the 14-field SgdConfig lowering target (D-06), the sibling BuildError enum (InvalidAlpha/L1Ratio/Eta0/Epsilon + Unknown{Loss,Penalty,LearningRate} + InvalidLossForEstimator, D-08) folding the enum-parse failures so a SINGLE build_err_to_py maps to PyValueError (D-09), and the four builder-fronted estimator homes (MBSGDClassifier/Regressor + LinearSVC/SVR) whose default field initializers encode sklearn defaults (D-01/D-03 — Phase-10 INTRODUCES the builder via ONLY the four new estimators; existing low-arity estimators NOT retrofitted, D-02). build() SIGNATURE is final; validation predicates land Wave-1/2. KEY DEVIATION (Rule 3): sgd_solve takes a FLAT SgdParams (prim-local SgdLoss/SgdSchedule enums) NOT the algos SgdConfig — mlrs-backend does not depend on mlrs-algos (the plan's literal config: &SgdConfig is a circular dependency); the estimator lowers SgdConfig into the flat params at the call site, exactly the cd_solve flat-scalar precedent. The two sgd_margin (pass-1 per-sample) / sgd_weight_update (pass-2 per-coordinate) #[cube(launch)] kernels are the SharedMemory/INFINITY-free two-pass GATHER (single-owner, cpu-MLIR-safe; the coordinate.rs idiom); sgd_solve has a REAL geometry guard (x.len()!=n*d / y.len()!=n) before its todo!() body (T-10-01-02). Four any_estimator! Unfit dispatch enums store sklearn STRINGS + scalars; the #[pyclass] registrations are Wave-3 (zero new binding infra; the macro needs no extension). 12 committed pinned-deterministic .npz fixtures (shuffle=False/tol=0/fixed max_iter/explicit schedule — Pitfall 2/7) regen in the /tmp venv (numpy 2.4.6/scipy 1.18.0/sklearn 1.9.0) in isolation; the MBSGDClassifier hinge fixture emits constant + optimal schedule variants (A1/Pitfall 3 t0 isolation) + a log-loss variant for predict_proba; ConvergenceWarning is EXPECTED (tol=0 runs all epochs deterministically). sgd_config_test runs LIVE (3 TryFrom/default tests green, build_rejects_bad_alpha #[ignore] until Wave-1). Wave gate satisfied: 10-02/03/04/05 each edit only their own files.
 - [09-01]: Phase-9 Wave-0 scaffold mirrors 08-01: front-loads ALL shared-file edits (error.rs/prims-mod.rs/cluster-mod.rs/estimators-mod.rs/lib.rs×2/kernels-lib.rs) + every compiling stub + the test scaffolding into one wave so Waves 1/2/3 are file-disjoint and parallel-safe. Lands the typed `AlgoError::NSamplesExceedsMaxDim` (D-06, n_samples>64 → names the dense-eig MAX_DIM=64 cap; reuses InvalidK for n_clusters/n_neighbors + InvalidGamma for non-finite gamma — no new variants for those), the `laplacian(pool, A, n) -> (L, dd)` host signature (RESEARCH Open Q2: estimator builds the affinity, prim returns Laplacian + degree-norm vector dd) with a REAL geometry guard but a `todo!()` compute body (Wave-1 09-02 fills it), the `laplacian_map` `#[cube(launch)]` stub (placeholder body, real launch shape + per-index dd gather like div_by_row; shared-memory-free, atomics-free, no infinite-value constant — the cpu-MLIR-safe profile Wave-1 inherits, T-9-LAP), both estimator struct homes (SpectralEmbedding default affinity=nearest_neighbors/gamma=None/n_components=2; SpectralClustering default affinity=rbf/gamma=1.0/n_clusters=8 — the D-01 per-estimator default DISAGREEMENT honored verbatim in struct defaults + pyclass `#[pyo3(signature)]` + oracle constructors), and the two PyO3 `any_estimator!` pyclass stubs registered on `_mlrs` (zero new binding infra). Five #[ignore] Nyquist scaffolds compile + collect (laplacian value/zero_degree/memory_gate; SE rbf/knn/subspace/reject_oversize; SC labels-up-to-permutation; py-smoke construct+fit) asserting fixture-load+shape only; reject_oversize asserts the typed variant message STRUCTURALLY (fit is todo!() in Wave-0). 10 committed `.npz` fixtures generated with each estimator's OWN DEFAULT constructor (D-01, the inverse of Phase-7 oracle-injection) — default + degenerate-spectrum SE (subspace test), value + isolated-node laplacian (zero-degree guard), well-separated SC (D-10 unique partition); regen in the /tmp venv (numpy 2.4.6/scipy 1.18.0/sklearn 1.9.0, PEP 668), run in isolation so other phase blobs do not churn. laplacian.rs stays n<=64 cap-agnostic (like kernel_matrix.rs) — the cap is the estimator's job (D-06). Wave gate satisfied: 09-02/03/04 each edit only their own files.
 - [09-02]: PRIM-09 laplacian compute FILLED + standalone-validated (primitive-first gate). `laplacian(pool, A, n) -> (L, dd)` is a 4-step host orchestration over `row_reduce(Sum)` + three NEW SharedMemory-free/atomics-free/infinity-free map kernels: (1) `zero_diag_copy` (non-in-place `np.fill_diagonal(m,0)` so the caller's affinity A is never mutated — the degree must exclude the self edge, scipy order); (2) `row_reduce(Sum, Shared)` degree GATHER (single-owner, no scatter/atomics); (3) `degree_guard` = `dd = where(w==0, 1, sqrt(w))` typed-zero guard (T-9-LAP — replaces the would-be `1/sqrt(0)` infinite value with typed 1, STATEMENT-form per Cubecl_conditionals.md, NO F::INFINITY); (4) `laplacian_map` = off-diag `-a/(dd_i·dd_j)` (dd GATHERed by row/col index, div_by_row idiom) + diagonal `1 - isolated`. KEY: `laplacian_map` threads the DEGREE vector `w` alongside `dd` so the diagonal uses the TRUE `w[i]==0` isolated test (not a `dd==1` heuristic, which is ambiguous for degree==1) — byte-exact diagonal vs scipy. The transient working buffer + degree vector are released (memory gate: live conserves, peak plateaus, read_backs==0); `dd` is RETURNED alongside `L` (the D-07 recovery in 09-03 divides each recovered eigenvector by it). Values vs scipy `_laplacian_dense`: f64 L max_abs 5.6e-17 (strict 1e-5), f32 2.98e-8 (band 1e-4). Zero-degree node: dd==1, L row all-zero, L diag 0, all-finite (no NaN/inf). 4 laplacian_test fns green cpu(f32+f64); INFINITY + SharedMemory grep gates clean on the new sources. NOTE: `mlrs-kernels` is feature-free so Task-1's `cargo build --features cpu -p mlrs-kernels` is wrong (no cpu feature) — build with bare `cargo build -p mlrs-kernels`; the launch-codegen gate is the backend test. zero_diag_copy was added under Task 2 (the host-orchestration step-1 — no existing diag-zero idiom in the codebase).
 - [09-03]: SPECTRAL-01 SpectralEmbedding.fit FILLED + oracle-validated. Pipeline = affinity → `laplacian(A,n)` (PRIM-09, returns dd) → v1 `eig(L)` (DESCENDING, V col-major) → host recovery in the pinned sklearn `_spectral_embedding` order (slice the smallest n_components+1 = descending col n-1-r → `/dd` recovery BEFORE the sign-flip, D-07 → `_deterministic_vector_sign_flip` per ROW argmax|·| → drop trivial row 0, D-08 → transpose → embedding_ n×n_components). The Laplacian buffer is threaded through eig's `out` (consumed/released after launch, no parallel n² alloc). rbf affinity = kernel_matrix(Rbf{gamma}) with gamma=None→1/n_features at fit (D-04); nearest_neighbors affinity = distance(sqrt=false)→top_k(n_neighbors)→host binarize 0/1 (self is the row-min, include_self automatic)→0.5(A+Aᵀ) symmetrize (D-03). Validate-before-launch (D-06): n_samples>64→NSamplesExceedsMaxDim BEFORE any device work, InvalidK(n_neighbors)/InvalidGamma/InvalidNComponents. KEY DEVIATION (Rule 3): regenerated the SE oracles — the Wave-0 fixture stored only the sklearn-DEFAULT nearest_neighbors embedding, but the default n_neighbors=None→max(n//10,1)=1 at n=12 makes a DISCONNECTED kNN graph whose high-multiplicity zero eigenspace a dense Jacobi eig cannot reproduce (sklearn's own _spectral_embedding on the same affinity diverges 0.6 from the stored embedding). Now stores: (a) an rbf embedding (gamma=1/n_features, the RESEARCH-validated dense path) as the STRICT primary gate (f64 1.05e-15, f32 4.17e-7); (b) embedding_knn at an explicit CONNECTED n_neighbors=5 (f64 6.66e-16); (c) a cycle-graph degenerate fixture with a degenerate Fiedler PAIR for the D-09 subspace test (principal-angles mismatch 0; per-element diff 0.06 would false-fail). 5 spectral_embedding_test fns green cpu(f32+f64). Lesson: an oracle pinning an estimator's DEFAULT-constructor params must verify the dense-eig path reproduces that parameterization — a disconnected/degenerate default needs an explicit connected param or a subspace gate.
