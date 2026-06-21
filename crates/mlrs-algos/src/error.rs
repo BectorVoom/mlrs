@@ -255,7 +255,8 @@ pub enum AlgoError {
     /// covers — so it is rejected at `fit` *before* any kernel launch (T-08-01-01 /
     /// ASVS V5).
     #[error(
-        "estimator '{estimator}': gamma = {gamma} is invalid (must be finite)"
+        "estimator '{estimator}': gamma = {gamma} is invalid \
+         (must be a finite value > 0)"
     )]
     InvalidGamma {
         /// Which estimator rejected the value (e.g. `"kernel_ridge"`).

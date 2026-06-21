@@ -192,7 +192,14 @@ where
             // (T-9-VAL / InvalidGamma).
             "rbf" => {
                 let gamma64 = host_to_f64(self.gamma);
-                if !gamma64.is_finite() {
+                // WR-04: sklearn's kernel-coefficient contract is
+                // Interval(Real, 0, None, closed='neither') — STRICTLY positive.
+                // gamma == 0 yields exp(0) = 1 for all pairs (a constant all-ones
+                // affinity → degenerate graph); a negative gamma blows the affinity
+                // up monotonically with distance. Reject gamma <= 0, not just the
+                // non-finite case (the finiteness check is subsumed: NaN and ±inf
+                // both fail `> 0.0`).
+                if !(gamma64 > 0.0) {
                     return Err(AlgoError::InvalidGamma {
                         estimator: "spectral_clustering",
                         gamma: gamma64,
