@@ -192,11 +192,11 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 11-01-PLAN.md — Wave-0 scaffold: PredictLogProba trait (D-07) + nb_common free functions incl. the class_grouped_sum GATHER (standalone-validated, no new kernel) + NB BuildError/AlgoError variants + MinCategories enum (D-04) + five compiling estimator stubs (sklearn-default builders, D-02/D-09) + gen_oracle.py generators + 10 committed fixtures + 5 #[ignore] oracle test scaffolds; resolves A1/A5
+- [x] 11-01-PLAN.md — Wave-0 scaffold: PredictLogProba trait (D-07) + nb_common free functions incl. the class_grouped_sum GATHER (standalone-validated, no new kernel) + NB BuildError/AlgoError variants + MinCategories enum (D-04) + five compiling estimator stubs (sklearn-default builders, D-02/D-09) + gen_oracle.py generators + 10 committed fixtures + 5 #[ignore] oracle test scaffolds; resolves A1/A5 — DONE 2026-06-21 (26c2b5e, 7b44257, 54cf1c7); nb_common_test 9/9, all five oracle files collect
 
 **Wave 2** *(blocked on Wave 1; 11-02 + 11-03 + 11-04 file-disjoint -> parallel)*
 
-- [ ] 11-02-PLAN.md — NB-01 GaussianNB (continuous; global var_smoothing epsilon_ per Pitfall 3, per-class mean/var via GATHER, host log-sum-exp, exact-labels hard gate)
+- [x] 11-02-PLAN.md — NB-01 GaussianNB (continuous; global var_smoothing epsilon_ per Pitfall 3, per-class mean/var via GATHER, host log-sum-exp, exact-labels hard gate) — DONE 2026-06-21 (1eb7aa9, 96bcfaf); gaussian_nb_test 7/7 (0 ignored), exact labels f32+f64 hard gate, proba band f64 1e-5/f32 1e-3 with rows-sum-to-1, refit leak-free
 - [ ] 11-03-PLAN.md — NB-02 MultinomialNB + NB-03 BernoulliNB + NB-04 ComplementNB (three independent count-based structs sharing the GEMM joint-LL; per-variant denominators, Bernoulli non-occurrence term + binarize, Complement complement-weights + norm + argmin)
 - [ ] 11-04-PLAN.md — NB-05 CategoricalNB (ragged Vec<Vec<f64>> feature_log_prob_ + MinCategories padding + integer-input validation + unseen-category-safe lookup)
 
