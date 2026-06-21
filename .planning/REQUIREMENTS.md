@@ -37,7 +37,7 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 ### Spectral
 
-- [ ] **SPECTRAL-01**: A data scientist can fit `SpectralEmbedding` (affinity → normalized graph Laplacian → smallest non-trivial eigenvectors via the v1 `eig`, dropping the ≈0 eigenvector, deterministic sign canonicalization) and get `embedding_` matching scikit-learn within tolerance after sign alignment
+- [x] **SPECTRAL-01**: A data scientist can fit `SpectralEmbedding` (affinity → normalized graph Laplacian → smallest non-trivial eigenvectors via the v1 `eig`, dropping the ≈0 eigenvector, deterministic sign canonicalization) and get `embedding_` matching scikit-learn within tolerance after sign alignment
 - [ ] **SPECTRAL-02**: A data scientist can fit `SpectralClustering` (spectral embedding → KMeans) and get `labels_` matching scikit-learn up to label permutation
 
 ### SGD / Linear SVM
@@ -86,7 +86,7 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | KERNEL-01 | Phase 8 | Complete |
 | KERNEL-02 | Phase 8 | Complete (08-04) |
 | PRIM-09 | Phase 9 | Complete (09-02) |
-| SPECTRAL-01 | Phase 9 | Pending |
+| SPECTRAL-01 | Phase 9 | Complete |
 | SPECTRAL-02 | Phase 9 | Pending |
 | PRIM-10 | Phase 10 | Pending |
 | SGDSVM-01 | Phase 10 | Pending |

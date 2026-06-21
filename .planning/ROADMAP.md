@@ -121,7 +121,7 @@ Plans:
 - [x] 09-02-laplacian-prim-PLAN.md — PRIM-09 laplacian.rs (zero-diag → row_reduce(Sum) degree GATHER → typed-zero dd guard → SharedMemory-free laplacian_map: L = I − D^-1/2 A D^-1/2) standalone-validated f32+f64, zero-degree no-NaN/inf, PoolStats memory gate — DONE 2026-06-21 (c2ec4fb, 545d5b7); f64 max_abs 5.6e-17 / f32 2.98e-8
 
 **Wave 2** *(blocked on Wave 1)*
-- [ ] 09-03-spectral-embedding-PLAN.md — SPECTRAL-01 SpectralEmbedding (rbf + nearest_neighbors-default affinity → laplacian → eig reverse→ascending → /dd recovery → sign-flip → drop-trivial; gamma None→1/n_features D-04; degenerate subspace test D-09; reject n_samples>64 D-06)
+- [x] 09-03-spectral-embedding-PLAN.md — SPECTRAL-01 SpectralEmbedding (rbf + nearest_neighbors affinity → laplacian → eig reverse→ascending → /dd recovery → sign-flip → drop-trivial; gamma None→1/n_features D-04; degenerate subspace test D-09; reject n_samples>64 D-06) — DONE 2026-06-21 (e61db77, a6da691, ee9411f); rbf f64 1.05e-15 / f32 4.17e-7, knn f64 6.66e-16, subspace mismatch 0
 
 **Wave 3** *(blocked on Wave 2)*
 - [ ] 09-04-spectral-clustering-pyo3-PLAN.md — SPECTRAL-02 SpectralClustering (rbf default + drop_first=FALSE + n_components=n_clusters D-11 → KMeans::new exact labels up to perm on well-separated fixture D-10) + PyO3 PySpectralEmbedding/PySpectralClustering (any_estimator! ×2, GIL release, f64 guard) + smoke test
@@ -171,6 +171,6 @@ Plans:
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
 | 7. Covariance & Projection | v2.0 | 7/7 | Complete    | 2026-06-20 |
 | 8. Kernel Family | v2.0 | 1/5 | Executing | - |
-| 9. Spectral Family | v2.0 | 0/? | Not started | - |
+| 9. Spectral Family | v2.0 | 3/4 | In progress | PRIM-09, SPECTRAL-01 |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
 | 11. Naive Bayes | v2.0 | 0/? | Not started | - |
