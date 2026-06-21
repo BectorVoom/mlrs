@@ -190,7 +190,6 @@ where
     // averaged by `1/bsz` and the margin is not re-read mid-batch (see the
     // `SgdParams::batch_size` doc). Only `batch == 1` matches sklearn.
     let batch = params.batch_size.clamp(1, n);
-    let inv_b = 1.0 / batch as f64;
 
     // The Bottou t0 (optimal schedule only); computed once before the loop.
     let t0 = optimal_t0(params.loss, params.alpha);
@@ -236,7 +235,7 @@ where
             let x_off = unsafe { ArrayArg::from_raw_parts(xb.handle().clone(), bsz * d) };
             let w_arg = unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) };
             let count = CubeCount::Static(
-                ((bsz as u32) + cube_block - 1) / cube_block.max(1),
+                ((bsz as u32) + cube_block - 1) / cube_block,
                 1,
                 1,
             );
@@ -292,7 +291,7 @@ where
             let g_arg = unsafe { ArrayArg::from_raw_parts(g_dev.handle().clone(), bsz) };
             let w_arg2 = unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) };
             let count2 = CubeCount::Static(
-                ((d as u32) + cube_block - 1) / cube_block.max(1),
+                ((d as u32) + cube_block - 1) / cube_block,
                 1,
                 1,
             );
@@ -405,7 +404,6 @@ where
             xb.release_into(pool);
 
             t += bsz as u64;
-            let _ = inv_b;
             start += bsz;
         }
 
