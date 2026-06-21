@@ -482,7 +482,13 @@ pub fn optimal_t0(loss: SgdLoss, alpha: f64) -> f64 {
         return 1.0;
     }
     let typw = (1.0 / alpha.sqrt()).sqrt();
-    let initial_eta0 = typw / dloss(loss, -typw, 1.0, 0.1).abs().max(1.0);
+    // IN-05: the `dloss` probe `epsilon` is INERT here — the `optimal` schedule is
+    // only paired with the classifier losses (hinge / log / squared-hinge), none
+    // of which read `epsilon` (matching sklearn's `optimal_init`, which likewise
+    // ignores it). A named zero documents this rather than a bare magic `0.1`.
+    const OPTIMAL_INIT_EPSILON: f64 = 0.0;
+    let initial_eta0 =
+        typw / dloss(loss, -typw, 1.0, OPTIMAL_INIT_EPSILON).abs().max(1.0);
     1.0 / (initial_eta0 * alpha)
 }
 
