@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
-status: executing
-stopped_at: Completed 09-04-PLAN.md (SPECTRAL-02 SpectralClustering filled + PyO3 spectral wrapping; Phase 09 plans complete)
-last_updated: "2026-06-21T03:25:35.000Z"
-last_activity: 2026-06-21 -- Completed 09-04-PLAN.md (SPECTRAL-02)
+status: completed
+stopped_at: Phase 09 (spectral-family) complete and verified — 4/4 plans, PRIM-09/SPECTRAL-01/SPECTRAL-02 met; next is Phase 10
+last_updated: "2026-06-21T03:41:16.512Z"
+last_activity: 2026-06-21
 progress:
   total_phases: 5
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 16
-  completed_plans: 15
-  percent: 49
+  completed_plans: 16
+  percent: 60
 ---
 
 # Project State
@@ -21,18 +21,18 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 09 — spectral-family
+**Current focus:** Phase 10 — sgd-/-linear-svm (next)
 
 ## Current Position
 
-Phase: 09 (spectral-family) — EXECUTING (all 4 plans complete; awaiting phase verify/close)
-Plan: 4 of 4 — COMPLETE
-Status: Phase 09 plans complete
-Last activity: 2026-06-21 -- Completed 09-04-PLAN.md (SPECTRAL-02 SpectralClustering + PyO3 spectral wrapping)
-Resume file: .planning/phases/09-spectral-family/09-04-SUMMARY.md
-Next: Phase 09 verify/close (all SPECTRAL-01/SPECTRAL-02/PRIM-09 requirements met); then advance to the next v2.0 phase
+Phase: 10
+Plan: Not started
+Status: Phase 09 complete and verified (3/3 must-haves; cpu f64 + rocm f32 gates green)
+Last activity: 2026-06-21
+Resume file: .planning/phases/09-spectral-family/09-VERIFICATION.md
+Next: Plan Phase 10 (sgd-/-linear-svm); optionally address the 6 Warning-level code-review findings from 09-REVIEW.md first
 
-Progress: [#####     ] 49% (v2.0 — 2/5 phases complete, 15/16 plans)
+Progress: [######    ] 60% (v2.0 — 3/5 phases complete, 16/16 plans)
 
 ## Open Follow-ups (Phase 05)
 
@@ -44,7 +44,7 @@ Progress: [#####     ] 49% (v2.0 — 2/5 phases complete, 15/16 plans)
 
 **Velocity:**
 
-- Total plans completed: 38
+- Total plans completed: 42
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -56,6 +56,7 @@ Progress: [#####     ] 49% (v2.0 — 2/5 phases complete, 15/16 plans)
 | 3 | 5 | - | - |
 | 04 | 5 | - | - |
 | 07 | 7 | - | - |
+| 09 | 4 | - | - |
 
 **Recent Trend:**
 

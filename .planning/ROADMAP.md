@@ -27,7 +27,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 
 - [x] **Phase 7: Covariance & Projection** — RNG-matrix + incremental-SVD prims, PartialFit trait; EmpiricalCovariance, LedoitWolf, IncrementalPCA, Gaussian/SparseRandomProjection (completed 2026-06-20)
 - [x] **Phase 8: Kernel Family** — kernel-matrix prim (linear/RBF/poly/sigmoid), ScoreSamples trait; KernelRidge, KernelDensity (completed 2026-06-21; verified 4/4 must-haves, UAT passed)
-- [ ] **Phase 9: Spectral Family** — graph-Laplacian prim (hard dep on Phase 8 kernel-matrix); SpectralEmbedding, SpectralClustering
+- [x] **Phase 9: Spectral Family** — graph-Laplacian prim (hard dep on Phase 8 kernel-matrix); SpectralEmbedding, SpectralClustering (completed 2026-06-21)
 - [ ] **Phase 10: SGD / Linear-SVM** — SGD solver prim (the one new device solver, highest cpu-MLIR risk); MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR
 - [ ] **Phase 11: Naive Bayes** — reductions-only closing bookend; GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB
 
@@ -86,16 +86,20 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 
 Plans:
 **Wave 0**
+
 - [x] 08-01-PLAN.md — Wave-0 scaffold: ScoreSamples<F> trait + 3 AlgoError guards + Kernel<F> enum/kernel_matrix signature + kernel_ridge//density/ module homes + 3 #[ignore] test scaffolds + 3 oracle generators
 
 **Wave 1** *(blocked on Wave 0)*
+
 - [x] 08-02-PLAN.md — PRIM-08 kernel_matrix.rs keystone prim (linear/rbf/poly/sigmoid map over v1 distance/gemm) + PoolStats memory gate [3/3 tasks; f64 ≤2.2e-16, f32 ≤2.4e-7 vs sklearn; memory gate green; wave gate satisfied]
 
 **Wave 2** *(blocked on Wave 1)*
+
 - [x] 08-03-PLAN.md — KERNEL-01 KernelRidge (dual (K+αI) Cholesky multi-RHS solve over kernel_matrix; no centering/intercept) [2/2 tasks; f64 ≤5.6e-16, f32 ≤3.6e-7 vs sklearn across 4 kernels + multi-target + both gamma paths]
 - [x] 08-04-PLAN.md — KERNEL-02 KernelDensity (6 KD kernels + scott/silverman; device log-sum-exp over v1 distance/reduce; ScoreSamples<F> impl) [3/3 tasks; f64 ≤1.6e-8 (cosine series), other 5 kernels ≤1e-12, f32 ≤1e-4 vs sklearn forced-exact; Open Q1 resolved — plain reduce-sum, no rescale]
 
 **Wave 3** *(blocked on Wave 2)*
+
 - [x] 08-05-PLAN.md — PY-06 (share) PyO3 wrappers PyKernelRidge/PyKernelDensity (any_estimator! + score_samples) + py smoke test [2/2 tasks; zero new binding infra; both pyclasses registered in _mlrs; smoke test 4/4 green (f32+f64 × predict + score_samples) via maturin develop --release on cpu]
 
 ### Phase 9: Spectral Family
@@ -115,15 +119,19 @@ Plans:
 
 Plans:
 **Wave 0**
+
 - [x] 09-01-wave0-scaffold-PLAN.md — Wave-0 scaffold: AlgoError::NSamplesExceedsMaxDim (D-06) + laplacian prim/kernel stubs + 2 estimator homes + PyO3 spectral.rs stub + 5 #[ignore] test scaffolds + gen_spectral_embedding/clustering oracle generators (committed .npz, default constructors per D-01) — DONE 2026-06-21 (5c5e763, 2b1e4bd)
 
 **Wave 1** *(blocked on Wave 0)*
+
 - [x] 09-02-laplacian-prim-PLAN.md — PRIM-09 laplacian.rs (zero-diag → row_reduce(Sum) degree GATHER → typed-zero dd guard → SharedMemory-free laplacian_map: L = I − D^-1/2 A D^-1/2) standalone-validated f32+f64, zero-degree no-NaN/inf, PoolStats memory gate — DONE 2026-06-21 (c2ec4fb, 545d5b7); f64 max_abs 5.6e-17 / f32 2.98e-8
 
 **Wave 2** *(blocked on Wave 1)*
+
 - [x] 09-03-spectral-embedding-PLAN.md — SPECTRAL-01 SpectralEmbedding (rbf + nearest_neighbors affinity → laplacian → eig reverse→ascending → /dd recovery → sign-flip → drop-trivial; gamma None→1/n_features D-04; degenerate subspace test D-09; reject n_samples>64 D-06) — DONE 2026-06-21 (e61db77, a6da691, ee9411f); rbf f64 1.05e-15 / f32 4.17e-7, knn f64 6.66e-16, subspace mismatch 0
 
 **Wave 3** *(blocked on Wave 2)*
+
 - [x] 09-04-spectral-clustering-pyo3-PLAN.md — SPECTRAL-02 SpectralClustering (rbf default + drop_first=FALSE + n_components=n_clusters D-11 → KMeans::new exact labels up to perm on well-separated fixture D-10) + PyO3 PySpectralEmbedding/PySpectralClustering (any_estimator! ×2, GIL release, f64 guard) + smoke test — DONE 2026-06-21 (9e04a75, c5befb0); labels_ best_match_accuracy==1.0 f32+f64, device fit/accessor smoke green
 
 ### Phase 10: SGD / Linear-SVM
@@ -171,6 +179,6 @@ Plans:
 | 6. Python Surface — PyO3 Estimators & Per-Backend Wheels | v1.0 | 6/6 | Complete | 2026-06-14 |
 | 7. Covariance & Projection | v2.0 | 7/7 | Complete    | 2026-06-20 |
 | 8. Kernel Family | v2.0 | 1/5 | Executing | - |
-| 9. Spectral Family | v2.0 | 4/4 | Plans complete | PRIM-09, SPECTRAL-01, SPECTRAL-02 |
+| 9. Spectral Family | v2.0 | 4/4 | Complete    | 2026-06-21 |
 | 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
 | 11. Naive Bayes | v2.0 | 0/? | Not started | - |
