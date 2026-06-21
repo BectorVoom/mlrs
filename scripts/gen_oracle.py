@@ -465,6 +465,164 @@ SVM_C = 1.0
 SVR_EPSILON = 0.1
 SVM_MAX_ITER = 1000
 
+# Naive Bayes fixture geometry (Phase 11, NB-01..05). Small, well-separated,
+# DEFAULT-constructor fits so the default-matches-sklearn test is meaningful.
+# GaussianNB uses continuous blobs (reuses _sgd_blobs); the three count-based
+# variants use small non-negative integer counts; CategoricalNB uses small
+# integer-encoded categorical features with no unseen categories at predict (A3).
+NB_N_SAMPLES, NB_N_QUERY, NB_N_FEATURES = 40, 8, 4
+NB_N_CLASSES = 3
+# Per-feature category count for the CategoricalNB integer-encoded generator.
+NB_N_CATEGORIES = 4
+
+
+def _nb_count_blobs(seed: int, n_classes: int = NB_N_CLASSES):
+    """Small NON-NEGATIVE integer-count `X`/`Xq`/`y` for the count-based NB
+    variants (Multinomial / Bernoulli / Complement). Each class draws Poisson
+    counts from a class-specific per-feature rate so the classes are
+    well-separated (a meaningful default fit). Returns `(x, y, xq)` integer arrays.
+    """
+    rng = np.random.default_rng(seed)
+    # Class-specific Poisson rates: class k emphasizes feature block k.
+    rates = np.full((n_classes, NB_N_FEATURES), 1.0)
+    for k in range(n_classes):
+        rates[k, k % NB_N_FEATURES] += 6.0
+    per = NB_N_SAMPLES // n_classes
+    x = np.vstack(
+        [rng.poisson(rates[k], size=(per, NB_N_FEATURES)) for k in range(n_classes)]
+    ).astype(np.int64)
+    y = np.concatenate([np.full(per, k) for k in range(n_classes)]).astype(np.int64)
+    qper = NB_N_QUERY // n_classes
+    xq = np.vstack(
+        [rng.poisson(rates[k], size=(qper, NB_N_FEATURES)) for k in range(n_classes)]
+    ).astype(np.int64)
+    return x, y, xq
+
+
+def _nb_categorical_blobs(seed: int, n_classes: int = NB_N_CLASSES):
+    """Small integer-ENCODED categorical `X`/`Xq`/`y` for CategoricalNB. Each
+    feature has `NB_N_CATEGORIES` levels; class k biases each feature toward a
+    class-specific modal category so the classes separate. NO unseen categories
+    at predict (A3): `Xq` is drawn from the SAME per-class modal distribution and
+    every category index stays in `[0, NB_N_CATEGORIES)`. Returns `(x, y, xq)`.
+    """
+    rng = np.random.default_rng(seed)
+    per = NB_N_SAMPLES // n_classes
+    qper = NB_N_QUERY // n_classes
+
+    def draw(n_rows: int) -> np.ndarray:
+        blocks = []
+        for k in range(n_classes):
+            # Per-class categorical probabilities biased toward category (k+j) % C.
+            rows = np.empty((n_rows, NB_N_FEATURES), dtype=np.int64)
+            for j in range(NB_N_FEATURES):
+                probs = np.full(NB_N_CATEGORIES, 1.0)
+                probs[(k + j) % NB_N_CATEGORIES] += 6.0
+                probs = probs / probs.sum()
+                rows[:, j] = rng.choice(NB_N_CATEGORIES, size=n_rows, p=probs)
+            blocks.append(rows)
+        return np.vstack(blocks)
+
+    x = draw(per)
+    xq = draw(qper)
+    y = np.concatenate([np.full(per, k) for k in range(n_classes)]).astype(np.int64)
+    return x, y, xq
+
+
+def _save_nb(out_path: str, x, xq, y, predict, predict_proba, dtype, **extra):
+    """Common savez for an NB fixture: cast every array to the fixture dtype and
+    store `X`/`Xq`/`y`/`predict`/`predict_proba` (the exact-label hard gate +
+    the proba band gate)."""
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    payload = dict(
+        X=c(x),
+        Xq=c(xq),
+        y=c(y),
+        predict=c(predict),
+        predict_proba=c(predict_proba),
+    )
+    payload.update({k: c(v) for k, v in extra.items()})
+    np.savez(out_path, **payload)
+    return out_path
+
+
+def gen_gaussian_nb(seed: int = SEED, dtype=np.float32) -> str:
+    """GaussianNB (NB-01) fixture — DEFAULT-constructor fit on continuous blobs.
+
+    Reuses ``_sgd_blobs`` (well-separated Gaussian class blobs). Stores
+    ``X``/``Xq``/``y``/``predict``/``predict_proba`` in the fixture dtype. The
+    default ``GaussianNB()`` (var_smoothing=1e-9, priors=None) is fit so the
+    default-matches-sklearn test is meaningful.
+    """
+    from sklearn.naive_bayes import GaussianNB
+
+    _, x, y, xq = _sgd_blobs(seed, n_classes=NB_N_CLASSES)
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    clf = GaussianNB().fit(x, y)
+    out_path = os.path.join(_FIXTURE_DIR, f"gaussian_nb_{dtype_tag}_seed{seed}.npz")
+    return _save_nb(
+        out_path, x, xq, y, clf.predict(xq), clf.predict_proba(xq), dtype
+    )
+
+
+def gen_multinomial_nb(seed: int = SEED, dtype=np.float32) -> str:
+    """MultinomialNB (NB-02) fixture — DEFAULT-constructor fit on integer counts."""
+    from sklearn.naive_bayes import MultinomialNB
+
+    x, y, xq = _nb_count_blobs(seed)
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    clf = MultinomialNB().fit(x, y)
+    out_path = os.path.join(_FIXTURE_DIR, f"multinomial_nb_{dtype_tag}_seed{seed}.npz")
+    return _save_nb(
+        out_path, x, xq, y, clf.predict(xq), clf.predict_proba(xq), dtype
+    )
+
+
+def gen_bernoulli_nb(seed: int = SEED, dtype=np.float32) -> str:
+    """BernoulliNB (NB-03) fixture — DEFAULT-constructor fit (binarize=0.0) on
+    integer counts (binarized internally by the default threshold)."""
+    from sklearn.naive_bayes import BernoulliNB
+
+    x, y, xq = _nb_count_blobs(seed)
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    clf = BernoulliNB().fit(x, y)
+    out_path = os.path.join(_FIXTURE_DIR, f"bernoulli_nb_{dtype_tag}_seed{seed}.npz")
+    return _save_nb(
+        out_path, x, xq, y, clf.predict(xq), clf.predict_proba(xq), dtype
+    )
+
+
+def gen_complement_nb(seed: int = SEED, dtype=np.float32) -> str:
+    """ComplementNB (NB-04) fixture — DEFAULT-constructor fit (norm=False) on
+    integer counts."""
+    from sklearn.naive_bayes import ComplementNB
+
+    x, y, xq = _nb_count_blobs(seed)
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    clf = ComplementNB().fit(x, y)
+    out_path = os.path.join(_FIXTURE_DIR, f"complement_nb_{dtype_tag}_seed{seed}.npz")
+    return _save_nb(
+        out_path, x, xq, y, clf.predict(xq), clf.predict_proba(xq), dtype
+    )
+
+
+def gen_categorical_nb(seed: int = SEED, dtype=np.float32) -> str:
+    """CategoricalNB (NB-05) fixture — DEFAULT-constructor fit (min_categories=None)
+    on integer-encoded categorical features (no unseen categories at predict, A3)."""
+    from sklearn.naive_bayes import CategoricalNB
+
+    x, y, xq = _nb_categorical_blobs(seed)
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    clf = CategoricalNB().fit(x, y)
+    out_path = os.path.join(_FIXTURE_DIR, f"categorical_nb_{dtype_tag}_seed{seed}.npz")
+    return _save_nb(
+        out_path, x, xq, y, clf.predict(xq), clf.predict_proba(xq), dtype
+    )
+
 
 def gen_kmeans(seed: int = SEED, dtype=np.float32) -> str:
     """Generate one seeded KMeans fixture (CLUSTER-01, D-09 injected init).
@@ -2160,6 +2318,26 @@ def main() -> None:
     # LinearSVR (SGDSVM-04): squared_epsilon_insensitive + epsilon.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_linear_svr(dtype=dtype)}")
+
+    # ---- Phase-11 Naive Bayes fixtures (NB-01..05) ----
+    # Each generator writes BOTH f32 (rocm gate) and f64 (cpu gate) blobs from the
+    # estimator's OWN DEFAULT constructor (D-02 — so the default-matches-sklearn
+    # test is meaningful). predict = exact-label HARD gate; predict_proba = band.
+    # GaussianNB (NB-01): continuous blobs.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_gaussian_nb(dtype=dtype)}")
+    # MultinomialNB (NB-02): integer counts.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_multinomial_nb(dtype=dtype)}")
+    # BernoulliNB (NB-03): integer counts (binarize=0.0 default).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_bernoulli_nb(dtype=dtype)}")
+    # ComplementNB (NB-04): integer counts (norm=False default, argmin decode).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_complement_nb(dtype=dtype)}")
+    # CategoricalNB (NB-05): integer-encoded categorical features (no unseen, A3).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_categorical_nb(dtype=dtype)}")
 
 
 if __name__ == "__main__":
