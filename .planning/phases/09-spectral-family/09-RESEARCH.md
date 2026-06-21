@@ -340,7 +340,10 @@ for r in 0..m {
 
 **Everything else in this RESEARCH is `[VERIFIED]` (source read on-machine) or `[CITED]` (sklearn/scipy file:line).**
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> Both questions are resolved inline by recommendation; the Phase-9 plans implement
+> these resolutions exactly (module home → `cluster/`; `laplacian.rs` RECEIVES affinity).
 
 1. **Module home for `SpectralEmbedding` (`manifold/` vs `cluster/`)**
    - Known: lib.rs currently has no `manifold` module; adding one touches `lib.rs` (the file-disjoint Wave-0 scaffold owns lib.rs edits).
