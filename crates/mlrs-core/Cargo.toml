@@ -8,3 +8,6 @@ description = "Host-side comparison helpers, tolerances, oracle fixture loader, 
 thiserror = { workspace = true }
 npyz = { workspace = true }
 log = { workspace = true }
+# Safe host<->device float bit-reinterpret (`bytemuck::Pod` bound) for the
+# shared `float_cast` helpers (IN-02); same workspace pin as the algo crates.
+bytemuck = { workspace = true }
