@@ -49,6 +49,9 @@ must be right and the backend abstraction must hold.
 - ✓ Decomposition: PCA, TruncatedSVD (Jacobi SVD/eig) — v1.0
 - ✓ Neighbors: NearestNeighbors, KNeighborsClassifier, KNeighborsRegressor (top-k) — v1.0
 
+**v2 Algorithms (in progress) — v2.0**
+- ✓ SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR (PRIM-10 two-pass GATHER solver, pinned deterministic sklearn oracle, exact-label hard gate) — Validated in Phase 10
+
 ### Active
 
 <!-- Current scope. Building toward these. All are hypotheses until shipped and validated. -->
@@ -57,7 +60,7 @@ must be right and the backend abstraction must hold.
 - [ ] Covariance & projection: EmpiricalCovariance, LedoitWolf, IncrementalPCA, Gaussian/SparseRandomProjection
 - [ ] Kernel family: KernelRidge, KernelDensity
 - [ ] Spectral family: SpectralEmbedding, SpectralClustering (leverages v1 eig)
-- [ ] SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR
+- [x] SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR — validated in Phase 10
 - [ ] Naive Bayes family: Gaussian/Multinomial/Bernoulli/Complement/Categorical
 
 ### Out of Scope
@@ -133,4 +136,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-14 after v1.0 milestone*
+*Last updated: 2026-06-21 — Phase 10 (SGD / linear-SVM) complete; v2.0 3/5 phases done*
