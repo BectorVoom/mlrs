@@ -15,11 +15,15 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
-use crate::traits::Fit;
+use crate::naive_bayes::nb_common::{
+    argmax_decode, class_grouped_sum, empirical_class_log_prior, log_sum_exp_normalize,
+};
+use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
 
 /// Multinomial Naive Bayes (NB-02). Construct via [`MultinomialNB::builder`],
 /// then [`Fit::fit`] + (Wave-1) the predict surface. Fitted `feature_log_prob_`
@@ -30,6 +34,8 @@ pub struct MultinomialNB<F> {
     alpha: f64,
     /// Keep `alpha` as-is even when `< 1e-10` (D-02 default `true`); when `false`
     /// a tiny `alpha` is clipped to `1e-10` at `build()` with a warning (D-06).
+    /// Retained as fitted-config provenance; the clip already applied at `build()`.
+    #[allow(dead_code)]
     force_alpha: bool,
     /// Learn class priors from the data (D-02 default `true`); when `false` a
     /// uniform prior is used.
@@ -64,6 +70,14 @@ where
     /// The per-class log-prior (`None` until `fit`).
     pub fn class_log_prior(&self) -> Option<&[f64]> {
         self.class_log_prior_.as_deref()
+    }
+
+    /// Host-materialized `feature_log_prob_` (`n_classes × n_features` row-major),
+    /// `None` until `fit`.
+    pub fn feature_log_prob(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<f64>> {
+        self.feature_log_prob_
+            .as_ref()
+            .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
     }
 }
 
@@ -149,7 +163,7 @@ where
 {
     fn fit(
         &mut self,
-        _pool: &mut BufferPool<ActiveRuntime>,
+        pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
@@ -175,9 +189,181 @@ where
                 len: y.len(),
             }));
         }
-        let _ = (self.alpha, self.force_alpha, self.fit_prior, &self.class_prior);
-        let _ = (&self.feature_log_prob_, &self.class_log_prior_, &self.n_features);
-        todo!("MultinomialNB::fit compute body — Wave 1 (11-03)")
+
+        // --- host distinct-sorted classes_ (multiclass, integer labels only, i32
+        //     range guarded — predicted labels are emitted as i32, WR-02). ---
+        let (classes_, class_of_row, n_classes) = decode_classes(pool, y, n_samples)?;
+
+        // --- feature_count_[c,j] via the validated GATHER (one owner per
+        //     (class, feature); the counts are accumulated in host f64). ---
+        let feature_count = class_grouped_sum::<F>(pool, x, shape, &class_of_row, n_classes)?;
+
+        // class_count_[c] = #rows of class c.
+        let mut class_count_: Vec<f64> = vec![0.0; n_classes];
+        for &c in &class_of_row {
+            class_count_[c] += 1.0;
+        }
+
+        // --- feature_log_prob_[c,j] = log((count[c,j] + alpha) /
+        //     (Σ_j count[c,j] + alpha·n_features)) (Pitfall 4: the denominator
+        //     smoothing is alpha·n_features, NOT alpha·1). ---
+        let alpha = self.alpha;
+        let mut flp: Vec<f64> = vec![0.0; n_classes * n_features];
+        for c in 0..n_classes {
+            let row_total: f64 = feature_count[c].iter().sum();
+            let denom = row_total + alpha * n_features as f64;
+            for j in 0..n_features {
+                flp[c * n_features + j] = ((feature_count[c][j] + alpha) / denom).ln();
+            }
+        }
+
+        // --- class_log_prior_: empirical log(count_c / n) when fit_prior=true &
+        //     class_prior=None; supplied class_prior (validated length); else a
+        //     uniform prior when fit_prior=false (D-05 data-dependent check). ---
+        let class_log_prior_ =
+            resolve_class_log_prior("multinomial_nb", self.fit_prior, &self.class_prior, &class_count_, n_classes)?;
+
+        // --- WR-07: release the prior fitted device buffer before storing the new
+        //     one so a re-fit at the same shape conserves live_bytes. ---
+        if let Some(old) = self.feature_log_prob_.take() {
+            old.release_into(pool);
+        }
+        let flp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
+            pool,
+            &flp.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
+        );
+
+        self.classes_ = classes_;
+        self.n_features = n_features;
+        self.feature_log_prob_ = Some(flp_dev);
+        self.class_log_prior_ = Some(class_log_prior_);
+        Ok(self)
+    }
+}
+
+impl<F> MultinomialNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Per-query-row joint log-likelihood matrix (`n_query × n_classes`, host f64,
+    /// row-major). Shared by the three predict surfaces. Runs the geometry guard,
+    /// computes `X @ feature_log_prob_.T` on the device via `gemm` (transb=true:
+    /// the stored `(n_classes, n_features)` buffer is read as its transpose), then
+    /// host-adds the `class_log_prior_[c]` bias.
+    fn joint_log_likelihood(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<Vec<f64>, AlgoError> {
+        let (n_query, n_features) = shape;
+        let flp = self.feature_log_prob_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "multinomial_nb",
+            operation: "predict (call fit first)",
+        })?;
+        let class_log_prior = self.class_log_prior_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "multinomial_nb",
+            operation: "predict (call fit first)",
+        })?;
+        if n_query == 0 || n_features != self.n_features || x.len() != n_query * n_features {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "multinomial_nb",
+                reason: format!(
+                    "predict geometry: got {n_query}x{n_features}, fitted n_features={}",
+                    self.n_features
+                ),
+            });
+        }
+        let n_classes = self.classes_.len();
+        // raw[i,c] = Σ_j X[i,j] · flp[c,j] = (X @ flp.T)[i,c]. The stored flp buffer
+        // is (n_classes, n_features); transb=true reads it as (n_features, n_classes).
+        let raw = gemm::<F>(
+            pool,
+            x,
+            (n_query, n_features),
+            flp,
+            (n_features, n_classes),
+            false,
+            true,
+            None,
+        )?;
+        let raw_host = raw.to_host(pool);
+        raw.release_into(pool);
+
+        let mut jll = vec![0.0f64; n_query * n_classes];
+        for i in 0..n_query {
+            for c in 0..n_classes {
+                jll[i * n_classes + c] =
+                    class_log_prior[c] + host_to_f64(raw_host[i * n_classes + c]);
+            }
+        }
+        Ok(jll)
+    }
+}
+
+impl<F> PredictLabels<F> for MultinomialNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_labels(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let labels = argmax_decode(&jll, &self.classes_);
+        Ok(DeviceArray::from_host(pool, &labels))
+    }
+}
+
+impl<F> PredictProba<F> for MultinomialNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_query, _n_features) = shape;
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let n_classes = self.classes_.len();
+        let mut proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        for r in 0..n_query {
+            let row = &jll[r * n_classes..(r + 1) * n_classes];
+            let (p, _lp) = log_sum_exp_normalize(row, n_classes);
+            for (c, &pv) in p.iter().enumerate() {
+                proba[r * n_classes + c] = f64_to_host::<F>(pv);
+            }
+        }
+        Ok(DeviceArray::from_host(pool, &proba))
+    }
+}
+
+impl<F> PredictLogProba<F> for MultinomialNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_log_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_query, _n_features) = shape;
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let n_classes = self.classes_.len();
+        let mut log_proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        for r in 0..n_query {
+            let row = &jll[r * n_classes..(r + 1) * n_classes];
+            let (_p, lp) = log_sum_exp_normalize(row, n_classes);
+            for (c, &lpv) in lp.iter().enumerate() {
+                log_proba[r * n_classes + c] = f64_to_host::<F>(lpv);
+            }
+        }
+        Ok(DeviceArray::from_host(pool, &log_proba))
     }
 }
 
@@ -213,4 +399,77 @@ pub(crate) fn validate_discrete_alpha(
         alpha
     };
     Ok(alpha)
+}
+
+/// Shared label decode for the discrete NB variants (D-03 — function-level
+/// sharing): read `y` to host, validate integer labels in i32 range (WR-02 —
+/// predicted labels are emitted as i32), and return the distinct-sorted
+/// `classes_`, the dense per-row class index, and `n_classes`. `pub(crate)` so
+/// the sibling discrete fits reuse it without a base struct.
+pub(crate) fn decode_classes<F>(
+    pool: &BufferPool<ActiveRuntime>,
+    y: &DeviceArray<ActiveRuntime, F>,
+    n_samples: usize,
+) -> Result<(Vec<i64>, Vec<usize>, usize), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let y_host = y.to_host(pool);
+    let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
+    for &yv in y_host.iter() {
+        let lf = host_to_f64(yv);
+        let li = lf.round();
+        if (li - lf).abs() > 1e-6 {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "discrete_nb",
+                reason: format!("labels must be integers (got {lf})"),
+            });
+        }
+        raw_labels.push(li as i64);
+    }
+    let mut classes_: Vec<i64> = raw_labels.clone();
+    classes_.sort_unstable();
+    classes_.dedup();
+    for &cls in classes_.iter() {
+        if i32::try_from(cls).is_err() {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "discrete_nb",
+                reason: format!("class label {cls} does not fit in i32 (predicted labels are i32)"),
+            });
+        }
+    }
+    let n_classes = classes_.len();
+    let class_of_row: Vec<usize> = raw_labels
+        .iter()
+        .map(|l| classes_.binary_search(l).expect("label is in classes_"))
+        .collect();
+    Ok((classes_, class_of_row, n_classes))
+}
+
+/// Shared `class_log_prior_` resolution for the discrete NB variants (D-03):
+/// supplied `class_prior` (validated length == n_classes) takes precedence; else
+/// the empirical `log(count_c / n)` when `fit_prior == true`; else a uniform
+/// `log(1/n_classes)` prior when `fit_prior == false` (sklearn semantics).
+pub(crate) fn resolve_class_log_prior(
+    estimator: &'static str,
+    fit_prior: bool,
+    class_prior: &Option<Vec<f64>>,
+    class_count_: &[f64],
+    n_classes: usize,
+) -> Result<Vec<f64>, AlgoError> {
+    if let Some(p) = class_prior {
+        if p.len() != n_classes {
+            return Err(AlgoError::InvalidLabels {
+                estimator,
+                reason: format!("class_prior length {} != number of classes {n_classes}", p.len()),
+            });
+        }
+        return Ok(p.iter().map(|&v| v.ln()).collect());
+    }
+    if fit_prior {
+        Ok(empirical_class_log_prior(class_count_))
+    } else {
+        let uniform = (1.0 / n_classes as f64).ln();
+        Ok(vec![uniform; n_classes])
+    }
 }
