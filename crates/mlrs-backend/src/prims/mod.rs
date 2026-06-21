@@ -22,6 +22,11 @@ pub mod rng;
 // `Kernel<F>` enum + `kernel_matrix` host-fn signature compile today (geometry
 // validation real; compute path `todo!()` until 08-02).
 pub mod kernel_matrix;
+// Phase-9 prim stub (Wave-0 scaffold 09-01 owns this registration; the Wave-1
+// plan 09-02 fills the file body — file-disjoint, parallel-safe). The
+// `laplacian` host-fn signature compiles today (geometry validation real;
+// compute path `todo!()` until 09-02).
+pub mod laplacian;
 // Phase-5 prim stubs (Wave-0 scaffold owns these registrations; plans
 // 05-02..06 fill their own file body — file-disjoint, parallel-safe). Each is an
 // empty compiling module until its plan adds the launch wrapper + a `pub use` of

@@ -35,3 +35,4 @@ pub mod kernel;
 pub mod linear;
 pub mod neighbors;
 pub mod projection;
+pub mod spectral;

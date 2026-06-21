@@ -264,6 +264,28 @@ pub enum AlgoError {
         gamma: f64,
     },
 
+    /// A spectral estimator (SpectralEmbedding / SpectralClustering) was given
+    /// more samples than the dense eigensolver cap (`n_samples > 64`). The
+    /// normalized Laplacian is `n_samples × n_samples` and v1 `eig` caps
+    /// `n ≤ MAX_DIM = 64` (the full-spectrum cyclic-Jacobi solver, D-05). The
+    /// guard is applied at `fit` *before* any affinity / Laplacian / eig launch so
+    /// the message names the SPECTRAL cap rather than deferring to `eig`'s generic
+    /// [`mlrs_core::PrimError::NotSquare`] (D-06 / ASVS V5). Carries the requested
+    /// `n_samples` and the `max = MAX_DIM` it exceeded.
+    #[error(
+        "estimator '{estimator}': n_samples = {n_samples} exceeds the dense \
+         eigensolver cap (must be <= {max} = MAX_DIM)"
+    )]
+    NSamplesExceedsMaxDim {
+        /// Which estimator rejected the value (e.g. `"spectral_embedding"` /
+        /// `"spectral_clustering"`).
+        estimator: &'static str,
+        /// The training sample count the caller supplied.
+        n_samples: usize,
+        /// The inclusive cap `MAX_DIM` (`64`) that was exceeded.
+        max: usize,
+    },
+
     /// A kernel estimator (KernelRidge / KernelDensity) was given an unrecognised
     /// `kernel` name. Only the supported kernel families are accepted
     /// (KernelRidge: `linear`/`rbf`/`poly`/`sigmoid`; KernelDensity:

@@ -20,3 +20,20 @@
 
 pub mod dbscan;
 pub mod kmeans;
+// Phase-9 spectral estimators (Wave-0 scaffold 09-01 owns these registrations;
+// the Wave-2 plan 09-03 fills `spectral_embedding`, the Wave-3 plan 09-04 fills
+// `spectral_clustering` — file-disjoint, parallel-safe). Both compile today as
+// struct + `new()` stubs (fit / accessor bodies `todo!()`).
+//
+// - `SpectralEmbedding` (SPECTRAL-01) — affinity → normalized Laplacian →
+//   smallest non-trivial eigenvectors → `D^-1/2` recovery → `embedding_`. Up to
+//   sign alignment vs sklearn (subspace test for degenerate spectra, D-09).
+//   Added by plan **09-03**.
+// - `SpectralClustering` (SPECTRAL-02) — spectral embedding → v1 KMeans;
+//   `labels_` matches sklearn up to label permutation (exact-labels gate, D-10).
+//   Added by plan **09-04**.
+pub mod spectral_clustering;
+pub mod spectral_embedding;
+
+pub use spectral_clustering::SpectralClustering;
+pub use spectral_embedding::SpectralEmbedding;

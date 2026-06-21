@@ -312,6 +312,59 @@ pub fn div_by_row<F: Float + CubeElement>(
     }
 }
 
+/// Normalized-Laplacian build map (PRIM-09, Wave-0 stub): given the affinity
+/// `a` (`n×n` row-major, diagonal already zeroed by the host orchestration) and
+/// the typed-zero guard vector `dd` (length `n`, `dd[i] = sqrt(degree_i)` or `1`
+/// for an isolated node), the FILLED (Wave-1) kernel writes
+///   `out[i*n+j] = -a[i*n+j] / (dd[i]*dd[j])`   for `i != j`
+///   `out[i*n+i] = if degree_i == 0 { 0 } else { 1 }`   (`= 1 - isolated`)
+/// reproducing the scipy `_laplacian_dense` normalized form. The diagonal of an
+/// isolated (zero-degree) node is EXACTLY `0`, never the reciprocal of a zero
+/// degree — this is the "no NaN / no infinite value on zero-degree nodes"
+/// success criterion (PRIM-09). The off-diagonal divisor is a GATHER of the
+/// length-`n` `dd` vector by the element's row/column index (the
+/// [`div_by_row`]-style per-index divisor pattern), so there is NO edge-scatter
+/// and NO atomic accumulation.
+///
+/// ## Wave-0 stub body
+/// This is the 09-01 Wave-0 COMPILING STUB: the signature, the bounds check, and
+/// the row/column decomposition are real (so the prim and the kernel re-export
+/// type-check today), but the body writes a placeholder (it copies `a` through)
+/// pending the Wave-1 plan (09-02), which fills the real `-a/(dd_i*dd_j)` +
+/// diagonal logic. The `dd` gather is referenced (length-checked) so the stub
+/// exercises the same argument arity the filled kernel uses.
+///
+/// `n` is a scalar `u32` passed by value (cubecl 0.10). The guard that replaces
+/// the would-be `1/sqrt(0)` is computed host-side into `dd` (the typed-zero
+/// guard), so this kernel never needs the infinite-value constant. Written to be
+/// shared-memory-free and atomics-free (the cpu-MLIR-safe profile), in the
+/// STATEMENT-guard style of [`kde_epanechnikov_map`] / [`clamp_nonneg`].
+#[cube(launch)]
+pub fn laplacian_map<F: Float + CubeElement>(
+    a: &Array<F>,
+    dd: &Array<F>,
+    output: &mut Array<F>,
+    n: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < a.len() {
+        let i = tid / n as usize;
+        let j = tid % n as usize;
+        // Wave-0 placeholder: pass the affinity through, gathering `dd` by row so
+        // the stub uses the same argument arity (a, dd, output, n) the Wave-1
+        // filled kernel will use. The real -a/(dd_i*dd_j) + diagonal build lands
+        // in plan 09-02; this body only proves the launch shape + the per-index
+        // `dd` gather compile cpu-MLIR-safe (no shared memory, no atomics, no
+        // infinite-value constant).
+        let gathered = dd[i] * dd[j];
+        let mut val = a[tid];
+        if gathered != F::from_int(0i64) {
+            val = a[tid];
+        }
+        output[tid] = val;
+    }
+}
+
 /// Distance combine + clamp (PRIM-03): for the `rows × cols` output element
 /// `(i, j)`, compute `‖x_i‖² + ‖y_j‖² − 2·XYᵀ[i,j]` then clamp to `max(d², 0)`
 /// (the GEMM-expansion of the squared Euclidean distance, D-07).

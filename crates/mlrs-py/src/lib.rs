@@ -146,6 +146,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::projection::{
         johnson_lindenstrauss_min_dim, PyGaussianRandomProjection, PySparseRandomProjection,
     };
+    use estimators::spectral::{PySpectralClustering, PySpectralEmbedding};
     m.add_class::<PyLinearRegression>()?;
     m.add_class::<PyRidge>()?;
     m.add_class::<PyLasso>()?;
@@ -170,5 +171,9 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Phase-8 kernel-family wrappers (KERNEL-01 / KERNEL-02 — PY-06 incr.).
     m.add_class::<PyKernelRidge>()?;
     m.add_class::<PyKernelDensity>()?;
+
+    // Phase-9 spectral-family wrappers (SPECTRAL-01 / SPECTRAL-02 — PY-06 incr.).
+    m.add_class::<PySpectralEmbedding>()?;
+    m.add_class::<PySpectralClustering>()?;
     Ok(())
 }
