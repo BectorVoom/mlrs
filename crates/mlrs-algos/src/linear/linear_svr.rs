@@ -1,14 +1,23 @@
 //! `LinearSVR` (SGDSVM-04) — linear support-vector regressor, ≈
 //! `sklearn.svm.LinearSVR`.
 //!
-//! Phase-10 Wave-0 scaffold (plan 10-01): the struct, the [`LinearSVRBuilder`]
-//! (D-01/D-03 — sklearn-default field initializers), and the
-//! `build() -> Result<LinearSVR<F>, BuildError>` SIGNATURE are final now; the
-//! validation predicates and the `fit`/`predict` bodies land in the
-//! Wave-2/Wave-3 plans. The closest analog is `elastic_net.rs` (struct + predict)
-//! over the v1 coordinate-descent solver (D-07). Like `LinearSVC` it exposes
-//! `c` + `intercept_scaling` and has NO `eta0`/`learning_rate` setter; like the
-//! SGD regressor it exposes an `epsilon` setter (the SVR insensitivity margin).
+//! ## Solver (Open Question Q1 RESOLVED — L-BFGS, shared with LinearSVC)
+//! `LinearSVR` minimizes the L2-regularized SQUARED-EPSILON-INSENSITIVE primal
+//! `½‖w‖² + C·Σᵢ max(0, |yᵢ − xᵢ·w| − ε)²`. Like the LinearSVC squared-hinge
+//! objective this is SMOOTH (C¹) and CONVEX but is NOT the Lasso/ElasticNet
+//! soft-threshold CD objective (Open Q1 / RESEARCH §LinearSVC), so it reuses the
+//! SAME validated 05-06 L-BFGS path via the shared
+//! [`svm_lbfgs_fit`](crate::linear::linear_svc::svm_lbfgs_fit) helper — only the
+//! per-sample margin-loss closure differs (squared-eps-insensitive vs
+//! squared-hinge). An early Python spike confirmed this reproduces sklearn's
+//! `coef_`/`intercept_`/`predict` (see the 10-04 SUMMARY).
+//!
+//! ## Intercept + predict (shared paths)
+//! The intercept is the SAME synthetic-feature `intercept_scaling` mechanism as
+//! LinearSVC (`intercept_ = intercept_scaling · w_last`, Pitfall 5 — NOT
+//! center-then-solve). `predict` delegates to the shared
+//! [`predict_linear`](crate::linear::elastic_net::predict_linear) `X·coef_ +
+//! intercept_` GEMM path (the `elastic_net.rs` regressor precedent).
 //!
 //! Tests live in `crates/mlrs-algos/tests/linear_svr_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
@@ -17,17 +26,20 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
+use mlrs_core::PrimError;
 
-use crate::error::BuildError;
+use crate::error::{AlgoError, BuildError};
+use crate::linear::elastic_net::predict_linear;
+use crate::linear::linear_svc::svm_lbfgs_fit;
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
+use crate::traits::{Fit, Predict};
 
 /// Linear support-vector regressor (SGDSVM-04). Construct via
-/// [`LinearSVR::builder`].
-///
-/// Wave-0 scaffold: the fitted-state fields are written by the Wave-2 `fit`
-/// body, hence `allow(dead_code)` until then.
-#[allow(dead_code)]
+/// [`LinearSVR::builder`], then [`Fit::fit`] + [`Predict::predict`]. Fitted
+/// `coef_` (length `n_features`) / `intercept_` (length 1) are device-resident
+/// (D-03).
 pub struct LinearSVR<F> {
     /// The lowered hyperparameter bundle (D-06); the SVM-specific knobs (`c`,
     /// `intercept_scaling`) sit alongside it.
@@ -64,6 +76,30 @@ where
     /// The synthetic-feature intercept scaling.
     pub fn intercept_scaling(&self) -> f64 {
         self.intercept_scaling
+    }
+
+    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
+    /// [`AlgoError::NotFitted`] before `fit`.
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+        self.coef_
+            .as_ref()
+            .map(|c| c.to_host(pool))
+            .ok_or(AlgoError::NotFitted {
+                estimator: "linear_svr",
+                operation: "coef_",
+            })
+    }
+
+    /// Host copy of the fitted `intercept_` (scalar). Errors with
+    /// [`AlgoError::NotFitted`] before `fit`.
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
+        self.intercept_
+            .as_ref()
+            .map(|i| i.to_host(pool)[0])
+            .ok_or(AlgoError::NotFitted {
+                estimator: "linear_svr",
+                operation: "intercept_",
+            })
     }
 }
 
@@ -141,12 +177,46 @@ impl LinearSVRBuilder {
     }
 
     /// Build the estimator, validating the data-INDEPENDENT hyperparameters
-    /// (D-08). The SIGNATURE is final (Wave-0); the validation predicates land in
-    /// Wave-2.
+    /// (D-08, T-10-04-01). `C > 0` ([`BuildError::InvalidC`]), `epsilon >= 0`
+    /// ([`BuildError::InvalidEpsilon`]), and the loss family must be valid for a
+    /// REGRESSOR ({`EpsilonInsensitive`, `SquaredEpsilonInsensitive`} — a
+    /// classifier loss like `Hinge`/`SquaredHinge`/`Log` is
+    /// [`BuildError::InvalidLossForEstimator`]). Only `L1`/`L2` penalties.
     pub fn build<F>(self) -> Result<LinearSVR<F>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
+        // --- T-10-04-01 / ASVS V5: validate the data-INDEPENDENT hyperparameters
+        //     at build() BEFORE any data is seen (D-08). ---
+        if !(self.c > 0.0) {
+            return Err(BuildError::InvalidC {
+                estimator: "linear_svr",
+                c: self.c,
+            });
+        }
+        if !(self.epsilon >= 0.0) {
+            return Err(BuildError::InvalidEpsilon {
+                estimator: "linear_svr",
+                epsilon: self.epsilon,
+            });
+        }
+        match self.loss {
+            Loss::EpsilonInsensitive | Loss::SquaredEpsilonInsensitive => {}
+            other => {
+                return Err(BuildError::InvalidLossForEstimator {
+                    estimator: "linear_svr",
+                    loss: other.name().to_string(),
+                });
+            }
+        }
+        match self.penalty {
+            Penalty::L1 | Penalty::L2 => {}
+            Penalty::ElasticNet => {
+                return Err(BuildError::UnknownPenalty {
+                    value: "elasticnet (LinearSVR supports only l1/l2)".to_string(),
+                });
+            }
+        }
         let config = SgdConfig {
             loss: self.loss,
             penalty: self.penalty,
@@ -172,5 +242,113 @@ impl LinearSVRBuilder {
             coef_: None,
             intercept_: None,
         })
+    }
+}
+
+impl<F> Fit<F> for LinearSVR<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn fit(
+        &mut self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<&mut Self, AlgoError> {
+        let (n_samples, n_features) = shape;
+
+        // --- T-10-04-02 / ASVS V5: geometry guard BEFORE any launch. ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "linear_svr",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+
+        // The regression targets are the per-sample `y` (no ±1 remap — SVR is a
+        // regressor). Reuse the SHARED svm_lbfgs_fit with the squared-eps-insensitive
+        // margin loss: residual r = target − margin; viol = max(0, |r| − ε);
+        //   ℓ = viol² ;  dℓ/dmargin = d(viol²)/d(−r)... = −2·sign(r)·viol·(−1) =
+        //   2·sign(r)·viol·(−1)? Derive carefully: margin m = x̃·w, r = y − m, so
+        //   ∂r/∂m = −1. viol = max(0,|r|−ε). ℓ = viol². dℓ/dm = 2·viol·∂viol/∂m.
+        //   ∂viol/∂m = sign(r)·∂|r|/∂r·∂r/∂m... when viol>0: ∂|r|/∂r = sign(r),
+        //   ∂r/∂m = −1, so ∂viol/∂m = −sign(r). Hence dℓ/dm = −2·sign(r)·viol.
+        let targets = y.to_host(pool);
+        let targets_f64: Vec<f64> = targets.iter().map(|&v| host_to_f64(v)).collect();
+        let c = host_to_f64(self.c);
+        let eps = self.config.epsilon;
+        let (coef, intercept) = svm_lbfgs_fit::<F>(
+            pool,
+            x,
+            &targets_f64,
+            n_samples,
+            n_features,
+            c,
+            self.intercept_scaling,
+            self.config.fit_intercept,
+            self.config.max_iter,
+            "linear_svr",
+            |margin, target| {
+                let r = target - margin;
+                let absr = r.abs();
+                let viol = absr - eps;
+                if viol > 0.0 {
+                    let s = if r >= 0.0 { 1.0 } else { -1.0 };
+                    (viol * viol, -2.0 * s * viol) // (loss_i, dloss/dmargin)
+                } else {
+                    (0.0, 0.0)
+                }
+            },
+        )?;
+
+        self.coef_ = Some(coef);
+        self.intercept_ = Some(intercept);
+        Ok(self)
+    }
+}
+
+impl<F> Predict<F> for LinearSVR<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        predict_linear(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            "linear_svr",
+            pool,
+            x,
+            shape,
+        )
+    }
+}
+
+/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine (mirrors the
+/// `elastic_net.rs` / `linear_svc.rs` helper).
+fn host_to_f64<F: Pod>(v: F) -> f64 {
+    match size_of::<F>() {
+        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("linear_svr is f32/f64 only"),
     }
 }
