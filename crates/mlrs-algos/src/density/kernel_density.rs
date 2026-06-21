@@ -399,11 +399,21 @@ fn launch_kde_map_in_place<F>(
 /// Standard ceiling-division 1D launch config for the in-place map pass (the
 /// elementwise per-element launch idiom shared with the backend prims).
 fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = ((n as u32) + block - 1) / block;
+    let block = 256usize;
+    // Compute the cube count in `usize` and check the `u32` launch-grid cast
+    // (WR-02): an unchecked `n as u32` silently wraps for `n > u32::MAX`,
+    // under-provisioning threads so trailing elements are never mapped — a silent
+    // wrong-result. The KDE problem sizes are small today, but the guard turns the
+    // overflow into a loud panic instead.
+    let cubes = u32::try_from((n + block - 1) / block)
+        .expect("element count exceeds u32 launch-grid limit");
     (
         CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
+        CubeDim {
+            x: block as u32,
+            y: 1,
+            z: 1,
+        },
     )
 }
 
