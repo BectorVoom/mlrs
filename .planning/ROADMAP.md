@@ -157,7 +157,7 @@ Plans:
 
 **Wave 1** *(blocked on Wave 0)*
 
-- [ ] 10-02-PLAN.md — PRIM-10 sgd.rs two-pass GATHER kernel + prims/sgd.rs epoch loop (dloss/optimal-t0/schedules) standalone-validated on a convex objective, cpu-launch gate, SharedMemory/INFINITY grep gates, PoolStats memory gate
+- [x] 10-02-PLAN.md — PRIM-10 sgd.rs two-pass GATHER kernel + prims/sgd.rs epoch loop (dloss/optimal-t0/schedules) standalone-validated on a convex objective, cpu-launch gate, SharedMemory/INFINITY grep gates, PoolStats memory gate ✅ (3 commits, 4 files; SUMMARY 10-02)
 
 **Wave 2** *(blocked on Wave 1; 10-03 + 10-04 file-disjoint → parallel)*
 
