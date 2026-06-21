@@ -188,7 +188,8 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
     use estimators::kernel::{PyKernelDensity, PyKernelRidge};
     use estimators::linear::{
-        PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge,
+        PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
+        PyLogisticRegression, PyMBSGDClassifier, PyMBSGDRegressor, PyRidge,
     };
     use estimators::neighbors::{
         PyKNeighborsClassifier, PyKNeighborsRegressor, PyNearestNeighbors,
@@ -225,5 +226,11 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Phase-9 spectral-family wrappers (SPECTRAL-01 / SPECTRAL-02 — PY-06 incr.).
     m.add_class::<PySpectralEmbedding>()?;
     m.add_class::<PySpectralClustering>()?;
+
+    // Phase-10 SGD / linear-SVM wrappers (SGDSVM-01..04 — PY-06 incr.).
+    m.add_class::<PyMBSGDClassifier>()?;
+    m.add_class::<PyMBSGDRegressor>()?;
+    m.add_class::<PyLinearSVC>()?;
+    m.add_class::<PyLinearSVR>()?;
     Ok(())
 }

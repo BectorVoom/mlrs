@@ -13,11 +13,16 @@ use pyo3::prelude::*;
 use mlrs_algos::linear::elastic_net::ElasticNet;
 use mlrs_algos::linear::lasso::Lasso;
 use mlrs_algos::linear::linear_regression::LinearRegression;
+use mlrs_algos::linear::linear_svc::LinearSVC;
+use mlrs_algos::linear::linear_svr::LinearSVR;
 use mlrs_algos::linear::logistic::LogisticRegression;
+use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
+use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::ridge::Ridge;
+use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
 use mlrs_algos::traits::{Fit, Predict, PredictLabels, PredictProba};
 
-use crate::errors::{algo_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
 
 // ---------------------------------------------------------------------------
@@ -863,73 +868,924 @@ crate::any_estimator! {
     },
 }
 
-/// Wave-3 promotion seam: construct the unfit `MBSGDClassifier` dispatch arm
-/// from sklearn defaults (Wave 3 turns this into the `#[pyclass]` `#[new]`).
-#[allow(dead_code)]
-fn unfit_default_mbsgd_classifier() -> AnyMBSGDClassifier {
-    AnyMBSGDClassifier::Unfit {
-        loss: "hinge".to_string(),
-        penalty: "l2".to_string(),
-        alpha: 1e-4,
-        l1_ratio: 0.15,
-        fit_intercept: true,
-        max_iter: 1000,
-        tol: 1e-3,
-        learning_rate: "optimal".to_string(),
-        eta0: 0.01,
-        power_t: 0.5,
-        batch_size: 1,
-        shuffle: true,
-        seed: 0,
+// ===========================================================================
+// MBSGDClassifier — Fit (TryFrom enums + builder().build()) + PredictLabels (i32)
+// + PredictProba (log-loss sigmoid); sklearn-named string knobs (SGDSVM-01).
+// ===========================================================================
+
+/// sklearn-compatible `MBSGDClassifier` (minibatch SGD classifier). The
+/// sklearn-named `loss`/`penalty`/`learning_rate` STRINGS are stored verbatim in
+/// the `Unfit` arm; the typed `Loss`/`Penalty`/`LearningRate` enums + the builder
+/// `build()` run at the first `fit` (an unknown string / bad data-independent
+/// param surfaces as a `ValueError` there, D-05/D-09).
+#[pyclass(name = "MBSGDClassifier")]
+pub struct PyMBSGDClassifier {
+    inner: AnyMBSGDClassifier,
+}
+
+impl PyMBSGDClassifier {
+    /// Rust-callable default constructor (smoke test seam — see
+    /// [`PyLinearRegression::unfit_default`]).
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyMBSGDClassifier::Unfit {
+                loss: "hinge".to_string(),
+                penalty: "l2".to_string(),
+                alpha: 1e-4,
+                l1_ratio: 0.15,
+                fit_intercept: true,
+                max_iter: 1000,
+                tol: 1e-3,
+                learning_rate: "optimal".to_string(),
+                eta0: 0.01,
+                power_t: 0.5,
+                batch_size: 1,
+                shuffle: true,
+                seed: 0,
+            },
+        }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyMBSGDClassifier::Unfit { .. })
     }
 }
 
-/// Wave-3 promotion seam for `MBSGDRegressor`.
-#[allow(dead_code)]
-fn unfit_default_mbsgd_regressor() -> AnyMBSGDRegressor {
-    AnyMBSGDRegressor::Unfit {
-        loss: "squared_error".to_string(),
-        penalty: "l2".to_string(),
-        alpha: 1e-4,
-        l1_ratio: 0.15,
-        fit_intercept: true,
-        max_iter: 1000,
-        tol: 1e-3,
-        learning_rate: "invscaling".to_string(),
-        eta0: 0.01,
-        power_t: 0.25,
-        epsilon: 0.1,
-        batch_size: 1,
-        shuffle: true,
-        seed: 0,
+#[pymethods]
+impl PyMBSGDClassifier {
+    /// `MBSGDClassifier(loss="hinge", penalty="l2", alpha=1e-4, l1_ratio=0.15,
+    /// fit_intercept=True, max_iter=1000, tol=1e-3, learning_rate="optimal",
+    /// eta0=0.01, power_t=0.5, batch_size=1, shuffle=True, seed=0)`.
+    #[new]
+    #[pyo3(signature = (
+        loss = "hinge".to_string(), penalty = "l2".to_string(), alpha = 1e-4,
+        l1_ratio = 0.15, fit_intercept = true, max_iter = 1000, tol = 1e-3,
+        learning_rate = "optimal".to_string(), eta0 = 0.01, power_t = 0.5,
+        batch_size = 1, shuffle = true, seed = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        loss: String,
+        penalty: String,
+        alpha: f64,
+        l1_ratio: f64,
+        fit_intercept: bool,
+        max_iter: usize,
+        tol: f64,
+        learning_rate: String,
+        eta0: f64,
+        power_t: f64,
+        batch_size: usize,
+        shuffle: bool,
+        seed: u64,
+    ) -> Self {
+        Self {
+            inner: AnyMBSGDClassifier::Unfit {
+                loss,
+                penalty,
+                alpha,
+                l1_ratio,
+                fit_intercept,
+                max_iter,
+                tol,
+                learning_rate,
+                eta0,
+                power_t,
+                batch_size,
+                shuffle,
+                seed,
+            },
+        }
+    }
+
+    /// Fit on `x` (`rows × cols`, row-major) + label vector `y`. The sklearn enum
+    /// strings are parsed (`TryFrom` → `ValueError` on a bad string, D-05) and the
+    /// builder validates the data-independent params (`build()` → `ValueError`,
+    /// D-09) BEFORE the device launch; GIL released (PY-03); f64 guarded (D-04).
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let dt = float_dtype(&xa)?;
+        let (
+            loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
+            lr_s, eta0, power_t, batch_size, shuffle, seed,
+        ) = match &self.inner {
+            AnyMBSGDClassifier::Unfit {
+                loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
+                learning_rate, eta0, power_t, batch_size, shuffle, seed,
+            } => (
+                loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
+                *max_iter, *tol, learning_rate.clone(), *eta0, *power_t,
+                *batch_size, *shuffle, *seed,
+            ),
+            _ => return Err(not_fitted("mbsgd_classifier", "re-fit")),
+        };
+        // Construction-time enum-string validation (D-05 → ValueError).
+        let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
+        let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
+        let lr = LearningRate::try_from(lr_s.as_str()).map_err(build_err_to_py)?;
+        let fitted = py.detach(|| -> PyResult<AnyMBSGDClassifier> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let mut est = MBSGDClassifier::<f32>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .alpha(alpha)
+                        .l1_ratio(l1_ratio)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .learning_rate(lr)
+                        .eta0(eta0)
+                        .power_t(power_t)
+                        .batch_size(batch_size)
+                        .shuffle(shuffle)
+                        .seed(seed)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyMBSGDClassifier::F32(est))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let mut est = MBSGDClassifier::<f64>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .alpha(alpha)
+                        .l1_ratio(l1_ratio)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .learning_rate(lr)
+                        .eta0(eta0)
+                        .power_t(power_t)
+                        .batch_size(batch_size)
+                        .shuffle(shuffle)
+                        .seed(seed)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyMBSGDClassifier::F64(est))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        Ok(())
+    }
+
+    /// `predict(x)` → length-`rows` host `Vec<i32>` class labels (margin sign).
+    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyMBSGDClassifier::F32(est) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                AnyMBSGDClassifier::F64(est) => {
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("mbsgd_classifier", "predict")),
+            }
+        })
+    }
+
+    /// `predict_proba(x)` → row-major `rows × 2` host floats (log-loss sigmoid;
+    /// sklearn raises for a non-log loss — the caller pins the log-loss path).
+    fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyMBSGDClassifier::F32(est) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("mbsgd_classifier", "predict_proba (f32 path)")),
+            }
+        })
+    }
+    fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyMBSGDClassifier::F64(est) => {
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("mbsgd_classifier", "predict_proba (f64 path)")),
+            }
+        })
+    }
+
+    /// The inferred class labels (`classes_`, length 2 for the binary fit).
+    fn classes_(&self) -> Vec<i64> {
+        match &self.inner {
+            AnyMBSGDClassifier::F32(e) => e.classes().to_vec(),
+            AnyMBSGDClassifier::F64(e) => e.classes().to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDClassifier::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_classifier", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDClassifier::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_classifier", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<f32> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDClassifier::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<f64> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDClassifier::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f64)")),
+        }
+    }
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyMBSGDClassifier::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyMBSGDClassifier::Unfit { .. } => None,
+            AnyMBSGDClassifier::F32(_) => Some("f32"),
+            AnyMBSGDClassifier::F64(_) => Some("f64"),
+        }
     }
 }
 
-/// Wave-3 promotion seam for `LinearSVC`.
-#[allow(dead_code)]
-fn unfit_default_linear_svc() -> AnyLinearSVC {
-    AnyLinearSVC::Unfit {
-        loss: "squared_hinge".to_string(),
-        penalty: "l2".to_string(),
-        c: 1.0,
-        intercept_scaling: 1.0,
-        fit_intercept: true,
-        max_iter: 1000,
-        tol: 1e-4,
+// ===========================================================================
+// MBSGDRegressor — Fit (TryFrom enums + builder().build()) + Predict (SGDSVM-02).
+// ===========================================================================
+
+/// sklearn-compatible `MBSGDRegressor` (minibatch SGD regressor).
+#[pyclass(name = "MBSGDRegressor")]
+pub struct PyMBSGDRegressor {
+    inner: AnyMBSGDRegressor,
+}
+
+impl PyMBSGDRegressor {
+    /// Rust-callable default constructor (smoke test seam).
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyMBSGDRegressor::Unfit {
+                loss: "squared_error".to_string(),
+                penalty: "l2".to_string(),
+                alpha: 1e-4,
+                l1_ratio: 0.15,
+                fit_intercept: true,
+                max_iter: 1000,
+                tol: 1e-3,
+                learning_rate: "invscaling".to_string(),
+                eta0: 0.01,
+                power_t: 0.25,
+                epsilon: 0.1,
+                batch_size: 1,
+                shuffle: true,
+                seed: 0,
+            },
+        }
+    }
+
+    /// Is this wrapper in the unfit arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyMBSGDRegressor::Unfit { .. })
     }
 }
 
-/// Wave-3 promotion seam for `LinearSVR`.
-#[allow(dead_code)]
-fn unfit_default_linear_svr() -> AnyLinearSVR {
-    AnyLinearSVR::Unfit {
-        loss: "squared_epsilon_insensitive".to_string(),
-        penalty: "l2".to_string(),
-        c: 1.0,
-        epsilon: 0.0,
-        intercept_scaling: 1.0,
-        fit_intercept: true,
-        max_iter: 1000,
-        tol: 1e-4,
+#[pymethods]
+impl PyMBSGDRegressor {
+    /// `MBSGDRegressor(loss="squared_error", penalty="l2", alpha=1e-4,
+    /// l1_ratio=0.15, fit_intercept=True, max_iter=1000, tol=1e-3,
+    /// learning_rate="invscaling", eta0=0.01, power_t=0.25, epsilon=0.1,
+    /// batch_size=1, shuffle=True, seed=0)`.
+    #[new]
+    #[pyo3(signature = (
+        loss = "squared_error".to_string(), penalty = "l2".to_string(), alpha = 1e-4,
+        l1_ratio = 0.15, fit_intercept = true, max_iter = 1000, tol = 1e-3,
+        learning_rate = "invscaling".to_string(), eta0 = 0.01, power_t = 0.25,
+        epsilon = 0.1, batch_size = 1, shuffle = true, seed = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        loss: String,
+        penalty: String,
+        alpha: f64,
+        l1_ratio: f64,
+        fit_intercept: bool,
+        max_iter: usize,
+        tol: f64,
+        learning_rate: String,
+        eta0: f64,
+        power_t: f64,
+        epsilon: f64,
+        batch_size: usize,
+        shuffle: bool,
+        seed: u64,
+    ) -> Self {
+        Self {
+            inner: AnyMBSGDRegressor::Unfit {
+                loss,
+                penalty,
+                alpha,
+                l1_ratio,
+                fit_intercept,
+                max_iter,
+                tol,
+                learning_rate,
+                eta0,
+                power_t,
+                epsilon,
+                batch_size,
+                shuffle,
+                seed,
+            },
+        }
+    }
+
+    /// Fit on `x` (`rows × cols`) + target `y`. Enum strings + builder validation
+    /// → `ValueError` (D-05/D-09) before the device launch; GIL released; f64 guarded.
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let dt = float_dtype(&xa)?;
+        let (
+            loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
+            lr_s, eta0, power_t, epsilon, batch_size, shuffle, seed,
+        ) = match &self.inner {
+            AnyMBSGDRegressor::Unfit {
+                loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
+                learning_rate, eta0, power_t, epsilon, batch_size, shuffle, seed,
+            } => (
+                loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
+                *max_iter, *tol, learning_rate.clone(), *eta0, *power_t, *epsilon,
+                *batch_size, *shuffle, *seed,
+            ),
+            _ => return Err(not_fitted("mbsgd_regressor", "re-fit")),
+        };
+        let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
+        let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
+        let lr = LearningRate::try_from(lr_s.as_str()).map_err(build_err_to_py)?;
+        let fitted = py.detach(|| -> PyResult<AnyMBSGDRegressor> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let mut est = MBSGDRegressor::<f32>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .alpha(alpha)
+                        .l1_ratio(l1_ratio)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .learning_rate(lr)
+                        .eta0(eta0)
+                        .power_t(power_t)
+                        .epsilon(epsilon)
+                        .batch_size(batch_size)
+                        .shuffle(shuffle)
+                        .seed(seed)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyMBSGDRegressor::F32(est))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let mut est = MBSGDRegressor::<f64>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .alpha(alpha)
+                        .l1_ratio(l1_ratio)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .learning_rate(lr)
+                        .eta0(eta0)
+                        .power_t(power_t)
+                        .epsilon(epsilon)
+                        .batch_size(batch_size)
+                        .shuffle(shuffle)
+                        .seed(seed)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyMBSGDRegressor::F64(est))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        Ok(())
+    }
+
+    fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyMBSGDRegressor::F32(est) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("mbsgd_regressor", "predict (f32 path)")),
+            }
+        })
+    }
+    fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyMBSGDRegressor::F64(est) => {
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("mbsgd_regressor", "predict (f64 path)")),
+            }
+        })
+    }
+
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDRegressor::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_regressor", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDRegressor::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_regressor", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<f32> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDRegressor::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_regressor", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<f64> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyMBSGDRegressor::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("mbsgd_regressor", "intercept_ (f64)")),
+        }
+    }
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyMBSGDRegressor::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyMBSGDRegressor::Unfit { .. } => None,
+            AnyMBSGDRegressor::F32(_) => Some("f32"),
+            AnyMBSGDRegressor::F64(_) => Some("f64"),
+        }
+    }
+}
+
+// ===========================================================================
+// LinearSVC — Fit (TryFrom enums + builder().build()) + PredictLabels (i32);
+// no learning_rate string (L-BFGS solver, SGDSVM-03).
+// ===========================================================================
+
+/// sklearn-compatible `LinearSVC` (L2-regularized squared-hinge primal).
+#[pyclass(name = "LinearSVC")]
+pub struct PyLinearSVC {
+    inner: AnyLinearSVC,
+}
+
+impl PyLinearSVC {
+    /// Rust-callable default constructor (smoke test seam).
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyLinearSVC::Unfit {
+                loss: "squared_hinge".to_string(),
+                penalty: "l2".to_string(),
+                c: 1.0,
+                intercept_scaling: 1.0,
+                fit_intercept: true,
+                max_iter: 1000,
+                tol: 1e-4,
+            },
+        }
+    }
+
+    /// Is this wrapper in the unfit arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyLinearSVC::Unfit { .. })
+    }
+}
+
+#[pymethods]
+impl PyLinearSVC {
+    /// `LinearSVC(loss="squared_hinge", penalty="l2", C=1.0, intercept_scaling=1.0,
+    /// fit_intercept=True, max_iter=1000, tol=1e-4)`. The sklearn-named inverse-
+    /// regularization strength `C` maps to the Rust `c` field.
+    #[new]
+    #[pyo3(signature = (
+        loss = "squared_hinge".to_string(), penalty = "l2".to_string(), C = 1.0,
+        intercept_scaling = 1.0, fit_intercept = true, max_iter = 1000, tol = 1e-4,
+    ))]
+    #[allow(non_snake_case)]
+    fn new(
+        loss: String,
+        penalty: String,
+        C: f64,
+        intercept_scaling: f64,
+        fit_intercept: bool,
+        max_iter: usize,
+        tol: f64,
+    ) -> Self {
+        Self {
+            inner: AnyLinearSVC::Unfit {
+                loss,
+                penalty,
+                c: C,
+                intercept_scaling,
+                fit_intercept,
+                max_iter,
+                tol,
+            },
+        }
+    }
+
+    /// Fit on `x` (`rows × cols`) + label vector `y`. Enum strings + builder
+    /// validation (`C>0`) → `ValueError` (D-05/D-09); GIL released; f64 guarded.
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let dt = float_dtype(&xa)?;
+        let (loss_s, penalty_s, c, intercept_scaling, fit_intercept, max_iter, tol) = match &self.inner {
+            AnyLinearSVC::Unfit {
+                loss, penalty, c, intercept_scaling, fit_intercept, max_iter, tol,
+            } => (
+                loss.clone(), penalty.clone(), *c, *intercept_scaling,
+                *fit_intercept, *max_iter, *tol,
+            ),
+            _ => return Err(not_fitted("linear_svc", "re-fit")),
+        };
+        let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
+        let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
+        let fitted = py.detach(|| -> PyResult<AnyLinearSVC> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let mut est = LinearSVC::<f32>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .c(c)
+                        .intercept_scaling(intercept_scaling)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyLinearSVC::F32(est))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let mut est = LinearSVC::<f64>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .c(c)
+                        .intercept_scaling(intercept_scaling)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyLinearSVC::F64(est))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        Ok(())
+    }
+
+    /// `predict(x)` → length-`rows` host `Vec<i32>` class labels (margin sign).
+    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyLinearSVC::F32(est) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                AnyLinearSVC::F64(est) => {
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("linear_svc", "predict")),
+            }
+        })
+    }
+
+    /// The inferred class labels (`classes_`, length 2 for the binary fit).
+    fn classes_(&self) -> Vec<i64> {
+        match &self.inner {
+            AnyLinearSVC::F32(e) => e.classes().to_vec(),
+            AnyLinearSVC::F64(e) => e.classes().to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVC::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svc", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVC::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svc", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<f32> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVC::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svc", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<f64> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVC::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svc", "intercept_ (f64)")),
+        }
+    }
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyLinearSVC::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyLinearSVC::Unfit { .. } => None,
+            AnyLinearSVC::F32(_) => Some("f32"),
+            AnyLinearSVC::F64(_) => Some("f64"),
+        }
+    }
+}
+
+// ===========================================================================
+// LinearSVR — Fit (TryFrom enums + builder().build()) + Predict; no learning_rate
+// string (L-BFGS solver, SGDSVM-04).
+// ===========================================================================
+
+/// sklearn-compatible `LinearSVR` (L2-regularized squared-eps-insensitive primal).
+#[pyclass(name = "LinearSVR")]
+pub struct PyLinearSVR {
+    inner: AnyLinearSVR,
+}
+
+impl PyLinearSVR {
+    /// Rust-callable default constructor (smoke test seam).
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyLinearSVR::Unfit {
+                loss: "squared_epsilon_insensitive".to_string(),
+                penalty: "l2".to_string(),
+                c: 1.0,
+                epsilon: 0.0,
+                intercept_scaling: 1.0,
+                fit_intercept: true,
+                max_iter: 1000,
+                tol: 1e-4,
+            },
+        }
+    }
+
+    /// Is this wrapper in the unfit arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyLinearSVR::Unfit { .. })
+    }
+}
+
+#[pymethods]
+impl PyLinearSVR {
+    /// `LinearSVR(loss="squared_epsilon_insensitive", penalty="l2", C=1.0,
+    /// epsilon=0.0, intercept_scaling=1.0, fit_intercept=True, max_iter=1000,
+    /// tol=1e-4)`. The sklearn-named `C` maps to the Rust `c` field.
+    #[new]
+    #[pyo3(signature = (
+        loss = "squared_epsilon_insensitive".to_string(), penalty = "l2".to_string(),
+        C = 1.0, epsilon = 0.0, intercept_scaling = 1.0, fit_intercept = true,
+        max_iter = 1000, tol = 1e-4,
+    ))]
+    #[allow(non_snake_case)]
+    fn new(
+        loss: String,
+        penalty: String,
+        C: f64,
+        epsilon: f64,
+        intercept_scaling: f64,
+        fit_intercept: bool,
+        max_iter: usize,
+        tol: f64,
+    ) -> Self {
+        Self {
+            inner: AnyLinearSVR::Unfit {
+                loss,
+                penalty,
+                c: C,
+                epsilon,
+                intercept_scaling,
+                fit_intercept,
+                max_iter,
+                tol,
+            },
+        }
+    }
+
+    /// Fit on `x` (`rows × cols`) + target `y`. Enum strings + builder validation
+    /// (`C>0`, `epsilon>=0`) → `ValueError` (D-05/D-09); GIL released; f64 guarded.
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let dt = float_dtype(&xa)?;
+        let (loss_s, penalty_s, c, epsilon, intercept_scaling, fit_intercept, max_iter, tol) = match &self.inner {
+            AnyLinearSVR::Unfit {
+                loss, penalty, c, epsilon, intercept_scaling, fit_intercept, max_iter, tol,
+            } => (
+                loss.clone(), penalty.clone(), *c, *epsilon, *intercept_scaling,
+                *fit_intercept, *max_iter, *tol,
+            ),
+            _ => return Err(not_fitted("linear_svr", "re-fit")),
+        };
+        let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
+        let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
+        let fitted = py.detach(|| -> PyResult<AnyLinearSVR> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let mut est = LinearSVR::<f32>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .c(c)
+                        .epsilon(epsilon)
+                        .intercept_scaling(intercept_scaling)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyLinearSVR::F32(est))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let mut est = LinearSVR::<f64>::builder()
+                        .loss(loss)
+                        .penalty(penalty)
+                        .c(c)
+                        .epsilon(epsilon)
+                        .intercept_scaling(intercept_scaling)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyLinearSVR::F64(est))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        Ok(())
+    }
+
+    fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyLinearSVR::F32(est) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("linear_svr", "predict (f32 path)")),
+            }
+        })
+    }
+    fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyLinearSVR::F64(est) => {
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("linear_svr", "predict (f64 path)")),
+            }
+        })
+    }
+
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVR::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svr", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVR::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svr", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<f32> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVR::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svr", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<f64> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyLinearSVR::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            _ => Err(not_fitted("linear_svr", "intercept_ (f64)")),
+        }
+    }
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyLinearSVR::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyLinearSVR::Unfit { .. } => None,
+            AnyLinearSVR::F32(_) => Some("f32"),
+            AnyLinearSVR::F64(_) => Some("f64"),
+        }
     }
 }
