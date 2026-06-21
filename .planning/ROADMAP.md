@@ -166,7 +166,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 10-05-PLAN.md — PyO3 wrappers for all four estimators (builder-chain fit, TryFrom/BuildError → ValueError D-05/D-09, dtype dispatch, GIL release, f64 guard) + maturin-develop smoke test
+- [x] 10-05-PLAN.md — PyO3 wrappers for all four estimators (builder-chain fit, TryFrom/BuildError → ValueError D-05/D-09, dtype dispatch, GIL release, f64 guard) + maturin-develop smoke test; ZERO new binding infra, pyo3 0.28; Rust smoke green cpu 3/3 (fit→predict f32+f64), test_sgd.py live FFI harness ✓ Plan 05
 
 ### Phase 11: Naive Bayes
 
