@@ -38,9 +38,18 @@ created: 2026-06-21
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 10-01-01 | 01 | 0 | PRIM-10 | — | N/A | unit | `cargo test -p mlrs-prims --features cpu sgd` | ❌ W0 | ⬜ pending |
+| 10-01-01 | 01 | 0 | SGDSVM-01..04 (enums/builders/BuildError) | T-10-01-01 | typed BuildError, not panic | unit | `cargo test -p mlrs-algos --features cpu --test sgd_config_test` | ✅ | ✅ green (3 live, 1 ignore) |
+| 10-01-02 | 01 | 0 | PRIM-10 (sgd kernel+prim stubs), D-09 | T-10-01-02 | geometry guard before launch | unit | `cargo build -p mlrs-kernels && cargo build -p mlrs-backend --features cpu` | ✅ | ✅ green (compile + grep gates) |
+| 10-01-03 | 01 | 0 | PRIM-10 + SGDSVM-01..04 (six #[ignore] scaffolds + oracle fixtures) | — | N/A | oracle/unit | `cargo test -p mlrs-algos -p mlrs-backend --features cpu --no-run` | ✅ | ❌ W0 pending (Wave-1/2 un-ignore) |
 
 *Populated by the planner / Nyquist scaffold pass. Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+
+> Wave-0 scaffold (plan 10-01) COMPLETE: the construction surface (enums/builders/
+> BuildError/build_err_to_py), the SGD kernel/prim stubs (SharedMemory/INFINITY-free,
+> geometry-guarded `sgd_solve` with `todo!()` body), the six `#[ignore]` Nyquist test
+> scaffolds (fixture-load + shape), and the 12 committed pinned-deterministic `.npz`
+> oracle fixtures are landed. Waves 1/2/3 un-ignore the scaffolds as they fill the
+> compute / fit / PyO3 bodies.
 
 ---
 

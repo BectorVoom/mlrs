@@ -447,6 +447,24 @@ EN_ALPHA, EN_L1_RATIO = 0.5, 0.5
 LOG_N_SAMPLES, LOG_N_QUERY, LOG_N_FEATURES = 40, 8, 4
 LOG_C, LOG_MAX_ITER = 1.0, 100
 
+# Phase-10 SGD / linear-SVM convention-fixtures (SGDSVM-01..04). The fixtures are
+# PINNED-DETERMINISTIC: shuffle=False (natural row order, no MT19937 to match),
+# tol=0 + fixed max_iter (both solvers run the SAME number of full epochs to the
+# SAME iterate), explicit eta0/schedule (Pitfall 2/7). The Rust oracle test
+# constructs the estimator with EXPLICIT pinned setters, NOT the bare
+# builder().build() default (a SEPARATE D-03 litmus checks the default equals
+# sklearn's default). n_samples >= n_features so LinearSVC dual='auto' resolves to
+# primal (RESEARCH §dual='auto').
+SGD_N_SAMPLES, SGD_N_QUERY, SGD_N_FEATURES = 40, 8, 4
+# Pinned SGD schedule overrides (deterministic, non-default).
+SGD_MAX_ITER = 50
+SGD_ETA0 = 0.01
+SGD_ALPHA = 1e-4
+# LinearSVC / LinearSVR pins.
+SVM_C = 1.0
+SVR_EPSILON = 0.1
+SVM_MAX_ITER = 1000
+
 
 def gen_kmeans(seed: int = SEED, dtype=np.float32) -> str:
     """Generate one seeded KMeans fixture (CLUSTER-01, D-09 injected init).
@@ -1732,6 +1750,260 @@ def gen_spectral_clustering(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+def _sgd_blobs(seed: int, n_classes: int = 2):
+    """Build well-separated class/regression blobs `X`/`Xq`/`y` for the SGD/SVM
+    fixtures (shared shape; classifier uses class blobs, regressor a linear map).
+    """
+    rng = np.random.default_rng(seed)
+    centers = rng.standard_normal((n_classes, SGD_N_FEATURES)) * 4.0
+    per = SGD_N_SAMPLES // n_classes
+    x = np.vstack(
+        [
+            centers[k] + rng.standard_normal((per, SGD_N_FEATURES))
+            for k in range(n_classes)
+        ]
+    )
+    y = np.concatenate([np.full(per, k) for k in range(n_classes)])
+    xq = np.vstack(
+        [
+            centers[k] + rng.standard_normal((SGD_N_QUERY // n_classes, SGD_N_FEATURES))
+            for k in range(n_classes)
+        ]
+    )
+    return rng, x, y, xq
+
+
+def gen_mbsgd_classifier(
+    seed: int = SEED, dtype=np.float32, loss: str = "hinge"
+) -> str:
+    """Generate one PINNED-DETERMINISTIC MBSGDClassifier fixture (SGDSVM-01).
+
+    Fits ``sklearn.linear_model.SGDClassifier`` with the deterministic pins
+    ``shuffle=False, tol=0, max_iter=SGD_MAX_ITER`` and an explicit schedule so
+    the Rust solver can reproduce the EXACT iterate (Pitfall 2/7). Two variants:
+
+      - ``loss="hinge"`` (default): emit BOTH a ``constant``-schedule fixture AND
+        an ``optimal``-schedule fixture so the t0/Bottou math (A1/Pitfall 3) is
+        isolated from the gradient math — a constant-schedule match with an
+        optimal-schedule mismatch localizes the bug to ``t0``.
+      - ``loss="log_loss"``: a SECOND variant for the ``predict_proba`` gate.
+
+    Stores ``X``/``Xq``/``y``/``coef``/``intercept``/``predict`` (and
+    ``predict_proba`` for the log-loss variant). Returns the path written.
+    """
+    from sklearn.linear_model import SGDClassifier
+
+    _, x, y, xq = _sgd_blobs(seed, n_classes=2)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+
+    if loss == "log_loss":
+        clf = SGDClassifier(
+            loss="log_loss",
+            penalty="l2",
+            alpha=SGD_ALPHA,
+            learning_rate="constant",
+            eta0=SGD_ETA0,
+            shuffle=False,
+            tol=0.0,
+            max_iter=SGD_MAX_ITER,
+            fit_intercept=True,
+            random_state=seed,
+        ).fit(x, y)
+        os.makedirs(_FIXTURE_DIR, exist_ok=True)
+        out_path = os.path.join(
+            _FIXTURE_DIR, f"mbsgd_classifier_log_{dtype_tag}_seed{seed}.npz"
+        )
+        np.savez(
+            out_path,
+            X=c(x),
+            Xq=c(xq),
+            y=c(y),
+            coef=c(clf.coef_),
+            intercept=c(clf.intercept_),
+            predict=c(clf.predict(xq)),
+            predict_proba=c(clf.predict_proba(xq)),
+        )
+        return out_path
+
+    # hinge default — emit constant-schedule (primary) AND optimal-schedule.
+    # The default file name is the constant-schedule fixture; the optimal-schedule
+    # variant carries an `_optimal` infix so the Wave-1 t0 test can load it.
+    paths = []
+    for schedule, infix in (("constant", ""), ("optimal", "_optimal")):
+        kwargs = dict(
+            loss="hinge",
+            penalty="l2",
+            alpha=SGD_ALPHA,
+            learning_rate=schedule,
+            shuffle=False,
+            tol=0.0,
+            max_iter=SGD_MAX_ITER,
+            fit_intercept=True,
+            random_state=seed,
+        )
+        if schedule == "constant":
+            kwargs["eta0"] = SGD_ETA0
+        clf = SGDClassifier(**kwargs).fit(x, y)
+        os.makedirs(_FIXTURE_DIR, exist_ok=True)
+        out_path = os.path.join(
+            _FIXTURE_DIR, f"mbsgd_classifier{infix}_{dtype_tag}_seed{seed}.npz"
+        )
+        np.savez(
+            out_path,
+            X=c(x),
+            Xq=c(xq),
+            y=c(y),
+            coef=c(clf.coef_),
+            intercept=c(clf.intercept_),
+            predict=c(clf.predict(xq)),
+        )
+        paths.append(out_path)
+    return paths[0]
+
+
+def gen_mbsgd_regressor(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one PINNED-DETERMINISTIC MBSGDRegressor fixture (SGDSVM-02).
+
+    Fits ``sklearn.linear_model.SGDRegressor`` (``squared_error`` + ``invscaling``)
+    with ``shuffle=False, tol=0, max_iter=SGD_MAX_ITER`` and explicit
+    ``eta0``/``power_t`` (Pitfall 2/7). Stores ``X``/``Xq``/``y``/``coef``/
+    ``intercept``/``predict``. Returns the path written.
+    """
+    from sklearn.linear_model import SGDRegressor
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((SGD_N_SAMPLES, SGD_N_FEATURES))
+    true_coef = rng.standard_normal(SGD_N_FEATURES)
+    y = x @ true_coef + 0.5 + 0.05 * rng.standard_normal(SGD_N_SAMPLES)
+    xq = rng.standard_normal((SGD_N_QUERY, SGD_N_FEATURES))
+
+    reg = SGDRegressor(
+        loss="squared_error",
+        penalty="l2",
+        alpha=SGD_ALPHA,
+        learning_rate="invscaling",
+        eta0=SGD_ETA0,
+        power_t=0.25,
+        shuffle=False,
+        tol=0.0,
+        max_iter=SGD_MAX_ITER,
+        fit_intercept=True,
+        random_state=seed,
+    ).fit(x, y)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"mbsgd_regressor_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        Xq=c(xq),
+        y=c(y),
+        coef=c(reg.coef_),
+        intercept=c(reg.intercept_),
+        predict=c(reg.predict(xq)),
+    )
+    return out_path
+
+
+def gen_linear_svc(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one LinearSVC fixture (SGDSVM-03).
+
+    Fits ``sklearn.svm.LinearSVC`` (``squared_hinge`` default, ``dual='auto'``,
+    ``intercept_scaling=1.0``). With n_samples >= n_features, ``dual='auto'``
+    resolves to primal (RESEARCH §dual='auto'). LinearSVC is liblinear CD —
+    converged (no SGD pins needed). Stores ``X``/``Xq``/``y``/``coef``/
+    ``intercept``/``predict`` (labels). Returns the path written.
+    """
+    from sklearn.svm import LinearSVC
+
+    _, x, y, xq = _sgd_blobs(seed, n_classes=2)
+
+    clf = LinearSVC(
+        loss="squared_hinge",
+        penalty="l2",
+        C=SVM_C,
+        dual="auto",
+        intercept_scaling=1.0,
+        fit_intercept=True,
+        max_iter=SVM_MAX_ITER,
+        tol=1e-4,
+        random_state=seed,
+    ).fit(x, y)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"linear_svc_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        Xq=c(xq),
+        y=c(y),
+        coef=c(clf.coef_),
+        intercept=c(clf.intercept_),
+        predict=c(clf.predict(xq)),
+    )
+    return out_path
+
+
+def gen_linear_svr(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one LinearSVR fixture (SGDSVM-04).
+
+    Fits ``sklearn.svm.LinearSVR`` (``squared_epsilon_insensitive`` default +
+    ``epsilon``, ``dual='auto'``, ``intercept_scaling=1.0``). Liblinear CD —
+    converged. Stores ``X``/``Xq``/``y``/``coef``/``intercept``/``predict``.
+    Returns the path written.
+    """
+    from sklearn.svm import LinearSVR
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((SGD_N_SAMPLES, SGD_N_FEATURES))
+    true_coef = rng.standard_normal(SGD_N_FEATURES)
+    y = x @ true_coef + 0.5 + 0.05 * rng.standard_normal(SGD_N_SAMPLES)
+    xq = rng.standard_normal((SGD_N_QUERY, SGD_N_FEATURES))
+
+    reg = LinearSVR(
+        loss="squared_epsilon_insensitive",
+        epsilon=SVR_EPSILON,
+        C=SVM_C,
+        dual="auto",
+        intercept_scaling=1.0,
+        fit_intercept=True,
+        max_iter=SVM_MAX_ITER,
+        tol=1e-4,
+        random_state=seed,
+    ).fit(x, y)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"linear_svr_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        Xq=c(xq),
+        y=c(y),
+        coef=c(reg.coef_),
+        intercept=c(reg.intercept_),
+        predict=c(reg.predict(xq)),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -1868,6 +2140,26 @@ def main() -> None:
     # well-separated fixture (D-01/D-10) — exact labels up to permutation.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_spectral_clustering(dtype=dtype)}")
+
+    # ---- Phase-10 SGD / linear-SVM fixtures (SGDSVM-01..04) ----
+    # Each generator writes BOTH f32 (rocm gate) and f64 (cpu gate) blobs, PINNED
+    # deterministic (shuffle=False, tol=0, fixed max_iter, explicit schedule).
+    # MBSGDClassifier (SGDSVM-01): hinge default emits constant + optimal schedule
+    # variants (A1/Pitfall 3 t0 isolation); a SECOND log-loss variant feeds the
+    # predict_proba gate.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_mbsgd_classifier(dtype=dtype, loss='hinge')}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_mbsgd_classifier(dtype=dtype, loss='log_loss')}")
+    # MBSGDRegressor (SGDSVM-02): squared_error + invscaling pinned.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_mbsgd_regressor(dtype=dtype)}")
+    # LinearSVC (SGDSVM-03): squared_hinge, dual='auto'→primal, intercept_scaling.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_linear_svc(dtype=dtype)}")
+    # LinearSVR (SGDSVM-04): squared_epsilon_insensitive + epsilon.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_linear_svr(dtype=dtype)}")
 
 
 if __name__ == "__main__":

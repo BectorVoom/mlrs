@@ -1826,3 +1826,28 @@ fn memory_gate_dbscan_n2_bounded() {
         pool.stats()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase-10 — sgd_solve (PRIM-10) bounded-allocation memory gate (Wave-0 scaffold)
+// ---------------------------------------------------------------------------
+
+/// PRIM-10 `sgd_solve` reuse-bounded gate (the iterative-solver bounded-allocation
+/// form, mirroring `memory_gate_iterative_solver_bounded`). `#[ignore]` Wave-0:
+/// the `sgd_solve` compute body is `todo!()`; the Wave-1 plan un-ignores this and
+/// asserts that driving the SGD solver N× at a fixed shape conserves `live_bytes`
+/// and plateaus `peak_bytes` after warmup (the per-epoch device `w`/`bias`/`g`
+/// buffers are acquired ONCE and reused), with the metered read-backs BOUNDED
+/// (one scalar loss/convergence readback per outer check, not per epoch).
+///
+/// The f64 path carries the `skip_f64_with_log` gate (cpu runs f64; rocm
+/// skips-with-log, D-07).
+#[test]
+#[ignore = "Wave-1 (plan 10-02) fills sgd_solve + asserts the bounded-allocation gate"]
+fn memory_gate_sgd_bounded() {
+    // skip_f64_with_log: the f64 solver runs on cpu and skips-with-log on rocm.
+    let _ = capability::skip_f64_with_log();
+    let client = runtime::active_client();
+    let _pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    // Wave-1 drives sgd_solve N× at a fixed (n, d) shape and asserts
+    // alloc-after-warmup delta == 0 + live/peak conserved + bounded read_backs.
+}
