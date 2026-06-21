@@ -148,7 +148,25 @@ Plans:
 
 **Recurring gates**: `skip_f64_with_log` on every f64 oracle case; documented f32-on-rocm band for weights, **exact predicted labels** the hard gate for the classifiers; pinned-deterministic oracle (shuffle off, fixed schedule/iters, sklearn ref) per Pitfall 7; **GATHER idiom + cpu-launch verification** per Pitfall 1; per-prim PoolStats memory gate.
 **Research flag**: `[v2-P4]` SGD under cpu-MLIR — spike the two-pass GATHER kernel and the pinned deterministic oracle before wiring any of the four estimators. Run a research spike before planning. **Highest-risk phase.**
-**Plans**: TBD
+**Plans**: 5 plans (4 waves)
+
+Plans:
+**Wave 0**
+
+- [ ] 10-01-PLAN.md — Wave-0 scaffold: Loss/Penalty/LearningRate enums + TryFrom + SgdConfig + BuildError (D-04..D-09) + sgd kernel/prim stubs + four builder-fronted estimator homes + PyO3 Unfit stubs + build_err_to_py + 6 #[ignore] Nyquist scaffolds + 4 pinned-deterministic oracle generators
+
+**Wave 1** *(blocked on Wave 0)*
+
+- [ ] 10-02-PLAN.md — PRIM-10 sgd.rs two-pass GATHER kernel + prims/sgd.rs epoch loop (dloss/optimal-t0/schedules) standalone-validated on a convex objective, cpu-launch gate, SharedMemory/INFINITY grep gates, PoolStats memory gate
+
+**Wave 2** *(blocked on Wave 1; 10-03 + 10-04 file-disjoint → parallel)*
+
+- [ ] 10-03-PLAN.md — SGDSVM-01 MBSGDClassifier + SGDSVM-02 MBSGDRegressor on the validated prim + pinned oracle (exact-label hard gate, log-loss proba, D-03 default litmus, D-08 split validation)
+- [ ] 10-04-PLAN.md — SGDSVM-03 LinearSVC + SGDSVM-04 LinearSVR (CD-reuse per D-07, dual='auto' internal, intercept_scaling synthetic-feature, Open-Q1 cd_fit-vs-SVM-CD spike)
+
+**Wave 3** *(blocked on Wave 2)*
+
+- [ ] 10-05-PLAN.md — PyO3 wrappers for all four estimators (builder-chain fit, TryFrom/BuildError → ValueError D-05/D-09, dtype dispatch, GIL release, f64 guard) + maturin-develop smoke test
 
 ### Phase 11: Naive Bayes
 
@@ -180,5 +198,5 @@ Plans:
 | 7. Covariance & Projection | v2.0 | 7/7 | Complete    | 2026-06-20 |
 | 8. Kernel Family | v2.0 | 1/5 | Executing | - |
 | 9. Spectral Family | v2.0 | 4/4 | Complete    | 2026-06-21 |
-| 10. SGD / Linear-SVM | v2.0 | 0/? | Not started | - |
+| 10. SGD / Linear-SVM | v2.0 | 0/5 | Planned | - |
 | 11. Naive Bayes | v2.0 | 0/? | Not started | - |
