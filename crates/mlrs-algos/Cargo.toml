@@ -22,6 +22,11 @@ cubecl = { workspace = true }
 # materialize-at-accessor path (D-03).
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
+# Host-side structured warnings — the D-06 `force_alpha` clip emits a sklearn-
+# parity warning when a too-small `alpha` is clipped to 1e-10 (the mlrs-backend
+# reduce prim uses the same `log::warn!` convention). Parity depends only on the
+# clipped numeric, not the warning text (Phase-11 A2).
+log = { workspace = true }
 
 [dev-dependencies]
 # Oracle harness (`load_npz`, `OracleCase`) + tolerance/sign-flip helpers the

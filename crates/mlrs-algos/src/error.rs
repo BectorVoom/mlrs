@@ -338,6 +338,22 @@ pub enum AlgoError {
         reason: String,
     },
 
+    /// `CategoricalNB` (Phase 11) was given a feature matrix that is not a valid
+    /// non-negative-INTEGER categorical encoding: a negative value, a non-integer
+    /// value, or a predict-time category index that exceeds the per-feature
+    /// category count learned at `fit`. Like [`AlgoError::InvalidLabels`] this is
+    /// a data-VALIDITY failure (the matrix has the right SHAPE, its CONTENT is
+    /// invalid), distinct from a geometry [`PrimError::ShapeMismatch`]. Carries an
+    /// honest reason string. Rejected at `fit` / `predict` (data-DEPENDENT, D-05).
+    #[error("estimator '{estimator}': invalid categorical input — {reason}")]
+    InvalidCategoricalInput {
+        /// Which estimator rejected the input (always `"categorical_nb"`).
+        estimator: &'static str,
+        /// The data-validity reason (e.g. `"feature values must be non-negative
+        /// integers"` or `"category index 5 >= n_categories 4 for feature 2"`).
+        reason: String,
+    },
+
     /// A primitive-layer failure (geometry / squareness / convergence /
     /// non-SPD pivot) surfaced from a `mlrs-backend` prim call the estimator
     /// composed. Transparent `#[from]` so estimator methods can `?` a prim
@@ -486,5 +502,46 @@ pub enum BuildError {
         estimator: &'static str,
         /// The offending (owned) loss name.
         loss: String,
+    },
+
+    /// `GaussianNB` was given a negative `var_smoothing` (Phase 11, T-11-01). The
+    /// portion of the largest feature variance added to every variance for
+    /// numerical stability must be `var_smoothing >= 0`; a negative value is
+    /// undefined. Rejected at `build()` (data-INDEPENDENT, D-05).
+    #[error(
+        "estimator '{estimator}': var_smoothing = {var_smoothing} is invalid \
+         (must be >= 0)"
+    )]
+    InvalidVarSmoothing {
+        /// Which estimator's builder rejected the value (always `"gaussian_nb"`).
+        estimator: &'static str,
+        /// The offending smoothing value.
+        var_smoothing: f64,
+    },
+
+    /// A Naive Bayes estimator was given a `priors` / `class_prior` vector with a
+    /// non-finite or negative entry (Phase 11, T-11-01). Class priors are
+    /// probabilities, so each entry must be finite and `>= 0` (the data-DEPENDENT
+    /// length-`== n_classes` and sum-to-one checks stay at `fit`, D-05). Rejected
+    /// at `build()` for the data-INDEPENDENT per-entry validity.
+    #[error(
+        "estimator '{estimator}': class prior entries must be finite and non-negative"
+    )]
+    InvalidClassPrior {
+        /// Which estimator's builder rejected the prior vector.
+        estimator: &'static str,
+    },
+
+    /// `CategoricalNB` was given a `min_categories` specification with a negative
+    /// entry (Phase 11, T-11-01). The minimum number of categories per feature is
+    /// a count, so every entry must be `>= 0`. Rejected at `build()`
+    /// (data-INDEPENDENT, D-05) — the data-DEPENDENT length-`== n_features` check
+    /// for the per-feature form stays at `fit`.
+    #[error(
+        "estimator '{estimator}': min_categories entries must be non-negative"
+    )]
+    InvalidMinCategories {
+        /// Which estimator's builder rejected the value (always `"categorical_nb"`).
+        estimator: &'static str,
     },
 }

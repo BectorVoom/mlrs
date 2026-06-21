@@ -268,3 +268,36 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
 }
+
+/// Predict the per-class LOG-probabilities for new samples (D-07, Phase 11). The
+/// sibling of [`PredictProba`]: returns the SAME `n_samples × n_classes`
+/// row-major matrix but in the log domain — the `predict_log_proba` surface the
+/// five Naive Bayes classifiers (`GaussianNB` / `MultinomialNB` / `BernoulliNB`
+/// / `ComplementNB` / `CategoricalNB`) implement alongside `predict_proba`.
+///
+/// Each returned row is `joint_ll − logsumexp(joint_ll)` (the per-row joint
+/// log-likelihood normalized by the log-sum-exp of the row), so that
+/// `exp(.)` of each row sums to 1 — i.e. `predict_log_proba(x).map(exp) ==
+/// predict_proba(x)` up to floating round-off. Computing in the log domain (a
+/// single host f64 max-shift + terminal log, never `±∞` mid-pipeline) is the
+/// numerically-stable form that keeps the small probabilities from underflowing
+/// to zero (Phase-11 Pitfall 9).
+///
+/// Runs device-side from the device-resident fitted state (D-03); the returned
+/// buffer is host-materialized only at a Rust accessor / oracle boundary.
+pub trait PredictLogProba<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Predict the per-class log-probability row for each sample of `x`
+    /// (`shape = (n_samples, n_features)`, row-major), returning the flat
+    /// `n_samples × n_classes` row-major buffer of `joint_ll − logsumexp`.
+    /// Errors if the estimator is unfitted or the geometry disagrees with the
+    /// fitted `n_features`.
+    fn predict_log_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
+}

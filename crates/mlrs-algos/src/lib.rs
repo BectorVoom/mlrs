@@ -30,6 +30,11 @@
 //! - [`density`] — `KernelDensity` (KERNEL-02) (Wave-2, 08-04). New `density/`
 //!   home (RESEARCH Open Q2 — KD is not a neighbor estimator in mlrs's trait
 //!   sense). Registered as an empty stub here by the 08-01 Wave-0 scaffold.
+//! - [`naive_bayes`] — the five Naive Bayes classifiers `GaussianNB` /
+//!   `MultinomialNB` / `BernoulliNB` / `ComplementNB` / `CategoricalNB`
+//!   (NB-01..05, Phase 11). Five mutually-independent builder-fronted structs
+//!   sharing only the `nb_common` free functions (D-03 — NO `NbBase`).
+//!   Registered here by the 11-01 Wave-0 scaffold.
 //!
 //! The estimator plans edit ONLY their own estimator file and the relevant
 //! module-index `mod.rs` (`linear/mod.rs` / `decomposition/mod.rs` /
@@ -46,6 +51,7 @@ pub mod density;
 pub mod error;
 pub mod kernel_ridge;
 pub mod linear;
+pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;
 pub mod traits;
@@ -55,6 +61,6 @@ pub mod traits;
 // KNeighbors, PredictProba, AlgoError};` directly.
 pub use error::AlgoError;
 pub use traits::{
-    Fit, KNeighbors, PartialFit, Predict, PredictLabels, PredictProba,
-    ScoreSamples, Transform,
+    Fit, KNeighbors, PartialFit, Predict, PredictLabels, PredictLogProba,
+    PredictProba, ScoreSamples, Transform,
 };

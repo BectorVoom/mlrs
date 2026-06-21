@@ -2520,6 +2520,7 @@ dependencies = [
  "bytemuck",
  "cubecl",
  "env_logger",
+ "log",
  "mlrs-backend",
  "mlrs-core",
  "mlrs-kernels",
@@ -2547,6 +2548,7 @@ dependencies = [
 name = "mlrs-core"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "log",
  "npyz",
  "thiserror",
