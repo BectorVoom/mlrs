@@ -185,6 +185,13 @@ where
                         gamma: gamma64,
                     });
                 }
+                // IN-03 (explicit parity decision): only `gamma <= 0` / non-finite
+                // is rejected. A finite-positive gamma so tiny that `exp(-gamma*dist)`
+                // underflows to an effective-constant all-ones affinity is ACCEPTED
+                // — this matches sklearn, which likewise gates solely on
+                // `Interval(Real, 0, None, closed='neither')` and does NOT guard the
+                // effective-zero underflow boundary. Intentional sklearn parity, not
+                // an oversight.
                 kernel_matrix::<F>(
                     pool,
                     x,
