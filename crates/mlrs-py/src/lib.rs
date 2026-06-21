@@ -105,6 +105,24 @@ pub(crate) fn global_pool() -> &'static Mutex<BufferPool<ActiveRuntime>> {
 /// unwinds before any half-written pool mutation), so `into_inner()` recovery is
 /// safe: a single bad `fit` no longer kills the interpreter session. Prefer this
 /// over `global_pool().lock().expect(...)` in any `fit`/accessor that can panic.
+///
+/// ## ACCOUNTING CAVEAT after a recovered poison (WR-01)
+/// "Not left torn" is a **memory-safety** statement, NOT an accounting one. The
+/// `BufferPool` counters (`live_bytes`/`peak_bytes`) are bumped at `acquire` and
+/// decremented at `release` ([`BufferPool::acquire`]/[`BufferPool::release`]). A
+/// `fit` acquires many buffers and releases them incrementally; if a panic unwinds
+/// the `py.detach` closure mid-`fit` while this guard is held, every
+/// acquired-but-not-yet-released buffer leaves its bytes permanently added to
+/// `live_bytes`. After `into_inner()` recovery, `live_bytes` (and therefore
+/// `peak_bytes`) may be monotonically INFLATED for the rest of the process.
+///
+/// The pool cannot self-reconcile this: its free-list only knows about *released*
+/// handles, and the *live* handles are owned by `DeviceArray`s outside the pool —
+/// so there is no in-pool truth source to recompute `live_bytes` from. Callers and
+/// the FOUND-05 leak-detection gates MUST therefore treat the conservation
+/// property (`live_bytes` returns to its pre-`fit` baseline) as VOID once a poison
+/// has been recovered through this path. Memory safety holds; the accounting
+/// counters do not.
 #[allow(dead_code)]
 pub(crate) fn lock_pool(
 ) -> std::sync::MutexGuard<'static, BufferPool<ActiveRuntime>> {
