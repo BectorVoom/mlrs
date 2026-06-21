@@ -15,10 +15,19 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
-use crate::traits::Fit;
+use crate::naive_bayes::nb_common::{
+    argmax_decode, class_grouped_sum, class_grouped_sumsq, empirical_class_log_prior,
+    log_sum_exp_normalize,
+};
+use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
+
+/// `ln(2π)`, the constant term of the Gaussian log-likelihood
+/// `−0.5·Σ_j[log(2π·var) + (x−mean)²/var]` factored as
+/// `−0.5·Σ_j[ln(2π) + ln(var) + (x−mean)²/var]`.
+const LN_2PI: f64 = 1.837_877_066_409_345_6; // (2.0 * std::f64::consts::PI).ln()
 
 /// Gaussian Naive Bayes (NB-01). Construct via [`GaussianNB::builder`], then
 /// [`Fit::fit`] + (Wave-1) `predict_labels` / `predict_proba` /
@@ -43,6 +52,13 @@ pub struct GaussianNB<F> {
     var_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Per-class log-prior (host f64, length `n_classes`), `None` until `fit`.
     class_log_prior_: Option<Vec<f64>>,
+    /// Per-class sample counts (host f64, length `n_classes`), `None` until
+    /// `fit`. The empirical-prior numerator and the `theta_`/`var_` divisor.
+    class_count_: Option<Vec<f64>>,
+    /// `var_smoothing · max_j Var(X[:,j])` over the WHOLE training set
+    /// (population, ddof=0) — the GLOBAL floor added to every `var_` cell
+    /// (Pitfall 3), `None` until `fit`.
+    epsilon_: Option<f64>,
 }
 
 impl<F> GaussianNB<F>
@@ -62,6 +78,32 @@ where
     /// The per-class log-prior (`None` until `fit`).
     pub fn class_log_prior(&self) -> Option<&[f64]> {
         self.class_log_prior_.as_deref()
+    }
+
+    /// The per-class sample counts (`None` until `fit`).
+    pub fn class_count(&self) -> Option<&[f64]> {
+        self.class_count_.as_deref()
+    }
+
+    /// The global variance floor `epsilon_` (`None` until `fit`).
+    pub fn epsilon(&self) -> Option<f64> {
+        self.epsilon_
+    }
+
+    /// Host-materialized per-class feature means `theta_` (`n_classes × n_features`
+    /// row-major), `None` until `fit`.
+    pub fn theta(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<f64>> {
+        self.theta_
+            .as_ref()
+            .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
+    }
+
+    /// Host-materialized per-class feature variances `var_` (`n_classes ×
+    /// n_features` row-major, epsilon_-floored), `None` until `fit`.
+    pub fn var(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<f64>> {
+        self.var_
+            .as_ref()
+            .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
     }
 }
 
@@ -119,6 +161,8 @@ impl GaussianNBBuilder {
             theta_: None,
             var_: None,
             class_log_prior_: None,
+            class_count_: None,
+            epsilon_: None,
         })
     }
 }
@@ -129,7 +173,7 @@ where
 {
     fn fit(
         &mut self,
-        _pool: &mut BufferPool<ActiveRuntime>,
+        pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
@@ -156,11 +200,272 @@ where
                 len: y.len(),
             }));
         }
-        // Wave-1 (11-02): host distinct-sorted classes_, the two-GATHER
-        // theta_/var_ via nb_common::class_grouped_sum / class_grouped_sumsq, the
-        // var_smoothing floor, and the empirical-or-supplied class_log_prior_.
-        let _ = (&self.priors, self.var_smoothing);
-        let _ = (&self.theta_, &self.var_, &self.class_log_prior_, &self.n_features);
-        todo!("GaussianNB::fit compute body — Wave 1 (11-02)")
+        // --- Pitfall 4: host distinct-sorted classes_ (no class-count
+        //     restriction; GaussianNB is multiclass). Integer labels only. ---
+        let y_host = y.to_host(pool);
+        let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
+        for &yv in y_host.iter() {
+            let lf = host_to_f64(yv);
+            let li = lf.round();
+            if (li - lf).abs() > 1e-6 {
+                return Err(AlgoError::InvalidLabels {
+                    estimator: "gaussian_nb",
+                    reason: format!("labels must be integers (got {lf})"),
+                });
+            }
+            raw_labels.push(li as i64);
+        }
+        let mut classes_: Vec<i64> = raw_labels.clone();
+        classes_.sort_unstable();
+        classes_.dedup();
+        let n_classes = classes_.len();
+        // WR-02: predicted labels are emitted as `i32`; a class id outside i32
+        // range would be SILENTLY truncated into a wrong label. Validate here.
+        for &cls in classes_.iter() {
+            if i32::try_from(cls).is_err() {
+                return Err(AlgoError::InvalidLabels {
+                    estimator: "gaussian_nb",
+                    reason: format!(
+                        "class label {cls} does not fit in i32 (predicted labels are i32)"
+                    ),
+                });
+            }
+        }
+        // Dense class index per row (position in the sorted classes_ table).
+        let class_of_row: Vec<usize> = raw_labels
+            .iter()
+            .map(|l| classes_.binary_search(l).expect("label is in classes_"))
+            .collect();
+
+        // --- Per-class sufficient statistics via the validated GATHER prims
+        //     (one owner per (class, feature); NO scatter-add, NO new kernel). ---
+        let sums = class_grouped_sum::<F>(pool, x, shape, &class_of_row, n_classes)?;
+        let sumsqs = class_grouped_sumsq::<F>(pool, x, shape, &class_of_row, n_classes)?;
+
+        // class_count_[c] = #rows of class c (every observed class has >= 1).
+        let mut class_count_: Vec<f64> = vec![0.0; n_classes];
+        for &c in &class_of_row {
+            class_count_[c] += 1.0;
+        }
+
+        // theta_[c,j] = sum/n_c ; var_[c,j] = sumsq/n_c − theta_² (population,
+        // ddof=0). epsilon_ is added below (a single global floor).
+        let mut theta: Vec<f64> = vec![0.0; n_classes * n_features];
+        let mut var: Vec<f64> = vec![0.0; n_classes * n_features];
+        for c in 0..n_classes {
+            let n_c = class_count_[c];
+            debug_assert!(n_c > 0.0, "every observed class has at least one sample");
+            for j in 0..n_features {
+                let mean = sums[c][j] / n_c;
+                let raw_var = sumsqs[c][j] / n_c - mean * mean;
+                theta[c * n_features + j] = mean;
+                // Population variance can dip slightly negative from f64 round-off
+                // when the true variance is ~0 (e.g. a constant feature); clamp to
+                // 0 before the epsilon_ floor so var_ stays >= epsilon_ > 0.
+                var[c * n_features + j] = raw_var.max(0.0);
+            }
+        }
+
+        // --- epsilon_ = var_smoothing · max_j Var(X[:,j]) over the WHOLE X
+        //     (population, ddof=0), computed ONCE — GLOBAL, not per-class
+        //     (Pitfall 3, FEATURES.md `var_smoothing * X.var(axis=0).max()`). ---
+        let x_host = x.to_host(pool);
+        let n = n_samples as f64;
+        let mut max_col_var = 0.0f64;
+        for j in 0..n_features {
+            let mut s = 0.0f64;
+            let mut ss = 0.0f64;
+            for i in 0..n_samples {
+                let v = host_to_f64(x_host[i * n_features + j]);
+                s += v;
+                ss += v * v;
+            }
+            let mean = s / n;
+            let col_var = (ss / n - mean * mean).max(0.0);
+            if col_var > max_col_var {
+                max_col_var = col_var;
+            }
+        }
+        let epsilon_ = self.var_smoothing * max_col_var;
+        for cell in var.iter_mut() {
+            *cell += epsilon_;
+        }
+
+        // --- class_log_prior_: empirical log(count_c / n) when priors=None, else
+        //     the supplied priors (length == n_classes, validated as a
+        //     data-DEPENDENT check here per D-05). ---
+        let class_log_prior_ = match &self.priors {
+            None => empirical_class_log_prior(&class_count_),
+            Some(p) => {
+                if p.len() != n_classes {
+                    return Err(AlgoError::InvalidLabels {
+                        estimator: "gaussian_nb",
+                        reason: format!(
+                            "priors length {} != number of classes {n_classes}",
+                            p.len()
+                        ),
+                    });
+                }
+                p.iter().map(|&v| v.ln()).collect()
+            }
+        };
+
+        // --- WR-07: release any prior fitted device buffers BEFORE storing the
+        //     new ones so a re-fit at the same shape conserves live_bytes. ---
+        if let Some(old) = self.theta_.take() {
+            old.release_into(pool);
+        }
+        if let Some(old) = self.var_.take() {
+            old.release_into(pool);
+        }
+
+        // Store fitted state. theta_/var_ are device-resident (per the stub's
+        // field types); the host materializes them at predict / accessor.
+        let theta_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
+            pool,
+            &theta.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
+        );
+        let var_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
+            pool,
+            &var.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
+        );
+
+        self.classes_ = classes_;
+        self.n_features = n_features;
+        self.theta_ = Some(theta_dev);
+        self.var_ = Some(var_dev);
+        self.class_log_prior_ = Some(class_log_prior_);
+        self.class_count_ = Some(class_count_);
+        self.epsilon_ = Some(epsilon_);
+        Ok(self)
+    }
+}
+
+impl<F> GaussianNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Per-query-row joint log-likelihood matrix (`n_query × n_classes`, host
+    /// f64, row-major). Shared by `predict_labels` / `predict_proba` /
+    /// `predict_log_proba`. Runs the geometry guard, then evaluates
+    /// `class_log_prior_[c] − 0.5·Σ_j[ln(2π·var_[c,j]) + (x_j−theta_[c,j])²/var_[c,j]]`
+    /// in host f64 (the var_ cells are epsilon_-floored, so no div-by-zero).
+    fn joint_log_likelihood(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<Vec<f64>, AlgoError> {
+        let (n_query, n_features) = shape;
+        let theta = self.theta_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "gaussian_nb",
+            operation: "predict (call fit first)",
+        })?;
+        let var = self.var_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "gaussian_nb",
+            operation: "predict (call fit first)",
+        })?;
+        let class_log_prior = self.class_log_prior_.as_ref().ok_or(AlgoError::NotFitted {
+            estimator: "gaussian_nb",
+            operation: "predict (call fit first)",
+        })?;
+        // Geometry guard BEFORE any host work (T-11-02-04 / ASVS V5).
+        if n_query == 0 || n_features != self.n_features || x.len() != n_query * n_features {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "gaussian_nb",
+                reason: format!(
+                    "predict geometry: got {n_query}x{n_features}, fitted n_features={}",
+                    self.n_features
+                ),
+            });
+        }
+        let n_classes = self.classes_.len();
+        let theta_h: Vec<f64> = theta.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        let var_h: Vec<f64> = var.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        let x_h = x.to_host(pool);
+
+        let mut jll = vec![0.0f64; n_query * n_classes];
+        for r in 0..n_query {
+            for c in 0..n_classes {
+                let mut acc = class_log_prior[c];
+                let mut quad = 0.0f64;
+                for j in 0..n_features {
+                    let cj = c * n_features + j;
+                    let xv = host_to_f64(x_h[r * n_features + j]);
+                    let v = var_h[cj];
+                    let d = xv - theta_h[cj];
+                    quad += (LN_2PI + v.ln()) + (d * d) / v;
+                }
+                acc -= 0.5 * quad;
+                jll[r * n_classes + c] = acc;
+            }
+        }
+        Ok(jll)
+    }
+}
+
+impl<F> PredictLabels<F> for GaussianNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_labels(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let labels = argmax_decode(&jll, &self.classes_);
+        Ok(DeviceArray::from_host(pool, &labels))
+    }
+}
+
+impl<F> PredictProba<F> for GaussianNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_query, _n_features) = shape;
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let n_classes = self.classes_.len();
+        let mut proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        for r in 0..n_query {
+            let row = &jll[r * n_classes..(r + 1) * n_classes];
+            let (p, _lp) = log_sum_exp_normalize(row, n_classes);
+            for (c, &pv) in p.iter().enumerate() {
+                proba[r * n_classes + c] = f64_to_host::<F>(pv);
+            }
+        }
+        Ok(DeviceArray::from_host(pool, &proba))
+    }
+}
+
+impl<F> PredictLogProba<F> for GaussianNB<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn predict_log_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_query, _n_features) = shape;
+        let jll = self.joint_log_likelihood(pool, x, shape)?;
+        let n_classes = self.classes_.len();
+        let mut log_proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        for r in 0..n_query {
+            let row = &jll[r * n_classes..(r + 1) * n_classes];
+            let (_p, lp) = log_sum_exp_normalize(row, n_classes);
+            for (c, &lpv) in lp.iter().enumerate() {
+                log_proba[r * n_classes + c] = f64_to_host::<F>(lpv);
+            }
+        }
+        Ok(DeviceArray::from_host(pool, &log_proba))
     }
 }
