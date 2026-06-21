@@ -334,6 +334,18 @@ where
         let x_host = x.to_host(pool);
         let x_fit: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_host);
 
+        // --- Re-fit buffer reuse (WR-07): on a re-`fit` the prior device-resident
+        //     dual_coef_ / x_fit_ allocations must go back to the pool free-list,
+        //     not be dropped to the allocator, or the buffer-reuse memory contract
+        //     is broken on the re-fit path. Release the old buffers (if any) BEFORE
+        //     reassigning the fresh ones. ---
+        if let Some(old) = self.dual_coef_.take() {
+            old.release_into(pool);
+        }
+        if let Some(old) = self.x_fit_.take() {
+            old.release_into(pool);
+        }
+
         self.kernel_ = Some(kernel);
         self.dual_coef_ = Some(dual_coef);
         self.x_fit_ = Some(x_fit);

@@ -235,6 +235,13 @@ where
         let x_host = x.to_host(pool);
         let x_fit: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_host);
 
+        // --- Re-fit buffer reuse (WR-07): on a re-`fit` the prior X_fit_ device
+        //     allocation must return to the pool free-list, not be dropped to the
+        //     allocator. Release the old buffer (if any) BEFORE reassigning. ---
+        if let Some(old) = self.x_fit_.take() {
+            old.release_into(pool);
+        }
+
         self.x_fit_ = Some(x_fit);
         self.bandwidth_ = Some(bandwidth);
         self.fit_shape_ = Some((n_samples, n_features));
