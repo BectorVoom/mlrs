@@ -85,6 +85,19 @@ fn assert_close(got: &[f64], expected: &[f64], tol: &Tolerance, what: &str) -> f
     );
     let mut max_abs = 0.0f64;
     for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+        // Fail-loud on non-finite output (WR-05): a NaN prediction (e.g. CR-01's
+        // poly negative-base path regressing) makes `(NaN − e).abs()` NaN and
+        // `NaN <= tol` `false`, surfacing as an opaque "allclose failed" rather
+        // than a clear NaN diagnosis. The sklearn KernelRidge reference is always
+        // finite, so any non-finite `got` (or a mismatched non-finite `e`) is a
+        // hard failure here, mirroring the KDE test helper.
+        if !g.is_finite() || !e.is_finite() {
+            assert!(
+                g == e,
+                "{what}: non-finite mismatch at {i}: got={g:e} expected={e:e}"
+            );
+            continue;
+        }
         let abs_err = (g - e).abs();
         max_abs = max_abs.max(abs_err);
         let allclose = abs_err <= tol.abs + tol.rel * e.abs();
