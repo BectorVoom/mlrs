@@ -93,7 +93,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1)*
 - [x] 08-03-PLAN.md — KERNEL-01 KernelRidge (dual (K+αI) Cholesky multi-RHS solve over kernel_matrix; no centering/intercept) [2/2 tasks; f64 ≤5.6e-16, f32 ≤3.6e-7 vs sklearn across 4 kernels + multi-target + both gamma paths]
-- [ ] 08-04-PLAN.md — KERNEL-02 KernelDensity (6 KD kernels + scott/silverman; device log-sum-exp over v1 distance/reduce; ScoreSamples<F> impl)
+- [x] 08-04-PLAN.md — KERNEL-02 KernelDensity (6 KD kernels + scott/silverman; device log-sum-exp over v1 distance/reduce; ScoreSamples<F> impl) [3/3 tasks; f64 ≤1.6e-8 (cosine series), other 5 kernels ≤1e-12, f32 ≤1e-4 vs sklearn forced-exact; Open Q1 resolved — plain reduce-sum, no rescale]
 
 **Wave 3** *(blocked on Wave 2)*
 - [ ] 08-05-PLAN.md — PY-06 (share) PyO3 wrappers PyKernelRidge/PyKernelDensity (any_estimator! + score_samples) + py smoke test

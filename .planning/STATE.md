@@ -27,12 +27,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 Phase: 08 (kernel-family) — EXECUTING
 Plan: 4 of 5
-Status: Executing Phase 08 (Wave-2 KernelRidge 08-03 complete — KERNEL-01 oracle-validated)
-Last activity: 2026-06-20 -- Phase 08 plan 03 (KernelRidge KERNEL-01) complete
-Resume file: .planning/phases/08-kernel-family/08-04-PLAN.md
-Next: 08-04 Wave-2 — KernelDensity (KERNEL-02) on the kernel_matrix prim + ScoreSamples<F>
+Status: Executing Phase 08 (Wave-2 KernelDensity 08-04 complete — KERNEL-02 oracle-validated)
+Last activity: 2026-06-21 -- Phase 08 plan 04 (KernelDensity KERNEL-02) complete
+Resume file: .planning/phases/08-kernel-family/08-05-PLAN.md
+Next: 08-05 — Python wrappers (PyKernelRidge + PyKernelDensity via any_estimator!, score_samples exposed)
 
-Progress: [###       ] 24% (v2.0 — 1/5 phases; phase 08 plan 3/5 done)
+Progress: [####      ] 28% (v2.0 — 1/5 phases; phase 08 plan 4/5 done)
 
 ## Open Follow-ups (Phase 05)
 

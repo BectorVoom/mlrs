@@ -33,7 +33,7 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 ### Kernel
 
 - [x] **KERNEL-01**: A data scientist can fit `KernelRidge` (dual-coefficient solve of `(K + αI)` via the v1 Cholesky primitive; kernels linear/rbf/polynomial/sigmoid with `gamma`/`degree`/`coef0`) and `predict`, matching scikit-learn within 1e-5
-- [ ] **KERNEL-02**: A data scientist can fit `KernelDensity` (kernels + `bandwidth`) and call `score_samples` for log-density, using a numerically-stable log-sum-exp, matching scikit-learn within tolerance
+- [x] **KERNEL-02**: A data scientist can fit `KernelDensity` (kernels + `bandwidth`) and call `score_samples` for log-density, using a numerically-stable log-sum-exp, matching scikit-learn within tolerance
 
 ### Spectral
 
@@ -84,7 +84,7 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | PROJ-02 | Phase 7 | Complete |
 | PRIM-08 | Phase 8 | Complete (08-02) |
 | KERNEL-01 | Phase 8 | Complete |
-| KERNEL-02 | Phase 8 | Pending |
+| KERNEL-02 | Phase 8 | Complete (08-04) |
 | PRIM-09 | Phase 9 | Pending |
 | SPECTRAL-01 | Phase 9 | Pending |
 | SPECTRAL-02 | Phase 9 | Pending |
