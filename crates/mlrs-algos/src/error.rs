@@ -429,6 +429,26 @@ pub enum BuildError {
         epsilon: f64,
     },
 
+    /// An SGD estimator was given a non-finite inverse-scaling exponent
+    /// `power_t` (NaN / ±inf). `power_t` flows into the `invscaling` schedule
+    /// `eta0 / t^power_t`; a non-finite value drives the step rate to NaN/inf and
+    /// diverges the solve. Rejected at `build()` (T-10-03-01 — the same
+    /// untrusted-hyperparameter class as the sibling schedule scalars). NOTE: a
+    /// NEGATIVE finite `power_t` is ACCEPTED but makes the step rate GROW with
+    /// `t` (and `power_t = 0` degenerates `invscaling` to constant) — these are
+    /// sklearn-divergent but well-defined, so they are documented rather than
+    /// rejected.
+    #[error(
+        "estimator '{estimator}': power_t = {power_t} is invalid \
+         (must be a finite value)"
+    )]
+    InvalidPowerT {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending (non-finite) inverse-scaling exponent.
+        power_t: f64,
+    },
+
     /// An unrecognised `loss` string was supplied (the
     /// [`TryFrom<&str>`](core::convert::TryFrom) enum-parse failure folded into
     /// `BuildError` so a single mapper covers it, D-09). Carries the offending

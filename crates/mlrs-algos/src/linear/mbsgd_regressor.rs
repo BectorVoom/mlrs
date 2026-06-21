@@ -235,6 +235,16 @@ impl MBSGDRegressorBuilder {
                 eta0: self.eta0,
             });
         }
+        // WR-04: reject a non-finite `power_t` (NaN / ±inf) — it feeds the
+        // `invscaling` schedule `eta0 / t^power_t` and would drive the step rate
+        // to NaN/inf. A negative finite `power_t` is accepted (documented
+        // divergence — it makes the rate grow with t).
+        if !self.power_t.is_finite() {
+            return Err(BuildError::InvalidPowerT {
+                estimator: "mbsgd_regressor",
+                power_t: self.power_t,
+            });
+        }
         if !(self.epsilon >= 0.0) {
             return Err(BuildError::InvalidEpsilon {
                 estimator: "mbsgd_regressor",
