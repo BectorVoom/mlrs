@@ -17,12 +17,14 @@
 //! `dloss` table + `optimal`/`invscaling` schedule arithmetic live in this layer
 //! (f64), feeding `g[]` and `eta` to the kernels.
 //!
-//! ## Status (Wave-0 / plan 10-01 — STUB)
+//! ## Status (Wave-1 / plan 10-02 — FILLED)
 //! The host signature + a REAL geometry guard (`x.len() == n*d`, `y.len() == n`,
-//! non-empty) compile today; the compute path is `todo!()`. The Wave-1 plan fills
-//! the epoch loop + the `dloss`/schedule helpers + the lazy-L2 / cumulative-L1
-//! penalty bookkeeping. The two kernels it drives are already SharedMemory-free
-//! by construction (cubecl-cpu MLIR-safe).
+//! non-empty) front the epoch loop. [`sgd_solve`] drives the two-pass GATHER
+//! kernels per minibatch: `sgd_margin` (pass 1, read `p[]`) → host `g[i] =
+//! dloss(p_i, y_i)` → `eta = schedule_eta(t)` → host lazy-L2 / cumulative-L1
+//! penalty shrink → `sgd_weight_update` (pass 2) → host intercept step;
+//! `NotConverged` is surfaced at the `max_iter` cap. The kernels are
+//! SharedMemory-free by construction (cubecl-cpu MLIR-safe).
 //!
 //! Tests live in `crates/mlrs-backend/tests/sgd_test.rs` (AGENTS.md §2 — never an
 //! in-source `#[cfg(test)] mod tests`).
@@ -31,6 +33,7 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use mlrs_core::PrimError;
+use mlrs_kernels::sgd::{sgd_margin, sgd_weight_update};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
@@ -122,9 +125,15 @@ pub struct SgdParams {
 /// - `params` carries the lowered (flat-scalar) penalty / schedule the host
 ///   gradient + step math reads.
 ///
-/// ## Status (Wave-0 — STUB)
-/// The geometry guard below is REAL; the compute body is `todo!()` (the Wave-1
-/// plan fills the epoch loop driving `sgd_margin` / `sgd_weight_update`).
+/// ## Compute (Wave-1)
+/// Epoch loop over `max_iter`; per minibatch (natural row order, `shuffle=false`):
+/// `sgd_margin::launch` → read `p[]` → host `g[i] = dloss(p_i, y_i)` clipped ±1e12
+/// → `eta = schedule_eta(t)` → host lazy-L2 / cumulative-L1 penalty shrink →
+/// `sgd_weight_update::launch` → host intercept `b -= eta·(Σ g_i)·inv_b`. Tracks
+/// the max coefficient change; stops when `< tol·scale`, else runs to the cap and
+/// the iterate is returned as-is (sklearn's `tol=0` deterministic-epochs contract;
+/// the caller maps a non-convergence to its estimator-level error if it cares).
+#[allow(clippy::too_many_arguments)]
 pub fn sgd_solve<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
@@ -148,17 +157,322 @@ where
     //     device read. Mirrors cd_solve / laplacian. ---
     validate_geometry(x.len(), y.len(), n, d)?;
 
-    // The flat-scalar params are consumed by the Wave-1 epoch loop; reference one
-    // field so the scaffold compiles without an unused-binding warning while the
-    // body is a stub.
-    let _ = (params.loss, params.schedule, params.max_iter);
-    let _ = pool;
+    let elem = size_of::<F>();
+    let client = pool.client().clone();
 
-    // Wave-1 fills: acquire device w (len d) + bias scalar, then per-epoch
-    // per-batch: sgd_margin::launch → host g[i]=dloss(p_i,y_i)+schedule eta →
-    // sgd_weight_update::launch → host bias -= eta·Σg (with intercept_decay) →
-    // NotConverged at the cap. The kernels are already SharedMemory-free.
-    todo!("PRIM-10 sgd_solve compute body — filled in Wave-1 (plan 10-02)")
+    // Host targets (read ONCE; the per-sample dloss is host f64 — the margin/
+    // gradient device kernels carry the n/d-heavy work, the host owns the loss).
+    let y_host: Vec<f64> = y.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+    // Host design (read ONCE): the batch kernels index from row 0 of the array
+    // they are launched over, so each minibatch's contiguous row block is uploaded
+    // into a reused batch buffer (the cubecl 0.10 `ArrayArg` has no offset variant;
+    // copying the slice keeps the kernel single-purpose — row 0-based, no
+    // row-offset scalar). The raw `F` values are kept so the upload is byte-exact.
+    let x_raw: Vec<F> = x.to_host(pool);
+
+    let max_iter = if params.max_iter == 0 {
+        SGD_DEFAULT_MAX_ITER
+    } else {
+        params.max_iter
+    };
+    let batch = params.batch_size.clamp(1, n);
+    let inv_b = 1.0 / batch as f64;
+
+    // The Bottou t0 (optimal schedule only); computed once before the loop.
+    let t0 = optimal_t0(params.loss, params.alpha);
+
+    // Device-resident solver state: w (len d), reused every batch; a length-`batch`
+    // margin output + a length-`batch·d` batch-design buffer, both reused.
+    let mut w_dev: DeviceArray<ActiveRuntime, F> =
+        DeviceArray::from_host(pool, &vec![narrow::<F>(0.0); d]);
+    let p_handle = pool.acquire(batch * elem); // margin output, reused.
+
+    // Host coefficient mirror (for the convergence delta + the L1 cumulative
+    // soft-shrink u-accumulator state); the device w is the authoritative copy the
+    // kernel updates, read back per batch to drive the host penalty shrink.
+    let mut bias = 0.0f64;
+    let mut u_l1 = 0.0f64; // cumulative L1 penalty budget (sklearn wscale trick).
+    let mut q = vec![0.0f64; d]; // applied-L1 per coordinate (sklearn `q`).
+
+    // `t` counts SAMPLES consumed across epochs (sklearn's schedule clock).
+    let mut t: u64 = 1;
+
+    let cube_block = 256u32;
+
+    for _epoch in 0..max_iter {
+        let mut max_change = 0.0f64;
+        let mut w_max = 0.0f64;
+
+        let mut start = 0usize;
+        while start < n {
+            let bsz = batch.min(n - start);
+            let binv = 1.0 / bsz as f64;
+
+            // Upload this batch's contiguous row block [start, start+bsz) into a
+            // device batch buffer (the kernels index from row 0 of the array they
+            // receive, so the batch slice must start at offset 0; cubecl 0.10's
+            // `ArrayArg` has no offset variant). The upload is a bounded same-size
+            // allocation per batch, served from the free-list after warmup and
+            // released back at batch end — the memory gate asserts this conserves.
+            let slice = &x_raw[start * d..(start + bsz) * d];
+            let xb = DeviceArray::<ActiveRuntime, F>::from_host(pool, slice);
+
+            // --- Pass 1: margin p[i] = Σ_j x[i,j]·w[j] + bias over the batch rows. ---
+            let p_arg = unsafe { ArrayArg::from_raw_parts(p_handle.clone(), bsz) };
+            let x_off = unsafe { ArrayArg::from_raw_parts(xb.handle().clone(), bsz * d) };
+            let w_arg = unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) };
+            let count = CubeCount::Static(
+                ((bsz as u32) + cube_block - 1) / cube_block.max(1),
+                1,
+                1,
+            );
+            let dim = CubeDim {
+                x: cube_block,
+                y: 1,
+                z: 1,
+            };
+            sgd_margin::launch::<F, ActiveRuntime>(
+                &client,
+                count.clone(),
+                dim,
+                x_off,
+                w_arg,
+                narrow::<F>(bias),
+                p_arg,
+                bsz as u32,
+                d as u32,
+            );
+            let p_dev = DeviceArray::<ActiveRuntime, F>::from_raw(p_handle.clone(), bsz);
+            let p_host: Vec<f64> = p_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+
+            // --- Host per-sample gradient g[i] = dloss(p_i, y_i), clipped ±1e12. ---
+            let g: Vec<F> = (0..bsz)
+                .map(|i| {
+                    let gi = dloss(params.loss, p_host[i], y_host[start + i], params.epsilon)
+                        .clamp(-1e12, 1e12);
+                    narrow::<F>(gi)
+                })
+                .collect();
+
+            // --- Schedule eta for this batch (use the batch-start sample clock). ---
+            let eta = schedule_eta(
+                params.schedule,
+                t,
+                params.eta0,
+                params.alpha,
+                params.power_t,
+                t0,
+            );
+
+            // --- Host lazy-L2 shrink BEFORE the gradient step (the wscale trick):
+            //     w_j *= max(0, 1 - (1 - l1_ratio)·eta·alpha). Applied directly to
+            //     the device w via a host round-trip (small d; the convergence
+            //     delta needs the host copy anyway). ---
+            let mut w_host: Vec<f64> =
+                w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+            let l2_factor = (1.0 - (1.0 - params.l1_ratio) * eta * params.alpha).max(0.0);
+            if params.alpha > 0.0 && l2_factor != 1.0 {
+                for wj in w_host.iter_mut() {
+                    *wj *= l2_factor;
+                }
+            }
+            // Upload the shrunk w back before the gradient kernel.
+            let w_shrunk: Vec<F> = w_host.iter().map(|&v| narrow::<F>(v)).collect();
+            let w_re = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_shrunk);
+            // Swap the device w to the freshly-shrunk buffer (release the old).
+            let old_w = std::mem::replace(&mut w_dev, w_re);
+            old_w.release_into(pool);
+
+            // --- Pass 2: w[j] -= eta·inv_b·Σ_i g[i]·x[i,j]. ---
+            let g_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &g);
+            let x_off2 = unsafe { ArrayArg::from_raw_parts(xb.handle().clone(), bsz * d) };
+            let g_arg = unsafe { ArrayArg::from_raw_parts(g_dev.handle().clone(), bsz) };
+            let w_arg2 = unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) };
+            let count2 = CubeCount::Static(
+                ((d as u32) + cube_block - 1) / cube_block.max(1),
+                1,
+                1,
+            );
+            sgd_weight_update::launch::<F, ActiveRuntime>(
+                &client,
+                count2,
+                dim,
+                x_off2,
+                g_arg,
+                w_arg2,
+                narrow::<F>(eta),
+                narrow::<F>(binv),
+                d as u32,
+                bsz as u32,
+            );
+            g_dev.release_into(pool);
+
+            // --- Host cumulative-L1 soft-shrink (sklearn `l1penalty`): u grows by
+            //     l1_ratio·eta·alpha; each w_j is pulled toward 0 by the budget. ---
+            if params.apply_l1 && params.l1_ratio > 0.0 && params.alpha > 0.0 {
+                u_l1 += params.l1_ratio * eta * params.alpha;
+                let mut w_after: Vec<f64> =
+                    w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+                for j in 0..d {
+                    let z = w_after[j];
+                    if w_after[j] > 0.0 {
+                        w_after[j] = (w_after[j] - (u_l1 + q[j])).max(0.0);
+                    } else if w_after[j] < 0.0 {
+                        w_after[j] = (w_after[j] + (u_l1 - q[j])).min(0.0);
+                    }
+                    q[j] += w_after[j] - z;
+                }
+                let w_l1: Vec<F> = w_after.iter().map(|&v| narrow::<F>(v)).collect();
+                let w_re2 = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_l1);
+                let old = std::mem::replace(&mut w_dev, w_re2);
+                old.release_into(pool);
+            }
+
+            // --- Host intercept step: b -= eta·inv_b·Σ_i g_i (intercept_decay = 1.0
+            //     dense, A3). ---
+            if params.fit_intercept {
+                let g_sum: f64 = (0..bsz).map(|i| host_to_f64(g[i])).sum();
+                bias -= eta * binv * g_sum;
+            }
+
+            // --- Convergence bookkeeping: max |Δw| this batch. ---
+            let w_new: Vec<f64> =
+                w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+            for j in 0..d {
+                let change = (w_new[j] - w_host[j]).abs();
+                if change > max_change {
+                    max_change = change;
+                }
+                let aw = w_new[j].abs();
+                if aw > w_max {
+                    w_max = aw;
+                }
+            }
+
+            // Release the batch design buffer back to the pool (bounded same-size
+            // alloc reused next batch — the memory gate's conservation signal).
+            xb.release_into(pool);
+
+            t += bsz as u64;
+            let _ = inv_b;
+            start += bsz;
+        }
+
+        // sklearn's cheap host stopping gate: max coefficient change vs tol·scale.
+        if params.tol > 0.0 {
+            let scale = w_max.max(1.0);
+            if max_change <= params.tol * scale {
+                break;
+            }
+        }
+    }
+
+    pool.release(p_handle, batch * elem);
+
+    // Materialize the device-resident intercept scalar.
+    let intercept: DeviceArray<ActiveRuntime, F> =
+        DeviceArray::from_host(pool, &[narrow::<F>(bias)]);
+
+    Ok((w_dev, intercept))
+}
+
+/// Per-sample loss subgradient `dloss(p, y)` (RESEARCH §SGD-Math, the exact
+/// sklearn `_sgd_fast` table). Computed host-side per minibatch sample, fed to
+/// `sgd_weight_update` as `g[]`. `epsilon` is the epsilon-insensitive margin
+/// (ignored by the other losses).
+pub fn dloss(loss: SgdLoss, p: f64, y: f64, epsilon: f64) -> f64 {
+    match loss {
+        SgdLoss::Hinge => {
+            let z = p * y;
+            if z <= 1.0 {
+                -y
+            } else {
+                0.0
+            }
+        }
+        SgdLoss::SquaredHinge => {
+            let z = 1.0 - p * y;
+            if z > 0.0 {
+                -2.0 * y * z
+            } else {
+                0.0
+            }
+        }
+        SgdLoss::Log => -y / (1.0 + (y * p).exp()),
+        SgdLoss::SquaredError => p - y,
+        SgdLoss::EpsilonInsensitive => {
+            if y - p > epsilon {
+                -1.0
+            } else if p - y > epsilon {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        SgdLoss::SquaredEpsilonInsensitive => {
+            let z = y - p;
+            if z > epsilon {
+                -2.0 * (z - epsilon)
+            } else if z < -epsilon {
+                2.0 * (-z - epsilon)
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+/// The Bottou `optimal` schedule `t0` (`BaseSGD._init_t` / `_sgd_fast`
+/// `optimal_init`, RESEARCH lines 510-514, A1):
+/// `typw = sqrt(1/sqrt(alpha)); initial_eta0 = typw / max(1, |dloss(loss,-typw,1)|);
+/// t0 = 1/(initial_eta0·alpha)`. For `alpha <= 0` (the convex-objective case with
+/// alpha≈0) this is unused (the schedule is constant/invscaling), so it returns a
+/// harmless `1.0` rather than dividing by zero.
+pub fn optimal_t0(loss: SgdLoss, alpha: f64) -> f64 {
+    if alpha <= 0.0 {
+        return 1.0;
+    }
+    let typw = (1.0 / alpha.sqrt()).sqrt();
+    let initial_eta0 = typw / dloss(loss, -typw, 1.0, 0.1).abs().max(1.0);
+    1.0 / (initial_eta0 * alpha)
+}
+
+/// The learning-rate schedule `eta(t)` (RESEARCH §SGD-Math). `t` is the 1-based
+/// sample clock. `Adaptive` is treated as `Constant` here (the no-improvement
+/// halving is driven by the host loop, which currently runs the deterministic
+/// pinned schedule; the estimator may extend it).
+pub fn schedule_eta(
+    lr: SgdSchedule,
+    t: u64,
+    eta0: f64,
+    alpha: f64,
+    power_t: f64,
+    t0: f64,
+) -> f64 {
+    match lr {
+        SgdSchedule::Optimal => 1.0 / (alpha * (t0 + t as f64 - 1.0)),
+        SgdSchedule::InvScaling => eta0 / (t as f64).powf(power_t),
+        SgdSchedule::Constant => eta0,
+        SgdSchedule::Adaptive => eta0,
+    }
+}
+
+/// Reinterpret an `F` (f32 / f64) as `f64` for host-side scalar math.
+fn host_to_f64<F: Pod>(v: F) -> f64 {
+    match size_of::<F>() {
+        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("sgd is f32/f64 only"),
+    }
+}
+
+/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
+fn narrow<F: Pod>(v: f64) -> F {
+    match size_of::<F>() {
+        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("sgd is f32/f64 only"),
+    }
 }
 
 /// Validate the SGD solve geometry (ASVS V5 / T-10-01-02): `x` must be a

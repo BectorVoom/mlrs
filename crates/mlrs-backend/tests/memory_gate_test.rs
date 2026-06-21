@@ -46,6 +46,7 @@ use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::lbfgs::lbfgs_minimize;
 use mlrs_backend::prims::reduce::{column_reduce, row_reduce, ReducePath, ScalarOp};
+use mlrs_backend::prims::sgd;
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::{self, ActiveRuntime};
 
@@ -1842,12 +1843,126 @@ fn memory_gate_dbscan_n2_bounded() {
 /// The f64 path carries the `skip_f64_with_log` gate (cpu runs f64; rocm
 /// skips-with-log, D-07).
 #[test]
-#[ignore = "Wave-1 (plan 10-02) fills sgd_solve + asserts the bounded-allocation gate"]
 fn memory_gate_sgd_bounded() {
-    // skip_f64_with_log: the f64 solver runs on cpu and skips-with-log on rocm.
-    let _ = capability::skip_f64_with_log();
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+
+    const N: usize = 5;
+    let (n, d) = (12usize, 4usize);
+
     let client = runtime::active_client();
-    let _pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
-    // Wave-1 drives sgd_solve N× at a fixed (n, d) shape and asserts
-    // alloc-after-warmup delta == 0 + live/peak conserved + bounded read_backs.
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Device-resident inputs uploaded ONCE (so per-call deltas measure ONLY the
+    // solver's internal per-epoch/per-batch scratch, not input churn). A small
+    // squared-error system; the gate asserts on POOL COUNTERS, not numerics.
+    let x_raw = fill_conditioned(n, d);
+    let y_raw: Vec<f32> = (0..n).map(|i| 0.2 * (i as f32) - 0.5).collect();
+    let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_raw);
+    let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y_raw);
+
+    let params = sgd::SgdParams {
+        loss: sgd::SgdLoss::SquaredError,
+        schedule: sgd::SgdSchedule::Constant,
+        alpha: 1e-4,
+        l1_ratio: 0.0,
+        apply_l1: false,
+        fit_intercept: true,
+        eta0: 0.02,
+        power_t: 0.5,
+        epsilon: 0.1,
+        batch_size: 4, // genuine minibatching (3 batches/epoch).
+        max_iter: 20,
+        tol: 0.0, // run all epochs (deterministic, exercises the per-batch scratch).
+    };
+
+    let mut allocs_after: Vec<u64> = Vec::with_capacity(N);
+    let mut live_after: Vec<u64> = Vec::with_capacity(N);
+    let mut peak_after: Vec<u64> = Vec::with_capacity(N);
+    let mut readbacks_after: Vec<u64> = Vec::with_capacity(N);
+
+    for _call in 0..N {
+        let (coef, intercept) = sgd::sgd_solve::<f32>(&mut pool, &xd, &yd, (n, d), &params)
+            .expect("sgd_solve accepts the validated shape");
+        // Release the returned fitted state so the steady-state footprint conserves
+        // (the caller owns it each call) — the iterative-solver release idiom.
+        coef.release_into(&mut pool);
+        intercept.release_into(&mut pool);
+
+        let st = pool.stats();
+        allocs_after.push(st.allocations);
+        live_after.push(st.live_bytes);
+        peak_after.push(st.peak_bytes);
+        readbacks_after.push(st.read_backs);
+    }
+
+    // Call 0 is warmup (first sight of each per-batch scratch byte-size is a fresh
+    // alloc); steady state holds from call 1 onward.
+    let live_baseline = live_after[1];
+    let peak_baseline = peak_after[1];
+
+    for call in 2..N {
+        // HARD GATE (SGD bounded allocation): the per-call FRESH-allocation delta is
+        // 0 after warmup — the per-epoch/per-batch device buffers (w, the margin
+        // output `p`, the batch design slice, the gradient upload) are reused from
+        // the free-list, NOT re-allocated per call/epoch. A per-epoch allocation
+        // regression makes this climb (the [05-11] iterative-solver exception form).
+        let alloc_delta = allocs_after[call] - allocs_after[call - 1];
+        assert_eq!(
+            alloc_delta,
+            0,
+            "D-10 (SGD bounded allocation) FAILED on {backend}: call {call} allocated \
+             {alloc_delta} fresh buffer(s) (allocations {} -> {}) — sgd_solve's \
+             per-epoch/per-batch scratch is GROWING with the call/epoch count instead \
+             of being reused. stats={:?}",
+            allocs_after[call - 1],
+            allocs_after[call],
+            pool.stats()
+        );
+
+        // HARD GATE (live_bytes conserved): scratch released, not stacked.
+        assert_eq!(
+            live_after[call],
+            live_baseline,
+            "D-10 (SGD live_bytes conserved) FAILED on {backend}: call {call} \
+             live_bytes={} != baseline={live_baseline} — sgd scratch is NOT being \
+             released (it stacks each call). stats={:?}",
+            live_after[call],
+            pool.stats()
+        );
+
+        // HARD GATE (peak_bytes bounded): peak plateaus after warmup.
+        assert_eq!(
+            peak_after[call],
+            peak_baseline,
+            "D-10 (SGD peak_bytes bounded) FAILED on {backend}: call {call} \
+             peak_bytes={} != baseline={peak_baseline} — peak grows with the call \
+             count (scratch stacks). stats={:?}",
+            peak_after[call],
+            pool.stats()
+        );
+
+        // HARD GATE (read_backs bounded): sgd_solve uses PLAIN to_host for the host
+        // dloss/penalty/convergence reads (NOT the metered path), so the metered
+        // counter does NOT grow per call — the bounded-readback signal. A metered
+        // per-epoch array readback would make this climb.
+        let rb_delta = readbacks_after[call] - readbacks_after[call - 1];
+        assert_eq!(
+            rb_delta,
+            0,
+            "D-10 (SGD metered readback bounded) FAILED on {backend}: call {call} \
+             read_backs delta={rb_delta} — sgd_solve performed a METERED per-call \
+             readback (expected 0; the host dloss/penalty reads use unmetered \
+             to_host). stats={:?}",
+            pool.stats()
+        );
+    }
+
+    println!(
+        "D-10 SGD backend={backend}: N={N} n={n} d={d} alloc_flat_after_warmup \
+         live_baseline={live_baseline} peak_baseline={peak_baseline} \
+         metered_read_backs={} stats={:?}",
+        pool.stats().read_backs,
+        pool.stats()
+    );
 }
