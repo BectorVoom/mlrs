@@ -53,7 +53,7 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 - [x] **NB-02**: A data scientist can fit `MultinomialNB` (multinomial likelihood, `alpha` smoothing) with `predict`/`predict_proba` matching scikit-learn within tolerance; sparse input accepted via ingress densify
 - [x] **NB-03**: A data scientist can fit `BernoulliNB` (binary likelihood with the `(1−x)·log(1−p)` non-occurrence term, `binarize`) matching scikit-learn within tolerance
 - [x] **NB-04**: A data scientist can fit `ComplementNB` (complement-class weights, argmin decision) matching scikit-learn within tolerance
-- [ ] **NB-05**: A data scientist can fit `CategoricalNB` (per-feature categorical likelihood, `alpha`) on categorical-encoded integer features, matching scikit-learn within tolerance
+- [x] **NB-05**: A data scientist can fit `CategoricalNB` (per-feature categorical likelihood, `alpha`) on categorical-encoded integer features, matching scikit-learn within tolerance
 
 ### Python Surface
 
@@ -97,7 +97,7 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | NB-02 | Phase 11 | Complete |
 | NB-03 | Phase 11 | Complete |
 | NB-04 | Phase 11 | Complete |
-| NB-05 | Phase 11 | Pending |
+| NB-05 | Phase 11 | Complete |
 | PY-06 | Phase 11 (cross-cutting; estimators wrapped incrementally per phase) | Pending |
 
 **Coverage:** 24/24 v2 requirements mapped, each to exactly one phase. No orphans, no duplicates.
