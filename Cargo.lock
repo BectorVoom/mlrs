@@ -2566,6 +2566,8 @@ dependencies = [
  "anyhow",
  "arrow",
  "bytemuck",
+ "cubecl",
+ "env_logger",
  "mimalloc",
  "mlrs-algos",
  "mlrs-backend",
