@@ -331,6 +331,22 @@ where
                 ),
             });
         }
+        // WR-02: `predict_labels` emits class ids as `i32`; a class id that fits
+        // an `f64` mantissa but exceeds `i32` range would be SILENTLY TRUNCATED
+        // (`as i32` wraps) into a wrong predicted label. Validate the distinct
+        // class ids against `i32` range at fit so an out-of-range label is a
+        // typed error, not a silent wrong prediction.
+        for &cls in classes_.iter() {
+            if i32::try_from(cls).is_err() {
+                return Err(AlgoError::InvalidLabels {
+                    estimator: "linear_svc",
+                    reason: format!(
+                        "class label {cls} does not fit in i32 \
+                         (predicted labels are i32)"
+                    ),
+                });
+            }
+        }
         // classes_[0] → −1, classes_[1] → +1 (sklearn maps the higher class to +1).
         let yp: Vec<f64> = raw_labels
             .iter()
