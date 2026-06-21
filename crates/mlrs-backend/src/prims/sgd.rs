@@ -301,8 +301,20 @@ where
             //     sklearn `_plain_sgd` / RESEARCH §Per-sample update sequence
             //     (the penalty shrink follows the gradient step, before the L1
             //     cumulative soft-shrink). Applied to the RESULTING w via a host
-            //     round-trip (small d). ---
-            let l2_factor = (1.0 - (1.0 - params.l1_ratio) * eta * params.alpha).max(0.0);
+            //     round-trip (small d).
+            //
+            //     CR-01: sklearn decays the weight scale ONCE PER SAMPLE inside
+            //     its per-sample loop, so over a batch of `bsz` samples it shrinks
+            //     by `(1 - eta·α·(1−l1_ratio))^bsz`. This averaged-batch model
+            //     applies the step once per batch, so the L2 factor is raised to
+            //     the `bsz` power to match the per-sample compound shrink (the
+            //     `bsz == 1` case is unchanged). NOTE: the margin is NOT re-read
+            //     between samples within a batch (see the WR-03 batch_size>1
+            //     divergence note above) — this matches the per-sample L2 decay
+            //     only, not sklearn's full per-sample re-margining. ---
+            let l2_factor = (1.0 - (1.0 - params.l1_ratio) * eta * params.alpha)
+                .max(0.0)
+                .powi(bsz as i32);
             if params.alpha > 0.0 && l2_factor != 1.0 {
                 let mut w_host: Vec<f64> =
                     w_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
