@@ -29,10 +29,10 @@ files_reviewed_list:
   - crates/mlrs-py/tests/test_sgd.py
   - scripts/gen_oracle.py
 findings:
-  critical: 1
+  critical: 2
   warning: 7
   info: 5
-  total: 13
+  total: 14
 status: issues_found
 ---
 
@@ -45,295 +45,238 @@ status: issues_found
 
 ## Summary
 
-Phase 10 adds four SGD/linear-SVM estimators (`MBSGDClassifier`, `MBSGDRegressor`,
-`LinearSVC`, `LinearSVR`), the shared `sgd_config` lowering surface, the PRIM-10
-`sgd_solve` host orchestrator + two SharedMemory-free kernels, the PyO3 wrappers,
-and the oracle fixtures. The kernels are correctly SharedMemory/infinity-free
-(cpu-MLIR safe) and the per-sample `dloss` table matches the sklearn `_sgd_fast`
-subgradient table (verified against the unit test). Build-time hyperparameter
-validation is thorough.
+Phase 10 adds four SGD / linear-SVM estimators (`MBSGDClassifier`, `MBSGDRegressor`,
+`LinearSVC`, `LinearSVR`), a PRIM-10 `sgd_solve` host orchestration over two
+SharedMemory-free kernels, and the PyO3 wrapper layer. The structure is clean and the
+oracle harness is thorough, but adversarial tracing surfaced two correctness defects
+that are masked because every committed fixture pins `batch_size=1`: the minibatch L2
+penalty and gradient averaging diverge from sklearn for `batch_size > 1`, which is a
+publicly settable knob. Several robustness / API-contract defects (ignored `tol`,
+unvalidated `power_t`, integer-label-overflow via `as i32` / `as i64` casts, and a known
+mutex-poison accounting / lock-path mismatch carried by the new linear wrappers) round
+out the findings.
 
-The central correctness concern is that the **headline schedule for
-`SGDClassifier` — `learning_rate="optimal"` (the sklearn default) — is never
-validated against a sklearn oracle**, even though the committed
-`mbsgd_classifier_optimal_*.npz` fixtures exist. Every active classifier oracle
-test pins the *constant* schedule instead, so the Bottou `t0` math and the
-optimal-schedule clock are completely unexercised against ground truth. Combined
-with the documented loose bands (5e-3 f64 coef, well above the project's 1e-5
-contract) and a confirmed loss-vs-penalty *ordering* discrepancy vs sklearn in
-`sgd_solve`, the numerical-fidelity claims for the SGD path are weaker than the
-artifacts imply. Secondary issues: an unreleased device buffer on the L-BFGS
-device-failure path, a self-contradictory tie-break comment, and dead code.
+The dominant theme: **the test suite only exercises `batch_size=1` and never asserts the
+documented sklearn semantics for the minibatch knob the API exposes.** "Tests pass" here
+does not establish that the minibatch path is correct.
+
+## Narrative Findings (AI reviewer)
 
 ## Critical Issues
 
-### CR-01: `optimal` learning-rate schedule (the sklearn `SGDClassifier` default) has no oracle validation; the committed fixture is generated but never loaded
+### CR-01: L2 `wscale` penalty applied once per BATCH, not per SAMPLE — wrong for `batch_size > 1`
 
-**File:** `crates/mlrs-algos/tests/mbsgd_classifier_test.rs:108-159`, `scripts/gen_oracle.py:1832-1865`, `crates/mlrs-backend/src/prims/sgd.rs:431-457`
+**File:** `crates/mlrs-backend/src/prims/sgd.rs:299-317`
+**Issue:** sklearn's `_plain_sgd` decays the weight scale **once per training sample**
+(`wscale *= (1 - eta * alpha * (1 - l1_ratio))` inside the per-sample loop). This prim
+applies the L2 shrink factor exactly **once per minibatch**, after a single averaged
+gradient step:
 
-**Issue:** `gen_oracle.py` deliberately emits BOTH a constant-schedule and an
-`_optimal`-schedule classifier fixture (lines 1836-1864), and both
-`mbsgd_classifier_optimal_f32_seed42.npz` / `..._f64_...npz` are committed in
-`tests/fixtures/`. The generator docstring states the intent explicitly: "a
-constant-schedule match with an optimal-schedule mismatch localizes the bug to
-`t0`." But **no Rust test ever loads the `_optimal` fixture** — `fit_hinge`
-hard-codes `LearningRate::Constant` (line 132), and every `oracle*`/`exact_labels*`
-test routes through it. The `optimal` schedule arithmetic
-(`schedule_eta`/`optimal_t0`, `sgd.rs:431-457`) is exercised only by a host-only
-unit test (`sgd_test.rs::schedule_constant_then_invscaling_then_optimal`) that
-recomputes the SAME formula it is testing (a tautology, not a sklearn oracle).
-
-Because `optimal` is the **default** schedule for `SGDClassifier` (confirmed by
-`MBSGDClassifierBuilder::default` at `mbsgd_classifier.rs:123` and the D-03 litmus
-at `mbsgd_classifier_test.rs:328`), a real `SGDClassifier()` with no overrides
-runs an entirely unvalidated solver path. The `t0` clock subtleties (sklearn
-increments the sample counter `t` and uses `1/(alpha*(t0 + t - 1))`; the
-`optimal_t0` here hard-codes `epsilon=0.1` into the `dloss` probe at line 436 and
-returns `1.0` for `alpha<=0`) could diverge from sklearn and the suite would stay
-green. This is the precise "tests pass ≠ correct" failure the adversarial review
-must surface: the artifact *looks* covered (fixture present, generator documents
-the t0-isolation rationale) but the assertion that would catch a `t0` bug does not
-exist.
-
-**Fix:** Add an `oracle_optimal` test (both dtypes, `skip_f64_with_log` gated)
-that loads `mbsgd_classifier_optimal_{f32,f64}_seed42.npz` and fits with
-`.learning_rate(LearningRate::Optimal)` (no `eta0`), asserting `coef_`/`intercept_`
-within the documented band AND `predict_labels` exactly. Mirror the existing
-`fit_hinge` but parameterize the schedule:
 ```rust
-fn fit_hinge_sched<F>(case: &OracleCase, lr: LearningRate) -> (Vec<f64>, f64, Vec<i32>) {
-    // ... same as fit_hinge but .learning_rate(lr) and omit .eta0 for Optimal ...
-}
-
-#[test]
-fn oracle_optimal() {
-    if capability::skip_f64_with_log() { return; }
-    let case = load_npz(fixture("mbsgd_classifier_optimal_f64_seed42.npz")).unwrap();
-    let (coef, intercept, labels) = fit_hinge_sched::<f64>(&case, LearningRate::Optimal);
-    assert_band(&coef, case.expect_f64("coef"), COEF_BAND_F64, "optimal coef_");
-    assert_eq!(labels, /* predict_ref */, "optimal exact labels");
+let l2_factor = (1.0 - (1.0 - params.l1_ratio) * eta * params.alpha).max(0.0);
+if params.alpha > 0.0 && l2_factor != 1.0 {
+    // ...applied once over the whole batch...
 }
 ```
-If the optimal path cannot meet the band, that is itself the bug the fixture was
-designed to localize — it must be fixed before the SGD path can claim sklearn
-fidelity.
+
+For `batch_size = b`, sklearn shrinks by `(1 - eta·α·(1−l1_ratio))^b` over the batch (and
+re-reads the margin between samples); this code shrinks by `(1 - eta·α·(1−l1_ratio))^1`.
+The two agree **only** when `b == 1`. Every committed fixture pins `batch_size=1`
+(`gen_oracle.py` SGD section; all oracle tests call `.batch_size(1)`), so the divergence is
+invisible to CI. `batch_size` is a public builder/PyO3 knob, so a user calling
+`MBSGDClassifier(batch_size=8)` silently gets a non-sklearn result with no error.
+
+**Fix:** Either (a) loop the gradient + penalty update per sample within the batch (true
+sklearn `_plain_sgd` semantics), or (b) raise `l2_factor` to the `bsz` power and document
+that the margin is not re-read mid-batch:
+
+```rust
+// (b) minimal correctness patch for the averaged-batch model:
+let l2_factor =
+    (1.0 - (1.0 - params.l1_ratio) * eta * params.alpha).max(0.0).powi(bsz as i32);
+```
+
+Add an oracle fixture with `batch_size > 1` so the path is actually gated.
+
+### CR-02: cumulative-L1 soft-shrink `u` / `q` budget advanced once per BATCH, not per SAMPLE
+
+**File:** `crates/mlrs-backend/src/prims/sgd.rs:319-338`
+**Issue:** sklearn accumulates the L1 penalty budget `u += eta * alpha * l1_ratio` **per
+sample** and applies `l1penalty` per sample. This prim advances `u_l1` and runs the
+soft-shrink **once per batch**:
+
+```rust
+if params.apply_l1 && params.l1_ratio > 0.0 && params.alpha > 0.0 {
+    u_l1 += params.l1_ratio * eta * params.alpha;   // once per batch
+    // ...single soft-shrink over all coords...
+}
+```
+
+For `batch_size > 1` the cumulative budget `u` grows too slowly relative to the number of
+samples consumed (`t` is incremented by `bsz`, but `u` only once), so the L1 path produces
+a different sparsity pattern than sklearn. As with CR-01 this is masked by the
+`batch_size=1` fixtures and by the fact that no L1/ElasticNet oracle fixture exists at all
+(the committed SGD fixtures are all `penalty="l2"`). The L1 lowering
+(`mbsgd_classifier.rs:519-532` `apply_l1`) is therefore completely **untested** end to end.
+
+**Fix:** Advance `u_l1` and apply `l1penalty` per sample inside the batch loop (matching
+`_plain_sgd`), and add an L1/ElasticNet oracle fixture to gate the path. Until then the
+penalty/`apply_l1` lowering should be considered unverified.
 
 ## Warnings
 
-### WR-01: `sgd_solve` applies the L2 penalty shrink BEFORE the gradient step; sklearn applies it after — exact-iterate reproduction is impossible
+### WR-01: `LinearSVC` / `LinearSVR` builder `tol` is silently ignored by the solver
 
-**File:** `crates/mlrs-backend/src/prims/sgd.rs:267-307`
+**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:612`
+**Issue:** `svm_lbfgs_fit` hard-codes the L-BFGS gradient tolerance to `1e-9` and never
+threads the user's `tol` (stored in `SgdConfig.tol`, settable via `.tol()` and the PyO3
+`tol=` kwarg) into `lbfgs_minimize`:
 
-**Issue:** The host loop computes the margin `p` with the current `w` (line 234),
-then applies the lazy-L2 `wscale` shrink to `w` (lines 271-284, "BEFORE the
-gradient step"), then runs `sgd_weight_update` (line 296). In sklearn's
-`_plain_sgd`, the per-sample order is: compute `p` → add the loss-gradient step to
-`w` → THEN decay `wscale *= (1 - eta*lambda)`. Shrinking before vs after the
-gradient step changes which iterate the penalty scales, so the device solver can
-never reproduce sklearn's exact `coef_`. This is why the tests fall back to a
-`5e-3` f64 band (`mbsgd_classifier_test.rs:59`) — an order of magnitude looser
-than the project's stated 1e-5 contract. The ordering should match sklearn so the
-band can tighten and the math is provably correct, not merely "close."
+```rust
+let result = lbfgs_minimize(x0, closure, 1e-9, LBFGS_FTOL, LBFGS_MAXLS, max_iter)?;
+```
 
-**Fix:** Move the L2 `wscale` shrink to AFTER `sgd_weight_update` (and before the
-cumulative-L1 shrink, matching sklearn's `_plain_sgd` sample loop), then re-pin the
-fixtures and tighten the bands. At minimum, document in `sgd.rs` that the iterate
-deliberately differs from sklearn's and the band is a consequence, so the
-divergence is not mistaken for round-off.
+`config.tol` is plumbed all the way from Python (`PyLinearSVC::new(tol=...)`) into the
+`SgdConfig`, then dropped. A caller tightening or loosening `tol` gets identical behavior,
+silently violating the sklearn-compatible API contract this phase advertises.
+**Fix:** pass the configured tolerance through, e.g.
+`lbfgs_minimize(x0, closure, self.config.tol.max(1e-12), ...)`, or document that
+`LinearSVC`/`LinearSVR` deliberately fix `gtol` and remove the `tol` setter to avoid a
+dead knob.
 
-### WR-02: convergence delta is measured against the post-L2-shrink `w`, omitting the shrink from `max|Δw|`
+### WR-02: integer label overflow via `as i64` / `as i32` truncation casts
 
-**File:** `crates/mlrs-backend/src/prims/sgd.rs:271-284, 339-345`
+**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:322, 445-449`; `crates/mlrs-algos/src/linear/mbsgd_classifier.rs:331, 392-396`
+**Issue:** Labels are rounded into `i64` via `li as i64` from an `f64`
+(`linear_svc.rs:322`, `mbsgd_classifier.rs:331`) and then emitted as `i32` in
+`predict_labels` via `self.classes_[k] as i32`. A label that fits in the `f64` mantissa
+but exceeds `i32::MAX` (e.g. a class id like `3_000_000_000`) is **silently truncated**
+(`as i32` wraps), producing a wrong predicted label rather than an error. The integrality
+check (`(li - lf).abs() > 1e-6`) accepts such values. `predict_labels` returns
+`DeviceArray<_, i32>`, so the API itself caps labels at i32 — but nothing validates the
+incoming labels against that range.
+**Fix:** validate that each distinct class label fits in `i32` at fit (return a typed
+`AlgoError`), or widen the predicted-label dtype. At minimum, replace the silent `as i32`
+with a checked conversion.
 
-**Issue:** `w_host` is read at line 271 from the pre-shrink `w_dev` and then mutated
-in place by the L2 shrink loop (lines 275-277), so by the time the convergence
-bookkeeping runs (line 342, `change = (w_new[j] - w_host[j]).abs()`), `w_host`
-already holds the *shrunk* weights. The per-batch coefficient change therefore
-excludes the L2 contribution, understating `max_change` and letting the
-`tol`-based early stop (line 364) fire prematurely when `tol > 0`. The committed
-fixtures pin `tol=0` so this is currently masked, but any user-facing
-`SGDClassifier(tol=1e-3)` (the default `tol`) hits this path and may stop early.
+### WR-03: minibatch gradient averaging by `inv_b` diverges from sklearn at `batch_size > 1`
 
-**Fix:** Snapshot the true start-of-batch `w` (before the L2 shrink) into a
-separate vector and diff `w_new` against that snapshot, so `max_change` reflects
-the full per-batch update including regularization.
+**File:** `crates/mlrs-backend/src/prims/sgd.rs:275-296, 340-345`
+**Issue:** The weight and intercept steps scale the summed gradient by `binv = 1/bsz`
+(`sgd_weight_update` multiplies by `inv_b`; intercept `bias -= eta·binv·g_sum`). sklearn's
+`SGDClassifier`/`SGDRegressor` are **per-sample** (effective `inv_b = 1`), not averaged
+minibatch. Combined with CR-01/CR-02 this means the entire `batch_size > 1` regime is a
+different algorithm from sklearn, yet `batch_size` is presented as a sklearn-compatible
+knob. The kernel comment even calls the averaging "the host's choice" (`A2`), which
+acknowledges the divergence without surfacing it to the user.
+**Fix:** document explicitly that `batch_size > 1` is NOT sklearn-equivalent, or implement
+true per-sample SGD; add a gating fixture either way.
 
-### WR-03: L-BFGS device-failure path leaks `x_aug_dev` (and partially-acquired buffers) without releasing back to the pool
+### WR-04: `power_t` is never validated
 
-**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:520-544, 563-580, 612-616`
+**File:** `crates/mlrs-algos/src/linear/mbsgd_classifier.rs:217-251`; `crates/mlrs-algos/src/linear/mbsgd_regressor.rs:212-254`
+**Issue:** Every other schedule scalar is validated at `build()` (`alpha >= 0`,
+`eta0 > 0`, `l1_ratio ∈ [0,1]`, `epsilon >= 0`), but `power_t` is accepted unchecked and
+flows into `schedule_eta`'s `eta0 / t.powf(power_t)` (`sgd.rs:466`). A negative `power_t`
+makes the step rate GROW with `t` (divergence); `power_t = 0` silently degenerates
+invscaling to constant. This is the same untrusted-hyperparameter class the phase's threat
+model (T-10-03-01) covers for the sibling scalars.
+**Fix:** add a `BuildError` guard (or at least reject non-finite `power_t` and document the
+divergence behavior for negatives).
 
-**Issue:** Inside `svm_lbfgs_fit`, when a per-iteration GEMM fails, the closure
-captures the `PrimError`, releases `w_dev`/`g_dev`, and returns a sentinel
-(`f64::MAX`). After `lbfgs_minimize` returns, line 613 checks `prim_err` and
-releases `x_aug_dev` before returning the error — good. BUT on the FIRST GEMM
-failure (lines 539-543), only `w_dev` is released; `margins` was never produced so
-that is fine, but the persistent `x_aug_dev` allocated at line 515 is only released
-on the line-613 path. That path IS reached, so `x_aug_dev` is released. However the
-`NotConverged`/`broke`/`hit_cap` paths (lines 625-631) DO release `x_aug_dev`, and
-the success path (line 648) releases it — so the accounting is actually balanced.
-The genuine gap: there is no `BufferPool`-conserving release of the per-eval
-`w_dev` on the SUCCESS path of each closure call — each L-BFGS evaluation
-allocates `w_dev`/`g_dev` from host and releases them at lines 583-584, which is
-correct. The remaining concern is robustness: the closure swallows the device
-error and returns `f64::MAX`, which can cause `lbfgs_minimize`'s line search to
-interpret the failure as a finite-but-huge loss and iterate further before the
-post-hoc `prim_err` check fires — wasting work and potentially masking the true
-failure point. Confirm `lbfgs_minimize` cannot loop forever on a `f64::MAX`
-plateau.
+### WR-05: new linear wrappers mix the poisoning-prone lock path
 
-**Fix:** Verify the L-BFGS line search terminates on a `f64::MAX` return (it should
-hit `LineSearchFailed`); if not, propagate the device error immediately rather than
-via the sentinel. Add a test that injects a GEMM failure (e.g. a deliberately
-malformed augmented shape) and asserts `AlgoError::Prim` is returned, not a hang.
+**File:** `crates/mlrs-py/src/estimators/linear.rs:87, 114, 143` (and the other legacy `global_pool().lock().expect(...)` sites in the file)
+**Issue:** `lib.rs:108-118` documents that `lock_pool()` is the SANCTIONED lock path and
+that "one surviving `global_pool().lock().expect("pool mutex")` re-panics on a poisoned
+mutex and re-bricks the interpreter." The Phase-10 SGD/SVM wrappers correctly use
+`lock_pool()`, but they live in the SAME `linear.rs` file as `LinearRegression`/`Ridge`/
+`Lasso`/`ElasticNet`/`LogisticRegression`, which still use the panicking
+`.lock().expect("pool mutex")` form. Because the pool is process-global, a poison created
+by ANY estimator (including a Phase-10 device fault) will brick the legacy linear
+wrappers, defeating the recovery the new code relies on. This is acknowledged as a
+"tracked migration" in `lib.rs`, but Phase-10 added more code to the very file that mixes
+the two helpers.
+**Fix:** convert the remaining `global_pool().lock().expect(...)` sites in `linear.rs` to
+`lock_pool()`; the change is mechanical and removes the partial-recovery footgun for
+estimators shipped together.
 
-### WR-04: `LinearSVR::predict` does not validate query `n_features` against the fitted feature count
+### WR-06: mutex-poison recovery permanently corrupts the FOUND-05 memory-conservation gate
 
-**File:** `crates/mlrs-algos/src/linear/linear_svr.rs:329-344`, `crates/mlrs-algos/src/linear/mbsgd_regressor.rs:336-351`
+**File:** `crates/mlrs-py/src/lib.rs:120-144` (interaction with `crates/mlrs-backend/tests/memory_gate_test.rs`)
+**Issue:** `lock_pool()`'s own doc (the "ACCOUNTING CAVEAT", `lib.rs:120-136`) states that
+after a recovered poison, `live_bytes`/`peak_bytes` are "monotonically INFLATED for the
+rest of the process" and the conservation property is "VOID." The new SGD path does many
+incremental `from_host`/`release_into` allocations inside `py.detach` while holding the
+guard (`sgd.rs` epoch loop, `svm_lbfgs_fit` per-eval GEMMs), so a device fault mid-`fit`
+is a realistic poison trigger. The memory gate (`memory_gate_test.rs`) asserts
+conservation but cannot detect this post-poison inflation, so a real leak-class regression
+after a recovered fault would pass the gate.
+**Fix:** on poison recovery, reset/reconstruct the pool counters (or replace the pool) so
+conservation accounting stays meaningful, rather than only documenting that it is void.
 
-**Issue:** Both regressors delegate `predict` to `predict_linear`, which checks
-`coef.len() == n_features` (`elastic_net.rs:238`). That happens to equal the fitted
-feature count because `coef_` has length `n_features` from fit. So a query with the
-WRONG `n_features` is caught — but only incidentally, and the error is a generic
-`DimMismatch { dim: "n_features" }` rather than the estimator-named
-`n_features != self.n_features` guard the classifiers use
-(`linear_svc.rs:415-421`, `mbsgd_classifier.rs:472-478`). `LinearSVR`/`MBSGDRegressor`
-do not even store `n_features`. The behavior is correct but the asymmetry means a
-future refactor of `predict_linear` that drops the `coef.len()` check would
-silently remove the regressors' only shape guard.
+### WR-07: misleading error type/message for non-binary or non-integer labels
 
-**Fix:** Either store `n_features` on the regressor structs and add an explicit
-`n_features != self.n_features` guard mirroring the classifiers, or add a comment
-in `predict_linear` flagging that the `coef.len() == n_features` check is the
-load-bearing fitted-shape guard for its callers so it is never removed.
-
-### WR-05: `MBSGDClassifier::predict_proba` returns a sigmoid for NON-log losses without raising, diverging from sklearn
-
-**File:** `crates/mlrs-algos/src/linear/mbsgd_classifier.rs:402-435`
-
-**Issue:** `predict_proba` always computes `σ(margin)` over the decision margin,
-regardless of the configured loss. sklearn's `SGDClassifier.predict_proba` RAISES
-`AttributeError`/`NotImplementedError` for `loss != "log_loss"` (and only
-`"modified_huber"`/`"log_loss"` are supported). Here a hinge-loss classifier
-silently returns an uncalibrated sigmoid (the docstring at lines 406-411
-acknowledges this). A caller who trained with the default `hinge` loss and calls
-`predict_proba` gets plausible-looking but meaningless probabilities instead of an
-error — a correctness/contract gap that masks misuse.
-
-**Fix:** Gate `predict_proba` on `self.config.loss == Loss::Log` and return
-`AlgoError::Unsupported { estimator: "mbsgd_classifier", operation: "predict_proba (non-log loss)" }`
-otherwise, matching sklearn's refusal. If the project intends to keep the permissive
-behavior, document it as a deliberate divergence in the estimator doc and the PyO3
-wrapper.
-
-### WR-06: `f64::MAX` sentinel as a loss value can be NaN-poisoned through the gradient norm in `svm_lbfgs_fit`
-
-**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:521-523, 542, 578`
-
-**Issue:** On the `prim_err.is_some()` early-return (line 521-523) and the
-GEMM-failure returns (lines 542, 578), the closure returns `(f64::MAX, vec![0.0; d_aug])`.
-Returning `f64::MAX` as the objective with a zero gradient can drive the strong-Wolfe
-line search into undefined behavior: a zero gradient at a finite-but-maximal loss
-signals a stationary point, which `lbfgs_minimize` may accept as "converged",
-causing `svm_lbfgs_fit` to skip the `prim_err` check semantics and return a
-nonsense `coef_` if the post-loop `prim_err` branch (line 613) were ever reordered.
-Currently the line-613 check fires first, so this is latent, but the sentinel
-design is fragile.
-
-**Fix:** Use `f64::INFINITY` (the host side is f64, not a device kernel, so the
-cpu-MLIR infinity ban does not apply here) so the line search unambiguously rejects
-the step, or restructure so the device error short-circuits `lbfgs_minimize`
-entirely rather than relying on a magic loss value plus a post-hoc check.
-
-### WR-07: oracle bands (5e-3 / 2e-2 f64) are an order of magnitude looser than the project's stated 1e-5 contract, with no convergence-equivalence justification for SGD coef_
-
-**File:** `crates/mlrs-algos/tests/mbsgd_classifier_test.rs:59-61`, `crates/mlrs-algos/tests/mbsgd_regressor_test.rs:56-58`
-
-**Issue:** CLAUDE.md states the core correctness contract is "abs/rel error ≤ 1e-5
-vs scikit-learn." The SGD oracle tests assert `coef_`/`intercept_` only to
-`BAND_F64 = 5e-3` (classifier) / `5e-3` (regressor) and `predict` to the same. The
-comments attribute this to "order-of-operations differs in the last-bit
-accumulation," but a 5e-3 gap is far beyond last-bit f64 round-off (≈1e-15
-relative) — it reflects a genuinely DIFFERENT iterate (see WR-01 ordering). Unlike
-`LogisticRegression` (where the looser `coef_` band is justified by documented
-gauge freedom and the predict/proba gate is strict), there is no gauge argument for
-SGD coefficients; sklearn and mlrs should converge to the same point under the same
-deterministic schedule. The exact-label gate is the only strict check, and labels
-are robust to large coefficient errors on well-separated blobs (the fixtures use
-`±4σ` cluster centers), so the hard gate is weak evidence of coefficient fidelity.
-
-**Fix:** Resolve WR-01 (ordering) so the iterates match, then tighten the bands
-toward 1e-5; or, if a residual gap remains, document the SGD-specific reason
-(e.g. exact per-sample loss-gradient ordering under `batch_size=1`) the way the
-logistic gauge note does, rather than attributing a 5e-3 gap to "last-bit"
-accumulation.
+**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:314-334`; `crates/mlrs-algos/src/linear/mbsgd_classifier.rs:323-343`
+**Issue:** Invalid-label conditions (non-integer label, not-exactly-2 classes) are reported
+as `PrimError::ShapeMismatch` with `operand: "linear_svc.y (labels must be integers)"`.
+This is a data-validity error shoehorned into a geometry error type, and at the PyO3
+boundary `algo_err_to_py` maps everything to `PyValueError`, so the Python caller sees a
+"shape mismatch"-flavored message for what is actually a label-content problem. `AlgoError`
+has no dedicated label variant, but reusing `ShapeMismatch` with fabricated `rows/cols/len`
+is a category error that will mislead debugging.
+**Fix:** add a typed label-validity `AlgoError` variant (e.g. `InvalidLabels`) or at least
+use an honest message that does not claim a shape mismatch.
 
 ## Info
 
-### IN-01: dead `_dual` binding in `LinearSVC::fit`
+### IN-01: dead `inv_b` binding and dead `.max(1)` on a constant
 
-**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:346`
+**File:** `crates/mlrs-backend/src/prims/sgd.rs:179, 369, 224-227, 280-283`
+**Issue:** `let inv_b = 1.0 / batch as f64;` (line 179) is shadowed by per-batch `binv` and
+only "used" via `let _ = inv_b;` (line 369) — dead code. Separately, `cube_block.max(1)`
+appears in both `CubeCount::Static` computations, but `cube_block` is the constant `256u32`
+so `.max(1)` can never change it.
+**Fix:** delete the unused `inv_b` and the `let _ = inv_b;` line; drop the redundant
+`.max(1)`.
 
-**Issue:** `let _dual = n_samples < n_features;` is computed and immediately
-discarded (underscore-prefixed). The comment says it is "computed only for fidelity
-to sklearn's resolution rule," but it has no effect and no diagnostic output. It is
-dead code that suggests an unfinished feature.
+### IN-02: redundant per-crate duplication of `host_to_f64` / `f64_to_host` / `narrow`
 
-**Fix:** Remove the binding, or actually surface it (e.g. log it or store it for a
-`dual_` accessor) if the diagnostic intent is real.
+**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:654-679`, `linear_svr.rs:348-354`, `mbsgd_classifier.rs:551-565`, `crates/mlrs-backend/src/prims/sgd.rs:473-488`
+**Issue:** The same `size_of::<F>()` bit-reinterpret helper is re-implemented in at least
+six places with identical bodies and `unreachable!` arms. Acknowledged in comments
+("mirrors the logistic.rs helper") but remains copy-paste that will drift.
+**Fix:** hoist a single `pub(crate)` helper (e.g. a `float_cast` module) and reuse it.
 
-### IN-02: self-contradictory tie-break comment in `LinearSVC::predict_labels`
+### IN-03: `host_to_f64(self.c)` is an identity no-op on an already-`f64` field
 
-**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:438-444`
+**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:353`; `crates/mlrs-algos/src/linear/linear_svr.rs:293`
+**Issue:** `self.c` is typed `f64`; `host_to_f64(self.c)` instantiates the helper with
+`F = f64`, a size-8 identity bit-cast. Harmless but reads as if a narrowing conversion is
+happening when none is.
+**Fix:** use `self.c` directly.
 
-**Issue:** The comment says "Ties (margin == 0) break toward the lower class,
-matching sklearn's `>= 0 -> +1`?" then "sklearn uses `decision >= 0` -> the +1
-class; we mirror that with `>= 0`." The first clause (ties → lower class)
-contradicts the code (`m >= 0.0 -> classes_[1]`, the HIGHER class) and the second
-clause. The dangling `?` reads like an unresolved note left in.
+### IN-04: stale Wave-0 scaffold comments contradict the shipped implementation
 
-**Fix:** Rewrite the comment to state the actual behavior unambiguously: a margin
-of exactly 0 maps to `classes_[1]` (the +1 / higher class), matching sklearn's
-`decision >= 0`.
+**File:** `crates/mlrs-algos/src/linear/mbsgd_classifier.rs:6-10`, `mbsgd_regressor.rs:5-8`, `crates/mlrs-algos/src/linear/mod.rs:49`, `crates/mlrs-backend/src/prims/mod.rs:42-47`
+**Issue:** Multiple docs still describe the code as a "Wave-0 scaffold" with "fit/predict
+bodies land in Wave-1/Wave-3", and `mod.rs:49` claims "`LinearSVC`/`LinearSVR` reuse the v1
+coordinate-descent solver (D-07 — liblinear CD)" — but the shipped solver is L-BFGS
+(`linear_svc.rs` Open-Q1 resolution), not CD. `prims/mod.rs:42-47` says `sgd_solve`'s
+"compute path `todo!()` until Wave-1" though it is fully implemented. These stale comments
+mislead future readers about the actual solver.
+**Fix:** update the module docs to match the shipped L-BFGS / `sgd_solve` reality.
 
-### IN-03: `host_to_f64(self.c)` is a confusing no-op identity
+### IN-05: `optimal_t0` hard-codes `epsilon = 0.1` in its `dloss` probe
 
-**File:** `crates/mlrs-algos/src/linear/linear_svc.rs:353`, `crates/mlrs-algos/src/linear/linear_svr.rs:293`
-
-**Issue:** `self.c` is already `f64`, so `host_to_f64::<f64>(self.c)` infers
-`F = f64` and hits the `8 => identity` arm — a pointless round-trip through
-`bytemuck` that reads as if a dtype conversion were happening. It is harmless but
-misleading (a reader may think `c` is being narrowed to the estimator's `F`).
-
-**Fix:** Replace with `let c = self.c;` directly. The value is intentionally kept in
-f64 for the host-side L-BFGS objective.
-
-### IN-04: `optimal_t0` hard-codes `epsilon=0.1` into the `dloss` probe
-
-**File:** `crates/mlrs-backend/src/prims/sgd.rs:436`
-
-**Issue:** `dloss(loss, -typw, 1.0, 0.1)` passes a magic `0.1` epsilon. For
-hinge/log/squared-error losses (the only ones that use the `optimal` schedule in
-practice) the epsilon arg is ignored, so this is currently harmless. But if a
-future caller wires `optimal` with an epsilon-insensitive loss, the `t0`
-computation would silently use the wrong epsilon. The magic number is unexplained.
-
-**Fix:** Pass the real `params.epsilon` through to `optimal_t0`, or assert/document
-that `optimal` is only valid for epsilon-free losses.
-
-### IN-05: `lower_config` maps `Loss::SquaredLoss -> SgdLoss::SquaredError` but the two enums are otherwise 1:1 — verify the regressor's `epsilon` is threaded for the epsilon losses
-
-**File:** `crates/mlrs-algos/src/linear/mbsgd_classifier.rs:504-547`
-
-**Issue:** `lower_config` correctly threads `cfg.epsilon` into `SgdParams.epsilon`
-(line 542), and the classifier sets `epsilon: 0.0` in its config so the regression
-epsilon branch is inert for the classifier. This is correct, but the classifier
-NEVER validates that a caller cannot set a nonzero epsilon (the classifier builder
-has no `epsilon` setter, so `SgdConfig.epsilon` is always 0 — fine). No action
-needed beyond confirming the classifier path can never carry a stray epsilon; the
-code is correct as written. Flagged only to record that the
-classifier/regressor epsilon asymmetry was checked and is sound.
-
-**Fix:** None required; documented for traceability.
+**File:** `crates/mlrs-backend/src/prims/sgd.rs:448`
+**Issue:** `dloss(loss, -typw, 1.0, 0.1)` passes a magic `0.1` epsilon. It is inert for the
+classifier losses that actually use the optimal schedule (and sklearn's `optimal_init`
+likewise ignores epsilon there), so this is not a correctness bug — but a magic literal in
+a schedule-init path invites a future mistake if `optimal` is ever paired with an
+epsilon-insensitive loss.
+**Fix:** pass the configured `params.epsilon` (or a named constant with a comment) instead
+of a bare `0.1`.
 
 ---
 
