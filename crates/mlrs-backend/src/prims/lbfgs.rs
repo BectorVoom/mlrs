@@ -37,6 +37,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use mlrs_core::host_to_f64;
 use mlrs_core::PrimError;
 use mlrs_kernels::lbfgs::lbfgs_softmax_loss_grad;
 
@@ -607,16 +608,7 @@ fn axpy(v: &mut [f64], a: f64, u: &[f64]) {
     }
 }
 
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side scalar math.
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("lbfgs is f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
+/// Build an `F` (f32 / f64) from an `f64`.
 fn from_f64<F: Pod>(v: f64) -> F {
     match size_of::<F>() {
         4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),

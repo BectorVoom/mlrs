@@ -34,6 +34,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use mlrs_core::{f64_to_host, host_to_f64};
 use mlrs_core::PrimError;
 use mlrs_kernels::{
     argmax_shared, argmin_shared, reduce_max_plane, reduce_max_shared, reduce_min_plane,
@@ -650,22 +651,4 @@ fn validate_nonempty(len: usize) -> Result<(), PrimError> {
         });
     }
     Ok(())
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine / finalize.
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("reductions are f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
-fn f64_to_host<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("reductions are f32/f64 only"),
-    }
 }

@@ -38,10 +38,10 @@ use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::kernel_matrix::{kernel_matrix, Kernel};
 use mlrs_backend::prims::laplacian::laplacian;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 // WR-06: shared spectral host recovery math (formerly duplicated in this file).
-use crate::cluster::spectral::{f64_to_host, host_to_f64, recover};
+use crate::cluster::spectral::recover;
 use crate::error::AlgoError;
 
 /// The v1 dense-eig MAX_DIM cap (`eig.rs` `MAX_DIM = 64`). The normalized

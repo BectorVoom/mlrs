@@ -32,6 +32,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use mlrs_core::{f64_to_host, host_to_f64};
 use mlrs_core::PrimError;
 use mlrs_kernels::sgd::{sgd_margin, sgd_weight_update};
 
@@ -197,7 +198,7 @@ where
     // Device-resident solver state: w (len d), reused every batch; a length-`batch`
     // margin output + a length-`batch·d` batch-design buffer, both reused.
     let mut w_dev: DeviceArray<ActiveRuntime, F> =
-        DeviceArray::from_host(pool, &vec![narrow::<F>(0.0); d]);
+        DeviceArray::from_host(pool, &vec![f64_to_host::<F>(0.0); d]);
     let p_handle = pool.acquire(batch * elem); // margin output, reused.
 
     // Host coefficient mirror (for the convergence delta + the L1 cumulative
@@ -250,7 +251,7 @@ where
                 dim,
                 x_off,
                 w_arg,
-                narrow::<F>(bias),
+                f64_to_host::<F>(bias),
                 p_arg,
                 bsz as u32,
                 d as u32,
@@ -263,7 +264,7 @@ where
                 .map(|i| {
                     let gi = dloss(params.loss, p_host[i], y_host[start + i], params.epsilon)
                         .clamp(-1e12, 1e12);
-                    narrow::<F>(gi)
+                    f64_to_host::<F>(gi)
                 })
                 .collect();
 
@@ -302,8 +303,8 @@ where
                 x_off2,
                 g_arg,
                 w_arg2,
-                narrow::<F>(eta),
-                narrow::<F>(binv),
+                f64_to_host::<F>(eta),
+                f64_to_host::<F>(binv),
                 d as u32,
                 bsz as u32,
             );
@@ -334,7 +335,7 @@ where
                 for wj in w_host.iter_mut() {
                     *wj *= l2_factor;
                 }
-                let w_shrunk: Vec<F> = w_host.iter().map(|&v| narrow::<F>(v)).collect();
+                let w_shrunk: Vec<F> = w_host.iter().map(|&v| f64_to_host::<F>(v)).collect();
                 let w_re = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_shrunk);
                 // Swap the device w to the freshly-shrunk buffer (release the old).
                 let old_w = std::mem::replace(&mut w_dev, w_re);
@@ -369,7 +370,7 @@ where
                         q[j] += w_after[j] - z;
                     }
                 }
-                let w_l1: Vec<F> = w_after.iter().map(|&v| narrow::<F>(v)).collect();
+                let w_l1: Vec<F> = w_after.iter().map(|&v| f64_to_host::<F>(v)).collect();
                 let w_re2 = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_l1);
                 let old = std::mem::replace(&mut w_dev, w_re2);
                 old.release_into(pool);
@@ -420,7 +421,7 @@ where
 
     // Materialize the device-resident intercept scalar.
     let intercept: DeviceArray<ActiveRuntime, F> =
-        DeviceArray::from_host(pool, &[narrow::<F>(bias)]);
+        DeviceArray::from_host(pool, &[f64_to_host::<F>(bias)]);
 
     Ok((w_dev, intercept))
 }
@@ -509,24 +510,6 @@ pub fn schedule_eta(
         SgdSchedule::InvScaling => eta0 / (t as f64).powf(power_t),
         SgdSchedule::Constant => eta0,
         SgdSchedule::Adaptive => eta0,
-    }
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side scalar math.
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("sgd is f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
-fn narrow<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("sgd is f32/f64 only"),
     }
 }
 

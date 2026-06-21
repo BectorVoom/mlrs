@@ -38,6 +38,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use mlrs_core::{f64_to_host, host_to_f64};
 use mlrs_core::PrimError;
 use mlrs_kernels::jacobi_eig_sweep;
 use mlrs_kernels::MAX_DIM;
@@ -273,22 +274,4 @@ where
     let skip_thr = (eps * fro).max(eps);
     let conv_thr = (THRESHOLD_SCALE * eps * fro * pairs.max(1.0).sqrt()).max(skip_thr);
     (f64_to_host::<F>(skip_thr), f64_to_host::<F>(conv_thr))
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine / finalize.
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("eig is f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
-fn f64_to_host<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("eig is f32/f64 only"),
-    }
 }

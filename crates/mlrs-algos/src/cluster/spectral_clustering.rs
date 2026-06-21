@@ -32,12 +32,12 @@ use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::kernel_matrix::{kernel_matrix, Kernel};
 use mlrs_backend::prims::laplacian::laplacian;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{host_to_f64, PrimError};
 
 use crate::cluster::kmeans::KMeans;
 // WR-06 / IN-02: shared spectral host recovery math + kNN-connectivity affinity
 // builder (formerly duplicated in this file).
-use crate::cluster::spectral::{host_to_f64, recover};
+use crate::cluster::spectral::recover;
 use crate::error::AlgoError;
 use crate::traits::Fit;
 

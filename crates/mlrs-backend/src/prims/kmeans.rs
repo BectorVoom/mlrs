@@ -38,6 +38,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use mlrs_core::{f64_to_host, host_to_f64};
 use mlrs_core::PrimError;
 use mlrs_kernels::kmeans::{centroid_sumcount, inertia_rows};
 
@@ -664,23 +665,5 @@ fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
 // ===========================================================================
 
 // ===========================================================================
-// f32/f64 host bit-cast helpers (mirror reduce.rs — F is f32/f64 only)
+// f32/f64 host bit-cast helpers (promoted to `mlrs_core` — F is f32/f64 only)
 // ===========================================================================
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side finalize.
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("kmeans prims are f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
-fn f64_to_host<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("kmeans prims are f32/f64 only"),
-    }
-}

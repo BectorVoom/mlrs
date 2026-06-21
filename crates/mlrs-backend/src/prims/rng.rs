@@ -33,6 +33,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use mlrs_core::f64_to_host;
 use mlrs_core::PrimError;
 
 use crate::device_array::DeviceArray;
@@ -290,17 +291,3 @@ fn validate_shape(n_components: usize, n_features: usize) -> Result<(), PrimErro
     Ok(())
 }
 
-// ===========================================================================
-// f32/f64 host bit-cast helper (mirror kmeans.rs / reduce.rs — F is f32/f64 only)
-// ===========================================================================
-
-/// Inverse of a host-to-f64 cast: build an `F` (f32 / f64) from an `f64`.
-/// Copied VERBATIM from `kmeans.rs` (the `host_to_f64` companion is not needed
-/// here — every generator accumulates in f64 and only writes back to F).
-fn f64_to_host<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("rng prims are f32/f64 only"),
-    }
-}

@@ -30,6 +30,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
+use mlrs_core::host_to_f64;
 
 use crate::error::AlgoError;
 use crate::linear::coordinate_descent::{cd_fit, CD_DEFAULT_MAX_ITER, CD_DEFAULT_TOL};
@@ -171,15 +172,5 @@ where
             x,
             shape,
         )
-    }
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine (mirrors the
-/// `ridge.rs` helper).
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("lasso is f32/f64 only"),
     }
 }

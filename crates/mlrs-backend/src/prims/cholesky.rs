@@ -31,6 +31,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use mlrs_core::host_to_f64;
 use mlrs_core::PrimError;
 use mlrs_kernels::cholesky_solve as cholesky_solve_kernel;
 use mlrs_kernels::MAX_DIM;
@@ -235,13 +236,4 @@ fn validate_geometry(
         }
     }
     Ok(())
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side info decoding.
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("cholesky is f32/f64 only"),
-    }
 }

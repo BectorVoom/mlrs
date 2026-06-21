@@ -20,8 +20,6 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
-use std::mem::size_of;
-
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -30,6 +28,7 @@ use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::distance;
 use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
+use mlrs_core::{f64_to_host, host_to_f64};
 
 use crate::error::AlgoError;
 
@@ -182,24 +181,4 @@ where
     }
 
     Ok(DeviceArray::from_host(pool, &sym))
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine. Shared by the
-/// two spectral estimators (WR-06 — formerly triplicated, mirrors the `eig.rs` /
-/// `kernel_ridge.rs` bytemuck pair).
-pub(crate) fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("spectral family is f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
-pub(crate) fn f64_to_host<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("spectral family is f32/f64 only"),
-    }
 }

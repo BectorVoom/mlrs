@@ -28,7 +28,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::elastic_net::predict_linear;
@@ -342,15 +342,5 @@ where
             x,
             shape,
         )
-    }
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine (mirrors the
-/// `elastic_net.rs` / `linear_svc.rs` helper).
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("linear_svr is f32/f64 only"),
     }
 }

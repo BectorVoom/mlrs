@@ -55,7 +55,7 @@ use mlrs_backend::prims::lbfgs::{
     lbfgs_minimize, softmax_loss_grad, LbfgsStopReason, LBFGS_FTOL, LBFGS_MAXLS,
 };
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::AlgoError;
 use crate::traits::{Fit, PredictLabels, PredictProba};
@@ -656,25 +656,6 @@ impl<F: Pod> Drop for ScratchGuard<'_, F> {
         if let Some(b) = self.b.take() {
             b.release_into(self.pool);
         }
-    }
-}
-
-/// Reinterpret an `F` (f32 / f64) as `f64` for host-side combine (mirrors the
-/// `ridge.rs` / `lbfgs.rs` helper).
-fn host_to_f64<F: Pod>(v: F) -> f64 {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
-        8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("logistic is f32/f64 only"),
-    }
-}
-
-/// Inverse of [`host_to_f64`]: build an `F` (f32 / f64) from an `f64`.
-fn f64_to_host<F: Pod>(v: f64) -> F {
-    match size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
-        _ => unreachable!("logistic is f32/f64 only"),
     }
 }
 
