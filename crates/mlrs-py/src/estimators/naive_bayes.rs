@@ -51,7 +51,7 @@ use mlrs_algos::naive_bayes::multinomial_nb::MultinomialNB;
 use mlrs_algos::naive_bayes::nb_common::accuracy_score;
 use mlrs_algos::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
 
-use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, dtype_mismatch, not_fitted};
 use crate::ingress::{
     as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype,
 };
@@ -171,6 +171,10 @@ macro_rules! nb_surface_fns {
                             .map_err(algo_err_to_py)?
                             .to_host_metered(&mut pool))
                     }
+                    // WR-04: an estimator fitted as f64 is FITTED — distinguish the
+                    // wrong-dtype case (dtype-mismatch error naming the fitted dtype)
+                    // from the genuinely-unfit case (not_fitted).
+                    $any::F64(_) => Err(dtype_mismatch($name, "f32", "f64")),
                     _ => Err(not_fitted($name, "predict_proba (f32 path)")),
                 }
             })
@@ -193,6 +197,8 @@ macro_rules! nb_surface_fns {
                             .map_err(algo_err_to_py)?
                             .to_host_metered(&mut pool))
                     }
+                    // WR-04: distinguish the wrong-dtype case from genuinely-unfit.
+                    $any::F32(_) => Err(dtype_mismatch($name, "f64", "f32")),
                     _ => Err(not_fitted($name, "predict_proba (f64 path)")),
                 }
             })
@@ -216,6 +222,8 @@ macro_rules! nb_surface_fns {
                             .map_err(algo_err_to_py)?
                             .to_host_metered(&mut pool))
                     }
+                    // WR-04: distinguish the wrong-dtype case from genuinely-unfit.
+                    $any::F64(_) => Err(dtype_mismatch($name, "f32", "f64")),
                     _ => Err(not_fitted($name, "predict_log_proba (f32 path)")),
                 }
             })
@@ -238,6 +246,8 @@ macro_rules! nb_surface_fns {
                             .map_err(algo_err_to_py)?
                             .to_host_metered(&mut pool))
                     }
+                    // WR-04: distinguish the wrong-dtype case from genuinely-unfit.
+                    $any::F32(_) => Err(dtype_mismatch($name, "f64", "f32")),
                     _ => Err(not_fitted($name, "predict_log_proba (f64 path)")),
                 }
             })

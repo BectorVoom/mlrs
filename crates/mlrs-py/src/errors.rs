@@ -87,6 +87,22 @@ pub fn not_fitted(estimator: &str, operation: &str) -> PyErr {
     ))
 }
 
+/// Build the `PyErr` raised when a dtype-specific accessor (e.g. the f32
+/// `predict_proba` path) is called on an estimator fitted as the OTHER dtype
+/// (WR-04).
+///
+/// The estimator IS fitted — it is simply the wrong dtype — so surfacing a
+/// `not_fitted` "called before fit" error would mislead a Python user who fitted
+/// in `fitted_dtype` and called the `requested_dtype` accessor. This is a caller
+/// *value* problem, so it maps to `PyValueError` naming the actual fitted dtype
+/// and the dtype-matched accessor to call instead.
+pub fn dtype_mismatch(estimator: &str, requested_dtype: &str, fitted_dtype: &str) -> PyErr {
+    PyValueError::new_err(format!(
+        "{estimator} was fitted as {fitted_dtype}; the {requested_dtype} accessor \
+         does not apply — call the {fitted_dtype} accessor instead"
+    ))
+}
+
 /// Build the `PyErr` raised when a `partial_fit` stream mixes float dtypes — a
 /// batch's dtype disagrees with the dtype the estimator's first batch fixed.
 ///
