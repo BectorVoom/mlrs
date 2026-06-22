@@ -20,7 +20,7 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_sum, class_grouped_sumsq, empirical_class_log_prior,
-    log_sum_exp_normalize,
+    log_sum_exp_normalize, NB_LABEL_INT_TOL,
 };
 use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
 
@@ -207,7 +207,7 @@ where
         for &yv in y_host.iter() {
             let lf = host_to_f64(yv);
             let li = lf.round();
-            if (li - lf).abs() > 1e-6 {
+            if (li - lf).abs() > NB_LABEL_INT_TOL {
                 return Err(AlgoError::InvalidLabels {
                     estimator: "gaussian_nb",
                     reason: format!("labels must be integers (got {lf})"),
@@ -286,7 +286,12 @@ where
                 max_col_var = col_var;
             }
         }
-        let epsilon_ = self.var_smoothing * max_col_var;
+        // WR-05: floor epsilon_ to a tiny positive minimum so an all-constant
+        // feature matrix (every column variance ~0 → epsilon_ == 0) cannot leave a
+        // var_ cell at 0 and divide-by-zero the predict quadratic `(d*d)/v`
+        // (→ +inf/NaN joint-LL in f32). The `raw_var.max(0.0)` clamp above guards
+        // negatives but not this degenerate; flooring epsilon_ keeps var_ > 0.
+        let epsilon_ = (self.var_smoothing * max_col_var).max(f64::MIN_POSITIVE);
         for cell in var.iter_mut() {
             *cell += epsilon_;
         }
@@ -304,6 +309,17 @@ where
                             "priors length {} != number of classes {n_classes}",
                             p.len()
                         ),
+                    });
+                }
+                // WR-01: sklearn requires the priors to sum to 1
+                // (`ValueError("The sum of the priors should be 1.")`); a
+                // non-normalized prior is silently `.ln()`-mapped here and the
+                // log-sum-exp renormalization masks the divergence from the oracle.
+                let prior_sum: f64 = p.iter().sum();
+                if (prior_sum - 1.0).abs() > 1e-6 {
+                    return Err(AlgoError::InvalidLabels {
+                        estimator: "gaussian_nb",
+                        reason: format!("the sum of the priors should be 1 (got {prior_sum})"),
                     });
                 }
                 p.iter().map(|&v| v.ln()).collect()
