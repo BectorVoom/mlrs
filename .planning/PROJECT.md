@@ -15,18 +15,13 @@ install` the package for their backend and use familiar `fit`/`predict`/`transfo
 CubeCL backend from a single generic codebase.** If everything else fails, the numerical results
 must be right and the backend abstraction must hold.
 
-## Current Milestone: v2.0 Breadth Sweep
+## Current Milestone: between milestones (v2.0 shipped 2026-06-22)
 
-**Goal:** Roughly double the scikit-learn-compatible estimator surface with low-risk algorithms that reuse v1's validated primitive base, deferring hard Tier-3 work (RandomForest, UMAP, HDBSCAN, ARIMA, kernel-SVM) to v3.
+**Shipped v2.0 Breadth Sweep** — roughly doubled the scikit-learn-compatible estimator surface with 18 low-risk estimators reusing v1's validated primitive base, deferring hard Tier-3 work (RandomForest, UMAP, HDBSCAN, ARIMA, kernel-SVM) to v3. All 24 v2 requirements complete; 5 phases (7–11), 27 plans. Next: start the next milestone via `/gsd-new-milestone`.
 
-**Target features:**
-- Covariance & projection: EmpiricalCovariance, LedoitWolf, IncrementalPCA, GaussianRandomProjection, SparseRandomProjection
-- Kernel family: KernelRidge, KernelDensity
-- Spectral family: SpectralEmbedding, SpectralClustering (leverages v1 `eig`)
-- SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR
-- Naive Bayes: GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB
+**Next milestone goals (candidate):** the deferred Tier-3 backlog in `notes/v3-hard-algorithm-backlog.md` (tree/ensemble, UMAP, HDBSCAN, ARIMA, kernel-SVM via SMO), and the carried-forward Python-surface work (a pure-Python sklearn shim for get_params/set_params/check_estimator across the v2 estimators; live FFI `estimator_checks` re-triage on a maturin+pyarrow host). Scope to be set during `/gsd-new-milestone`.
 
-**Key context:** Same oracle (scikit-learn ≤1e-5) and gate (cpu f64 + rocm f32) as v1. Primitive-first discipline continues — each phase lands one reusable primitive (RNG-matrix/incremental-SVD, kernel-matrix, graph-Laplacian, SGD solver) then the estimators that consume it. Genuine unknowns tracked in `research/questions.md`. Phase numbering continues from v1.0 (next phase = 7).
+**Key context:** Same oracle (scikit-learn ≤1e-5) and gate (cpu f64 + rocm f32) as v1. Primitive-first discipline held through v2 — each phase landed one reusable primitive (RNG-matrix/incremental-SVD, kernel-matrix, graph-Laplacian, SGD solver) then the estimators that consume it, with zero new compute dependency (pyo3 stayed 0.28). Phase numbering continues from v2.0 (next phase = 12).
 
 ## Requirements
 
@@ -49,19 +44,20 @@ must be right and the backend abstraction must hold.
 - ✓ Decomposition: PCA, TruncatedSVD (Jacobi SVD/eig) — v1.0
 - ✓ Neighbors: NearestNeighbors, KNeighborsClassifier, KNeighborsRegressor (top-k) — v1.0
 
-**v2 Algorithms (in progress) — v2.0**
-- ✓ SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR (PRIM-10 two-pass GATHER solver, pinned deterministic sklearn oracle, exact-label hard gate) — Validated in Phase 10
+**v2 Algorithms (18, sklearn-compatible) — v2.0**
+- ✓ New compute primitives: RNG-matrix (PRIM-06), incremental-SVD (PRIM-07), kernel-matrix (PRIM-08), graph-Laplacian (PRIM-09), SGD solver (PRIM-10) — all feature-free, GATHER-idiom, standalone-validated — v2.0
+- ✓ Covariance & projection: EmpiricalCovariance, LedoitWolf, IncrementalPCA, GaussianRandomProjection, SparseRandomProjection (PartialFit trait; property-gated projections) — v2.0
+- ✓ Kernel family: KernelRidge, KernelDensity (kernel-matrix prim; ScoreSamples trait) — v2.0
+- ✓ Spectral family: SpectralEmbedding, SpectralClustering (graph-Laplacian + v1 eig + v1 KMeans) — v2.0
+- ✓ SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR (PRIM-10 two-pass GATHER solver, pinned deterministic sklearn oracle, exact-label hard gate) — v2.0
+- ✓ Naive Bayes: GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB (reductions-only; exact-label hard gate) — v2.0
+- ✓ PY-06: all v2 estimators `#[pyclass]`-backed with sklearn-named hyperparameters, f32/f64 dispatch, GIL release, shipped in the four per-backend wheels — v2.0
 
 ### Active
 
 <!-- Current scope. Building toward these. All are hypotheses until shipped and validated. -->
 
-**v2.0 Breadth Sweep** (defined via `/gsd-new-milestone`; see `seeds/v2-breadth-roadmap.md`)
-- [ ] Covariance & projection: EmpiricalCovariance, LedoitWolf, IncrementalPCA, Gaussian/SparseRandomProjection
-- [ ] Kernel family: KernelRidge, KernelDensity
-- [ ] Spectral family: SpectralEmbedding, SpectralClustering (leverages v1 eig)
-- [x] SGD / linear-SVM: MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR — validated in Phase 10
-- [ ] Naive Bayes family: Gaussian/Multinomial/Bernoulli/Complement/Categorical
+_None — v2.0 shipped. Next milestone scope is defined via `/gsd-new-milestone` (see `notes/v3-hard-algorithm-backlog.md`)._
 
 ### Out of Scope
 
@@ -83,13 +79,14 @@ must be right and the backend abstraction must hold.
 - **Oracle:** scikit-learn on CPU produces reference outputs from identical random inputs — runs in CI without a GPU.
 - **Build protocol (AGENTS.md):** Source and test code strictly separated (no `mod tests` in source files; use `tests/` or `*_test.rs`). On any CubeCL build error, consult the CubeCL error guideline before attempting fixes.
 
-### Current State (after v1.0)
+### Current State (after v2.0)
 
-- **Shipped v1.0** (2026-06-14): 12 sklearn-compatible estimators across 5 crates, 38 plans over Phases 1–6, 233 commits, 3-day build. All 27 v1 requirements complete.
-- **Validated primitive base** reusable for v2: GEMM, reductions, pairwise distance, covariance/Gram, Jacobi SVD + symmetric eig, Cholesky/triangular-solve, top-k, L-BFGS, coordinate descent.
-- **Packaging:** four per-backend abi3-py312 wheels (`mlrs_cpu`/`wgpu`/`cuda`/`rocm`), each `import mlrs`; cpu imports without LD_PRELOAD (mimalloc local_dynamic_tls).
-- **Known tech debt / deferred:** CUDA-host-only checks (live cuda import, cross-hardware absent-driver, two-wheel overwrite); Phase-5 follow-ups (empty-cluster KMeans estimator fixture, code-review WR-05/06/07 + IN-01..05, no Phase-5 SECURITY.md). See STATE.md Deferred Items.
-- **Next:** v2.0 Breadth Sweep — ~16 low-risk estimators reusing the v1 primitive base (`seeds/v2-breadth-roadmap.md`).
+- **Shipped v2.0** (2026-06-22): 18 sklearn-compatible estimators added across five families (covariance/projection, kernel, spectral, SGD/linear-SVM, Naive Bayes), 27 plans over Phases 7–11, ~192 commits, built 2026-06-20 → 2026-06-22. All 24 v2 requirements complete. Total estimator surface now 30.
+- **Shipped v1.0** (2026-06-14): 12 sklearn-compatible estimators across 5 crates, 38 plans over Phases 1–6, 233 commits. All 27 v1 requirements complete.
+- **Validated primitive base** (v1 + v2): GEMM, reductions, pairwise distance, covariance/Gram, Jacobi SVD + symmetric eig, Cholesky/triangular-solve, top-k, L-BFGS, coordinate descent, RNG-matrix, incremental-SVD merge, kernel-matrix, graph-Laplacian, two-pass SGD solver — all feature-free and standalone-validated.
+- **Packaging:** four per-backend abi3-py312 wheels (`mlrs_cpu`/`wgpu`/`cuda`/`rocm`), each `import mlrs`; cpu imports without LD_PRELOAD (mimalloc local_dynamic_tls). pyo3 pinned 0.28; v2 added zero compute dependencies.
+- **Known tech debt / deferred:** (v2) live Python FFI smoke + sklearn `estimator_checks` re-triage (need maturin+pyarrow host), pure-Python sklearn shim for get_params/set_params/check_estimator not built (consistent across Phases 8–11); (v1) CUDA-host-only checks, Phase-5 follow-ups. See STATE.md Deferred Items.
+- **Next:** start the next milestone via `/gsd-new-milestone` — candidate scope is the Tier-3 backlog (`notes/v3-hard-algorithm-backlog.md`) and the carried-forward Python-surface work.
 
 ## Constraints
 
@@ -117,6 +114,10 @@ must be right and the backend abstraction must hold.
 | Memory efficiency as per-phase requirement | Stated high priority; retrofitting zero-copy/allocators later is costly | ✓ Good — build-failing PoolStats gates every phase, never deferred |
 | Primitive-first horizontal build order | Validate GEMM/reduce/distance/SVD/eig/Cholesky standalone before estimators consume them | ✓ Good — estimators were "mostly assembly"; SVD/eig gated 4, distance gated 3 |
 | LogReg keeps symmetric over-parameterized multinomial for all K (D-12) | Single objective for binary+multiclass; gauge-fixed predict_proba is the correctness witness | ⚠️ Revisit — binary differs ~3.6e-3 from sklearn's binomial under L2 (user-approved); a binomial path may be wanted later |
+| v2 reuses the shipped PyO3 binding layer (no dedicated Python phase) | v1's `any_estimator!` machinery + ingress/egress/capability/errors are general; each v2 phase wraps its own estimators incrementally | ✓ Good — v2 added zero new binding infrastructure across 18 estimators; pyo3 stayed 0.28 |
+| Property-gate (not 1e-5 value match) for RandomProjection (D-12) | mlrs SplitMix64 ≠ NumPy MT19937, so the projection matrix can't match element-wise; JL distortion + distribution stats + seed-reproducibility are the meaningful contract | ✓ Good — `johnson_lindenstrauss_min_dim` value-matched exactly; JL ratio concentration gated via 50-trial averaging |
+| Exact predicted labels as the hard correctness gate for classifiers (SGD/SVM/NB) | Iterative/host-order solvers agree with sklearn only to a band on coefficients, but argmax/label decisions are integer-exact | ✓ Good — every v2 classifier passes exact-label gate on cpu f32+f64; coef bands documented |
+| cpu-MLIR-safe GATHER idiom for all new kernels (no SharedMemory, no cross-unit atomics) | cubecl-cpu MLIR lowering panics on SharedMemory + mutable-bool/INFINITY/shift-loops; single-owner GATHER launches first try | ✓ Good — all five v2 prims (incl. the highest-risk SGD solver) launched on cpu-MLIR without rework |
 
 ## Evolution
 
@@ -136,4 +137,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-21 — Phase 10 (SGD / linear-SVM) complete; v2.0 3/5 phases done*
+*Last updated: 2026-06-22 after v2.0 Breadth Sweep milestone (Phases 7–11; 18 estimators; 30 total)*

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Breadth Sweep
-status: executing
-stopped_at: Completed 11-04-PLAN.md (CategoricalNB NB-05)
-last_updated: "2026-06-22T00:00:00.000Z"
-last_activity: 2026-06-22 -- Completed Phase 11 Plan 04 (CategoricalNB NB-05 ragged fit/predict + oracle)
+status: Awaiting next milestone
+stopped_at: Completed 11-03-PLAN.md (Multinomial/Bernoulli/Complement NB)
+last_updated: "2026-06-22T02:49:56.242Z"
+last_activity: 2026-06-22 — Milestone v2.0 completed and archived
 progress:
   total_phases: 5
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 27
-  completed_plans: 26
-  percent: 93
+  completed_plans: 27
+  percent: 100
 ---
 
 # Project State
@@ -25,14 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 11 (naive-bayes) — COMPLETE
-Plan: 5 of 5 (all complete)
-Status: Phase 11 complete (Wave-0 seam + GaussianNB + count-based NB + CategoricalNB + PyO3 PY-06 sign-off done)
-Last activity: 2026-06-22 -- Completed Phase 11 Plan 05 (PY-06 final cross-cutting PyO3 sign-off)
-Resume file: None
-Next: Phase 11 done — verify/ship the phase (sklearn estimator_checks re-triage is environment-gated: needs maturin+pyarrow; see 11-05-SUMMARY.md)
-
-Progress: [##########] 100% (v2.0 — 5/5 phases complete, 27/27 plans)
+Phase: Milestone v2.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-06-22 — Milestone v2.0 completed and archived
 
 ## Open Follow-ups (Phase 05)
 
@@ -249,9 +245,16 @@ Items acknowledged and carried forward from previous milestone close:
 | cuda-hardware | Live `import mlrs` from the mlrs_cuda wheel on a CUDA host (wheel builds compile-only here) | Deferred (opportunistic) | 06-06 (user-approved) |
 | cuda-hardware | Cross-hardware foreign-driver-absent `import mlrs` raising a clean ImportError (not segfault) on real hardware | Deferred (opportunistic) | 06-06 (user-approved) |
 | packaging | Two backend wheels in one env overwriting the shared `mlrs` namespace (D-07 accepted-by-design) confirmed on a co-install host | Deferred (opportunistic) | 06-06 (user-approved) |
+| python-ffi | Live Python FFI smoke test (11-UAT #1) — `pytest crates/mlrs-py/tests/test_naive_bayes.py` through the five NB `#[pyclass]` estimators; needs maturin+pyarrow (Rust pyclass_smoke_test already 4/4 in-repo) | Deferred (environment-gated) | v2.0 close (user-acknowledged) |
+| python-ffi | sklearn `estimator_checks` re-triage across the full v2 surface (11-UAT #2); needs the built wheel + sklearn-compat path | Deferred (environment-gated) | v2.0 close (user-acknowledged) |
+| python-api | Pure-Python `mlrs/naive_bayes.py` sklearn shim (get_params/set_params/clone/check_estimator) not created (11-UAT #3 / 11-VERIFICATION human_needed) — consistent with Phases 8–10, which ship no shim; WARNING-level, defer to a dedicated Python-API phase | Deferred (accepted-by-design) | v2.0 close (user-acknowledged) |
 
 ## Session Continuity
 
 Last session: 2026-06-21T22:03:19.000Z
 Stopped at: Completed 11-03-PLAN.md (Multinomial/Bernoulli/Complement NB)
 Resume file: .planning/phases/11-naive-bayes/11-04-PLAN.md
+
+## Operator Next Steps
+
+- Start the next milestone with /gsd-new-milestone
