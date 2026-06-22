@@ -43,8 +43,50 @@ A ground-up Rust rewrite of cuML's scikit-learn-core surface: 12 sklearn-compati
 - Sessions: multi-session over 3 days; model mix not instrumented.
 - Notable: primitive-first ordering front-loaded the hard work (Phase 3 SVD/eig) so later estimator phases were fast and low-risk.
 
+## Milestone: v2.0 — Breadth Sweep
+
+**Shipped:** 2026-06-22
+**Phases:** 5 (7–11) | **Plans:** 27 | **Tasks:** 52 | **Commits:** ~192 (45 feat) | **Timeline:** built 2026-06-20 → 2026-06-22 (3 days; planned 2026-06-14)
+
+### What Was Built
+
+18 new sklearn-compatible estimators across five families — covariance/projection (EmpiricalCovariance, LedoitWolf, IncrementalPCA, Gaussian/SparseRandomProjection), kernel (KernelRidge, KernelDensity), spectral (SpectralEmbedding, SpectralClustering), SGD/linear-SVM (MBSGDClassifier/Regressor, LinearSVC/SVR), and Naive Bayes (Gaussian/Multinomial/Bernoulli/Complement/Categorical) — built as assembly on v1's primitive base plus five new feature-free CubeCL prims (RNG-matrix, incremental-SVD, kernel-matrix, graph-Laplacian, two-pass SGD solver). Zero new compute dependency; pyo3 stayed 0.28. Total estimator surface now 30.
+
+### What Worked
+
+- **Wave-0 shared-seam scaffold per phase.** Front-loading every shared-file edit (traits, error variants, module index, oracle generators, #[ignore] test scaffolds) into one wave made Waves 1/2/3 strictly file-disjoint and parallel-buildable — the pattern repeated cleanly across all five phases.
+- **Primitive-first discipline carried from v1.** Each phase landed + standalone-validated its one new prim (with a PoolStats memory gate) before any estimator consumed it; the highest-risk prim (the SGD device solver) launched on cpu-MLIR first try because the GATHER idiom was applied by construction, not discovered reactively.
+- **Reusing the shipped PyO3 layer.** v1's `any_estimator!` machinery generalized to all 18 v2 estimators with zero new binding infrastructure — each phase wrapped its own estimators incrementally.
+- **Exact-label hard gate + documented coef bands.** For iterative/host-order solvers (SGD, SVM, NB) the integer-exact label decision was the strict correctness witness while coefficients agreed to a measured band — a clean, honest contract.
+
+### What Was Inefficient
+
+- **Oracle-fixture re-generation mid-phase.** The Phase-9 SpectralEmbedding default-constructor fixture pinned a disconnected kNN graph whose degenerate zero-eigenspace a dense Jacobi eig can't reproduce; the oracle had to be regenerated with an explicit connected parameterization + a subspace gate. Lesson: an oracle pinning an estimator's *default* params must verify the dense-eig path actually reproduces that parameterization.
+- **Literal-grep acceptance criteria vs intent.** Several plans had `grep == 0` gates (e.g. `to_host`, `cholesky`, `SharedMemory`) that the correct implementation legitimately tripped (host-side sorts, doc-comments); reconciling literal-grep-vs-intent recurred and cost cycles.
+- **Live Python FFI remained environment-gated.** The maturin+pyarrow path can't run here, so PY-06's live `estimator_checks` re-triage + FFI smoke are carried forward as deferred (Rust-side pyclass smoke compensates) — same shape as v1's deferred CUDA-host checks.
+
+### Patterns Established
+
+- Wave-0 shared-seam scaffold (all cross-cutting edits + test scaffolds + committed fixtures in one file-disjoint wave).
+- Builder-fronted estimators with sklearn-default field initializers + a split validation contract (data-independent at `build()` → BuildError; data-dependent at `fit()` → AlgoError).
+- Property-gate exception for RNG-dependent estimators (RandomProjection: JL distortion + distribution + seed-reproducibility, not 1e-5 value match), with trial-count averaging for reproducible bands.
+- Ragged per-feature fitted tables (`Vec<Vec<f64>>`) + per-feature host lookup-and-sum for structurally-distinct estimators (CategoricalNB) where the GEMM joint-LL shape doesn't fit.
+
+### Key Lessons
+
+1. A default-constructor oracle is only meaningful if the implementation's solver path can actually reproduce that default — verify, don't assume (SpectralEmbedding).
+2. Prefer behavioral acceptance criteria over literal source greps; when a grep gate is unavoidable, scope it to non-comment lines and document the legitimate exceptions up front.
+3. The cpu-MLIR GATHER idiom, applied proactively, eliminated the reactive kernel-rewrite cost that dogged v1 — environment constraints belong in the design, not the debugging.
+
+### Cost Observations
+
+- Model mix: planner + executor both opus (model_profile=quality); mix not finely instrumented.
+- Sessions: multi-session over ~3 active build days.
+- Notable: the five-prim primitive-first structure again front-loaded risk (SGD solver in Phase 10) so the closing Naive-Bayes phase was wide-but-shallow and fast.
+
 ## Cross-Milestone Trends
 
 | Milestone | Phases | Plans | Days | Estimators |
 |-----------|--------|-------|------|------------|
 | v1.0 | 6 | 38 | 3 | 12 |
+| v2.0 | 5 | 27 | 3 | 18 (30 total) |
