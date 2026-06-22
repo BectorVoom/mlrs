@@ -1,159 +1,192 @@
 # Project Research Summary
 
-**Project:** mlrs — cuML in Rust (v2.0 Breadth Sweep milestone)
-**Domain:** scikit-learn-compatible ML estimator library (Rust/CubeCL rewrite of RAPIDS cuML)
-**Researched:** 2026-06-14
-**Confidence:** HIGH (three scoped MEDIUM unknowns to resolve at plan time)
+**Project:** mlrs v3.0 — Manifold Algorithms & Rust-Native API
+**Domain:** UMAP + HDBSCAN on a shared KNN-graph primitive; Rust builder/typestate API retrofit; pure-Python sklearn shim
+**Researched:** 2026-06-22
+**Confidence:** HIGH overall (grounded in shipped codebase, project memory, and stable documented APIs); MEDIUM on two specific execution unknowns (see Gaps)
 
 ## Executive Summary
 
-v2.0 is a **breadth sweep**: ~16 sklearn-compatible estimators across five families (Covariance & Projection, Kernel, Spectral, SGD/linear-SVM, Naive Bayes) added on top of v1's shipped, validated five-crate stack. The single most important conclusion from all four research files is that **this milestone requires no new compute dependency**. Every estimator is *assembly* over v1's existing primitives (GEMM, reductions, pairwise distance, covariance/Gram, Jacobi SVD + symmetric eig, Cholesky/triangular-solve, top-k, L-BFGS, coordinate descent) plus exactly five new *feature-free* mlrs-authored CubeCL primitives — one (or zero) per phase: RNG-matrix + incremental-SVD (P7), kernel-matrix (P8), graph-Laplacian (P9), SGD solver (P10), and none for Naive Bayes (P11, reductions only). The workspace `Cargo.toml` is unchanged; pyo3 stays pinned at 0.28 (arrow-59 transitively pins it), `cubek-random` is rejected (no caller seed → breaks ASVS-V6 reproducibility; shared-memory Tausworthe → breaks cpu-MLIR), and sparse input is densified at the Python ingress rather than adding a CSR device path (a v3 line item).
+v3.0 adds two high-value algorithms — UMAP (nonlinear manifold embedding) and HDBSCAN (density-based variable-cluster clustering) — on a shared KNN-graph primitive built from the already-validated v1 NearestNeighbors (top-k) prim, and completes the Rust-native builder-pattern API retrofit across all 30+ estimators plus a pure-Python sklearn shim. The critical architectural insight from all four research streams is that the KNN-graph primitive is the feasibility keystone for the entire milestone: it is cpu-MLIR-safe by COMPOSITION of already-shipped prims (distance + top-k + a single-owner GATHER symmetrize map, no new heap/scatter kernel), it must be built and standalone-gated before either estimator consumes it, and the GATHER idiom that makes it viable directly constrains how UMAP's SGD layout step and HDBSCAN's mutual-reachability are structured. Zero new runtime crate dependencies are needed; the five-crate workspace structure, pyo3 0.28/arrow-59 ABI pin, cubecl 0.10, and cubek-{matmul,reduce} 0.2.0 stay entirely unchanged.
 
-The recommended approach reuses v1's proven discipline verbatim: **primitive-first** (land the prim + its build-failing PoolStats memory gate, then the estimators as thin assembly), **file-disjoint parallelism** (each estimator is a new file + one `pub mod`/`pub use` line; the only shared-edit points are `mlrs-py/src/lib.rs` registration and family `mod.rs` files), and **scikit-learn as the sole oracle** at abs/rel ≤ 1e-5 on f64. The build order from the seed roadmap is sound and dependency-correct: 7→8→9→10→11, with one dependency that must be made explicit — **P9 (Spectral) hard-depends on P8's kernel-matrix prim** because the graph affinity *is* `kernel_matrix(Rbf)`. P7 and P11 are pure assembly (lowest risk, ideal confidence-building bookends); P10 (the one genuinely new solver) is the highest risk and unblocks four estimators.
+The three correctness-gate regimes are distinct and must not be conflated. The KNN-graph prim and UMAP's deterministic stages 1-4 (fuzzy simplicial set through spectral init) use the standard value gate (<=1e-5 vs sklearn NearestNeighbors / umap-learn intermediate arrays). UMAP's SGD layout stage 5 uses a property/structural gate (trustworthiness + kNN-overlap relative to umap-learn, plus seed-reproducibility within mlrs) — attempting a value oracle here is not merely unhelpful, it will report total failure on a correct implementation, exactly the trap v2 hit with RandomProjection D-12. HDBSCAN uses an exact-labels-up-to-permutation hard gate (the v2 classifier exact-label rule), with -1 noise pinned in the permutation search, against sklearn.cluster.HDBSCAN as the primary oracle; hdbscan 0.8.44 as a secondary cross-check.
 
-The risk profile is dominated by two cross-cutting concerns. First, **cpu-MLIR safety**: the new SGD, Naive-Bayes, and Laplacian kernels all have a naive formulation that wants cross-unit atomics or SharedMemory (scatter-add into weight/class/degree bins), which compiled-but-panicked-at-launch in v1. The fix is the v1 GATHER idiom — invert parallelism to one-thread-per-output-cell with F/u32 accumulators, if-guards, no `bool`/`F::INFINITY`/descending-shift loops, no SharedMemory, no atomics. Second, **oracle exceptions**: most estimators value-match sklearn at 1e-5, but RandomProjection is *property-gated* (Johnson–Lindenstrauss distortion + matrix distribution, NOT value-match, because mlrs's seeded PRNG ≠ NumPy MT19937), and SGD/LinearSVM need a *pinned deterministic self-reference oracle* (shuffle off, fixed schedule, fixed `max_iter`, `tol=0`) exactly as v1 did for LogReg's L-BFGS. cuML is NOT the oracle — it diverges from sklearn on the SGD loss set/schedule and on LinearSVC's solver. Three genuine unknowns (incremental-SVD f32 stability, smallest-eigenpair extraction, SGD under cpu-MLIR) must get a research spike before planning P7/P9/P10.
+The two cross-cutting surface features — the Rust builder API and the Python shim — are extensions of already-shipped infrastructure, not greenfield work. Nine v2 estimators already carry hand-written T::builder() -> TBuilder -> build() -> Result (LinearSVR, LinearSVC, MBSGDClassifier, MBSGDRegressor, all five Naive Bayes variants), and the MlrsBase(BaseEstimator) shim already ships for the v1 12 estimators in mlrs-py/python/mlrs/base.py. v3 extends and retrofits both; derive-macro builder crates are explicitly rejected as they add proc-macro dependencies for a pattern already hand-written and proven, and they fight the hand-written any_estimator! PyO3 macro machinery.
 
 ## Key Findings
 
 ### Recommended Stack
 
-No new runtime crate is added. All v2 compute composes from v1 prims plus five mlrs-authored, feature-free CubeCL primitives. RNG is host-side SplitMix64 (promoted from `prims/kmeans.rs` into a shared `prims/rng.rs`) generating the projection matrix / epoch-shuffle permutation on host and uploading once — reproducible (ASVS-V6), backend-independent, and cpu-MLIR-safe. Sparse input is densified at the Python wrapper before the existing dense Arrow ingress; a native CSR device path is explicitly deferred to v3. See [STACK.md](STACK.md).
+Zero new runtime crate dependencies. The entire v3.0 surface — UMAP, HDBSCAN, KNN-graph, builders, shim — is implemented as new modules in the existing five-crate workspace. The workspace Cargo.toml [workspace.dependencies] block is unchanged. New oracle-regen dev-venv deps (umap-learn 0.5.12, hdbscan 0.8.44) are confined to the /tmp/oracle-venv pattern established in v1/v2 and never enter the shipped wheel.
 
-**Core technologies (all UNCHANGED from v1):**
-- cubecl 0.10.0 (`default-features=false`): device-kernel layer, generic over float + runtime — entire v2 surface is feature-free kernels over the existing pattern.
-- cubek-matmul / cubek-reduce 0.2.0: GEMM and reductions backing KernelRidge, RandomProjection, SGD, the full Naive-Bayes family, and LedoitWolf shrinkage — already wired.
-- arrow 59 (`pyarrow`) + pyo3 0.28 (`abi3-py312`): dense Float32/Float64 ingress is sufficient (sparse densified at ingress). **pyo3 stays pinned at 0.28** — arrow-59 transitively pins it; bumping to 0.29 links a second PyInit ABI and crashes the wheel at import (D-09/PY-05).
-- **NOT used:** `cubek-random` (no caller seed → ASVS-V6 fail; shared-memory Tausworthe → cpu-MLIR fail), `rand`/`getrandom` (OsRng forbidden by ASVS-V6), `ndarray`/`nalgebra` (math runs on device via existing prims).
+**Core technologies (all pinned, all unchanged):**
+- `cubecl` 0.10 (`default-features=false`): device-kernel layer; new v3 kernels (knn_graph symmetrize, umap_fuzzy_map, umap_layout_step, mutual_reach_map) follow the feature-free GATHER idiom — SharedMemory-free, atomic-free, no mutable-bool/F::INFINITY/shift-loops
+- `cubek-reduce` 0.2.0: per-point sigma/rho row reductions (UMAP fuzzy set) and core-distance (HDBSCAN k-th NN distance) already wired
+- `pyo3` 0.28 / `arrow` 59 (pyarrow): HARD pin — arrow-59's pyarrow transitively pins pyo3 0.28; mixing ABIs crashes wheel at import (D-09/PY-05); UMAP/HDBSCAN add #[pyclass] wrappers only
+- `mimalloc` 0.1, `bytemuck` 1, `thiserror` 2, `anyhow` 1, `log`/`env_logger` 0.4/0.11: all unchanged
 
-**Five new mlrs-authored primitives (NOT crates):** `prims/rng.rs` (host PRNG, no device kernel), `prims/incremental_svd.rs` (glue over v1 `svd`), `prims/kernel_matrix.rs` (one elementwise map over distance/Gram → linear/RBF/poly/sigmoid), `prims/laplacian.rs` (reduce + elementwise over affinity), `prims/sgd.rs` (host epoch loop + GATHER per-minibatch device passes).
+**Builder strategy: hand-written builders + runtime fitted-flag. Reject all derive-macro crates.**
+The hand-rolled convention is already shipped on 9 estimators. v3 retrofits the same shape across the remaining ~24 estimators plus the 2 new ones, and adds Option<DeviceArray> fitted-flag runtime state (not per-param PhantomData typestate, which would explode the generic surface and break the any_estimator! enum). bon, typed-builder, and derive_builder are all rejected: proc-macro dependencies for a pattern already proven, fighting the hand-written trait-impl machinery.
+
+**Oracle libraries (dev-venv only, never shipped):**
+- `umap-learn` 0.5.12: UMAP property gate only; pulls numba transitively (oracle-regen watch-item — numba may lag numpy 2.5.0; mitigation: pin compatible numba at regen time; CI uses committed .npz blobs and is fully decoupled)
+- `hdbscan` 0.8.44: HDBSCAN cross-check oracle; no numba dep — clean against existing pins
+- `sklearn.cluster.HDBSCAN` (scikit-learn >= 1.6, already pinned): PRIMARY HDBSCAN gate oracle; zero new dependency
 
 ### Expected Features
 
-The oracle is **scikit-learn**, not cuML. Where cuML diverges (SGD loss set/schedule, LinearSVC solver), match sklearn. Every estimator exposes sklearn-named params/defaults, the appropriate `fit`/`predict`/`transform`/`score` surface, sklearn fitted attributes (trailing-underscore), `n_features_in_`, and passes the v1 `estimator_checks` harness. See [FEATURES.md](FEATURES.md).
+**Must have (v3.0 table stakes):**
+- **KNN-graph primitive** — (n x k) neighbor indices + distances; self-inclusion control (k+1/self-drop); directed output; standalone value-gated (<=1e-5 vs sklearn.neighbors.NearestNeighbors); consumed by both UMAP and HDBSCAN
+- **UMAP** fit/fit_transform -> embedding_ (n, n_components); table-stakes params (n_neighbors=15, min_dist=0.1, n_components=2, metric='euclidean', init='spectral'/'random', random_state, n_epochs); stages 1-4 value-gated at <=1e-5, stage 5 property-gated
+- **HDBSCAN** fit/fit_predict -> labels_ (-1 = noise), probabilities_; table-stakes params (min_cluster_size=5, min_samples=None->min_cluster_size, cluster_selection_method='eom'/'leaf'); exact-label gate via metric='precomputed'
+- **Rust builder + typestate convention** — T::builder().setter().build()? -> T (runtime fitted-flag; build() validates params; new() stays as thin wrapper for any_estimator! compatibility); retrofit across all 30 existing + 2 new estimators
+- **Pure-Python sklearn shim** — extend MlrsBase subclassing to v2 18 + UMAP/HDBSCAN; get_params/set_params/clone semantics; PyO3-wrap UMAP/HDBSCAN; FFI-free invariant unit tests in CI
 
-**Must have (the 16 firm estimators = the MVP):**
-- Covariance: EmpiricalCovariance, LedoitWolf (ddof=0 MLE covariance; LW shrinkage clipped to [0,1]).
-- Projection: IncrementalPCA (incremental-SVD merge, V-based `svd_flip`, ddof=1 explained_variance), Gaussian/SparseRandomProjection (property-gated).
-- Kernel: KernelRidge (Cholesky dual solve), KernelDensity (brute-force kernel-sum, log-sum-exp).
-- Spectral: SpectralEmbedding, SpectralClustering (full-spectrum eig → take smallest nontrivial → KMeans).
-- SGD/linear-SVM: MBSGDClassifier/Regressor (sklearn schedules incl. `optimal` + Bottou t0), LinearSVC/SVR (sklearn liblinear objective: `squared_hinge`/`squared_epsilon_insensitive` defaults, regularized intercept via `intercept_scaling`).
-- Naive Bayes: Gaussian/Multinomial/Bernoulli/Complement/CategoricalNB (per-variant smoothing; log-sum-exp predict_proba).
+**Should have (differentiators):**
+- f32 + f64 device path for both algorithms (cuML is GPU f32-only for both — differentiator)
+- Single shared KNN-graph prim feeding both UMAP and HDBSCAN (primitive-first; reusable by future SpectralEmbedding affinity)
+- outlier_scores_ (GLOSH) on HDBSCAN — differentiator vs sklearn.cluster.HDBSCAN (which omits it)
 
-**Should have (differentiators):** f64 device path for all 16 (most GPU libs are f32-only); a single generic kernel-matrix prim reused by KRR/KDE and future kernel-SVM; exact (not approximate) spectral.
-
-**Defer (v3):** `crammer_singer` multiclass, callable/numba kernels, KDE `sample`, spectral `discretize`/`cluster_qr`, tree-based KDE, native sparse interchange, Lanczos/shift-invert smallest-eigenpair solver, Nyström kernel approximation.
+**Defer to v3.x / future:**
+- UMAP transform (new-data embedding) — fast-follow once fit property gate is stable
+- HDBSCAN approximate_predict/membership_vector, store_centers, condensed-tree plot objects
+- Supervised/semi-supervised UMAP, inverse_transform
+- Approximate/NN-Descent KNN graph build (exact brute-force is correct for v3 oracle sizes)
+- Custom callable metrics (no numba on CubeCL)
+- Live FFI check_estimator re-triage (needs maturin+pyarrow host; routed to UAT)
 
 ### Architecture Approach
 
-The v1 five-crate seam is REUSED unchanged and the dependency graph stays acyclic. Every v2 addition is a new file plus a `pub mod`/`pub use` line; no v2 work edits a v1 estimator file. Two new traits are added (`PartialFit<F>` for IncrementalPCA, `ScoreSamples<F>` for KernelDensity); all other traits (`Fit`, `Predict`, `Transform`, `PredictLabels`, `PredictProba`) are reused, and covariance estimators need no new trait (`Fit` + accessors, no `predict`). See [ARCHITECTURE.md](ARCHITECTURE.md).
+v3.0 extends the fixed five-crate workspace (mlrs-kernels -> mlrs-backend -> mlrs-algos -> mlrs-py -> scripts/fixtures) with new files only. The dependency graph is acyclic and unchanged. HDBSCAN uses the "device front-end, host tree back-end" split: the embarrassingly-parallel stages (distance, top-k, mutual-reachability map) run on device via GATHER; the MST (Prim's), condensed-tree, stability extraction, and cluster selection run in plain host Rust — deliberately avoiding the GPU-MST atomics wall that blocks RandomForest. UMAP uses a new umap_layout_step GATHER kernel (one thread per embedding vertex i, owning y[i], scanning incident edges + negative samples into private registers, single write) plus reuse of the v2 graph-Laplacian + eig prims for spectral init (capped at MAX_DIM=64 — init='random' is the default correctness path for realistic sizes).
 
-**Major components:**
-1. `mlrs-kernels` — feature-free `#[cube]` kernels (new: kernel-matrix elementwise map, Laplacian D^{-1/2} scale, SGD per-minibatch grad/update, NB per-class reductions).
-2. `mlrs-backend/src/prims/` — the only kernel-launch site (D-13); five new prim files following the `validate_geometry → compose prims → in-place scale on reused out → return exact handle` contract, each with a PoolStats memory gate.
-3. `mlrs-algos` — estimator structs that COMPOSE prims (never launch kernels); new modules `covariance/`, `projection/`, `kernel/`, `manifold/`, + spectral in `cluster/`, MBSGD/SVM in `linear/`, `naive_bayes/`.
-4. `mlrs-py` — `#[pyclass]` via `any_estimator!` enum (Unfit/F32/F64), dtype-suffixed accessors, `py.detach` + `guard_f64`, pure-Python sklearn shim reusing `MlrsBase`.
-5. `scripts/gen_oracle.py` + committed `tests/fixtures/*.npz` — per-estimator fixtures, with the RandomProjection property-gate exception.
+**Major components (v3 deltas only):**
+1. `mlrs-kernels`: knn_graph.rs (symmetrize map), umap_layout.rs (attract/repel GATHER), mutual_reach.rs (elementwise max), elementwise.rs += umap_fuzzy_map
+2. `mlrs-backend/prims`: knn_graph.rs (distance+topk+symmetrize — the shared prim), umap_layout.rs (host epoch/neg-sample loop + layout kernel), mutual_reach.rs (device front-end), mst.rs (HOST Prim's), condense.rs (HOST condensed-tree + stability)
+3. `mlrs-algos`: builder.rs (shared builder convention), manifold/umap.rs, cluster/hdbscan.rs
+4. `mlrs-py`: estimators/manifold.rs (PyUMAP), extend cluster.rs + lib.rs, python/mlrs/manifold.py, extend cluster.py
 
 ### Critical Pitfalls
 
-Top pitfalls, all grounded in v1 idioms + project memory. See [PITFALLS.md](PITFALLS.md).
+1. **KNN-graph reaches for atomics/SharedMemory (cpu-MLIR panic)** — Compose from the launch-proven top_k prim (distance -> top_k per row -> dense [n,k] pair); no new heap kernel; materialise the graph as [n,k] index+distance arrays (single-owner per row), never as scatter-built CSR. Guard: no Atomic/SharedMemory/F::INFINITY/mutable-bool/shift-loop imports in any KNN kernel. Spike the composed path under --features cpu before UMAP/HDBSCAN consume it.
 
-1. **cpu-MLIR scatter-add panic (SGD/NB/Laplacian)** — naive kernels accumulate into shared weight/class/degree bins (cross-unit atomics or SharedMemory) → compiles under cuda/wgpu but PANICS at launch under `--features cpu`. **Avoid:** GATHER rewrite — one thread per output cell (weight coord / (class,feature) / row), ascending scan, F/u32 accumulators, if-guards, no SharedMemory/atomics.
-2. **RandomProjection value-unmatchable (wrong oracle)** — mlrs's seeded PRNG ≠ NumPy MT19937, so a value oracle reports total failure on correct code. **Avoid:** property gate (JL distortion within `eps`, matrix distribution, seed-reproducibility, `transform == X@components_.T` self-consistency); value-match only `johnson_lindenstrauss_min_dim` (pure arithmetic).
-3. **SGD oracle nondeterminism (and using cuML)** — shuffle RNG + `optimal` schedule + early-stop make a default-config oracle a moving target; cuML diverges. **Avoid:** pinned self-reference oracle (`shuffle=False`, fixed `eta0`/schedule, fixed `max_iter`, `tol=0`, `n_iter_no_change=max_iter`) referencing sklearn, mirroring v1 LogReg; separate looser convergence property test.
-4. **Spectral takes the WRONG eigenvectors** — v1 eig returns full *descending* spectrum; spectral needs *smallest* nontrivial. **Avoid:** sort ascending, drop index 0 (trivial ≈0 vector), take next k; `_deterministic_vector_sign_flip` for embedding output; clustering is sign-immune via `label_perm`; subspace test for degenerate spectra.
-5. **f64-on-rocm runs instead of skipping (gate violation)** — every new f64 oracle case must begin `if capability::skip_f64_with_log() { return; }` (cubecl-cpp 0.10 has F64 unregistered for HIP). Hits EVERY new test file in P7–11; make it a per-file checklist line.
+2. **UMAP layout parallelised over edges (cpu-MLIR panic + nondeterminism)** — Invert to one thread per embedding vertex i (single owner of y[i]), scanning its incident edges + negative samples into private registers, writing y[i] once. This is the vertex-owner GATHER analog of the v2 SGD two-pass solver. Do NOT reuse prims/sgd.rs (wrong gradient/layout); build prims/umap_layout.rs with a new umap_layout_step kernel.
 
-Additional recurring traps: IncrementalPCA merge (mean-correction factor, stack order, V-based `svd_flip`, ddof=1) — test with 2+ batches; LedoitWolf/EmpCov ddof=0 normalization + `shrinkage_ ∈ [0,1]`; NB underflow/smoothing/`var_smoothing` from *global* feature variance; large n×n kernel/Gram/Laplacian tiles overflowing gfx1100 LDS (65536 B) → keep big operands in global memory; per-family f32-on-rocm bands (classifiers/clusterers keep exact label/argmax as the hard gate).
+3. **UMAP value oracle instead of property gate** — Forcing <=1e-5 against umap-learn coordinates reports total failure on a correct implementation (SplitMix64 != NumPy RNG). Gate: (a) value-gate stages 1-4 (fuzzy set, spectral init) at <=1e-5 against umap-learn intermediate arrays; (b) property-gate stage 5 on trustworthiness + kNN-overlap relative to umap-learn's own scores + seed-reproducibility. Never a coordinate value oracle for the layout.
+
+4. **HDBSCAN labels diverge from oracle (MST tie-breaking, noise label, min_samples semantics)** — Use stable-sort MST edge ordering (matching np.argsort reference); extend label_perm to pin -1->-1 (noise is not permutable); resolve min_samples=None->min_cluster_size exactly matching hdbscan semantics; gate against sklearn.cluster.HDBSCAN (not cuML — cuML's epsilon/outlier paths are incomplete). Use jittered AND explicitly-tied fixtures.
+
+5. **Builder retrofit breaks any_estimator! PyO3 machinery** — Keep new() as a thin wrapper over builder().build().expect("defaults valid"); builder is additive. Establish the convention + pilot on 1-2 estimators with the PyO3 suite green before the 28-estimator mechanical sweep. No per-param PhantomData (typestate explosion). Audit every any_estimator! call site when touching any constructor.
 
 ## Implications for Roadmap
 
-Build order 7→8→9→10→11, continuing v1's phase numbering. The seed roadmap order is dependency-correct; the one addition is making the P8→P9 dependency explicit.
+Based on all four research streams, the milestone requires five phases (continuing from v2's Phase 11 -> Phase 12+). Two sequencing variants were proposed across the research files; both are presented here so the roadmapper can decide.
 
-### Phase 7: Covariance & Projection
-**Rationale:** Pure assembly on v1 covariance + SVD — lowest-risk opener, builds confidence and lands the reusable RNG-matrix prim early. First introduces the `PartialFit` trait.
-**Delivers:** `prims/rng.rs` (host PRNG), `prims/incremental_svd.rs` (glue over v1 svd), `PartialFit<F>` trait; EmpiricalCovariance, LedoitWolf, IncrementalPCA, GaussianRandomProjection, SparseRandomProjection.
-**Addresses (FEATURES):** Covariance + Projection families.
-**Avoids (PITFALLS):** RandomProjection wrong-oracle (set property-gate contract up front); IncrementalPCA merge (V-based svd_flip, ddof=1, 2+ batch oracle); LedoitWolf ddof=0 + shrinkage∈[0,1]; f64-on-rocm skip guard.
+---
 
-### Phase 8: Kernel Family
-**Rationale:** Lands the keystone kernel-matrix prim (linear/RBF/poly/sigmoid) that P9 and future kernel-SVM reuse. Introduces the `ScoreSamples` trait.
-**Delivers:** `prims/kernel_matrix.rs` (one elementwise map over distance/Gram), `ScoreSamples<F>` trait; KernelRidge (reuses `cholesky_solve`), KernelDensity (reuses distance + log-sum-exp).
-**Uses (STACK):** existing distance/gemm/cholesky prims + one new elementwise kernel.
-**Implements (ARCH):** `prims/kernel_matrix.rs` + `kernel/` estimator module.
-**Avoids (PITFALLS):** per-kernel log-norm constants (KDE); singular-K fallback (KRR); LDS budget overflow on dense Gram tiles (keep in global); f64-on-rocm skip guard.
+### Variant A: Builder convention leads (ARCHITECTURE.md preferred ordering)
 
-### Phase 9: Spectral Family [HARD DEP on Phase 8]
-**Rationale:** Cashes in v1's hardest-won prim (`eig`) for two estimators cheaply; the Laplacian's affinity *is* `kernel_matrix(Rbf)` from P8 — order is mandatory, not just convenient.
-**Delivers:** `prims/laplacian.rs` (affinity → degree row-reduction → normalized Laplacian); SpectralEmbedding (Fit+Transform), SpectralClustering (Fit+PredictLabels, reuses v1 KMeans).
-**Uses (STACK):** P8 kernel_matrix + v1 eig + v1 kmeans.
-**Avoids (PITFALLS):** Laplacian degree scatter + zero-degree (`d_inv_sqrt` guard, NO `F::INFINITY`); wrong/sign eigenvectors (ascending + drop-0 + sign_flip; clustering via label_perm); LDS overflow on dense Laplacian; f64-on-rocm skip guard.
+**Phase 12 — Builder Convention + Typestate Foundation**
+**Rationale:** Establish the shared builder convention FIRST so UMAP/HDBSCAN (Phases 14-15) are born builder-fronted, avoiding a retroactive re-touch. Pure API work, no algorithm, lowest risk, unblocks everything downstream. Does NOT retrofit existing estimators yet (that is Phase 16).
+**Delivers:** mlrs-algos/src/builder.rs (shared builder macro/convention; runtime fitted-flag via Option<DeviceArray>; reuse existing BuildError); convention applied to the 2 new estimator shells.
+**Addresses:** Builder DX feature; foundation for the 30-estimator retrofit.
+**Avoids:** Pitfall 9 (typestate explosion / any_estimator! break) by establishing the safe convention before scale.
+**Research flag:** STANDARD PATTERN — the convention is already proven on 9 estimators; no additional phase research needed.
 
-### Phase 10: SGD / Linear-SVM
-**Rationale:** The single genuinely new solver; unblocks four estimators at once and carries the highest cpu-MLIR risk. Budget a research spike before planning.
-**Delivers:** `prims/sgd.rs` (hinge/log/squared/ε-insensitive losses; l1/l2/elasticnet; LR schedules incl. `optimal` + Bottou t0); MBSGDClassifier/Regressor, LinearSVC, LinearSVR (sklearn liblinear converged-optimum via v1 CD).
-**Uses (STACK):** gemm + reductions + host SplitMix64 shuffle.
-**Avoids (PITFALLS):** SGD cross-unit atomics (two-pass GATHER kernel); nondeterministic oracle (pinned shuffle=False/fixed-schedule self-reference, sklearn NOT cuML); squared_hinge default + regularized intercept (LinearSVC); f64-on-rocm skip guard; named f32 band with exact predicted labels as hard gate.
+**Phase 13 — KNN-Graph Primitive (the feasibility keystone)**
+**Rationale:** The shared substrate both UMAP and HDBSCAN depend on; must be standalone-validated before either consumes it (primitive-first discipline). The cpu-MLIR feasibility answer lives here.
+**Delivers:** prims/knn_graph.rs (distance+topk+symmetrize); knn_graph_test.rs (exact gate vs sklearn.neighbors.NearestNeighbors; PoolStats memory gate); self-inclusion parameter; directed output contract.
+**Addresses:** KNN-graph primitive feature; UMAP + HDBSCAN prerequisite.
+**Avoids:** Pitfalls 1, 3, 4 (atomics/SharedMemory; self-neighbour/symmetrisation; n x n memory overflow).
+**Research flag:** SPIKE NEEDED before planning — confirm the composed-from-top_k path launches on --features cpu (MEDIUM confidence; precedent is favorable but not verified for this exact composition).
 
-### Phase 11: Naive Bayes
-**Rationale:** Wide-but-shallow (reductions only) — highest coverage per unit effort, ideal closing bookend. Five mutually-independent, parallel-buildable estimators.
-**Delivers:** Gaussian/Multinomial/Bernoulli/Complement/CategoricalNB (all Fit+PredictLabels+PredictProba); no new prim.
-**Avoids (PITFALLS):** per-class scatter-add (one-owner-per-(class,feature) GATHER); underflow/smoothing/`var_smoothing` from global variance; log-sum-exp predict_proba (rows sum to 1); per-variant quirks (Bernoulli `(1-x)log(1-p)`, Complement argmin/L1-norm, Categorical ragged list); f64-on-rocm skip guard.
+**Phase 14 — UMAP**
+**Rationale:** Hard dep on Phase 12 (builder) and Phase 13 (KNN-graph). The stochastic layout introduces a new GATHER kernel (umap_layout_step) that requires a cpu-MLIR spike. UMAP is file-disjoint from HDBSCAN.
+**Delivers:** prims/umap_layout.rs + umap_layout_step kernel; umap_fuzzy_map kernel; manifold/umap.rs estimator; estimators/manifold.rs PyUMAP; python/mlrs/manifold.py shim; property-gate test suite (trustworthiness + kNN-overlap + seed-reproducibility vs umap-learn 0.5.12) + value gate for stages 1-4.
+**Addresses:** UMAP feature; spectral init reuses v2 graph-Laplacian + eig prims (default init='random' for realistic sizes).
+**Avoids:** Pitfalls 2 and 5 (edge-scatter SGD; wrong oracle type).
+**Research flag:** SPIKE NEEDED before planning — vertex-owner GATHER umap_layout_step under cpu-MLIR (MEDIUM confidence); also exact property-gate thresholds need measurement on a first fixture run.
+
+**Phase 15 — HDBSCAN**
+**Rationale:** Hard dep on Phase 12 (builder) and Phase 13 (KNN-graph); feature-disjoint from Phase 14 (can be built in parallel after Phase 13 if resources allow). Device front-end + host tree back-end split is clear.
+**Delivers:** prims/mutual_reach.rs + mutual_reach_map kernel; prims/mst.rs (HOST Prim's); prims/condense.rs (HOST condensed-tree + stability); cluster/hdbscan.rs estimator; PyHDBSCAN; cluster.py shim extension; exact-label test suite (label_perm with -1-pinned; jittered + tied fixtures; precomputed-distance oracle path).
+**Addresses:** HDBSCAN feature; device/host split dodges GPU-tree-atomics wall.
+**Avoids:** Pitfalls 6 and 7 (label divergence; MST/tree atomics + float reorder).
+**Research flag:** SPIKE NEEDED before planning — confirm host MST + condensed-tree matches hdbscan reference exactly on tie-heavy fixtures.
+
+**Phase 16 — Builder Retrofit Sweep + Shim Coverage**
+**Rationale:** The one broad-edit, parallel-unsafe phase. Touching ~24 existing estimator files must be isolated so it never contends with new-estimator phases. Placed last to minimize blast radius.
+**Delivers:** Builder convention retrofitted to the ~24 pre-Phase-10 estimators (new() kept as thin wrappers); test_params.py/test_estimator_checks.py extended to UMAP/HDBSCAN + retrofitted set; all FFI-free invariant unit tests (get_params/set_params/clone/double-fit reset/pre-fit-raises) green in CI.
+**Addresses:** 30-estimator builder retrofit; full Python shim coverage.
+**Avoids:** Pitfalls 9, 10, 11 (typestate explosion; default drift; check_estimator failures).
+**Research flag:** STANDARD PATTERN — the retrofit is mechanical; the any_estimator! compatibility invariants are well-understood from v2. Pilot on 1-2 estimators under the PyO3 suite before the 28-estimator sweep.
+
+---
+
+### Variant B: Retrofit trails (alternative — PITFALLS.md and STACK.md implicit ordering)
+
+The PITFALLS.md phase numbering assumed: Phase 12 = KNN-graph prim, Phase 13 = UMAP, Phase 14 = HDBSCAN, Phase 15 = builder convention + retrofit, Phase 16 = sklearn shim. Under this variant, UMAP and HDBSCAN are born with new(...) constructors and the builder is added in a cleanup sweep afterward.
+
+**Trade-off:** Under Variant B, UMAP and HDBSCAN must be lightly re-touched in Phase 15 to add the builder front door. Under Variant A, the builder is established first (one extra phase before any algorithm work) and the algorithm phases carry it from birth. Both variants agree the retrofit sweep is the higher blast-radius work and must be isolated as its own phase. The disagreement is only whether the convention-foundation phase belongs first (A) or after the algorithms are working (B).
+
+**Recommendation for roadmapper:** Variant A is preferred. The cost of a dedicated builder-convention phase (Phase 12) is low (pure API, no device work, no algorithm risk); the benefit is that UMAP and HDBSCAN are born idiomatic and never need a re-touch. Variant B is acceptable if the roadmapper wants algorithm value (KNN graph, UMAP, HDBSCAN) to land as early as possible and is comfortable with a minor re-touch to UMAP/HDBSCAN in the retrofit sweep.
+
+---
 
 ### Phase Ordering Rationale
 
-- **Dependency-driven:** RNG/incremental-SVD (P7) → IncrementalPCA/RandomProjection; kernel-matrix (P8) → spectral affinity (P9) AND future kernel-SVM; Laplacian+eig (P9) reuse v1 eig/KMeans; SGD solver (P10) → all four SGD/SVM estimators; reductions-only (P11) needs nothing new.
-- **Risk-tiered:** P7 and P11 are pure assembly (confidence bookends); P8/P9 are MEDIUM (kernel-matrix + smallest-eig); P10 is the HIGH-risk single new solver isolated to one phase.
-- **Pitfall-driven:** the P8→P9 hard dependency prevents duplicating the kernel-matrix map in the Laplacian; isolating SGD in P10 contains the cpu-MLIR GATHER risk; bookending with assembly phases keeps momentum either side of the hard solver.
+- KNN-graph before UMAP/HDBSCAN is mandatory in both variants: it is the shared substrate; primitive-first discipline requires standalone validation before consumers exist.
+- UMAP and HDBSCAN are file-disjoint (manifold/ vs cluster/, separate prim sets) and can be planned/built in parallel after the KNN-graph prim lands — same pattern as v2's parallel five-family wave after PRIM-06 through PRIM-10.
+- Retrofit sweep last in both variants: the ~24-file broad edit is the one parallel-unsafe work item in the milestone; isolating it prevents merge contention with algorithm phases.
+- Builder convention leads in Variant A because UMAP/HDBSCAN adopting it from birth is cheaper than a retroactive re-touch; in Variant B the algorithms land first and the convention arrives as cleanup.
 
 ### Research Flags
 
-Phases needing a research spike during planning (the three genuine unknowns from `research/questions.md`):
-- **Phase 7:** `[v2-P1]` incremental-SVD merge — settle "full Jacobi per batch vs dedicated rank-update kernel" and the f32-on-rocm stability of the stacked re-SVD.
-- **Phase 9:** `[v2-P3]` smallest-eigenpair extraction — confirm full-spectrum-then-slice is acceptable at v2 sizes (vs Lanczos/shift-invert); document the problem-size cap.
-- **Phase 10:** `[v2-P4]` SGD under cpu-MLIR — spike the two-pass GATHER kernel and the pinned deterministic oracle before wiring any of the four estimators.
+Phases needing spikes before planning (MEDIUM confidence unknowns):
 
-Phases with standard/established patterns (research-phase can be skipped):
-- **Phase 8:** kernel-matrix is a known elementwise map over distance/Gram; design is settled in research.
-- **Phase 11:** Naive Bayes is reductions-only over the validated v1 reduce prim; per-variant math is fully specified in FEATURES.md.
+- **Phase 13 (Variant A) / Phase 12 (Variant B) — KNN-graph prim:** Spike the composed-from-top_k GATHER path (distance -> top_k -> dense [n,k] -> symmetrize map) under --features cpu. Precedent is strongly favorable (v2 top_k launches on cpu-MLIR first try; same idiom), but the symmetrize-map step is new and must be confirmed.
+- **Phase 14 (Variant A) / Phase 13 (Variant B) — UMAP:** Spike the vertex-owner umap_layout_step GATHER kernel on cpu-MLIR before planning the estimator. Also determine the exact property-gate thresholds (trustworthiness floor relative to umap-learn) by running a small prototype.
+- **Phase 15 (both variants) — HDBSCAN:** Spike host MST (Prim's) + condensed-tree exactness vs the hdbscan reference on a tied-distance fixture. MST tie-breaking is the main label-divergence risk.
+
+Phases with standard patterns (no phase-level research needed):
+
+- **Phase 12 (Variant A) — Builder convention:** The pattern is proven on 9 shipped estimators; BuildError already exists; the runtime fitted-flag via Option<DeviceArray> matches gaussian_nb.rs's shipped state model. Plan directly.
+- **Phase 16 (Variant A) / Phase 15-16 (Variant B) — Builder retrofit + shim coverage:** Mechanical retrofit following the established convention. The any_estimator! compatibility rules are well-documented from v2. Pilot on 1-2 estimators before sweeping; no dedicated research phase.
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | crates.io versions verified 2026-06-14; cubek-random/pyo3 decisions grounded in Context7 + transitive-pin analysis + direct source reads. |
-| Features | HIGH | sklearn semantics verified live against docs + cuML source; parity-sensitive defaults (SGD `optimal`/t0, LinearSVC `squared_hinge`/`dual='auto'`, NB smoothing) explicitly confirmed. |
-| Architecture | HIGH for placement/signatures/traits/dispatch/oracle (mirrors shipped files); MEDIUM for incremental-SVD merge stability, SGD-under-cpu-MLIR, smallest-eigenpair — the three open questions. |
-| Pitfalls | HIGH for backend/cpu-MLIR + oracle traps (v1 idioms + memory) and sklearn parity math; MEDIUM for exact f32-on-rocm band magnitudes (must be measured empirically per family, as in v1). |
+| Stack | HIGH | Zero new dependencies; all pins verified from shipped workspace Cargo.toml and pyproject.tomls; oracle-venv strategy proven from v1/v2. One watch-item: numba/numpy-2.5 compat in the oracle-regen venv — fully mitigated by committed .npz fixture blobs (CI is decoupled). |
+| Features | HIGH | Algorithm parameter surfaces verified against cuML v26.08 source (local), umap-learn and hdbscan stable documented APIs, and sklearn estimator contract. MEDIUM item: exact f32-on-rocm band magnitudes for UMAP/HDBSCAN continuous outputs — measured empirically per family during Phase 14/15 validation, same posture as every prior phase. |
+| Architecture | HIGH (placement/boundaries/device-host split) / MEDIUM (two execution unknowns) | File placement, trait deltas, data-flow seams, and the device-host split are grounded in shipped code reads. Two MEDIUM items: (1) umap_layout_step single-owner GATHER on cpu-MLIR (precedent strongly favorable but unconfirmed); (2) host MST/condensed-tree exactness on tie-heavy fixtures. Both are SPIKE NEEDED before their respective phase plans. |
+| Pitfalls | HIGH | Every pitfall is grounded in v1/v2 codebase idioms, project memory, CONCERNS.md cuML reference-behavior anti-patterns, and the hdbscan/umap-learn source and validation literature. The cuML UMAP vertex-parallel nondeterminism bug and the cuML HDBSCAN epsilon-path incompleteness are HIGH-confidence failure modes to avoid. |
 
-**Overall confidence:** HIGH
+**Overall confidence:** HIGH for the approach; MEDIUM for two specific execution spikes that must precede Phase 14 and Phase 15 planning.
 
 ### Gaps to Address
 
-- **Incremental-SVD f32 stability (P7):** the stacked re-SVD merge may compound f32 error on rocm. Handle: research spike at plan time; reuse v1 Jacobi SVD; expect a documented f32 band for components/explained_variance; gate with a 2+ batch oracle.
-- **Smallest-eigenpair extraction (P9):** full-spectrum-then-slice is the v2 decision but has an O(n³) size ceiling. Handle: confirm and document the `n_samples` cap during planning; Lanczos/shift-invert deferred to v3.
-- **SGD under cpu-MLIR (P10):** the two-pass GATHER kernel is designed but unproven on the MLIR backend. Handle: spike the cpu launch (not just compile) before wiring estimators; verify no Atomic/SharedMemory imports.
-- **f32-on-rocm band magnitudes (P7–11):** predicted per-family (LedoitWolf, IncrementalPCA, KernelRidge/Density, Spectral, SGD/SVM, GaussianNB likely need bands) but actual magnitudes must be measured on hardware. Handle: measure during each phase's validation; classifiers/clusterers keep exact label/argmax as the hard gate; never loosen the global tolerance.
-- **Sparse densify memory cost:** densifying large term-count matrices can blow the per-phase memory gate. Handle: document in estimator docstrings; let the existing BufferPool gate catch regressions; native CSR is v3.
+- **UMAP layout-step cpu-MLIR feasibility (spike before Phase 14):** Run a minimal umap_layout_step kernel (one thread per vertex, scan neighbors, write embedding row) under --features cpu before committing to the phase plan. If it panics, the ARCHITECTURE.md host-loop fallback for the inner step is the immediate mitigation. Resolution: spike takes < 1 day.
+- **Host MST tie-breaking exactness (spike before Phase 15):** Run Prim's MST + condensed-tree on a small fixture with deliberate tied mutual-reachability edges against hdbscan Python reference. Lock the tie-breaking convention (stable-sort on weight, lowest-index tiebreak for equal weights) before the phase plan commits to the exact-label gate. Resolution: spike takes < 1 day.
+- **UMAP property-gate thresholds (measure during Phase 14 fixture generation):** The trustworthiness and kNN-overlap floors are relative-to-umap-learn (not hard absolute values) and must be calibrated on the first oracle fixture run. Design the gate as mlrs_trustworthiness >= umap_learn_trustworthiness - delta and measure delta empirically.
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- Context7 `/tracel-ai/cubek` + `/tracel-ai/cubecl` — cubek-random API (no seed arg; shared-memory Tausworthe); CubeCL 0.10 multi-runtime.
-- crates.io API (2026-06-14) — cubecl 0.10.0, cubek-matmul/reduce 0.2.0, arrow 59.0.0, pyo3 0.28/0.29.
-- scikit-learn docs verified live 2026-06-14 — SGDClassifier (optimal/t0/schedules/stopping), LinearSVC/LinearSVR (squared_hinge/dual/liblinear), IncrementalPCA merge, LedoitWolf shrinkage, RandomProjection JL + sparse density, KDE kernels, spectral normalized-Laplacian + deterministic sign flip.
-- cuML v26.08 source (read-only reference) — ledoit_wolf, kernel_ridge, sgd.pyx (confirms cuML is a *subset* of sklearn), naive_bayes, manifold, svm, linear_model.
-- mlrs shipped code — `traits.rs`, `prims/{covariance,distance,kmeans,lbfgs,cholesky,reduce}.rs`, `dispatch.rs`, `estimators/decomposition.rs`, `python/mlrs/{base,decomposition,linear}.py`, `gen_oracle.py`, `Cargo.toml`.
-- Project memory (HIGH) — cubecl-cpu no-SharedMemory/no-atomics; rocm f64-unsupported gate; gfx1100 LDS 65536 B; f32 band policy; oracle /tmp-venv regen; cuML diverges from sklearn.
+- mlrs codebase (shipped, direct reads): crates/mlrs-algos/src/{traits,error}.rs, crates/mlrs-algos/src/{naive_bayes,linear,cluster}/*, crates/mlrs-backend/src/prims/{topk,distance,eig,laplacian,sgd}.rs, crates/mlrs-py/src/{dispatch,lib}.rs, crates/mlrs-py/python/mlrs/base.py — confirm builder/shim partial existence, top_k GATHER idiom, any_estimator! structure, BuildError, MlrsBase
+- .planning/PROJECT.md (v3 scope, gate regime, primitive-first discipline, phase numbering, deferred items)
+- .planning/milestones/v2.0-research/{STACK,FEATURES,ARCHITECTURE,PITFALLS,SUMMARY}.md (GATHER idiom validation, RandomProjection D-12 property-gate precedent, exact-label D-08 rule, pyo3 0.28/arrow-59 ABI pin)
+- Project memory: cubecl-cpu-no-shared-memory.md, rocm-is-runnable-gpu-gate.md, oracle-fixture-regen-needs-venv.md, cubecl-algo-crates-moved-to-cubek.md
+- cuML v26.08 source (local, read-only): cuml-main/python/cuml/cuml/manifold/umap/umap.pyx, cuml-main/python/cuml/cuml/cluster/hdbscan/hdbscan.pyx — algorithm param surfaces and defaults; CONCERNS.md — vertex-parallel nondeterminism bug, epsilon-path incompleteness warnings
+- PyPI JSON API (2026-06-22): umap-learn 0.5.12, hdbscan 0.8.44, scikit-learn 1.9.0 version/dep metadata
+- crates.io API (2026-06-22): bon 3.9.3, typed-builder 0.23.2, derive_builder 0.20.2 — rationale for rejection
+- scikit-learn estimator development guide: check_estimator invariants, get_params/set_params/clone contract, trailing-_ fitted-attr convention
+- hdbscan reference source (scikit-learn-contrib/hdbscan/hdbscan_.py): stable-sort MST edge ordering, noise -1, probabilities_ formula, min_samples semantics
 
 ### Secondary (MEDIUM confidence)
-- `research/questions.md` open unknowns `[v2-P1]`/`[v2-P3]`/`[v2-P4]` — incremental-SVD merge stability, smallest-eigenpair approach, SGD-under-cpu-MLIR — to resolve before P7/P9/P10.
-- Predicted f32-on-rocm band needs per family — must be measured empirically on rocm hardware during each phase (as in v1).
-- RAPIDS issues #2113/#2114 — cuML MBSGD default-schedule divergence from sklearn.
-
-### Tertiary (LOW confidence)
-- None — all findings traced to verified sources, shipped code, or scoped open questions.
+- UMAP validation practice literature: trustworthiness/continuity/kNN-preservation as structure-preservation gate; 5-15% coordinate variation across implementations confirms value-matching is infeasible
+- GitHub lmcinnes/umap: numpy > 2.0 / numba compatibility discussion — corroborates the oracle-venv watch-item
+- cubecl 0.10 cpu-MLIR lowering behavior: SharedMemory/atomic failure modes documented in project memory (empirical from v1/v2 codebase)
 
 ---
-*Research completed: 2026-06-14*
+*Research completed: 2026-06-22*
 *Ready for roadmap: yes*

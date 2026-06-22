@@ -1,354 +1,359 @@
 # Pitfalls Research
 
-**Domain:** Adding ~16 sklearn-compatible estimators to mlrs (Rust/CubeCL rewrite of cuML), gated cpu(f64) + rocm(f32) vs the scikit-learn ≤1e-5 oracle
-**Researched:** 2026-06-14
-**Confidence:** HIGH for backend/cpu-MLIR and oracle traps (grounded in v1 codebase idioms + project memory); HIGH for the sklearn parity math (verified against sklearn source); MEDIUM for the exact f32-on-rocm band magnitudes (must be measured empirically per family, as in v1)
+**Domain:** Adding UMAP + HDBSCAN (on a shared KNN-graph primitive), a Rust-native builder-pattern API (retrofit across 30 estimators), and a pure-Python sklearn shim to mlrs (Rust/CubeCL rewrite of cuML), gated cpu(f64)+rocm(f32) against scikit-learn ≤1e-5 / umap-learn property gate / hdbscan exact-label gate
+**Researched:** 2026-06-22
+**Confidence:** HIGH for cpu-MLIR kernel constraints + builder-retrofit + sklearn-shim traps (grounded in v1/v2 codebase idioms, project memory, and existing `top_k`/`any_estimator!` source); HIGH for the UMAP stochastic-gate strategy and HDBSCAN label-divergence sources (verified against umap-learn validation practice + hdbscan reference source); MEDIUM for exact f32-on-rocm band magnitudes (must be measured empirically per family, as v1/v2 did)
 
-This file is scoped to **these estimators on THIS backend**. Generic ML advice is omitted. Every pitfall names the estimator/phase it hits, gives the concrete GATHER rewrite / sign convention / oracle construction, and maps to a phase. Phase numbers continue v1 numbering: **Phase 7 = Covariance & projection, 8 = Kernel, 9 = Spectral, 10 = SGD/linear-SVM, 11 = Naive Bayes** (per `seeds/v2-breadth-roadmap.md`, "Phase numbering continues from v1.0").
+This file is scoped to **adding THESE features to THIS backend** — the cpu-MLIR no-SharedMemory/no-atomics GATHER discipline, the cpu(f64)+rocm(f32) gate with f64-on-rocm skip-with-log, and the oracle discipline (sklearn ≤1e-5 where it exists; umap-learn **property** gate for the stochastic UMAP layout; hdbscan **exact-labels-up-to-permutation** for HDBSCAN). Generic ML/UMAP/HDBSCAN tutorials are omitted. Every pitfall names the feature/phase it hits, the concrete prevention, and a phase. **Phase numbering continues from v2.0: next phase = 12.** A working phase assumption (refine in the roadmap): **Phase 12 = KNN-graph prim, 13 = UMAP, 14 = HDBSCAN, 15 = Rust-native builder retrofit, 16 = pure-Python sklearn shim.**
+
+The two make-or-break items per the downstream consumer — **the UMAP stochastic-gate strategy (Pitfall 5)** and **the cpu-MLIR KNN-graph feasibility (Pitfalls 1–3)** — lead the list.
 
 ---
 
 ## Critical Pitfalls
 
-### Pitfall 1: SGD minibatch weight update naively wants cross-unit atomics (cpu-MLIR launch panic)
+### Pitfall 1: KNN-graph construction reaches for cross-unit atomics / SharedMemory and panics at cpu-MLIR launch
 
 **What goes wrong:**
-The obvious SGD kernel parallelizes over the `batch_size` samples and has each sample-thread accumulate its gradient contribution into the *shared* weight vector `w[j] += -lr * grad_ij`. On the cpu MLIR backend this either needs `Atomic::add` across units or a SharedMemory reduction with a mutable accumulator — exactly the pattern that COMPILED but PANICKED at launch in v1 ("failed to run pass" in cubecl_cpu MLIR lowering). On rocm it serializes/races.
+The shared KNN-graph prim is the v3 keystone and the single highest cpu-MLIR risk. Two natural kernel shapes both fail:
+- **Heap/insertion-sort per query row with a mutable running heap** — uses a mutable-bool "is this slot used" flag, `F::INFINITY` sentinels to initialise the heap, and a shift-loop to insert into the sorted prefix. All three (mutable bool, `F::INFINITY`, shift-loop) are on the v1/v2 cpu-MLIR forbidden list and panic at *launch* ("failed to run pass" in cubecl_cpu MLIR lowering), not compile.
+- **Scatter into a CSR adjacency** where each query writes its k neighbour edges into a shared edge array via an atomic running offset — cross-unit atomic, which cpu-MLIR cannot lower.
 
 **Why it happens:**
-SGD is "embarrassingly per-sample" so the instinct is one thread per sample. But every sample writes the *same* output cells (the weight vector), which is a multi-writer reduction — the thing cpu-MLIR cannot lower (no cross-unit atomics) and the thing the v1 memory note explicitly warns against (mutable accumulators in SharedMemory).
+KNN is taught as "maintain a max-heap of size k while scanning candidates" — inherently a mutable-accumulator, sentinel-initialised, shift-on-insert structure. And building a graph "feels" like emitting edges into a shared list (scatter). Both instincts are exactly what broke earlier mlrs kernels.
 
-**How to avoid (GATHER rewrite):**
-Split each minibatch step into TWO single-owner passes, mirroring the v1 GATHER idiom (single-owner outputs, only F/u32 accumulators, if-guards, no SharedMemory):
-1. **Gradient-build pass** — one thread per *weight coordinate* `j` (single owner of `g[j]`). Each `g[j]` thread reads the whole minibatch and computes `g[j] = (1/B) * Σ_i loss'(margin_i) * x_ij + reg'(w_j)` with an ascending scan over `i`. The margin `margin_i = Σ_j w_j x_ij` is precomputed by a prior GEMV pass (reuse v1 GEMM, single-owner per row). No two threads write the same cell.
-2. **Apply pass** — one thread per `j`: `w[j] = w[j] - lr * g[j]` (and the averaged-SGD running mean as a second single-owner buffer).
-This makes the whole step a sequence of GATHER kernels with F-only accumulators and no SharedMemory. Loss derivatives (hinge / log / squared / ε-insensitive) become branch-on-`u32`-flag, not mutable-bool while-loops.
+**How to avoid (reuse the v1 `top_k` GATHER prim, do NOT write a new heap kernel):**
+mlrs already has a **launch-proven** `top_k` (`crates/mlrs-backend/src/prims/topk.rs`) that returns the k smallest distances + column indices ascending, single-owner per output row, no SharedMemory, no `F::INFINITY`, no shift-loop. The KNN-graph prim should be a thin composition:
+1. v1 pairwise `distance` prim → dense `n×n` (or tiled) distance (single-owner per cell, already cpu-MLIR-safe).
+2. v1 `top_k` per row → `(indices[n,k], dists[n,k])`. This is the whole neighbour search; no new heap kernel.
+3. Materialise the graph as a **dense `[n,k]` index+distance pair** (the format UMAP's fuzzy-set and HDBSCAN's core-distance both consume directly), NOT a scatter-built CSR. Any later CSR/symmetrisation is a *single-owner* transform (Pitfall 3), not a scatter.
+Loop guards over candidates use **ascending u32 counters with `if`-guards**, never mutable bool / `while`-on-flag.
 
 **Warning signs:**
-Kernel compiles under `--features cuda`/`wgpu` but the `--features cpu` test panics at *launch* (not compile) with an MLIR "failed to run pass" message; or any `Atomic`/`SharedMemory` import in the SGD kernel module.
+Any new `*.rs` kernel module in the KNN-graph prim importing `Atomic` or `SharedMemory`; any `F::INFINITY` literal; any `while` loop with a mutable-bool condition; a kernel that compiles under `--features rocm` but panics at launch under `--features cpu`.
 
-**Phase to address:** Phase 10 (SGD solver prim). This is the single genuinely-new solver of v2 and the highest-risk cpu-MLIR item — spike the two-pass GATHER kernel before wiring any of the four estimators (MBSGDClassifier/Regressor, LinearSVC/SVR).
-
----
-
-### Pitfall 2: Naive Bayes per-class accumulation naively wants scatter-add into class bins (cpu-MLIR panic)
-
-**What goes wrong:**
-The natural NB fit kernel loops over samples and does `class_sum[y_i, j] += x_ij` — a scatter-add keyed by the label `y_i`. Multiple sample-threads hit the same `(class, feature)` cell → cross-unit atomic / mutable SharedMemory accumulator → cpu-MLIR launch panic, same failure class as Pitfall 1.
-
-**Why it happens:**
-Per-class sufficient statistics (class counts, feature sums, feature sum-of-squares for GaussianNB) feel like a histogram, and histograms are the canonical atomics use-case. But the cpu-MLIR backend forbids exactly this.
-
-**How to avoid (GATHER rewrite):**
-Invert the parallelism so each output cell has ONE owner:
-- One thread per `(class c, feature j)` cell. That thread scans all `n` samples once (ascending) with an `if (y_i == c)` guard and accumulates into its private register, writing `theta[c,j]` exactly once. Class counts are one thread per class with the same guard.
-- For GaussianNB also accumulate `Σ x²` in a parallel single-owner buffer (then `var = Σx²/N - mean²`, matching sklearn's biased population variance, see Pitfall 9).
-- CategoricalNB: one owner per `(class, feature, category)` cell.
-Cost is `O(K·d·n)` reads but n is the only large axis and reads are cheap/coalescable; v2 problem sizes make this fine and it is 100% GATHER (F/u32 accumulators, u32 label compare, if-guard).
-
-**Warning signs:** Any label-indexed write target `out[y_i]`; any `Atomic` in NB kernels.
-
-**Phase to address:** Phase 11 (Naive Bayes family — Gaussian/Multinomial/Bernoulli/Complement/Categorical). "Reductions only" in the seed roadmap is correct *only if* the per-class reductions are written as single-owner GATHER kernels.
+**Phase to address:** Phase 12 (KNN-graph prim). **Spike the compose-from-`top_k` path and confirm `--features cpu` launch BEFORE UMAP/HDBSCAN consume it** — this is the feasibility gate for the whole milestone. Primitive-first discipline (land + standalone-validate the prim before consumers) is non-negotiable here.
 
 ---
 
-### Pitfall 3: Graph-Laplacian degree normalization wants a scatter over edges (cpu-MLIR) and silently breaks on zero-degree / disconnected nodes
+### Pitfall 2: UMAP SGD layout update wants per-edge scatter into shared embedding coordinates (cpu-MLIR panic + nondeterminism, exactly cuML's bug)
 
 **What goes wrong:**
-Building the normalized Laplacian `L_sym = I - D^{-1/2} W D^{-1/2}` from an affinity `W`, the naive kernel iterates over edges and scatter-adds into a degree vector `D`, then divides. Edge-scatter is multi-writer (cpu-MLIR panic). Separately, when a node has degree 0 (isolated point at the chosen affinity/`n_neighbors`), `D^{-1/2}` is `inf` → NaN rows → eig returns garbage. `F::INFINITY` literals in the kernel are also on the v1 cpu-MLIR forbidden list.
+The UMAP optimisation loop is "for each edge (i,j): pull `y_i`,`y_j` together; for each negative sample (i,c): push apart." The obvious kernel parallelises **over edges** and writes `y[i] += ...` and `y[j] -= ...`. Multiple edge-threads touch the same embedding row → cross-unit atomic / mutable accumulator → cpu-MLIR launch panic (same class as v2 Pitfall 1/2). cuML hit the *same* shape as a non-determinism bug: vertex-parallel races in `optimize_batch_kernel.cuh` (CONCERNS.md: "UMAP Non-Determinism Under Vertex-Parallel Kernels", fixed in 26.06 by enforcing sequential vertex-parallel behaviour). The cuML reference kernel is also 1,165 lines of warp-shuffle + shared-memory collision handling (CONCERNS.md porting risk) — do NOT port it.
 
 **Why it happens:**
-Degree is a row-sum that *looks* like a reduction over a sparse edge list; and dense affinity construction hides the zero-degree case until a sparse/`n_neighbors` graph exposes it.
+Edge-parallel SGD is the textbook UMAP layout. But edge-parallel = multi-writer on vertices, which is both the cpu-MLIR forbidden pattern and a source of the very nondeterminism that makes UMAP hard to gate.
 
-**How to avoid (GATHER rewrite + guard):**
-- Keep `W` dense at v2 sizes and compute `D[i]` as a **single-owner row-reduction** (one thread per row `i` sums row `i`) — reuse the v1 reduce prim, no scatter, no SharedMemory accumulator.
-- Compute `d_inv_sqrt[i]` with an explicit guard producing a typed zero, NOT infinity: `if D[i] > eps { rsqrt(D[i]) } else { 0 }`. Do not emit `F::INFINITY`. Then `L[i,j] = (i==j ? 1 : 0) - d_inv_sqrt[i]*W[i,j]*d_inv_sqrt[j]`, one owner per `(i,j)`.
-- This matches sklearn's `_set_diag` / degree handling, which guards against zero degrees rather than dividing by them.
+**How to avoid (vertex-owner GATHER, mirroring the v2 SGD two-pass idiom):**
+Invert to **one thread per embedding vertex `i`** (single owner of `y[i]`). Each `i`-thread scans its own incident edges (from the dense `[n,k]` KNN-graph, Pitfall 1) and its own assigned negative samples, accumulating the net gradient for `y[i]` into private registers, then writes `y[i]` once. This is the v2 SGD "gradient-build pass = one owner per coordinate, apply pass = one owner" idiom applied to vertices. Negative sampling indices are drawn from the **SplitMix64 device/host PRNG** (project memory: no OsRng; seeded reproducible PRNG), generated single-owner per vertex. This also fixes determinism for free — single-owner writes are race-free, so same seed → identical mlrs embedding across runs (the determinism leg of the property gate, Pitfall 5).
 
-**Warning signs:** NaN/inf in the Laplacian; eig returning constant or exploding eigenvectors; any `F::INFINITY` or edge-indexed scatter in the Laplacian kernel.
+**Warning signs:**
+Any UMAP kernel parallelised over edges with `y[i] += / y[j] -=`; any `Atomic`/`SharedMemory` import; embedding differs across two identical-seed runs (race re-introduced); cpu launch panic.
 
-**Phase to address:** Phase 9 (graph-Laplacian prim → SpectralEmbedding / SpectralClustering).
+**Phase to address:** Phase 13 (UMAP layout). Spike the vertex-owner SGD kernel on `--features cpu` before wiring the estimator.
 
 ---
 
-### Pitfall 4: Spectral embedding takes the WRONG eigenvectors (sign + the zero-eigenvector skip + ordering)
+### Pitfall 3: KNN-graph symmetrisation, self-neighbour inclusion, and tie-handling diverge silently from the references
 
 **What goes wrong:**
-v1's Jacobi eig returns the **full spectrum in descending order** (the convention used by PCA/TruncatedSVD). Spectral methods need the **smallest** nontrivial eigenvectors of the Laplacian, and must **drop the first** (the constant eigenvector at eigenvalue ≈0). Three independent ways to get it wrong: (a) taking the largest instead of smallest, (b) keeping the trivial eigenvector 0, (c) per-component sign disagreeing with sklearn so every oracle value is off by a sign.
+Four independent, quiet correctness bugs in the graph stage that both consumers inherit:
+1. **Self-neighbour:** A brute-force `top_k` over the full `n×n` distance returns each point as its OWN nearest neighbour (distance 0 at lowest index — and mlrs `top_k` uses a **lowest-index tie-break**, so the self-index always wins the 0-distance tie). UMAP and HDBSCAN both expect the k neighbours *excluding self* (umap-learn) — using `min_samples+1` and dropping the self-column is the reference convention (hdbscan does `tree.query(X, k=min_samples+1)`). Forgetting to drop self silently shifts every neighbourhood by one and corrupts core distances.
+2. **Symmetrisation:** UMAP's fuzzy simplicial set is the **fuzzy union** `A + Aᵀ − A∘Aᵀ` of the directed fuzzy graph, NOT a plain `max(A, Aᵀ)` or `(A+Aᵀ)/2`. HDBSCAN's mutual-reachability is `max(core_i, core_j, d_ij)` — symmetric by construction but only if `core` is computed on the self-dropped k-graph. Mixing these up (using UMAP's union for HDBSCAN, or arithmetic mean for UMAP) produces plausible-but-wrong graphs.
+3. **Tie-handling vs the reference:** mlrs `top_k` breaks distance ties by **lowest column index**; umap-learn/hdbscan rely on the (different) tie order of pynndescent/KDTree. For **UMAP this is fine** — the property gate (Pitfall 5) tolerates neighbour-set tie differences. For **HDBSCAN it can flip a label** when a tied mutual-reachability edge changes which MST edge is chosen (Pitfall 6).
+4. **The symmetrisation transform itself must be GATHER:** computing `A + Aᵀ − A∘Aᵀ` as one-owner-per-`(i,j)` cell reading `A[i,j]` and `A[j,i]` — never a scatter over edges.
 
 **Why it happens:**
-Reusing the PCA descending-order eig and "take top-k" muscle memory is exactly backwards for Laplacians. And eigenvectors are only defined up to sign, so even a numerically perfect embedding fails the 1e-5 value gate without sign canonicalization.
-
-**How to avoid (selection + sign convention + oracle):**
-- **Selection:** sort ascending, drop index 0 (the ~0 eigenvalue / constant vector), take the next `n_components`. For SpectralClustering the embedding then feeds KMeans (reuse v1) — and the *clustering label* is the witness, compared with the v1 `label_perm` best-mapping helper (labels are permutation-invariant), so embedding sign does NOT need to match there.
-- **For SpectralEmbedding's transform output**, the embedding values DO need sign canonicalization: apply sklearn's `_deterministic_vector_sign_flip` rule — flip each eigenvector so its entry of largest absolute value is positive — and reuse the v1 `sign_flip`/`align_sign` helper in the oracle comparison.
-- **Degenerate/near-equal eigenvalues:** when eigenvalues cluster, the eigenbasis is only defined up to rotation within the degenerate subspace → value-match is impossible. For those fixtures fall back to a subspace/property test (Pitfall 13/below).
-
-**Warning signs:** Embedding is constant or rank-deficient (kept the trivial vector); oracle off by exact sign; oracle fails only on symmetric/blocky inputs (degenerate spectrum).
-
-**Phase to address:** Phase 9 (selection + sign), with the oracle policy decided up front.
-
----
-
-### Pitfall 5: IncrementalPCA batch-merge gets the mean-correction factor, stacking, sign, or ddof wrong
-
-**What goes wrong:**
-IncrementalPCA is NOT "PCA on a running covariance." sklearn's `partial_fit` does a specific SVD merge; four independent off-by-ways each break 1e-5 parity:
-1. Wrong **mean-correction row**: must be `sqrt((n_seen/n_total) * n_batch) * (mean_old - batch_mean)`.
-2. Wrong **stack order/scaling**: SVD is taken on `vstack([ S.reshape(-1,1) * components_old , X_centered , mean_correction ])` — previous components scaled by their singular values, then the new centered batch, then the correction row.
-3. Wrong **sign**: sklearn uses `svd_flip(U, Vt, u_based_decision=False)` (V-based), whereas standard PCA uses U-based — using the wrong one flips component signs vs the oracle.
-4. Wrong **ddof**: `explained_variance_ = S**2 / (n_total - 1)` (ddof=1, Bessel), while GaussianNB/var uses population variance (ddof=0). Mixing these up is a classic parity miss.
-
-**Why it happens:**
-Every term is plausible-looking, and the merge math only appears in sklearn's source, not the docstring. The U-vs-V `svd_flip` flag and the ddof choice are silent until the oracle diff appears.
+"k nearest neighbours" ambiguously includes/excludes self; "symmetrise" sounds like averaging; and the tie-order assumption is invisible until a label flips.
 
 **How to avoid:**
-Port `sklearn/decomposition/_incremental_pca.py` line-for-line for the merge (the four quoted facts above are the spec), reuse the v1 Jacobi SVD for the per-batch decomposition, and reuse the v1 `sign_flip` helper with the **V-based** convention in the oracle. Verify the merge against a multi-batch oracle, not just single-batch (single-batch hides the correction-row bug).
+- Query `k+1` then drop the self column (assert column 0 is self at distance ≈0 in a debug check).
+- Encode the exact symmetrisation per consumer: **UMAP fuzzy union** (`a+b−a*b` per cell), **HDBSCAN mutual-reachability** (`max(core_i, core_j, d_ij)` per cell). Both as single-owner GATHER transforms.
+- Document the lowest-index tie-break as the mlrs convention; rely on UMAP's property gate to absorb it; for HDBSCAN, design the MST tie-break to be deterministic and reference-aligned (Pitfall 6).
 
-**Warning signs:** Single-batch passes but 2+ batches drift; components sign-flipped vs oracle; explained_variance off by exactly an `(n-1)/n` factor (ddof slip).
+**Warning signs:**
+Core distances all one-off; UMAP clusters look right but slightly rotated/merged (self not dropped); HDBSCAN label count differs by one on tied-distance fixtures; any `(A+Aᵀ)/2` in UMAP code.
 
-**Phase to address:** Phase 7 (incremental-SVD merge prim → IncrementalPCA). This is the `[v2-P1]` open research question — settle "full Jacobi per batch vs dedicated update kernel" and the f32-on-rocm stability of the merge here.
-
----
-
-### Pitfall 6: RandomProjection is value-unmatchable against sklearn (different RNG) — wrong oracle kills the phase
-
-**What goes wrong:**
-Trying to oracle-match the actual projection matrix or transformed output against sklearn fails by construction: sklearn fills the Gaussian/sparse matrix with NumPy's MT19937 / its own sparse sampler; mlrs uses a seeded SplitMix64-style device/host PRNG (project memory + `questions.md` note: no OsRng, reproducible seeded PRNG required). Identical seeds across two different PRNGs produce different matrices → every transformed value differs → a value oracle reports total failure on a correct implementation.
-
-**Why it happens:**
-The v1 oracle pattern is "same random input → compare values ≤1e-5," and RandomProjection breaks the unstated assumption that the *algorithm* is deterministic given the input. The randomness is internal and RNG-specific.
-
-**How to avoid (property test, not value oracle):**
-Test the *mathematical guarantees*, not the values:
-- **Shape/density:** Gaussian matrix entries ~ N(0, 1/n_components) (test mean≈0, variance≈1/n_components over the matrix). Sparse matrix has the expected nonzero density `1/sqrt(n_features)` (or `density`) and values in `{-s, 0, +s}` with `s = sqrt(1/(density·n_components))`.
-- **Johnson–Lindenstrauss distortion:** sampled pairwise distances are preserved within the JL `eps` bound after projection — the actual contract RandomProjection promises.
-- **Determinism:** same seed → identical mlrs output across runs (reproducibility, ASVS V6).
-- **`johnson_lindenstrauss_min_dim`** helper value-matches sklearn (it is pure arithmetic, no RNG) — gate that at 1e-5.
-
-**Warning signs:** Anyone writing a `.npz` value oracle for `transform()` output of a projection; "RandomProjection fails 1e-5 everywhere" (means a value oracle was wrongly chosen).
-
-**Phase to address:** Phase 7 (RNG-matrix prim → Gaussian/SparseRandomProjection). Decide the property-test contract in the phase plan so no one wastes time on a value fixture.
+**Phase to address:** Phase 12 (graph format, self-drop, symmetrisation transforms), consumed in 13/14.
 
 ---
 
-### Pitfall 7: SGD parity is undefined unless the oracle pins shuffle, schedule, and stopping — and cuML is NOT the oracle
+### Pitfall 4: A dense `n×n` distance / heap tile for the KNN-graph overflows the gfx1100 LDS budget or the per-phase memory gate
 
 **What goes wrong:**
-SGD has three sources of nondeterminism that make a default-config oracle impossible to match: (a) per-epoch sample **shuffling** (RNG-dependent, and mlrs's PRNG ≠ NumPy's), (b) the **learning-rate schedule** (sklearn default `optimal`: `eta = 1/(alpha*(t + t0))` with Bottou's `t0` heuristic — cuML's MBSGD defaults to a *constant* schedule and produces materially different weights, confirmed by RAPIDS issues #2113/#2114), and (c) early stopping via `tol`/`n_iter_no_change` triggering at a different iteration. Picking cuML as the reference, or leaving defaults on, yields a moving target.
+The compose-from-`top_k` path (Pitfall 1) materialises a dense `n×n` distance matrix. At UMAP/HDBSCAN fixture sizes this is `O(n²)` device memory and, if any tiled GEMM/distance stage stages an operand in SharedMemory, a modest f32 tile (128×128 = 64 KiB) already blows gfx1100's 65536 B LDS budget (f64 doubles it) → HIP rejects the launch. Separately the `n×n` buffer can blow the **build-failing PoolStats memory gate** that every phase must pass.
 
 **Why it happens:**
-The milestone explicitly warns "sklearn (NOT cuML) is the oracle — cuML diverges on SGD loss set + LinearSVC solver," but it's tempting to compare against cuML's MBSGD since the estimator names match. They don't agree.
-
-**How to avoid (deterministic SGD oracle, mirroring v1's LogReg recipe):**
-Construct a *pinned* oracle exactly as v1 did for LogReg's L-BFGS:
-- `shuffle=False` (removes the RNG mismatch entirely) — this is the single most important knob.
-- A **fixed schedule with explicit `eta0`** (`learning_rate='constant'` or `'invscaling'` with a fixed `eta0`), so both sides use the identical, RNG-free `eta_t` sequence. Avoid `optimal` for the oracle (its `t0` heuristic adds a derived constant to reproduce).
-- **Fixed `max_iter`, `tol=0` (or very tight), `n_iter_no_change=max_iter`** so both run the same number of steps with no early-stop divergence.
-- Same `alpha`, `penalty`, `loss`, `fit_intercept`, `average`.
-With shuffle off + fixed schedule + fixed iterations, sklearn and mlrs perform the identical deterministic update sequence → weights value-match. Then add a *separate, looser* property test that shuffled training still converges (decreasing loss), not value-matched. Mirror v1's documented LogReg gauge handling for the multinomial/decision-function comparison.
-
-**Warning signs:** SGD oracle "almost matches" and drifts with `max_iter`; comparing to cuML; oracle uses `shuffle=True`.
-
-**Phase to address:** Phase 10. Write the deterministic-oracle spec into the phase plan before kernels.
-
----
-
-### Pitfall 8: LedoitWolf shrinkage formula computed on the wrong (non-centered / wrong-normalization) quantities
-
-**What goes wrong:**
-The Ledoit–Wolf shrinkage intensity is a ratio of specific Frobenius-norm quantities; getting any normalization wrong yields a plausible but parity-failing `shrinkage_`, and then the whole `covariance_ = (1-δ)·S + δ·μ·I` is off. Common errors: using sample covariance with ddof=1 instead of the **biased** (ddof=0, divide by `n`) empirical covariance sklearn uses; computing `mu = trace(S)/n_features` wrong; forgetting that `delta`/`beta` are clipped so `0 ≤ shrinkage ≤ 1`.
-
-**Why it happens:**
-The 2004 paper's `mu/beta/delta` terms aren't spelled out in the sklearn docstring, and EmpiricalCovariance in sklearn uses the **maximum-likelihood (biased, ddof=0)** estimator by default, which contradicts the "use ddof=1" habit.
+v2 already hit this for kernel/Gram/Laplacian `n×n` operands (v2 Pitfall 11). The KNN-graph is the next `n×n` offender, and memory is a first-class per-phase gate, never deferred.
 
 **How to avoid:**
-- EmpiricalCovariance baseline: divide by `n` (ddof=0), centered on the sample mean — match sklearn `empirical_covariance` exactly. Reuse the v1 covariance prim but confirm its normalization is ddof=0 (or parameterize it).
-- LedoitWolf: port `ledoit_wolf_shrinkage` directly — `mu = trace(emp_cov)/n_features`; `delta_ = ||emp_cov - mu·I||_F² / n_features`; `beta_` from the per-sample term; `shrinkage = clip(beta/delta, 0, 1)`; `cov = (1-shrinkage)·emp_cov + shrinkage·mu·I`. Then gate `shrinkage_` AND `covariance_` against the oracle.
+- Keep the big distance operand in **global** memory (v1 Jacobi precedent); stage only small bounded tiles in SharedMemory, and **none on cpu** (GATHER everywhere).
+- Compute LDS bytes = `tile_elems * size_of::<F>()` and assert `< 65536` at kernel-author time.
+- For large n, **tile the query axis**: compute distances for a block of rows, run `top_k` on that block, never hold the full `n×n` resident — single-owner per row throughout, keeping the resident set within the PoolStats gate.
 
-**Warning signs:** `covariance_` off by an `n/(n-1)` factor (ddof slip); `shrinkage_` outside [0,1]; passes for one `n` but not another (normalization scaling with `n`).
+**Warning signs:**
+Launch failure only on rocm with an LDS/occupancy/resource error; PoolStats gate fails as fixture n grows; works on a small fixture, OOMs on the next size.
 
-**Phase to address:** Phase 7 (covariance family).
-
----
-
-### Pitfall 9: Naive Bayes underflow / smoothing / variance-convention mismatches
-
-**What goes wrong:**
-NB has a cluster of parity-and-stability traps:
-- **Log-space:** computing `P = Π p` in probability space underflows to 0 for moderate `d`. Joint log-likelihood must be accumulated in log space; `predict_proba` needs **log-sum-exp** normalization, not `exp` then divide (which overflows/underflows).
-- **Smoothing placement:** Multinomial/Bernoulli use additive `alpha` (`feature_log_prob = log(count + alpha) - log(class_count + alpha·n_features)`); getting the denominator term wrong (forgetting `alpha·n_features`) silently shifts every log-prob.
-- **GaussianNB var convention:** uses **population variance (ddof=0)** plus `var_smoothing = 1e-9 * max(var)` added to every variance — omitting `var_smoothing`, or using ddof=1, breaks parity and risks divide-by-zero on constant features.
-- **ComplementNB** uses the complement-class statistics with a weight normalization step; **BernoulliNB** binarizes inputs at the `binarize` threshold and includes the `log(1 - p)` term for absent features — both easy to drop.
-
-**Why it happens:**
-Each NB variant has its own smoothing/normalization quirk; reusing one variant's code for another silently mis-specifies the math.
-
-**How to avoid:**
-- Accumulate joint log-likelihood per class; normalize with a log-sum-exp helper (`m + log Σ exp(x-m)`), implemented as a single-owner GATHER reduction over classes (small K) with an F-only running max+sum — no SharedMemory.
-- Encode each variant's exact smoothing/denominator from sklearn source as the spec; add the `var_smoothing` term for GaussianNB and ddof=0 variance.
-- Gate `predict` labels (exact) AND `predict_log_proba` values at the f64 tolerance.
-
-**Warning signs:** `predict_proba` rows not summing to 1; `-inf` log-probs; GaussianNB NaN on a constant feature (missing `var_smoothing`); off-by-constant log-probs across all classes (smoothing denominator).
-
-**Phase to address:** Phase 11.
+**Phase to address:** Phase 12 (set the tiled, global-operand design + memory gate up front).
 
 ---
 
-### Pitfall 10: f64-on-rocm cases run instead of skip-with-log (gate violation)
+### Pitfall 5: Forcing element-wise 1e-5 on the STOCHASTIC UMAP layout (or picking a too-loose / too-strict property gate) — the make-or-break oracle decision
 
 **What goes wrong:**
-Every new prim's f64 oracle path, if not guarded, will attempt to launch on rocm where cubecl-cpp 0.10 has F64 unregistered for HIP → the test fails (not skips), breaking the established cpu(f64)+rocm(f32) gate. This will hit EVERY new test file in Phases 7–11.
+UMAP is triply stochastic: random init, SGD edge sampling order, and **negative sampling**, all RNG-driven. mlrs uses **SplitMix64**; umap-learn uses NumPy's RNG. Identical seeds across different PRNGs → different embeddings, so an element-wise ≤1e-5 value oracle against umap-learn reports **total failure on a perfectly correct implementation** — exactly the trap v2 hit with RandomProjection (D-12), where the fix was a property gate, not a value oracle. Two opposite failure modes follow:
+- **Too strict:** any attempt to value-match coordinates (or even match umap-learn's embedding via Procrustes alignment to 1e-5) fails forever; the phase stalls chasing a non-existent bug.
+- **Too loose:** "it returns a 2-D blob, ship it" with only a smoke test passes a *broken* layout (e.g. one that learned nothing, or collapsed) because nobody checked structure preservation.
 
 **Why it happens:**
-It's a per-file boilerplate that's easy to forget when copying a test from a non-f64 path; the failure looks like a real numerical bug.
+The whole v1/v2 oracle reflex is "same input → compare values ≤1e-5." UMAP breaks the unstated determinism-given-input assumption, and the right gate (structure-preservation metrics) is unfamiliar.
 
-**How to avoid:**
-Mirror the v1 idiom verbatim: every f64 oracle case begins with
-```rust
-if capability::skip_f64_with_log() { return; }
-```
-exactly as in `crates/mlrs-backend/tests/gemm_test.rs`, `eig_test.rs`, `distance_test.rs`, `covariance_test.rs`. f32 cases run on rocm; f64 cases run on cpu and skip-with-log on rocm. Make this a checklist item in every Phase 7–11 plan.
+**How to avoid (the concrete UMAP property gate — the precedent is RandomProjection D-12):**
+Gate the **mathematical/structural contract**, not coordinates. The standard practitioner toolkit for validating a UMAP reimplementation:
+1. **Trustworthiness** (`sklearn.manifold.trustworthiness`) — fraction of each point's k-NN preserved from high-D into the embedding. Gate `trustworthiness(X, mlrs_emb, n_neighbors=k) ≥ threshold`, AND assert it is **within a small delta of umap-learn's own trustworthiness on the same data** (e.g. `mlrs_trust ≥ umap_trust − 0.02`). This anchors "as good as the reference" without value-matching. (Literature: different UMAP implementations land at *similar* trustworthiness; that comparability IS the gate.)
+2. **k-NN overlap / preservation** — for a held-out sample of points, fraction of high-D k neighbours that remain among the embedding's k neighbours. Gate against an absolute floor and against umap-learn's overlap on the same fixture.
+3. **Determinism** — same SplitMix64 seed → byte-identical mlrs embedding across runs (this is *mlrs's* internal contract, value-matchable, and it catches the Pitfall 2 race). ASVS V6 reproducibility.
+4. **Cluster-label preservation on a labelled fixture** — embed `make_blobs`/`digits`, run a trivial clustering (or known labels) on the embedding, and require neighbourhood/label structure matches expectation (e.g. silhouette or label-KNN accuracy above a floor). Discrete, robust to RNG.
+5. **`fuzzy_simplicial_set` / `smooth_knn_dist` are NOT stochastic** — the fuzzy-graph construction (given the KNN-graph) is deterministic arithmetic. **Value-gate those against umap-learn at ≤1e-5** (like v2 value-matched `johnson_lindenstrauss_min_dim`). This pins the deterministic 80% of UMAP exactly and confines the property gate to the SGD layout only.
 
-**Warning signs:** A new `*_test.rs` f64 case failing only under `--features rocm` with an F64/HIP registration error.
+Choosing thresholds: anchor every continuous gate to **umap-learn's own score on the identical fixture** (relative floor) rather than a hard absolute, so the gate is neither arbitrarily strict nor a rubber stamp. Pick `n_neighbors` for trustworthiness equal to the UMAP `n_neighbors`. Use multiple seeds and require the gate to hold for all.
 
-**Phase to address:** Every phase (7–11); enforce as a per-test-file checklist line.
+**Warning signs:**
+Anyone writing a `.npz` value oracle for UMAP `transform()`; "UMAP fails 1e-5 everywhere" (wrong gate chosen); a green test suite where the only UMAP check is `assert emb.shape == (n,2)` (too loose); trustworthiness gate with a hard absolute threshold and no comparison to umap-learn.
+
+**Phase to address:** Phase 13 (decide the exact property-gate spec — metrics, thresholds-relative-to-umap-learn, seeds — IN the phase plan before kernels, so no time is wasted on a value fixture). This is the milestone's flagship oracle decision.
 
 ---
 
-### Pitfall 11: Large kernel/Laplacian/Gram tiles overflow the gfx1100 LDS budget (HIP rejects launch)
+### Pitfall 6: HDBSCAN labels are unstable across reimplementations — MST/condensed-tree tie-breaking, noise label, and probabilities diverge
 
 **What goes wrong:**
-KernelRidge/KernelDensity Gram matrices, the dense Laplacian, and any tiled GEMM/eig that stages a big operand in SharedMemory can exceed gfx1100's 65536 B LDS budget → HIP rejects the launch (v1 hit this in Jacobi and kept the big operand in global). New v2 prims (kernel-matrix, Gram, Laplacian) are prime offenders because n×n is the natural tile.
+HDBSCAN's hard gate is **exact labels up to permutation**, but several quiet sources make a correct-looking reimplementation produce *different* labels than the `hdbscan` reference:
+1. **MST tie-breaking:** the reference sorts MST edges by mutual-reachability weight with a **stable sort** (`np.argsort(...)`), so equal-weight edges keep input order. A different tie order picks a different spanning tree → a different dendrogram → flipped/merged clusters. Worse, mlrs's KNN tie-break is lowest-index (Pitfall 3) while the reference inherits KDTree/pynndescent neighbour order — so the *inputs* to the MST already differ on ties.
+2. **Noise label −1 vs cluster ids:** noise is `−1`; clusters are arbitrary non-negative ids. The label-permutation comparison must treat `−1` as a **fixed, non-permutable** class (noise maps only to noise) while permuting the cluster ids — the v1/v2 `label_perm` best-mapping helper must be extended so `−1` is excluded from the permutation search, else a correct result fails or a wrong one passes.
+3. **`probabilities_`:** membership strength per point (distance-based, normalised within cluster); the reference computes it in a Cython module. Re-deriving the formula wrong yields plausible `[0,1]` values that don't match — but probabilities are continuous and RNG-free, so they CAN be value-gated (with an f32 band), unlike labels.
+4. **single vs full mutual reachability / `min_samples` vs `min_cluster_size`:** `min_samples` sets the k for **core distance** (`tree.query(X, k=min_samples+1)`); `min_cluster_size` thresholds the condensed tree. Defaulting `min_samples = min_cluster_size` (the reference default) and conflating the two is a classic divergence — using `min_cluster_size` where `min_samples` belongs changes every core distance.
+5. **`cluster_selection_method` (eom vs leaf) and `cluster_selection_epsilon`:** the reference's epsilon path is itself incomplete in cuML (CONCERNS.md: cuML's `extract.cuh`/`select.cuh` only approximate epsilon). Match the `hdbscan` Python reference, not cuML, and start with `cluster_selection_epsilon=0` + `eom` to make exact-labels achievable.
 
 **Why it happens:**
-Tiling tutorials stage the working set in shared memory; on gfx1100 a modest n×n f32 tile (e.g. 128×128 = 64 KiB) already blows the budget, and f64 doubles it.
+The condensed-tree → stability → selection pipeline has many integer/ordering decisions that are deterministic-but-implementation-specific; ties are rare on real data so divergence hides until a tied fixture.
 
 **How to avoid:**
-Keep large operands in **global** memory (v1 Jacobi precedent); only stage small, bounded tiles in SharedMemory — and on cpu, no SharedMemory at all (Pitfalls 1–3). Compute LDS bytes = `tile_elems * size_of::<F>()` and assert it stays under budget at kernel-author time; prefer the GATHER/global pattern that has no SharedMemory dependence so the same kernel runs on cpu too.
+- Reproduce the reference ordering: **stable sort MST edges by weight**, and make the MST construction's tie-break deterministic and documented (Prim's/Borůvka with a defined lowest-index tie-break). Generate oracle fixtures with **distinct distances where possible** (small jitter) so ties don't dominate the gate, AND add a *separate* explicitly-tied fixture to lock the tie convention.
+- Extend `label_perm` to **pin `−1`→`−1`** and permute only cluster ids; assert noise sets match exactly before permuting.
+- Port `min_samples`/`min_cluster_size`/core-distance semantics line-for-line from the `hdbscan` reference; default `min_samples = min_cluster_size`.
+- Value-gate `probabilities_` and the condensed-tree stabilities with a named f32 band; **labels stay the exact hard gate** (the v2 D-08 classifier rule: discrete decisions are integer-exact, continuous outputs get a band).
+- Gate against `hdbscan` / `sklearn.cluster.HDBSCAN`, NOT cuML (cuML's epsilon/outlier paths are incomplete — CONCERNS.md).
 
-**Warning signs:** Launch failure only on rocm with an LDS/occupancy/resource error; kernel works on a small fixture but fails as n grows.
+**Warning signs:**
+Label count off by one on tied fixtures; `label_perm` "passing" by mapping noise into a cluster; `probabilities_` in `[0,1]` but not matching; results match on jittered data but diverge on grid/duplicate data; comparing to cuML.
 
-**Phase to address:** Phases 8 (kernel/Gram) and 9 (Laplacian); audit any SharedMemory tile size against 65536 B.
+**Phase to address:** Phase 14 (HDBSCAN). Decide the deterministic MST tie-break + the `−1`-pinned `label_perm` extension + the exact-vs-band split in the phase plan.
+
+---
+
+### Pitfall 7: The MST and condensed-tree builders want scatter/atomics (cpu-MLIR) — and parallel core-distance accumulation reorders floats
+
+**What goes wrong:**
+- **MST (Borůvka/Prim) on GPU** classically uses atomic min-reductions to find each component's cheapest outgoing edge and scatter to union-find parents — both cross-unit atomics, cpu-MLIR launch panic. cuML's tree algorithms are exactly the atomics-heavy code the milestone is *deliberately dodging* (PROJECT.md defers RandomForest tree construction for this reason).
+- **Condensed-tree / stability** is inherently sequential hierarchy traversal — fighting to GPU-parallelise it invites scatter into shared node arrays.
+- **Core-distance** parallel reduction across threads reorders float accumulation → f32 results differ run-to-run and from the reference (hdbscan CONCERNS source: "parallel jobs → floating-point accumulation differs across thread orderings").
+
+**Why it happens:**
+"GPU MST" literature is atomics-and-union-find; the instinct is to parallelise the whole pipeline on-device.
+
+**How to avoid (split device vs host deliberately):**
+- Do the **embarrassingly-parallel, single-owner** parts on device via GATHER: pairwise distance, `top_k` neighbours (Pitfall 1), core distances (one owner per point, ascending scan — deterministic accumulation order, no atomics), mutual-reachability transform (one owner per cell).
+- Do the **MST + condensed-tree + stability + selection on the host** (it is `O(n·k)`-ish, sequential, label-exact-sensitive, and tiny vs the distance work). This sidesteps the atomics constraint entirely and makes deterministic tie-breaking trivial — exactly the "dodge tree-atomics risk" framing in PROJECT.md. cuML itself does the hierarchy logic in serial Cython on CPU in the reference.
+- Pin core-distance accumulation to a fixed (ascending) order so f32 is reproducible.
+
+**Warning signs:**
+Any `Atomic`/union-find scatter in an MST kernel; cpu launch panic on the graph→tree stage; core distances vary across runs.
+
+**Phase to address:** Phase 14 — decide the device/host split (device = distance+knn+core+mutual-reach GATHER; host = MST+tree+stability) in the plan.
+
+---
+
+### Pitfall 8: f32-on-rocm error bands for UMAP/HDBSCAN distance/exp/log-sum accumulation — too-strict gate fails correct code, too-loose hides bugs
+
+**What goes wrong:**
+Strict 1e-5 is often physically unreachable in f32 (project memory): ULP exceeds 1e-5 on large magnitudes and error compounds through accumulation-heavy kernels. The v3 features are accumulation- and transcendental-heavy: UMAP's `smooth_knn_dist` binary search + `exp(-(d−ρ)/σ)` membership, the SGD layout's repeated coordinate updates, HDBSCAN's `probabilities_`. Forcing strict 1e-5 fails correct f32 code; loosening the *global* tolerance hides real bugs. **f64-on-rocm is unsupported and must skip-with-log** (cubecl-cpp 0.10 F64 unregistered for HIP) — every new f64 oracle case in Phases 12–16 needs the guard or it FAILS (not skips), looking like a numerical bug.
+
+**Why it happens:**
+Copying a non-f64 test forgets the skip guard; reusing one global tolerance is less bookkeeping than per-family bands.
+
+**How to avoid:**
+- Mirror the v1/v2 idiom verbatim in **every f64 oracle case**: `if capability::skip_f64_with_log() { return; }` (as in `crates/mlrs-backend/tests/{topk,eig,distance,sgd}_test.rs`). Make it a per-test-file checklist line for Phases 12–16.
+- Add **named per-family f32 bands** (continue v1's `Tolerance::for_family` / `docs/tolerance-policy.md`), never a global loosen. Predicted band needs (MEDIUM — measure on rocm):
+  | Feature | f32-on-rocm strict 1e-5? | Hard gate kept exact |
+  |---|---|---|
+  | KNN-graph distances/indices | indices exact; distances band-likely | neighbour **indices** exact (modulo documented tie-break) |
+  | UMAP fuzzy set (`smooth_knn_dist`/membership) | band needed (exp + binary search) | value-band vs umap-learn on the deterministic graph |
+  | UMAP layout | N/A — **property gate** (Pitfall 5) | trustworthiness/kNN-overlap floors; determinism exact |
+  | HDBSCAN core dist / mutual-reach | band likely | feeds exact-label gate |
+  | HDBSCAN labels | exact | **exact labels** via `−1`-pinned label_perm |
+  | HDBSCAN probabilities_ / stabilities | band needed | named band; labels exact |
+
+**Warning signs:**
+A new `*_test.rs` f64 case failing only under `--features rocm` with an F64/HIP registration error; UMAP/HDBSCAN continuous oracle "almost matches" with no named band; a global tolerance being loosened.
+
+**Phase to address:** Every phase 12–16 (skip guard); 13/14 set their family bands during validation.
+
+---
+
+### Pitfall 9: Builder-pattern retrofit explodes into typestate combinatorics and breaks the shipped PyO3 `any_estimator!` machinery
+
+**What goes wrong:**
+Retrofitting a Rust-native builder across **30 estimators** has three structural traps:
+1. **Typestate explosion:** modelling every hyperparameter's set/unset state in the type system (phantom-typed builders) multiplies types combinatorially — 30 estimators × many params → unmaintainable, slow to compile, and hostile to the macro-generated PyO3 layer.
+2. **Breaking `any_estimator!`:** the shipped PyO3 layer (`crates/mlrs-py/src/dispatch.rs`) generates, per estimator, an `Unfit { /* sklearn-named hyperparameters stored verbatim */ } + F32(Estimator<f32>) + F64(Estimator<f64>)` enum and constructs the fitted arm from the **stored verbatim hyperparameters** at `fit`. If the Rust builder changes the *construction surface* (e.g. `Estimator::new(k)` → `Estimator::builder().k(k).build()?`, or makes fields private, or moves defaults into the builder), every `any_estimator!` expansion that does `KMeans::<f32>::new(..)` must change in lockstep, and the "store verbatim hyperparameters then build at fit" contract can silently drift.
+3. **Two construction paths fighting:** the sklearn-mirror constructors (consumed via PyO3) and the new idiomatic Rust builders must coexist; if the builder becomes the *only* path, the macro breaks; if they diverge, defaults drift (Pitfall 10).
+
+**Why it happens:**
+"Idiomatic Rust builder" tutorials reach for full typestate (compile-time required-field enforcement). And a 30-estimator mechanical sweep is the highest large-blast-radius regression risk in the milestone.
+
+**How to avoid:**
+- **Prefer a simple owned-builder (or `derive_builder`-style) over full typestate.** Use the **fit/unfit typestate at the estimator level only** (`Estimator<Unfit>` → `fit` → `Estimator<Fitted>`), which mlrs already expresses via the `Fit<F>` trait + `any_estimator!`'s Unfit/F32/F64 enum — extend that, don't invent per-param phantom types. Required-vs-optional is enforced by `build() -> Result<_, BuildError>` (mlrs already has `BuildError` in `sgd_config.rs`), not by the type system.
+- **Keep `new(...)` as a thin wrapper over the builder** so `any_estimator!` and the sklearn-mirror constructors keep working unchanged; the builder is *additive*. Audit every `any_estimator!` call site (`grep -rn any_estimator crates/mlrs-py`) when changing any constructor.
+- **Land the builder convention on 1–2 estimators first** (e.g. `NearestNeighbors`, `KMeans`) with the macro still green, write the migration recipe, THEN sweep the remaining 28. Don't sweep blind.
+
+**Warning signs:**
+A `PhantomData` per hyperparameter; compile-time blowup; `any_estimator!` expansions failing to compile after a constructor change; the builder being the only way to construct an estimator.
+
+**Phase to address:** Phase 15 (builder convention + retrofit). Establish the convention on a pilot estimator under the green `any_estimator!`/PyO3 suite before the mechanical sweep.
+
+---
+
+### Pitfall 10: Default-value drift between the Rust builder, the sklearn-mirror constructors, and sklearn's actual defaults
+
+**What goes wrong:**
+The builder introduces a *new* place to define defaults. If a builder default disagrees with the sklearn default (or with the existing sklearn-mirror constructor), an estimator silently behaves differently depending on construction path — and the PyO3 layer (which must mirror sklearn) ships the wrong default. Example shapes: UMAP `n_neighbors=15`, `min_dist=0.1`, `metric='euclidean'`; HDBSCAN `min_cluster_size=5`, `min_samples=None→min_cluster_size`, `cluster_selection_method='eom'`. A builder defaulting `min_samples=5` instead of `=min_cluster_size` changes results.
+
+**Why it happens:**
+Defaults get re-typed in the builder by hand; the `min_samples=None` "derive from min_cluster_size" sklearn convention is easy to hard-code wrong.
+
+**How to avoid:**
+- **Single source of truth for defaults:** define them once (a `Default` impl or const block) and have both `new(...)` and `builder()` read from it; never duplicate literal defaults across the two paths.
+- Add a test asserting **builder-default == sklearn-default** for every hyperparameter that the PyO3 layer mirrors (a small table-driven test), and that `new()` and `builder().build()` produce identical configs.
+- Encode `None`-derived defaults (e.g. HDBSCAN `min_samples`) as an explicit `Option` resolved at `build()`/`fit()`, matching sklearn's resolution point.
+
+**Warning signs:**
+The same default literal appearing in two files; PyO3 default ≠ sklearn default; results differing between `new()` and `builder()`.
+
+**Phase to address:** Phase 15 (and 13/14 set the UMAP/HDBSCAN defaults table that the shim mirrors).
+
+---
+
+### Pitfall 11: The pure-Python sklearn shim fails `check_estimator` on get_params types, clone semantics, fit idempotence, and trailing-underscore attribute naming
+
+**What goes wrong:**
+The new pure-Python sklearn shim (`get_params`/`set_params`/`check_estimator`) has a well-known cluster of `check_estimator` failure modes, all of which mlrs is exposed to because the estimators are PyO3-backed (state lives in Rust):
+1. **`get_params` returns wrong types / not the constructor args:** sklearn requires `get_params()` to return exactly the `__init__` parameters, by their exact names, as the *original Python objects* (ints stay ints, `None` stays `None`) — not Rust-coerced values, not fitted attributes. A PyO3 getter returning a Rust-coerced `u64` where `__init__` took `int`, or omitting a param, fails `check_estimator`.
+2. **`clone()` semantics:** sklearn's `clone(est)` calls `get_params(deep=False)` then `type(est)(**params)` and requires the clone be **unfitted** with **identical params** and **no shared mutable state**. If the PyO3 wrapper's `__init__` mutates/normalises params, `clone` produces a non-equal estimator → fails. Params must be stored verbatim (the `any_estimator!` "stored verbatim hyperparameters" contract already does this on the Rust side — mirror it in Python).
+3. **Fit idempotence / re-fit:** calling `fit` twice must fully reset state (no accumulation); `check_estimator` calls `fit` on different data and expects clean state. The `any_estimator!` mutex-poisoning guard (WR-02/WR-04) must reset to Unfit on re-fit, not retain the previous monomorphization.
+4. **Trailing-underscore convention:** fitted attributes MUST end in `_` (`embedding_`, `labels_`, `probabilities_`, `components_`) and MUST NOT exist before `fit` (accessing them pre-fit must raise `NotFittedError`/`AttributeError`). Estimators must NOT have trailing-underscore attributes set in `__init__`, and constructor params must NOT have trailing underscores. A getter that returns a default pre-fit instead of raising fails `check_estimator`.
+
+**Why it happens:**
+`check_estimator` encodes ~40 invariants most reimplementations don't know; the Rust↔Python boundary makes it easy to leak coerced types or fitted state.
+
+**How to avoid:**
+- `get_params` returns the verbatim Python `__init__` kwargs (store them on the Python side as given; do NOT round-trip through Rust). `set_params` updates them and invalidates fitted state.
+- Implement `__init__` as **pure assignment, no validation/coercion** (sklearn rule: validate in `fit`, not `__init__`) so `clone` round-trips exactly.
+- On `fit`, reset to Unfit first; raise `NotFittedError` for `_`-attributes pre-fit; expose fitted state only via `_`-suffixed properties that pull from Rust.
+- Run sklearn's `check_estimator` / `parametrize_with_checks` against each shimmed estimator. **Note (deferred reality):** *live* FFI `estimator_checks` needs a maturin+pyarrow host this env lacks (project memory + PROJECT.md) — so author the shim to the documented invariants and route live verification to UAT, the same way v1/v2 did. Pure-Python invariant unit tests (get_params returns ctor kwargs, clone equality, double-fit reset, pre-fit raises) CAN run without the GPU/FFI host and should gate in CI.
+
+**Warning signs:**
+`get_params()` returns fitted attrs or coerced types; `clone()` produces an estimator that isn't `==` on params; second `fit` accumulates; `_`-attributes readable before fit; constructor doing validation.
+
+**Phase to address:** Phase 16 (pure-Python sklearn shim). Build the invariant unit tests (FFI-free) into CI; route live `check_estimator` to UAT.
 
 ---
 
 ## Technical Debt Patterns
 
-Shortcuts that seem reasonable but create long-term problems.
-
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| Full Jacobi SVD per IncrementalPCA batch (no dedicated update kernel) | Reuses v1 SVD; fast to ship | More flops than a true rank-update; fine at v2 sizes, costly at streaming scale | Acceptable for v2 (settle in `[v2-P1]`); revisit if streaming-large becomes a requirement |
-| Dense affinity/Laplacian (no sparse graph) | Avoids edge-scatter (which cpu-MLIR can't do anyway) and `n_neighbors` sparse kernels | O(n²) memory; caps spectral problem size | Acceptable for v2 (matches the `[v2-P3]` "full-spectrum-then-take-smallest" decision); sparse is a v3 lift |
-| Full-spectrum eig then slice smallest (vs shift-invert/Lanczos) | Reuses v1 Jacobi eig directly | O(n³); wrong for large n | Acceptable at v2 sizes per `questions.md`; never for large-graph spectral |
-| Host-generate-then-upload RNG matrix for RandomProjection | Avoids a device RNG kernel; trivially reproducible | Host↔device copy crosses the zero-copy boundary | Acceptable if seeded + reproducible (ASVS V6) and within the per-phase memory gate; prefer device RNG only if the copy violates the gate |
-| One global tolerance reused for new families | Less bookkeeping | Hides genuine f32-on-rocm bands; a too-loose global masks bugs | Never globally loosen; add a *named per-family* band (Pitfall 12) like v1's D-08 growth point |
+| Dense `n×n` distance for the KNN-graph (no ANN / pynndescent) | Reuses v1 distance + `top_k`; 100% cpu-MLIR-safe; exact (not approximate) neighbours | `O(n²)` mem/time; caps UMAP/HDBSCAN fixture size | Acceptable for v3 (matches exact-neighbour oracle discipline); ANN is a later lift |
+| MST + condensed-tree + stability on the HOST (not device) | Sidesteps atomics/union-find cpu-MLIR panic; trivial deterministic tie-break; matches reference serial Cython | Host↔device hop for the (small) graph; not GPU-parallel | Acceptable for v3 (the deliberate "dodge tree-atomics" choice); revisit only if graph stage dominates |
+| Host-generate SplitMix64 negative-sample indices then upload | Avoids a device RNG kernel for UMAP sampling; trivially reproducible | Host↔device copy crosses the zero-copy boundary | Acceptable if seeded+reproducible and within the PoolStats gate; prefer device RNG if the copy violates the gate |
+| `new(...)` kept as a thin wrapper over `builder()` (no full typestate) | Keeps `any_estimator!`/PyO3 + sklearn-mirror constructors working unchanged; small blast radius | Required-field enforcement is runtime (`build()->Result`), not compile-time | Acceptable / preferred — full per-param typestate is the over-engineering trap (Pitfall 9) |
+| One global tolerance reused for UMAP/HDBSCAN continuous outputs | Less bookkeeping | Hides genuine f32-on-rocm bands; a too-loose global masks bugs | Never globally loosen; add a named per-family band (Pitfall 8) |
+| Shimming `check_estimator` to documented invariants (no live FFI run) | Unblocks the shim without a maturin+pyarrow host | Live sklearn-suite gaps until a UAT host runs it | Acceptable (env constraint, project memory); FFI-free invariant tests must still gate in CI |
 
----
+## Integration Gotchas
+
+| Integration | Common Mistake | Correct Approach |
+|-------------|----------------|------------------|
+| umap-learn (UMAP oracle) | Value-matching the embedding to 1e-5; comparing to cuML | Property gate (trustworthiness/kNN-overlap **relative to umap-learn's own score**) + value-gate only the deterministic `fuzzy_simplicial_set` (Pitfall 5) |
+| hdbscan / sklearn.cluster.HDBSCAN (HDBSCAN oracle) | Comparing to cuML (incomplete epsilon/outlier paths); not pinning MST tie-break; `label_perm` permuting `−1` | Gate vs `hdbscan` Python ref; stable-sort MST edges; `−1`-pinned label_perm; jittered + tied fixtures (Pitfall 6) |
+| PyO3 `any_estimator!` macro | Changing a constructor signature without updating every macro call site; builder as the only construction path | Builder is additive; `new()` stays; audit `grep -rn any_estimator crates/mlrs-py` on any ctor change (Pitfall 9) |
+| sklearn `check_estimator` | `get_params` returns coerced types/fitted attrs; `__init__` validates; `_`-attrs pre-fit | get_params = verbatim ctor kwargs; validate in `fit`; `NotFittedError` pre-fit (Pitfall 11) |
+| cpu-MLIR (cubecl-cpu) | New KNN/UMAP/MST kernel with Atomic/SharedMemory/`F::INFINITY`/mutable-bool/shift-loop | Compose from launch-proven `top_k`; single-owner GATHER; host-side hierarchy (Pitfalls 1,2,7) |
+| rocm (cubecl-cpp 0.10) | f64 oracle case launched on rocm (F64 unregistered → fail) | `if capability::skip_f64_with_log() { return; }` in every f64 case (Pitfall 8) |
 
 ## Performance Traps
 
-Patterns that work at small scale but fail as usage grows. (mlrs v2 targets oracle-sized fixtures; the relevant "scale" is fixture/test problem size.)
-
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| Kernel-matrix materialized dense for KernelRidge/KernelDensity | OOM / pool-gate failure on larger n | Reuse v1 distance prim; for KDE score, fuse the log-sum-exp so the n×n kernel is never fully resident (stream per query row, single-owner) | n² exceeds buffer pool budget |
-| NB GATHER kernel re-reads all n per `(class,feature)` cell | Slow fit on wide+long data | Acceptable at v2 sizes; if it bites, tile the sample axis (still single-owner) | very large K·d·n |
-| Backend test suite already slow (v1: cpu ~6min) | CI time balloons as Phases 7–11 add suites | Run targeted post-merge gates, background the full run (project memory: backend-test-suite-slow) | every added `*_test.rs` |
-| Full-spectrum eig for spectral at large n | O(n³) blowup | Cap fixture n; defer Lanczos to v3 | large graphs |
-
----
+| Full `n×n` distance resident for KNN-graph | OOM / PoolStats-gate failure as n grows | Tile the query axis; `top_k` per block; keep big operand global, never resident-full | n² exceeds buffer-pool budget |
+| Re-running full UMAP layout for the property gate at large n | Test-suite time balloons (backend suite already ~6min, project memory) | Cap fixture n for the property gate; background the full run; targeted post-merge gates | every added UMAP/HDBSCAN `*_test.rs` |
+| Host MST on a dense graph at large n | `O(n²)` edges to the host | Build MST from the **k-graph** (`O(n·k)` edges), not the dense matrix | n large with dense edge list |
+| f32 core-distance parallel reduction reordered | Non-reproducible f32; label flips | Pin ascending accumulation order, single-owner (Pitfall 7) | parallel float accumulation |
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **SGD/NB/Laplacian kernels:** Compiles under cuda/wgpu but never run under `--features cpu` — verify the cpu launch (not just compile) passes; cpu-MLIR panics are launch-time (Pitfalls 1–3).
-- [ ] **Every f64 oracle case:** Has the `if capability::skip_f64_with_log() { return; }` guard (Pitfall 10).
-- [ ] **IncrementalPCA:** Tested with **2+ batches**, not just one — the mean-correction-row bug is invisible single-batch (Pitfall 5).
-- [ ] **RandomProjection:** Has a **property/JL** test, NOT a value oracle; `johnson_lindenstrauss_min_dim` value-matched separately (Pitfall 6).
-- [ ] **SGD oracle:** `shuffle=False`, fixed `eta0`/schedule, fixed `max_iter`, `tol=0` — and references sklearn, not cuML (Pitfall 7).
-- [ ] **Spectral:** Drops the trivial (≈0) eigenvector, takes *smallest*, sign-canonicalized via `_deterministic_vector_sign_flip` for embedding output (Pitfall 4).
-- [ ] **NB predict_proba:** Rows sum to 1, computed via log-sum-exp; GaussianNB has `var_smoothing` (Pitfall 9).
-- [ ] **EmpiricalCovariance/LedoitWolf:** ddof=0 (biased) normalization, `shrinkage_ ∈ [0,1]`, both `shrinkage_` and `covariance_` gated (Pitfall 8).
-- [ ] **LDS budget:** Any SharedMemory tile size asserted < 65536 B on gfx1100 (Pitfall 11).
-- [ ] **Memory gate:** Every new prim/estimator has its build-failing PoolStats gate (v1 per-phase discipline) — not deferred.
-- [ ] **f32 band:** Any family that can't hit strict 1e-5 in f32-on-rocm has a *documented, named* band with exact-label/argmax as the hard gate (Pitfall 12).
-
----
+- [ ] **KNN-graph prim:** Composed from launch-proven `top_k` (no new heap kernel); `--features cpu` **launch** verified (not just compile); self-neighbour dropped (query k+1); no `Atomic`/`SharedMemory`/`F::INFINITY`/mutable-bool/shift-loop (Pitfalls 1,3).
+- [ ] **UMAP layout:** Vertex-owner GATHER (not edge-scatter); cpu launch passes; same SplitMix64 seed → byte-identical embedding across runs (Pitfall 2).
+- [ ] **UMAP gate:** Property gate present (trustworthiness + kNN-overlap **relative to umap-learn**, + determinism); `fuzzy_simplicial_set`/`smooth_knn_dist` value-gated ≤1e-5; NO embedding value oracle; NOT a shape-only smoke test (Pitfall 5).
+- [ ] **HDBSCAN:** Stable-sorted MST edges + documented deterministic tie-break; `label_perm` **pins `−1`→`−1`**; `min_samples` vs `min_cluster_size` semantics correct; tested on jittered AND explicitly-tied fixtures; gated vs `hdbscan` not cuML (Pitfall 6).
+- [ ] **HDBSCAN device/host split:** distance+knn+core+mutual-reach on device (GATHER), MST+condensed-tree+stability on host; no Atomic/union-find kernel; core-dist accumulation order pinned (Pitfall 7).
+- [ ] **Every f64 oracle case:** Has `if capability::skip_f64_with_log() { return; }` (Pitfall 8).
+- [ ] **f32 bands:** UMAP fuzzy-set / HDBSCAN probabilities have named bands; labels exact; UMAP layout is property-gated (Pitfall 8).
+- [ ] **Builder retrofit:** Piloted on 1–2 estimators with `any_estimator!`/PyO3 suite green BEFORE the 28-estimator sweep; `new()` still works; no per-param `PhantomData` (Pitfall 9).
+- [ ] **Defaults:** Single source of truth; builder-default == new()-default == sklearn-default (table test); HDBSCAN `min_samples=None→min_cluster_size` resolved at build/fit (Pitfall 10).
+- [ ] **sklearn shim:** `get_params` returns verbatim ctor kwargs; `__init__` pure assignment; double-`fit` resets; `_`-attrs raise pre-fit; FFI-free invariant unit tests gate in CI; live `check_estimator` routed to UAT (Pitfall 11).
+- [ ] **Memory gate:** Every new prim/estimator has its build-failing PoolStats gate — not deferred (per-phase discipline).
 
 ## Recovery Strategies
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| cpu-MLIR atomic/SharedMemory panic (1,2,3) | MEDIUM | Rewrite the kernel as single-owner GATHER (invert parallelism to one-thread-per-output-cell, ascending scan, F/u32 accumulators, drop `F::INFINITY`/mutable-bool); re-validate cpu launch |
-| Wrong eigenvector selection/sign (4) | LOW | Switch to ascending sort + drop index 0 + sign_flip helper; clustering path is sign-immune via label_perm |
-| IncrementalPCA merge wrong (5) | MEDIUM | Re-port from sklearn `_incremental_pca.py`; add multi-batch oracle |
-| RandomProjection value oracle chosen (6) | LOW | Delete value fixture; replace with JL/property test (no kernel change) |
-| SGD oracle nondeterministic (7) | LOW | Pin shuffle/schedule/iters in the fixture generator; regen `.npz` via /tmp venv |
-| f64-on-rocm not skipped (10) | LOW | Add the skip_f64_with_log guard line |
-| LDS overflow (11) | MEDIUM | Move the big operand to global memory; shrink/remove the SharedMemory tile |
-| Too-strict f32 gate (12) | LOW | Introduce a named per-family band; keep exact-label/argmax as the hard gate |
-
----
+| cpu-MLIR panic in KNN/UMAP/MST kernel (1,2,7) | MEDIUM | Compose from `top_k`; invert to single-owner-per-vertex/cell GATHER; move hierarchy logic to host; drop `F::INFINITY`/mutable-bool; re-verify cpu launch |
+| Self-neighbour / symmetrisation wrong (3) | LOW | Query k+1 + drop self; apply correct per-consumer symmetrisation (union vs mutual-reach) as GATHER |
+| LDS / PoolStats overflow on `n×n` (4) | MEDIUM | Move big operand to global; tile the query axis; assert tile bytes < 65536 |
+| UMAP value oracle chosen (5) | LOW | Delete value fixture; add trustworthiness/kNN-overlap-vs-umap-learn + determinism; value-gate only the fuzzy set |
+| HDBSCAN labels diverge (6) | MEDIUM | Stable-sort MST + deterministic tie-break; `−1`-pin label_perm; regen jittered+tied fixtures via /tmp venv; gate vs hdbscan |
+| f64-on-rocm not skipped (8) | LOW | Add the `skip_f64_with_log` guard line |
+| `any_estimator!` broken by builder (9) | MEDIUM-HIGH | Revert constructor to thin wrapper; pilot on 1–2 estimators; audit every macro call site before re-sweeping |
+| Default drift (10) | LOW | Single-source defaults; add builder==new==sklearn default test |
+| sklearn shim check_estimator fails (11) | LOW-MEDIUM | get_params=verbatim kwargs; move validation to fit; raise NotFittedError pre-fit; reset on re-fit |
 
 ## Pitfall-to-Phase Mapping
 
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| 1. SGD update wants atomics | Phase 10 | Two-pass GATHER kernel passes `--features cpu` launch; no Atomic/SharedMemory imports |
-| 2. NB per-class scatter-add | Phase 11 | One-owner-per-(class,feature) kernel; cpu launch passes |
-| 3. Laplacian degree scatter + zero-degree | Phase 9 | Row-reduction degree; guarded `d_inv_sqrt` (no INFINITY); no NaN in L |
-| 4. Spectral wrong/sign eigenvectors | Phase 9 | Ascending+drop-0 selection; embedding sign-matched; clustering via label_perm |
-| 5. IncrementalPCA merge | Phase 7 | 2+ batch oracle at f64 1e-5; V-based svd_flip; ddof=1 explained_variance |
-| 6. RandomProjection value-unmatchable | Phase 7 | JL/property test present; no transform value fixture; JL-min-dim value-matched |
-| 7. SGD oracle nondeterminism / cuML | Phase 10 | Oracle: shuffle=False, fixed schedule/iters, sklearn ref; weights value-match |
-| 8. LedoitWolf/EmpCov normalization | Phase 7 | ddof=0; shrinkage∈[0,1]; covariance_ matches across two n |
-| 9. NB underflow/smoothing/variance | Phase 11 | log-sum-exp; var_smoothing; predict_log_proba value-matched; proba sums to 1 |
-| 10. f64-on-rocm not skipped | Phases 7–11 | skip_f64_with_log guard in every f64 test case |
-| 11. LDS budget overflow | Phases 8, 9 | SharedMemory tile bytes asserted < 65536; big operands in global |
-| 12. f32-on-rocm band (below) | Phases 7–11 | Named band documented; exact label/argmax hard-gated |
-
----
-
-## Pitfall 12 (cross-cutting): Which f32-on-rocm cases need a documented band vs strict 1e-5
-
-**What goes wrong:**
-Strict 1e-5 is "often physically unreachable in f32" (project memory): ULP exceeds 1e-5 on large magnitudes, and error compounds through iterative/accumulation-heavy kernels. Forcing strict 1e-5 on rocm-f32 fails correct code; loosening the *global* tolerance hides real bugs. v1's answer is **documented per-family bands** with exact labels/argmax as the hard gate.
-
-**Predicted band needs (MEDIUM confidence — measure empirically, as v1 did):**
-
-| Estimator / prim | f32-on-rocm strict 1e-5? | Why / band rationale | Hard gate to keep exact |
-|---|---|---|---|
-| EmpiricalCovariance | Likely strict | Single-pass sums, low accumulation | values |
-| LedoitWolf | Band likely | Ratio of Frobenius norms amplifies f32 error | `shrinkage_` band; covariance band |
-| IncrementalPCA | **Band needed** | Iterative SVD merge across batches compounds f32 error; sign already handled | components band + sign; explained_variance band |
-| RandomProjection | N/A (property test) | No value oracle (Pitfall 6) | JL bound + density exact |
-| KernelRidge | Band likely | RBF `exp(-γ·d²)` + Cholesky solve compound f32 error | predictions band |
-| KernelDensity | **Band needed** | log-sum-exp over n kernels; large dynamic range | log-density band |
-| SpectralEmbedding | **Band needed** | eig of Laplacian; near-degenerate spectra | embedding band + sign; or subspace test |
-| SpectralClustering | Strict on labels | Labels are discrete | **exact labels** via label_perm (sign/band irrelevant) |
-| MBSGD*/LinearSVC/SVR | **Band needed** | Iterative SGD accumulates per-step f32 error over epochs | weights band; **exact predicted labels** (classifier) |
-| GaussianNB | Band likely | var + log-Gaussian; var_smoothing helps | log-proba band; **exact labels** |
-| Multinomial/Bernoulli/Complement/CategoricalNB | Strict-ish on labels | Log-space sums are stable | **exact labels**; log-proba near-strict |
-
-**Rule (from v1 D-08):** classifiers/clusterers keep **exact predicted labels / argmax** as the non-negotiable hard gate even when continuous outputs get a band; regressors/decompositions get a *named* per-family band documented in `docs/tolerance-policy.md`, never a global loosening. Measure the actual band on rocm hardware during each phase and record it.
-
-**Phase to address:** Each of Phases 7–11 sets its own family band during validation (continue v1's `Tolerance::for_family` growth point).
-
----
+| 1. KNN-graph atomics/SharedMemory | Phase 12 | Composed from `top_k`; `--features cpu` launch passes; no forbidden imports/literals |
+| 2. UMAP edge-scatter layout | Phase 13 | Vertex-owner GATHER; cpu launch passes; identical-seed reproducibility |
+| 3. Self-neighbour / symmetrisation / ties | Phase 12 | Self dropped (k+1); correct per-consumer symmetrisation as GATHER |
+| 4. `n×n` LDS / memory-gate overflow | Phase 12 | Tile bytes < 65536; global big operand; PoolStats gate green at fixture sizes |
+| 5. UMAP stochastic-gate (make-or-break) | Phase 13 | Property gate (trustworthiness/kNN-overlap vs umap-learn + determinism); fuzzy-set value-gated; no value oracle |
+| 6. HDBSCAN label divergence | Phase 14 | Stable-sort MST + deterministic tie-break; `−1`-pinned label_perm; jittered+tied fixtures; vs hdbscan |
+| 7. MST/tree atomics + float reorder | Phase 14 | Host-side MST/tree; device GATHER for distance/core/mutual-reach; pinned accumulation |
+| 8. f32 bands + f64-on-rocm skip | Phases 12–16 | `skip_f64_with_log` in every f64 case; named family bands; labels exact |
+| 9. Builder typestate / `any_estimator!` break | Phase 15 | Pilot estimator green under PyO3 suite; `new()` works; no per-param PhantomData; call sites audited |
+| 10. Default-value drift | Phase 15 (+13/14 defaults) | builder==new==sklearn default table test; `min_samples` None-resolution correct |
+| 11. sklearn shim check_estimator | Phase 16 | FFI-free invariant tests in CI (get_params/clone/double-fit/pre-fit); live check_estimator → UAT |
 
 ## Sources
 
-- v1 codebase idioms (HIGH): `crates/mlrs-backend/src/prims/reduce.rs` (GATHER / single-owner / pairwise-stable, no mutable SharedMemory accumulator), `tests/{gemm,eig,distance,covariance}_test.rs` (`capability::skip_f64_with_log` idiom), `crates/mlrs-core/src/{tolerance,compare,sign_flip,label_perm}.rs` (tolerance policy D-08, sign-flip + label-perm helpers).
-- Project memory (HIGH): cubecl-cpu no-SharedMemory/no-atomics launch panic + GATHER fix idiom; rocm f64-unsupported gate (cubecl-cpp 0.10); gfx1100 LDS 65536 B; f32 band policy; oracle-fixture /tmp-venv regen; cuML diverges from sklearn on SGD/LinearSVC.
-- Planning docs (HIGH): `.planning/PROJECT.md`, `seeds/v2-breadth-roadmap.md`, `research/questions.md`, `notes/v3-hard-algorithm-backlog.md`.
-- scikit-learn parity math (HIGH, verified against source/docs):
-  - IncrementalPCA merge (mean_correction sqrt factor, S·components stacking, `svd_flip(u_based_decision=False)`, `S²/(n_total-1)`, noise_variance) — https://github.com/scikit-learn/scikit-learn/blob/main/sklearn/decomposition/_incremental_pca.py
-  - LedoitWolf shrinkage (mu/beta/delta, biased empirical_covariance) — https://scikit-learn.org/stable/modules/generated/sklearn.covariance.ledoit_wolf_shrinkage.html , https://scikit-learn.org/stable/modules/generated/sklearn.covariance.LedoitWolf.html
-  - SGDClassifier schedule (`optimal` = `1/(alpha*(t+t0))`, Bottou t0; eta0/shuffle/random_state) — https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDClassifier.html
-  - cuML MBSGD diverges from sklearn (constant default schedule, different results) — https://github.com/rapidsai/cuml/issues/2113 , https://github.com/rapidsai/cuml/issues/2114
-  - Spectral: drop the zero eigenvalue / smallest nontrivial eigenvectors — https://en.wikipedia.org/wiki/Spectral_clustering , https://en.wikipedia.org/wiki/Laplacian_matrix
+- v1/v2 codebase idioms (HIGH): `crates/mlrs-backend/src/prims/topk.rs` (launch-proven `top_k`, ascending, **lowest-index tie-break**, no SharedMemory/INFINITY/shift-loop), `prims/distance.rs`, `crates/mlrs-py/src/dispatch.rs` (`any_estimator!` Unfit/F32/F64 + stored-verbatim-hyperparameters + mutex-poisoning WR-02/WR-04), `crates/mlrs-algos/src/linear/sgd_config.rs` (`BuildError`, builder precedent), `tests/{topk,eig,distance,sgd}_test.rs` (`capability::skip_f64_with_log` idiom), `crates/mlrs-core` sign_flip/label_perm/tolerance helpers (D-08).
+- Project memory + PROJECT.md (HIGH): cubecl-cpu no-SharedMemory/no-atomics launch panic + GATHER fix; mutable-bool/`F::INFINITY`/shift-loop panic on cpu-MLIR; rocm f64-unsupported skip-with-log (cubecl-cpp 0.10); gfx1100 LDS 65536 B; per-phase PoolStats memory gate; SplitMix64 reproducible PRNG (no OsRng); v2 D-12 RandomProjection property-gate precedent; v2 D-08 exact-label rule; Python-wheel-untestable-in-env (live check_estimator → UAT); oracle-fixture /tmp-venv regen; "dodge tree-atomics risk" framing.
+- v2.0 PITFALLS.md (HIGH): two-pass GATHER SGD idiom (vertex-owner UMAP layout mirrors it), zero-degree/`F::INFINITY` guard, LDS-budget audit, f32-band-vs-exact-label policy.
+- CONCERNS.md (HIGH, cuML reference behaviour to NOT replicate): UMAP vertex-parallel non-determinism bug (`optimize_batch_kernel.cuh`); cuML HDBSCAN `cluster_selection_epsilon`/outlier-score incompleteness (`extract.cuh`/`select.cuh`/`membership.cuh`) → gate vs hdbscan not cuML; UMAP/SMO/tree CUDA porting risk (don't port the 1,165-line kernel); warp-size NVIDIA assumptions.
+- hdbscan reference (HIGH, verified against source): `scikit-learn-contrib/hdbscan/hdbscan_.py` — stable `np.argsort` MST-edge tie order; noise `−1`; `probabilities_` via Cython; `min_samples` (`query(X, k=min_samples+1)`) vs `min_cluster_size`; parallel float-accumulation nondeterminism — https://github.com/scikit-learn-contrib/hdbscan/blob/master/hdbscan/hdbscan_.py
+- UMAP validation practice (HIGH/MEDIUM): trustworthiness + kNN-preservation + Shepard/stress as the structure-preservation gate; different UMAP implementations land at *similar* trustworthiness (comparability = the gate); 5–15% coordinate variation across runs → value-matching is impossible — https://medium.com/data-science/on-the-validating-umap-embeddings-2c8907588175 , https://direct.mit.edu/neco/article/33/11/2881/107068/Parametric-UMAP-Embeddings-for-Representation-and
+- sklearn estimator contract (HIGH): `check_estimator`/`get_params` returns ctor params; `clone` = `type(est)(**get_params(deep=False))`; validate in `fit` not `__init__`; trailing-`_` fitted attrs; `NotFittedError` pre-fit — https://scikit-learn.org/stable/developers/develop.html
 
 ---
-*Pitfalls research for: mlrs v2.0 breadth-sweep estimators on cpu(f64)+rocm(f32) / sklearn ≤1e-5 oracle*
-*Researched: 2026-06-14*
+*Pitfalls research for: mlrs v3.0 UMAP + HDBSCAN + KNN-graph prim + Rust-native builder retrofit + pure-Python sklearn shim, on cpu(f64)+rocm(f32) / sklearn ≤1e-5 + umap-learn property gate + hdbscan exact-label gate*
+*Researched: 2026-06-22*

@@ -1,319 +1,331 @@
-# Architecture Patterns — v2.0 Breadth Sweep
+# Architecture Research — v3.0 Manifold Algorithms & Rust-Native API
 
-**Domain:** sklearn-compatible ML estimator library (Rust/CubeCL rewrite of cuML), v2.0 breadth sweep
-**Researched:** 2026-06-14
-**Supersedes for v2:** the v1.0 `ARCHITECTURE.md` (2026-06-11) covered crate layout / generic-over-runtime / Arrow zero-copy and is now VALIDATED (shipped). This file is the v2 integration architecture: how the ~16 new estimators + 5 new primitives slot into that shipped layering. The v1 architecture is REUSED, not re-researched.
+**Domain:** sklearn-compatible ML estimator library (Rust/CubeCL rewrite of cuML), v3.0 manifold + builder-API milestone
+**Researched:** 2026-06-22
+**Confidence:** HIGH for placement / trait deltas / dispatch / shim / build order / the device-host split of each new prim (every claim mirrors a shipped file read this pass). MEDIUM for the HDBSCAN on-device MST feasibility and the UMAP negative-sampling layout kernel under cpu-MLIR — the two genuine unknowns that each need a per-phase research spike before planning.
 
-This file answers: how do the v2 estimators and their new primitives integrate into the existing
-five-crate layering and trait surface — what is NEW, what is MODIFIED, in what build order, and
-how each threads through dispatch / shim / oracle. Every claim is grounded in the actual shipped
-code read this pass (`crates/*/src/**`, `scripts/gen_oracle.py`).
-
-> Confidence: **HIGH** for placement / host-API signature shape / trait deltas / dispatch / shim
-> mixins / oracle (every claim mirrors a shipped file). **MEDIUM** for the incremental-SVD merge
-> stability, SGD-under-cpu-MLIR fit, and smallest-eigenpair approach — the genuine unknowns in
-> `research/questions.md` that need a per-phase research spike before planning P7/P9/P10.
+**Supersedes for v3:** the v2.0 `v2.0-research/ARCHITECTURE.md` is VALIDATED (shipped). This file is the v3 integration architecture: how the KNN-graph prim + UMAP + HDBSCAN + the builder-API retrofit slot into the shipped five-crate layering. The v1/v2 architecture is REUSED, not re-researched.
 
 ---
 
-## Recommended Architecture
+## Standard Architecture
 
 ### The fixed five-crate seam (REUSE — do not change)
 
 ```
-mlrs-kernels   #[cube] generic-float kernels, BACKEND-FEATURE-FREE (no ActiveRuntime)
-      │            new: kernel_matrix elementwise, laplacian helpers, sgd update, nb reductions
-      ▼
-mlrs-backend   prims/*  validate-geometry → unsafe launch → Result<_, PrimError>
-      │            owns ActiveRuntime, BufferPool, DeviceArray; the ONLY kernel launch site (D-13)
-      │            new: prims/rng.rs, prims/kernel_matrix.rs, prims/incremental_svd.rs,
-      │                 prims/laplacian.rs, prims/sgd.rs (+ reuse reduce/distance/eig/cholesky/gemm)
-      ▼
-mlrs-algos     estimator structs<F>; impl Fit/Predict/Transform/PredictLabels/PredictProba
-      │            COMPOSE prims, never launch kernels directly
-      │            new modules: covariance/, projection/, kernel/, manifold/, naive_bayes/
-      │                         (+ spectral in cluster/, + mbsgd & svm in linear/)
-      ▼
-mlrs-py        #[pyclass] via any_estimator! enum (Unfit/F32/F64); dtype-suffixed accessors;
-      │            py.detach + guard_f64; pure-Python sklearn shim (python/mlrs/*.py)
-      ▼
-scripts/gen_oracle.py + tests/fixtures/*.npz  (committed blobs, no Python at test time)
+┌──────────────────────────────────────────────────────────────────────┐
+│ mlrs-kernels  #[cube] generic-float kernels, BACKEND-FEATURE-FREE      │
+│   v3 NEW: knn_graph symmetrize map, umap_layout (neg-sample) update,   │
+│           mutual_reach map, (mst/condense are HOST — see HDBSCAN)      │
+├──────────────────────────────────────────────────────────────────────┤
+│ mlrs-backend  prims/*  validate-geometry → unsafe launch → Result      │
+│   owns ActiveRuntime, BufferPool, DeviceArray; the ONLY launch site    │
+│   v3 NEW: prims/knn_graph.rs  (reuses distance + topk)                 │
+│           prims/umap_layout.rs (new neg-sample SGD-layout solver)      │
+│           prims/mutual_reach.rs (small, reuses distance/topk)          │
+│           prims/mst.rs + prims/condense.rs are HOST-side (no kernel)   │
+│   reuse: distance, topk, eig, laplacian, reduce, gemm, rng             │
+├──────────────────────────────────────────────────────────────────────┤
+│ mlrs-algos  estimator structs<F>; impl Fit/Transform/PredictLabels     │
+│   COMPOSE prims, never launch kernels (D-13)                           │
+│   v3 NEW: manifold/umap.rs, cluster/hdbscan.rs                         │
+│   v3 NEW: a shared builder convention (trait/derive) + retrofit        │
+├──────────────────────────────────────────────────────────────────────┤
+│ mlrs-py  #[pyclass] via any_estimator! enum (Unfit/F32/F64);           │
+│   dtype-suffixed accessors; py.detach + guard_f64                      │
+│   v3 NEW: estimators/manifold.rs (UMAP), add hdbscan to cluster.rs     │
+│   v3 REUSE: python/mlrs/*.py shim (MlrsBase + sklearn mixins)          │
+├──────────────────────────────────────────────────────────────────────┤
+│ scripts/gen_oracle.py + tests/fixtures/*.npz (committed blobs)         │
+│   v3 NEW: umap-learn oracle (property gate), hdbscan oracle (labels)   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-The dependency arrows are **acyclic and unchanged**. Every v2 addition is a *new file plus a
-`pub mod` / `pub use` line* in the relevant crate root; no v2 work edits a v1 estimator file
-(the file-disjoint, parallel-safe discipline from v1 holds). The single shared-edit point is
-`mlrs-py/src/lib.rs` (pyclass registration) and the family-module `mod.rs` files.
+The dependency arrows are **acyclic and unchanged**. Every algorithm addition is a *new file + a `pub mod`/`pub use` line* in the relevant crate root. The single shared-edit points stay `mlrs-py/src/lib.rs` (pyclass registration) and the family-module `mod.rs` files. The builder retrofit is the ONE v3 work item that touches existing estimator files broadly — see §Pattern 3 and the build-order sequencing.
 
-### Two structural decisions the roadmapper must make up front
+### Component Responsibilities (v3 deltas only)
 
-1. **Promote host SplitMix64 to `prims/rng.rs` vs. a device RNG kernel.** v1 already has a
-   host-side seeded PRNG inside `prims/kmeans.rs::kmeanspp_sample` (read back once per center,
-   never `OsRng` — ASVS V6). RandomProjection needs a full `n_features × n_components` matrix.
-   **Recommendation: host-generate-then-upload** (SplitMix64/Philox on host → single
-   `BufferPool` upload), promoted into a shared `prims/rng.rs` so RandomProjection, future SGD
-   shuffling, and any later sampler reuse one seeded generator. A device RNG kernel is not worth
-   it at v2 sizes and would fight the cpu-MLIR no-atomics constraint. (Resolves `[v2-P1] RNG`.)
-
-2. **Smallest-eigenpairs for spectral.** v1 `eig` (Jacobi) returns the *full* descending
-   spectrum. SpectralEmbedding/Clustering need the *smallest* nontrivial eigenvectors of the
-   Laplacian. **Recommendation: full-spectrum-then-take-smallest** at v2 problem sizes (no
-   Lanczos/shift-invert) — it reuses the validated `eig` prim verbatim; the only new code is a
-   host-side "drop the trivial near-zero eigenvector, take the next k ascending" slice in the
-   estimator. Flag a problem-size cap in PITFALLS. (Resolves the `[v2-P3]` default.)
+| Component | Responsibility | Implementation |
+|-----------|----------------|----------------|
+| `prims/knn_graph.rs` | Build the shared (indices, distances) KNN graph + symmetrize; the single feasibility-critical prim | distance → topk → host/device symmetrize; feature-free, GATHER idiom |
+| `prims/umap_layout.rs` | The new neg-sampling SGD layout solver (the one genuinely new UMAP kernel) | host epoch/edge-sampling loop + per-edge attract/repel device update (GATHER, single-owner) |
+| `prims/mutual_reach.rs` | Mutual-reachability distance for HDBSCAN | core-dist (= k-th col of KNN dist) + pairwise max; reuses topk/distance |
+| `prims/mst.rs` (HOST) | Minimum spanning tree over mutual-reach (Prim's) | pure host CPU loop — pointer-chasing, NOT on device |
+| `prims/condense.rs` (HOST) | Condensed tree + stability extraction | pure host CPU — recursive tree walk, NOT on device |
+| `manifold/umap.rs` | UMAP estimator: KNN→fuzzy set→init→optimize | composes knn_graph + (eig\|rng) init + umap_layout |
+| `cluster/hdbscan.rs` | HDBSCAN estimator: mutual-reach→MST→condense→extract | composes mutual_reach (device) + mst/condense (host) |
+| builder convention | Idiomatic Rust `Estimator::builder().setter().build()?` across all 30+ estimators | a `derive`-or-macro standard generalizing the Phase-10 `*Builder` precedent |
 
 ---
 
-## (1) New primitives — placement + host-API signature shape
+## Integration Points — new vs modified vs reused, per feature
 
-Every prim follows the shipped contract seen in `prims/covariance.rs` and `prims/distance.rs`:
-**`pub fn name<F: Float + CubeElement + Pod>(pool, inputs, geometry, params, out: Option<DeviceArray>) -> Result<DeviceArray, PrimError>`** — `validate_geometry(...)` called BEFORE any
-`unsafe` launch, `out`-buffer reuse via `BufferPool`, zero host round-trips (the device-residency
-grep gate). Any new kernel lives in `mlrs-kernels/src/` and is re-exported from its `lib.rs`; the
-prim wrapper is the launch site.
+### Feature 1 — KNN-graph primitive (the shared, feasibility-critical prim)
 
-| New prim | Kernel (mlrs-kernels) | Prim file (mlrs-backend/src/prims) | Signature shape | Composition / new-kernel? |
-|---|---|---|---|---|
-| **RNG matrix** | none (host PRNG) | `rng.rs` | `fn random_matrix<F>(pool, shape:(usize,usize), kind: RngKind {Gaussian, SparseAchlioptas{density}}, seed:u64, out:Option<_>) -> Result<DeviceArray<F>, PrimError>` | Host SplitMix64/Philox fills `Vec<F>` → single pool upload. **No device kernel.** Promotes v1's kmeans++ host PRNG. |
-| **Kernel matrix** | extend `elementwise.rs` (exp/poly/tanh map) | `kernel_matrix.rs` | `fn kernel_matrix<F>(pool, x,(nx,d), y,(ny,d), kind: KernelKind {Linear, Rbf{gamma}, Poly{degree,gamma,coef0}, Sigmoid{gamma,coef0}}, out) -> Result<DeviceArray<F>, PrimError>` | Linear = `gemm(transb=true)`; RBF = `distance(sqrt=false)`→`exp(-γ·d²)`; Poly/Sigmoid = `gemm`→`(γG+c0)^deg`/`tanh`. **One small elementwise map kernel**, NO SharedMemory/atomics (resolves `[v2-P2]`). |
-| **Incremental SVD merge** | none (glue over `svd`/`gemm`) | `incremental_svd.rs` | `fn isvd_merge<F>(pool, prev:(components,S,mean,n_seen), x_batch,(nb,d), out) -> Result<(components, S, mean), PrimError>` | sklearn `IncrementalPCA._fit`: stack `[√(n/seen)·diag(S)·components ; X_batch_centered]`, `svd` it (reuse v1 `svd`). **Host-light glue**; open risk = f32-on-rocm stability of the stacked merge (`[v2-P1]`). |
-| **Graph Laplacian** | extend `elementwise.rs` (D^{-1/2} scale) | `laplacian.rs` | `fn laplacian<F>(pool, affinity,(n,n), norm: LapNorm {Unnormalized, SymmetricNorm, RandomWalk}, out) -> Result<DeviceArray<F>, PrimError>` | Affinity = `kernel_matrix(Rbf)` (reuse P8 prim). Degree = `row_reduce(Sum)`; `L=D−W` or `I−D^{-1/2}WD^{-1/2}`. **Small reduce+elementwise composition.** |
-| **SGD solver** | `sgd.rs` (per-minibatch grad/update, GATHER idiom) | `sgd.rs` | `fn sgd_fit<F>(pool, x,(n,d), y, loss: SgdLoss {Hinge, Log, SquaredLoss, EpsilonInsensitive{eps}}, penalty:{kind,alpha,l1_ratio}, lr_schedule, max_iter, tol, n_iter_no_change, seed, fit_intercept) -> Result<(coef, intercept), PrimError>` | The ONE genuinely new solver. Host owns the epoch/shuffle/LR-schedule loop (like `prims/lbfgs.rs`'s host driver); device does the per-minibatch dot/update. **Must fit the v1 GATHER idiom** (no SharedMemory / no cross-unit atomics — `[v2-P4]`). |
+**This is the keystone. Land it standalone with its own gate test BEFORE UMAP/HDBSCAN consume it** (primitive-first discipline; the v1/v2 pattern where the prim is gated and the estimator is "mostly assembly").
 
-**Pattern to follow (from `covariance.rs`):** `validate_geometry → reduce/gemm/distance compose →
-in-place scale on the REUSED out buffer → return the exact out handle`. Each new prim needs its
-own `tests/<prim>_test.rs` with the PoolStats memory gate (bounded reuse, out-buffer reuse,
-`read_backs == 0` inside the prim) — the v1 per-prim gate discipline continues.
-
-**Anti-pattern to avoid:** launching a kernel from `mlrs-algos` (estimators compose prims only —
-D-13). Also avoid a caller-visible `ReducePath` parameter on INTERNAL reductions (the `CR-01`
-plane-path-`None` panic on cpu — see `covariance.rs`: internal reductions are unconditionally
-`ReducePath::Shared`).
-
----
-
-## (2) New / modified traits
-
-v1 trait surface (`mlrs-algos/src/traits.rs`): `Fit`, `Predict<F>` (continuous), `Transform<F>`
-(+ default-`Unsupported` `inverse_transform`), `PredictLabels<F>` (i32), `KNeighbors<F>`,
-`PredictProba<F>`. v2 needs **two new traits and reuses the rest**.
-
-| Estimator family | Trait surface | NEW or REUSE |
+| Aspect | Disposition | Detail |
 |---|---|---|
-| EmpiricalCovariance, LedoitWolf | `Fit` only + host accessors (`covariance_`, `location_`, `precision_`) | **REUSE `Fit`.** No `Predict`/`Transform`. A "covariance estimator without predict" is just `Fit` + accessors — **no new trait.** |
-| IncrementalPCA | `Fit` + `Transform` + **`PartialFit`** | **NEW `PartialFit<F>`**: `fn partial_fit(&mut self, pool, x, y:Option, shape) -> Result<&mut Self, AlgoError>` — same shape as `Fit::fit` but accumulates running SVD state instead of resetting (`Fit::fit` = `partial_fit` over one batch). |
-| Gaussian/SparseRandomProjection | `Fit` + `Transform` | **REUSE.** `fit` builds the random matrix from `n_features` (+seed); `transform` = `gemm(X, Rᵀ)`. No `inverse_transform`. |
-| KernelRidge | `Fit` + `Predict` | **REUSE.** `fit` solves `(K+αI)·dual = y` via `cholesky_solve`; `predict` = `kernel_matrix(Xq,Xfit)·dual`. |
-| KernelDensity | `Fit` + **`ScoreSamples`** | **NEW `ScoreSamples<F>`**: `fn score_samples(&self, pool, x, shape) -> Result<DeviceArray<F>, AlgoError>` → length-`n` log-densities (sklearn `KernelDensity.score_samples`; not `Predict` semantics). |
-| SpectralEmbedding | `Fit` + `Transform` (transductive) | **REUSE `Transform`.** `fit` computes affinity→Laplacian→eig, stores embedding; `transform` returns it. sklearn SpectralEmbedding has no out-of-sample transform; shim exposes `fit_transform` via `TransformerMixin`. |
-| SpectralClustering | `Fit` + `PredictLabels` | **REUSE `PredictLabels`** (i32, like KMeans/DBSCAN). `fit` = embedding → KMeans on embedding; labels stored. |
-| MBSGDClassifier, LinearSVC | `Fit` + `PredictLabels` (+ `PredictProba` for log-loss MBSGDClassifier) | **REUSE.** Hinge/log via SGD prim. |
-| MBSGDRegressor, LinearSVR | `Fit` + `Predict` (continuous) | **REUSE.** Squared / ε-insensitive via SGD prim. |
-| 5× NaiveBayes | `Fit` + `PredictLabels` + `PredictProba` | **REUSE** all three. Pure reductions; proba = normalized class posteriors, labels = argmax. |
+| Pairwise distance | **REUSE** | `prims/distance.rs::distance` (squared, order-preserving) — already validated. |
+| k-NN selection | **REUSE** | `prims/topk.rs::top_k(dist, rows, cols, k, sqrt, ...)` returns `(distances F, indices u32)` per query row, lowest-index tie-break, optional boundary-sqrt. **This IS the NearestNeighbors prim.** |
+| Self-exclusion / k+1 | **NEW (host glue)** | When the graph is over the training set itself, request `k+1` and drop the self-column (the precedent already lives in the spectral kNN-connectivity builder). |
+| Symmetrization | **NEW** | A small symmetrize step producing the union/intersection graph that BOTH consumers need. **Device path:** a `knn_graph_symmetrize` elementwise/scatter map over a dense `n×n` working buffer at v3 oracle sizes (GATHER-safe: single-owner write per output cell, no atomics). **Host path fallback:** build the COO/CSR adjacency on host from the read-back `(indices, distances)` when `n` is large enough that dense `n×n` is wasteful — flag the size cutoff in PITFALLS. |
+| Output contract | **NEW (the shared seam)** | Return BOTH `indices (n×k, i32)` AND `distances (n×k, F)` in the **un-symmetrized neighbor-list form** plus a **symmetrized weighted-graph form** (COO triplets `(row, col, weight)` or dense `n×n`). UMAP needs the symmetrized *fuzzy union* (probabilistic t-conorm `a + b − a·b`); HDBSCAN needs the raw `(indices, distances)` to compute core-distance + mutual reachability. **Contract: emit the neighbor-list `(idx, dist)` as the primitive output; let each estimator apply its own edge-weighting** (UMAP fuzzy-set vs HDBSCAN mutual-reach). The symmetrize helper is a shared utility both call. |
 
-**Trait deltas summary:**
-- **NEW:** `PartialFit<F>` (IncrementalPCA), `ScoreSamples<F>` (KernelDensity). Both placed in
-  `traits.rs` next to existing traits, same `<F: Float + CubeElement + Pod>` bound, same
-  `(pool, x, shape)` convention, errors via `AlgoError`. Re-export from `mlrs-algos/src/lib.rs`'s
-  `pub use traits::{...}` (one-line MODIFY).
-- **REUSE unchanged:** `Fit`, `Predict`, `Transform`, `PredictLabels`, `PredictProba`.
-- **Covariance estimators need no new trait** — `Fit` + accessors, just don't impl `Predict`.
+**Device/host split (the cpu-MLIR answer):**
+- **Device:** distance (reuse), top-k select (reuse — already proven on cpu-MLIR), and the symmetrize map (new, single-owner GATHER write per cell — no SharedMemory, no cross-unit atomics).
+- **Host:** the k+1/self-drop bookkeeping and the choice of dense-vs-COO representation. No pointer-chasing here — the KNN graph is *embarrassingly parallel per query row*, so it is fully GATHER-idiom-compatible. **This prim is feature-free and standalone-gateable**, exactly like the v2 prims.
 
----
+**Is it feature-free?** YES. It is `distance` + `topk` + a symmetrize map, all generic over `<F: Float + CubeElement + Pod>` and over runtime, no backend feature. Its gate test is a `tests/knn_graph_test.rs` with PoolStats memory gate + a sklearn `kneighbors_graph` oracle (the connectivity/distances are 1e-5-comparable since selection is deterministic).
 
-## (3) Threading through dispatch + accessors + shim mixins
+### Feature 2 — UMAP
 
-### PyO3 layer (`mlrs-py/src/`)
+UMAP = KNN graph → fuzzy simplicial set → low-dim init → SGD layout optimization.
 
-Each estimator follows the **three-part pattern** in `estimators/decomposition.rs`:
+| Stage | Disposition | Detail |
+|---|---|---|
+| KNN graph | **REUSE (Feature 1)** | `knn_graph` prim provides `(indices, distances)`. |
+| Fuzzy simplicial set | **NEW (mostly host + small device map)** | Per-point: find ρ (distance to nearest neighbor) + binary-search σ for the local connectivity target (host loop, like the LR-schedule host arithmetic in `sgd.rs`); membership strength `exp(−(d−ρ)/σ)` is a small elementwise device map (new `umap_fuzzy_map` kernel, GATHER-safe). Symmetrize via the probabilistic t-conorm (reuse the Feature-1 symmetrize helper with the fuzzy-union weight). |
+| Low-dim init | **REUSE — with a hard caveat** | Spectral init = smallest nontrivial eigenvectors of the graph Laplacian → **reuse `prims/laplacian.rs` + `prims/eig.rs` (the v2 spectral path verbatim)**. **CAVEAT:** the Jacobi `eig` prim has `MAX_DIM` (= 64, per `jacobi_eig`); the spectral estimators already cap `n_samples > MAX_DIM`. Dense Jacobi eig does NOT scale to UMAP-sized graphs. **Recommendation: ship `init="random"` (reuse `prims/rng.rs`) as the DEFAULT correctness path, and offer `init="spectral"` only under the eig `MAX_DIM` cap** — flag the size limit loudly in PITFALLS (Lanczos/sparse-eig is deferred, same call as v2). This keeps UMAP runnable at realistic sizes without a new eigensolver. |
+| SGD layout optimization | **NEW kernel — does NOT reuse the two-pass SGD solver** | The v2 `prims/sgd.rs` is a *supervised linear-model* solver (per-sample margin → weight update over a fixed coef vector). UMAP layout is a *fundamentally different* update: **edge-sampled attractive forces + negative-sampled repulsive forces over the embedding coordinate matrix**, with per-epoch learning-rate decay. The host loop shape (epoch loop + LR schedule + per-batch device launch) is the SAME orchestration pattern as `sgd.rs`/`lbfgs.rs`, but the device kernel is new: `umap_layout_step` applying attract/repel gradient to embedding rows. **Build it as `prims/umap_layout.rs` with a new `umap_layout_step` kernel.** Negative sampling = host-drawn negative indices (reuse `prims/rng.rs` SplitMix64) fed to the GATHER kernel (single-owner update per embedding row — no atomics; this is the cpu-MLIR feasibility question to spike). |
 
-1. **`any_estimator! { any: AnyX, algo: mlrs_algos::family::X, unfit: { hp: ty, ... } }`** — emits
-   the `Unfit{..}/F32(X<f32>)/F64(X<f64>)` enum (REUSE `dispatch.rs` macro verbatim).
-2. **`#[pyclass(name="SklearnName")] struct PyX { inner: AnyX }`** + `#[pymethods]`: `#[new]`
-   stores hyperparameters into `Unfit`; `fit` does `float_dtype → match → guard_f64()` on the
-   F64 arm BEFORE upload → `py.detach(|| { global_pool().lock(); est.fit(...) })`.
-3. **dtype-suffixed accessors** (`coef_f32`/`coef_f64`, `transform_f32`/`_f64`, …) because a
-   `#[pyclass]` method can't be generic over `F`; plus `dtype()`, `is_fitted()`, and the
-   trait-specific method (`predict_labels` is i32 / unsuffixed; `predict_proba_f32/f64`).
+**Data flow:** `X → knn_graph(X,k) → (idx, dist) → fuzzy_set (host σ/ρ + device map + symmetrize) → init (rng default | eig under cap) → umap_layout_step × epochs → embedding_`.
 
-New estimator modules in `mlrs-py/src/estimators/`: `covariance.rs`, `projection.rs`, `kernel.rs`,
-`manifold.rs`; add spectral-clustering to `cluster.rs`, MBSGD/LinearSVM to `linear.rs`, new
-`naive_bayes.rs`. Register every `#[pyclass]` in `mlrs-py/src/lib.rs` module init (the one shared
-MODIFIED file).
+**Device/host split:** device = distance, topk, fuzzy map, symmetrize, layout step; host = σ/ρ binary search, edge/negative sampling schedule, LR decay, epoch loop. **The layout step's per-row single-owner GATHER update under cpu-MLIR is the MEDIUM-confidence item — spike it before planning the UMAP phase** (precedent: the v2 SGD solver launched on cpu-MLIR first try, which is encouraging).
 
-**Per-family dispatch notes:**
-- Covariance: `fit(x, rows, cols)` unsupervised (no `y`); accessors `covariance_f32/f64`,
-  `location_f32/f64`, `precision_f32/f64`. No `predict`.
-- IncrementalPCA: add `partial_fit(x, rows, cols)` `#[pymethod]` — first call picks dtype arm,
-  later calls dispatch to the fitted arm's `PartialFit`; enforce dtype-consistency across batches
-  (new guard).
-- RandomProjection: `fit(rows, cols)` data-independent (matrix from `n_features`+seed); expose
-  `components_f32/f64` and `transform_f32/f64`.
-- KernelDensity: `score_samples_f32/f64`. KernelRidge: `predict_f32/f64`, `dual_coef_f32/f64`.
-- NaiveBayes: `predict_labels` (i32, unsuffixed), `predict_proba_f32/f64`, `n_classes()` int
-  accessor (mirror LogisticRegression's `classes_ = arange(n_classes())`).
+**Correctness gate:** stochastic layout → NOT element-wise 1e-5. Property/structural gate à la RandomProjection (D-12): trustworthiness/continuity metric vs `umap-learn`, k-NN preservation in the embedding, seed-reproducibility. Oracle broadens to `umap-learn`.
 
-### Pure-Python shim (`mlrs-py/python/mlrs/`)
+### Feature 3 — HDBSCAN
 
-`MlrsBase` (REUSE unchanged) already gives `_normalize`/`_normalize_y`, `_to_output`,
-`_suffix()`/`_suffixed()`/`_np_float()` dtype routing, `_post_fit(n_features)`, `_check_fitted`,
-and `__sklearn_tags__` (sparse/nan/array-api off). Each shim = `MlrsBase` + the sklearn family
-mixin; the `fit` body is the v1 boilerplate verbatim (`_normalize → _ext().PyX(...) →
-obj.fit(...) → self._mlrs_obj = obj → _post_fit(cols) → return self`).
+HDBSCAN = mutual-reachability → MST → condensed cluster tree → stability extraction.
 
-| Family | sklearn mixin(s) | Shim file | Notes |
-|---|---|---|---|
-| EmpiricalCovariance, LedoitWolf | **none** (bare `MlrsBase`/`BaseEstimator`) | `covariance.py` (new) | `fit(X, y=None)`; `covariance_`/`location_`/`precision_` props. No mixin ⇒ no injected predict/transform. |
-| IncrementalPCA | `TransformerMixin` | `decomposition.py` (extend) | add `partial_fit(X, y=None)`; `transform`, `components_`, `mean_`, `explained_variance_`. |
-| Gaussian/SparseRandomProjection | `TransformerMixin` | `projection.py` (new) | `fit(X, y=None)` (uses only `X.shape[1]`); `transform`; `components_`. |
-| KernelRidge | `RegressorMixin` | `kernel.py` (new) | `fit(X, y)`; `predict`; `dual_coef_`. |
-| KernelDensity | **none** (sklearn KDE is bare `BaseEstimator`) | `kernel.py` or `neighbors.py` | `fit(X, y=None)`; `score_samples(X)`; `score(X)`. |
-| SpectralEmbedding | `TransformerMixin` | `manifold.py` (new) | `fit_transform(X)` primary; `embedding_`. |
-| SpectralClustering | `ClusterMixin` | `cluster.py` (extend) | `ClusterMixin` gives `fit_predict`; `labels_` (int). |
-| MBSGDClassifier, LinearSVC | `ClassifierMixin` | `linear.py` (extend) | `classes_=arange(n_classes())`; `predict`→int; LinearSVC no `predict_proba`; MBSGDClassifier(log) has it. |
-| MBSGDRegressor, LinearSVR | `RegressorMixin` | `linear.py` (extend) | `predict`→float; `coef_`/`intercept_`. |
-| 5× NaiveBayes | `ClassifierMixin` | `naive_bayes.py` (new) | `classes_`; `predict`→int; `predict_proba`; per-variant fitted attrs (`theta_`/`var_` Gaussian; `feature_log_prob_`/`class_log_prior_` discrete). |
+| Stage | Disposition | Detail |
+|---|---|---|
+| KNN graph / core distance | **REUSE (Feature 1)** | Core distance of point i = distance to its k-th neighbor = the k-th column of `knn_graph` distances. Pure reuse. |
+| Mutual-reachability distance | **NEW (small device map)** | `mreach(a,b) = max(core_a, core_b, d(a,b))`. A small elementwise map over the (dense or neighbor-list) distance graph — `prims/mutual_reach.rs` with a `mutual_reach_map` kernel (GATHER-safe, no atomics). |
+| **MST construction** | **NEW — HOST-SIDE (Prim's / Boruvka)** | This is the inherently sequential / pointer-chasing stage. **Prim's algorithm over the mutual-reach graph runs on the HOST** (read the mutual-reach graph back once, build the MST in a CPU loop). GPU Boruvka needs atomics for the parallel edge-contraction and fights the cpu-MLIR no-atomics constraint head-on — **do NOT attempt on-device MST in v3.** cuML uses a GPU MST (raft); mlrs deliberately stays host here. Feasible because at v3 oracle sizes the MST is cheap and the device→host read-back is a one-time cost. |
+| Condensed tree + stability | **NEW — HOST-SIDE** | Building the single-linkage hierarchy from the MST, condensing it (min_cluster_size), and computing per-cluster stability is a recursive tree walk — pure host CPU. NOT on device (pointer-chasing, no parallelism win, no atomics available). |
+| Label extraction (EOM) | **NEW — HOST-SIDE** | Excess-of-mass cluster selection from the condensed tree → final labels (`-1` noise sentinel, already representable in the `i32` `PredictLabels` contract). Host. |
 
-**No new shim machinery is required** — `MlrsBase` already covers dtype-suffix routing + output
-mirroring. The v1 `__sklearn_tags__` (dense-float-only, nulls rejected) carries over to every
-new family.
+**Data flow:** `X → knn_graph(X,k) → core_dist (k-th col) → mutual_reach (device map) → [READ BACK] → MST (host Prim's) → single-linkage tree (host) → condense (host) → stability/EOM (host) → labels_`.
+
+**Device/host split (the cpu-MLIR answer):** **device = only the embarrassingly-parallel front half** (distance, topk, mutual-reach map); **host = the entire tree half** (MST, condensation, stability, extraction). This is the correct split *regardless* of backend — the tree algorithms have no data-parallel structure to exploit and the no-atomics constraint makes a GPU MST infeasible in v3. HDBSCAN is therefore a "device front-end, host tree back-end" estimator. The host code is plain Rust (`Vec`/union-find), no CubeCL.
+
+**Correctness gate:** exact labels up to permutation (the hard gate), oracle = `hdbscan` / `sklearn.cluster.HDBSCAN`. Reuse the v1 `label_perm` helper.
+
+### Feature 4 — Rust-native builder-pattern API
+
+**Critical finding: the builder pattern is ALREADY PARTIALLY SHIPPED.** Phase 10 (`linear/mod.rs`) and Phase 11 (`naive_bayes/mod.rs`) INTRODUCED `Estimator::builder().setter(..).build() -> Result<_, BuildError>` for high-arity estimators, with `BuildError` already defined in `mlrs-algos/src/error.rs`. The v1 low-arity estimators (LogisticRegression, LinearRegression, Ridge, PCA, KMeans, NN…) still use `new(...)` / `with_opts(...)` and were **deliberately NOT retrofitted (D-02)**. So v3 work is: (a) elevate the existing ad-hoc per-estimator `*Builder` structs into ONE shared convention, (b) add typestate, (c) retrofit the ~24 estimators that don't have a builder yet.
+
+| Aspect | Disposition | Detail |
+|---|---|---|
+| Where it lives | **mlrs-algos** (NOT mlrs-core) | The builder is an estimator-construction concern; `mlrs-core` holds only float/oracle/error infra and must stay estimator-agnostic. Put the convention next to `traits.rs` in `mlrs-algos` — a `builder` module (a `derive` macro or a small declarative `builder!` macro + a shared `BuildError`, which already exists). It does NOT belong in `mlrs-backend` (no estimators there) or `mlrs-core`. |
+| Typestate (Unfit→Fitted) | **NEW** | Two designs are viable. **(A) Type-level typestate:** `Estimator<F, Unfit>` → `fit` returns `Estimator<F, Fitted>`; predict/transform only impl'd on `Fitted`. Clean but multiplies the generic surface and complicates the PyO3 enum. **(B) Runtime fitted-flag (recommended for v3):** keep the single `Estimator<F>` struct, `build()` produces it Unfit, fitted attributes are `Option<DeviceArray>` (already the shipped pattern — see `gaussian_nb.rs` `theta_: None`), accessors/predict return `AlgoError::NotFitted` if `None`. **Recommendation: runtime fitted-flag** — it matches the shipped device-resident-`Option` state pattern, keeps the `any_estimator!` enum unchanged, and the *typestate guarantee surfaces in the Python shim* via `check_is_fitted`/`NotFittedError` (already wired in `MlrsBase`). Type-level typestate is gold-plating that fights the PyO3 `Unfit/F32/F64` enum. |
+| Coexistence with `any_estimator!` | **REUSE — no conflict** | The PyO3 `any_estimator!` enum already has an `Unfit { hyperparameters }` arm. The Rust builder produces the *Rust* `Estimator<F>` that lands in the `F32(..)`/`F64(..)` arms after fit; the PyO3 `#[new]` keeps storing sklearn-named hyperparameters into the enum's `Unfit` arm. **The builder is the Rust-native front door; the PyO3 enum is the Python front door; both construct the same `Estimator<F>`.** No machinery change to dispatch.rs. |
+| Coexistence with sklearn-mirror ctors | **MODIFIED (keep both)** | Keep `new`/`with_opts` as thin wrappers over `builder().…build().unwrap()` for backward compat, OR deprecate them. **Recommendation: builder is canonical; `new` becomes `builder().build().expect("defaults valid")` for the zero-required-arg estimators** so existing call sites and tests keep compiling. |
+| Sequencing | **CONVENTION FIRST, retrofit as a sweep** | Establish the shared builder convention + typestate decision in an EARLY v3 phase so the NEW v3 estimators (UMAP/HDBSCAN) are *born with it*. Retrofit the existing 30 as a dedicated sweep phase. See build order. |
+
+### Feature 5 — Pure-Python sklearn shim
+
+**Critical finding: the shim ALREADY EXISTS and is shipped** (`crates/mlrs-py/python/mlrs/{base,linear,cluster,decomposition,neighbors,covariance,random_projection}.py`). `MlrsBase` subclasses sklearn `BaseEstimator` directly, giving `get_params`/`set_params`/`clone`/`__repr__` for free, plus `_normalize`/`_to_output` IO routing, `_check_fitted` (→ `NotFittedError`), and a `__sklearn_tags__` override. The PROJECT.md "shim not built / carried-forward" note refers specifically to **`check_estimator` live-FFI re-triage** (needs a maturin+pyarrow host this env lacks — deferred), NOT the shim package.
+
+| Aspect | Disposition | Detail |
+|---|---|---|
+| Where it sits | **REUSE** | Above the PyO3 `_mlrs` extension (`from . import _io`; estimators call `_ext().PyX(...)`). It sits in `mlrs-py/python/mlrs/`, packaged INTO each of the four per-backend wheels (the shim is pure-Python and backend-agnostic; the `_mlrs` cdylib differs per wheel). |
+| v3 additions | **NEW (assembly only)** | `python/mlrs/manifold.py` (UMAP — `TransformerMixin`, `fit_transform` primary, `embedding_`) and add HDBSCAN to `cluster.py` (`ClusterMixin`, `labels_`, `-1` noise). UMAP and HDBSCAN get PyO3 `#[pyclass]` wrappers (`estimators/manifold.rs`, extend `cluster.rs`) registered in `lib.rs`. No new shim machinery — `MlrsBase` covers dtype-suffix routing + output mirroring already. |
+| `check_estimator` / get/set_params | **REUSE + extend coverage** | `get_params`/`set_params` come free from `BaseEstimator` given the `__init__`-purity rule (already enforced). Extend the existing `test_params.py`/`test_estimator_checks.py` to the new estimators. Live `check_estimator` triage stays deferred (no maturin+pyarrow host). |
 
 ---
 
-## (4) Suggested build order (primitive-first dependency graph)
-
-The seed roadmap's phase order is sound and respects the prim→estimator graph. Phase numbering
-continues from v1 (next = 7).
+## Recommended Project Structure (v3 deltas)
 
 ```
-Phase 7  Covariance & projection
-   prim: rng.rs (promote host PRNG)         → Gaussian/SparseRandomProjection
-   prim: incremental_svd.rs (merge glue)    → IncrementalPCA
-   reuse: covariance prim                    → EmpiricalCovariance, LedoitWolf (Fit-only)
-   NEW trait: PartialFit                     → IncrementalPCA
-   estimators: EmpiricalCovariance, LedoitWolf, IncrementalPCA, GaussianRP, SparseRP
+crates/
+├── mlrs-kernels/src/
+│   ├── knn_graph.rs        # NEW: symmetrize map kernel
+│   ├── umap_layout.rs      # NEW: umap_layout_step (attract/repel GATHER)
+│   ├── mutual_reach.rs     # NEW: mutual_reach_map (small elementwise)
+│   └── elementwise.rs      # MODIFY: + umap_fuzzy_map
+├── mlrs-backend/src/prims/
+│   ├── knn_graph.rs        # NEW: distance→topk→symmetrize (the shared prim)
+│   ├── umap_layout.rs      # NEW: host epoch/neg-sample loop + layout kernel
+│   ├── mutual_reach.rs     # NEW: core-dist + mutual-reach (device front-end)
+│   ├── mst.rs              # NEW: HOST Prim's (no kernel — pointer-chasing)
+│   └── condense.rs         # NEW: HOST condensed-tree + stability (no kernel)
+├── mlrs-algos/src/
+│   ├── builder.rs          # NEW: shared builder convention + typestate
+│   ├── manifold/umap.rs    # NEW: UMAP estimator
+│   ├── cluster/hdbscan.rs  # NEW: HDBSCAN estimator
+│   └── {all 30 estimators} # MODIFY (retrofit sweep): builder + fitted-flag
+└── mlrs-py/
+    ├── src/estimators/manifold.rs  # NEW: PyUMAP
+    ├── src/estimators/cluster.rs   # MODIFY: + PyHDBSCAN
+    ├── src/lib.rs                  # MODIFY: register PyUMAP/PyHDBSCAN
+    └── python/mlrs/
+        ├── manifold.py             # NEW: UMAP shim (TransformerMixin)
+        └── cluster.py              # MODIFY: + HDBSCAN (ClusterMixin)
+```
 
-Phase 8  Kernel family
-   prim: kernel_matrix.rs (linear/rbf/poly/sigmoid)  → reused by P9 + future SVM
-   NEW trait: ScoreSamples                   → KernelDensity
-   reuse: cholesky_solve                      → KernelRidge
-   estimators: KernelRidge (Fit+Predict), KernelDensity (Fit+ScoreSamples)
+### Structure Rationale
 
-Phase 9  Spectral family   [HARD DEP on Phase 8]
-   prim: laplacian.rs                         → consumes kernel_matrix(P8) + eig(v1) + kmeans(v1)
-   reuse: eig (full-spectrum→take-smallest), kmeans
-   estimators: SpectralEmbedding (Fit+Transform), SpectralClustering (Fit+PredictLabels)
+- **`mst.rs`/`condense.rs` live in `mlrs-backend/src/prims/` but contain NO CubeCL** — they are host-side algorithm primitives. Placing them under `prims/` keeps the "estimators compose prims, never implement algorithm internals" discipline (D-13) intact: HDBSCAN's `cluster/hdbscan.rs` composes `mutual_reach` (device) + `mst` + `condense` (host) prims, it does not inline a Prim's loop.
+- **`builder.rs` in mlrs-algos, not mlrs-core** — keeps `mlrs-core` estimator-agnostic; the builder is an estimator-construction concern co-located with `traits.rs`.
 
-Phase 10 SGD / linear-SVM
-   prim: sgd.rs (hinge/log/squared/epsilon)   → one new solver; unblocks 4 estimators
-   reuse: gemm, reductions
-   estimators: MBSGDClassifier (Fit+PredictLabels[+PredictProba]), MBSGDRegressor (Fit+Predict),
-               LinearSVC (Fit+PredictLabels), LinearSVR (Fit+Predict)
+---
 
-Phase 11 Naive Bayes
-   prim: none (reductions only)
-   estimators: Gaussian/Multinomial/Bernoulli/Complement/CategoricalNB
-               (all Fit+PredictLabels+PredictProba)
+## Architectural Patterns
+
+### Pattern 1: Device front-end, host tree back-end (HDBSCAN)
+
+**What:** Run the embarrassingly-parallel, GATHER-friendly stages (distance, topk, mutual-reach) on device; read back once; run the inherently-sequential tree stages (MST, condense, stability) on the host in plain Rust.
+**When to use:** Any algorithm whose back half is pointer-chasing / recursive with no data-parallel structure, under the cpu-MLIR no-atomics constraint.
+**Trade-offs:** One device→host read-back (cheap at v3 sizes); avoids the infeasible GPU-MST atomics problem entirely; the host code is simple, testable Rust. The cost is it won't scale to millions of points without a GPU MST (deferred, same posture as cuML's raft MST which mlrs deliberately does not port in v3).
+
+### Pattern 2: Reuse the topk/distance prims as the KNN graph (no new neighbor prim)
+
+**What:** The KNN graph IS `distance → top_k` (already shipped + cpu-MLIR-proven) plus a symmetrize map. Do not build a new neighbor search.
+**When to use:** Both UMAP and HDBSCAN front-ends.
+**Trade-offs:** Dense `n×n` distance at v3 oracle sizes is fine (same as the kernel-matrix prim); approximate-NN (NN-Descent, like umap-learn's default) is deferred — flag the exact-vs-approximate divergence in PITFALLS since umap-learn uses approximate KNN.
+
+### Pattern 3: Builder convention generalizing the Phase-10 precedent
+
+**What:** Promote the per-estimator `*Builder` structs (shipped for the 9 Phase-10/11 estimators) into ONE shared convention — a `derive`/macro that emits `builder()` + setters + `build() -> Result<_, BuildError>`, reusing the existing `BuildError` enum.
+**When to use:** All estimators; new v3 estimators adopt it from birth.
+**Trade-offs:** A retrofit sweep touches ~24 existing files (the one broad-edit work item in v3 — schedule it as its own phase, not interleaved with algorithm phases, to keep waves feature-disjoint). Runtime fitted-flag (not type-level typestate) keeps the PyO3 enum unchanged.
+
+**Example (the shipped builder shape to generalize):**
+```rust
+// Already shipped in gaussian_nb.rs — generalize this into builder.rs:
+GaussianNB::builder().priors(p).var_smoothing(1e-9).build::<f32>()?  // -> GaussianNB<f32>, Unfit
+```
+
+### Pattern 4: Host orchestration + GATHER device step (UMAP layout, reusing the sgd.rs shape)
+
+**What:** The host owns the epoch loop, LR schedule, and edge/negative-index sampling (SplitMix64); the device runs a single-owner per-row update kernel. Same *orchestration shape* as `prims/sgd.rs`/`prims/lbfgs.rs`, but a NEW layout kernel (not the SGD weight-update kernel).
+**When to use:** UMAP layout optimization.
+**Trade-offs:** The per-embedding-row single-owner update is the cpu-MLIR feasibility unknown to spike. Precedent is favorable (the v2 SGD two-pass GATHER solver launched on cpu-MLIR first try).
+
+## Data Flow
+
+### KNN-graph → UMAP
+```
+X →[device]→ distance → topk(k+1) →[host]→ self-drop, σ/ρ binary-search
+  →[device]→ fuzzy_map + symmetrize(t-conorm) → init(rng default | eig≤MAX_DIM)
+  →[host loop + device step]→ umap_layout_step × epochs → embedding_
+```
+
+### KNN-graph → HDBSCAN
+```
+X →[device]→ distance → topk → core_dist(k-th col) → mutual_reach_map
+  →[READ BACK]→[host]→ MST(Prim's) → single-linkage → condense → stability/EOM → labels_
+```
+
+## Scaling Considerations
+
+| Scale | Architecture Adjustments |
+|-------|--------------------------|
+| v3 oracle sizes (≤ few thousand pts) | Dense `n×n` distance + host MST + dense symmetrize all fine; eig-spectral-init only under `MAX_DIM`=64 cap. |
+| Larger (10k+) | Switch KNN symmetrize to COO/CSR (host); UMAP must use `init="random"` (eig caps out); host MST still OK to ~100k. |
+| Much larger (deferred) | Approximate-NN (NN-Descent), sparse-eig (Lanczos), GPU-MST (atomics — blocked by cpu-MLIR) — all deferred past v3, same posture as v2's Nyström/Lanczos deferrals. |
+
+### Scaling Priorities
+1. **First bottleneck:** dense `n×n` distance/symmetrize memory → COO/CSR on host.
+2. **Second bottleneck:** spectral-init eig `MAX_DIM` cap → default to random init.
+
+## Anti-Patterns
+
+### Anti-Pattern 1: Attempting on-device MST / GPU tree construction in v3
+**What people do:** Try a GPU Boruvka MST or device-side condensed-tree build for HDBSCAN.
+**Why it's wrong:** Both need cross-unit atomics / dynamic parallelism that the cpu-MLIR backend cannot lower (the exact reason RandomForest/tree work is deferred past v3 per PROJECT.md Out-of-Scope). It will panic on the cpu gate.
+**Do this instead:** Read the mutual-reach graph back once; run Prim's + condensation in plain host Rust (Pattern 1).
+
+### Anti-Pattern 2: Reusing the v2 SGD weight-update kernel for UMAP layout
+**What people do:** Try to force UMAP's attract/repel embedding optimization through `prims/sgd.rs`.
+**Why it's wrong:** `sgd.rs` updates a fixed-length coef vector from per-sample margins (supervised linear model); UMAP updates an `n×d_embed` coordinate matrix from sampled edges + negative samples — a different gradient and data layout.
+**Do this instead:** New `prims/umap_layout.rs` + `umap_layout_step` kernel; reuse only the *host orchestration shape* and `rng.rs` for sampling.
+
+### Anti-Pattern 3: Interleaving the builder retrofit with algorithm phases
+**What people do:** Retrofit builders to existing estimators inside the UMAP/HDBSCAN phases.
+**Why it's wrong:** Breaks the file-disjoint, parallel-safe wave discipline — the retrofit touches ~24 existing estimator files; mixing it with new-estimator phases creates merge contention.
+**Do this instead:** Establish the convention in an early phase; do the retrofit as its own dedicated sweep phase.
+
+### Anti-Pattern 4: Building a new KNN/neighbor primitive
+**What people do:** Write a fresh k-NN search for UMAP/HDBSCAN.
+**Why it's wrong:** `distance` + `topk` already do this, are cpu-MLIR-proven, and are the shipped NearestNeighbors prim.
+**Do this instead:** `prims/knn_graph.rs` composes them + a symmetrize map.
+
+## Integration Points
+
+### Internal Boundaries
+
+| Boundary | Communication | Notes |
+|----------|---------------|-------|
+| knn_graph prim ↔ UMAP / HDBSCAN | `(indices i32, distances F)` neighbor-list + shared symmetrize helper | Each estimator applies its own edge weighting (fuzzy-union vs mutual-reach). |
+| mutual_reach (device) ↔ mst/condense (host) | one device→host read-back of the mutual-reach graph | The HDBSCAN device/host seam. |
+| Rust builder ↔ `any_estimator!` Unfit arm | both construct the same `Estimator<F>` | No dispatch.rs change. |
+| `mlrs-py` shim (Python) ↔ `_mlrs` cdylib | `_ext().PyX(...)`, dtype-suffixed accessors | Shim is pure-Python, packaged into all four wheels. |
+
+## Suggested phase / build order (continuing from Phase 12)
+
+Primitive-first, dependencies respected (KNN-graph before UMAP/HDBSCAN; builder convention before retrofit), feature-disjoint waves.
+
+```
+Phase 12  Builder convention + typestate  [DO FIRST — born-with-it for new estimators]
+   NEW: mlrs-algos/src/builder.rs (shared builder; runtime fitted-flag; reuse BuildError)
+   establishes the convention so UMAP/HDBSCAN (P14/P15) adopt it from birth
+   NO algorithm work — pure API foundation; lowest risk; unblocks everything
+   (does NOT retrofit existing estimators yet — that is P16)
+
+Phase 13  KNN-graph primitive  [the shared, feasibility-critical prim]
+   NEW: prims/knn_graph.rs (distance + topk + symmetrize map) + knn_graph kernel
+   reuse: distance, topk (cpu-MLIR-proven)
+   gate: tests/knn_graph_test.rs (sklearn kneighbors_graph oracle + PoolStats)
+   feature-free, standalone-validated — NOTHING consumes it yet (primitive-first)
+
+Phase 14  UMAP   [HARD DEP on P12 builder + P13 knn_graph]
+   NEW: prims/umap_layout.rs + umap_layout_step kernel (the one new solver)
+   NEW: umap_fuzzy_map kernel; reuse rng (init+neg-sample), eig/laplacian (spectral init ≤MAX_DIM)
+   NEW: manifold/umap.rs estimator (builder-fronted), estimators/manifold.rs PyUMAP, manifold.py shim
+   SPIKE FIRST: layout-step single-owner GATHER on cpu-MLIR (MEDIUM-confidence unknown)
+   gate: property/structural vs umap-learn (trustworthiness, kNN-preservation, seed-repro)
+
+Phase 15  HDBSCAN   [HARD DEP on P12 builder + P13 knn_graph; feature-disjoint from P14]
+   NEW: prims/mutual_reach.rs + mutual_reach_map kernel (device front-end)
+   NEW: prims/mst.rs (HOST Prim's), prims/condense.rs (HOST condensed-tree + stability)
+   NEW: cluster/hdbscan.rs estimator (builder-fronted), PyHDBSCAN in cluster.rs, cluster.py shim
+   SPIKE FIRST: confirm host MST/condense matches hdbscan condensation exactly
+   gate: exact labels up to permutation vs hdbscan/sklearn.cluster.HDBSCAN (label_perm helper)
+
+Phase 16  Builder retrofit sweep + shim coverage  [DO LAST — broad-edit, parallel-unsafe]
+   MODIFY: retrofit the ~24 pre-Phase-10 estimators to the P12 builder convention
+   MODIFY: keep new()/with_opts as thin builder wrappers for back-compat
+   EXTEND: test_params.py / test_estimator_checks.py to UMAP/HDBSCAN + retrofitted set
+   isolate as its own phase so it never contends with new-estimator files
 ```
 
 **Critical ordering facts:**
-- **P8 (kernel_matrix) must precede P9 (spectral)** — the Laplacian's affinity matrix *is*
-  `kernel_matrix(Rbf)`. The seed lists them adjacent; make the dep explicit.
-- **P7 and P11 are pure assembly** (covariance / reductions already validated) → lowest risk;
-  ideal confidence-building bookends.
-- **P10 (SGD) is the single new-solver risk** with the most research-gated unknown (`[v2-P4]`
-  cpu-MLIR fit) and unblocks the most estimators (4). Budget a research spike before planning it.
-- Within a phase, land the **prim + its gate test first**, then the consuming estimators (the v1
-  "prim gated, estimator is assembly" pattern).
-
----
-
-## (5) gen_oracle.py additions + the RandomProjection fixture exception
-
-Each estimator adds a `gen_<name>(seed, dtype)` to `scripts/gen_oracle.py` writing a committed
-`tests/fixtures/<name>_<dtype>_seed42.npz` (both f32 + f64), registered in `main()`. Follow v1
-conventions: `np.ascontiguousarray(...).astype(dtype)` on every array (the PCA Fortran-order trap,
-04-04 Rule-1); store sklearn fitted attrs + a held-out `predict`/`transform`; pin deterministic
-solver settings (`algorithm='arpack'` not `'randomized'`; tight `tol` where the estimator
-converges deeper than sklearn's default — cf. the LogReg `tol=1e-10` note).
-
-| Estimator | Fixture arrays | Reference | Gate notes |
-|---|---|---|---|
-| EmpiricalCovariance | `X`, `covariance_`, `location_` | `sklearn.covariance.EmpiricalCovariance` | strict 1e-5; mirrors `gen_covariance`. |
-| LedoitWolf | `X`, `covariance_`, `shrinkage_` | `sklearn.covariance.LedoitWolf` | pin shrinkage scalar too. |
-| IncrementalPCA | `X` + batch sizes, `components_`, `explained_variance_`, `mean_`, `transform` | `sklearn.decomposition.IncrementalPCA(batch_size)` | **sign-align components rows (`align_rows`)** like PCA; pin batch schedule so the merge order matches. f32-on-rocm merge stability is the watch item. |
-| Gaussian/SparseRandomProjection | see exception below | — | **PROPERTY GATE, not value-match.** |
-| KernelRidge | `X`, `y`, `Xq`, `alpha`, kernel params, `dual_coef_`, `predict` | `sklearn.kernel_ridge.KernelRidge` | strict 1e-5; pin kernel + gamma. |
-| KernelDensity | `X`, `Xq`, `bandwidth`, kernel, `score_samples` | `sklearn.neighbors.KernelDensity` | compare log-densities; pin kernel='gaussian'. |
-| SpectralEmbedding | `X`/affinity, `embedding_` | `sklearn.manifold.SpectralEmbedding` | eigenvectors sign+order ambiguous → sign-align AND allow subspace comparison; pin `affinity`, `n_components`, drop trivial eigenvector. |
-| SpectralClustering | `X`/affinity, `labels` | `sklearn.cluster.SpectralClustering` | **label-permutation invariant** (reuse v1 `label_perm` helper, like KMeans). |
-| MBSGDClassifier/Regressor | `X`, `y`, `Xq`, hp, `coef_`, `intercept_`, `predict`(+`predict_proba`) | `sklearn.linear_model.SGDClassifier/SGDRegressor` | SGD parity is path-dependent (LR schedule, shuffle seed) → may need a SELF-REFERENCE (cf. LogReg binary) or fixed-seed+matched-schedule. Flag in PITFALLS. |
-| LinearSVC/SVR | `X`, `y`, `Xq`, `C`, `coef_`, `intercept_`, `predict` | `sklearn.svm.LinearSVC/LinearSVR` (liblinear) | liblinear objective differs slightly → predict/label is the robust gate; `coef_` looser. |
-| GaussianNB | `X`, `y`, `Xq`, `theta_`, `var_`, `predict`, `predict_proba` | `sklearn.naive_bayes.GaussianNB` | strict on proba; predict label-exact. |
-| Multinomial/Bernoulli/Complement/CategoricalNB | `X` (counts/binary/categorical), `y`, `Xq`, `feature_log_prob_`/`class_log_prior_`, `predict`, `predict_proba` | corresponding `sklearn.naive_bayes.*` | discrete inputs; pin `alpha` smoothing. |
-
-### The RandomProjection exception (explicit)
-
-`GaussianRandomProjection` / `SparseRandomProjection` **cannot be value-matched against sklearn**:
-the projection matrix is RNG-drawn and sklearn's NumPy `default_rng` stream is NOT reproducible by
-mlrs's host SplitMix64/Philox (the same reason KMeans injects a fixed `init`). So instead of a
-`coef_ ≤ 1e-5` value oracle, the test is a **property gate**:
-
-- **Johnson–Lindenstrauss distance preservation:** for the *mlrs-drawn* matrix, pairwise distances
-  after projection are preserved within the JL `eps` bound (sklearn's
-  `johnson_lindenstrauss_min_dim` is the oracle for the required `n_components`).
-- **Matrix distribution:** Gaussian RP — entries `~N(0, 1/n_components)` (mean/var within tol);
-  Sparse RP — Achlioptas density + the `±sqrt(s)/sqrt(n_components)` value set at the expected
-  nonzero fraction.
-- **Seed reproducibility:** same seed → identical matrix across runs/backends (ASVS-V6).
-- **Shape/transform correctness:** `transform(X) == X @ components_.T` value-exact against the
-  *mlrs* matrix (self-consistency, not a sklearn match).
-
-`gen_random_projection` (if any committed blob at all) stores only the seeded `X` + the
-JL/`n_components` params; the test draws the matrix and asserts the *properties*. This is the one
-v2 estimator whose correctness gate is structurally different from the 1e-5 value oracle — call it
-out loudly in REQUIREMENTS and PITFALLS.
-
----
-
-## Scalability Considerations
-
-| Concern | v2 oracle sizes | Larger | Notes |
-|---|---|---|---|
-| Spectral eig | full Jacobi spectrum, take smallest | dense eig O(n³) — cap `n_samples` | Lanczos/shift-invert deferred to v3. |
-| Kernel matrix | dense `n×n` | O(n²) memory | OK at v2 sizes; Nyström deferred. |
-| IncrementalPCA | batched merge, O(batch·d) memory | the streaming point | f32 merge stability is the watch item. |
-| SGD | host epoch loop, device minibatch | GATHER idiom (cpu-MLIR) | averaging/LR-schedule parity is the correctness risk, not throughput. |
-
----
-
-## Patterns to Follow / Anti-Patterns
-
-**Follow:** prim `validate_geometry → compose prims → in-place scale on reused `out` → return exact
-handle` (`covariance.rs`); estimator stores fitted state as device-resident `Option<DeviceArray>`,
-host-materializes only at accessors (`pca.rs`); PyO3 `any_estimator!` enum + `py.detach` +
-`guard_f64()` before F64 arm (`decomposition.rs`); shim = `MlrsBase` + family mixin, `fit` returns
-`self`, `_post_fit(cols)` (`linear.py`/`base.py`); fixtures sign-align via `align_rows` and
-label-permute via `label_perm` where the math is gauge/permutation ambiguous.
-
-**Avoid:** kernel launch from `mlrs-algos`; caller-visible `ReducePath` on internal reductions
-(cpu plane-path-`None` panic); in-source `#[cfg(test)] mod tests` (AGENTS.md §2 — tests in
-`tests/`); SharedMemory/atomics in any new kernel (cpu-MLIR MLIR backend panics — MEMORY note
-`cubecl-cpu-no-shared-memory`); `OsRng` (ASVS-V6 — seeded reproducible PRNG only).
-
----
+- **P12 (builder convention) FIRST** so UMAP/HDBSCAN are born builder-fronted — avoids re-touching them in the retrofit. P12 is pure API, no algorithm, lowest risk.
+- **P13 (knn_graph) before P14/P15** — both consume it; land + gate it standalone (primitive-first; the v1/v2 "prim gated, estimator assembly" pattern).
+- **P14 (UMAP) and P15 (HDBSCAN) are feature-disjoint waves** — different new files (manifold/ vs cluster/, umap_layout/fuzzy vs mutual_reach/mst/condense). They share ONLY the P13 knn_graph prim (already landed) → can be planned/built in parallel after P13.
+- **P16 (retrofit) LAST** — it is the one broad, parallel-unsafe edit; isolating it preserves the file-disjoint wave discipline for P12–P15.
+- **Two research spikes gate planning:** UMAP layout-step on cpu-MLIR (P14) and host MST/condense exactness (P15). Both MEDIUM-confidence; budget a spike before each phase's planning, exactly as v2 did for the SGD solver.
 
 ## Sources
 
-- Shipped code (HIGH): `crates/mlrs-algos/src/traits.rs`,
-  `crates/mlrs-backend/src/prims/{mod,covariance,distance,kmeans,lbfgs,cholesky}.rs`,
-  `crates/mlrs-py/src/dispatch.rs`, `crates/mlrs-py/src/estimators/decomposition.rs`,
-  `crates/mlrs-py/python/mlrs/{base,decomposition,linear}.py`,
-  `crates/mlrs-algos/src/{lib.rs,decomposition/pca.rs}`, `crates/mlrs-kernels/src/lib.rs`,
-  `scripts/gen_oracle.py`.
-- Planning: `.planning/PROJECT.md`, `.planning/seeds/v2-breadth-roadmap.md`,
-  `.planning/notes/cuml-mlrs-gap-inventory.md`, `.planning/research/questions.md`.
-- cuML reference (read-only): `cuml-main/python/cuml/cuml/{covariance,random_projection,
-  kernel_ridge,naive_bayes,manifold,svm,linear_model}/`.
-- Open unknowns to resolve before P7/P9/P10 (MEDIUM): `[v2-P1]` incremental-SVD merge stability,
-  `[v2-P3]` smallest-eigenpair approach, `[v2-P4]` SGD-under-cpu-MLIR — all in `research/questions.md`.
+- Shipped code (HIGH): `crates/mlrs-algos/src/{traits.rs, lib.rs, error.rs}`,
+  `crates/mlrs-algos/src/{naive_bayes/{mod,gaussian_nb}.rs, linear/{mod,logistic}.rs, cluster/spectral_embedding.rs}`,
+  `crates/mlrs-backend/src/{lib.rs, prims/{topk,sgd,laplacian,eig,distance}.rs}`,
+  `crates/mlrs-kernels/src/lib.rs` (incl. `jacobi_eig::MAX_DIM`),
+  `crates/mlrs-py/src/{dispatch.rs, lib.rs}`, `crates/mlrs-py/python/mlrs/base.py`,
+  the `crates/mlrs-py/python/mlrs/*.py` shim package (confirms shim already shipped).
+- Planning (HIGH): `.planning/PROJECT.md`, `.planning/notes/v3-hard-algorithm-backlog.md`,
+  `.planning/codebase/{ARCHITECTURE,STRUCTURE}.md`, `.planning/milestones/v2.0-research/ARCHITECTURE.md`.
+- cuML reference (read-only, behavior only): `cuml-main/cpp/src/{umap,hdbscan}/`,
+  `cuml-main/python/cuml/cuml/{manifold,cluster}/`.
+- MEDIUM-confidence unknowns to spike before P14/P15: UMAP `umap_layout_step` single-owner
+  GATHER on cpu-MLIR; host MST/condense exactness vs `hdbscan`; KNN approximate-vs-exact
+  divergence from umap-learn's NN-Descent default.
+
+---
+*Architecture research for: mlrs v3.0 manifold algorithms & Rust-native builder API*
+*Researched: 2026-06-22*
