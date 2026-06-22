@@ -24,7 +24,9 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
-use crate::naive_bayes::multinomial_nb::{decode_classes, resolve_class_log_prior, validate_discrete_alpha};
+use crate::naive_bayes::multinomial_nb::{
+    decode_classes, resolve_class_log_prior, validate_discrete_alpha, validate_non_negative_counts,
+};
 use crate::naive_bayes::nb_common::{argmin_decode, class_grouped_sum, log_sum_exp_normalize};
 use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
 
@@ -36,8 +38,8 @@ pub struct ComplementNB<F> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is when `< 1e-10` (D-02 default `true`); else clip (D-06).
-    /// Retained as fitted-config provenance; the clip already applied at `build()`.
-    #[allow(dead_code)]
+    /// Retained as fitted-config provenance (exposed via [`ComplementNB::force_alpha`]);
+    /// the clip already applied at `build()` (WR-08).
     force_alpha: bool,
     /// Learn class priors from the data (D-02 default `true`).
     fit_prior: bool,
@@ -69,6 +71,12 @@ where
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
+    }
+
+    /// The stored `force_alpha` config provenance (WR-08). The D-06 alpha clip is
+    /// already applied at `build()`; this exposes whether the clip was suppressed.
+    pub fn force_alpha(&self) -> bool {
+        self.force_alpha
     }
 
     /// The per-class log-prior (`None` until `fit`).
@@ -198,7 +206,13 @@ where
             }));
         }
 
-        let (classes_, class_of_row, n_classes) = decode_classes(pool, y, n_samples)?;
+        // CR-01 / T-11-02: validate X is a finite, non-negative count matrix BEFORE
+        // it reaches `(cc / comp_sum).ln()` (sklearn's `check_non_negative` parity;
+        // a negative count drives comp_sum / the log to NaN/-inf silently).
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        validate_non_negative_counts("complement_nb", &x_host)?;
+
+        let (classes_, class_of_row, n_classes) = decode_classes("complement_nb", pool, y, n_samples)?;
 
         // feature_count_[c,j] via the validated GATHER.
         let feature_count = class_grouped_sum::<F>(pool, x, shape, &class_of_row, n_classes)?;
@@ -305,6 +319,10 @@ where
                 ),
             });
         }
+        // CR-01 / T-11-02: a negative / NaN query row is equally invalid for the
+        // count model — reject it before the GEMM (sklearn rejects at predict too).
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        validate_non_negative_counts("complement_nb", &x_host)?;
         let n_classes = self.classes_.len();
         let raw = gemm::<F>(
             pool,

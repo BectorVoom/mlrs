@@ -27,7 +27,7 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::multinomial_nb::{
-    decode_classes, resolve_class_log_prior, validate_discrete_alpha,
+    decode_classes, resolve_class_log_prior, validate_discrete_alpha, validate_non_negative_counts,
 };
 use crate::naive_bayes::nb_common::{argmax_decode, class_grouped_sum, log_sum_exp_normalize};
 use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
@@ -39,8 +39,8 @@ pub struct BernoulliNB<F> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is when `< 1e-10` (D-02 default `true`); else clip (D-06).
-    /// Retained as fitted-config provenance; the clip already applied at `build()`.
-    #[allow(dead_code)]
+    /// Retained as fitted-config provenance (exposed via [`BernoulliNB::force_alpha`]);
+    /// the clip already applied at `build()` (WR-08).
     force_alpha: bool,
     /// Threshold for binarizing the input; `None` disables binarization (assumes
     /// already-binary), `Some(t)` maps `x > t → 1` (D-02 default `Some(0.0)`).
@@ -78,6 +78,12 @@ where
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
+    }
+
+    /// The stored `force_alpha` config provenance (WR-08). The D-06 alpha clip is
+    /// already applied at `build()`; this exposes whether the clip was suppressed.
+    pub fn force_alpha(&self) -> bool {
+        self.force_alpha
     }
 
     /// The per-class log-prior (`None` until `fit`).
@@ -219,12 +225,17 @@ where
             }));
         }
 
-        let (classes_, class_of_row, n_classes) = decode_classes(pool, y, n_samples)?;
+        let (classes_, class_of_row, n_classes) = decode_classes("bernoulli_nb", pool, y, n_samples)?;
 
         // --- D-04 binarize: apply x>t → 1 on a host copy BEFORE the GATHER so the
         //     per-(class, feature) counts are occurrence counts. binarize=None
         //     assumes the input is already binary (pass-through). ---
         let mut x_bin: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        // CR-01 / T-11-02: validate the RAW input is finite and non-negative BEFORE
+        // binarization (sklearn's BernoulliNB calls `check_non_negative`; a NaN
+        // input would otherwise survive binarization in an undefined way and a
+        // negative count is rejected for parity).
+        validate_non_negative_counts("bernoulli_nb", &x_bin)?;
         binarize_host(&mut x_bin, self.binarize);
         let x_bin_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
             pool,
@@ -232,9 +243,19 @@ where
         );
 
         // feature_count_[c,j] = Σ over class-c rows of binarized x[i,j].
+        // WR-03: release `x_bin_dev` on BOTH the Ok and Err arms before propagating
+        // so a GATHER failure does not leak the binarized scratch (WR-07 contract).
         let feature_count =
-            class_grouped_sum::<F>(pool, &x_bin_dev, shape, &class_of_row, n_classes)?;
-        x_bin_dev.release_into(pool);
+            match class_grouped_sum::<F>(pool, &x_bin_dev, shape, &class_of_row, n_classes) {
+                Ok(fc) => {
+                    x_bin_dev.release_into(pool);
+                    fc
+                }
+                Err(e) => {
+                    x_bin_dev.release_into(pool);
+                    return Err(AlgoError::from(e));
+                }
+            };
 
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
         for &c in &class_of_row {
@@ -325,6 +346,9 @@ where
 
         // Binarize the query the same way as fit BEFORE the GEMM.
         let mut xq_bin: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        // CR-01 / T-11-02: a negative / NaN query row is equally invalid — reject it
+        // before binarization + the GEMM (sklearn rejects at predict too).
+        validate_non_negative_counts("bernoulli_nb", &xq_bin)?;
         binarize_host(&mut xq_bin, self.binarize);
         let xq_bin_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
             pool,

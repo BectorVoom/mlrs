@@ -22,6 +22,7 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_sum, empirical_class_log_prior, log_sum_exp_normalize,
+    NB_LABEL_INT_TOL,
 };
 use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
 
@@ -34,8 +35,8 @@ pub struct MultinomialNB<F> {
     alpha: f64,
     /// Keep `alpha` as-is even when `< 1e-10` (D-02 default `true`); when `false`
     /// a tiny `alpha` is clipped to `1e-10` at `build()` with a warning (D-06).
-    /// Retained as fitted-config provenance; the clip already applied at `build()`.
-    #[allow(dead_code)]
+    /// Retained as fitted-config provenance (exposed via [`MultinomialNB::force_alpha`]);
+    /// the clip already applied at `build()` (WR-08).
     force_alpha: bool,
     /// Learn class priors from the data (D-02 default `true`); when `false` a
     /// uniform prior is used.
@@ -65,6 +66,12 @@ where
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
+    }
+
+    /// The stored `force_alpha` config provenance (WR-08). The D-06 alpha clip is
+    /// already applied at `build()`; this exposes whether the clip was suppressed.
+    pub fn force_alpha(&self) -> bool {
+        self.force_alpha
     }
 
     /// The per-class log-prior (`None` until `fit`).
@@ -190,9 +197,16 @@ where
             }));
         }
 
+        // --- CR-01 / T-11-02: validate X is a finite, non-negative count matrix
+        //     BEFORE the GATHER reaches `((count + alpha) / denom).ln()` (sklearn's
+        //     `check_non_negative` parity; a negative / NaN count otherwise yields a
+        //     silent NaN feature_log_prob_). ---
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        validate_non_negative_counts("multinomial_nb", &x_host)?;
+
         // --- host distinct-sorted classes_ (multiclass, integer labels only, i32
         //     range guarded — predicted labels are emitted as i32, WR-02). ---
-        let (classes_, class_of_row, n_classes) = decode_classes(pool, y, n_samples)?;
+        let (classes_, class_of_row, n_classes) = decode_classes("multinomial_nb", pool, y, n_samples)?;
 
         // --- feature_count_[c,j] via the validated GATHER (one owner per
         //     (class, feature); the counts are accumulated in host f64). ---
@@ -274,6 +288,10 @@ where
                 ),
             });
         }
+        // CR-01 / T-11-02: a negative / NaN query row is equally invalid for the
+        // count model — reject it before the GEMM (sklearn rejects at predict too).
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        validate_non_negative_counts("multinomial_nb", &x_host)?;
         let n_classes = self.classes_.len();
         // raw[i,c] = Σ_j X[i,j] · flp[c,j] = (X @ flp.T)[i,c]. The stored flp buffer
         // is (n_classes, n_features); transb=true reads it as (n_features, n_classes).
@@ -401,12 +419,41 @@ pub(crate) fn validate_discrete_alpha(
     Ok(alpha)
 }
 
+/// Shared non-negativity / finiteness guard for the COUNT-based discrete NB
+/// variants (Multinomial / Complement / Bernoulli, CR-01 / T-11-02). sklearn
+/// rejects a negative or non-finite count matrix with
+/// `check_non_negative(X, …) -> ValueError`; a negative count here flows
+/// straight into `((count + alpha) / denom).ln()` (or ComplementNB's
+/// `(cc / comp_sum).ln()`), producing a silent `NaN`/`-inf` `feature_log_prob_`
+/// that corrupts every `predict`/`predict_proba` row with no error surfaced. A
+/// `NaN` input is equally unguarded. This validates the host-read matrix `x`
+/// (already on host at `fit`/`predict`) BEFORE it reaches the smoothed-log
+/// formulas, mirroring sklearn's contract (D-09). `pub(crate)` so the sibling
+/// count-based fits/predicts reuse it without a base struct (D-03).
+pub(crate) fn validate_non_negative_counts(
+    estimator: &'static str,
+    x_host: &[f64],
+) -> Result<(), AlgoError> {
+    for &v in x_host {
+        if !v.is_finite() || v < 0.0 {
+            return Err(AlgoError::InvalidLabels {
+                estimator,
+                reason: format!("input X must be finite and non-negative (got {v})"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Shared label decode for the discrete NB variants (D-03 — function-level
 /// sharing): read `y` to host, validate integer labels in i32 range (WR-02 —
 /// predicted labels are emitted as i32), and return the distinct-sorted
 /// `classes_`, the dense per-row class index, and `n_classes`. `pub(crate)` so
-/// the sibling discrete fits reuse it without a base struct.
+/// the sibling discrete fits reuse it without a base struct. `estimator` is the
+/// caller's name, surfaced in the user-facing label errors (IN-03 — no leaking
+/// the internal `"discrete_nb"` helper name).
 pub(crate) fn decode_classes<F>(
+    estimator: &'static str,
     pool: &BufferPool<ActiveRuntime>,
     y: &DeviceArray<ActiveRuntime, F>,
     n_samples: usize,
@@ -419,9 +466,11 @@ where
     for &yv in y_host.iter() {
         let lf = host_to_f64(yv);
         let li = lf.round();
-        if (li - lf).abs() > 1e-6 {
+        if (li - lf).abs() > NB_LABEL_INT_TOL {
+            // IN-03: name the concrete caller estimator (not the internal helper
+            // name) in the user-facing error.
             return Err(AlgoError::InvalidLabels {
-                estimator: "discrete_nb",
+                estimator,
                 reason: format!("labels must be integers (got {lf})"),
             });
         }
@@ -433,7 +482,7 @@ where
     for &cls in classes_.iter() {
         if i32::try_from(cls).is_err() {
             return Err(AlgoError::InvalidLabels {
-                estimator: "discrete_nb",
+                estimator,
                 reason: format!("class label {cls} does not fit in i32 (predicted labels are i32)"),
             });
         }
@@ -462,6 +511,16 @@ pub(crate) fn resolve_class_log_prior(
             return Err(AlgoError::InvalidLabels {
                 estimator,
                 reason: format!("class_prior length {} != number of classes {n_classes}", p.len()),
+            });
+        }
+        // WR-01: sklearn requires a normalized `class_prior` (sum to 1); a
+        // non-normalized prior is otherwise silently `.ln()`-mapped here and the
+        // log-sum-exp renormalization at predict masks the oracle divergence.
+        let prior_sum: f64 = p.iter().sum();
+        if (prior_sum - 1.0).abs() > 1e-6 {
+            return Err(AlgoError::InvalidLabels {
+                estimator,
+                reason: format!("the sum of the priors should be 1 (got {prior_sum})"),
             });
         }
         return Ok(p.iter().map(|&v| v.ln()).collect());
