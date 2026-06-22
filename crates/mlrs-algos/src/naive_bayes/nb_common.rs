@@ -45,6 +45,14 @@ use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{host_to_f64, PrimError};
 
+/// Shared tolerance for the integer round-trip check applied to NB labels and
+/// categorical feature values (IN-02). A host-read f32/f64 integer-encoded value
+/// is treated as the integer `v.round()` when `(v.round() - v).abs() <=
+/// NB_LABEL_INT_TOL`. Extracted here so the four variants (`GaussianNB` /
+/// `MultinomialNB` / `CategoricalNB` label decode + the categorical category
+/// index check) stay consistent if the tolerance is ever tuned.
+pub const NB_LABEL_INT_TOL: f64 = 1e-6;
+
 /// Normalize a SINGLE row of `n_classes` joint log-likelihoods into
 /// `(proba, log_proba)` (Pattern 3 — host f64, per-row max-shift, single terminal
 /// log).
@@ -53,8 +61,10 @@ use mlrs_core::{host_to_f64, PrimError};
 /// `m = max_c ll_c`, `lse = m + log(Σ_c exp(ll_c − m))`,
 /// `log_proba_c = ll_c − lse`, and `proba_c = exp(log_proba_c)`. The returned
 /// `proba` sums to `1.0 ± 1e-12` and `log_proba == joint_ll − lse` element-wise.
-/// The max-shift keeps `exp` from overflowing and the single terminal `log`
-/// keeps the small probabilities from underflowing to `0` (Pitfall 9); the
+/// The max-shift keeps `exp` from overflowing; the single terminal `log` keeps
+/// the `log_proba` output underflow-safe (Pitfall 9). NOTE (IN-01): only
+/// `log_proba` avoids underflow — `proba_c = exp(log_proba_c)` may still flush a
+/// tiny `log_proba` to `0.0`, which is the expected, correct behavior. The
 /// pipeline never produces `±∞` (cpu-MLIR-safe).
 ///
 /// Panics only on `n_classes == 0` (a degenerate row with no classes) — callers
@@ -144,8 +154,9 @@ fn decode(joint_ll: &[f64], classes_: &[i64], take_max: bool) -> Vec<i32> {
 }
 
 /// The fraction of exact matches `Σ[pred_i == y_true_i] / n` (the shared `score`,
-/// D-07). `[1,1,0]` vs `[1,0,0]` → `2/3`. Panics on a length mismatch (a real
-/// caller passes equal-length vectors).
+/// D-07). `[1,1,0]` vs `[1,0,0]` → `2/3`. Returns `f64::NAN` for an empty input
+/// (accuracy is undefined with no samples — sklearn raises; WR-07). Panics on a
+/// length mismatch (a real caller passes equal-length vectors).
 pub fn accuracy_score(pred: &[i32], y_true: &[i32]) -> f64 {
     assert_eq!(
         pred.len(),
@@ -154,8 +165,12 @@ pub fn accuracy_score(pred: &[i32], y_true: &[i32]) -> f64 {
         pred.len(),
         y_true.len()
     );
+    // WR-07: an empty prediction vector has an UNDEFINED accuracy — return NaN
+    // (sklearn raises on empty input) rather than `0.0`, which is indistinguishable
+    // from "0% correct". The geometry guard upstream already rejects an empty
+    // predict, but this `pub` fn is independently callable.
     if pred.is_empty() {
-        return 0.0;
+        return f64::NAN;
     }
     let correct = pred
         .iter()
@@ -267,8 +282,22 @@ where
         // column_reduce sums each of the n_features columns over the n_c rows of
         // this class block — the per-(class, feature) owner. ReducePath::Shared is
         // always available (cpu-MLIR-safe; the plane path is capability-gated).
-        let reduced = column_reduce::<F>(pool, &block_dev, n_c, n_features, op, ReducePath::Shared)?
-            .expect("shared-path column_reduce is always available");
+        // WR-02: release `block_dev` on EVERY exit (Ok / None / Err) before the `?`
+        // propagation so a `column_reduce` failure does not leak the scratch buffer
+        // (WR-07 "conserve live_bytes" contract).
+        let reduced = match column_reduce::<F>(
+            pool, &block_dev, n_c, n_features, op, ReducePath::Shared,
+        ) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                block_dev.release_into(pool);
+                unreachable!("shared-path column_reduce is always available");
+            }
+            Err(e) => {
+                block_dev.release_into(pool);
+                return Err(e);
+            }
+        };
         let reduced_host = reduced.to_host(pool);
         for (j, &v) in reduced_host.iter().enumerate() {
             out[c][j] = host_to_f64(v);
