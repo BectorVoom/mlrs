@@ -3,8 +3,9 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 status: planning
-last_updated: "2026-06-22T03:18:52.793Z"
-last_activity: 2026-06-22
+stopped_at: Phase 12 context gathered
+last_updated: "2026-06-22T22:30:15.170Z"
+last_activity: "2026-06-22 — v3.0 ROADMAP.md created (Variant A: builder convention → KNN-graph prim → UMAP → HDBSCAN → retrofit sweep + shim)"
 progress:
   total_phases: 5
   completed_phases: 0
@@ -254,9 +255,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-21T22:03:19.000Z
-Stopped at: Completed 11-03-PLAN.md (Multinomial/Bernoulli/Complement NB)
-Resume file: .planning/phases/11-naive-bayes/11-04-PLAN.md
+Last session: 2026-06-22T22:30:15.153Z
+Stopped at: Phase 12 context gathered
+Resume file: .planning/phases/12-builder-typestate-convention-foundation/12-CONTEXT.md
 
 ## Operator Next Steps
 
