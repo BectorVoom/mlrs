@@ -33,6 +33,7 @@ pub mod covariance;
 pub mod decomposition;
 pub mod kernel;
 pub mod linear;
+pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;
 pub mod spectral;

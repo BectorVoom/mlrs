@@ -204,6 +204,9 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
         PyLogisticRegression, PyMBSGDClassifier, PyMBSGDRegressor, PyRidge,
     };
+    use estimators::naive_bayes::{
+        PyBernoulliNB, PyCategoricalNB, PyComplementNB, PyGaussianNB, PyMultinomialNB,
+    };
     use estimators::neighbors::{
         PyKNeighborsClassifier, PyKNeighborsRegressor, PyNearestNeighbors,
     };
@@ -245,5 +248,13 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMBSGDRegressor>()?;
     m.add_class::<PyLinearSVC>()?;
     m.add_class::<PyLinearSVR>()?;
+
+    // Phase-11 Naive-Bayes wrappers (NB-01..05 — PY-06 final cross-cutting
+    // sign-off: the five sklearn NB estimators, registration 25 → 30).
+    m.add_class::<PyGaussianNB>()?;
+    m.add_class::<PyMultinomialNB>()?;
+    m.add_class::<PyBernoulliNB>()?;
+    m.add_class::<PyComplementNB>()?;
+    m.add_class::<PyCategoricalNB>()?;
     Ok(())
 }
