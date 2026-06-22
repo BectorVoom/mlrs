@@ -311,3 +311,55 @@ def test_bad_hyperparameter_raises_value_error(ctor, kwargs):
     est = ctor(**kwargs)
     with pytest.raises(ValueError):
         est.fit(_arrow(X, dtype), _arrow(y, dtype), rows, cols)
+
+
+# --- Negative-input ValueError (CR-01/CR-02, T-11-02) -----------------------
+
+
+@pytest.mark.parametrize(
+    "ctor, kwargs",
+    [
+        (_mlrs.MultinomialNB, {}),
+        (_mlrs.BernoulliNB, {}),
+        (_mlrs.ComplementNB, {}),
+    ],
+    ids=["multinomial", "bernoulli", "complement"],
+)
+def test_negative_count_input_raises_value_error(ctor, kwargs):
+    """The count-based discrete NB variants reject a NEGATIVE feature matrix at
+    fit with a Python ValueError (CR-01/CR-02 — sklearn's `check_non_negative`
+    parity). A negative count otherwise flows into `((count + alpha)/denom).ln()`
+    (or ComplementNB's `(cc/comp_sum).ln()`) and silently produces NaN
+    predictions. The algos-layer `AlgoError::InvalidLabels` guard maps through
+    `algo_err_to_py` to a `PyValueError` at the FFI boundary (D-09)."""
+    dtype = np.float32
+    X, y = _toy_counts(dtype)
+    rows, cols = X.shape
+    X_neg = X.copy()
+    X_neg[0, 0] = -1.0  # one negative count makes the whole matrix invalid
+    est = ctor(**kwargs)
+    with pytest.raises(ValueError):
+        est.fit(_arrow(X_neg, dtype), _arrow(y, dtype), rows, cols)
+
+
+@pytest.mark.parametrize(
+    "ctor, kwargs",
+    [
+        (_mlrs.MultinomialNB, {}),
+        (_mlrs.BernoulliNB, {}),
+        (_mlrs.ComplementNB, {}),
+    ],
+    ids=["multinomial", "bernoulli", "complement"],
+)
+def test_negative_count_query_raises_value_error(ctor, kwargs):
+    """A negative query row is equally invalid for the count model — predict
+    rejects it with a ValueError too (CR-01 — sklearn rejects at predict)."""
+    dtype = np.float32
+    X, y = _toy_counts(dtype)
+    rows, cols = X.shape
+    est = ctor(**kwargs)
+    est.fit(_arrow(X, dtype), _arrow(y, dtype), rows, cols)
+    X_neg = X.copy()
+    X_neg[0, 0] = -1.0
+    with pytest.raises(ValueError):
+        est.predict_labels(_arrow(X_neg, dtype), rows, cols)
