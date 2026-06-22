@@ -21,6 +21,9 @@ use mlrs_py::estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD
 use mlrs_py::estimators::linear::{
     PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge,
 };
+use mlrs_py::estimators::naive_bayes::{
+    PyBernoulliNB, PyCategoricalNB, PyComplementNB, PyGaussianNB, PyMultinomialNB,
+};
 use mlrs_py::estimators::neighbors::{
     PyKNeighborsClassifier, PyKNeighborsRegressor, PyNearestNeighbors,
 };
@@ -66,6 +69,29 @@ fn five_phase7_estimators_construct_unfit() {
     // projection (2)
     assert!(PyGaussianRandomProjection::unfit_default().is_unfit(), "GaussianRandomProjection");
     assert!(PySparseRandomProjection::unfit_default().is_unfit(), "SparseRandomProjection");
+}
+
+/// The five Phase-11 Naive-Bayes wrappers (NB-01..05 — PY-06) also construct in
+/// the `Unfit` arm without a Python interpreter or live device. This is the
+/// compiled-half witness that all five `#[pyclass]` definitions (the
+/// `any_estimator!`-generated `Any<Name>` enums + the hand-written `#[new]` /
+/// `fit` / shared predict surface) COMPILE and INSTANTIATE with their
+/// sklearn-default hyperparameters.
+///
+/// The live-FFI fit→predict round-trip (incl. `predict_proba` rows summing to 1
+/// across the boundary, `predict_log_proba == log(predict_proba)`, `score` in
+/// [0,1], and the bad-hyperparameter `ValueError`) is exercised by
+/// `tests/test_naive_bayes.py` against the real `_mlrs` module — the Rust
+/// integration binary cannot build pyarrow capsules / link `PyErr::is_instance_of`
+/// (the 10-05 precedent), so the concrete FFI assertions live in the pytest
+/// harness where a live interpreter + device exist.
+#[test]
+fn five_naive_bayes_estimators_construct_unfit() {
+    assert!(PyGaussianNB::unfit_default().is_unfit(), "GaussianNB");
+    assert!(PyMultinomialNB::unfit_default().is_unfit(), "MultinomialNB");
+    assert!(PyBernoulliNB::unfit_default().is_unfit(), "BernoulliNB");
+    assert!(PyComplementNB::unfit_default().is_unfit(), "ComplementNB");
+    assert!(PyCategoricalNB::unfit_default().is_unfit(), "CategoricalNB");
 }
 
 /// Re-constructing does not panic and yields an independent `Unfit` instance —
