@@ -79,28 +79,37 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PRIM-11 | TBD | Pending |
-| UMAP-01 | TBD | Pending |
-| UMAP-02 | TBD | Pending |
-| UMAP-03 | TBD | Pending |
-| UMAP-04 | TBD | Pending |
-| HDBS-01 | TBD | Pending |
-| HDBS-02 | TBD | Pending |
-| HDBS-03 | TBD | Pending |
-| HDBS-04 | TBD | Pending |
-| BLDR-01 | TBD | Pending |
-| BLDR-02 | TBD | Pending |
-| BLDR-03 | TBD | Pending |
-| BLDR-04 | TBD | Pending |
-| SHIM-01 | TBD | Pending |
-| SHIM-02 | TBD | Pending |
-| SHIM-03 | TBD | Pending |
+| PRIM-11 | Phase 13 | Pending |
+| UMAP-01 | Phase 14 | Pending |
+| UMAP-02 | Phase 14 | Pending |
+| UMAP-03 | Phase 14 | Pending |
+| UMAP-04 | Phase 14 | Pending |
+| HDBS-01 | Phase 15 | Pending |
+| HDBS-02 | Phase 15 | Pending |
+| HDBS-03 | Phase 15 | Pending |
+| HDBS-04 | Phase 15 | Pending |
+| BLDR-01 | Phase 12 | Pending |
+| BLDR-02 | Phase 12 | Pending |
+| BLDR-03 | Phase 16 | Pending |
+| BLDR-04 | Phase 12 | Pending |
+| SHIM-01 | Phase 16 | Pending |
+| SHIM-02 | Phase 16 | Pending |
+| SHIM-03 | Phase 16 | Pending |
 
 **Coverage:**
 - v3.0 requirements: 16 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 16 ⚠️ (filled by roadmapper)
+- Mapped to phases: 16 ✓
+- Unmapped: 0 ✓
+
+**Phase distribution:**
+- Phase 12 (Builder + Typestate Convention): BLDR-01, BLDR-02, BLDR-04 (3)
+- Phase 13 (KNN-Graph Primitive): PRIM-11 (1)
+- Phase 14 (UMAP): UMAP-01, UMAP-02, UMAP-03, UMAP-04 (4)
+- Phase 15 (HDBSCAN): HDBS-01, HDBS-02, HDBS-03, HDBS-04 (4)
+- Phase 16 (Builder Retrofit Sweep + Shim Coverage): BLDR-03, SHIM-01, SHIM-02, SHIM-03 (4)
+
+> **Note on BLDR split:** the builder *convention* (BLDR-01/02/04) leads in Phase 12 so UMAP/HDBSCAN are born builder-fronted; the broad, parallel-unsafe 30-estimator *retrofit sweep* (BLDR-03) is isolated to Phase 16 to preserve file-disjoint discipline and protect the shipped 1e-5/exact gates (Variant A, per all four research streams).
 
 ---
 *Requirements defined: 2026-06-22*
-*Last updated: 2026-06-22 after initial v3.0 definition*
+*Last updated: 2026-06-22 after roadmap creation — all 16 v3.0 requirements mapped to Phases 12–16*
