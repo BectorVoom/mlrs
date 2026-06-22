@@ -29,7 +29,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v1.0-ROADMAP.md](miles
 - [x] **Phase 8: Kernel Family** — kernel-matrix prim (linear/RBF/poly/sigmoid), ScoreSamples trait; KernelRidge, KernelDensity (completed 2026-06-21; verified 4/4 must-haves, UAT passed)
 - [x] **Phase 9: Spectral Family** — graph-Laplacian prim (hard dep on Phase 8 kernel-matrix); SpectralEmbedding, SpectralClustering (completed 2026-06-21)
 - [x] **Phase 10: SGD / Linear-SVM** — SGD solver prim (the one new device solver, highest cpu-MLIR risk); MBSGDClassifier, MBSGDRegressor, LinearSVC, LinearSVR (completed 2026-06-21)
-- [ ] **Phase 11: Naive Bayes** — reductions-only closing bookend; GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB
+- [x] **Phase 11: Naive Bayes** — reductions-only closing bookend; GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB
 
 ## Phase Details
 
@@ -187,7 +187,7 @@ Plans:
 **Recurring gates**: `skip_f64_with_log` on every f64 oracle case; documented f32-on-rocm band for GaussianNB (log-proba), **exact labels** the hard gate for all five; **GATHER idiom + cpu-launch verification** per Pitfall 2; log-sum-exp + `var_smoothing` per Pitfall 9; PoolStats memory gate per estimator.
 **Research flag**: None — Naive Bayes is reductions-only over the validated v1 reduce prim; per-variant math fully specified in FEATURES.md. Standard pattern, research-phase can be skipped.
 **PY-06 placement decision**: PY-06 spans all v2 estimators. **Each phase wraps its own estimators incrementally** (reusing the shipped PyO3 `any_estimator!` machinery — v2 adds zero binding infrastructure), and PY-06 is formally assigned to Phase 11 as the final cross-cutting Python-surface sign-off (all v2 `#[pyclass]` estimators registered, dtype-suffixed accessors complete, the two new methods `partial_fit`/`score_samples` exposed, and `estimator_checks` re-triaged across the full v2 surface). This differs from v1's dedicated Phase-6 Python phase because v2 reuses the shipped binding layer rather than building it.
-**Plans**: 5 plans (3 waves)
+**Plans**: 5 plans (3 waves) — **COMPLETE (5/5)**: 11-01 Wave-0 shared seam, 11-02 GaussianNB (NB-01), 11-03 count-based NB (NB-02/03/04), 11-04 CategoricalNB (NB-05), 11-05 PyO3 PY-06 sign-off (five #[pyclass] wrappers on _mlrs, 25→30; sklearn check_estimator re-triage environment-gated — needs maturin+pyarrow).
 
 Plans:
 **Wave 1**

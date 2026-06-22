@@ -25,14 +25,14 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 11 (naive-bayes) — EXECUTING
-Plan: 5 of 5
-Status: Executing Phase 11 (Wave-0 seam + GaussianNB + count-based NB + CategoricalNB done; 11-05 PyO3 PY-06 remains)
-Last activity: 2026-06-22 -- Completed Phase 11 Plan 04 (CategoricalNB NB-05)
-Resume file: .planning/phases/11-naive-bayes/11-05-PLAN.md
-Next: Execute Phase 11 Plan 05 (PY-06 final cross-cutting PyO3 sign-off) — /gsd-execute-phase 11
+Phase: 11 (naive-bayes) — COMPLETE
+Plan: 5 of 5 (all complete)
+Status: Phase 11 complete (Wave-0 seam + GaussianNB + count-based NB + CategoricalNB + PyO3 PY-06 sign-off done)
+Last activity: 2026-06-22 -- Completed Phase 11 Plan 05 (PY-06 final cross-cutting PyO3 sign-off)
+Resume file: None
+Next: Phase 11 done — verify/ship the phase (sklearn estimator_checks re-triage is environment-gated: needs maturin+pyarrow; see 11-05-SUMMARY.md)
 
-Progress: [######### ] 93% (v2.0 — 4/5 phases complete, 26/27 plans)
+Progress: [##########] 100% (v2.0 — 5/5 phases complete, 27/27 plans)
 
 ## Open Follow-ups (Phase 05)
 
@@ -44,7 +44,7 @@ Progress: [######### ] 93% (v2.0 — 4/5 phases complete, 26/27 plans)
 
 **Velocity:**
 
-- Total plans completed: 48
+- Total plans completed: 49
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -58,6 +58,7 @@ Progress: [######### ] 93% (v2.0 — 4/5 phases complete, 26/27 plans)
 | 07 | 7 | - | - |
 | 09 | 4 | - | - |
 | 10 | 6 | - | - |
+| 11 | 5 | - | - |
 
 **Recent Trend:**
 
@@ -115,6 +116,7 @@ Progress: [######### ] 93% (v2.0 — 4/5 phases complete, 26/27 plans)
 | Phase 10 P05 | 8 | 2 tasks | 4 files |
 | Phase 10 P06 | 22 | 2 tasks | 2 files |
 | Phase 11 P04 | 12 | 2 tasks (co-located, 1 commit) | 2 files |
+| Phase 11 P05 | 13 | 2 tasks | 5 files |
 
 ## Accumulated Context
 

@@ -57,7 +57,7 @@ Requirements for the v2.0 Breadth Sweep milestone — ~18 additional scikit-lear
 
 ### Python Surface
 
-- [ ] **PY-06**: All new v2 estimators are `#[pyclass]`-backed with sklearn-compatible `fit`/`predict`/`transform`/`score` (+ `partial_fit` for IncrementalPCA/MBSGD, `score_samples` for KernelDensity), `get_params`/`set_params` with sklearn-named hyperparameters, f32/f64 runtime dispatch, GIL release during compute, and ship inside the existing four per-backend wheels
+- [x] **PY-06**: All new v2 estimators are `#[pyclass]`-backed with sklearn-compatible `fit`/`predict`/`transform`/`score` (+ `partial_fit` for IncrementalPCA/MBSGD, `score_samples` for KernelDensity), `get_params`/`set_params` with sklearn-named hyperparameters, f32/f64 runtime dispatch, GIL release during compute, and ship inside the existing four per-backend wheels
 
 ## Future Requirements (deferred)
 
@@ -98,7 +98,7 @@ Tracked in `.planning/notes/v3-hard-algorithm-backlog.md`: RandomForest → FIL 
 | NB-03 | Phase 11 | Complete |
 | NB-04 | Phase 11 | Complete |
 | NB-05 | Phase 11 | Complete |
-| PY-06 | Phase 11 (cross-cutting; estimators wrapped incrementally per phase) | Pending |
+| PY-06 | Phase 11 (cross-cutting; estimators wrapped incrementally per phase) | Complete (11-05; sklearn check_estimator re-triage environment-gated — needs maturin+pyarrow) |
 
 **Coverage:** 24/24 v2 requirements mapped, each to exactly one phase. No orphans, no duplicates.
 
