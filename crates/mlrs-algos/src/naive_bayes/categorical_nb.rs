@@ -27,7 +27,7 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::multinomial_nb::{decode_classes, resolve_class_log_prior, validate_discrete_alpha};
-use crate::naive_bayes::nb_common::{argmax_decode, log_sum_exp_normalize};
+use crate::naive_bayes::nb_common::{argmax_decode, log_sum_exp_normalize, NB_LABEL_INT_TOL};
 use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
 
 /// The minimum-categories-per-feature specification (D-04), modeled on the
@@ -57,6 +57,8 @@ pub struct CategoricalNB<F> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is when `< 1e-10` (D-02 default `true`); else clip (D-06).
+    /// Retained as fitted-config provenance (exposed via [`CategoricalNB::force_alpha`]);
+    /// the clip already applied at `build()` (WR-08).
     force_alpha: bool,
     /// Learn class priors from the data (D-02 default `true`).
     fit_prior: bool,
@@ -101,6 +103,12 @@ where
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
+    }
+
+    /// The stored `force_alpha` config provenance (WR-08). The D-06 alpha clip is
+    /// already applied at `build()`; this exposes whether the clip was suppressed.
+    pub fn force_alpha(&self) -> bool {
+        self.force_alpha
     }
 
     /// The per-class log-prior (`None` until `fit`).
@@ -245,7 +253,10 @@ where
                 len: y.len(),
             }));
         }
-        let _ = self.force_alpha; // fitted-config provenance (D-06 clip applied at build()).
+        // WR-08: `force_alpha` is fitted-config provenance (D-06 clip already
+        // applied at build()); it is now exposed via the `force_alpha()` accessor
+        // so the field is genuinely used (the prior `let _ = self.force_alpha;`
+        // suppression is removed).
 
         // --- T-11-04-01: validate X is a non-negative-INTEGER categorical encoding
         //     BEFORE any table is sized (a negative / non-integer value would later
@@ -256,7 +267,7 @@ where
         for &xv in x_host.iter() {
             let xf = host_to_f64(xv);
             let xr = xf.round();
-            if (xr - xf).abs() > 1e-6 || xr < 0.0 {
+            if (xr - xf).abs() > NB_LABEL_INT_TOL || xr < 0.0 {
                 return Err(AlgoError::InvalidCategoricalInput {
                     estimator: "categorical_nb",
                     reason: format!("feature values must be non-negative integers (got {xf})"),
@@ -267,7 +278,7 @@ where
 
         // --- classes_ / dense per-row class index / n_classes via the shared
         //     discrete decode (integer + i32-range label guard, WR-02). ---
-        let (classes_, class_of_row, n_classes) = decode_classes::<F>(pool, y, n_samples)?;
+        let (classes_, class_of_row, n_classes) = decode_classes::<F>("categorical_nb", pool, y, n_samples)?;
 
         // class_count_[c] = #rows of class c (every observed class has >= 1).
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
@@ -386,7 +397,11 @@ where
             estimator: "categorical_nb",
             operation: "predict (call fit first)",
         })?;
-        let class_count = self.class_count_.as_ref().ok_or(AlgoError::NotFitted {
+        // WR-06: `class_count_` is still required-fitted (kept as a not-fitted
+        // guard) but no longer consulted at predict — the unseen-category smoothed
+        // fallback that used it is now a hard error. Bind with `_` to retain the
+        // fitted-state check without an unused-variable warning.
+        let _class_count = self.class_count_.as_ref().ok_or(AlgoError::NotFitted {
             estimator: "categorical_nb",
             operation: "predict (call fit first)",
         })?;
@@ -403,7 +418,6 @@ where
         let n_classes = self.classes_.len();
         let x_h = x.to_host(pool);
 
-        let alpha = self.alpha;
         let mut jll = vec![0.0f64; n_query * n_classes];
         for r in 0..n_query {
             for c in 0..n_classes {
@@ -413,23 +427,32 @@ where
                     let flp_j = &feature_log_prob[j];
                     let xf = host_to_f64(x_h[r * n_features + j]);
                     let xr = xf.round();
-                    // T-11-04-02: clamp the lookup index against n_categories_j. A
-                    // negative / non-integer / out-of-range category is treated as
-                    // UNSEEN (count == 0) → the smoothed log(alpha / denom_cj) where
-                    // denom_cj = class_count[c] + alpha·n_cat_j — NOT an OOB ragged-
-                    // table index. An in-range category indexes the fitted cell.
-                    let k = if (xr - xf).abs() <= 1e-6 && xr >= 0.0 {
-                        xr as usize
-                    } else {
-                        usize::MAX
-                    };
-                    let lp = if k < n_cat_j {
-                        flp_j[c * n_cat_j + k]
-                    } else {
-                        let denom = class_count[c] + alpha * n_cat_j as f64;
-                        (alpha / denom).ln()
-                    };
-                    acc += lp;
+                    // WR-06 / T-11-04-02: a predict-time category index that is
+                    // negative, non-integer, or >= n_categories_j is REJECTED with
+                    // `InvalidCategoricalInput` — matching sklearn (which raises
+                    // IndexError/ValueError on an out-of-range category) and the
+                    // documented purpose of the error variant. (Previously such a
+                    // category was silently mapped to the smoothed log(alpha/denom)
+                    // fallback, which diverged from sklearn and contradicted the
+                    // variant's own doc.)
+                    if (xr - xf).abs() > NB_LABEL_INT_TOL || xr < 0.0 {
+                        return Err(AlgoError::InvalidCategoricalInput {
+                            estimator: "categorical_nb",
+                            reason: format!(
+                                "feature values must be non-negative integers (got {xf} for feature {j})"
+                            ),
+                        });
+                    }
+                    let k = xr as usize;
+                    if k >= n_cat_j {
+                        return Err(AlgoError::InvalidCategoricalInput {
+                            estimator: "categorical_nb",
+                            reason: format!(
+                                "category index {k} >= n_categories {n_cat_j} for feature {j}"
+                            ),
+                        });
+                    }
+                    acc += flp_j[c * n_cat_j + k];
                 }
                 jll[r * n_classes + c] = acc;
             }
