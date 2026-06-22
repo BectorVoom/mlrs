@@ -15,13 +15,18 @@ install` the package for their backend and use familiar `fit`/`predict`/`transfo
 CubeCL backend from a single generic codebase.** If everything else fails, the numerical results
 must be right and the backend abstraction must hold.
 
-## Current Milestone: between milestones (v2.0 shipped 2026-06-22)
+## Current Milestone: v3.0 Manifold Algorithms & Rust-Native API
 
-**Shipped v2.0 Breadth Sweep** — roughly doubled the scikit-learn-compatible estimator surface with 18 low-risk estimators reusing v1's validated primitive base, deferring hard Tier-3 work (RandomForest, UMAP, HDBSCAN, ARIMA, kernel-SVM) to v3. All 24 v2 requirements complete; 5 phases (7–11), 27 plans. Next: start the next milestone via `/gsd-new-milestone`.
+**Goal:** Add the UMAP + HDBSCAN manifold/clustering pair on a shared KNN-graph primitive, and establish a Rust-native builder-pattern API retrofitted across the whole estimator surface.
 
-**Next milestone goals (candidate):** the deferred Tier-3 backlog in `notes/v3-hard-algorithm-backlog.md` (tree/ensemble, UMAP, HDBSCAN, ARIMA, kernel-SVM via SMO), and the carried-forward Python-surface work (a pure-Python sklearn shim for get_params/set_params/check_estimator across the v2 estimators; live FFI `estimator_checks` re-triage on a maturin+pyarrow host). Scope to be set during `/gsd-new-milestone`.
+**Target features:**
+- **KNN-graph primitive** — the shared, feasibility-critical prim (built on v1 `NearestNeighbors`) under the cpu-MLIR no-SharedMemory/no-atomics constraint; consumed by both UMAP and HDBSCAN
+- **UMAP** — fuzzy simplicial set → SGD-based low-dim layout (oracle: `umap-learn`; stochastic layout → structural/property gate à la RandomProjection D-12, not element-wise 1e-5)
+- **HDBSCAN** — mutual-reachability → MST → condensed cluster tree → stability extraction (oracle: `hdbscan` / `sklearn.cluster.HDBSCAN`; exact labels up to permutation as the hard gate)
+- **Rust-native builder-pattern API** — establish the idiomatic Rust builder convention (typed builder, fit/unfit typestate, error surface) and retrofit all 30 existing estimators plus the new v3 estimators (today's surface is sklearn-mirror, consumed mainly via PyO3)
+- **Pure-Python sklearn shim** — `get_params`/`set_params`/`check_estimator` across the estimator surface; PyO3-wrap UMAP/HDBSCAN
 
-**Key context:** Same oracle (scikit-learn ≤1e-5) and gate (cpu f64 + rocm f32) as v1. Primitive-first discipline held through v2 — each phase landed one reusable primitive (RNG-matrix/incremental-SVD, kernel-matrix, graph-Laplacian, SGD solver) then the estimators that consume it, with zero new compute dependency (pyo3 stayed 0.28). Phase numbering continues from v2.0 (next phase = 12).
+**Key context:** Same gate (cpu f64 + rocm f32) as v1/v2. Oracle broadens beyond scikit-learn for UMAP (`umap-learn`), and the core-value 1e-5 relaxes to a property/structural gate for the stochastic UMAP layout (HDBSCAN keeps exact-label gating). Keeps primitive-first discipline — land the KNN-graph prim standalone before UMAP/HDBSCAN consume it. Deliberately avoids GPU tree-construction atomics risk: RandomForest→FIL→TreeSHAP, ARIMA, and kernel-SVM/SMO stay deferred. Live FFI `estimator_checks` re-triage stays deferred (needs a maturin+pyarrow host this env lacks). Phase numbering continues from v2.0 (next phase = 12). Backlog: `notes/v3-hard-algorithm-backlog.md`.
 
 ## Requirements
 
@@ -57,7 +62,12 @@ must be right and the backend abstraction must hold.
 
 <!-- Current scope. Building toward these. All are hypotheses until shipped and validated. -->
 
-_None — v2.0 shipped. Next milestone scope is defined via `/gsd-new-milestone` (see `notes/v3-hard-algorithm-backlog.md`)._
+**v3.0 Manifold Algorithms & Rust-Native API** (scope being detailed in REQUIREMENTS.md)
+- [ ] KNN-graph primitive (shared, cpu-MLIR-safe; built on v1 NearestNeighbors)
+- [ ] UMAP (fuzzy simplicial set → SGD layout; `umap-learn` oracle; property gate)
+- [ ] HDBSCAN (mutual-reach → MST → condensed tree → stability; exact-label gate)
+- [ ] Rust-native builder-pattern API convention + retrofit across all 30 existing estimators
+- [ ] Pure-Python sklearn shim (get_params/set_params/check_estimator); PyO3-wrap UMAP/HDBSCAN
 
 ### Out of Scope
 
@@ -65,8 +75,9 @@ _None — v2.0 shipped. Next milestone scope is defined via `/gsd-new-milestone`
 
 - Multi-GPU / distributed (cuml.dask, NCCL/UCX, `*_mg` paths) — single-device first; distribution is a separate milestone
 - cuml.accel transparent acceleration (sklearn import-hook proxying) — magic-proxy layer adds large surface area with no algorithmic value
-- Tree / ensemble (RandomForest → FIL → TreeSHAP) — GPU tree construction fights the cpu-MLIR no-SharedMemory/no-atomics constraint; the keystone v3 lift (see `notes/v3-hard-algorithm-backlog.md`)
-- Hard manifold/clustering (UMAP, HDBSCAN, exact-spectral excepted), time-series (ARIMA/AutoARIMA), kernel SVM (SVC/SVR via SMO), genetic/symbolic regression, explainers (SHAP) — deferred to v3 (`notes/v3-hard-algorithm-backlog.md`). NOTE: *linear* SVM (LinearSVC/SVR) and SpectralClustering/Embedding moved into v2 Active — they reuse existing solvers/eig.
+- Tree / ensemble (RandomForest → FIL → TreeSHAP) — GPU tree construction fights the cpu-MLIR no-SharedMemory/no-atomics constraint; deferred past v3 (the keystone lift; needs a feasibility spike first — see `notes/v3-hard-algorithm-backlog.md`)
+- Time-series (ARIMA/AutoARIMA), kernel SVM (SVC/SVR via SMO), genetic/symbolic regression, explainers (SHAP) — deferred to a later milestone (`notes/v3-hard-algorithm-backlog.md`). NOTE: UMAP + HDBSCAN moved into v3.0 Active (manifold/cluster pair on a shared KNN-graph prim, dodging tree-atomics risk); *linear* SVM (LinearSVC/SVR) and SpectralClustering/Embedding shipped in v2.
+- Live FFI `estimator_checks` re-triage — needs a maturin+pyarrow host this environment lacks; deferred (the pure-Python sklearn shim IS in v3 scope)
 - Bit-exact reproduction of cuML internals — goal is numerical agreement with scikit-learn (≤1e-5), not kernel-for-kernel parity with cuML
 - Half-precision (f16/bf16) validated paths — infrastructure may allow it but not a near-term deliverable
 
@@ -137,4 +148,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-22 after v2.0 Breadth Sweep milestone (Phases 7–11; 18 estimators; 30 total)*
+*Last updated: 2026-06-22 after starting v3.0 Manifold Algorithms & Rust-Native API milestone (UMAP + HDBSCAN + builder-pattern retrofit; phases continue from 12)*
