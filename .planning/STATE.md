@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
-current_phase: 14
-current_phase_name: umap
-status: gaps_found
-stopped_at: Completed 14-07-PLAN.md
-last_updated: "2026-06-24T00:00:00.000Z"
-last_activity: 2026-06-24
-last_activity_desc: "14-07 gap-closure executed: fit layout owner-only (move_other=0) — CR-01 race + CR-03 double-count closed; awaiting re-verification"
+current_phase: 15
+current_phase_name: HDBSCAN
+status: verifying
+stopped_at: Completed 14-01-PLAN.md
+last_updated: "2026-06-23T22:09:34.200Z"
+last_activity: 2026-06-23
+last_activity_desc: Phase 14 complete, transitioned to Phase 15
 progress:
   total_phases: 5
   completed_phases: 3
@@ -28,10 +28,10 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 14 (umap) — GAP-CLOSURE PLANS EXECUTED, awaiting re-verification
-Plan: 7 of 7 executed (gap-closure 14-06/14-07 complete)
+Phase: 15 — HDBSCAN
+Plan: Not started
 Status: Gap-closure done — 14-06 closed CR-02 (n_components<n guard); 14-07 closed CR-01 (parallel-backend write race) + CR-03 (force double-count) via owner-only move_other=0 fit launch. Phase NOT yet re-verified — orchestrator/verifier must confirm before marking complete.
-Last activity: 2026-06-24 -- 14-07 gap-closure executed: fit layout owner-only (move_other=0); D-05 byte-identity now holds on any parallel backend
+Last activity: 2026-06-23 — Phase 14 complete, transitioned to Phase 15
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
 
 Progress: [██████░░░░] 60% (v3.0)
@@ -46,7 +46,7 @@ Progress: [██████░░░░] 60% (v3.0)
 
 **Velocity:**
 
-- Total plans completed: 54
+- Total plans completed: 61
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -62,6 +62,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | 10 | 6 | - | - |
 | 11 | 5 | - | - |
 | 13 | 3 | - | - |
+| 14 | 7 | - | - |
 
 **Recent Trend:**
 
