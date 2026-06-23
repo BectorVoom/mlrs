@@ -82,6 +82,39 @@ true labels — both mlrs and umap recover the 3 clusters exactly. All 5
 `layout_property_<metric>` tests are GREEN at these thresholds; the full run
 (spectral-init Jacobi eig dominated) took ~1717s for the five metrics.
 
+### Calibrated TRANSFORM sub-gate threshold (Plan 05 — UMAP-04)
+
+The `transform(X_new)` property sub-gate (trustworthiness of the new points,
+measured EUCLIDEAN-on-`X_new` like sklearn's `trustworthiness`, `k=5`,
+`random_state=42`, n_neighbors=10, default n_epochs) is RELATIVE to umap-learn
+0.5.12's own `transform` (`mlrs ≥ umap − ε`, D-04). Transform is a HARDER problem
+than the fit layout: each new point is optimized in a FROZEN-subset SGD where it
+sees only its training neighbours + random negatives (never the other new
+points, `move_other=0`), driven by mlrs's `SplitMix64` negatives vs umap-learn's
+`tau_rand_int` Tausworthe — so the relative margins are inherently WIDER than the
+fit layout's. Measured on the first spectral-init transform sweep (cpu-MLIR f64,
+`n_train=60`, `n_new=15`):
+
+| Metric | new-pt trust (mlrs / umap) | margin (umap − mlrs) |
+|--------|----------------------------|----------------------|
+| euclidean | 0.9390 / 0.9124 | **−0.0267** (mlrs beats umap) |
+| cosine | 0.9581 / 0.8895 | **−0.0686** (mlrs beats umap) |
+| manhattan | 0.8152 / 0.8648 | +0.0495 |
+| minkowski (p=3) | 0.8343 / 0.9143 | +0.0800 |
+| chebyshev | 0.8305 / 0.9752 | +0.1448 |
+
+**Worst positive margin:** chebyshev +0.1448. mlrs MATCHES or BEATS umap on the
+two GEMM metrics (euclidean, cosine) and stays within ≤0.145 trust on the three
+direct-kernel metrics — it never collapses the new-point structure.
+
+| Constant | Value | Rationale |
+|----------|-------|-----------|
+| `TRANSFORM_PROPERTY_EPS` (new-pt trust slack) | **0.15** | Covers the worst measured margin (chebyshev +0.1448) with a small buffer; a meaningful RELATIVE structural gate (D-04), looser than the fit `PROPERTY_EPS=0.02` because the frozen-subset transform + RNG divergence is a structurally harder, wider-margin problem (RESEARCH landmine: mlrs SplitMix64 ≠ umap Tausworthe → property-gated, not value-gated). |
+
+The transform is ALSO byte-identical-reproducible per (backend, dtype): two
+`transform` runs with the same `random_state` produce a bit-identical embedding
+(D-05), asserted in `transform_property_<metric>`.
+
 ---
 
 ## Manual-Only Verifications

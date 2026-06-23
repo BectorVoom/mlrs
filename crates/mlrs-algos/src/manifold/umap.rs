@@ -129,6 +129,12 @@ pub struct Umap<F, S = Unfit> {
     // --- fitted state (None / 0 until fit; Some on Fitted by construction) ---
     /// Fitted embedding `(n, n_components)`, device-resident. `None` until fit.
     embedding_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Retained training design rows `(n, n_features_in_)`, device-resident, kept
+    /// for `transform`'s query-vs-train KNN (new→train runs in the ORIGINAL
+    /// feature space; the fitted embedding alone is insufficient). `None` until
+    /// fit (UMAP-04 / D-03 — umap-learn likewise retains the training data / KNN
+    /// search index for `transform`).
+    x_train_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Number of features seen at fit (`n_features_in_`). `0` until fit.
     n_features_in_: usize,
     /// Compile-time lifecycle marker (zero-sized).
@@ -162,6 +168,7 @@ where
             a: None,
             b: None,
             embedding_: None,
+            x_train_: None,
             n_features_in_: 0,
             _state: PhantomData,
         }
@@ -403,6 +410,7 @@ impl UmapBuilder {
             a: self.a,
             b: self.b,
             embedding_: None,
+            x_train_: None,
             n_features_in_: 0,
             _state: PhantomData,
         })
@@ -442,6 +450,12 @@ where
         let embedding_host = run_umap_layout::<F>(pool, x, n, p, &self)?;
         let embedding = DeviceArray::from_host(pool, &embedding_host);
 
+        // Retain the training design rows for `transform`'s query-vs-train KNN
+        // (D-03 — new→train runs in the original feature space). A host round-trip
+        // re-uploads `x` into an owned device buffer the fitted estimator keeps.
+        let x_train_host: Vec<F> = x.to_host(pool);
+        let x_train = DeviceArray::from_host(pool, &x_train_host);
+
         Ok(Umap {
             n_neighbors: self.n_neighbors,
             n_components: self.n_components,
@@ -459,6 +473,7 @@ where
             a: self.a,
             b: self.b,
             embedding_: Some(embedding),
+            x_train_: Some(x_train),
             n_features_in_: p,
             _state: PhantomData,
         })
@@ -490,34 +505,359 @@ impl<F> Transform<F> for Umap<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
-    /// NON-algorithmic trivial transform (Phase-12 shell — real UMAP transform
-    /// lands in Phase 14). Re-emits an all-zeros `(rows, n_components)` buffer
-    /// from the passed shape — NO kernel, NO compute. Exists ONLY on
-    /// `Umap<F, Fitted>`, so `transform`-before-`fit` is a compile error (D-02).
+    /// Real UMAP `transform(X_new)` (UMAP-04, D-03) — embed `m` NEW points against
+    /// the fitted fuzzy graph via the umap-learn frozen-subset path: query-vs-train
+    /// KNN(new→train) → membership of the new points → `init_graph_transform`
+    /// neighbor-weighted-average init → reduced-epoch SGD optimizing ONLY the new
+    /// points with the training embedding FROZEN (read-only GATHER targets),
+    /// driving the SAME [`umap_layout_step`] kernel as `fit` with
+    /// `owners = m new points`, `move_other = 0`. Exists ONLY on `Umap<F, Fitted>`,
+    /// so `transform`-before-`fit` is a compile error (D-02).
+    ///
+    /// All randomness is HOST-drawn `SplitMix64` keyed as a pure function of
+    /// `(random_state, epoch, edge)` (D-05) so two same-`random_state` transforms
+    /// are byte-identical per (backend, dtype). The fit-time `n_features_in_`
+    /// defines the contract: a `X_new` whose column count differs returns the typed
+    /// [`PrimError::ShapeMismatch`] BEFORE any launch (T-14-15), never a wrong-shape
+    /// device read.
     fn transform(
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
-        let (n, p) = shape;
+        let (m, p) = shape;
         validate_geometry(x, shape)?;
         // The fitted `n_features_in_` defines the transform contract (typestate
         // doc: "Errors if the geometry disagrees with the fitted `n_features`"):
         // a matrix whose column count differs from the fit-time feature count
-        // cannot be projected onto the fitted components (WR-02). Surface the
-        // same typed `ShapeMismatch` rather than silently emitting a wrong-shape
-        // all-zeros buffer.
+        // cannot be projected onto the fitted components (WR-02 / T-14-15).
         if p != self.n_features_in_ {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "x",
-                rows: n,
+                rows: m,
                 cols: p,
                 len: x.len(),
             }));
         }
-        let zeros = vec![F::from_int(0i64); n * self.n_components];
-        Ok(DeviceArray::from_host(pool, &zeros))
+
+        let new_host = transform_new_points::<F>(pool, self, x, m, p)?;
+        Ok(DeviceArray::from_host(pool, &new_host))
+    }
+}
+
+/// The frozen-subset transform driver (UMAP-04, D-03). Returns the row-major
+/// `(m, n_components)` host buffer of the `m` new points' embedding coordinates.
+/// Pure host orchestration over the Task-1 query-vs-train KNN, the Plan-02
+/// membership stage, `init_graph_transform`, and the Plan-04 `umap_layout_step`
+/// kernel (driven owner-only / `move_other = 0` so the training coords stay
+/// frozen — proven by the `umap_layout_step_launches_f64_owner_only` smoke test).
+fn transform_new_points<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    cfg: &Umap<F, Fitted>,
+    x_new: &DeviceArray<ActiveRuntime, F>,
+    m: usize,
+    d: usize,
+) -> Result<Vec<F>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let n_components = cfg.n_components;
+
+    // The FROZEN training embedding (host f64, row-major (n, n_components)).
+    let embedding_train: Vec<f64> = cfg
+        .embedding_
+        .as_ref()
+        .expect("embedding_ is Some by construction on Umap<F, Fitted>")
+        .to_host(pool)
+        .iter()
+        .map(|&v| host_to_f64(v))
+        .collect();
+    let n = embedding_train.len() / n_components;
+
+    // Host f64 copies of the query (new) and the training design rows. The
+    // training X is NOT retained on the fitted estimator (umap retains it via the
+    // KNN search index; here the query-vs-train KNN needs the raw train rows), so
+    // it is reconstructed by re-reading… — but the fitted shell does not keep X.
+    // Instead transform receives X_new only and uses the FITTED embedding as the
+    // frozen target; the query-vs-train KNN runs new-vs-train in the ORIGINAL
+    // feature space, which requires the training X. The estimator therefore keeps
+    // the training design rows for transform (see `x_train_` below).
+    let x_new_host: Vec<f64> = x_new.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+    let x_train_host: Vec<f64> = cfg
+        .x_train_
+        .as_ref()
+        .expect("x_train_ is Some by construction on Umap<F, Fitted>")
+        .to_host(pool)
+        .iter()
+        .map(|&v| host_to_f64(v))
+        .collect();
+
+    // --- (1) Query-vs-train KNN (new→train), no self-drop (new ≠ train). ---
+    let k = cfg.n_neighbors.min(n.saturating_sub(1)).max(1);
+    let (knn_idx_host, knn_dist_host) =
+        query_train_knn::<F>(pool, &x_new_host, &x_train_host, m, n, d, k, cfg.metric)?;
+
+    // --- (2) membership of the NEW points against the fitted graph: smooth-kNN
+    //     ρ/σ on the new points' OWN knn distances + the directed membership exp
+    //     (same constants as fit). NO t-conorm union — the transform graph is the
+    //     directed bipartite (m new rows × n train cols), not symmetrized. ---
+    let (sigmas, rhos) = umap_internals::smooth_knn_dist(
+        &knn_dist_host,
+        m,
+        k,
+        cfg.n_neighbors,
+        cfg.local_connectivity,
+    );
+    let (t_rows, t_cols, t_vals) = umap_internals::compute_membership_strengths(
+        &knn_idx_host,
+        &knn_dist_host,
+        &rhos,
+        &sigmas,
+        m,
+        k,
+    );
+
+    // --- (3) init_graph_transform: neighbor-weighted-average init for new pts. ---
+    let init_new = umap_internals::init_graph_transform(
+        &t_rows,
+        &t_cols,
+        &t_vals,
+        &embedding_train,
+        m,
+        n,
+        n_components,
+    );
+
+    // --- (4) a/b curve parameters (same as fit). ---
+    let (a, b) = match (cfg.a, cfg.b) {
+        (Some(a), Some(b)) => (a, b),
+        _ => umap_init::fit_ab(cfg.min_dist, cfg.spread)?,
+    };
+
+    // --- (5) build the combined embedding [n frozen train rows][m new rows] and
+    //     the per-new-point CSR edges into the frozen train block. Owners are the
+    //     m NEW rows placed CONTIGUOUSLY AFTER the n training rows (D-03). ---
+    let mut combined: Vec<f64> = Vec::with_capacity((n + m) * n_components);
+    combined.extend_from_slice(&embedding_train);
+    combined.extend_from_slice(&init_new);
+
+    // Per-new-point positive edges (target = train col index, GLOBAL row index is
+    // unchanged since train rows occupy 0..n). Weights are the transform
+    // membership values; the layout schedule samples them as in fit.
+    // head/tail are GLOBAL vertex indices in the combined buffer: owner = n + new_i.
+    let mut head: Vec<usize> = Vec::with_capacity(t_vals.len());
+    let mut tail: Vec<usize> = Vec::with_capacity(t_vals.len());
+    let mut weights: Vec<f64> = Vec::with_capacity(t_vals.len());
+    for e in 0..t_vals.len() {
+        if t_vals[e] > 0.0 {
+            head.push(n + t_rows[e]); // owner = the new point (after the train block)
+            tail.push(t_cols[e]); // target = the frozen training vertex
+            weights.push(t_vals[e]);
+        }
+    }
+
+    // --- (6) reduced-epoch SGD: n_epochs = 100 when fit-time was None (RESEARCH
+    //     Pattern 7 step 4), else the fit-time count. Drive the SAME kernel with
+    //     owners = m (the new rows) starting at offset n, move_other = 0. ---
+    let n_epochs = cfg.n_epochs.unwrap_or(100);
+    let eps = make_epochs_per_sample(&weights, n_epochs);
+    let seed = cfg.random_state.unwrap_or(42);
+
+    transform_epoch_driver::<F>(
+        pool,
+        &mut combined,
+        &head,
+        &tail,
+        &eps,
+        n,
+        m,
+        n_components,
+        a,
+        b,
+        cfg.repulsion_strength,
+        cfg.learning_rate,
+        cfg.negative_sample_rate,
+        n_epochs,
+        seed,
+    );
+
+    // Extract the m new-point rows (the tail of the combined buffer).
+    let new_coords: Vec<F> = combined[n * n_components..(n + m) * n_components]
+        .iter()
+        .map(|&v| f64_to_host::<F>(v))
+        .collect();
+    Ok(new_coords)
+}
+
+/// Frozen-subset host epoch driver for `transform` (UMAP-04, D-03). Drives the
+/// SAME [`umap_layout_step`] kernel as the fit-path [`host_epoch_driver`] but with
+/// `move_other = 0` (the training coords are read-only GATHER targets) and only
+/// the `m` NEW vertices as owners. The owners occupy the contiguous rows
+/// `n..n+m` of `combined`, but `umap_layout_step` treats rows `0..n_owners` as the
+/// owners — so the CSR is keyed by the OWNER-LOCAL index `0..m` while the edge
+/// targets are GLOBAL vertex indices `< n + m`. To reuse the kernel's
+/// `embedding[owner_local]` write semantics with owners placed at the END, the
+/// driver passes a VIEW whose owner rows are the new points: it launches over the
+/// full `(n + m)` buffer with `n_owners = n + m` would move the train rows too —
+/// instead it builds the CSR so ONLY the `m` new owners have edges and launches
+/// with `n_owners = n + m`, `move_other = 0`; train owners (rows `0..n`) get empty
+/// CSR ranges and are never written. Negative samples are drawn over the whole
+/// combined vertex set `0..n_vertices` host-side per `(seed, epoch, edge)` (D-05)
+/// so the transform is byte-identical (matching umap-learn's `optimize_layout`,
+/// which samples negatives over the full `head_embedding` vertex count).
+#[allow(clippy::too_many_arguments)]
+fn transform_epoch_driver<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    combined: &mut [f64],
+    head: &[usize],
+    tail: &[usize],
+    epochs_per_sample: &[f64],
+    n_train: usize,
+    m_new: usize,
+    dim: usize,
+    a: f64,
+    b: f64,
+    gamma: f64,
+    initial_alpha: f64,
+    negative_sample_rate: usize,
+    n_epochs: usize,
+    seed: u64,
+) where
+    F: Float + CubeElement + Pod,
+{
+    let n_vertices = n_train + m_new;
+    let n_edges = epochs_per_sample.len();
+    let mut next_sample: Vec<f64> = epochs_per_sample.to_vec();
+    let epochs_per_negative: Vec<f64> = epochs_per_sample
+        .iter()
+        .map(|&e| if e > 0.0 { e / negative_sample_rate as f64 } else { -1.0 })
+        .collect();
+    let mut next_negative: Vec<f64> = epochs_per_negative.clone();
+
+    let client = pool.client().clone();
+
+    for epoch in 0..n_epochs {
+        let alpha = initial_alpha * (1.0 - epoch as f64 / n_epochs as f64);
+
+        // Per-owner CSR over ALL n_vertices owners; only the m new owners (rows
+        // n_train..n_vertices) ever receive edges, so the train owners stay frozen
+        // (empty ranges) AND move_other = 0 prevents any train coordinate write.
+        let mut pos_per_owner: Vec<Vec<u32>> = vec![Vec::new(); n_vertices];
+        let mut neg_per_owner: Vec<Vec<u32>> = vec![Vec::new(); n_vertices];
+
+        for e in 0..n_edges {
+            let eps_e = epochs_per_sample[e];
+            if eps_e <= 0.0 {
+                continue;
+            }
+            if next_sample[e] > epoch as f64 {
+                continue;
+            }
+            let owner = head[e]; // GLOBAL owner index (a new vertex, ≥ n_train)
+            pos_per_owner[owner].push(tail[e] as u32);
+
+            let epn = epochs_per_negative[e];
+            let n_neg = if epn > 0.0 {
+                ((epoch as f64 - next_negative[e]) / epn).floor() as i64
+            } else {
+                0
+            };
+            if n_neg > 0 {
+                let sub_seed = seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((epoch as u64).wrapping_mul(0x1000_0001))
+                    .wrapping_add(e as u64);
+                let mut rng = SplitMix64::new(sub_seed);
+                for _ in 0..n_neg {
+                    // Negatives are drawn over the WHOLE combined vertex set
+                    // `0..n_vertices` (train ∪ new) — the new point is repelled from
+                    // random vertices of the combined embedding, matching umap-learn's
+                    // `optimize_layout` which samples `tail` over `n_vertices =
+                    // head_embedding.shape[0]`. (Restricting to train-only measurably
+                    // REGRESSED the structural gate for euclidean+cosine, so the
+                    // combined-set draw is the correct, calibrated behaviour.)
+                    let kk = rng.next_below(n_vertices as u64) as u32;
+                    neg_per_owner[owner].push(kk);
+                }
+                next_negative[e] += n_neg as f64 * epn;
+            }
+            next_sample[e] += eps_e;
+        }
+
+        // Flatten per-owner buckets into CSR offsets + tail/neg arrays over the
+        // full n_vertices owner set (train owners have empty ranges).
+        let mut pos_offsets: Vec<u32> = Vec::with_capacity(n_vertices + 1);
+        let mut pos_tail: Vec<u32> = Vec::new();
+        let mut neg_offsets: Vec<u32> = Vec::with_capacity(n_vertices + 1);
+        let mut neg_idx: Vec<u32> = Vec::new();
+        pos_offsets.push(0);
+        neg_offsets.push(0);
+        for o in 0..n_vertices {
+            pos_tail.extend_from_slice(&pos_per_owner[o]);
+            pos_offsets.push(pos_tail.len() as u32);
+            neg_idx.extend_from_slice(&neg_per_owner[o]);
+            neg_offsets.push(neg_idx.len() as u32);
+        }
+
+        if pos_tail.is_empty() && neg_idx.is_empty() {
+            continue;
+        }
+        if pos_tail.is_empty() {
+            pos_tail.push(0);
+        }
+        if neg_idx.is_empty() {
+            neg_idx.push(0);
+        }
+
+        let emb_f: Vec<F> = combined.iter().map(|&v| f64_to_host::<F>(v)).collect();
+        let emb_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &emb_f);
+        let pos_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_offsets);
+        let pos_tail_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_tail);
+        let neg_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_offsets);
+        let neg_idx_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_idx);
+
+        let count = CubeCount::Static(n_vertices as u32, 1, 1);
+        let cube_dim = CubeDim { x: 1, y: 1, z: 1 };
+        let emb_arg =
+            unsafe { ArrayArg::from_raw_parts(emb_dev.handle().clone(), n_vertices * dim) };
+        let pos_off_arg =
+            unsafe { ArrayArg::from_raw_parts(pos_off_dev.handle().clone(), pos_offsets.len()) };
+        let pos_tail_arg =
+            unsafe { ArrayArg::from_raw_parts(pos_tail_dev.handle().clone(), pos_tail.len()) };
+        let neg_off_arg =
+            unsafe { ArrayArg::from_raw_parts(neg_off_dev.handle().clone(), neg_offsets.len()) };
+        let neg_idx_arg =
+            unsafe { ArrayArg::from_raw_parts(neg_idx_dev.handle().clone(), neg_idx.len()) };
+
+        umap_layout_step::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            cube_dim,
+            emb_arg,
+            pos_off_arg,
+            pos_tail_arg,
+            neg_off_arg,
+            neg_idx_arg,
+            f64_to_host::<F>(a),
+            f64_to_host::<F>(b),
+            f64_to_host::<F>(gamma),
+            f64_to_host::<F>(alpha),
+            dim as u32,
+            n_vertices as u32, // n_owners = all vertices; train owners have empty CSR
+            n_vertices as u32, // n_vertices bound for the GATHER index check
+            0u32,              // move_other = 0 (frozen-subset transform path, D-03)
+        );
+
+        let updated: Vec<f64> =
+            emb_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        combined.copy_from_slice(&updated);
+
+        emb_dev.release_into(pool);
+        pos_off_dev.release_into(pool);
+        pos_tail_dev.release_into(pool);
+        neg_off_dev.release_into(pool);
+        neg_idx_dev.release_into(pool);
     }
 }
 
