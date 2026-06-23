@@ -137,7 +137,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1; 02 & 03 file-disjoint, parallel)*
 
-- [ ] 14-02-PLAN.md — deterministic stages 1–3 (host f64): smooth-kNN ρ/σ binary search + membership strengths + t-conorm fuzzy union (UMAP's symmetrization); value-gated ≤1e-5 × 5 metrics
+- [x] 14-02-PLAN.md — deterministic stages 1–3 (host f64): smooth-kNN ρ/σ binary search + membership strengths + t-conorm fuzzy union (UMAP's symmetrization); value-gated ≤1e-5 × 5 metrics
 - [ ] 14-03-PLAN.md — deterministic stages: host LM a/b curve fit + spectral init (reuse laplacian+eig+recover, random fallback above n=64) ; value-gated ≤1e-5 × 5 metrics (up-to-sign spectral)
 
 **Wave 3** *(blocked on Wave 2; SPIKE-GATED)*
@@ -202,6 +202,6 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 11. Naive Bayes | v2.0 | 5/5 | Complete | 2026-06-22 |
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
-| 14. UMAP | v3.0 | 1/5 | In Progress|  |
+| 14. UMAP | v3.0 | 2/5 | In Progress|  |
 | 15. HDBSCAN | v3.0 | 0/TBD | Not started | - |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |
