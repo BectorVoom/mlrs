@@ -701,7 +701,7 @@ where
     //     Pattern 7 step 4), else the fit-time count. Drive the SAME kernel with
     //     owners = m (the new rows) starting at offset n, move_other = 0. ---
     let n_epochs = cfg.n_epochs.unwrap_or(100);
-    let eps = make_epochs_per_sample(&weights, n_epochs);
+    let eps = make_epochs_per_sample(&weights, n_epochs)?;
     let seed = cfg.random_state.unwrap_or(42);
 
     transform_epoch_driver::<F>(
@@ -1069,9 +1069,25 @@ where
 /// `n_epochs / (n_epochs · w/w_max) = w_max / w`. Edges whose scaled sample
 /// count is ≤ 0 are never sampled (sentinel `-1.0`). Mirrors umap's
 /// `result[n_samples > 0] = n_epochs / n_samples[n_samples > 0]`.
-fn make_epochs_per_sample(weights: &[f64], n_epochs: usize) -> Vec<f64> {
+///
+/// WR-05: validates every weight is finite BEFORE the `w_max` reduction.
+/// `f64::max(0.0, NaN)` returns `0.0`, so a NaN weight would otherwise be
+/// silently folded to 0 and corrupt `w_max`, yielding a wrong per-edge sampling
+/// schedule for every edge with no error. Membership values come from `exp` of
+/// finite inputs so a NaN should not arise today, but the failure mode (silent
+/// schedule corruption) is invisible, so it is rejected as a typed error.
+fn make_epochs_per_sample(weights: &[f64], n_epochs: usize) -> Result<Vec<f64>, AlgoError> {
+    if let Some(bad) = weights.iter().position(|w| !w.is_finite()) {
+        return Err(AlgoError::InvalidGraphInput {
+            estimator: "umap",
+            reason: format!(
+                "fuzzy-graph edge weight {} is non-finite at index {}",
+                weights[bad], bad
+            ),
+        });
+    }
     let w_max = weights.iter().cloned().fold(0.0_f64, f64::max);
-    weights
+    Ok(weights
         .iter()
         .map(|&w| {
             // n_samples = n_epochs * (w / w_max); epochs_per_sample = n_epochs / n_samples
@@ -1086,7 +1102,7 @@ fn make_epochs_per_sample(weights: &[f64], n_epochs: usize) -> Vec<f64> {
                 -1.0
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Run the full UMAP pipeline and return the row-major `(n, n_components)`
@@ -1191,7 +1207,7 @@ where
 
     // --- (5) epochs_per_sample + n_epochs resolution (A4: 500 small / 200 large). ---
     let n_epochs = cfg.n_epochs.unwrap_or(if n <= 10_000 { 500 } else { 200 });
-    let eps = make_epochs_per_sample(&g_vals, n_epochs);
+    let eps = make_epochs_per_sample(&g_vals, n_epochs)?;
 
     // --- (6) host epoch driver: per epoch, select active edges by umap's
     //     epoch_of_next_sample schedule, draw host negative samples, launch
