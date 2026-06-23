@@ -19,6 +19,10 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 pub mod dbscan;
+// Phase-12 convention-foundation HDBSCAN shell (HDBS-01, plan 12-02). Born
+// builder-fronted + typestate (`Hdbscan<F, S = Unfit>`) with a NON-algorithmic
+// trivial fit (all-`-1` labels); the real HDBSCAN algorithm lands in Phase 15.
+pub mod hdbscan;
 pub mod kmeans;
 // Phase-9 spectral estimators (Wave-0 scaffold 09-01 owns these registrations;
 // the Wave-2 plan 09-03 fills `spectral_embedding`, the Wave-3 plan 09-04 fills
@@ -39,5 +43,6 @@ pub(crate) mod spectral;
 pub mod spectral_clustering;
 pub mod spectral_embedding;
 
+pub use hdbscan::Hdbscan;
 pub use spectral_clustering::SpectralClustering;
 pub use spectral_embedding::SpectralEmbedding;
