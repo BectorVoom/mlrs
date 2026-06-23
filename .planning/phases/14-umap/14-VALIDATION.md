@@ -52,7 +52,35 @@ created: 2026-06-23
 - [ ] umap-learn 0.5.12 oracle fixtures (committed blobs) regenerated via the `/tmp` numpy/umap-learn venv — all 5 metrics; intermediates: graph rows/cols/vals, sigmas/rhos, a/b, spectral-init coords
 - [ ] property-gate helpers (trustworthiness, kNN-overlap, downstream-ARI) in-repo
 
-*Calibrated thresholds (ε, ARI band) recorded here after the first oracle-fixture/spike run (ROADMAP Spike flag item 2).*
+### Calibrated property-gate thresholds (Plan 04 — Spike flag item 2)
+
+Measured on the first fixture run (cpu-MLIR f64, `n=60`, 3 well-separated
+clusters, `random_state=42`, `n_epochs=200`) by computing mlrs's and
+umap-learn 0.5.12's structural scores on identical seeded data. The gate is
+RELATIVE to umap (`mlrs ≥ umap − ε`, D-04), never an absolute floor.
+
+| Metric | trustworthiness (mlrs / umap) | margin (umap−mlrs) | kNN-overlap (mlrs / umap) | margin (umap−mlrs) | downstream-ARI (mlrs / umap) | gap |
+|--------|-------------------------------|--------------------|----------------------------|--------------------|------------------------------|-----|
+| euclidean | 0.9673 / 0.9680 | **+0.0007** | 0.6950 / 0.6917 | −0.0033 | 1.0000 / 1.0000 | 0.0000 |
+| manhattan | 0.9654 / 0.9635 | −0.0019 | 0.6850 / 0.6783 | −0.0067 | 1.0000 / 1.0000 | 0.0000 |
+| cosine | 0.9685 / 0.9673 | −0.0012 | 0.6983 / 0.6733 | −0.0250 | 1.0000 / 1.0000 | 0.0000 |
+| chebyshev | 0.9621 / 0.9615 | −0.0006 | 0.6350 / 0.6317 | −0.0033 | 1.0000 / 1.0000 | 0.0000 |
+| minkowski (p=3) | 0.9675 / 0.9652 | −0.0023 | 0.6917 / 0.6667 | −0.0250 | 1.0000 / 1.0000 | 0.0000 |
+
+**Worst positive margin:** trust +0.0007 (euclidean); overlap +0.0000 (mlrs ≥ umap on every metric); ARI gap 0.0000 on all five.
+
+**Calibrated constants** (in `crates/mlrs-algos/tests/umap_test.rs`):
+
+| Constant | Value | Rationale |
+|----------|-------|-----------|
+| `PROPERTY_EPS` (trust + overlap slack) | **0.02** | ≈28× the worst trust margin (0.0007); tight while absorbing cpu/rocm structural jitter (D-04). |
+| `ARI_BAND` (downstream-ARI band) | **0.05** | ARI gap measured 0.0000 on all metrics; a tight relative band, not an absolute floor. |
+
+The downstream-ARI clusters BOTH embeddings with the same deterministic host
+Lloyd k-means (`k = 3` true classes) and scores each clustering against the
+true labels — both mlrs and umap recover the 3 clusters exactly. All 5
+`layout_property_<metric>` tests are GREEN at these thresholds; the full run
+(spectral-init Jacobi eig dominated) took ~1717s for the five metrics.
 
 ---
 

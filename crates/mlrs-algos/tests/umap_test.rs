@@ -47,12 +47,19 @@ use mlrs_core::{load_npz, OracleCase, F64_TOL};
 // Placeholder calibration consts (Plan 04 overwrites — RESEARCH Q4)
 // ===========================================================================
 
-/// TODO(Plan 04 calibration): trustworthiness/kNN-overlap slack below the umap
-/// reference score. Placeholder only — replace with the calibrated margin and
-/// record in 14-VALIDATION.md (do NOT invent the real threshold here).
-const PROPERTY_EPS: f64 = 0.05;
-/// TODO(Plan 04 calibration): allowed downstream-ARI band below umap's ARI.
-const ARI_BAND: f64 = 0.10;
+/// Calibrated (Plan 04) trustworthiness/kNN-overlap slack below the umap-learn
+/// 0.5.12 reference score (D-04 — RELATIVE-to-oracle, NEVER an absolute floor).
+/// Set from the first fixture run's worst measured margin `(umap − mlrs)` across
+/// all 5 metrics plus a tight safety buffer; recorded per metric in
+/// `14-VALIDATION.md`. Measured worst positive margins: trust +0.0007 (euclidean),
+/// overlap +0.0000 (mlrs ≥ umap on every metric). `ε = 0.02` keeps the gate tight
+/// (≈28× the worst trust margin) while absorbing cpu/rocm structural jitter.
+const PROPERTY_EPS: f64 = 0.02;
+/// Calibrated downstream-ARI band: mlrs's clustering-vs-truth ARI must be within
+/// this of umap's `(umap_ari − band)` (D-04). Measured ARI gap was 0.0000 on all
+/// 5 metrics (both recover the 3 true clusters exactly); `band = 0.05` is a tight
+/// relative gate, not an absolute floor.
+const ARI_BAND: f64 = 0.05;
 
 // ===========================================================================
 // Fixture path + load helpers
@@ -236,6 +243,65 @@ fn downstream_ari(labels_a: &[i64], labels_b: &[i64]) -> f64 {
         return 1.0;
     }
     (sum_ij - expected) / (max_index - expected)
+}
+
+/// Deterministic host Lloyd k-means on a row-major `(n, dim)` embedding, returning
+/// integer cluster labels. Seeded farthest-first-style init (first `k` distinct
+/// rows by index) + fixed 50 Lloyd iterations — fully deterministic so the
+/// downstream-ARI gate is reproducible (no sklearn / no device at test time).
+fn host_kmeans_labels(emb: &[f64], n: usize, dim: usize, k: usize) -> Vec<i64> {
+    // Init centroids from the first k rows (deterministic).
+    let mut centroids: Vec<f64> = vec![0.0; k * dim];
+    for c in 0..k {
+        for d in 0..dim {
+            centroids[c * dim + d] = emb[c * dim + d];
+        }
+    }
+    let mut labels = vec![0i64; n];
+    for _iter in 0..50 {
+        // Assign.
+        let mut changed = false;
+        for i in 0..n {
+            let mut best = 0usize;
+            let mut best_d = f64::INFINITY;
+            for c in 0..k {
+                let mut acc = 0.0;
+                for d in 0..dim {
+                    let diff = emb[i * dim + d] - centroids[c * dim + d];
+                    acc += diff * diff;
+                }
+                if acc < best_d {
+                    best_d = acc;
+                    best = c;
+                }
+            }
+            if labels[i] != best as i64 {
+                changed = true;
+            }
+            labels[i] = best as i64;
+        }
+        // Update.
+        let mut sums = vec![0.0; k * dim];
+        let mut counts = vec![0usize; k];
+        for i in 0..n {
+            let c = labels[i] as usize;
+            counts[c] += 1;
+            for d in 0..dim {
+                sums[c * dim + d] += emb[i * dim + d];
+            }
+        }
+        for c in 0..k {
+            if counts[c] > 0 {
+                for d in 0..dim {
+                    centroids[c * dim + d] = sums[c * dim + d] / counts[c] as f64;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    labels
 }
 
 /// Decode a float-encoded integer label array to `i64` (fixtures store labels as
@@ -695,26 +761,48 @@ fn run_layout_property(metric_tag: &str, metric: Metric) {
     let umap_overlap = knn_overlap(high, umap_emb, n, d, n_components, k);
     let mlrs_overlap = knn_overlap(high, &mlrs_emb, n, d, n_components, k);
 
-    // Downstream ARI: a trivial host k=clusters labeling by nearest embedding
-    // centroid is deferred to Plan 04; here assert the helper runs against the
-    // true labels as a self-consistency witness, then the structural gate.
-    let _self_ari = downstream_ari(&labels, &labels);
-    assert_eq!(_self_ari, 1.0, "ARI of labels with themselves is 1.0");
+    // Downstream-ARI (D-04): cluster BOTH embeddings with the same deterministic
+    // host k-means (k = number of true classes) and score each clustering against
+    // the true labels via ARI. The gate is RELATIVE: mlrs's ARI must be within
+    // ARI_BAND of umap's, never an absolute floor.
+    let n_classes = {
+        let mut s: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for &l in &labels {
+            s.insert(l);
+        }
+        s.len().max(2)
+    };
+    let umap_km = host_kmeans_labels(umap_emb, n, n_components, n_classes);
+    let mlrs_km = host_kmeans_labels(&mlrs_emb, n, n_components, n_classes);
+    let umap_ari = downstream_ari(&labels, &umap_km);
+    let mlrs_ari = downstream_ari(&labels, &mlrs_km);
+    // Self-witness: the ARI helper is correct (ARI of labels with themselves = 1).
+    assert_eq!(downstream_ari(&labels, &labels), 1.0, "ARI self-identity");
 
-    // RED-by-design structural gate: zeros embedding cannot match umap structure.
+    // Calibration witness (printed under --nocapture so the recorded thresholds
+    // in 14-VALIDATION.md are reproducible from the measured margins).
+    println!(
+        "CALIB layout_property {metric_tag}: trust mlrs={mlrs_trust:.4} umap={umap_trust:.4} \
+         (margin {:.4}); overlap mlrs={mlrs_overlap:.4} umap={umap_overlap:.4} (margin {:.4}); \
+         ARI mlrs={mlrs_ari:.4} umap={umap_ari:.4} (gap {:.4})",
+        umap_trust - mlrs_trust,
+        umap_overlap - mlrs_overlap,
+        umap_ari - mlrs_ari,
+    );
+
+    // Relative-to-umap structural gate (D-04 — `≥ umap − ε`, NOT an absolute floor).
     assert!(
         mlrs_trust >= umap_trust - PROPERTY_EPS,
-        "layout_property {metric_tag}: trustworthiness {mlrs_trust} < umap {umap_trust} − ε \
-         (RED until Plan 04; PROPERTY_EPS is a calibration placeholder)"
+        "layout_property {metric_tag}: trustworthiness {mlrs_trust} < umap {umap_trust} − ε ({PROPERTY_EPS})"
     );
     assert!(
         mlrs_overlap >= umap_overlap - PROPERTY_EPS,
-        "layout_property {metric_tag}: kNN-overlap {mlrs_overlap} < umap {umap_overlap} − ε \
-         (RED until Plan 04)"
+        "layout_property {metric_tag}: kNN-overlap {mlrs_overlap} < umap {umap_overlap} − ε ({PROPERTY_EPS})"
     );
-    // ARI band is exercised once Plan 04 produces real cluster labels from both
-    // embeddings; ARI_BAND is referenced so the calibration const is live.
-    assert!(ARI_BAND > 0.0, "ARI_BAND placeholder must be positive");
+    assert!(
+        mlrs_ari >= umap_ari - ARI_BAND,
+        "layout_property {metric_tag}: downstream-ARI {mlrs_ari} < umap {umap_ari} − band ({ARI_BAND})"
+    );
 }
 
 #[test]
