@@ -129,7 +129,24 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
   3. UMAP's stochastic SGD layout passes a property/structural gate vs umap-learn 0.5.12 — trustworthiness / kNN-overlap ≥ umap-learn − margin and downstream-ARI within band — NOT coordinate value-match, and the same `random_state` reproduces a byte-identical mlrs embedding across runs.
   4. A user can embed new data via `transform(X_new)` against the fitted fuzzy graph, gated by a property sub-gate on the new points.
 
-**Plans**: TBD
+**Plans**: 5 plans
+Plans:
+**Wave 1**
+
+- [ ] 14-01-PLAN.md — Nyquist Wave 0: umap-learn 0.5.12 oracle fixtures (5 metrics × every stage) + RED value/property/reproducibility/transform harness + Metric→5 variants + umap_internals/umap_init module stubs
+
+**Wave 2** *(blocked on Wave 1; 02 & 03 file-disjoint, parallel)*
+
+- [ ] 14-02-PLAN.md — deterministic stages 1–3 (host f64): smooth-kNN ρ/σ binary search + membership strengths + t-conorm fuzzy union (UMAP's symmetrization); value-gated ≤1e-5 × 5 metrics
+- [ ] 14-03-PLAN.md — deterministic stages: host LM a/b curve fit + spectral init (reuse laplacian+eig+recover, random fallback above n=64) ; value-gated ≤1e-5 × 5 metrics (up-to-sign spectral)
+
+**Wave 3** *(blocked on Wave 2; SPIKE-GATED)*
+
+- [ ] 14-04-PLAN.md — NEW umap_layout_step<F> vertex-owner GATHER SGD kernel (cpu-MLIR-safe, frozen-subset) + host epoch driver + real fit/fit_transform + property-gate calibration; property-gated + byte-identical reproducibility
+
+**Wave 4** *(blocked on Wave 3)*
+
+- [ ] 14-05-PLAN.md — transform(X_new) frozen-subset path (same kernel, move_other=false) + property sub-gate + replace stale zeros shell tests
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — (1) confirm the vertex-owner `umap_layout_step` single-owner GATHER kernel launches under cpu-MLIR (the named cpu-MLIR unknown; precedent: v2 two-pass SGD solver launched first try); (2) calibrate the property-gate thresholds (trustworthiness / kNN-overlap floors relative to umap-learn) empirically on the first oracle fixture run.
 
@@ -184,6 +201,6 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 11. Naive Bayes | v2.0 | 5/5 | Complete | 2026-06-22 |
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
-| 14. UMAP | v3.0 | 0/TBD | Not started | - |
+| 14. UMAP | v3.0 | 0/5 | Planned | - |
 | 15. HDBSCAN | v3.0 | 0/TBD | Not started | - |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |
