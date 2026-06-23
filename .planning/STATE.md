@@ -4,17 +4,17 @@ milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 14
 current_phase_name: umap
-status: executing
+status: verifying
 stopped_at: Completed 14-01-PLAN.md
-last_updated: "2026-06-23T15:43:36.764Z"
+last_updated: "2026-06-23T17:41:29.880Z"
 last_activity: 2026-06-23
 last_activity_desc: Phase 14 execution started
 progress:
   total_phases: 5
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 12
-  completed_plans: 11
-  percent: 40
+  completed_plans: 12
+  percent: 60
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 Phase: 14 (umap) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-23 -- Phase 14 execution started
 Resume: next phase (UMAP — Phase 14) consumes knn_graph
 
@@ -129,6 +129,7 @@ Progress: [███░░░░░░░] 31% (v3.0)
 | Phase 14-umap P02 | 25m | 2 tasks | 2 files |
 | Phase 14 P03 | 120min | 2 tasks | 12 files |
 | Phase 14 P04 | 75 | 3 tasks | 6 files |
+| Phase 14 P05 | 180 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -250,6 +251,9 @@ Recent decisions affecting current work:
 - [Phase ?]: UMAP spectral_layout returns raw symmetric-Laplacian eigenvectors (no /dd, no sign flip); threaded a diffusion_recover flag into shared recover (false=UMAP, true=SE/SC), dump-diff confirmed (14-03)
 - [Phase ?]: Regenerated umap_spectral fixtures with ARPACK tol=1e-12: umap default 1e-4 carried ~4e-5 iterative error, unachievable for exact mlrs Jacobi eig at the 1e-5 gate (14-03)
 - [Phase ?]: umap_layout_step CSR-per-owner GATHER kernel; calibrated property thresholds 0.02/0.05 relative to umap (D-04)
+- [Phase ?]: UMAP transform composes query-vs-train KNN in-estimator (distance+top_k, no self-drop) — no new prim (RESEARCH A2)
+- [Phase ?]: Fitted Umap retains x_train_ for transform's original-feature-space KNN
+- [Phase ?]: TRANSFORM_PROPERTY_EPS=0.15 calibrated separately from fit 0.02 (frozen reduced-context + RNG divergence; worst chebyshev +0.1448)
 
 ### Pending Todos
 
@@ -281,7 +285,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23T15:43:18.108Z
+Last session: 2026-06-23T17:40:54.932Z
 Stopped at: Completed 14-01-PLAN.md
 Resume file: .planning/phases/14-umap/14-CONTEXT.md
 
