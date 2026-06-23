@@ -2,15 +2,18 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
+current_phase: 14
+current_phase_name: umap
 status: executing
 stopped_at: Completed 14-01-PLAN.md
-last_updated: "2026-06-23T11:17:00.000Z"
-last_activity: 2026-06-23 -- Phase 14 execution started
+last_updated: "2026-06-23T14:35:41.865Z"
+last_activity: 2026-06-23
+last_activity_desc: Phase 14 execution started
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 12
-  completed_plans: 9
+  completed_plans: 10
   percent: 40
 ---
 
@@ -26,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 14 (umap) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
 Last activity: 2026-06-23 -- Phase 14 execution started
 Resume: next phase (UMAP — Phase 14) consumes knn_graph
@@ -124,6 +127,7 @@ Progress: [███░░░░░░░] 31% (v3.0)
 | Phase 13 P03 | 7 | 2 tasks | 3 files |
 | Phase 14 P01 | 25 | 3 tasks | 27 files |
 | Phase 14-umap P02 | 25m | 2 tasks | 2 files |
+| Phase 14 P03 | 120min | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -242,6 +246,8 @@ Recent decisions affecting current work:
 - [Phase 05]: [05-01]: Wave-0 scaffold landed file-disjoint. AlgoError is extended IN-PLACE with 6 Phase-5 hyperparameter guards (InvalidK/InvalidEps/InvalidMinSamples/InvalidL1Ratio/InvalidC/NotConverged) in the InvalidAlpha struct-variant style; traits.rs gains PredictLabels (i32 labels, D-05/D-06), KNeighbors ((F dist, i32 idx), D-07), PredictProba (F per-class, D-07). The scaffold OWNS lib.rs + prims/mod.rs + kernels/lib.rs registrations (pub mod for 5 kernels + 5 prims, no pub use until the symbol exists) so plans 02-06 fill exactly one kernel file + one prim file and never touch the shared index — empty doc-comment-only module body is a valid compiling stub. D-06 i32 DeviceArray CONFIRMED by a NON-ignored round-trip test (incl. -1 noise) — zero pool/bridge changes, so no later plan is surprised. gen_oracle.py gained 6 generators: gen_kmeans carries an INJECTED init array (D-09, Lloyd deterministic across numpy/Rust), gen_dbscan tuned eps=0.7/min_samples=4 for cluster+noise(-1)+border, gen_knn is ONE fixture serving NEIGH-01/02/03 with distinct distances (Pitfall 8), gen_lasso has 5 exact-zero coefficients (Pitfall 1), gen_logistic stores the symmetric over-parameterized softmax (multi coef 3×n_features) with predict_proba the PRIMARY gauge-invariant gate (Pitfall 5). 14 fixtures committed (regen needs /tmp venv numpy+scipy+sklearn, PEP 668). 14 #[ignore] oracle stubs (6 prim + 8 estimator) assert load_npz+shape only (NO non-existent symbol) so both test crates compile on cpu+rocm today.
 - [Phase 14]: Umap::Metric mirrors knn_graph::Metric (5 variants, Minkowski{p:f64}); Eq dropped, PartialEq kept
 - [Phase 14]: UMAP oracle fixtures dump umap-learn 0.5.12 OWN internals (f64-only); property thresholds left TODO for Plan 04 calibration
+- [Phase ?]: UMAP spectral_layout returns raw symmetric-Laplacian eigenvectors (no /dd, no sign flip); threaded a diffusion_recover flag into shared recover (false=UMAP, true=SE/SC), dump-diff confirmed (14-03)
+- [Phase ?]: Regenerated umap_spectral fixtures with ARPACK tol=1e-12: umap default 1e-4 carried ~4e-5 iterative error, unachievable for exact mlrs Jacobi eig at the 1e-5 gate (14-03)
 
 ### Pending Todos
 
@@ -273,7 +279,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23T11:16:55.137Z
+Last session: 2026-06-23T14:35:34.119Z
 Stopped at: Completed 14-01-PLAN.md
 Resume file: .planning/phases/14-umap/14-CONTEXT.md
 
