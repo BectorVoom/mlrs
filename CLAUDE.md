@@ -28,6 +28,10 @@ must be right and the backend abstraction must hold.
 - **Memory**: efficiency is first-class — zero-copy, buffer reuse, minimal copies, custom allocator — verified per phase, not deferred
 - **Code structure**: tests separated from source files (project AGENTS.md rule)
 
+### Spike findings
+
+- **Spike findings for mlrs** (KNN-graph prim recipe, cpu-MLIR-safe kernel authoring, landmines) → `Skill("spike-findings-mlrs")`
+
 <!-- GSD:project-end -->
 
 <!-- GSD:stack-start source:codebase/STACK.md -->
