@@ -438,8 +438,17 @@ fn validate_geometry(
             });
         }
     }
-    // u32-overflow guards on the launch geometry (WR-03): n, d, k+1 are cast to
-    // u32 for the kernel launches; reject an overflowing dim BEFORE launch.
+    // u32-overflow guards on the launch geometry: n, d, k+1 are cast to u32 for
+    // the kernel launches; reject an overflowing dim BEFORE launch.
+    //
+    // WR-04: these three guarded dims provably dominate EVERY later `as u32` cast
+    // for supported sizes. The derived launch dims are all bounded by the guarded
+    // set: `launch_dims_2d` ceiling-div `(rows + bx - 1)` over `bx = by = 16`
+    // shrinks `rows = tile <= QUERY_TILE = 8` and `cols = n` (both <= the guarded
+    // `n`); `out_len = tile * n <= QUERY_TILE * n` and `self_drop`'s `n * k1` are
+    // element counts, not launch dims, and are bounded by the guarded `n` and
+    // `k+1`. So with `n`, `d`, `k+1` <= u32::MAX and `tile <= 8`, no derived cast
+    // can wrap. If QUERY_TILE ever grows large, re-derive this domination argument.
     for (operand, dim) in [("x", n), ("x", d), ("k", k + 1)] {
         if dim > u32::MAX as usize {
             return Err(PrimError::ShapeMismatch {
