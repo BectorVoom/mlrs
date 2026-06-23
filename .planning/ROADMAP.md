@@ -100,9 +100,14 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
   3. For **each** metric, indices are set-equal to `sklearn.neighbors.NearestNeighbors` (with the matching `metric`) up to tie-ordering and distances match to ≤1e-5 (f64), with the lowest-index tie-break documented as the mlrs convention.
   4. A build-failing PoolStats memory gate passes at fixture sizes (big distance operand kept global / query-axis tiled; never the full `n×n` resident-and-leaking).
 
-**Plans**: TBD
+**Plans**: 3 plans
+Plans:
+- [ ] 13-01-PLAN.md — Nyquist Wave 0: per-metric sklearn oracle fixtures (incl. duplicate-point design) + knn_graph_test.rs harness (set-equal index, dup-point VALUE assert, geometry-rejection, query-axis memory gate) + kernel/prim module scaffolds
+- [ ] 13-02-PLAN.md — new cpu-MLIR-safe device kernels: manhattan/chebyshev/minkowski direct pairwise distance (STATIC F::powf) + self_drop_gather (index-identity, CUBE_POS_X shape) + launch smoke test
+- [ ] 13-03-PLAN.md — knn_graph<F> prim + Metric enum: validate-before-launch host orchestrator (metric routing, query-axis-tiled distance->top_k->self_drop composition, directed-only) — turns the per-metric oracle + memory gate GREEN (PRIM-11)
 **UI hint**: no
-**Spike flag**: SPIKE BEFORE PLANNING — confirm (a) the composed distance → top_k → dense `[n,k]` path launches under `--features cpu` (directed-only; the symmetrize-map step is removed — symmetrization moved to the UMAP/HDBSCAN consumers), and (b) the **new direct pairwise GATHER distance kernels** for Manhattan/Chebyshev/Minkowski-p launch under cpu-MLIR with no SharedMemory/atomics (Minkowski-p needs in-kernel `pow` — the named cpu-MLIR unknown). Precedent (v2 top_k + GATHER kernels on cpu-MLIR) is favorable but unverified for these new distance kernels.
+**Spike status**: VALIDATED (spikes 001+002, 2026-06-23) — both feasibility unknowns confirmed under --features cpu; planning built on the proven kernel shapes.
+**Spike flag (historical)**: SPIKE BEFORE PLANNING — confirm (a) the composed distance → top_k → dense `[n,k]` path launches under `--features cpu` (directed-only; the symmetrize-map step is removed — symmetrization moved to the UMAP/HDBSCAN consumers), and (b) the **new direct pairwise GATHER distance kernels** for Manhattan/Chebyshev/Minkowski-p launch under cpu-MLIR with no SharedMemory/atomics (Minkowski-p needs in-kernel `pow` — the named cpu-MLIR unknown). Precedent (v2 top_k + GATHER kernels on cpu-MLIR) is favorable but unverified for these new distance kernels.
 
 ### Phase 14: UMAP
 
