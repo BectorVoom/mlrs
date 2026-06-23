@@ -35,7 +35,7 @@
 use std::path::PathBuf;
 
 use mlrs_algos::manifold::umap::{Metric, Umap};
-use mlrs_algos::error::BuildError;
+use mlrs_algos::error::{AlgoError, BuildError};
 use mlrs_algos::typestate::{Fit, Transform};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -381,6 +381,49 @@ fn build_rejects_bad_min_dist() {
             Some(BuildError::InvalidMinDist { min_dist, .. }) if min_dist == 2.0
         ),
         "min_dist > spread must be BuildError::InvalidMinDist, got {bad:?}"
+    );
+}
+
+/// CR-02 / T-14-06-01: the data-DEPENDENT `n_components < n` guard. With the
+/// default `Init::Spectral`, `n_components >= n` would drive
+/// `spectral::recover`'s `col = n - 1 - r` (with `r` up to `n_components`) into
+/// a `usize` underflow → panic (debug) / OOB device read (release). The fit must
+/// instead reject the bad-but-valid-typed input with the typed
+/// `AlgoError::InvalidNComponents { estimator: "umap", .. }` BEFORE any device
+/// launch — NOT a panic. Here `n = 2` rows, `n_components = 2` (so
+/// `n_components >= n`); the guard fires before any KNN / launch, so a tiny
+/// inline host buffer suffices (no fixture needed).
+#[test]
+fn fit_rejects_n_components_ge_n() {
+    if gate_f64("fit_rejects_n_components_ge_n") {
+        return;
+    }
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // n = 2 rows of d = 3 features; n_components = 2 => n_components >= n.
+    let n = 2usize;
+    let d = 3usize;
+    let x_host: Vec<f64> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
+
+    let result = Umap::<f64>::builder()
+        .n_components(2)
+        .n_neighbors(1)
+        .metric(Metric::Euclidean)
+        .random_state(Some(0))
+        .build::<f64>()
+        .expect("builds")
+        .fit(&mut pool, &x_dev, None, (n, d));
+
+    assert!(
+        matches!(
+            result.err(),
+            Some(AlgoError::InvalidNComponents { ref estimator, requested, .. })
+                if *estimator == "umap" && requested == 2
+        ),
+        "n_components >= n must return AlgoError::InvalidNComponents \
+         {{ estimator: \"umap\", requested: 2, .. }} (typed error, NOT a panic)"
     );
 }
 
