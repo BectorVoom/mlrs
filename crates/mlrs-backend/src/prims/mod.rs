@@ -22,6 +22,13 @@ pub mod rng;
 // `Kernel<F>` enum + `kernel_matrix` host-fn signature compile today (geometry
 // validation real; compute path `todo!()` until 08-02).
 pub mod kernel_matrix;
+// Phase-13 KNN-graph primitive (PRIM-11). Wave-1 scaffold plan 13-01 owns this
+// registration; plan 13-03 fills the file body — the `Metric` enum +
+// `knn_graph` host orchestrator composing `distance`/`topk` + the new
+// `mlrs-kernels::distance` direct + self-drop kernels (file-disjoint,
+// single-owner). Empty compiling shell until then; the oracle harness in
+// `tests/knn_graph_test.rs` (plan 13-01) is RED until `Metric`/`knn_graph` land.
+pub mod knn_graph;
 // Phase-9 prim stub (Wave-0 scaffold 09-01 owns this registration; the Wave-1
 // plan 09-02 fills the file body — file-disjoint, parallel-safe). The
 // `laplacian` host-fn signature compiles today (geometry validation real;

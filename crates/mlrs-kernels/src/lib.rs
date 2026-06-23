@@ -6,6 +6,12 @@
 //! runtime is chosen in `mlrs-backend`.
 
 pub mod cholesky;
+// Phase-13 KNN-graph direct distance + self-drop kernels (PRIM-11). Wave-1
+// scaffold plan 13-01 owns this registration; plan 13-02 fills the file body
+// (the direct pairwise feature-loop distance kernels + the per-row self-drop
+// GATHER kernel) and adds its own `pub use distance::{…}` re-export INSIDE that
+// plan's edit — file-disjoint, single-owner. Empty compiling module until then.
+pub mod distance;
 // Phase-5 kernel stubs (Wave-0 scaffold owns these registrations; plans
 // 05-02..06 fill their own file body — file-disjoint, parallel-safe). Each is an
 // empty compiling module until its plan adds the `#[cube]` kernel + a `pub use`
