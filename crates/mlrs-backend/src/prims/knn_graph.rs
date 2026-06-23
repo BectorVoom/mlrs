@@ -130,11 +130,18 @@ where
     // is selected then removed), else exactly k.
     let k_internal = if include_self { k } else { k + 1 };
 
-    // Euclidean and Cosine use the GEMM distance() which returns SQUARED distance;
-    // top_k applies the boundary sqrt only to the returned k values (cheaper than
-    // sqrting the whole block, Pitfall 8 / D-08). The direct L1/L∞/Lp kernels
-    // already emit the TRUE distance, so no boundary sqrt for those.
-    let needs_sqrt = matches!(metric, Metric::Euclidean | Metric::Cosine);
+    // Euclidean uses the GEMM distance() which returns SQUARED distance; top_k
+    // applies the boundary sqrt only to the returned k values (cheaper than
+    // sqrting the whole block, Pitfall 8 / D-08). Cosine also uses GEMM (on
+    // L2-normalised rows) but its TRUE distance is `1 − cos = squared/2` (the
+    // squared-Euclidean of unit vectors is `2(1 − cos)`), NOT the sqrt — so
+    // Cosine selects on the order-preserving squared value (no boundary sqrt) and
+    // the returned distances are halved host-side below. The direct L1/L∞/Lp
+    // kernels already emit the TRUE distance, so no boundary sqrt for those.
+    let needs_sqrt = matches!(metric, Metric::Euclidean);
+    // Cosine post-scale: `1 − cos = ‖x̂ − ŷ‖² / 2`. Applied to the returned k
+    // distances host-side (the indices are unaffected — the scale is monotone).
+    let cosine_halve = matches!(metric, Metric::Cosine);
 
     // Read x to the host ONCE so we can upload each query-row tile as a
     // contiguous device block (the rows are contiguous in row-major x). This is
@@ -186,9 +193,17 @@ where
         // at the correct GLOBAL row offset, then release the tile scratch (the
         // free-list serves the SAME-shape next tile → reuses grow, live conserves).
         let tile_idx: Vec<u32> = tk_idx.to_host(pool);
-        let tile_val: Vec<F> = tk_val.to_host(pool);
+        let mut tile_val: Vec<F> = tk_val.to_host(pool);
         tk_idx.release_into(pool);
         tk_val.release_into(pool);
+        // Cosine: convert the selected squared-Euclidean-of-unit-vectors value
+        // `2(1 − cos)` into the true cosine distance `1 − cos` (halve). Monotone,
+        // so the already-selected indices/order are unchanged.
+        if cosine_halve {
+            for v in tile_val.iter_mut() {
+                *v = f64_to_host::<F>(host_to_f64(*v) * 0.5);
+            }
+        }
         let base = r0 * k_internal;
         let span = tile * k_internal;
         tk_idx_full[base..base + span].copy_from_slice(&tile_idx[..span]);
