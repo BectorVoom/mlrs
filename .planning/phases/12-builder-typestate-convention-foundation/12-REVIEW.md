@@ -2,7 +2,7 @@
 phase: 12-builder-typestate-convention-foundation
 reviewed: 2026-06-23T00:00:00Z
 depth: standard
-files_reviewed: 20
+files_reviewed: 22
 files_reviewed_list:
   - crates/mlrs-algos/Cargo.toml
   - crates/mlrs-algos/src/cluster/hdbscan.rs
@@ -16,7 +16,9 @@ files_reviewed_list:
   - crates/mlrs-algos/tests/hdbscan_test.rs
   - crates/mlrs-algos/tests/typestate_test.rs
   - crates/mlrs-algos/tests/ui/predict_before_fit.rs
+  - crates/mlrs-algos/tests/ui/predict_before_fit.stderr
   - crates/mlrs-algos/tests/ui/transform_before_fit.rs
+  - crates/mlrs-algos/tests/ui/transform_before_fit.stderr
   - crates/mlrs-algos/tests/umap_test.rs
   - crates/mlrs-py/src/dispatch.rs
   - crates/mlrs-py/src/estimators/cluster.rs
@@ -26,204 +28,193 @@ files_reviewed_list:
   - crates/mlrs-py/tests/manifold_test.rs
 findings:
   critical: 0
-  warning: 4
+  warning: 5
   info: 5
-  total: 9
+  total: 10
 status: issues_found
 ---
 
 # Phase 12: Code Review Report
 
-**Reviewed:** 2026-06-23
+**Reviewed:** 2026-06-23T00:00:00Z
 **Depth:** standard
-**Files Reviewed:** 20
+**Files Reviewed:** 22
 **Status:** issues_found
 
 ## Summary
 
-Phase 12 introduces the v3 typestate/builder convention foundation: a sealed `State`
-marker trait with `Unfit`/`Fitted` markers, four consuming-`self` lifecycle traits,
-two non-algorithmic estimator shells (UMAP, HDBSCAN), a second additive dispatch
-macro (`any_estimator_typestate!`), and the first two PyO3 shells over typestate
-estimators. The phase invariants were respected during review: the trivial fits
-(zeros embedding / all `-1` labels) are NOT flagged as missing algorithm; the frozen
-`traits::*` surface and the additive `any_estimator_typestate!` clone are accepted as
-intentional; cfg-gated no-feature diagnostics are treated as false positives.
+This phase delivers the v3 builder + typestate convention foundation: a sealed
+`State` marker trait with `Unfit`/`Fitted` markers, a consuming-`self` typestate
+`Fit`/`Predict`/`Transform`/`PartialFit` surface, two non-algorithmic estimator
+SHELLS (`Umap`, `Hdbscan`) that demonstrate the convention end-to-end, a
+`trybuild` compile-fail gate, and the two PyO3 wrappers (`PyUMAP`, `PyHDBSCAN`)
+plus a second `any_estimator_typestate!` dispatch macro.
 
-The typestate machinery itself is sound — the sealing is correct, the markers are
-zero-sized, and the compile-fail gate proves the `Unfit` value/trait gate. No
-Critical defects were found. The findings below are robustness and consistency
-defects: a hyperparameter-validation gap in `UmapBuilder::build` (`spread` is never
-validated, so NaN/negative `spread` slips through and disables the `min_dist`
-check), a misleading not-fitted error on the wrong-dtype embedding accessor (a
-purpose-built `dtype_mismatch` helper exists but is bypassed), and the new Phase-12
-HDBSCAN PyO3 fit path sharing a file with legacy KMeans/DBSCAN wrappers that use the
-non-poison-recovering lock path the module doc explicitly deprecates.
+The typestate design is sound and the compile-fail gate is well-reasoned. No
+BLOCKER-class correctness or security defects were found: the shells are
+deliberately non-algorithmic, the device-side data-dependent geometry guards are
+present, the f64 capability guard runs before the f64 upload on both Py wrappers,
+and a `rows`/`cols` mismatch from Python is caught as a typed `ShapeMismatch`
+rather than panicking in `DeviceArray::from_host`.
+
+The findings below are robustness and consistency gaps that will become live
+bugs (not just shell quirks) when Phases 14/15 fill in the real algorithms, plus
+an inconsistency in the mutex-lock convention in a file this phase edited.
+
+## Narrative Findings (AI reviewer)
 
 ## Warnings
 
-### WR-01: `UmapBuilder::build` never validates `spread`; NaN/negative `spread` defeats the `min_dist` guard
+### WR-01: `n_components == 0` is accepted, producing a silently-empty embedding
 
-**File:** `crates/mlrs-algos/src/manifold/umap.rs:326-331`
-**Issue:** The only build-time guard is
-`if !self.min_dist.is_finite() || self.min_dist > self.spread`. `spread` is the
-right-hand operand of the comparison but is itself never validated:
-- If `spread` is `NaN`, `self.min_dist > self.spread` is `false` (all comparisons
-  with NaN are false), so any finite `min_dist` passes and a `NaN` `spread` is
-  stored. The doc comment for `InvalidMinDist` ("must be finite and `<= spread`")
-  is silently violated — a NaN `spread` makes the relation meaningless.
-- If `spread` is negative (e.g. `-1.0`) with a negative `min_dist <= spread`, the
-  pair is accepted, even though `spread` is "the effective scale of embedded
-  points" and must be positive (umap-learn requires `spread > 0`).
-
-In Phase 14 the real curve-fit derives `a`/`b` from `min_dist`/`spread`; a NaN or
-non-positive `spread` admitted here will surface much later as a NaN embedding far
-from its origin. The validate-before-fit contract (D-08) is meant to reject
-untrusted hyperparameters at the boundary, and `spread` is one.
-**Fix:**
+**File:** `crates/mlrs-algos/src/manifold/umap.rs:322-352` (build), `:366-411` (fit), `:443-460` (transform)
+**Issue:** `UmapBuilder::build` validates only `min_dist` (finite and `<= spread`).
+It never rejects `n_components == 0`. With `n_components = 0`, `fit` allocates
+`vec![F::from_int(0i64); n * 0]` = an empty buffer, `embedding()` returns an
+empty `Vec`, and `transform` likewise returns an empty buffer — all without
+error. sklearn/umap-learn require `n_components >= 1`. This is data-independent
+hyperparameter validation that the D-08 split places at `build()`, so it should
+be rejected there rather than silently producing a degenerate empty result that
+the Phase-14 algorithm must special-case. The same gap exists for
+`n_neighbors == 0`, also undefined in umap-learn.
+**Fix:** Add a guard in `UmapBuilder::build` before the `Ok(...)`:
 ```rust
-if !self.spread.is_finite() || self.spread <= 0.0 {
-    return Err(BuildError::InvalidSpread {
+if self.n_components == 0 {
+    return Err(BuildError::InvalidNComponents {  // or a new BuildError variant
         estimator: "umap",
-        spread: self.spread,
-    });
-}
-if !self.min_dist.is_finite() || self.min_dist > self.spread {
-    return Err(BuildError::InvalidMinDist {
-        estimator: "umap",
-        min_dist: self.min_dist,
+        n_components: self.n_components,
     });
 }
 ```
-(Add an `InvalidSpread` variant to `BuildError`, or fold it into `InvalidMinDist`'s
-message; the blanket `build_err_to_py` mapper already covers any new variant.) At
-minimum, guard `self.spread.is_finite()` so the NaN-defeats-the-check path is closed.
+At minimum enforce `n_components >= 1`; consider `n_neighbors >= 1` too.
 
-### WR-02: Wrong-dtype embedding accessor reports "not fitted" instead of a dtype mismatch
+### WR-02: `Transform::transform` for `Umap<F, Fitted>` ignores fitted `n_features_in_`
 
-**File:** `crates/mlrs-py/src/estimators/manifold.rs:118-132` (and `:275-281`)
-**Issue:** `embedding_f32_inner` returns `not_fitted("umap", "embedding_ (f32)")`
-for ANY non-`F32` arm — including the `F64` arm, i.e. an estimator that IS fitted
-but in the other dtype. The codebase already documents this exact hazard and ships
-a purpose-built helper for it: `crate::errors::dtype_mismatch` (errors.rs:90-99,
-"surfacing a `not_fitted` 'called before fit' error would mislead a Python user who
-fitted in `fitted_dtype` and called the `requested_dtype` accessor", WR-04). The new
-UMAP shell regresses on that decision: a user who fits f64 and reads `embedding_f32`
-gets "not fitted yet: call fit before embedding_ (f32)", which is false — the
-estimator is fitted. Same defect on `embedding_f64_inner` for the `F32` arm.
-**Fix:** Distinguish the fitted-but-wrong-dtype case from the genuinely-unfit case,
-mirroring the WR-04 helper:
+**File:** `crates/mlrs-algos/src/manifold/umap.rs:443-460`; trait doc `crates/mlrs-algos/src/typestate.rs:126-127,143-144`
+**Issue:** The `Transform` trait doc explicitly states transform "Errors if the
+geometry disagrees with the fitted `n_features`." The shell impl validates only
+`n == 0 || p == 0 || x.len() != n * p` — it never compares the incoming `p`
+against the fitted `self.n_features_in_`. A caller that fitted on `p=3` and
+transforms a `p=5` matrix gets a silently-wrong all-zeros `(rows, n_components)`
+buffer instead of the documented error. The `n_features_in_` field is stored
+specifically to enable this check but is unused in `transform`. When Phase 14
+fills in the real projection, this missing guard becomes an out-of-contract
+device read against the fitted components.
+**Fix:** Add the feature-count check the trait documents:
 ```rust
-fn embedding_f32_inner(&self) -> PyResult<Vec<f32>> {
-    let pool = crate::lock_pool();
-    match &self.inner {
-        AnyUmap::F32(e) => Ok(e.embedding(&pool)),
-        AnyUmap::F64(_) => Err(dtype_mismatch("umap", "f32", "f64")),
-        AnyUmap::Unfit { .. } => Err(not_fitted("umap", "embedding_ (f32)")),
-    }
+let (n, p) = shape;
+if p != self.n_features_in_ {
+    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+        operand: "x", rows: n, cols: p, len: x.len(),
+    }));
+    // or a dedicated AlgoError naming the fitted-vs-supplied feature mismatch
 }
 ```
-(import `dtype_mismatch` from `crate::errors`). Apply symmetrically to the f64 path.
 
-### WR-03: Phase-12 HDBSCAN wrapper shares a file with KMeans/DBSCAN bodies still on the deprecated panicking lock path
+### WR-03: New `PyHDBSCAN` uses the sanctioned `lock_pool`, but `PyKMeans`/`PyDBSCAN` in the same edited file still use the panicking lock form
 
-**File:** `crates/mlrs-py/src/estimators/cluster.rs:87, 112, 128, 135, 143, 223, 246, 255`
-**Issue:** `lib.rs:108-118` declares `lock_pool` the SANCTIONED lock path and warns
-that "one surviving `global_pool().lock().expect(\"pool mutex\")` re-panics on a
-poisoned mutex and re-bricks the interpreter, making the brick-prevention only
-partial." The new `PyHDBSCAN` body (added this phase) correctly uses `lock_pool()`,
-but it was added into `cluster.rs` alongside `PyKMeans`/`PyDBSCAN`, both of which
-still call `crate::global_pool().lock().expect("pool mutex")` directly. The result
-is a single source file where one estimator is poison-safe and two are not. The
-module doc frames the legacy form as "a pre-existing, tracked migration," so this is
-acknowledged rather than newly introduced — but Phase 12 touched this file and is
-the natural point to migrate the two siblings, especially given HDBSCAN's poison
-recovery is only effective if every lock site in the process participates.
-**Fix:** Convert the eight `global_pool().lock().expect("pool mutex")` sites in
-`PyKMeans`/`PyDBSCAN` to `crate::lock_pool()`, matching the `PyHDBSCAN`/`PyUMAP`
-bodies, or file an explicit follow-up so the partial-recovery gap is not lost.
+**File:** `crates/mlrs-py/src/estimators/cluster.rs:87,112,128,135,143,223,246,255` (panicking) vs `:360,429` (sanctioned)
+**Issue:** `crates/mlrs-py/src/lib.rs:96-157` documents `lock_pool()` as the
+SANCTIONED, poison-recovering lock path and states explicitly that "one
+surviving `global_pool().lock().expect(...)` re-panics on a poisoned mutex and
+re-bricks the interpreter, making the brick-prevention only partial." This phase
+added `PyHDBSCAN` to `cluster.rs` using `lock_pool()` correctly, but left every
+`KMeans`/`DBSCAN` lock site in the same file on the panicking
+`global_pool().lock().expect("pool mutex")` form. The result is an inconsistent
+failure mode within one file: a panic in `PyKMeans::fit` poisons the global
+mutex; `PyHDBSCAN::labels_` then recovers via `lock_pool`, but `PyKMeans`'s own
+later calls re-panic. `lib.rs` calls the legacy `cluster` wrappers a
+"pre-existing, tracked migration," but the recovery is only sound if every site
+participates, and this phase touched the file without resolving the mix.
+**Fix:** Convert the `cluster.rs` lock sites to `crate::lock_pool()` so the file
+this phase edited does not mix the two forms; or record an explicit tracking
+issue and reference it at each remaining panicking site.
 
-### WR-04: `UmapBuilder` / `HdbscanBuilder` derive `Copy` but expose owned-`self` chained setters — silent setter-result drops compile
+### WR-04: HDBSCAN leaves `min_samples`/`max_cluster_size` unvalidated with no tracked follow-up
 
-**File:** `crates/mlrs-algos/src/manifold/umap.rs:210` and `crates/mlrs-algos/src/cluster/hdbscan.rs:183`
-**Issue:** Both builders are `#[derive(Debug, Clone, Copy)]` and use the
-owned-`self` "consuming" setter style (`pub fn n_neighbors(mut self, v) -> Self`).
-Because the builder is `Copy`, a misuse like `let b = Umap::builder(); b.min_dist(0.5); b.build::<f32>()` compiles WITHOUT a moved-value error (the setter receives a
-copy, mutates it, and the result is dropped), silently discarding `min_dist(0.5)`.
-The consuming-setter idiom relies on `!Copy` to make "ignored builder result" a
-move-after-use error and force `let b = b.min_dist(0.5)`. With `Copy` derived that
-safety net is gone. (The fluent one-liner form used in the PyO3 wrappers is correct;
-the risk is for downstream Rust callers using the builder across statements.)
-**Fix:** Drop `Copy` from both builder derives (keep `Clone`):
-```rust
-#[derive(Debug, Clone)]
-pub struct UmapBuilder { /* ... */ }
-```
-This makes a dropped-setter-result a compile error, restoring the guarantee the
-consuming-setter convention is supposed to provide.
+**File:** `crates/mlrs-algos/src/cluster/hdbscan.rs:250-274` (build), `:288-325` (fit)
+**Issue:** `HdbscanBuilder::build` guards only `min_cluster_size >= 2`.
+`min_samples` is "stored verbatim and is NOT validated," and `max_cluster_size`
+is unbounded. For a Phase-12 shell this is acceptable, but `min_samples = Some(0)`
+and a `max_cluster_size` smaller than `min_cluster_size` are both geometrically
+meaningless and will flow silently into Phase 15, which reaches a real device
+kernel. `AlgoError::InvalidMinSamples` already exists in `error.rs:119-131` as
+the precedent for the `>= 1` guard, so the validation pattern is established but
+not applied here. The risk is that the deferred validation is forgotten when the
+real compute lands.
+**Fix:** When Phase 15 lands, extend `build()` with `min_samples >= 1` (when
+`Some`) and a `max_cluster_size == 0 || max_cluster_size >= min_cluster_size`
+check. Track explicitly (e.g. a `// TODO(phase-15): validate min_samples/
+max_cluster_size` at the build guard) so it is not lost.
+
+### WR-05: `predict_before_fit.stderr` golden is brittle and elides `Unfit` on its primary diagnostic line
+
+**File:** `crates/mlrs-algos/tests/ui/predict_before_fit.stderr:5,10`; harness `crates/mlrs-algos/tests/compile_fail.rs:26-34`
+**Issue:** The golden renders the found type as `Umap<f32>` on line 5 (the
+defaulted `S = Unfit` elided) and only the "found struct" note on line 10 shows
+`Umap<f32, Unfit>`. The stated VALUE gate is "non-compilation that references the
+`Unfit` state." Two problems: (1) the golden was generated against rustc 1.96.0
+while the toolchain pins `channel = "stable"` (a moving target), so a stable
+bump can fail the exact-match golden on wording rather than on a real regression;
+(2) because the primary line already elides `Unfit`, a future rustc that also
+elided it from the note would let the test pass while no longer naming `Unfit`
+at all, silently weakening the gate. `transform_before_fit.rs` (the `E0277`
+trait-bound form) is more robust because it prints `Unfit` verbatim.
+**Fix:** Prefer the `E0277` trait-bound assertion style (as in
+`transform_before_fit.rs`) for both fixtures so the diagnostic always names the
+`Unfit` argument, or pin an exact toolchain for the `compile_fail` job so the
+golden cannot be silently invalidated by stable drift.
 
 ## Info
 
-### IN-01: `_state_phantom` is dead code with no caller in-tree
+### IN-01: UMAP and HDBSCAN shells diverge in method order and doc text
+
+**File:** `crates/mlrs-algos/src/cluster/hdbscan.rs:145-168` vs `crates/mlrs-algos/src/manifold/umap.rs:150-194`
+**Issue:** UMAP orders `hyperparams_eq` before `into_builder`; HDBSCAN reverses
+it, and HDBSCAN's `into_builder` doc drops UMAP's "available to callers who want
+to tweak a constructed estimator before fitting" sentence. The two shells are
+the copyable template for Phase 14/15, so the drift invites inconsistency.
+**Fix:** Align method order and doc wording between the two shells.
+
+### IN-02: Single-variant `Metric` enum with a write-only stored field
+
+**File:** `crates/mlrs-algos/src/cluster/hdbscan.rs:49-53`, `crates/mlrs-algos/src/manifold/umap.rs:44-48`; parse sites `crates/mlrs-py/src/estimators/cluster.rs:299-306`, `manifold.rs:51-58`
+**Issue:** `Metric` has exactly one variant (`Euclidean`); the stored `metric`
+field is verbatim-stored but ignored by the trivial fit. Intentional shell
+scaffolding, but the field is currently write-only and a linter may flag it.
+**Fix:** No action for the shell; confirm Phase 14/15 consumes `metric`.
+
+### IN-03: Duplicated geometry-guard block across `fit` and `transform`
+
+**File:** `crates/mlrs-algos/src/manifold/umap.rs:378-385,450-457`, `crates/mlrs-algos/src/cluster/hdbscan.rs:299-306`
+**Issue:** The `n == 0 || p == 0 || x.len() != n * p` guard plus the
+`AlgoError::Prim(PrimError::ShapeMismatch { ... })` construction is copy-pasted
+three times verbatim. A shared helper would remove the duplication and keep the
+sites in sync — relevant given WR-02, where one of the three needs an extra check.
+**Fix:** Extract a crate-private `validate_geometry(x, shape)` helper and call it
+from each `fit`/`transform`.
+
+### IN-04: `_state_phantom` helper is exported (doc-hidden) but unused
 
 **File:** `crates/mlrs-algos/src/typestate.rs:191-194`
-**Issue:** The `#[doc(hidden)] pub fn _state_phantom<S: State>()` helper has no
-caller anywhere in the phase (the shells construct `PhantomData` inline). It is
-documented as "a zero-cost helper for downstream estimator authors (Plan 02)," but
-Plan 02 (UMAP/HDBSCAN) does not use it. It is harmless (zero codegen) but is
-unexercised public API surface.
-**Fix:** Remove it, or add a test that invokes it so its `State`-composability claim
-is actually verified, or downgrade it to a doctest example.
+**Issue:** `_state_phantom<S: State>()` is a `pub fn` described as a downstream
+helper, but no code in the phase calls it — the shells build `PhantomData`
+directly. Harmless dead surface area today.
+**Fix:** Drop it until a consumer exists, or add a one-line test that invokes it
+so it stays compiled-exercised.
 
-### IN-02: `PartialFit` trait is defined-but-unused with no compile-level exercise
+### IN-05: Two near-identical dispatch macros kept in lockstep only by prose
 
-**File:** `crates/mlrs-algos/src/typestate.rs:165-185`
-**Issue:** `PartialFit` is intentionally unimplemented in Phase 12 (Phase-16
-retrofit target, documented). However nothing in the test suite even names it, so a
-future signature drift (e.g. a wrong associated-type bound) would not surface until
-Phase 16. `typestate_test.rs` exercises `State`/`Unfit`/`Fitted` but not the four
-lifecycle traits.
-**Fix:** Add a trivial `assert_impl`-style compile probe, or a doc example, that
-references `PartialFit`'s signature so the frozen contract is regression-guarded
-before Phase 16 consumes it.
-
-### IN-03: `Predict`/`Transform` doc comments promise an `n_features` geometry check the shells do not perform
-
-**File:** `crates/mlrs-algos/src/typestate.rs:126-127, 143-144` and `crates/mlrs-algos/src/manifold/umap.rs:443-460`
-**Issue:** The trait docs state `predict`/`transform` "Errors if the geometry
-disagrees with the fitted `n_features`." The UMAP `Transform` shell validates only
-`n == 0 || p == 0 || x.len() != n*p` and ignores the fitted `n_features_in_`, so a
-caller can `transform` a matrix whose `p != n_features_in_` and get zeros back with
-no error. This is acceptable for the non-algorithmic shell, but the trait-level doc
-asserts a guarantee the only implementation does not honor, which will mislead
-Phase-14 implementers.
-**Fix:** Either soften the trait doc to "implementations SHOULD validate against the
-fitted `n_features`," or add the `p != self.n_features_in_` check to the shell so the
-documented contract holds from the start.
-
-### IN-04: Repeated geometry-guard block duplicated across three fit/transform bodies
-
-**File:** `crates/mlrs-algos/src/cluster/hdbscan.rs:299-306`, `crates/mlrs-algos/src/manifold/umap.rs:378-385`, `crates/mlrs-algos/src/manifold/umap.rs:450-457`
-**Issue:** The identical `if n == 0 || p == 0 || x.len() != n * p { return Err(AlgoError::Prim(PrimError::ShapeMismatch { operand: "x", rows: n, cols: p, len: x.len() })); }` block appears verbatim three times. As more typestate
-estimators land (the convention is meant to be copied), this stanza will proliferate.
-**Fix:** Extract a small crate-internal helper, e.g.
-`fn check_xy_geometry(x_len: usize, shape: (usize, usize)) -> Result<(), AlgoError>`,
-and call it from each body so the geometry contract has one definition.
-
-### IN-05: `Metric` enum is duplicated between `manifold::umap` and `cluster::hdbscan` with single identical variant
-
-**File:** `crates/mlrs-algos/src/manifold/umap.rs:44-48` and `crates/mlrs-algos/src/cluster/hdbscan.rs:49-53`
-**Issue:** Both modules define `pub enum Metric { Euclidean }` independently, and the
-two PyO3 parsers (`parse_metric`, `parse_hdbscan_metric`) are near-identical. This is
-acceptable per-estimator decoupling for now, but with only one variant each it is
-pure duplication that the two string parsers must each track. Noting for the Phase
-14/15 expansion where the metric sets diverge — at that point the divergence
-justifies the split; today it does not.
-**Fix:** No action required for Phase 12; revisit when the metric sets actually
-diverge. If they are expected to stay aligned, consider a shared `metric` module.
+**File:** `crates/mlrs-py/src/dispatch.rs:90-115,150-178`
+**Issue:** `any_estimator!` and `any_estimator_typestate!` are identical except
+for the two fitted-arm type spellings. The doc explains why a second macro
+exists rather than parameterizing, but the bodies must be kept in sync by hand
+for any future field/derive change. Low risk while both are skeleton-only.
+**Fix:** Consider a single macro with an optional `state:` token, or add a
+cross-link comment at both sites.
 
 ---
 
-_Reviewed: 2026-06-23_
+_Reviewed: 2026-06-23T00:00:00Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
