@@ -4,7 +4,7 @@ milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 14
 current_phase_name: umap
-status: verifying
+status: gaps_found
 stopped_at: Completed 14-01-PLAN.md
 last_updated: "2026-06-23T17:41:29.880Z"
 last_activity: 2026-06-23
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 14 (umap) — EXECUTING
-Plan: 5 of 5
-Status: Phase complete — ready for verification
-Last activity: 2026-06-23 -- Phase 14 execution started
-Resume: next phase (UMAP — Phase 14) consumes knn_graph
+Phase: 14 (umap) — GAPS FOUND (verification)
+Plan: 5 of 5 executed
+Status: Verification gaps_found — CR-01 parallel-backend kernel write race + CR-02 missing n_components<n guard (CR-03 force double-count). Phase NOT complete.
+Last activity: 2026-06-24 -- Phase 14 verified: 4/4 criteria pass on cpu-MLIR, but criterion-3 "any backend" intent unmet
+Resume: /gsd-plan-phase 14 --gaps  (then /gsd-execute-phase 14 --gaps-only)
 
 Progress: [███░░░░░░░] 31% (v3.0)
 
