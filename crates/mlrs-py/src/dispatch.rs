@@ -113,3 +113,66 @@ macro_rules! any_estimator {
         // (GIL release, f64 guard) documented at the module level above.
     };
 }
+
+/// Generate the per-estimator dtype-dispatch enum for one TYPESTATE `mlrs_algos`
+/// estimator (D-04 / Plan 04) — the byte-for-byte clone of [`any_estimator!`]
+/// whose fitted arms spell the lifecycle state argument EXPLICITLY as
+/// `<f32, mlrs_algos::typestate::Fitted>` / `<f64, mlrs_algos::typestate::Fitted>`.
+///
+/// This SECOND macro exists (rather than editing the shared [`any_estimator!`])
+/// because the v3 estimators (`Umap<F, S = Unfit>` / `Hdbscan<F, S = Unfit>`)
+/// default their state type parameter to `Unfit`: a bare `$algo<f32>` in the
+/// `F32` arm would resolve to the WRONG `Umap<f32, Unfit>` monomorphization
+/// (RESEARCH § Pitfall 2), not the `Fitted` sibling the consuming `fit` returns.
+/// The 35 existing (no-`S`) call sites keep using the unchanged [`any_estimator!`]
+/// (Success Criterion 3, BLDR-04); the new typestate shells use this one.
+///
+/// Same matcher + same `Unfit { .. }` arm as [`any_estimator!`]; ONLY the two
+/// fitted arms differ. Invocation shape (Plan 04):
+///
+/// ```ignore
+/// any_estimator_typestate! {
+///     any:   AnyUmap,
+///     algo:  mlrs_algos::manifold::umap::Umap,
+///     unfit: { n_neighbors: usize, n_components: usize, /* … */ },
+/// }
+/// ```
+///
+/// emits:
+///
+/// ```ignore
+/// enum AnyUmap {
+///     Unfit { n_neighbors: usize, n_components: usize, /* … */ },
+///     F32(mlrs_algos::manifold::umap::Umap<f32, mlrs_algos::typestate::Fitted>),
+///     F64(mlrs_algos::manifold::umap::Umap<f64, mlrs_algos::typestate::Fitted>),
+/// }
+/// ```
+#[macro_export]
+macro_rules! any_estimator_typestate {
+    (
+        any:   $any:ident,
+        algo:  $algo:ident $( :: $algo_rest:ident )*,
+        unfit: { $( $field:ident : $ty:ty ),* $(,)? } $(,)?
+    ) => {
+        /// Internal dtype-dispatch enum (D-06) for a TYPESTATE estimator: an unfit
+        /// state holding the sklearn-named hyperparameters, plus the two fitted
+        /// monomorphizations tagged `Fitted` explicitly (D-04).
+        enum $any {
+            /// Constructed-but-unfit: the verbatim hyperparameters the matching
+            /// `Estimator<F, Fitted>` arm is built from at `fit`.
+            Unfit { $( $field : $ty ),* },
+            /// Fitted f32 monomorphization (`Fitted` state spelled explicitly).
+            F32($algo $( :: $algo_rest )* <f32, mlrs_algos::typestate::Fitted>),
+            /// Fitted f64 monomorphization (`Fitted` state spelled explicitly).
+            F64($algo $( :: $algo_rest )* <f64, mlrs_algos::typestate::Fitted>),
+        }
+        // NOTE (Plan 04): the `#[pymethods] impl PyEstimator { fn fit(...) {...} }`
+        // block — with `float_dtype` dispatch, `guard_f64()?` on the F64 arm, and
+        // the `py.detach(|| { crate::lock_pool()... })` device call (the
+        // poison-recovering sanctioned lock path, WR-04) — extends this enum,
+        // hand-written per shell. The consuming `fit` form is STRICTLY simpler
+        // than the `any_estimator!` `&mut self` form: it builds the `Unfit`
+        // estimator, calls the consuming `typestate::Fit::fit` returning the
+        // `Fitted`-tagged sibling, and stores it in the `F32`/`F64` arm.
+    };
+}
