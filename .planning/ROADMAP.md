@@ -53,7 +53,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 **Milestone Goal:** Add UMAP + HDBSCAN on a shared KNN-graph primitive, and establish + retrofit a Rust-native builder/typestate API across the full estimator surface, plus extend the pure-Python sklearn shim.
 
 - [x] **Phase 12: Builder + Typestate Convention Foundation** — Establish the shared idiomatic Rust builder + fit/unfit typestate convention (born-with-it for the new estimators; no retrofit yet) (4/4 plans) — completed 2026-06-23
-- [ ] **Phase 13: KNN-Graph Primitive (feasibility keystone)** — Land + standalone-gate the shared `(indices, distances)` KNN-graph prim before any consumer touches it
+- [ ] **Phase 13: KNN-Graph Primitive (feasibility keystone)** — Land + standalone-gate the shared multi-metric `(indices, distances)` KNN-graph prim (euclidean/manhattan/cosine/chebyshev/minkowski-p) before any consumer touches it
 - [ ] **Phase 14: UMAP** — Fuzzy simplicial set → spectral/random init → vertex-owner SGD layout; deterministic stages value-gated, stochastic layout property-gated
 - [ ] **Phase 15: HDBSCAN** — Device front-end (core/mutual-reach) + host tree back-end (MST → condensed tree → stability); exact-label hard gate
 - [ ] **Phase 16: Builder Retrofit Sweep + Shim Coverage** — Retrofit the convention across all existing estimators (additive) and complete the pure-Python sklearn shim coverage
@@ -90,19 +90,19 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 
 ### Phase 13: KNN-Graph Primitive (feasibility keystone)
 
-**Goal**: Land the single shared KNN-graph primitive — ascending-ordered k-nearest-neighbor indices `(n, k)` + distances `(n, k)` over the v1 distance prim, with a self-inclusion parameter — composed cpu-MLIR-safe from the launch-proven distance → top-k GATHER path (no SharedMemory/atomics/heap kernel), and standalone-validate it BEFORE UMAP or HDBSCAN consume it (primitive-first discipline). This is the milestone's feasibility keystone.
-**Depends on**: Phase 12 (born builder-fronted convention is established; the prim itself reuses v1 distance + top-k)
+**Goal**: Land the single shared KNN-graph primitive — ascending-ordered k-nearest-neighbor indices `(n, k)` + distances `(n, k)` over a **multi-metric** distance layer (Euclidean, Manhattan/L1, Cosine, Chebyshev/L∞, Minkowski-p), with a self-inclusion parameter — exposed as a new standalone `mlrs-backend` prim fn composed cpu-MLIR-safe from the launch-proven distance → top-k GATHER path (no SharedMemory/atomics/heap kernel), and standalone-validate it (per metric) BEFORE UMAP or HDBSCAN consume it (primitive-first discipline). Euclidean/Cosine reuse the v1 GEMM-expansion (Cosine on L2-normalized rows); Manhattan/Chebyshev/Minkowski-p add new direct pairwise GATHER distance kernels. Emits the **directed** `(indices, distances)` graph only (symmetrization deferred to the consumers). This is the milestone's feasibility keystone.
+**Depends on**: Phase 12 (born builder-fronted convention is established; the prim itself reuses v1 distance + top-k, plus new direct-distance kernels)
 **Requirements**: PRIM-11
 **Success Criteria** (what must be TRUE):
 
-  1. The KNN-graph prim returns ascending-ordered neighbor indices `(n, k)` and distances `(n, k)`, with a self-inclusion parameter (UMAP self-excluded via k+1/self-drop; HDBSCAN self-counted core distances), composed from distance → top-k GATHER with no new heap kernel.
-  2. The prim launches under `--features cpu` (verified at launch, not just compile) with no `Atomic`/`SharedMemory`/`F::INFINITY`/mutable-bool/shift-loop, and on rocm f32.
-  3. Indices are set-equal to `sklearn.neighbors.NearestNeighbors` up to tie-ordering and distances match to ≤1e-5 (f64), with the lowest-index tie-break documented as the mlrs convention.
+  1. The KNN-graph prim (a new `mlrs-backend` prim fn) returns ascending-ordered neighbor indices `(n, k)` and distances `(n, k)`, with a `metric` parameter (Euclidean, Manhattan, Cosine, Chebyshev, Minkowski-p) and a self-inclusion parameter (UMAP self-excluded via k+1/self-drop-by-index-identity; HDBSCAN self-counted core distances), composed from distance → top-k GATHER with no new heap kernel. Output is the **directed** graph only; symmetrization is each consumer's job.
+  2. The prim launches under `--features cpu` (verified at launch, not just compile) with no `Atomic`/`SharedMemory`/`F::INFINITY`/mutable-bool/shift-loop — for **every** metric, including the new direct Manhattan/Chebyshev/Minkowski-p kernels — and on rocm f32.
+  3. For **each** metric, indices are set-equal to `sklearn.neighbors.NearestNeighbors` (with the matching `metric`) up to tie-ordering and distances match to ≤1e-5 (f64), with the lowest-index tie-break documented as the mlrs convention.
   4. A build-failing PoolStats memory gate passes at fixture sizes (big distance operand kept global / query-axis tiled; never the full `n×n` resident-and-leaking).
 
 **Plans**: TBD
 **UI hint**: no
-**Spike flag**: SPIKE BEFORE PLANNING — confirm the composed distance → top_k → dense `[n,k]` → symmetrize-map path launches under `--features cpu`; the symmetrize-map step is new (the KNN symmetrize map on cpu-MLIR is the named unknown). Precedent (v2 top_k on cpu-MLIR) is favorable but unverified for this exact composition.
+**Spike flag**: SPIKE BEFORE PLANNING — confirm (a) the composed distance → top_k → dense `[n,k]` path launches under `--features cpu` (directed-only; the symmetrize-map step is removed — symmetrization moved to the UMAP/HDBSCAN consumers), and (b) the **new direct pairwise GATHER distance kernels** for Manhattan/Chebyshev/Minkowski-p launch under cpu-MLIR with no SharedMemory/atomics (Minkowski-p needs in-kernel `pow` — the named cpu-MLIR unknown). Precedent (v2 top_k + GATHER kernels on cpu-MLIR) is favorable but unverified for these new distance kernels.
 
 ### Phase 14: UMAP
 

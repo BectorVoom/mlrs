@@ -20,7 +20,7 @@ must be right and the backend abstraction must hold.
 **Goal:** Add the UMAP + HDBSCAN manifold/clustering pair on a shared KNN-graph primitive, and establish a Rust-native builder-pattern API retrofitted across the whole estimator surface.
 
 **Target features:**
-- **KNN-graph primitive** — the shared, feasibility-critical prim (built on v1 `NearestNeighbors`) under the cpu-MLIR no-SharedMemory/no-atomics constraint; consumed by both UMAP and HDBSCAN
+- **KNN-graph primitive** — the shared, feasibility-critical, **multi-metric** prim (built on the v1 distance + top-k path, plus new direct pairwise distance kernels) returning directed `(indices, distances)`; metrics: euclidean, manhattan (L1), cosine, chebyshev (L∞), minkowski-p; under the cpu-MLIR no-SharedMemory/no-atomics constraint; consumed by both UMAP and HDBSCAN
 - **UMAP** — fuzzy simplicial set → SGD-based low-dim layout (oracle: `umap-learn`; stochastic layout → structural/property gate à la RandomProjection D-12, not element-wise 1e-5)
 - **HDBSCAN** — mutual-reachability → MST → condensed cluster tree → stability extraction (oracle: `hdbscan` / `sklearn.cluster.HDBSCAN`; exact labels up to permutation as the hard gate)
 - **Rust-native builder-pattern API** — establish the idiomatic Rust builder convention (typed builder, fit/unfit typestate, error surface) and retrofit all 30 existing estimators plus the new v3 estimators (today's surface is sklearn-mirror, consumed mainly via PyO3)
@@ -63,7 +63,7 @@ must be right and the backend abstraction must hold.
 <!-- Current scope. Building toward these. All are hypotheses until shipped and validated. -->
 
 **v3.0 Manifold Algorithms & Rust-Native API** (scope being detailed in REQUIREMENTS.md)
-- [ ] KNN-graph primitive (shared, cpu-MLIR-safe; built on v1 NearestNeighbors)
+- [ ] KNN-graph primitive (shared, cpu-MLIR-safe, multi-metric: euclidean/manhattan/cosine/chebyshev/minkowski-p; built on v1 distance + top-k + new direct distance kernels)
 - [ ] UMAP (fuzzy simplicial set → SGD layout; `umap-learn` oracle; property gate)
 - [ ] HDBSCAN (mutual-reach → MST → condensed tree → stability; exact-label gate)
 - [ ] Rust-native builder-pattern API convention + retrofit across all 30 existing estimators

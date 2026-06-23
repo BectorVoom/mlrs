@@ -16,7 +16,7 @@ Requirements for the v3.0 milestone. Each maps to a roadmap phase.
 
 ### KNN-Graph Primitive (shared substrate — build & gate FIRST)
 
-- [ ] **PRIM-11**: A shared KNN-graph primitive returns ascending-ordered k-nearest-neighbor indices `(n, k)` and distances `(n, k)` over the v1 distance prim, with a self-inclusion parameter (UMAP self-excluded / HDBSCAN self-counted core distances), built cpu-MLIR-safe by composition (distance → top-k GATHER, no SharedMemory/atomics/heap kernel), standalone-validated exact vs `sklearn.neighbors.NearestNeighbors` (indices set-equal up to tie-ordering; distances ≤1e-5 f64) with a build-failing PoolStats memory gate.
+- [ ] **PRIM-11**: A shared KNN-graph primitive returns ascending-ordered k-nearest-neighbor indices `(n, k)` and distances `(n, k)` over a **multi-metric** distance layer, with a self-inclusion parameter (UMAP self-excluded via k+1/self-drop-by-index-identity / HDBSCAN self-counted core distances). It accepts a `metric` parameter covering **Euclidean, Manhattan (L1), Cosine, Chebyshev (L∞), and parameterized Minkowski-p** — Euclidean reuses the v1 GEMM-expansion fast path, Cosine reuses GEMM on L2-normalized rows, and Manhattan/Chebyshev/Minkowski-p add new direct pairwise GATHER distance kernels. Built cpu-MLIR-safe by composition (distance → top-k GATHER, no SharedMemory/atomics/heap kernel) for **every** metric, standalone-validated **per metric** vs `sklearn.neighbors.NearestNeighbors` with the matching `metric` (indices set-equal up to tie-ordering; distances ≤1e-5 f64; lowest-index tie-break documented as the mlrs convention) with a build-failing PoolStats memory gate. Emits the **directed** `(indices, distances)` graph only — symmetrization is each consumer's responsibility (UMAP fuzzy-set union, HDBSCAN mutual-reachability). Custom/callable metrics remain out of scope.
 
 ### UMAP
 
@@ -67,7 +67,7 @@ Explicitly excluded from v3.0. Documented to prevent scope creep.
 | HDBSCAN `approximate_predict` / `membership_vector` (new-point predict) | Needs persisted prediction-data structures; large surface — defer to v3.x. |
 | HDBSCAN condensed-tree / dendrogram plot objects | Pure-Python inspection surface, no algorithmic value, no oracle. |
 | Approximate / NN-Descent / tree KNN-graph build | Fights cpu-MLIR (no SharedMemory) and the approximation breaks the exact-label HDBSCAN gate. Brute-force exact KNN only. |
-| Custom / callable metrics | No numba on CubeCL; unbounded surface, no oracle. Fixed string metrics (euclidean; optionally manhattan/cosine). |
+| Custom / callable (Python) metrics | No numba on CubeCL; unbounded surface, no oracle. PRIM-11 ships a **fixed** metric set: euclidean, manhattan (L1), cosine, chebyshev (L∞), minkowski-p. |
 | Native sparse KNN-graph path | Densify at ingress for v3. |
 | Live FFI `estimator_checks` re-triage | Needs a maturin+pyarrow host this environment lacks (SHIM-03 covers the static path). |
 | Builder retrofit that rewrites estimator fit bodies | Touching 30 fit paths risks regressing shipped gates; retrofit is an additive front door (BLDR-03). |
