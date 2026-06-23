@@ -904,15 +904,28 @@ fn transform_epoch_driver<F>(
 
 /// Map the estimator's [`Metric`] onto the Phase-13 [`knn_graph::Metric`]
 /// (Pitfall 4 — the enums mirror each other EXACTLY, so the mapping is total and
-/// lossless). Returns `(metric, p)` where `p` is the Minkowski exponent passed to
-/// `knn_graph` (ignored by the non-Minkowski variants).
-fn map_metric(metric: Metric) -> (knn_graph::Metric, f64) {
+/// lossless). The Minkowski exponent travels INSIDE the
+/// [`knn_graph::Metric::Minkowski`] payload, so it is the single source of truth;
+/// the fit call site that needs the scalar `p` for `knn_graph` reads it back via
+/// [`minkowski_p`] (IN-02 — no redundant tuple carriage).
+fn map_metric(metric: Metric) -> knn_graph::Metric {
     match metric {
-        Metric::Euclidean => (knn_graph::Metric::Euclidean, 2.0),
-        Metric::Manhattan => (knn_graph::Metric::Manhattan, 1.0),
-        Metric::Cosine => (knn_graph::Metric::Cosine, 2.0),
-        Metric::Chebyshev => (knn_graph::Metric::Chebyshev, 2.0),
-        Metric::Minkowski { p } => (knn_graph::Metric::Minkowski { p }, p),
+        Metric::Euclidean => knn_graph::Metric::Euclidean,
+        Metric::Manhattan => knn_graph::Metric::Manhattan,
+        Metric::Cosine => knn_graph::Metric::Cosine,
+        Metric::Chebyshev => knn_graph::Metric::Chebyshev,
+        Metric::Minkowski { p } => knn_graph::Metric::Minkowski { p },
+    }
+}
+
+/// The scalar Minkowski exponent `knn_graph` requires as a separate argument,
+/// read back from the enum payload (the single source of truth, IN-02). The
+/// non-Minkowski variants pass the conventional default `2.0`, which `knn_graph`
+/// ignores for those metrics.
+fn minkowski_p(metric: knn_graph::Metric) -> f64 {
+    match metric {
+        knn_graph::Metric::Minkowski { p } => p,
+        _ => 2.0,
     }
 }
 
@@ -960,7 +973,7 @@ fn query_train_knn<F>(
 where
     F: Float + CubeElement + Pod,
 {
-    let (knn_metric, p) = map_metric(metric);
+    let knn_metric = map_metric(metric);
 
     // Euclidean uses GEMM squared distance with a top_k boundary sqrt; Cosine
     // uses GEMM on L2-normalised rows (its returned squared value `2(1−cos)` is
@@ -1030,7 +1043,6 @@ where
             DeviceArray::from_raw(out_handle, out_len)
         }
     };
-    let _ = p; // p flows through the Minkowski enum payload (single source of truth)
     q_dev.release_into(pool);
     t_dev.release_into(pool);
 
@@ -1117,7 +1129,8 @@ where
     let n_components = cfg.n_components;
 
     // --- (1) Directed KNN graph (UMAP path: include_self = false). ---
-    let (knn_metric, p) = map_metric(cfg.metric);
+    let knn_metric = map_metric(cfg.metric);
+    let p = minkowski_p(knn_metric);
     // umap clamps n_neighbors to n-1 (can't have more neighbours than points-1).
     let k = cfg.n_neighbors.min(n.saturating_sub(1)).max(1);
     let (knn_idx_dev, knn_dist_dev) =
