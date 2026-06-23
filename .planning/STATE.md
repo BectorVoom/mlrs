@@ -6,15 +6,15 @@ current_phase: 14
 current_phase_name: umap
 status: gaps_found
 stopped_at: Completed 14-01-PLAN.md
-last_updated: "2026-06-23T17:41:29.880Z"
-last_activity: 2026-06-23
-last_activity_desc: Phase 14 execution started
+last_updated: "2026-06-23T21:11:12.163Z"
+last_activity: 2026-06-24
+last_activity_desc: "Phase 14 verified: 4/4 criteria pass on cpu-MLIR, but criterion-3 "any backend" intent unmet"
 progress:
   total_phases: 5
-  completed_phases: 3
-  total_plans: 12
-  completed_plans: 12
-  percent: 60
+  completed_phases: 2
+  total_plans: 14
+  completed_plans: 13
+  percent: 40
 ---
 
 # Project State
@@ -130,6 +130,7 @@ Progress: [███░░░░░░░] 31% (v3.0)
 | Phase 14 P03 | 120min | 2 tasks | 12 files |
 | Phase 14 P04 | 75 | 3 tasks | 6 files |
 | Phase 14 P05 | 180 | 2 tasks | 4 files |
+| Phase 14 P06 | 3 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -254,6 +255,7 @@ Recent decisions affecting current work:
 - [Phase ?]: UMAP transform composes query-vs-train KNN in-estimator (distance+top_k, no self-drop) — no new prim (RESEARCH A2)
 - [Phase ?]: Fitted Umap retains x_train_ for transform's original-feature-space KNN
 - [Phase ?]: TRANSFORM_PROPERTY_EPS=0.15 calibrated separately from fit 0.02 (frozen reduced-context + RNG divergence; worst chebyshev +0.1448)
+- [Phase ?]: 14-06: Umap::fit guards n_components < n via typed AlgoError::InvalidNComponents before any device launch (mirrors SpectralEmbedding::fit), closing CR-02 recover underflow.
 
 ### Pending Todos
 
@@ -285,7 +287,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23T17:40:54.932Z
+Last session: 2026-06-23T21:10:45.641Z
 Stopped at: Completed 14-01-PLAN.md
 Resume file: .planning/phases/14-umap/14-CONTEXT.md
 

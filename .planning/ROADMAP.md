@@ -129,7 +129,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
   3. UMAP's stochastic SGD layout passes a property/structural gate vs umap-learn 0.5.12 — trustworthiness / kNN-overlap ≥ umap-learn − margin and downstream-ARI within band — NOT coordinate value-match, and the same `random_state` reproduces a byte-identical mlrs embedding across runs.
   4. A user can embed new data via `transform(X_new)` against the fitted fuzzy graph, gated by a property sub-gate on the new points.
 
-**Plans**: 5/5 complete + 2 gap-closure plans (14-06, 14-07)
+**Plans**: 6/7 plans executed
 Plans:
 **Wave 1**
 
@@ -150,7 +150,7 @@ Plans:
 
 **Gap closure** *(from verification gaps_found — CR-01/CR-02/CR-03)*
 
-- [ ] 14-06-PLAN.md — GAP 2 (CR-02): n_components < n guard in Umap::fit (mirror SpectralEmbedding) + typed-error test (UMAP-01, wave 1)
+- [x] 14-06-PLAN.md — GAP 2 (CR-02): n_components < n guard in Umap::fit (mirror SpectralEmbedding) + typed-error test (UMAP-01, wave 1)
 - [ ] 14-07-PLAN.md — GAP 1 (CR-01+CR-03): owner-only move_other=0 fit launch (kills cross-cube race + edge double-count) + scheduling-order determinism test + property-gate recalibration (UMAP-03, wave 2, depends 14-06)
 
 **UI hint**: no
@@ -207,6 +207,6 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 11. Naive Bayes | v2.0 | 5/5 | Complete | 2026-06-22 |
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
-| 14. UMAP | v3.0 | 5/5 | Complete   | 2026-06-23 |
+| 14. UMAP | v3.0 | 6/7 | In Progress|  |
 | 15. HDBSCAN | v3.0 | 0/TBD | Not started | - |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |
