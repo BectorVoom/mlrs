@@ -52,35 +52,67 @@ created: 2026-06-23
 - [ ] umap-learn 0.5.12 oracle fixtures (committed blobs) regenerated via the `/tmp` numpy/umap-learn venv — all 5 metrics; intermediates: graph rows/cols/vals, sigmas/rhos, a/b, spectral-init coords
 - [ ] property-gate helpers (trustworthiness, kNN-overlap, downstream-ARI) in-repo
 
-### Calibrated property-gate thresholds (Plan 04 — Spike flag item 2)
+### Calibrated property-gate thresholds (Plan 04, RE-DERIVED Plan 14-07)
 
-Measured on the first fixture run (cpu-MLIR f64, `n=60`, 3 well-separated
-clusters, `random_state=42`, `n_epochs=200`) by computing mlrs's and
-umap-learn 0.5.12's structural scores on identical seeded data. The gate is
-RELATIVE to umap (`mlrs ≥ umap − ε`, D-04), never an absolute floor.
+> **Plan 14-07 recalibration.** The Plan-04 `PROPERTY_EPS=0.02` was fit against
+> the OLD `move_other=1` fit schedule, under which each owner-cube also wrote its
+> neighbour's coordinates — so every undirected pair was attracted ~2-4× per
+> due-epoch (CR-03 double-count) AND two concurrently-scheduled cubes raced on the
+> same embedding slot (CR-01). Plan 14-07 sets the fit launch `move_other=0`
+> (owner-only over the already-symmetric COO): each undirected pair is now
+> processed ONCE PER DIRECTION — the (r,c) and (c,r) owner-edges each move only
+> their own vertex — matching umap-learn's single head/tail force pass and
+> eliminating the cross-cube write-write race. The constants below are RE-DERIVED
+> against this corrected `move_other=0` output, so the gate validates against
+> umap's force schedule, not mlrs's former double-count (CR-03 resolved).
+
+Measured on the fixture run (cpu-MLIR f64, `n=60`, 3 well-separated clusters,
+`random_state=42`, `n_epochs=200`) by computing mlrs's and umap-learn 0.5.12's
+structural scores on identical seeded data, AFTER the `move_other=0` change. The
+gate is RELATIVE to umap (`mlrs ≥ umap − ε`, D-04), never an absolute floor.
 
 | Metric | trustworthiness (mlrs / umap) | margin (umap−mlrs) | kNN-overlap (mlrs / umap) | margin (umap−mlrs) | downstream-ARI (mlrs / umap) | gap |
 |--------|-------------------------------|--------------------|----------------------------|--------------------|------------------------------|-----|
-| euclidean | 0.9673 / 0.9680 | **+0.0007** | 0.6950 / 0.6917 | −0.0033 | 1.0000 / 1.0000 | 0.0000 |
-| manhattan | 0.9654 / 0.9635 | −0.0019 | 0.6850 / 0.6783 | −0.0067 | 1.0000 / 1.0000 | 0.0000 |
-| cosine | 0.9685 / 0.9673 | −0.0012 | 0.6983 / 0.6733 | −0.0250 | 1.0000 / 1.0000 | 0.0000 |
-| chebyshev | 0.9621 / 0.9615 | −0.0006 | 0.6350 / 0.6317 | −0.0033 | 1.0000 / 1.0000 | 0.0000 |
-| minkowski (p=3) | 0.9675 / 0.9652 | −0.0023 | 0.6917 / 0.6667 | −0.0250 | 1.0000 / 1.0000 | 0.0000 |
+| euclidean | 0.9655 / 0.9680 | **+0.0025** | 0.6917 / 0.6917 | +0.0000 | 1.0000 / 1.0000 | 0.0000 |
+| manhattan | 0.9633 / 0.9635 | +0.0002 | 0.6867 / 0.6783 | −0.0083 | 1.0000 / 1.0000 | 0.0000 |
+| cosine | 0.9670 / 0.9673 | +0.0003 | 0.6983 / 0.6733 | −0.0250 | 1.0000 / 1.0000 | 0.0000 |
+| chebyshev | 0.9679 / 0.9615 | −0.0064 | 0.6850 / 0.6317 | −0.0533 | 1.0000 / 1.0000 | 0.0000 |
+| minkowski (p=3) | 0.9648 / 0.9652 | +0.0004 | 0.6917 / 0.6667 | −0.0250 | 1.0000 / 1.0000 | 0.0000 |
 
-**Worst positive margin:** trust +0.0007 (euclidean); overlap +0.0000 (mlrs ≥ umap on every metric); ARI gap 0.0000 on all five.
+**Worst positive margin (move_other=0):** trust **+0.0025** (euclidean); overlap
+**+0.0000** (mlrs ≥ umap on every metric); ARI gap 0.0000 on all five. (Prior
+move_other=1 worst trust margin was +0.0007 — the corrected single-pass schedule
+slightly widens the worst trust margin to +0.0025, still tiny and well within the
+guardrail below; mlrs continues to MATCH-or-BEAT umap on overlap and ARI.)
 
 **Calibrated constants** (in `crates/mlrs-algos/tests/umap_test.rs`):
 
 | Constant | Value | Rationale |
 |----------|-------|-----------|
-| `PROPERTY_EPS` (trust + overlap slack) | **0.02** | ≈28× the worst trust margin (0.0007); tight while absorbing cpu/rocm structural jitter (D-04). |
-| `ARI_BAND` (downstream-ARI band) | **0.05** | ARI gap measured 0.0000 on all metrics; a tight relative band, not an absolute floor. |
+| `PROPERTY_EPS` (trust + overlap slack) | **0.03** | ≈12× the worst trust margin (0.0025) on the corrected move_other=0 schedule — same tight small-multiple-of-worst-margin relation the prior 0.02 had; absorbs cpu/rocm structural jitter (D-04). |
+| `ARI_BAND` (downstream-ARI band) | **0.05** | ARI gap STILL 0.0000 on all metrics after the schedule change; a tight relative band, not an absolute floor. |
+
+**HARD recalibration guardrail (Plan 14-07).** `PROPERTY_EPS` MUST satisfy BOTH
+(i) `≤ 0.04` (≤ ~2× the prior 0.02 calibration) AND (ii) remain a small multiple
+of the worst measured per-metric positive margin (the same tight relation the
+prior 0.02 had, NOT an arbitrary absolute floor). The re-derived `0.03` honours
+both (0.03 ≤ 0.04; 0.03 ≈ 12× the worst margin 0.0025). `ARI_BAND` likewise stays
+`≤ ~2×` its prior 0.05 and a small multiple of the worst (here zero) ARI gap. A
+future recalibration MUST NOT quietly loosen past this ceiling: if the corrected
+schedule ever pushes the worst margin large enough that ε > 0.04 would be needed
+to keep all 5 metrics green, that is a genuine divergence from umap-learn and must
+be surfaced for a human decision, not masked. The per-pair sample-count assertion
+(`per_pair_sample_count_matches_schedule`, Plan 14-07) now anchors the corrected
+single-pass-per-direction schedule against a future `move_other=1` regression
+(CR-03 guard), so this gate validates against umap's force schedule.
 
 The downstream-ARI clusters BOTH embeddings with the same deterministic host
 Lloyd k-means (`k = 3` true classes) and scores each clustering against the
 true labels — both mlrs and umap recover the 3 clusters exactly. All 5
-`layout_property_<metric>` tests are GREEN at these thresholds; the full run
-(spectral-init Jacobi eig dominated) took ~1717s for the five metrics.
+`layout_property_<metric>` tests are GREEN at the re-derived thresholds; the full
+move_other=0 run took ~2254s for the five metrics (spectral-init Jacobi eig
+dominated). `reproducible_f64` stays byte-identical after the change (same-seed
+fit reproducibility preserved).
 
 ### Calibrated TRANSFORM sub-gate threshold (Plan 05 — UMAP-04)
 

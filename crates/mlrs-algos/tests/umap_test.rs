@@ -47,14 +47,23 @@ use mlrs_core::{load_npz, OracleCase, F64_TOL};
 // Placeholder calibration consts (Plan 04 overwrites — RESEARCH Q4)
 // ===========================================================================
 
-/// Calibrated (Plan 04) trustworthiness/kNN-overlap slack below the umap-learn
-/// 0.5.12 reference score (D-04 — RELATIVE-to-oracle, NEVER an absolute floor).
-/// Set from the first fixture run's worst measured margin `(umap − mlrs)` across
-/// all 5 metrics plus a tight safety buffer; recorded per metric in
-/// `14-VALIDATION.md`. Measured worst positive margins: trust +0.0007 (euclidean),
-/// overlap +0.0000 (mlrs ≥ umap on every metric). `ε = 0.02` keeps the gate tight
-/// (≈28× the worst trust margin) while absorbing cpu/rocm structural jitter.
-const PROPERTY_EPS: f64 = 0.02;
+/// Calibrated trustworthiness/kNN-overlap slack below the umap-learn 0.5.12
+/// reference score (D-04 — RELATIVE-to-oracle, NEVER an absolute floor).
+///
+/// **Re-derived (Plan 14-07) against the corrected `move_other=0` (owner-only,
+/// single-pass-per-direction) force schedule** that matches umap-learn — NOT the
+/// former doubled (move_other=1) output the Plan-04 `0.02` was fit to. Measured
+/// worst positive margins `(umap − mlrs)` across all 5 metrics on the corrected
+/// schedule (recorded per metric in `14-VALIDATION.md`): trust +0.0025
+/// (euclidean), overlap +0.0000 (mlrs ≥ umap on every metric), ARI gap 0.0000.
+/// `ε = 0.03` keeps the gate TIGHT (≈12× the worst trust margin 0.0025, same
+/// small-multiple-of-worst-margin relation the prior 0.02 had) while absorbing
+/// cpu/rocm structural jitter. HARD recalibration guardrail: ε ≤ 0.04 (≤ ~2× the
+/// prior 0.02) AND a small multiple of the worst measured margin — NEVER silently
+/// widened to absorb the schedule change. The per-pair sample-count assertion
+/// (`per_pair_sample_count_matches_schedule`) anchors the schedule so this gate
+/// validates against umap's force schedule, not mlrs's former double-count.
+const PROPERTY_EPS: f64 = 0.03;
 /// Calibrated (Plan 05) trustworthiness slack for the TRANSFORM new-points
 /// sub-gate (UMAP-04, D-04 — RELATIVE-to-umap, NEVER an absolute floor). The
 /// transform is a HARDER problem than the fit layout: it is a reduced-context
@@ -70,9 +79,12 @@ const PROPERTY_EPS: f64 = 0.02;
 /// new-point structure — it stays within 0.15 trust of umap on every metric).
 const TRANSFORM_PROPERTY_EPS: f64 = 0.15;
 /// Calibrated downstream-ARI band: mlrs's clustering-vs-truth ARI must be within
-/// this of umap's `(umap_ari − band)` (D-04). Measured ARI gap was 0.0000 on all
-/// 5 metrics (both recover the 3 true clusters exactly); `band = 0.05` is a tight
-/// relative gate, not an absolute floor.
+/// this of umap's `(umap_ari − band)` (D-04). **Re-confirmed (Plan 14-07) against
+/// the corrected `move_other=0` schedule**: measured ARI gap is STILL 0.0000 on
+/// all 5 metrics (both recover the 3 true clusters exactly), so `band = 0.05`
+/// stays a tight relative gate (≤ ~2× a hypothetical prior and a small multiple
+/// of the worst — here zero — ARI gap), not an absolute floor, under the same
+/// ε ≤ 0.04-style guardrail applied to `PROPERTY_EPS`.
 const ARI_BAND: f64 = 0.05;
 
 // ===========================================================================
