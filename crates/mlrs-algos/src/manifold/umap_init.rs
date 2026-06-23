@@ -262,7 +262,23 @@ where
 
     // --- Full symmetric spectrum via v1 eig (DESCENDING, V col-major). Thread
     //     the Laplacian buffer through `out` so eig reuses it as its working input
-    //     (the spectral_embedding.rs:260-264 WR-05 aliasing precedent). ---
+    //     — saving one n² allocation (RESEARCH Anti-Pattern).
+    //
+    //     WR-05/WR-06: `&l` (the eig `a` input) and `l_out` (the eig `out`) wrap
+    //     the SAME ref-counted cubecl handle (l.handle().clone()). This aliasing
+    //     is SOUND only because of two load-bearing, eig-internal invariants
+    //     (the same argument carried verbatim at spectral_embedding.rs:248-259
+    //     and spectral_clustering.rs — this is the THIRD copy of the pattern, so
+    //     the full soundness comment is repeated here rather than referenced):
+    //       (1) eig READS `a_in` (= the `out` handle) and NEVER writes it — it
+    //           writes its separate w/V/info outputs (eig.rs jacobi_eig_sweep);
+    //       (2) eig ACQUIRES w/V/info from the pool BEFORE it releases the `out`
+    //           working buffer (eig.rs: acquire happens before the
+    //           `a_in_owned.release_into(pool)` post-launch), so the freed
+    //           handle is never re-handed mid-call.
+    //     If eig ever writes its working input in place, or reorders the
+    //     acquire/release, this reuse becomes an aliased-write / use-after-free
+    //     with NO compile-time signal — keep those invariants if eig changes.
     let l_out =
         DeviceArray::<ActiveRuntime, F>::from_raw(l.handle().clone(), n * n);
     let (w_desc, v_desc) = eig::<F>(pool, &l, n, Some(l_out))?;
