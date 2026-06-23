@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 status: completed
-stopped_at: Completed 12-04-PLAN.md (PyO3 typestate collapse — PyUMAP/PyHDBSCAN, BLDR-04). Phase 12 all plans complete.
-last_updated: "2026-06-23T05:07:56.607Z"
+stopped_at: Phase 14 context gathered
+last_updated: "2026-06-23T10:09:07.896Z"
 last_activity: 2026-06-23
 progress:
   total_phases: 5
@@ -269,9 +269,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23
-Stopped at: Completed 12-04-PLAN.md (PyO3 typestate collapse — PyUMAP/PyHDBSCAN, BLDR-04). Phase 12 all plans complete.
-Resume file: .planning/phases/12-builder-typestate-convention-foundation/12-CONTEXT.md
+Last session: 2026-06-23T10:09:07.891Z
+Stopped at: Phase 14 context gathered
+Resume file: .planning/phases/14-umap/14-CONTEXT.md
 
 ## Operator Next Steps
 
