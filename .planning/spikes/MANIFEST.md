@@ -33,13 +33,24 @@ Established design decisions (from Phase 13 CONTEXT.md; non-negotiable for the r
 - **R-6 — Memory gate.** Query-axis tiled; never a full `n×n` distance matrix resident-and-leaking.
 - **R-7 — New standalone prim fn** at `crates/mlrs-backend/src/prims/knn_graph.rs`, composing
   `distance.rs` + `topk.rs`; no estimator wrapper this phase. (D-03)
+- **R-8 — Self-drop kernel authoring constraints (emerged from Spike 002).** The
+  `include_self=false` self-drop kernel MUST (a) use the `top_k` launch shape (`row =
+  CUBE_POS_X` + `UNIT_POS_X == 0` guard), NOT a bare-`ABSOLUTE_POS` 1D launch — the latter
+  triggers a cpu-MLIR "operation with block successors" pass failure (FINDING 002-A); and (b)
+  carry NO cross-sibling-loop mutable accumulator — a flag written in one `while` and read in a
+  separate sibling `while` SILENTLY miscompiles (FINDING 002-B). Compute per-row positional
+  values with a self-contained nested accumulate inside the output loop.
+- **R-9 — Oracle gate must include a duplicate point + assert VALUES.** FINDING 002-B compiled,
+  launched, and returned plausible wrong data; only an end-to-end value assertion against a
+  brute-force/sklearn oracle (with rows at distance 0) caught it. The per-metric oracle test
+  must include a duplicate-point row and assert returned indices/distances, not just non-panic.
 
 ## Spikes
 
 | # | Name | Type | Validates | Verdict | Tags |
 |---|------|------|-----------|---------|------|
 | 001 | direct-feature-loop-distance-kernels | standard | Direct pairwise feature-loop kernels (Manhattan/Chebyshev/Minkowski-p incl. in-kernel `pow`) launch under cpu-MLIR and match a host reference ≤1e-6 | **VALIDATED ✓** | knn, cpu-mlir, kernel, minkowski, distance |
-| 002 | directed-knn-compose-and-self-drop | standard | Directed `(indices,distances)` composition with `include_self` true/false and index-identity self-drop matches brute-force host KNN incl. duplicate-point/tie cases | PENDING | knn, composition, self-drop, topk |
+| 002 | directed-knn-compose-and-self-drop | standard | Directed `(indices,distances)` composition with `include_self` true/false and index-identity self-drop matches brute-force host KNN incl. duplicate-point/tie cases | **VALIDATED ✓** | knn, composition, self-drop, topk |
 
 ## Notes
 
