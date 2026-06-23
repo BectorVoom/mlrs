@@ -68,7 +68,12 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
   2. The fit/unfit distinction is modeled at compile time (`T<Unfit>` → `T<Fitted>`) such that `predict`/`transform`/fitted-attr accessors exist only on the fitted type — predict-before-fit fails to compile.
   3. The PyO3 surface is unchanged: the Rust typestate collapses behind the existing `any_estimator!` `Unfit/F32/F64` enum, with a runtime `NotFittedError` analog at the Python boundary, and every existing `any_estimator!` call site still compiles and passes its suite.
   4. The convention is demonstrated end-to-end on the two new-estimator shells (UMAP/HDBSCAN homes) so Phases 14–15 inherit it from birth.
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 12-01-PLAN.md — typestate foundation: sealed `State` + `Unfit`/`Fitted` markers + consuming `Fit`/`Predict`/`Transform`/`PartialFit` traits (new module, `traits.rs` frozen) + trybuild dev-dep
+- [ ] 12-02-PLAN.md — UMAP + HDBSCAN shells: full param surface, owned builder, single-source defaults, non-algorithmic trivial fit, Fitted-only accessors, 2 new `BuildError` variants
+- [ ] 12-03-PLAN.md — trybuild compile-fail gate proving predict/transform-before-fit won't compile (BLDR-02 structural proof)
+- [ ] 12-04-PLAN.md — PyO3 collapse: additive `any_estimator_typestate!` macro + `PyUMAP`/`PyHDBSCAN` shells + runtime `NotFittedError` analog; existing 35 call sites stay green
 **UI hint**: no
 
 ### Phase 13: KNN-Graph Primitive (feasibility keystone)
