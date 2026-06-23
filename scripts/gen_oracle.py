@@ -920,6 +920,353 @@ def gen_knn_metric(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Phase-14 UMAP oracle fixtures (UMAP-01..04, D-02). Per-stage × per-metric
+# committed blobs dumping umap-learn 0.5.12's OWN internals (NEVER recomputed in
+# numpy — RESEARCH Pitfall 6). All arrays are 4/8-byte floats (load_npz
+# constraint): KNN indices/COO row-col indices are encoded as float, the metric
+# tag lives in the FILENAME (the gen_knn_metric precedent). Regenerate ONLY in a
+# /tmp venv with `numpy scipy scikit-learn umap-learn==0.5.12` (PEP 668); the
+# resulting blobs are committed, CI never runs this script.
+# ---------------------------------------------------------------------------
+
+# Fixed UMAP oracle design (small, CONNECTED at n_neighbors so the single-
+# component spectral_layout path matches — RESEARCH Q1). n<=64 keeps spectral on
+# the dense-Jacobi path the mlrs `eig` prim reproduces.
+UMAP_N = 60
+UMAP_N_FEATURES = 8
+UMAP_N_NEIGHBORS = 10
+UMAP_MINKOWSKI_P = 3.0
+# Layout/transform property-gate design: well-separated blobs so trustworthiness
+# / kNN-overlap / downstream-ARI are meaningful (3 clusters, deterministic).
+UMAP_LAYOUT_N = 60
+UMAP_LAYOUT_CLUSTERS = 3
+UMAP_TRANSFORM_N_NEW = 15
+UMAP_RANDOM_STATE = 42
+UMAP_N_EPOCHS = 200
+# a/b curve-fit grid (metric-independent, one fixture): (min_dist, spread) pairs.
+UMAP_AB_GRID = (
+    (0.1, 1.0),
+    (0.0, 1.0),
+    (0.5, 1.0),
+    (0.1, 2.0),
+    (0.25, 0.5),
+)
+
+# Metric tag → sklearn NearestNeighbors (metric, p) AND umap-learn metric string.
+# The umap `metric=` strings match sklearn's for all five (umap dispatches the
+# same names to its numba distance fns).
+_UMAP_METRICS = {
+    "euclidean": ("euclidean", 2),
+    "manhattan": ("manhattan", 1),
+    "cosine": ("cosine", 2),
+    "chebyshev": ("chebyshev", 2),
+    "minkowski": ("minkowski", UMAP_MINKOWSKI_P),
+}
+
+
+def _umap_design(seed: int):
+    """The shared (n, d) UMAP fixture design — random, well-spread so pairwise
+    distances are distinct, no zero-norm row (cosine-safe, A4)."""
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((UMAP_N, UMAP_N_FEATURES)) * 3.0
+    x += np.arange(UMAP_N)[:, None] * 0.01
+    # Keep every row well away from the origin so cosine is well-defined.
+    x += 5.0
+    return x
+
+
+def _umap_knn(x, metric_tag: str):
+    """sklearn brute KNN matching the mlrs knn_graph prim (X-vs-X, self-dropped,
+    lowest-index tie-break) — the umap membership stage consumes these."""
+    from sklearn.neighbors import NearestNeighbors
+
+    sk_metric, p_arg = _UMAP_METRICS[metric_tag]
+    k = UMAP_N_NEIGHBORS
+    # Over-fetch ALL then per-row lexsort (distance, index) for the documented
+    # lowest-index tie-break, then drop self (column 0, distance 0) → (n, k).
+    nn = NearestNeighbors(
+        n_neighbors=x.shape[0], algorithm="brute", metric=sk_metric, p=p_arg
+    ).fit(x)
+    dist_all, idx_all = nn.kneighbors(x)
+    knn_dist = np.empty((x.shape[0], k), dtype=np.float64)
+    knn_idx = np.empty((x.shape[0], k), dtype=np.int64)
+    for r in range(x.shape[0]):
+        order = np.lexsort((idx_all[r], dist_all[r]))
+        sel = [j for j in order if idx_all[r][j] != r][:k]
+        knn_dist[r] = dist_all[r][sel]
+        knn_idx[r] = idx_all[r][sel]
+    return knn_dist, knn_idx
+
+
+def _umap_cast(dtype):
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    return c
+
+
+_UMAP_DTYPE_TAG = {np.float32: "f32", np.float64: "f64"}
+
+
+def gen_umap_fuzzy(
+    seed: int = SEED, dtype=np.float64, metric: str = "euclidean"
+) -> str:
+    """Smooth-kNN ρ/σ + membership + t-conorm union oracle (UMAP-02, D-02).
+
+    Dumps umap-learn 0.5.12's OWN ``smooth_knn_dist`` (``sigmas``, ``rhos``) and
+    ``fuzzy_simplicial_set`` graph (COO ``rows``/``cols``/``vals``) for one
+    metric on the fixed UMAP design. The KNN (``knn_idx``/``knn_dist``) the umap
+    internals consume are also stored so the mlrs host stages run on the SAME
+    neighbours. Stores scalar params ``set_op_mix_ratio``/``local_connectivity``/
+    ``n_neighbors``. Indices are float-encoded; metric tag in the filename.
+    """
+    import numpy as _np
+    from umap.umap_ import fuzzy_simplicial_set, smooth_knn_dist
+
+    c = _umap_cast(dtype)
+    x = _umap_design(seed)
+    knn_dist, knn_idx = _umap_knn(x, metric)
+
+    set_op_mix_ratio = 1.0
+    local_connectivity = 1.0
+    sigmas, rhos = smooth_knn_dist(
+        knn_dist.astype(_np.float64),
+        float(UMAP_N_NEIGHBORS),
+        local_connectivity=local_connectivity,
+    )
+    sk_metric, _ = _UMAP_METRICS[metric]
+    graph, _s, _r, _d = fuzzy_simplicial_set(
+        x,
+        UMAP_N_NEIGHBORS,
+        _np.random.RandomState(seed),
+        sk_metric,
+        knn_indices=knn_idx,
+        knn_dists=knn_dist,
+        set_op_mix_ratio=set_op_mix_ratio,
+        local_connectivity=local_connectivity,
+        return_dists=True,
+    )
+    coo = graph.tocoo()
+
+    dtype_tag = _UMAP_DTYPE_TAG[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"umap_fuzzy_{metric}_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        knn_idx=c(knn_idx),  # float-encoded indices (load_npz: floats only)
+        knn_dist=c(knn_dist),
+        sigmas=c(sigmas),
+        rhos=c(rhos),
+        rows=c(coo.row),  # float-encoded COO row index
+        cols=c(coo.col),  # float-encoded COO col index
+        vals=c(coo.data),
+        n_neighbors=c([UMAP_N_NEIGHBORS]),
+        set_op_mix_ratio=c([set_op_mix_ratio]),
+        local_connectivity=c([local_connectivity]),
+    )
+    return out_path
+
+
+def gen_umap_spectral(
+    seed: int = SEED, dtype=np.float64, metric: str = "euclidean"
+) -> str:
+    """Spectral-init oracle (UMAP-02, D-02). Dumps umap-learn's OWN
+    ``spectral_layout`` coords on the symmetric fuzzy graph (n<=64 CONNECTED
+    design so the single-component laplacian+eig path matches — RESEARCH Q1).
+
+    Stores the symmetric graph COO (``rows``/``cols``/``vals``) and the spectral
+    coordinates ``coords`` (n, n_components). The value-gate compares up-to-sign
+    per column (umap applies NO sign-flip; mlrs `recover` does — RESEARCH Q3).
+    """
+    import numpy as _np
+    from umap.spectral import spectral_layout
+    from umap.umap_ import fuzzy_simplicial_set
+
+    c = _umap_cast(dtype)
+    x = _umap_design(seed)
+    knn_dist, knn_idx = _umap_knn(x, metric)
+    sk_metric, _ = _UMAP_METRICS[metric]
+    graph, _s, _r, _d = fuzzy_simplicial_set(
+        x,
+        UMAP_N_NEIGHBORS,
+        _np.random.RandomState(seed),
+        sk_metric,
+        knn_indices=knn_idx,
+        knn_dists=knn_dist,
+        set_op_mix_ratio=1.0,
+        local_connectivity=1.0,
+        return_dists=True,
+    )
+    # Symmetrize (t-conorm union is already symmetric, but spectral_layout takes
+    # the symmetric affinity — mirror umap's own simplicial_set_embedding which
+    # uses graph + graph.T - graph.multiply(graph.T); here the union graph IS the
+    # symmetric affinity, so use it directly as umap's spectral_layout input).
+    g = graph.maximum(graph.transpose()).tocoo()
+    n_components = 2
+    coords = spectral_layout(
+        x, graph.maximum(graph.transpose()), n_components, _np.random.RandomState(seed)
+    )
+
+    dtype_tag = _UMAP_DTYPE_TAG[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"umap_spectral_{metric}_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        rows=c(g.row),
+        cols=c(g.col),
+        vals=c(g.data),
+        coords=c(coords),
+        n_components=c([n_components]),
+    )
+    return out_path
+
+
+def gen_umap_ab(seed: int = SEED, dtype=np.float64) -> str:
+    """a/b curve-fit oracle (UMAP-01/02, D-06). Metric-independent — ONE fixture.
+
+    Dumps umap-learn's OWN ``find_ab_params`` outputs over the
+    ``UMAP_AB_GRID`` of ``(min_dist, spread)`` pairs. Stores ``min_dist`` /
+    ``spread`` / ``a`` / ``b`` parallel arrays (one row per grid point). The mlrs
+    host LM port value-gates ``a``/``b`` to <=1e-5 against these.
+    """
+    from umap.umap_ import find_ab_params
+
+    c = _umap_cast(dtype)
+    min_dists = []
+    spreads = []
+    a_vals = []
+    b_vals = []
+    for (min_dist, spread) in UMAP_AB_GRID:
+        a, b = find_ab_params(spread, min_dist)
+        min_dists.append(min_dist)
+        spreads.append(spread)
+        a_vals.append(a)
+        b_vals.append(b)
+
+    dtype_tag = _UMAP_DTYPE_TAG[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"umap_ab_{dtype_tag}.npz")
+    np.savez(
+        out_path,
+        min_dist=c(min_dists),
+        spread=c(spreads),
+        a=c(a_vals),
+        b=c(b_vals),
+    )
+    return out_path
+
+
+def _umap_layout_design(seed: int):
+    """Well-separated blobs + true labels for the property-gate (UMAP-03)."""
+    from sklearn.datasets import make_blobs
+
+    x, y = make_blobs(
+        n_samples=UMAP_LAYOUT_N,
+        n_features=UMAP_N_FEATURES,
+        centers=UMAP_LAYOUT_CLUSTERS,
+        cluster_std=1.0,
+        random_state=seed,
+    )
+    return x.astype(np.float64), y.astype(np.int64)
+
+
+def gen_umap_layout(
+    seed: int = SEED, dtype=np.float64, metric: str = "euclidean"
+) -> str:
+    """SGD-layout property-gate reference (UMAP-03, D-02). Dumps umap-learn's
+    fitted ``embedding_`` + true ``labels`` (for downstream-ARI) on a fixed
+    ``random_state``/``n_epochs``. NOT an element-wise oracle — mlrs SplitMix64 !=
+    umap Tausworthe, so the gate is trustworthiness/kNN-overlap/ARI (UMAP-03).
+    """
+    import umap as _umap
+
+    c = _umap_cast(dtype)
+    x, y = _umap_layout_design(seed)
+    sk_metric, p_arg = _UMAP_METRICS[metric]
+    kwds = {"p": p_arg} if metric == "minkowski" else {}
+    reducer = _umap.UMAP(
+        n_neighbors=UMAP_N_NEIGHBORS,
+        n_components=2,
+        metric=sk_metric,
+        metric_kwds=kwds,
+        random_state=UMAP_RANDOM_STATE,
+        n_epochs=UMAP_N_EPOCHS,
+    )
+    embedding = reducer.fit_transform(x)
+
+    dtype_tag = _UMAP_DTYPE_TAG[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"umap_layout_{metric}_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        embedding=c(embedding),
+        labels=c(y),  # float-encoded integer labels (ARI)
+        n_neighbors=c([UMAP_N_NEIGHBORS]),
+        n_epochs=c([UMAP_N_EPOCHS]),
+        random_state=c([UMAP_RANDOM_STATE]),
+    )
+    return out_path
+
+
+def gen_umap_transform(
+    seed: int = SEED, dtype=np.float64, metric: str = "euclidean"
+) -> str:
+    """Transform-new-points property sub-gate reference (UMAP-04, D-02). Dumps
+    ``X_train``, ``X_new``, the fitted ``embedding`` (train), and umap's
+    ``transform`` output ``embedding_new``. Gate: trustworthiness of new points
+    >= umap - eps (NOT element-wise).
+    """
+    import umap as _umap
+
+    c = _umap_cast(dtype)
+    x, y = _umap_layout_design(seed)
+    rng = np.random.default_rng(seed + 1)
+    # New points drawn from the SAME generating distribution region.
+    x_new = x[:UMAP_TRANSFORM_N_NEW] + rng.standard_normal(
+        (UMAP_TRANSFORM_N_NEW, UMAP_N_FEATURES)
+    ) * 0.1
+    sk_metric, p_arg = _UMAP_METRICS[metric]
+    kwds = {"p": p_arg} if metric == "minkowski" else {}
+    reducer = _umap.UMAP(
+        n_neighbors=UMAP_N_NEIGHBORS,
+        n_components=2,
+        metric=sk_metric,
+        metric_kwds=kwds,
+        random_state=UMAP_RANDOM_STATE,
+        n_epochs=UMAP_N_EPOCHS,
+    )
+    embedding = reducer.fit_transform(x)
+    embedding_new = reducer.transform(x_new)
+
+    dtype_tag = _UMAP_DTYPE_TAG[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"umap_transform_{metric}_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X_train=c(x),
+        X_new=c(x_new),
+        embedding=c(embedding),
+        embedding_new=c(embedding_new),
+        labels=c(y),
+        n_neighbors=c([UMAP_N_NEIGHBORS]),
+        n_epochs=c([UMAP_N_EPOCHS]),
+        random_state=c([UMAP_RANDOM_STATE]),
+    )
+    return out_path
+
+
 def gen_lasso(seed: int = SEED, dtype=np.float32) -> str:
     """Generate one seeded Lasso fixture (LINEAR-03, sklearn coordinate descent).
 
@@ -2355,6 +2702,18 @@ def main() -> None:
     for metric in ("euclidean", "manhattan", "cosine", "chebyshev", "minkowski"):
         for dtype in (np.float32, np.float64):
             print(f"wrote {gen_knn_metric(dtype=dtype, metric=metric)}")
+    # ---- Phase-14 UMAP oracle fixtures (UMAP-01..04, D-02) ----
+    # Per-stage × per-metric committed blobs dumping umap-learn 0.5.12 internals
+    # (NEVER recomputed — RESEARCH Pitfall 6). f64 only (the cpu value gate; the
+    # deterministic stages value-gate to <=1e-5 in host f64 — RESEARCH §host-f64
+    # readback). Regen in a /tmp venv with `umap-learn==0.5.12` (PEP 668).
+    for metric in ("euclidean", "manhattan", "cosine", "chebyshev", "minkowski"):
+        print(f"wrote {gen_umap_fuzzy(dtype=np.float64, metric=metric)}")
+        print(f"wrote {gen_umap_spectral(dtype=np.float64, metric=metric)}")
+        print(f"wrote {gen_umap_layout(dtype=np.float64, metric=metric)}")
+        print(f"wrote {gen_umap_transform(dtype=np.float64, metric=metric)}")
+    # a/b curve fit is metric-independent — one fixture.
+    print(f"wrote {gen_umap_ab(dtype=np.float64)}")
     # Lasso (LINEAR-03): sparse coef_ with exact zeros (Pitfall 1).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_lasso(dtype=dtype)}")
