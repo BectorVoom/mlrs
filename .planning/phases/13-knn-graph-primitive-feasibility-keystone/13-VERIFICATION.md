@@ -1,13 +1,14 @@
 ---
 phase: 13-knn-graph-primitive-feasibility-keystone
 verified: 2026-06-23T12:00:00Z
-status: gaps_found
-score: 3/4 must-haves verified
+status: passed
+score: 4/4 must-haves verified
 overrides_applied: 0
-gaps:
+resolved_gaps:
   - truth: "For each metric, indices are set-equal to sklearn.neighbors.NearestNeighbors (with the matching metric) up to tie-ordering and distances match to <=1e-5 (f64), with the lowest-index tie-break documented as the mlrs convention — verifiable by re-running the canonical oracle generator"
-    status: failed
-    reason: "CR-01/CR-02 oracle integrity failure: the committed chebyshev fixtures were hand-regenerated in commit 7f73d4e to enforce the lowest-index tie-break, but scripts/gen_oracle.py (declared the canonical regeneration tool by its own module docstring) was NOT updated. Running 'python3 scripts/gen_oracle.py' today silently reverts the committed chebyshev blobs to sklearn-arbitrary-tie-order, breaking the gate. The committed artifact is not derivable from the committed generator. Additionally (CR-02), because the chebyshev fixture was conformed to the prim's own tie-break rather than an independent rule in the generator, the chebyshev index gate is partially circular at the tied boundary: a miscompile that happened to produce lowest-index selection would still pass."
+    status: resolved
+    resolution: "Fixed in commit e55aa95 (inline gap closure during execute-phase). gen_knn_metric() now over-fetches ALL neighbours and selects the k+1 by a global (distance, index) lexsort, deterministically resolving every tie — including boundary MEMBERSHIP — to the lowest index from an independent rule. NOTE: the verifier's originally-proposed one-line lexsort of sklearn's k+1 result was insufficient — at chebyshev row 25 indices 0 and 4 are BOTH at the cutoff distance and sklearn arbitrarily returns one, so reordering the returned set cannot recover the lowest-index member (verified empirically: plain lexsort produced idx 4, gate FAILED). Over-fetch + global lexsort produces idx 0, byte-identical to the hand-patch. Re-test evidence: all 10 fixtures regenerated, distances byte-identical to committed (chebyshev_f32 differs 4.8e-7 fp rounding, < 1e-5), index sets unchanged vs prim, chebyshev row 25 = [25 26 6 16 2 0] = hand-patch. knn_graph_test 14/14 GREEN under --features cpu. The committed fixtures are now fully derivable from the committed generator; the chebyshev index gate is no longer circular."
+    reason_original: "CR-01/CR-02 oracle integrity failure: the committed chebyshev fixtures were hand-regenerated in commit 7f73d4e to enforce the lowest-index tie-break, but scripts/gen_oracle.py (declared the canonical regeneration tool by its own module docstring) was NOT updated. Running 'python3 scripts/gen_oracle.py' today silently reverts the committed chebyshev blobs to sklearn-arbitrary-tie-order, breaking the gate. The committed artifact is not derivable from the committed generator. Additionally (CR-02), because the chebyshev fixture was conformed to the prim's own tie-break rather than an independent rule in the generator, the chebyshev index gate is partially circular at the tied boundary: a miscompile that happened to produce lowest-index selection would still pass."
     artifacts:
       - path: "scripts/gen_oracle.py"
         issue: "gen_knn_metric() calls nn.kneighbors(x) and saves indices without any lexsort/stable-argsort post-processing. Confirmed by reading lines 870-897: no re-sort after kneighbors. Running this script regenerates chebyshev fixtures with sklearn-arbitrary tie order (idx 4 at row 25), not the lowest-index (idx 0) that the committed blob carries."
@@ -25,8 +26,8 @@ gaps:
 
 **Phase Goal:** Land the single shared KNN-graph primitive — ascending-ordered k-nearest-neighbor indices (n, k) + distances (n, k) over a multi-metric distance layer (Euclidean, Manhattan/L1, Cosine, Chebyshev/L∞, Minkowski-p), with a self-inclusion parameter — exposed as a new standalone `mlrs-backend` prim fn composed cpu-MLIR-safe from the launch-proven distance → top-k GATHER path (no SharedMemory/atomics/heap kernel), and standalone-validate it (per metric) BEFORE UMAP or HDBSCAN consume it. Emits the DIRECTED (indices, distances) graph only (symmetrization deferred to consumers). This is the milestone's feasibility keystone.
 **Verified:** 2026-06-23T12:00:00Z
-**Status:** gaps_found
-**Re-verification:** No — initial verification
+**Status:** passed (1 gap found at initial verification, resolved inline in commit e55aa95)
+**Re-verification:** Yes — initial verification found the CR-01/CR-02 oracle-integrity gap; it was fixed inline and the knn_graph_test gate re-run 14/14 GREEN before this report was updated to passed.
 
 ---
 

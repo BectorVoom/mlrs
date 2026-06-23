@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
-status: executing
-stopped_at: Completed 13-03-PLAN.md (KNN-graph primitive PRIM-11 keystone — knn_graph<F> + Metric enum; validate-before-launch host orchestrator, query-axis-tiled distance->top_k + single self_drop_gather, directed (indices, distances) (n,k); all 5 metrics oracle-GREEN <=1e-5, R-9 dup-point VALUE gate, memory gate GREEN on cpu f64+f32 / rocm f32). Plan 3 of 3 complete — Phase 13 DONE.
-last_updated: "2026-06-23T04:32:37Z"
-last_activity: 2026-06-23 -- Completed 13-03-PLAN.md (KNN-graph prim keystone, Phase 13 complete)
+status: completed
+stopped_at: Completed 12-04-PLAN.md (PyO3 typestate collapse — PyUMAP/PyHDBSCAN, BLDR-04). Phase 12 all plans complete.
+last_updated: "2026-06-23T05:07:56.607Z"
+last_activity: 2026-06-23
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 7
   completed_plans: 7
-  percent: 31
+  percent: 40
 ---
 
 # Project State
@@ -25,10 +25,10 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 13 (knn-graph-primitive-feasibility-keystone) — COMPLETE
-Plan: 3 of 3 (all complete)
+Phase: 14
+Plan: Not started
 Status: Phase 13 complete (13-01, 13-02, 13-03 done) — PRIM-11 keystone GREEN
-Last activity: 2026-06-23 -- Completed 13-03-PLAN.md (KNN-graph prim keystone)
+Last activity: 2026-06-23
 Resume: next phase (UMAP — Phase 14) consumes knn_graph
 
 Progress: [███░░░░░░░] 31% (v3.0)
@@ -43,7 +43,7 @@ Progress: [███░░░░░░░] 31% (v3.0)
 
 **Velocity:**
 
-- Total plans completed: 51
+- Total plans completed: 54
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -58,6 +58,7 @@ Progress: [███░░░░░░░] 31% (v3.0)
 | 09 | 4 | - | - |
 | 10 | 6 | - | - |
 | 11 | 5 | - | - |
+| 13 | 3 | - | - |
 
 **Recent Trend:**
 
