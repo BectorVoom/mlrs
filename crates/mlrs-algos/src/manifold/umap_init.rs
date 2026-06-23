@@ -319,6 +319,12 @@ where
 /// Operates in place on the row-major `n × n_components` `coords`. If all coords
 /// are zero (degenerate), the expansion is skipped (no division by zero) and only
 /// the noise is applied — matching umap's `max(1, max|coords|)`-style guard.
+///
+/// IN-04: `n` and `n_components` exist SOLELY for the debug-build shape assertion
+/// (`debug_assert_eq!(coords.len(), n * n_components)`) — they are not used by the
+/// scaling/noise computation and are dead parameters in release builds. They are
+/// kept so callers carry the intended shape next to the buffer (a cheap
+/// debug-only invariant check), not because the routine needs them.
 pub fn noisy_scale_coords(
     coords: &mut [f64],
     n: usize,
