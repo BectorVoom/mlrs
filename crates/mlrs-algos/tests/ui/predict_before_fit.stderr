@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/predict_before_fit.rs:23:20
+   |
+23 |     consume_fitted(Umap::<f32, Unfit>::new());
+   |     -------------- ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Umap<f32, Fitted>`, found `Umap<f32>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected struct `Umap<f32, Fitted>`
+              found struct `Umap<f32, Unfit>`
+note: function defined here
+  --> tests/ui/predict_before_fit.rs:20:4
+   |
+20 | fn consume_fitted(_est: Umap<f32, Fitted>) {}
+   |    ^^^^^^^^^^^^^^ -----------------------

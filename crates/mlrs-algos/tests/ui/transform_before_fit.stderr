@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `Umap<f32>: mlrs_algos::typestate::Transform<f32>` is not satisfied
+  --> tests/ui/transform_before_fit.rs:20:24
+   |
+20 |     assert_transform::<Umap<f32, Unfit>>();
+   |                        ^^^^^^^^^^^^^^^^ the trait `mlrs_algos::typestate::Transform<f32>` is not implemented for `Umap<f32>`
+   |
+help: the trait `mlrs_algos::typestate::Transform<f32>` is not implemented for `Umap<f32, Unfit>`
+      but it is implemented for `Umap<f32, Fitted>`
+  --> src/manifold/umap.rs
+   |
+   | / impl<F> Transform<F> for Umap<F, Fitted>
+   | | where
+   | |     F: Float + CubeElement + Pod,
+   | |_________________________________^
+   = help: for that trait implementation, expected `Fitted`, found `Unfit`
+note: required by a bound in `assert_transform`
+  --> tests/ui/transform_before_fit.rs:17:24
+   |
+17 | fn assert_transform<T: Transform<f32>>() {}
+   |                        ^^^^^^^^^^^^^^ required by this bound in `assert_transform`
