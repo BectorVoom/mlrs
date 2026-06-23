@@ -83,6 +83,14 @@ pub enum Metric {
 /// `knn_memory_gate_query_axis_tiled`.
 const QUERY_TILE: usize = 8;
 
+/// The 2D cube edge length for the direct pairwise distance kernels — a single
+/// source for both launch axes (IN-03; previously hard-coded twice as `bx`/`by`
+/// in `launch_dims_2d`). The kernel doc-comment in `distance.rs` documents the
+/// matching `CubeDim {x:16, y:16}`; the kernel bounds-checks `i`/`j` regardless,
+/// so the two are decoupled for correctness — this constant just removes the
+/// silent magic-number duplication on the host side.
+const CUBE_DIM_2D: u32 = 16;
+
 /// Build the directed k-nearest-neighbour graph of the rows of `x` against
 /// themselves (X-vs-X), under `metric`.
 ///
@@ -466,8 +474,8 @@ fn validate_geometry(
 /// element `(i, j)`, `i` on `ABSOLUTE_POS_X` (query rows), `j` on `ABSOLUTE_POS_Y`
 /// (train rows). Ceiling-division over a 16×16 cube (matches distance.rs).
 fn launch_dims_2d(rows: usize, cols: usize) -> (CubeCount, CubeDim) {
-    let bx = 16u32;
-    let by = 16u32;
+    let bx = CUBE_DIM_2D;
+    let by = CUBE_DIM_2D;
     let cx = ((rows as u32) + bx - 1) / bx;
     let cy = ((cols as u32) + by - 1) / by;
     (
