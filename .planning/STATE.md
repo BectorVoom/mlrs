@@ -5,16 +5,16 @@ milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 14
 current_phase_name: umap
 status: gaps_found
-stopped_at: Completed 14-01-PLAN.md
-last_updated: "2026-06-23T21:11:12.163Z"
+stopped_at: Completed 14-07-PLAN.md
+last_updated: "2026-06-24T00:00:00.000Z"
 last_activity: 2026-06-24
-last_activity_desc: "Phase 14 verified: 4/4 criteria pass on cpu-MLIR, but criterion-3 "any backend" intent unmet"
+last_activity_desc: "14-07 gap-closure executed: fit layout owner-only (move_other=0) — CR-01 race + CR-03 double-count closed; awaiting re-verification"
 progress:
   total_phases: 5
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 14
-  completed_plans: 13
-  percent: 40
+  completed_plans: 14
+  percent: 60
 ---
 
 # Project State
@@ -28,13 +28,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 14 (umap) — GAPS FOUND (verification)
-Plan: 5 of 5 executed
-Status: Verification gaps_found — CR-01 parallel-backend kernel write race + CR-02 missing n_components<n guard (CR-03 force double-count). Phase NOT complete.
-Last activity: 2026-06-24 -- Phase 14 verified: 4/4 criteria pass on cpu-MLIR, but criterion-3 "any backend" intent unmet
-Resume: /gsd-plan-phase 14 --gaps  (then /gsd-execute-phase 14 --gaps-only)
+Phase: 14 (umap) — GAP-CLOSURE PLANS EXECUTED, awaiting re-verification
+Plan: 7 of 7 executed (gap-closure 14-06/14-07 complete)
+Status: Gap-closure done — 14-06 closed CR-02 (n_components<n guard); 14-07 closed CR-01 (parallel-backend write race) + CR-03 (force double-count) via owner-only move_other=0 fit launch. Phase NOT yet re-verified — orchestrator/verifier must confirm before marking complete.
+Last activity: 2026-06-24 -- 14-07 gap-closure executed: fit layout owner-only (move_other=0); D-05 byte-identity now holds on any parallel backend
+Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
 
-Progress: [███░░░░░░░] 31% (v3.0)
+Progress: [██████░░░░] 60% (v3.0)
 
 ## Open Follow-ups (Phase 05)
 
@@ -131,6 +131,7 @@ Progress: [███░░░░░░░] 31% (v3.0)
 | Phase 14 P04 | 75 | 3 tasks | 6 files |
 | Phase 14 P05 | 180 | 2 tasks | 4 files |
 | Phase 14 P06 | 3 | 2 tasks | 2 files |
+| Phase 14 P07 | 70 | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -256,6 +257,8 @@ Recent decisions affecting current work:
 - [Phase ?]: Fitted Umap retains x_train_ for transform's original-feature-space KNN
 - [Phase ?]: TRANSFORM_PROPERTY_EPS=0.15 calibrated separately from fit 0.02 (frozen reduced-context + RNG divergence; worst chebyshev +0.1448)
 - [Phase ?]: 14-06: Umap::fit guards n_components < n via typed AlgoError::InvalidNComponents before any device launch (mirrors SpectralEmbedding::fit), closing CR-02 recover underflow.
+- [Phase ?]: 14-07: fit layout owner-only (move_other=0) via FIT_MOVE_OTHER resolves CR-01 race + CR-03 double-count; D-05 holds on any parallel backend
+- [Phase ?]: 14-07: PROPERTY_EPS re-derived 0.02->0.03 (~12x worst trust margin 0.0025, <=0.04 ceiling); ARI_BAND stays 0.05; all 5 layout_property metrics green + reproducible_f64 byte-identical
 
 ### Pending Todos
 
@@ -287,7 +290,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23T21:10:45.641Z
+Last session: 2026-06-23T22:01:44.328Z
 Stopped at: Completed 14-01-PLAN.md
 Resume file: .planning/phases/14-umap/14-CONTEXT.md
 
