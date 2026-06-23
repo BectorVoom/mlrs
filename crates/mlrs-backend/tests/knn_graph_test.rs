@@ -406,14 +406,25 @@ fn knn_include_self_returns_self_at_col0() {
     idx_dev.release_into(&mut pool);
     val_dev.release_into(&mut pool);
 
+    // IN-01: dup_row_a / dup_row_b are loop-invariant — decode once above the loop.
+    let dup_a = case.expect_f64("dup_row_a")[0].round() as usize;
+    let dup_b = case.expect_f64("dup_row_b")[0].round() as usize;
+    // The two members of the duplicate pair are at distance 0 from each other, so
+    // under the LOWEST-INDEX tie-break BOTH rows pin the SAME col-0 index: the
+    // lower of the pair (IN-02 — assert the index strictly, not just distance~0).
+    let dup_col0 = dup_a.min(dup_b);
+
     for row in 0..N {
-        // Skip the duplicate rows: with a genuine distance-0 duplicate present,
-        // column 0 may be EITHER self or the duplicate (both at distance 0) — the
-        // lowest-index tie-break decides. The non-duplicate rows pin self@col0.
-        let dup_a = case.expect_f64("dup_row_a")[0].round() as usize;
-        let dup_b = case.expect_f64("dup_row_b")[0].round() as usize;
         if row == dup_a || row == dup_b {
-            // Either self or its duplicate is acceptable at col 0; distance is 0.
+            // Lowest-index tie-break: col 0 is the lower of the duplicate pair for
+            // BOTH members (IN-02 — strictly assert the winning index, not merely
+            // "either is acceptable"). Distance to that col-0 neighbour is ~0.
+            assert_eq!(
+                got_idx[row * K] as usize, dup_col0,
+                "include_self: dup row {row} col-0 must be the lower-index pair \
+                 member {dup_col0} (lowest-index tie-break), got {}",
+                got_idx[row * K]
+            );
             assert!(
                 got_dist[row * K].abs() <= DIST_TOL,
                 "include_self: dup row {row} col-0 distance must be ~0, got {:e}",
