@@ -20,10 +20,10 @@ Requirements for the v3.0 milestone. Each maps to a roadmap phase.
 
 ### UMAP
 
-- [ ] **UMAP-01**: User can fit UMAP (`fit` / `fit_transform`) to produce `embedding_` `(n, n_components)` with umap-learn/sklearn-named hyperparameters and defaults (`n_neighbors=15`, `n_components=2`, `metric='euclidean'`, `min_dist=0.1`, `spread=1.0`, `n_epochs=None`, `init='spectral'`, `random_state`, `learning_rate=1.0`, `set_op_mix_ratio=1.0`, `local_connectivity=1.0`, `repulsion_strength=1.0`, `negative_sample_rate=5`, `a`/`b` override), `min_dist ≤ spread` validated.
-- [ ] **UMAP-02**: UMAP's deterministic stages — KNN graph, fuzzy simplicial set (smooth-kNN `ρ`/`σ` binary search), fuzzy-set union, and spectral init (reusing the v2 graph-Laplacian + v1 eig stack; random-init fallback above the Jacobi size cap) — value-match `umap-learn` intermediates to ≤1e-5 (f64).
-- [ ] **UMAP-03**: UMAP's stochastic SGD layout (negative-sampling, new vertex-owner GATHER layout kernel) passes a property/structural gate vs `umap-learn` 0.5.12 — trustworthiness / kNN-overlap ≥ umap-learn − margin, downstream-ARI within band, and same-`random_state` reproducibility within mlrs — NOT coordinate value-match.
-- [ ] **UMAP-04**: User can embed new data via `transform(X_new)` against the fitted fuzzy graph, gated by a property sub-gate on the new points.
+- [x] **UMAP-01**: User can fit UMAP (`fit` / `fit_transform`) to produce `embedding_` `(n, n_components)` with umap-learn/sklearn-named hyperparameters and defaults (`n_neighbors=15`, `n_components=2`, `metric='euclidean'`, `min_dist=0.1`, `spread=1.0`, `n_epochs=None`, `init='spectral'`, `random_state`, `learning_rate=1.0`, `set_op_mix_ratio=1.0`, `local_connectivity=1.0`, `repulsion_strength=1.0`, `negative_sample_rate=5`, `a`/`b` override), `min_dist ≤ spread` validated.
+- [x] **UMAP-02**: UMAP's deterministic stages — KNN graph, fuzzy simplicial set (smooth-kNN `ρ`/`σ` binary search), fuzzy-set union, and spectral init (reusing the v2 graph-Laplacian + v1 eig stack; random-init fallback above the Jacobi size cap) — value-match `umap-learn` intermediates to ≤1e-5 (f64).
+- [x] **UMAP-03**: UMAP's stochastic SGD layout (negative-sampling, new vertex-owner GATHER layout kernel) passes a property/structural gate vs `umap-learn` 0.5.12 — trustworthiness / kNN-overlap ≥ umap-learn − margin, downstream-ARI within band, and same-`random_state` reproducibility within mlrs — NOT coordinate value-match.
+- [x] **UMAP-04**: User can embed new data via `transform(X_new)` against the fitted fuzzy graph, gated by a property sub-gate on the new points.
 
 ### HDBSCAN
 
@@ -80,10 +80,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | PRIM-11 | Phase 13 | Complete |
-| UMAP-01 | Phase 14 | Pending |
-| UMAP-02 | Phase 14 | Pending |
-| UMAP-03 | Phase 14 | Pending |
-| UMAP-04 | Phase 14 | Pending |
+| UMAP-01 | Phase 14 | Complete |
+| UMAP-02 | Phase 14 | Complete |
+| UMAP-03 | Phase 14 | Complete |
+| UMAP-04 | Phase 14 | Complete |
 | HDBS-01 | Phase 15 | Pending |
 | HDBS-02 | Phase 15 | Pending |
 | HDBS-03 | Phase 15 | Pending |
@@ -97,11 +97,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SHIM-03 | Phase 16 | Pending |
 
 **Coverage:**
+
 - v3.0 requirements: 16 total
 - Mapped to phases: 16 ✓
 - Unmapped: 0 ✓
 
 **Phase distribution:**
+
 - Phase 12 (Builder + Typestate Convention): BLDR-01, BLDR-02, BLDR-04 (3)
 - Phase 13 (KNN-Graph Primitive): PRIM-11 (1)
 - Phase 14 (UMAP): UMAP-01, UMAP-02, UMAP-03, UMAP-04 (4)

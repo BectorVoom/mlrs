@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 status: executing
-stopped_at: Phase 14 context gathered
-last_updated: "2026-06-23T10:41:13.736Z"
-last_activity: 2026-06-23 -- Phase 14 planning complete
+stopped_at: Completed 14-01-PLAN.md
+last_updated: "2026-06-23T11:01:32.240Z"
+last_activity: 2026-06-23 -- Phase 14 execution started
 progress:
   total_phases: 5
   completed_phases: 2
-  total_plans: 7
-  completed_plans: 7
+  total_plans: 12
+  completed_plans: 8
   percent: 40
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 13 — knn-graph-primitive-feasibility-keystone
+**Current focus:** Phase 14 — umap
 
 ## Current Position
 
-Phase: 14
-Plan: Not started
+Phase: 14 (umap) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
-Last activity: 2026-06-23 -- Phase 14 planning complete
+Last activity: 2026-06-23 -- Phase 14 execution started
 Resume: next phase (UMAP — Phase 14) consumes knn_graph
 
 Progress: [███░░░░░░░] 31% (v3.0)
@@ -122,6 +122,7 @@ Progress: [███░░░░░░░] 31% (v3.0)
 | Phase 13 P01 | 6 | 3 tasks (+1 Rule-1 fix commit) | 16 files |
 | Phase 13 P02 | 12 | 2 tasks | 3 files |
 | Phase 13 P03 | 7 | 2 tasks | 3 files |
+| Phase 14 P01 | 25 | 3 tasks | 27 files |
 
 ## Accumulated Context
 
@@ -238,6 +239,8 @@ Recent decisions affecting current work:
 - [Phase 07]: [07-02]: PRIM-06 rng.rs landed as pure host-side glue. SplitMix64 PROMOTED VERBATIM from kmeans.rs → prims/rng.rs (now `pub`, mix constants byte-frozen); kmeans.rs `use crate::prims::rng::SplitMix64` so kmeanspp/lloyd tests stay green (Pitfall 7 stream identity). Three generators added on next_f64/next_below, all generate-on-host → ONE DeviceArray::from_host upload (NO device kernel — dodges the cpu-MLIR SharedMemory/atomics landmines): gaussian_matrix = Box-Muller N(0,1/n_components) with a cached second sample so the stream is fully seed-determined (u1 floored to f64::MIN_POSITIVE so ln is finite); sparse_achlioptas_matrix = single-uniform branch [0,d/2)→+v/[d/2,d)→−v/[d,1)→0 with v=sqrt((1/density)/n_components), DENSE (D-12); permutation = unbiased Fisher-Yates via next_below(i+1), never next_u64()%n. ASVS-V5 guards reject n_components==0/n_features==0 and density∉(0,1] as typed PrimError::ShapeMismatch BEFORE allocation (PrimError has no InvalidDensity — synthetic "density" operand). 5 live rng_ tests green cpu: byte-IDENTICAL same-seed matrices (the PRIM-06 cpu==rocm hard gate, T-07-02), Gaussian mean≈0/var≈1/nc over 32768 samples, Achlioptas density≈0.25 + nonzeros exactly ±v, permutation bijection over 50 seeds × several n, and a D-10 PoolStats memory gate (allocations/live/peak conserved from iter 1 — host-generate-then-single-upload bounded). The `grep next_u64()% == 0` acceptance criterion is unsatisfiable under verbatim promotion (the promoted struct's OWN doc-comments warn against biased modulo — 3 matches, all doc-comments, no real call site); T-07-03 met via next_below (Rule-1 reconciliation). f64_to_host copied verbatim; host_to_f64 NOT copied (unused — generators write back to F only). rocm test target builds.
 - [Phase 07]: [07-01]: Wave-0 scaffold landed file-disjoint. `PartialFit<F>` added to traits.rs (D-01) mirroring `Fit<F>` exactly with the `Option<&DeviceArray>` y-slot RETAINED for Phase-10 MBSGD reuse; re-exported from lib.rs. AlgoError gained three guards: `InvalidDensity`(0,1], `InvalidBatchSize`≥1, and `InvalidEpsDistortion`(0,1) — the JL guard is NAMED `InvalidEpsDistortion` NOT `InvalidEps` because DBSCAN's `InvalidEps` (Phase-5) already occupies that variant; a duplicate is a compile error (the plan's grep-==3 criterion assumed `InvalidEps` was a new name). This plan OWNS the shared index: covariance/ + projection/ mod.rs stubs + lib.rs registration; prims::rng + prims::incremental_svd empty stub FILES (so THIS plan compiles; bodies filled by 07-02/03); decomposition::incremental_pca left COMMENTED (file created by 07-05). gen_oracle.py gained 4 generators (empirical_covariance full-rank+rank-deficient, ledoit_wolf two-n, incremental_pca whiten on/off, jl_min_dim grid) with 14 committed .npz blobs; LedoitWolf uses a CORRELATED low-rank+noise design so shrinkage_ is interior (~0.18/0.12) not the degenerate 1.0 pure standard_normal yields (Rule 2). Regen ran on SYSTEM python (sklearn 1.9.0 present, no /tmp venv needed). Six #[ignore] Nyquist test scaffolds assert fixture-load+shape only (no non-existent symbol); both test crates build --no-run on cpu; RNG_TRIALS=50 / JL_TRIALS=50 trial-count constants pinned (D-11). kmeanspp_test untouched.
 - [Phase 05]: [05-01]: Wave-0 scaffold landed file-disjoint. AlgoError is extended IN-PLACE with 6 Phase-5 hyperparameter guards (InvalidK/InvalidEps/InvalidMinSamples/InvalidL1Ratio/InvalidC/NotConverged) in the InvalidAlpha struct-variant style; traits.rs gains PredictLabels (i32 labels, D-05/D-06), KNeighbors ((F dist, i32 idx), D-07), PredictProba (F per-class, D-07). The scaffold OWNS lib.rs + prims/mod.rs + kernels/lib.rs registrations (pub mod for 5 kernels + 5 prims, no pub use until the symbol exists) so plans 02-06 fill exactly one kernel file + one prim file and never touch the shared index — empty doc-comment-only module body is a valid compiling stub. D-06 i32 DeviceArray CONFIRMED by a NON-ignored round-trip test (incl. -1 noise) — zero pool/bridge changes, so no later plan is surprised. gen_oracle.py gained 6 generators: gen_kmeans carries an INJECTED init array (D-09, Lloyd deterministic across numpy/Rust), gen_dbscan tuned eps=0.7/min_samples=4 for cluster+noise(-1)+border, gen_knn is ONE fixture serving NEIGH-01/02/03 with distinct distances (Pitfall 8), gen_lasso has 5 exact-zero coefficients (Pitfall 1), gen_logistic stores the symmetric over-parameterized softmax (multi coef 3×n_features) with predict_proba the PRIMARY gauge-invariant gate (Pitfall 5). 14 fixtures committed (regen needs /tmp venv numpy+scipy+sklearn, PEP 668). 14 #[ignore] oracle stubs (6 prim + 8 estimator) assert load_npz+shape only (NO non-existent symbol) so both test crates compile on cpu+rocm today.
+- [Phase 14]: Umap::Metric mirrors knn_graph::Metric (5 variants, Minkowski{p:f64}); Eq dropped, PartialEq kept
+- [Phase 14]: UMAP oracle fixtures dump umap-learn 0.5.12 OWN internals (f64-only); property thresholds left TODO for Plan 04 calibration
 
 ### Pending Todos
 
@@ -269,8 +272,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-23T10:09:07.891Z
-Stopped at: Phase 14 context gathered
+Last session: 2026-06-23T11:01:32.234Z
+Stopped at: Completed 14-01-PLAN.md
 Resume file: .planning/phases/14-umap/14-CONTEXT.md
 
 ## Operator Next Steps

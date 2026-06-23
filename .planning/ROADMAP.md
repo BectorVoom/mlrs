@@ -133,7 +133,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 Plans:
 **Wave 1**
 
-- [ ] 14-01-PLAN.md — Nyquist Wave 0: umap-learn 0.5.12 oracle fixtures (5 metrics × every stage) + RED value/property/reproducibility/transform harness + Metric→5 variants + umap_internals/umap_init module stubs
+- [x] 14-01-PLAN.md — Nyquist Wave 0: umap-learn 0.5.12 oracle fixtures (5 metrics × every stage) + RED value/property/reproducibility/transform harness + Metric→5 variants + umap_internals/umap_init module stubs
 
 **Wave 2** *(blocked on Wave 1; 02 & 03 file-disjoint, parallel)*
 
@@ -147,6 +147,7 @@ Plans:
 **Wave 4** *(blocked on Wave 3)*
 
 - [ ] 14-05-PLAN.md — transform(X_new) frozen-subset path (same kernel, move_other=false) + property sub-gate + replace stale zeros shell tests
+
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — (1) confirm the vertex-owner `umap_layout_step` single-owner GATHER kernel launches under cpu-MLIR (the named cpu-MLIR unknown; precedent: v2 two-pass SGD solver launched first try); (2) calibrate the property-gate thresholds (trustworthiness / kNN-overlap floors relative to umap-learn) empirically on the first oracle fixture run.
 
@@ -201,6 +202,6 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 11. Naive Bayes | v2.0 | 5/5 | Complete | 2026-06-22 |
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
-| 14. UMAP | v3.0 | 0/5 | Planned | - |
+| 14. UMAP | v3.0 | 1/5 | In Progress|  |
 | 15. HDBSCAN | v3.0 | 0/TBD | Not started | - |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |
