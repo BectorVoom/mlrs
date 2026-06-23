@@ -561,6 +561,23 @@ pub enum BuildError {
         min_dist: f64,
     },
 
+    /// `UMAP` was given an `n_components` of 0 — a degenerate embedding
+    /// dimensionality (Phase 12, UMAP-01, T-12-02). umap-learn requires
+    /// `n_components >= 1` (and `n_neighbors >= 1`); a value of 0 would produce a
+    /// silently-empty embedding. Rejected at `build()` (data-INDEPENDENT, the
+    /// D-08 split) — never at `fit`.
+    #[error(
+        "estimator '{estimator}': {param} = {value} is invalid (must be >= 1)"
+    )]
+    InvalidNComponents {
+        /// Which estimator's builder rejected the value (always `"umap"`).
+        estimator: &'static str,
+        /// Which hyperparameter was rejected (`"n_components"` / `"n_neighbors"`).
+        param: &'static str,
+        /// The offending value (0).
+        value: usize,
+    },
+
     /// `HDBSCAN` was given a `min_cluster_size` below 2 (Phase 12, HDBS-01,
     /// T-12-02). The minimum number of samples in a cluster must be `>= 2`; a
     /// smaller value is undefined. Rejected at `build()` (data-INDEPENDENT, the

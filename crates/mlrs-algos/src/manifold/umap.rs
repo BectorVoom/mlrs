@@ -319,6 +319,9 @@ impl UmapBuilder {
     ///
     /// - `min_dist` must be finite and `<= spread`
     ///   ([`BuildError::InvalidMinDist`]).
+    /// - `n_components >= 1` and `n_neighbors >= 1`
+    ///   ([`BuildError::InvalidNComponents`]); umap-learn rejects 0 for both, and
+    ///   `n_components = 0` would otherwise yield a silently-empty embedding.
     pub fn build<F>(self) -> Result<Umap<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
@@ -327,6 +330,20 @@ impl UmapBuilder {
             return Err(BuildError::InvalidMinDist {
                 estimator: "umap",
                 min_dist: self.min_dist,
+            });
+        }
+        if self.n_components == 0 {
+            return Err(BuildError::InvalidNComponents {
+                estimator: "umap",
+                param: "n_components",
+                value: self.n_components,
+            });
+        }
+        if self.n_neighbors == 0 {
+            return Err(BuildError::InvalidNComponents {
+                estimator: "umap",
+                param: "n_neighbors",
+                value: self.n_neighbors,
             });
         }
         Ok(Umap {
