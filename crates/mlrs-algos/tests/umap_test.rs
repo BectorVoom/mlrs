@@ -352,6 +352,11 @@ fn fit_embedding(
         .n_neighbors(10)
         .n_components(2)
         .metric(metric)
+        // Match the committed oracle, which was generated with
+        // `UMAP_N_EPOCHS = 200` (gen_oracle.py:946). The fit default would
+        // otherwise run 500 epochs against a 200-epoch umap reference (WR-04),
+        // making the calibration not like-for-like.
+        .n_epochs(Some(200))
         .random_state(random_state)
         .build::<f64>()
         .expect("umap builds")
@@ -987,6 +992,9 @@ fn run_transform_property(metric_tag: &str, metric: Metric) {
         .n_neighbors(n_neighbors)
         .n_components(2)
         .metric(metric)
+        // Match the committed transform oracle's `UMAP_N_EPOCHS = 200`
+        // (gen_oracle.py:946) instead of the 500-epoch fit default (WR-04).
+        .n_epochs(Some(200))
         .random_state(Some(42))
         .build::<f64>()
         .expect("umap builds")
