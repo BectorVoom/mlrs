@@ -196,7 +196,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register all 12 estimator `#[pyclass]` wrappers (PY-01). The pure-Python
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.
-    use estimators::cluster::{PyDBSCAN, PyKMeans};
+    use estimators::cluster::{PyDBSCAN, PyHDBSCAN, PyKMeans};
     use estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
     use estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
     use estimators::kernel::{PyKernelDensity, PyKernelRidge};
@@ -259,8 +259,10 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCategoricalNB>()?;
 
     // Phase-12 v3 builder + typestate convention-foundation shells (BLDR-04):
-    // UMAP (manifold), the first PyO3 shell over a consuming-`fit` typestate
-    // estimator (collapsed behind the additive `any_estimator_typestate!`).
+    // UMAP (manifold) + HDBSCAN (cluster), the first PyO3 shells over the
+    // consuming-`fit` typestate estimators (collapsed behind the additive
+    // `any_estimator_typestate!`).
     m.add_class::<PyUMAP>()?;
+    m.add_class::<PyHDBSCAN>()?;
     Ok(())
 }
