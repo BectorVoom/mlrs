@@ -44,6 +44,34 @@ use crate::error::{AlgoError, BuildError};
 use crate::manifold::{umap_init, umap_internals};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
+// ===========================================================================
+// Reproducibility-critical RNG stream separators (IN-03).
+//
+// These FIXED values are part of the D-05 byte-identical reproducibility
+// contract: the per-(seed, epoch, edge) negative-sampling substream and the
+// init scale are pure functions of `seed` mixed with these constants. CHANGING
+// ANY OF THEM ALTERS EVERY committed-seed output (and every fixture) with NO
+// compile error — they are deliberately named here so a future "cleanup"
+// cannot silently rotate them.
+// ===========================================================================
+
+/// Golden-ratio 64-bit odd multiplier (the SplitMix64 increment constant) used
+/// to mix `seed` into the per-(seed, epoch, edge) negative-sampling substream.
+/// FIXED — part of the D-05 byte-identical contract.
+const SUBSTREAM_SEED_MULT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Per-epoch stride multiplier folded into the negative-sampling substream
+/// (`epoch * SUBSTREAM_EPOCH_MULT`). A fixed, non-standard separator chosen so
+/// adjacent epochs land in well-separated substreams. FIXED — part of the D-05
+/// byte-identical contract.
+const SUBSTREAM_EPOCH_MULT: u64 = 0x1000_0001;
+
+/// XOR mask applied to `seed` to derive the init-noise stream key
+/// (`seed ^ INIT_SCALE_SEED_XOR`) so the layout init draws from a substream
+/// DISTINCT from the SGD negative sampling. FIXED — part of the D-05
+/// byte-identical contract. (`0x5350_4543` is the ASCII bytes `"SPEC"`.)
+const INIT_SCALE_SEED_XOR: u64 = 0x5350_4543;
+
 /// Distance metric for the UMAP neighbor graph (UMAP-01, full set — Phase 14).
 ///
 /// This MIRRORS `mlrs_backend::prims::knn_graph::Metric` EXACTLY (same variants,
@@ -801,8 +829,8 @@ fn transform_epoch_driver<F>(
             };
             if n_neg > 0 {
                 let sub_seed = seed
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    .wrapping_add((epoch as u64).wrapping_mul(0x1000_0001))
+                    .wrapping_mul(SUBSTREAM_SEED_MULT)
+                    .wrapping_add((epoch as u64).wrapping_mul(SUBSTREAM_EPOCH_MULT))
                     .wrapping_add(e as u64);
                 let mut rng = SplitMix64::new(sub_seed);
                 for _ in 0..n_neg {
@@ -1212,7 +1240,7 @@ where
     };
     // umap's separate post-init stage: scale to max-coord 10 + tiny noise.
     // Keyed off `seed` so the init is byte-deterministic (D-05).
-    umap_init::noisy_scale_coords(&mut init, n, n_components, 10.0, 1e-4, seed ^ 0x5350_4543);
+    umap_init::noisy_scale_coords(&mut init, n, n_components, 10.0, 1e-4, seed ^ INIT_SCALE_SEED_XOR);
 
     // --- (5) epochs_per_sample + n_epochs resolution (A4: 500 small / 200 large). ---
     let n_epochs = cfg.n_epochs.unwrap_or(if n <= 10_000 { 500 } else { 200 });
@@ -1339,8 +1367,8 @@ fn host_epoch_driver<F>(
             if n_neg > 0 {
                 // Deterministic per-(seed, epoch, edge) substream (D-05).
                 let sub_seed = seed
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    .wrapping_add((epoch as u64).wrapping_mul(0x1000_0001))
+                    .wrapping_mul(SUBSTREAM_SEED_MULT)
+                    .wrapping_add((epoch as u64).wrapping_mul(SUBSTREAM_EPOCH_MULT))
                     .wrapping_add(e as u64);
                 let mut rng = SplitMix64::new(sub_seed);
                 for _ in 0..n_neg {
