@@ -276,11 +276,32 @@ fn downstream_ari(labels_a: &[i64], labels_b: &[i64]) -> f64 {
 /// rows by index) + fixed 50 Lloyd iterations — fully deterministic so the
 /// downstream-ARI gate is reproducible (no sklearn / no device at test time).
 fn host_kmeans_labels(emb: &[f64], n: usize, dim: usize, k: usize) -> Vec<i64> {
-    // Init centroids from the first k rows (deterministic).
+    // Deterministic distinct-row init (IN-05): seeding from the literal first k
+    // rows leaves a centroid permanently empty when two of those rows COINCIDE
+    // (a collapsed/degenerate embedding), skewing the ARI gate. Instead pick k
+    // rows by scanning in index order and accepting a row only if it differs
+    // from every already-chosen centroid (farthest-first-style by index). If
+    // fewer than k distinct rows exist, fall back to padding with row 0 (the
+    // embedding is genuinely degenerate and the gate should reflect that).
+    let row_eq = |a: usize, b: usize| -> bool {
+        (0..dim).all(|d| emb[a * dim + d] == emb[b * dim + d])
+    };
+    let mut chosen: Vec<usize> = Vec::with_capacity(k);
+    for i in 0..n {
+        if chosen.len() == k {
+            break;
+        }
+        if !chosen.iter().any(|&c| row_eq(c, i)) {
+            chosen.push(i);
+        }
+    }
+    while chosen.len() < k {
+        chosen.push(0);
+    }
     let mut centroids: Vec<f64> = vec![0.0; k * dim];
-    for c in 0..k {
+    for (c, &src) in chosen.iter().enumerate() {
         for d in 0..dim {
-            centroids[c * dim + d] = emb[c * dim + d];
+            centroids[c * dim + d] = emb[src * dim + d];
         }
     }
     let mut labels = vec![0i64; n];
