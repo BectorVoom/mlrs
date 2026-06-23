@@ -10,7 +10,9 @@
 //! Per AGENTS.md §2 tests live in `crates/mlrs-algos/tests/`, never an in-source
 //! `#[cfg(test)] mod tests`.
 
-use mlrs_algos::typestate::{Fitted, State, Unfit};
+use std::marker::PhantomData;
+
+use mlrs_algos::typestate::{_state_phantom, Fitted, State, Unfit};
 
 /// Generic helper that compiles only if `S` satisfies the sealed [`State`]
 /// bound — invoking it for a type is a static proof of `State` membership.
@@ -38,4 +40,15 @@ fn typestate_module_is_importable() {
     // is wired into lib.rs and reachable as `mlrs_algos::typestate::*`.
     let _unfit = Unfit;
     let _fitted = Fitted;
+}
+
+#[test]
+fn state_phantom_helper_constructs_zero_sized_marker() {
+    // Exercise the doc-hidden `_state_phantom` downstream helper (IN-04) so the
+    // exported surface stays compiled-exercised rather than dead. It yields a
+    // zero-sized `PhantomData<S>` for any sealed `State`.
+    let unfit: PhantomData<Unfit> = _state_phantom::<Unfit>();
+    let fitted: PhantomData<Fitted> = _state_phantom::<Fitted>();
+    assert_eq!(std::mem::size_of_val(&unfit), 0);
+    assert_eq!(std::mem::size_of_val(&fitted), 0);
 }
