@@ -127,6 +127,15 @@ pub fn chebyshev_dist<F: Float + CubeElement>(
 
 /// Minkowski-`p` pairwise distance: `out[i*rows_y+j] = (sum_k |x_ik - y_jk|^p)^(1/p)`.
 ///
+/// # Precondition (caller obligation, WR-02)
+/// `p >= 1` is a HARD caller precondition: this kernel computes `inv_p = 1/p` with
+/// NO in-kernel positive-`p` guard (an in-kernel branch would risk a cpu-MLIR
+/// mis-lower and the host already validates `p` typed). A `p == 0` launch divides
+/// by zero (→ inf) and then `F::powf(acc, inv_p)` yields inf/NaN distances rather
+/// than a typed error. The ONLY supported launch path is through the validated
+/// `knn_graph` entry (`validate_geometry` rejects `p < 1` BEFORE any launch); do
+/// not launch this kernel directly with unchecked `p`.
+///
 /// The named cpu-MLIR feasibility unknown for this phase (VALIDATED spike 001):
 /// an in-kernel general-exponent power inside the feature-loop accumulator, then a
 /// final `^(1/p)` root. cpu-MLIR contract: BOTH powers use the STATIC associated
