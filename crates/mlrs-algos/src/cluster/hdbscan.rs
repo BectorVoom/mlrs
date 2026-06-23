@@ -256,6 +256,11 @@ impl HdbscanBuilder {
                 min_cluster_size: self.min_cluster_size,
             });
         }
+        // TODO(phase-15): validate min_samples (>= 1 when Some) and
+        // max_cluster_size (0 == unbounded, else >= min_cluster_size) here BEFORE
+        // the real device kernel lands — both are currently stored verbatim and
+        // unvalidated (WR-04). `AlgoError::InvalidMinSamples` is the precedent for
+        // the min_samples >= 1 guard.
         let min_samples = Some(self.min_samples.unwrap_or(self.min_cluster_size));
         Ok(Hdbscan {
             min_cluster_size: self.min_cluster_size,
