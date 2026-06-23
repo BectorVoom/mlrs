@@ -31,6 +31,11 @@ pub mod reduce;
 pub mod sgd;
 pub mod smoke;
 pub mod topk;
+// Phase-14 UMAP layout (UMAP-03): the ONE new device kernel of the phase —
+// `umap_layout_step` is a vertex-owner GATHER SGD step (cpu-MLIR-safe, frozen-
+// subset-capable, host-drawn negative samples). This file owns its `pub mod` +
+// `pub use` (file-disjoint, single-owner — the sgd/topk re-export precedent).
+pub mod umap_layout;
 
 pub use cholesky::cholesky_solve;
 // Phase-13 KNN-graph (PRIM-11): direct pairwise distance kernels + per-row
@@ -49,3 +54,7 @@ pub use reduce::{
     reduce_min_shared, reduce_sum_plane, reduce_sum_shared, reduce_sumsq_plane, reduce_sumsq_shared,
 };
 pub use smoke::saxpy_kernel;
+// Phase-14 UMAP layout SGD step (UMAP-03): the per-owner GATHER kernel the host
+// epoch driver in `manifold/umap.rs` launches each epoch (Plan 04) and the
+// `transform` frozen-subset path reuses (Plan 05).
+pub use umap_layout::umap_layout_step;
