@@ -75,7 +75,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 **Plans**: 4 plansPlans:
 **Wave 1**
 
-- [ ] 12-01-PLAN.md — typestate foundation: sealed `State` + `Unfit`/`Fitted` markers + consuming `Fit`/`Predict`/`Transform`/`PartialFit` traits (new module, `traits.rs` frozen) + trybuild dev-dep
+- [x] 12-01-PLAN.md — typestate foundation: sealed `State` + `Unfit`/`Fitted` markers + consuming `Fit`/`Predict`/`Transform`/`PartialFit` traits (new module, `traits.rs` frozen) + trybuild dev-dep — completed 2026-06-23 (3 commits, cpu-green; traits.rs byte-for-byte unchanged)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
