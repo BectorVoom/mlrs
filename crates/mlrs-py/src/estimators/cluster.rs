@@ -84,7 +84,7 @@ impl PyKMeans {
             _ => (8, DEFAULT_SEED, 300, 1e-4),
         };
         let fitted = py.detach(|| -> PyResult<AnyKMeans> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -109,7 +109,7 @@ impl PyKMeans {
     fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKMeans::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -125,14 +125,14 @@ impl PyKMeans {
     }
 
     fn cluster_centers_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyKMeans::F32(e) => e.cluster_centers(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("kmeans", "cluster_centers_ (f32)")),
         }
     }
     fn cluster_centers_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyKMeans::F64(e) => e.cluster_centers(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("kmeans", "cluster_centers_ (f64)")),
@@ -140,7 +140,7 @@ impl PyKMeans {
     }
     /// Fitted `labels_` (i32), either dtype arm.
     fn labels_(&self) -> PyResult<Vec<i32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyKMeans::F32(e) => e.labels(&pool).map_err(algo_err_to_py),
             AnyKMeans::F64(e) => e.labels(&pool).map_err(algo_err_to_py),
@@ -220,7 +220,7 @@ impl PyDBSCAN {
             _ => (0.5, 5),
         };
         let fitted = py.detach(|| -> PyResult<AnyDbscan> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -243,7 +243,7 @@ impl PyDBSCAN {
 
     /// Fitted `labels_` (i32, noise = -1), either dtype arm.
     fn labels_(&self) -> PyResult<Vec<i32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyDbscan::F32(e) => e.labels(&pool).map_err(algo_err_to_py),
             AnyDbscan::F64(e) => e.labels(&pool).map_err(algo_err_to_py),
@@ -252,7 +252,7 @@ impl PyDBSCAN {
     }
     /// Fitted `core_sample_indices_` (i32), either dtype arm.
     fn core_sample_indices_(&self) -> PyResult<Vec<i32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyDbscan::F32(e) => e.core_sample_indices(&pool).map_err(algo_err_to_py),
             AnyDbscan::F64(e) => e.core_sample_indices(&pool).map_err(algo_err_to_py),
