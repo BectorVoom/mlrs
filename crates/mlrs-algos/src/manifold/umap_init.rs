@@ -212,22 +212,33 @@ fn residual_and_grad(x: f64, y: f64, a: f64, b: f64) -> (f64, f64, f64) {
 /// `g_affinity` (`n × n`, row-major, device-resident). Reuses the EXISTING
 /// `laplacian` + `eig` + `recover` stack — NO re-derived Laplacian or eig.
 ///
-/// Pipeline (mirroring `spectral_embedding.rs:239-283`):
+/// Pipeline (mirroring `spectral_embedding.rs:239-283`, but with the diffusion
+/// recovery gated OFF — see the recovery note below):
 /// `laplacian(g, n)` `(L, dd)` → `eig(L)` (DESCENDING; `recover` reverses to
-/// ascending internally) → `recover(.., drop_first = true)` (slice smallest →
-/// `/dd` → sign-flip → drop the trivial ≈0 eigenvector) → [`noisy_scale_coords`]
-/// (`max = 10`, `noise = 1e-4`). Returns the row-major `n × n_components` coords.
+/// ascending internally) → `recover(.., drop_first = true, diffusion_recover =
+/// false)` (slice smallest → drop the trivial ≈0 eigenvector → transpose).
+/// Returns the row-major `n × n_components` RAW spectral coords — exactly umap's
+/// `spectral_layout` output, the value-gate target.
+///
+/// `noisy_scale_coords` (`max = 10`, `noise = 1e-4`) is umap's SEPARATE
+/// post-spectral stage (applied by `simplicial_set_embedding`, NOT
+/// `spectral_layout`), exposed as a standalone host helper for Plan 04's `fit`
+/// pipeline — applying it here would break the ≤1e-5 value-gate against the raw
+/// `spectral_layout` fixture.
 ///
 /// Cap + fallback (T-14-07): when `n > MAX_DIM (== 64)`, this returns
 /// [`random_init`] WITHOUT erroring or launching `eig` — umap's documented
 /// random-init fallback above the Jacobi cap (RESEARCH Pattern 4). All RNG draws
 /// are order-deterministic from `seed` (D-05 backbone; reused by Plan 04).
 ///
-/// Value-gate note (RESEARCH Q3/A3): umap's `spectral_layout` applies NO
-/// deterministic sign flip; `recover` does. The test therefore compares
-/// up-to-sign PER COLUMN, so the `recover` sign convention is preserved here
-/// (no `sign_flip` flag threaded into the shared `recover`, keeping the
-/// SpectralEmbedding/SpectralClustering callers untouched).
+/// Recovery note (RESEARCH Q3/A3, dump-diff confirmed): umap's `spectral_layout`
+/// decomposes the SAME `I − D^-1/2 A D^-1/2` Laplacian but returns the RAW
+/// eigenvectors — NO `/dd` diffusion recovery and NO deterministic sign flip
+/// (the dump-diff measured the `/dd` path mismatching umap by ~0.2 and the raw
+/// path matching to ≤1e-6). So the shared `recover` is called with
+/// `diffusion_recover = false`; the spectral-family callers keep
+/// `diffusion_recover = true` and stay bit-identical. The value-gate still
+/// compares up-to-sign per column (eigenvectors are sign-arbitrary).
 pub fn spectral_init<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     g_affinity: &DeviceArray<ActiveRuntime, F>,
@@ -264,18 +275,21 @@ where
         .collect();
     v_desc.release_into(pool);
 
-    // --- Post-eig recovery (reuse the shared host `recover`, drop_first = true):
-    //     slice smallest → /dd → sign-flip → drop the trivial ≈0 eigenvector →
-    //     transpose → row-major n × n_components. ---
-    let mut coords: Vec<f64> = recover::<F>(&v_host, &dd_host, n, n_components, true)
-        .into_iter()
-        .map(host_to_f64)
-        .collect();
-
-    // --- umap noisy_scale_coords(max=10, noise=1e-4) post-spectral scaling. ---
-    noisy_scale_coords(&mut coords, n, n_components, 10.0, 1e-4, seed);
-
-    Ok(coords.into_iter().map(f64_to_host::<F>).collect())
+    // --- Post-eig recovery (reuse the shared host `recover`, drop_first = true,
+    //     diffusion_recover = FALSE): slice smallest → drop the trivial ≈0
+    //     eigenvector → transpose → row-major n × n_components. umap's
+    //     `spectral_layout` returns the RAW symmetric-Laplacian eigenvectors with
+    //     NO /dd recovery and NO sign flip (dump-diff: /dd mismatches umap by
+    //     ~0.2, raw matches ≤1e-6 — RESEARCH Q3/A3 confirmed empirically), so the
+    //     diffusion-recovery family is gated OFF for the UMAP path. The shared
+    //     `recover` keeps the spectral-family callers bit-identical (they pass
+    //     `diffusion_recover = true`). ---
+    // NOTE: noisy_scale_coords is NOT applied here (it is umap's separate
+    // post-spectral stage; applying it would break the ≤1e-5 gate vs the raw
+    // spectral_layout fixture). `seed` is retained in the signature for the
+    // n > 64 random fallback above and for Plan 04's call-site symmetry.
+    let _ = seed;
+    Ok(recover::<F>(&v_host, &dd_host, n, n_components, true, false))
 }
 
 /// umap `noisy_scale_coords` (RESEARCH Pattern 4): expand the coords so the max

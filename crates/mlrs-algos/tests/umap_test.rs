@@ -561,13 +561,29 @@ fn run_spectral_init(metric_tag: &str, metric: Metric) {
     let coords = case.expect_f64("coords");
     let cshape = case.shape("coords").expect("coords shape");
     let (n, k) = (cshape[0] as usize, cshape[1] as usize);
-    let (x, nx, d) = upload_x(&mut pool, &case, "X");
+    let (_x, nx, _d) = upload_x(&mut pool, &case, "X");
     assert_eq!(nx, n, "X and coords agree on n");
-    let _embedding = fit_embedding(&mut pool, &x, n, d, metric, Some(42));
+    // `metric` is unused for spectral init — the fixture carries the symmetric
+    // fuzzy graph COO directly (Plan 02 owns the X → graph metric path).
+    let _ = metric;
 
-    // RED-by-design: no spectral-init stage yet. Plan 03 produces the spectral
-    // coords; compare each column up-to-sign against `coords` ≤1e-5.
-    let produced = vec![0.0f64; n * k]; // placeholder: Plan 03 spectral_init
+    // Reconstruct umap's spectral_layout INPUT: the symmetric fuzzy graph
+    // (graph.maximum(graph.T)) the fixture dumped as COO rows/cols/vals. Build
+    // the dense n×n affinity and upload it, then drive the real spectral_init.
+    let g_rows = case.expect_f64("rows");
+    let g_cols = case.expect_f64("cols");
+    let g_vals = case.expect_f64("vals");
+    let mut affinity = vec![0.0f64; n * n];
+    for e in 0..g_vals.len() {
+        let r = g_rows[e].round() as usize;
+        let c = g_cols[e].round() as usize;
+        affinity[r * n + c] = g_vals[e];
+    }
+    let g_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &affinity);
+
+    use mlrs_algos::manifold::umap_init;
+    let produced = umap_init::spectral_init::<f64>(&mut pool, &g_dev, n, k, 42)
+        .unwrap_or_else(|e| panic!("spectral_init {metric_tag}: {e}"));
     for c in 0..k {
         // Up-to-sign per column: pick the sign minimizing the abs error.
         let mut err_pos = 0.0f64;
@@ -581,7 +597,7 @@ fn run_spectral_init(metric_tag: &str, metric: Metric) {
         let col_err = err_pos.min(err_neg);
         assert!(
             col_err <= F64_TOL.abs,
-            "spectral_init {metric_tag} col {c}: up-to-sign err {col_err} > {} (RED until Plan 03)",
+            "spectral_init {metric_tag} col {c}: up-to-sign err {col_err} > {}",
             F64_TOL.abs
         );
     }

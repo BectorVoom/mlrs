@@ -1107,8 +1107,22 @@ def gen_umap_spectral(
     # symmetric affinity, so use it directly as umap's spectral_layout input).
     g = graph.maximum(graph.transpose()).tocoo()
     n_components = 2
+    # umap's spectral_layout defaults its ARPACK eigsh solver to `tol=1e-4`
+    # (`tol or 1e-4` inside `_spectral_layout`), so its eigenvectors carry up to
+    # ~4e-5 iterative error vs the EXACT eigenvectors of the same Laplacian. mlrs
+    # uses an EXACT dense Jacobi `eig`, so the ≤1e-5 value-gate is only meaningful
+    # against near-exact umap coords. Pass a machine-tight `tol` (and a generous
+    # `maxiter`) so umap's OWN spectral_layout converges to the exact eigenvectors
+    # — still umap's own internal, just at full precision (RESEARCH Q4 / borderline
+    # value-gate boundary). `0.0` would re-trigger the 1e-4 default via `tol or`.
+    sym = graph.maximum(graph.transpose())
     coords = spectral_layout(
-        x, graph.maximum(graph.transpose()), n_components, _np.random.RandomState(seed)
+        x,
+        sym,
+        n_components,
+        _np.random.RandomState(seed),
+        tol=1e-12,
+        maxiter=20000,
     )
 
     dtype_tag = _UMAP_DTYPE_TAG[dtype]

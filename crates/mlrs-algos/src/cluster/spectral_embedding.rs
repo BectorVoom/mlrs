@@ -280,7 +280,7 @@ where
         // WR-06: drop_first = TRUE for SpectralEmbedding (D-08) — drop the trivial
         // ≈0 eigenvector. Shared recovery helper (was the local recover_embedding).
         let embedding_host =
-            recover::<F>(&v_host, &dd_host, n_samples, self.n_components, true);
+            recover::<F>(&v_host, &dd_host, n_samples, self.n_components, true, true);
         let embedding_dev = DeviceArray::from_host(pool, &embedding_host);
 
         // --- Re-fit buffer reuse (WR-07): release a prior embedding allocation

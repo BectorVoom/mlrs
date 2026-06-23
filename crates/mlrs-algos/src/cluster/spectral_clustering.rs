@@ -304,7 +304,8 @@ where
         //     SC) → transpose into the n × n_components `maps`. ---
         // WR-06: drop_first = FALSE for SpectralClustering (D-11) — KEEP the trivial
         // ≈0 eigenvector as a KMeans feature. Shared recovery helper (was recover_maps).
-        let maps_host = recover::<F>(&v_host, &dd_host, n_samples, n_components, false);
+        let maps_host =
+            recover::<F>(&v_host, &dd_host, n_samples, n_components, false, true);
         let maps_dev = DeviceArray::from_host(pool, &maps_host);
 
         // --- v1 KMeans on the embedding (D-10): KMeans::new (kmeans++, n_init=1;

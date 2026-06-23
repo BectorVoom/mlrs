@@ -44,18 +44,33 @@ use crate::error::AlgoError;
 ///   - `false` → slice the smallest `n_components` eigenvectors, keep ALL rows
 ///     `0..n_components` (SpectralClustering, D-11).
 ///
+/// `diffusion_recover` selects the post-slice transform family (Plan 14-03):
+///   - `true`  → the sklearn `_spectral_embedding` recovery: `/dd` diffusion-map
+///     scaling (D-07) followed by the deterministic per-row sign flip. This is
+///     what `SpectralEmbedding`/`SpectralClustering` need (their pinned sklearn
+///     reference applies BOTH).
+///   - `false` → return the RAW eigenvectors of the symmetric-normalized
+///     Laplacian unchanged (no `/dd`, no sign flip). This is what umap-learn's
+///     `spectral_layout` returns — it decomposes the SAME `I − D^-1/2 A D^-1/2`
+///     but uses `eigenvectors[:, order]` directly, with no diffusion recovery and
+///     no sign convention (verified by dump-diff: the `/dd` path mismatches umap
+///     by ~0.2, the raw path matches to ≤1e-6 — RESEARCH Q3/A3 confirmed empirically).
+///
 /// ORDER (load-bearing — a wrong order fails the value/label match):
 ///   1. slice the smallest `m` eigenvectors (ascending; the `r`-th smallest is
 ///      descending column `n - 1 - r`) into an `m × n` array;
-///   2. `emb[r][i] /= dd[i]` — the `D^-1/2` recovery, BEFORE the sign flip (D-07);
-///   3. `_deterministic_vector_sign_flip` per ROW (argmax|row| → sign → multiply);
+///   2. (`diffusion_recover` only) `emb[r][i] /= dd[i]` — the `D^-1/2` recovery,
+///      BEFORE the sign flip (D-07);
+///   3. (`diffusion_recover` only) `_deterministic_vector_sign_flip` per ROW
+///      (argmax|row| → sign → multiply);
 ///   4. keep rows per `drop_first`; transpose → row-major `n × n_components`.
-pub(crate) fn recover<F>(
+pub fn recover<F>(
     v_host: &[f64],
     dd: &[f64],
     n: usize,
     n_components: usize,
     drop_first: bool,
+    diffusion_recover: bool,
 ) -> Vec<F>
 where
     F: Float + CubeElement + Pod,
@@ -79,31 +94,38 @@ where
         }
     }
 
-    // 2. /dd recovery (D-07) — BEFORE the sign flip. dd is the Laplacian's
-    //    returned degree vector (NOT a fresh sqrt).
-    for r in 0..m {
-        for i in 0..n {
-            emb[r * n + i] /= dd[i];
-        }
-    }
-
-    // 3. _deterministic_vector_sign_flip on the m × n array (per ROW): the
-    //    largest-magnitude element of each eigenvector is made positive
-    //    (sklearn extmath, exact). Lowest-index tie-break on equal magnitudes.
-    for r in 0..m {
-        let row = &emb[r * n..(r + 1) * n];
-        let mut max_idx = 0usize;
-        let mut max_abs = row[0].abs();
-        for (i, &val) in row.iter().enumerate().skip(1) {
-            if val.abs() > max_abs {
-                max_abs = val.abs();
-                max_idx = i;
+    // Steps 2-3 are the sklearn `_spectral_embedding` DIFFUSION recovery, applied
+    // only when `diffusion_recover` is set. umap-learn's `spectral_layout` skips
+    // BOTH (it returns the raw symmetric-Laplacian eigenvectors) — gating them
+    // keeps the spectral-family callers bit-identical while letting the UMAP path
+    // reuse the slice + drop-first + transpose (RESEARCH Q3/A3).
+    if diffusion_recover {
+        // 2. /dd recovery (D-07) — BEFORE the sign flip. dd is the Laplacian's
+        //    returned degree vector (NOT a fresh sqrt).
+        for r in 0..m {
+            for i in 0..n {
+                emb[r * n + i] /= dd[i];
             }
         }
-        let sign = if emb[r * n + max_idx] < 0.0 { -1.0 } else { 1.0 };
-        if sign < 0.0 {
-            for i in 0..n {
-                emb[r * n + i] = -emb[r * n + i];
+
+        // 3. _deterministic_vector_sign_flip on the m × n array (per ROW): the
+        //    largest-magnitude element of each eigenvector is made positive
+        //    (sklearn extmath, exact). Lowest-index tie-break on equal magnitudes.
+        for r in 0..m {
+            let row = &emb[r * n..(r + 1) * n];
+            let mut max_idx = 0usize;
+            let mut max_abs = row[0].abs();
+            for (i, &val) in row.iter().enumerate().skip(1) {
+                if val.abs() > max_abs {
+                    max_abs = val.abs();
+                    max_idx = i;
+                }
+            }
+            let sign = if emb[r * n + max_idx] < 0.0 { -1.0 } else { 1.0 };
+            if sign < 0.0 {
+                for i in 0..n {
+                    emb[r * n + i] = -emb[r * n + i];
+                }
             }
         }
     }
