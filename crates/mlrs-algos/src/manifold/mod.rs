@@ -14,4 +14,12 @@
 
 pub mod umap;
 
+// Plan-02/03 homes, pre-declared EMPTY in Plan 14-01 so the two Wave-2 plans
+// fill their own file WITHOUT both editing this `mod.rs` (file-disjoint,
+// parallel-safe). `umap_internals` = host numerics (smooth-kNN/membership/union,
+// + transform helper in Plan 05); `umap_init` = a/b LM fit + spectral/random
+// init. Both are `pub(crate)` — internal stages, not part of the public surface.
+pub(crate) mod umap_init;
+pub(crate) mod umap_internals;
+
 pub use umap::Umap;

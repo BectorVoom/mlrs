@@ -38,13 +38,32 @@ use mlrs_core::PrimError;
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
-/// Distance metric for the UMAP neighbor graph (UMAP-01 subset). Only
-/// `Euclidean` carries meaning in the Phase-12 shell (the trivial fit ignores
-/// the metric); the full umap-learn metric set is filled in Phase 14.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Distance metric for the UMAP neighbor graph (UMAP-01, full set — Phase 14).
+///
+/// This MIRRORS `mlrs_backend::prims::knn_graph::Metric` EXACTLY (same variants,
+/// same `Minkowski { p: f64 }` payload — D-01 / PATTERNS Pitfall 4) so UMAP's
+/// `metric=`/`p` map straight onto the KNN-graph prim with no lossy conversion.
+/// The `Metric → knn_graph::Metric` mapping fn is added at the KNN call site in
+/// Plan 04 (not here).
+///
+/// `Minkowski { p: f64 }` carries a non-`Eq` `f64`, so this enum derives
+/// `PartialEq` but NOT `Eq`; `hyperparams_eq` compares via `PartialEq`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Metric {
-    /// Euclidean (L2) distance — umap-learn's `metric='euclidean'` default.
+    /// L2 (Euclidean) — umap-learn's `metric='euclidean'` default.
     Euclidean,
+    /// L1 (Manhattan) — umap-learn's `metric='manhattan'`.
+    Manhattan,
+    /// Cosine distance `1 − x̂·ŷ` — umap-learn's `metric='cosine'`.
+    Cosine,
+    /// L∞ (Chebyshev) — umap-learn's `metric='chebyshev'`.
+    Chebyshev,
+    /// Minkowski-`p` — umap-learn's `metric='minkowski'` with `p=` exponent
+    /// (validated `>= 1` host-side at the KNN call site in Plan 04).
+    Minkowski {
+        /// The Minkowski exponent (matches `knn_graph::Metric::Minkowski.p`).
+        p: f64,
+    },
 }
 
 /// Initialization strategy for the low-dimensional embedding (UMAP-01 subset).
