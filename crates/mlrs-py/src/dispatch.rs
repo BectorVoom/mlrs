@@ -87,6 +87,10 @@
 ///     F64(mlrs_algos::cluster::KMeans<f64>),
 /// }
 /// ```
+// IN-05: `any_estimator!` and `any_estimator_typestate!` below are identical
+// except for the two fitted-arm type spellings (the typestate variant spells the
+// `Fitted` state argument explicitly). Any field/derive change to one MUST be
+// mirrored in the other until they are unified behind an optional `state:` token.
 #[macro_export]
 macro_rules! any_estimator {
     (
@@ -147,6 +151,9 @@ macro_rules! any_estimator {
 ///     F64(mlrs_algos::manifold::umap::Umap<f64, mlrs_algos::typestate::Fitted>),
 /// }
 /// ```
+// IN-05: byte-for-byte clone of `any_estimator!` above except for the two fitted
+// arms (which spell `<f32/f64, mlrs_algos::typestate::Fitted>` explicitly). Keep
+// the `Unfit { .. }` arm and matcher in sync with `any_estimator!` by hand.
 #[macro_export]
 macro_rules! any_estimator_typestate {
     (
