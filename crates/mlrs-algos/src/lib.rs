@@ -55,6 +55,12 @@ pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;
 pub mod traits;
+// NEW typestate-aware surface (D-03/D-05/D-06/D-07). Deliberately NOT
+// glob-re-exported alongside `traits::*` below: the trait names collide with the
+// frozen `traits` surface, so consumers reach these via the explicit
+// `mlrs_algos::typestate::` path (e.g. `use mlrs_algos::typestate::Fit;`) to
+// keep the two surfaces from colliding at one call site (Pitfall 1, D-07).
+pub mod typestate;
 
 // Re-export the estimator surface so downstream crates/tests write
 // `use mlrs_algos::{Fit, PartialFit, Predict, Transform, PredictLabels,
