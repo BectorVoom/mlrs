@@ -103,7 +103,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 **Plans**: 3 plansPlans:
 **Wave 1**
 
-- [ ] 13-01-PLAN.md — Nyquist Wave 0: per-metric sklearn oracle fixtures (incl. duplicate-point design) + knn_graph_test.rs harness (set-equal index, dup-point VALUE assert, geometry-rejection, query-axis memory gate) + kernel/prim module scaffolds
+- [x] 13-01-PLAN.md — Nyquist Wave 0: per-metric sklearn oracle fixtures (incl. duplicate-point design) + knn_graph_test.rs harness (set-equal index, dup-point VALUE assert, geometry-rejection, query-axis memory gate) + kernel/prim module scaffolds ✅ 2026-06-23 (RED-by-design pending 13-03)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -183,7 +183,7 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 10. SGD / Linear-SVM | v2.0 | 6/6 | Complete | 2026-06-21 |
 | 11. Naive Bayes | v2.0 | 5/5 | Complete | 2026-06-22 |
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
-| 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 0/TBD | Not started | - |
+| 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 1/3 | In Progress | - |
 | 14. UMAP | v3.0 | 0/TBD | Not started | - |
 | 15. HDBSCAN | v3.0 | 0/TBD | Not started | - |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |

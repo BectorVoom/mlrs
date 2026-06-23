@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
-status: planning
-stopped_at: Completed 12-04-PLAN.md (PyO3 typestate collapse — PyUMAP/PyHDBSCAN, BLDR-04). Phase 12 all plans complete.
-last_updated: "2026-06-23T04:00:58.367Z"
-last_activity: 2026-06-23 -- Gathered Phase 13 context; user-directed multi-metric scope expansion (PRIM-11/ROADMAP/PROJECT updated)
+status: executing
+stopped_at: Completed 13-01-PLAN.md (KNN-graph Nyquist Wave-0 harness — per-metric oracle fixtures, RED knn_graph_test.rs, distance+knn_graph scaffolds). Plan 1 of 3 complete.
+last_updated: "2026-06-23T04:11:56Z"
+last_activity: 2026-06-23 -- Completed 13-01-PLAN.md
 progress:
   total_phases: 5
-  completed_phases: 0
-  total_plans: 4
-  completed_plans: 4
-  percent: 20
+  completed_phases: 1
+  total_plans: 7
+  completed_plans: 5
+  percent: 24
 ---
 
 # Project State
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 13 — knn-graph-primitive-feasibility-keystone (context gathered; ready to spike/plan)
+**Current focus:** Phase 13 — knn-graph-primitive-feasibility-keystone
 
 ## Current Position
 
-Phase: 13 (knn-graph-primitive-feasibility-keystone) — CONTEXT GATHERED
-Plan: none yet (Phase 12 plans 01–04 complete)
-Status: Phase 13 context captured; SPIKE BEFORE PLANNING flagged (multi-metric direct distance kernels + Minkowski-p pow under cpu-MLIR)
-Last activity: 2026-06-23 -- Gathered Phase 13 context; user-directed multi-metric scope expansion (PRIM-11/ROADMAP/PROJECT updated)
-Resume: .planning/phases/13-knn-graph-primitive-feasibility-keystone/13-CONTEXT.md
+Phase: 13 (knn-graph-primitive-feasibility-keystone) — EXECUTING
+Plan: 2 of 3
+Status: Executing Phase 13 (13-01 complete)
+Last activity: 2026-06-23 -- Completed 13-01-PLAN.md (Nyquist Wave-0 harness)
+Resume: .planning/phases/13-knn-graph-primitive-feasibility-keystone/13-02-PLAN.md
 
-Progress: [██░░░░░░░░] 20% (v3.0)
+Progress: [██░░░░░░░░] 24% (v3.0)
 
 ## Open Follow-ups (Phase 05)
 
@@ -118,6 +118,7 @@ Progress: [██░░░░░░░░] 20% (v3.0)
 | Phase 11 P05 | 13 | 2 tasks | 5 files |
 | Phase 12 P01 | 3 | 3 tasks | 5 files |
 | Phase 12 P03 | 12 | 1 task | 5 files |
+| Phase 13 P01 | 6 | 3 tasks (+1 Rule-1 fix commit) | 16 files |
 
 ## Accumulated Context
 
@@ -126,6 +127,7 @@ Progress: [██░░░░░░░░] 20% (v3.0)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [13-01]: KNN-graph oracle fixtures carry the metric tag in the FILENAME only — never an in-blob numpy string array — because `mlrs_core::load_npz` decodes only 4/8-byte float arrays and returns `InvalidData` on any other dtype (a string `metric` array would silently break every consuming Rust test). The float `p` field carries the only metric-dependent scalar. Fixtures live at workspace-root `tests/fixtures/` (the `_FIXTURE_DIR` / `fixture()` resolver location), not crate-relative. PRIM-11 stays Pending until plan 13-03 lands `Metric`+`knn_graph` and turns `knn_graph_test.rs` GREEN.
 - [v3.0 roadmap]: Adopted Variant A (all four research streams converged) — builder *convention* leads (Phase 12: BLDR-01/02/04) so UMAP/HDBSCAN are born builder-fronted; KNN-graph prim is the feasibility keystone, landed + standalone-gated before consumers (Phase 13: PRIM-11); UMAP (Phase 14) and HDBSCAN (Phase 15) are file-disjoint and parallel-buildable after Phase 13; the broad 30-estimator builder retrofit sweep (BLDR-03) + full Python shim coverage (SHIM-*) are isolated to the last phase (Phase 16) as the one parallel-unsafe edit. BLDR is deliberately split across Phase 12 (convention) and Phase 16 (retrofit). Three spike-before-planning flags: PRIM-11 KNN symmetrize map on cpu-MLIR (P13); UMAP umap_layout_step vertex-owner GATHER on cpu-MLIR + property-gate threshold calibration vs umap-learn (P14); HDBSCAN host-MST tie-breaking exactness vs the reference (P15). Gates threaded through every phase: cpu(f64)+rocm(f32) with f64-on-rocm skip-with-log, per-phase build-failing PoolStats memory gate, tests separated from source, zero new compute dependencies.
 
 - [12-01]: NEW `mlrs_algos::typestate` surface authored (D-03/D-05/D-06/D-07) — the v3 builder foundation. A private `mod sealed { pub trait Sealed {} }` seals `pub trait State: sealed::Sealed` so the lifecycle-state set is CLOSED (downstream cannot `impl State for Evil`, T-12-01); the two inhabitants are the ZST markers `pub struct Unfit;` (freshly built) and `pub struct Fitted;` (predict/transform/accessors live here only). The four lifecycle traits mirror the FROZEN `traits.rs` names but change signatures: `Fit<F>` has `type Fitted` + consuming `fn fit(self, ..) -> Result<Self::Fitted, AlgoError>` (D-05); `Predict<F>`/`Transform<F>` borrow `&self` returning a `DeviceArray` (identical to legacy except module path); `PartialFit<F>` has `type Fitted` + consuming `partial_fit(self, ..)` declared as the MULTI-TRANSITION (Unfit→Fitted→Fitted) Phase-16 streaming target, DEFINED-BUT-UNUSED this phase (D-06). KEY DECISION: `lib.rs` registers `pub mod typestate;` but deliberately does NOT glob-re-export `typestate::*` alongside the legacy `pub use traits::{Fit, .., Transform};` — the names collide, so consumers reach the new surface via the explicit `use mlrs_algos::typestate::Fit;` path (Pitfall 1, D-07). `traits.rs` is byte-for-byte UNCHANGED (`git diff` empty across all three commits, T-12-02) — full `cargo build -p mlrs-algos --features cpu` proves all 30 existing estimators still compile against the untouched legacy surface. Added `trybuild = "1.0.117"` dev-dep (dtolnay, legitimacy-audited, dev-only no build.rs) for the Plan 03 compile-fail gate (D-11). Smoke test (typestate_test.rs) green cpu 3/3: markers are ZSTs (`size_of==0`), satisfy the sealed `State` bound (via a generic `assert_state<S: State>()`), module importable. Commits 30a0220 (feat: module+lib.rs) / 139a3db (chore: trybuild) / fc9f914 (test: smoke). No deviations — executed exactly as written. Wave gate satisfied: Plans 02/03/04 are file-disjoint and may now import `mlrs_algos::typestate::*`.
