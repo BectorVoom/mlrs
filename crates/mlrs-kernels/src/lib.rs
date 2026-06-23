@@ -33,6 +33,10 @@ pub mod smoke;
 pub mod topk;
 
 pub use cholesky::cholesky_solve;
+// Phase-13 KNN-graph (PRIM-11): direct pairwise distance kernels + per-row
+// index-identity self-drop GATHER. Plan 13-02 owns this re-export (file-disjoint,
+// single-owner) alongside the kernel bodies in `distance.rs`.
+pub use distance::{chebyshev_dist, manhattan_dist, minkowski_dist, self_drop_gather};
 pub use elementwise::{
     center_columns, clamp_nonneg, degree_guard, dist_combine_clamp, div_by_row, kde_cosine_map,
     kde_epanechnikov_map, kde_exponential_map, kde_gaussian_map, kde_linear_map, kde_tophat_map,

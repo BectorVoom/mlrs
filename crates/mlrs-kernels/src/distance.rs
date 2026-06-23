@@ -162,3 +162,62 @@ pub fn minkowski_dist<F: Float + CubeElement>(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Self-drop-by-index-identity GATHER kernel (cpu-MLIR-safe; VALIDATED spike-002).
+//
+// Input is the `top_k(k+1)` result (ascending `(val, idx)` per row); output is the
+// `k` true neighbours with the self column (the slot whose index == the query row)
+// removed — the `include_self=false` UMAP path (D-02: drop by INDEX IDENTITY, not
+// first-zero-distance, so a duplicate point at distance 0 is handled correctly).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-row self-drop GATHER: removes the index-identity self column from a
+/// `top_k(k+1)` result, emitting the `k` true neighbours per row.
+///
+/// cpu-MLIR contract (two VALIDATED landmines this kernel must NOT trip):
+/// - **002-A (loud):** launch via `CUBE_POS_X` / `UNIT_POS_X == 0u32` (one cube per
+///   query row, one selecting unit) — NEVER a bare 1D `ABSOLUTE_POS` launch, which
+///   is a loud MLIR pass failure (the kernel never runs and reads back zeros).
+/// - **002-B (silent):** the per-output-slot shift is recomputed LOCALLY via a
+///   nested count inside the consuming `while` (`src = s + #self-cols-at-cols-<=-s`)
+///   — NEVER a flag/counter written in one `while` and read in a separate sibling
+///   `while` (that silently miscompiles under the cube macro).
+///
+/// Fallback (R-3): if self is absent from the top-`(k+1)` (shouldn't happen for
+/// X-vs-X), `bump` stays 0 for every `s` so `src = s`, dropping the last column `k`.
+/// Uses only `u32`/`F` accumulators and STATEMENT-form `if`; no mutable bool, no
+/// SharedMemory, no infinity constant.
+#[cube(launch)]
+pub fn self_drop_gather<F: Float + CubeElement>(
+    in_val: &Array<F>,
+    in_idx: &Array<u32>,
+    out_val: &mut Array<F>,
+    out_idx: &mut Array<u32>,
+    rows: u32,
+    k: u32,
+    k1: u32, // k + 1
+) {
+    let row = CUBE_POS_X;
+    if row < rows {
+        if UNIT_POS_X == 0u32 {
+            let ibase = row * k1;
+            let obase = row * k;
+            let mut s = 0u32;
+            while s < k {
+                let mut bump = 0u32;
+                let mut c = 0u32;
+                while c < s + 1u32 {
+                    if in_idx[(ibase + c) as usize] == row {
+                        bump += 1u32;
+                    }
+                    c += 1u32;
+                }
+                let src = s + bump;
+                out_val[(obase + s) as usize] = in_val[(ibase + src) as usize];
+                out_idx[(obase + s) as usize] = in_idx[(ibase + src) as usize];
+                s += 1u32;
+            }
+        }
+    }
+}
