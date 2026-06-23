@@ -868,7 +868,30 @@ def gen_knn_metric(
     nn = NearestNeighbors(
         n_neighbors=k_query, algorithm="brute", metric=metric, p=p_arg
     ).fit(x)
-    distances, indices = nn.kneighbors(x)  # X-vs-X, ascending; col 0 = self
+    # Enforce the mlrs lowest-index tie-break as the CANONICAL oracle rule so the
+    # committed fixtures are derivable from THIS generator (not hand-patched) and
+    # the index gate stays INDEPENDENT of the prim's own selection (CR-01/CR-02).
+    #
+    # A plain lexsort of sklearn's k+1 result is NOT enough: at a BOUNDARY tie
+    # (two points equidistant at the (k+1)-th slot, e.g. chebyshev row 25 where
+    # indices 0 and 4 are both at the cutoff distance) sklearn arbitrarily returns
+    # ONE of them, so reordering the already-returned set cannot recover the
+    # lowest-index member. We therefore over-fetch ALL neighbours, then per row
+    # select the first k+1 by a global lexicographic key (primary: distance,
+    # secondary: neighbour index). This deterministically resolves every tie —
+    # including boundary membership — to the lowest index, reproducing the prim's
+    # documented convention from an independent rule.
+    nn_all = NearestNeighbors(
+        n_neighbors=x.shape[0], algorithm="brute", metric=metric, p=p_arg
+    ).fit(x)
+    dist_all, idx_all = nn_all.kneighbors(x)
+    distances = np.empty((x.shape[0], k_query), dtype=dist_all.dtype)
+    indices = np.empty((x.shape[0], k_query), dtype=idx_all.dtype)
+    for r in range(x.shape[0]):
+        order = np.lexsort((idx_all[r], dist_all[r]))  # primary=distance, secondary=index
+        sel = order[:k_query]
+        distances[r] = dist_all[r][sel]
+        indices[r] = idx_all[r][sel]
 
     def c(arr):
         return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
