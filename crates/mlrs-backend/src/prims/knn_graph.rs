@@ -81,6 +81,11 @@ pub enum Metric {
 /// per-tile scratch is released-then-reused (the free-list serves it, so
 /// `reuses` grows and `live_bytes` conserves). Tuned against
 /// `knn_memory_gate_query_axis_tiled`.
+///
+/// IN-04: small-`n` safety is handled at the use site by `QUERY_TILE.min(n - r0)`
+/// (the loop in `knn_graph`), which clamps the per-tile row count to the rows
+/// remaining — so `n < QUERY_TILE` simply yields a single short tile, never an
+/// over-read.
 const QUERY_TILE: usize = 8;
 
 /// The 2D cube edge length for the direct pairwise distance kernels — a single
