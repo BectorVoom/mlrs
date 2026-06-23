@@ -354,6 +354,22 @@ pub enum AlgoError {
         reason: String,
     },
 
+    /// A cross-module invariant carried across a host round-trip was violated at
+    /// a consumption boundary — e.g. a KNN neighbour index that should be `< n`
+    /// (the Phase-13 prim guarantee) was found `>= n` when consumed by the UMAP
+    /// fuzzy-graph affinity write. Surfaced as a typed error rather than a silent
+    /// out-of-bounds host write / panic so a future KNN-prim regression (or a NaN
+    /// float-encoded index whose `round()` yields a huge value) is caught at the
+    /// boundary instead of corrupting memory (T-14-05 / ASVS V5). Carries an
+    /// honest reason string describing the violated invariant.
+    #[error("estimator '{estimator}': invalid graph input — {reason}")]
+    InvalidGraphInput {
+        /// Which estimator detected the violation (e.g. `"umap"`).
+        estimator: &'static str,
+        /// The invariant-violation reason (e.g. `"knn index 17 >= n_samples 16"`).
+        reason: String,
+    },
+
     /// A primitive-layer failure (geometry / squareness / convergence /
     /// non-SPD pivot) surfaced from a `mlrs-backend` prim call the estimator
     /// composed. Transparent `#[from]` so estimator methods can `?` a prim

@@ -1135,6 +1135,20 @@ where
             // behaviour) — no error.
             let mut affinity = vec![0.0f64; n * n];
             for e in 0..g_vals.len() {
+                // Bounds check at the COO-consumption boundary (WR-01): the
+                // Phase-13 prim guarantees `cols < n`, but that is an unchecked
+                // cross-module invariant carried across a host round-trip. A
+                // regression (or a NaN float-encoded index) would otherwise be a
+                // silent OOB write; surface it as a typed error instead.
+                if g_rows[e] >= n || g_cols[e] >= n {
+                    return Err(AlgoError::InvalidGraphInput {
+                        estimator: "umap",
+                        reason: format!(
+                            "fuzzy-graph edge ({}, {}) out of range for n_samples {}",
+                            g_rows[e], g_cols[e], n
+                        ),
+                    });
+                }
                 affinity[g_rows[e] * n + g_cols[e]] = g_vals[e];
             }
             let aff_f: Vec<F> = affinity.iter().map(|&v| f64_to_host::<F>(v)).collect();
