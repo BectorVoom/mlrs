@@ -623,10 +623,12 @@ fn ab_fit() {
     assert_eq!(min_dist.len(), spread.len(), "grid parallel arrays");
     assert_eq!(a.len(), b.len(), "a/b parallel arrays");
 
-    // RED-by-design: no host LM a/b fit yet. Plan 03 lands `fit_ab(min_dist,
-    // spread) -> (a, b)`; assert each grid point ≤1e-5.
+    // Plan 03: drive the real host LM a/b fit and assert each grid point ≤1e-5
+    // vs umap-learn `find_ab_params`.
+    use mlrs_algos::manifold::umap_init;
     for g in 0..a.len() {
-        let (produced_a, produced_b) = (0.0f64, 0.0f64); // placeholder: Plan 03 fit_ab
+        let (produced_a, produced_b) = umap_init::fit_ab(min_dist[g], spread[g])
+            .unwrap_or_else(|e| panic!("fit_ab grid {g}: {e}"));
         assert!(
             mlrs_core::is_close(produced_a, a[g], &F64_TOL),
             "ab_fit grid {g} (min_dist={}, spread={}): a {} != umap {} (RED until Plan 03)",
