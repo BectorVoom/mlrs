@@ -1,15 +1,20 @@
-error[E0308]: mismatched types
-  --> tests/ui/predict_before_fit.rs:23:20
+error[E0277]: the trait bound `Umap<f32>: mlrs_algos::typestate::Transform<f32>` is not satisfied
+  --> tests/ui/predict_before_fit.rs:29:29
    |
-23 |     consume_fitted(Umap::<f32, Unfit>::new());
-   |     -------------- ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Umap<f32, Fitted>`, found `Umap<f32>`
-   |     |
-   |     arguments to this function are incorrect
+29 |     assert_fitted_surface::<Umap<f32, Unfit>>();
+   |                             ^^^^^^^^^^^^^^^^ the trait `mlrs_algos::typestate::Transform<f32>` is not implemented for `Umap<f32>`
    |
-   = note: expected struct `Umap<f32, Fitted>`
-              found struct `Umap<f32, Unfit>`
-note: function defined here
-  --> tests/ui/predict_before_fit.rs:20:4
+help: the trait `mlrs_algos::typestate::Transform<f32>` is not implemented for `Umap<f32, Unfit>`
+      but it is implemented for `Umap<f32, Fitted>`
+  --> src/manifold/umap.rs
    |
-20 | fn consume_fitted(_est: Umap<f32, Fitted>) {}
-   |    ^^^^^^^^^^^^^^ -----------------------
+   | / impl<F> Transform<F> for Umap<F, Fitted>
+   | | where
+   | |     F: Float + CubeElement + Pod,
+   | |_________________________________^
+   = help: for that trait implementation, expected `Fitted`, found `Unfit`
+note: required by a bound in `assert_fitted_surface`
+  --> tests/ui/predict_before_fit.rs:26:29
+   |
+26 | fn assert_fitted_surface<T: Transform<f32>>() {}
+   |                             ^^^^^^^^^^^^^^ required by this bound in `assert_fitted_surface`
