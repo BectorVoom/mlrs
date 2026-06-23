@@ -222,7 +222,17 @@ pub fn self_drop_gather<F: Float + CubeElement>(
                     }
                     c += 1u32;
                 }
-                let src = s + bump;
+                // WR-03: clamp the source column into the (k+1)-wide row so a
+                // self index that (unexpectedly) appears more than once cannot push
+                // `src = s + bump` past the row end (`in_idx[ibase + k + 1]`) — an
+                // OOB device read for the last row. For the single-self-occurrence
+                // X-vs-X invariant `src < k1` always holds, so this clamp is inert
+                // there; it is defense-in-depth, not a behavior change. STATEMENT-
+                // form mutable-`if` guard (cpu-MLIR-safe, no if-expr in value pos).
+                let mut src = s + bump;
+                if src >= k1 {
+                    src = k1 - 1u32;
+                }
                 out_val[(obase + s) as usize] = in_val[(ibase + src) as usize];
                 out_idx[(obase + s) as usize] = in_idx[(ibase + src) as usize];
                 s += 1u32;
