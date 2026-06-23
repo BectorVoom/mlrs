@@ -424,7 +424,14 @@ For each metric ∈ {euclidean, manhattan, cosine, chebyshev, minkowski(p)}, gen
 | A4 | `n_epochs=None` → 500 for n≤10000 (verified), and the small-fixture property gate uses the same default | Discretion / verified | Low risk — verified from source; threshold is 10000. |
 | A5 | Host LM (Gauss-Newton with LM damping) on the 300-point curve hits a/b ≤1e-5 vs scipy `curve_fit` | D-06 / §Standard Stack | If LM doesn't converge tightly, a/b gate fails. Mitigate: the curve is smooth/well-conditioned; LM with analytic Jacobian is standard. ASSUMED — validate on first fixture. |
 
-## Open Questions
+## Open Questions (RESOLVED — routed to the spike / plans during planning)
+
+> All four are substantively addressed by the Phase-14 plans; none is a blocking planning unknown.
+> Resolution map: Q1 → Plan 03 connected-fixture design (defer `multi_component_layout`); Q2 →
+> Plan 05 Task 1 (`distance`+`top_k` in-estimator composition); Q3 → Plan 03 Task 2 (empirical
+> up-to-sign / `recover`-flag choice, whichever passes the ≤1e-5 gate); Q4 → Plan 04 Task 3
+> (calibrate ε / ARI band on the first oracle-fixture run, record in 14-VALIDATION.md).
+
 1. **Disconnected-component spectral init.** umap-learn's `spectral_layout` delegates to `multi_component_layout` when the fuzzy graph has >1 connected component. The v2 `SpectralEmbedding` assumes connected.
    - What we know: the existing `laplacian`+`eig`+`recover` path handles the single-component case exactly; the zero-degree guard prevents NaN.
    - What's unclear: whether any value-gate fixture will be disconnected, and whether matching umap's per-component layout is required for ≤1e-5.
