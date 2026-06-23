@@ -51,6 +51,7 @@ pub mod density;
 pub mod error;
 pub mod kernel_ridge;
 pub mod linear;
+pub mod manifold;
 pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;
