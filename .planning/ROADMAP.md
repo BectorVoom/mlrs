@@ -107,7 +107,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 13-02-PLAN.md — new cpu-MLIR-safe device kernels: manhattan/chebyshev/minkowski direct pairwise distance (STATIC F::powf) + self_drop_gather (index-identity, CUBE_POS_X shape) + launch smoke test
+- [x] 13-02-PLAN.md — new cpu-MLIR-safe device kernels: manhattan/chebyshev/minkowski direct pairwise distance (STATIC F::powf) + self_drop_gather (index-identity, CUBE_POS_X shape) + launch smoke test ✅ 2026-06-23 (launch-proven cpu f32+f64 / rocm f32)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 

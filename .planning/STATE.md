@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 status: executing
-stopped_at: Completed 13-01-PLAN.md (KNN-graph Nyquist Wave-0 harness — per-metric oracle fixtures, RED knn_graph_test.rs, distance+knn_graph scaffolds). Plan 1 of 3 complete.
-last_updated: "2026-06-23T04:11:56Z"
-last_activity: 2026-06-23 -- Completed 13-01-PLAN.md
+stopped_at: Completed 13-02-PLAN.md (KNN-graph device kernels — manhattan/chebyshev/minkowski direct pairwise + self_drop_gather, re-exported from mlrs-kernels, launch-proven under cpu f32+f64 / rocm f32). Plan 2 of 3 complete.
+last_updated: "2026-06-23T04:19:55Z"
+last_activity: 2026-06-23 -- Completed 13-02-PLAN.md
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 7
-  completed_plans: 5
-  percent: 24
+  completed_plans: 6
+  percent: 27
 ---
 
 # Project State
@@ -26,12 +26,12 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 13 (knn-graph-primitive-feasibility-keystone) — EXECUTING
-Plan: 2 of 3
-Status: Executing Phase 13 (13-01 complete)
-Last activity: 2026-06-23 -- Completed 13-01-PLAN.md (Nyquist Wave-0 harness)
-Resume: .planning/phases/13-knn-graph-primitive-feasibility-keystone/13-02-PLAN.md
+Plan: 3 of 3
+Status: Executing Phase 13 (13-01, 13-02 complete)
+Last activity: 2026-06-23 -- Completed 13-02-PLAN.md (KNN-graph device kernels)
+Resume: .planning/phases/13-knn-graph-primitive-feasibility-keystone/13-03-PLAN.md
 
-Progress: [██░░░░░░░░] 24% (v3.0)
+Progress: [███░░░░░░░] 27% (v3.0)
 
 ## Open Follow-ups (Phase 05)
 
@@ -119,6 +119,7 @@ Progress: [██░░░░░░░░] 24% (v3.0)
 | Phase 12 P01 | 3 | 3 tasks | 5 files |
 | Phase 12 P03 | 12 | 1 task | 5 files |
 | Phase 13 P01 | 6 | 3 tasks (+1 Rule-1 fix commit) | 16 files |
+| Phase 13 P02 | 12 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -127,6 +128,7 @@ Progress: [██░░░░░░░░] 24% (v3.0)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [13-02]: The four new KNN-graph device kernels (manhattan/chebyshev/minkowski direct pairwise + self_drop_gather) are transcribed VERBATIM from the VALIDATED Phase-13 spikes 001/002 — Minkowski uses STATIC `F::powf` for both the per-term power and the `1/p` root (the named cpu-MLIR unknown, now landed); self_drop_gather uses the `CUBE_POS_X`/`UNIT_POS_X==0` per-row shape with a self-contained nested-count shift (no cross-sibling accumulator) to avoid the 002-A loud and 002-B silent miscompiles. Because `mlrs-kernels` is backend-feature-free (no `cpu`/`rocm` feature → no `ActiveRuntime`), the launch smoke test MUST live in `mlrs-backend/tests/` (mirrors `spike_test.rs`); the kernels crate is build-verified bare, the cpu-MLIR launch proof runs via `cargo test -p mlrs-backend --features cpu`. Launch-proven green on cpu(f32+f64) and rocm(f32; f64 skip-with-log). PRIM-11 still Pending until 13-03 lands `Metric`+`knn_graph` and turns the oracle harness GREEN.
 - [13-01]: KNN-graph oracle fixtures carry the metric tag in the FILENAME only — never an in-blob numpy string array — because `mlrs_core::load_npz` decodes only 4/8-byte float arrays and returns `InvalidData` on any other dtype (a string `metric` array would silently break every consuming Rust test). The float `p` field carries the only metric-dependent scalar. Fixtures live at workspace-root `tests/fixtures/` (the `_FIXTURE_DIR` / `fixture()` resolver location), not crate-relative. PRIM-11 stays Pending until plan 13-03 lands `Metric`+`knn_graph` and turns `knn_graph_test.rs` GREEN.
 - [v3.0 roadmap]: Adopted Variant A (all four research streams converged) — builder *convention* leads (Phase 12: BLDR-01/02/04) so UMAP/HDBSCAN are born builder-fronted; KNN-graph prim is the feasibility keystone, landed + standalone-gated before consumers (Phase 13: PRIM-11); UMAP (Phase 14) and HDBSCAN (Phase 15) are file-disjoint and parallel-buildable after Phase 13; the broad 30-estimator builder retrofit sweep (BLDR-03) + full Python shim coverage (SHIM-*) are isolated to the last phase (Phase 16) as the one parallel-unsafe edit. BLDR is deliberately split across Phase 12 (convention) and Phase 16 (retrofit). Three spike-before-planning flags: PRIM-11 KNN symmetrize map on cpu-MLIR (P13); UMAP umap_layout_step vertex-owner GATHER on cpu-MLIR + property-gate threshold calibration vs umap-learn (P14); HDBSCAN host-MST tie-breaking exactness vs the reference (P15). Gates threaded through every phase: cpu(f64)+rocm(f32) with f64-on-rocm skip-with-log, per-phase build-failing PoolStats memory gate, tests separated from source, zero new compute dependencies.
 
