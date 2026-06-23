@@ -447,6 +447,23 @@ where
         // data-INDEPENDENT params were validated at build()).
         validate_geometry(x, shape)?;
 
+        // Data-DEPENDENT `n_components < n` guard mirroring the sibling
+        // `SpectralEmbedding::fit` (spectral_embedding.rs:155). With the default
+        // `Init::Spectral`, `run_umap_layout → spectral_init → spectral::recover`
+        // needs the smallest `n_components + 1` eigenvectors (drop_first) and
+        // computes `col = n - 1 - r` with `r` up to `n_components`; when
+        // `n_components + 1 > n` (i.e. `n_components >= n`) that underflows
+        // `usize` → panic (debug) / OOB device read (release). Reject the bad
+        // input BEFORE any device launch as a typed error (CR-02 / ASVS V5).
+        // The lower bound (`n_components >= 1`) is already enforced at build().
+        if self.n_components >= n {
+            return Err(AlgoError::InvalidNComponents {
+                estimator: "umap",
+                requested: self.n_components,
+                max: n.saturating_sub(1),
+            });
+        }
+
         let embedding_host = run_umap_layout::<F>(pool, x, n, p, &self)?;
         let embedding = DeviceArray::from_host(pool, &embedding_host);
 
