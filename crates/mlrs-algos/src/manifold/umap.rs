@@ -616,13 +616,9 @@ where
     let n = embedding_train.len() / n_components;
 
     // Host f64 copies of the query (new) and the training design rows. The
-    // training X is NOT retained on the fitted estimator (umap retains it via the
-    // KNN search index; here the query-vs-train KNN needs the raw train rows), so
-    // it is reconstructed by re-reading… — but the fitted shell does not keep X.
-    // Instead transform receives X_new only and uses the FITTED embedding as the
-    // frozen target; the query-vs-train KNN runs new-vs-train in the ORIGINAL
-    // feature space, which requires the training X. The estimator therefore keeps
-    // the training design rows for transform (see `x_train_` below).
+    // query-vs-train KNN runs new-vs-train in the ORIGINAL feature space, which
+    // requires the training X, so the estimator retains the training design rows
+    // on the fitted shell (`x_train_`, read below) alongside the frozen embedding.
     let x_new_host: Vec<f64> = x_new.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
     let x_train_host: Vec<f64> = cfg
         .x_train_

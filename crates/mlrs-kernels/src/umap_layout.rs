@@ -20,7 +20,10 @@
 //! The kernel takes `n_owners` (the count of contiguous OWNER rows at the FRONT
 //! of `embedding`) and writes only `embedding[owner]`; every non-owner vertex is
 //! a read-only GATHER target. `fit` launches with `owners = all n`,
-//! `move_other = 1` (two-sided). `transform` (Plan 05) launches the SAME kernel
+//! `move_other = 0` (owner-only — REVIEW CR-01 option b: the symmetric fuzzy COO
+//! carries both endpoints of every undirected pair, so owner-only still covers
+//! both directions while eliminating the cross-cube WRITE-WRITE race; see
+//! `umap.rs::FIT_MOVE_OTHER`). `transform` (Plan 05) launches the SAME kernel
 //! with `owners = m new points placed contiguously` and `move_other = 0` so the
 //! trained coordinates stay frozen.
 //!
