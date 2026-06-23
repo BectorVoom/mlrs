@@ -4,18 +4,18 @@ reviewed: 2026-06-23T00:00:00Z
 depth: standard
 files_reviewed: 7
 files_reviewed_list:
+  - crates/mlrs-kernels/src/distance.rs
+  - crates/mlrs-kernels/src/lib.rs
   - crates/mlrs-backend/src/prims/knn_graph.rs
   - crates/mlrs-backend/src/prims/mod.rs
   - crates/mlrs-backend/tests/knn_graph_test.rs
   - crates/mlrs-backend/tests/self_drop_gather_test.rs
-  - crates/mlrs-kernels/src/distance.rs
-  - crates/mlrs-kernels/src/lib.rs
   - scripts/gen_oracle.py
 findings:
-  critical: 2
+  critical: 0
   warning: 5
   info: 4
-  total: 11
+  total: 9
 status: issues_found
 ---
 
@@ -28,232 +28,165 @@ status: issues_found
 
 ## Summary
 
-The KNN-graph primitive (PRIM-11) is a host orchestrator composing the launch-proven
-`distance`/`top_k` prims with three new cpu-MLIR-safe direct distance kernels
-(manhattan/chebyshev/minkowski) and a self-drop GATHER kernel. The kernel authoring
-respects the documented cpu-MLIR contract (no SharedMemory / Atomic / infinity / mutable-bool
-scan; statement-form running max; static `F::powf`; per-row GATHER launch shape). The
-Cosine `1−cos` math, the Euclidean deferred-sqrt boundary, the index-identity self-drop, and
-the host-side geometry validation are all correct as written.
+Reviewed the KNN-graph primitive (PRIM-11): the three direct pairwise distance
+kernels (`manhattan_dist` / `chebyshev_dist` / `minkowski_dist`) and the
+`self_drop_gather` index-identity GATHER kernel in `mlrs-kernels`, the
+`knn_graph` host orchestrator in `mlrs-backend`, the two test harnesses, and the
+Phase-13 additions to the oracle generator.
 
-Two BLOCKERs dominate the assessment, both touching the integrity of the oracle gate this
-phase is supposed to be the keystone of:
+The numerics and the cpu-MLIR authoring contract are followed carefully, and the
+self-drop index-identity logic (the load-bearing 002-B catch) is correct under
+trace. No BLOCKER-class correctness or security defect was found this pass:
+geometry is validated host-side before every `unsafe` launch, all kernels
+bounds-check their indices, the Euclidean/Cosine GEMM-vs-direct routing is
+internally consistent (squared-select + boundary sqrt for L2, halved squared for
+Cosine), and the over-fetch global-lexsort oracle rule is a sound independent
+reference that resolves boundary-membership ties to the documented lowest-index
+convention.
 
-1. **The chebyshev fixtures were hand-regenerated outside the canonical generator**
-   (`scripts/gen_oracle.py` was NOT updated). Re-running the documented regeneration tool
-   silently REVERTS the committed fixture, reintroducing the tie-break divergence the GREEN
-   commit fixed. The committed blob and the generator that is supposed to produce it now disagree.
-
-2. **The chebyshev fixture was patched to match the prim's tie-break rather than an independent
-   oracle.** Combined with the set-based index assertion, this weakens the chebyshev gate's
-   ability to catch a real boundary miscompile.
-
-The remaining findings are robustness / honesty-of-comment / dead-code items.
-
-## Critical Issues
-
-### CR-01: Chebyshev oracle fixtures are unreproducible — `gen_oracle.py` does not produce the committed blobs
-
-**File:** `scripts/gen_oracle.py:814-897` (`gen_knn_metric`); committed blobs `tests/fixtures/knn_chebyshev_f{32,64}_seed42.npz`
-**Issue:**
-Commit `7f73d4e` regenerated `knn_chebyshev_f32_seed42.npz` and `knn_chebyshev_f64_seed42.npz`
-"with a stable (lowest-index) argsort so the oracle matches the PRIM-11 convention", but it
-did **not** change `gen_oracle.py`. The generator still does:
-
-```python
-nn = NearestNeighbors(n_neighbors=k_query, algorithm="brute", metric=metric, p=p_arg).fit(x)
-distances, indices = nn.kneighbors(x)   # sklearn's arbitrary boundary-tie order
-...
-np.savez(out_path, ..., distances=c(distances), indices=c(indices), ...)
-```
-
-`sklearn.NearestNeighbors.kneighbors` does NOT guarantee a lowest-index tie-break at a
-distance boundary (the commit message itself documents row 25 of chebyshev getting idx 4 from
-sklearn vs idx 0 under lowest-index). The module docstring declares this script the
-"*canonical* regeneration tool" whose output is "checked in so CI never runs this script."
-Running `python3 scripts/gen_oracle.py` today will OVERWRITE the hand-patched chebyshev blobs
-with sklearn-tie-order blobs, reverting the fix and turning the chebyshev oracle test red (or,
-worse, leaving a divergent blob that someone re-commits). The committed artifact is no longer
-derivable from the committed generator — a reproducibility/data-integrity defect on the phase
-keystone.
-
-**Fix:** Encode the lowest-index tie-break in the generator so the committed blob is
-reproducible. After `kneighbors`, re-sort each row by `(distance, index)` lexicographically
-for ALL metrics (a stable secondary key on the neighbour index), e.g.:
-
-```python
-distances, indices = nn.kneighbors(x)
-# Lowest-index tie-break: stable lexsort by (distance, neighbour index) per row so the
-# committed oracle matches the PRIM-11 top_k convention and is reproducible by this script.
-for r in range(distances.shape[0]):
-    order = np.lexsort((indices[r], distances[r]))  # primary=distance, secondary=index
-    distances[r] = distances[r][order]
-    indices[r] = indices[r][order]
-```
-
-Then re-run the generator and confirm the committed chebyshev blobs are byte-identical to the
-hand-patched ones; commit the generator change alongside. (This also future-proofs the other
-four metrics against the same latent divergence the commit message says it "audited" manually.)
-
-### CR-02: Chebyshev gate compares against a fixture edited to match the implementation, not an independent oracle
-
-**File:** `crates/mlrs-backend/tests/knn_graph_test.rs:144-168` (set comparison); fixture provenance per commit `7f73d4e`
-**Issue:**
-`check_knn_metric` asserts per-row index **set** equality (`BTreeSet`) and sorted-distance
-equality. At a `k+1` distance boundary a tie means one tied index is inside the window and one
-is outside; changing the tie-break therefore changes the **set** membership, not merely the
-ordering. The chebyshev fixture was regenerated specifically so its boundary index matches the
-prim's lowest-index pick. Because the fixture was conformed to the implementation's tie-break
-(and per CR-01 that re-sort lives only as a one-off edit, not in the generator), the chebyshev
-oracle no longer independently verifies the prim's boundary selection: if the prim's tie-break
-were itself miscompiled to (say) "lowest index" by accident vs. by design, the hand-edited
-fixture would still agree. The phase's stated purpose is an INDEPENDENT sklearn oracle; for
-chebyshev that independence has been partially traded away to make the gate green.
-
-The distance-value assertion still provides SOME protection (the sorted distance vectors must
-match within 1e-5, and a wrong-index pick at the boundary generally also perturbs the distance
-multiset). But the index gate specifically is now circular for the tied-boundary case.
-
-**Fix:** Land CR-01 (put the lowest-index lexsort in the generator) so the fixture is derived
-by an INDEPENDENT rule (lexicographic `(distance, index)`) rather than copied from the prim's
-output, then document in the test that chebyshev's tied-boundary index is pinned by the
-generator's lexsort, not by the implementation. Optionally add an explicit assertion that the
-chebyshev row-25 boundary tie resolves to the lowest index, so the convention is gated by a
-named, human-readable expectation independent of the blob.
+The findings below are robustness / API-safety / maintainability defects. The
+most material is **WR-01**: the Minkowski exponent is carried in BOTH the
+`Metric::Minkowski { p }` enum AND a separate `p: f64` parameter, but only the
+separate parameter drives the kernel while only the enum's copy is partly
+validated — the two can silently disagree and produce wrong-`p` distances for a
+real caller (the tests never exercise the divergence).
 
 ## Warnings
 
-### WR-01: `compute_tile_distance` doc-comment describes the OPPOSITE of the Cosine code path
+### WR-01: Minkowski exponent is duplicated across two parameters; only one drives compute, allowing silent disagreement
 
-**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:256-260`
-**Issue:**
-The comment for the `Euclidean | Cosine` arm states: *"the boundary sqrt recovers √(2·(1−cos))
-and the oracle compares in that space ≤1e-5."* But the actual code sets `needs_sqrt =
-matches!(metric, Metric::Euclidean)` (line 141) — Cosine does NOT get the boundary sqrt; it
-selects on the squared value `2(1−cos)` and is then HALVED host-side to `1−cos` (lines 144,
-202-206). The oracle is `metric='cosine'` = `1−cos`, NOT `√(2(1−cos))`. The comment contradicts
-both the code and the actual (correct) behaviour, and will mislead the next maintainer into
-thinking Cosine sqrt-s. The code is right; the comment is wrong.
+**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:295-299, 420-429`
+**Issue:** `knn_graph` accepts the exponent twice: once inside the metric enum
+(`Metric::Minkowski { p }`) and once as the standalone `p: f64` argument. The
+compute path uses ONLY the standalone argument:
+```rust
+Metric::Minkowski { .. } => minkowski_dist::launch::<F, ActiveRuntime>(
+    ..., f64_to_host::<F>(p), // <-- standalone arg, NOT the enum's p
+),
+```
+while `validate_geometry` checks BOTH but never reconciles them:
+```rust
+if let Metric::Minkowski { p: mp } = metric {
+    if !(mp >= 1.0) || !(p >= 1.0) { return Err(...); }
+}
+```
+A caller passing `Metric::Minkowski { p: 3.0 }` with the standalone arg `p = 2.0`
+passes validation (both ≥ 1) and silently computes L2 distances while the enum
+(and any logging/serialization keyed on it) says L3. The test suite cannot catch
+this because `metric_p()` extracts the enum's `p` and feeds it as the arg, so they
+always coincide in tests — the divergence is unreachable by the tests but fully
+reachable by callers.
+**Fix:** Make the exponent single-source. Read the exponent from the enum inside
+`compute_tile_distance` and drop the standalone `p` argument:
+```rust
+Metric::Minkowski { p } => minkowski_dist::launch::<F, ActiveRuntime>(
+    ..., f64_to_host::<F>(p),
+),
+```
+If the standalone parameter must stay for signature stability, reject mismatches
+in `validate_geometry` (`(mp - p).abs() > 0.0` ⇒ `ShapeMismatch{operand:"p"}`).
 
-**Fix:** Replace the Cosine portion of the comment, e.g.: *"Cosine's normalised-row GEMM gives
-2·(1−cos) (squared Euclidean of unit vectors); top_k selects on that order-preserving value
-with NO boundary sqrt, and the returned k values are halved host-side (line 202) to the true
-cosine distance 1−cos."*
+### WR-02: `minkowski_dist` divides by `p` with no positive-`p` guard inside the public kernel
 
-### WR-02: `validate_geometry` u32-overflow loop omits `n` (rows), the largest launched dimension
+**File:** `crates/mlrs-kernels/src/distance.rs:160`
+**Issue:** `let inv_p = F::new(1.0) / p;` assumes `p != 0`. The host validates
+`p >= 1` in `knn_graph::validate_geometry`, but `minkowski_dist` is a public
+`#[cube(launch)]` export (re-exported from `lib.rs:39`) and relies entirely on an
+external invariant. A `p = 0` launch yields a division producing inf, then
+`F::powf(acc, inv_p)` silently yields inf/NaN distances rather than a typed
+error. Defense-in-depth: numerical safety should not depend on a caller in
+another crate replicating the host guard.
+**Fix:** Add an explicit precondition doc-comment (`p >= 1` is a caller
+obligation) on `minkowski_dist`, and ensure every host launch path funnels
+through the validated `knn_graph` entry so no caller can launch with unchecked
+`p`.
 
-**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:430-441`
-**Issue:**
-The overflow guard iterates `[("x", n), ("x", d), ("k", k + 1)]`, but the kernels are launched
-with `n as u32` in MANY more places than the train-row dimension: `compute_tile_distance` casts
-`n as u32` (line 289/293/297) for `rows_y`, and `self_drop_full` casts `n as u32` (line 354)
-for `rows`. The guard DOES include `n`, so the `n` dimension is covered. However `k + 1` can
-itself overflow `usize` addition if `k == usize::MAX` BEFORE the loop computes `k + 1` — `k` is
-already bounded by `k <= max_k <= n` at lines 409-417, and `n` is bounded later, so in practice
-`k` is small. The real gap: `tile` (≤ `QUERY_TILE` = 8) is fine, but the **product**
-`out_len = tile * n` (line 272) and `n * k_internal` (line 168) host allocations are not
-overflow-checked; on a 32-bit host `n * k_internal` could wrap. This is a robustness gap, not a
-live bug on 64-bit targets.
+### WR-03: `self_drop_gather` shift can read one slot past the row if the self index appears more than once
 
-**Fix:** Add `n.checked_mul(k + 1)` and `tile.checked_mul(n)` guards (or assert the host is
-64-bit), and reject overflow with `ShapeMismatch` as the existing precedent does. At minimum
-add a comment that the host-buffer products assume a 64-bit `usize`.
+**File:** `crates/mlrs-kernels/src/distance.rs:207-220`; `crates/mlrs-backend/src/prims/knn_graph.rs:340-343`
+**Issue:** The kernel computes `bump = count of in_idx[ibase..=ibase+s] == row`,
+then `src = s + bump`, and reads `in_idx[(ibase + src)]`. The scheme is correct
+ONLY when the self index occurs at most once in the `(k+1)`-wide window. For
+X-vs-X self-query that holds, but the prim never asserts uniqueness of the self
+index in the assembled top-k result. If self appeared twice (a future non-X-vs-X
+caller, or a top-k miscompile feeding two equal indices), `bump` could reach 2
+and `src = s + 2` reads `in_idx[ibase + k + 1]` — past the `k1 = k+1`-wide row,
+and for the LAST row past the buffer end (`self_drop_full` sizes the `ArrayArg`
+at exactly `n * k1`), an OOB device read.
+**Fix:** Clamp the source index in-kernel so it can never leave the row:
+```rust
+let src = s + bump;
+let src = if src < k1 { src } else { k1 - 1u32 };
+```
+and/or document the single-self-occurrence precondition at the prim boundary.
 
-### WR-03: `self_drop_full` fallback (self absent) silently drops the FARTHEST neighbour with no diagnostic
+### WR-04: Overflow guard set does not cover the launch dims actually cast to `u32`
 
-**File:** `crates/mlrs-kernels/src/distance.rs:191-223`; `crates/mlrs-backend/src/prims/knn_graph.rs:230`
-**Issue:**
-The self-drop kernel's R-3 fallback: if the query row's own index is absent from the
-top-`(k+1)` (cannot happen for X-vs-X, but the prim does not assert X-vs-X), `bump` stays 0 for
-every `s`, so `src = s` and the kernel silently returns the first `k` of the `k+1` neighbours —
-dropping column `k` (the farthest). For a genuine X-vs-X graph self is always present, so this
-is benign today. But `knn_graph` is a public prim with no runtime guarantee that the caller
-passes X-vs-X (the signature only takes one matrix, so it IS always X-vs-X — acceptable), yet
-the kernel is independently launchable (see `self_drop_gather_test.rs`) where the invariant is
-NOT enforced. If a future caller feeds a `top_k` result where self legitimately fell outside
-`k+1`, the kernel drops a real neighbour with no error. This is a latent correctness trap
-guarded only by an undocumented precondition.
+**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:430-441, 448-457`
+**Issue:** `validate_geometry` guards `n`, `d`, and `k+1` against `u32::MAX`, but
+the launched values include the ceiling-division `(rows as u32) + bx - 1` in
+`launch_dims_2d` and the `out_len = tile * n` element count. With `n` guarded and
+`tile ≤ QUERY_TILE = 8` these never trigger for supported sizes, so this is
+latent rather than reachable — but the validated set does not provably dominate
+every later `as u32` cast, so a future size increase could wrap silently.
+**Fix:** Either add a comment that the `n`-guard plus `tile ≤ 8` bounds all
+derived launch dims, or extend the guard to the largest derived launch product so
+validation provably dominates every cast.
 
-**Fix:** Acceptable for this phase given the single-matrix X-vs-X signature, but document the
-precondition explicitly at the `knn_graph` API (self MUST be in the top-`(k+1)`, which holds
-for X-vs-X) and consider a debug-only host assertion in `self_drop_full` that each row's
-`tk_idx_full` window contains `row` before launch.
+### WR-05: Memory-gate test asserts EXACT byte equality across iterations — brittle, not a true leak bound
 
-### WR-04: Per-call host round-trips (`to_host`) on every tile defeat the "device-resident" contract and stress the memory gate's assumptions
-
-**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:150, 195-196, 226-227, 327-328`
-**Issue:**
-The orchestrator reads `x` to host (line 150), reads every tile's `top_k` result back to host
-(lines 195-196), then re-uploads the assembled buffers (lines 226-227 / 327-328). This is the
-documented host-segment composition pattern and is functionally correct, but it means the
-graph result makes a full device→host→device round-trip, and the per-tile `to_host` calls use
-the UNMETERED `to_host` (not `to_host_metered`). The memory gate test
-(`knn_memory_gate_query_axis_tiled`) asserts `live_bytes` exactly equals a baseline across
-iterations and `reuses > 0`; whether those hold depends on the pool accounting for these
-unmetered reads/uploads consistently. The correctness risk is low, but the "NO host round-trip"
-spirit of the sibling `top_k`/`distance` prims (which keep results device-resident) is broken
-here, and the project's memory-efficiency-is-first-class constraint is only met in the
-sub-quadratic-residency sense, not the zero-copy sense.
-
-**Fix:** Out of v1 scope as a performance item, but flag for the consumer phases (UMAP/HDBSCAN):
-document that `knn_graph` currently returns via a host round-trip, and consider a device-side
-gather/assemble for the tiled top_k results in a follow-up so the result never leaves the device.
-
-### WR-05: `include_self=true` with `k == n` selects all rows but the duplicate-row test path can mask an off-by-one in self placement
-
-**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:409`; `crates/mlrs-backend/tests/knn_graph_test.rs:409-434`
-**Issue:**
-For `include_self=true`, `max_k = n`, so `k` may equal `n` and `k_internal = k = n`, passing
-`top_k(n)` over an `n`-column block (allowed: `k <= cols == n`). The `knn_include_self_returns_self_at_col0`
-test asserts self@col0 only for NON-duplicate rows and skips both duplicate rows entirely
-(lines 415-423), accepting "either self or its duplicate" at col 0. That skip is justified by
-the genuine distance-0 tie, but it means the duplicate rows contribute ZERO verification of
-self placement under `include_self=true`. Since the duplicate rows are exactly where the
-lowest-index tie-break matters most, the test's strongest case is excused. Not a code bug, but
-a coverage gap that lets a self-placement regression at a distance-0 tie pass.
-
-**Fix:** Strengthen the duplicate-row branch to assert col-0 index is EITHER `row` OR the
-partner duplicate index (a concrete two-valued check), not merely that the distance is ~0 —
-that pins the lowest-index tie-break instead of waiving it.
+**File:** `crates/mlrs-backend/tests/knn_graph_test.rs:499-521`
+**Issue:** The gate uses `assert_eq!(live_after[iter], live_baseline)` and
+`assert_eq!(peak_after[iter], peak_baseline)`. Exact-equality on allocator byte
+counts is correct ONLY if the pool is byte-for-byte deterministic per call. Any
+benign future change (allocation rounding, a one-shot cached scratch on the 2nd
+call, interleaved same-pool allocation) flips this to a hard red that does NOT
+indicate a real leak. The file's own docstring (lines 448-450) says "Threshold
+tuning is deferred to plan 13-03," yet the committed assertion is exact, not a
+bound.
+**Fix:** Assert conservation as a non-growth bound, which still catches leaks:
+```rust
+assert!(live_after[iter] <= live_baseline, "live_bytes grew → leak");
+assert!(peak_after[iter] <= peak_baseline, "peak grew → scratch stacking");
+```
 
 ## Info
 
-### IN-01: Stale scaffold comments in `mod.rs` / `lib.rs` describe modules as "empty compiling shell until then"
+### IN-01: Redundant re-read of `dup_row_a` / `dup_row_b` inside the per-row loop
 
-**File:** `crates/mlrs-backend/src/prims/mod.rs:25-31`; `crates/mlrs-kernels/src/lib.rs:9-14, 36-39`
-**Issue:** The registration comments still say the KNN modules are "Empty compiling shell until
-then" / "Empty compiling module until then", but plans 13-02/13-03 have landed the bodies. The
-comments are now historical noise that misdescribe the current state.
-**Fix:** Update the comments to past tense ("landed by plan 13-02/03") or remove the
-scaffold-era prose.
+**File:** `crates/mlrs-backend/tests/knn_graph_test.rs:413-414`
+**Issue:** `dup_a` / `dup_b` are decoded from the npz case on every iteration of
+`for row in 0..N`; they are loop-invariant.
+**Fix:** Hoist the two `expect_f64(...).round() as usize` reads above the loop.
 
-### IN-02: `metric` argument is `Copy` but `compute_tile_distance` re-matches it twice
+### IN-02: `include_self=true` test over-relaxes the col-0 assertion for `dup_a`
 
-**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:255-301`
-**Issue:** The function matches `metric` to route, then inside the direct-kernel arm matches
-`metric` AGAIN (line 286) with an `unreachable!()` default. This is correct but slightly
-redundant; the inner match could destructure the outer arm. Minor readability.
-**Fix:** Optional — collapse to a single match or pass an enum discriminant; low value.
+**File:** `crates/mlrs-backend/tests/knn_graph_test.rs:409-423`
+**Issue:** The test treats both dup rows as "either self or its duplicate at
+col 0." Under the lowest-index tie-break, dup_a (self idx 0) always wins col 0
+over dup_b (idx 4) since 0 < 4, so for dup_a the stronger `self@col0` assertion
+holds and is being skipped.
+**Fix:** Optional — assert `self@col0` strictly for dup_a; keep the relaxed check
+only for dup_b (self idx 4 vs dup idx 0 genuinely ties to the lower index).
 
-### IN-03: `p` is passed both as enum field `Metric::Minkowski{p}` AND as a separate `p` argument, validated for agreement only loosely
+### IN-03: 2D cube dims duplicated between kernel doc-comment and host constant
 
-**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:420-429`; called at `tests/knn_graph_test.rs:124-133`
-**Issue:** `validate_geometry` checks both `mp >= 1.0` AND `p >= 1.0` but never checks `mp == p`.
-The kernel uses the SEPARATE `p` argument (line 298), not the enum's `mp`. A caller could pass
-`Metric::Minkowski{p: 3.0}` with argument `p = 5.0` and get a graph under exponent 5 while the
-type says 3. The test helper `metric_p` keeps them in sync, so this is latent. Dual-source-of-
-truth for the same scalar is an API smell.
-**Fix:** Either drop the standalone `p` argument and read it from the enum, or assert `mp == p`
-in `validate_geometry` and reject the mismatch.
+**File:** `crates/mlrs-kernels/src/distance.rs:27-29`; `crates/mlrs-backend/src/prims/knn_graph.rs:448-456`
+**Issue:** The `16×16` cube dims appear in the kernel docs and as hard-coded
+`bx = 16u32; by = 16u32;` in `launch_dims_2d`. The "these must match" contract
+lives only in prose (the kernel guards bounds regardless, so they are safe to
+differ — the doc just implies coupling).
+**Fix:** A named `const CUBE_DIM_2D: u32 = 16;` referenced by both axes documents
+the single source; no behavior change.
 
-### IN-04: `f64_to_host::<F>(0.0)` initialiser allocates a full zero vector then overwrites every slot
+### IN-04: `QUERY_TILE = 8` magic constant with no in-code bound rationale
 
-**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:168-169`
-**Issue:** `tk_val_full` is zero-initialised via `vec![f64_to_host::<F>(0.0); n * k_internal]`
-then fully written tile-by-tile, so the init value is dead. Harmless; the loop always covers all
-slots because tiles partition `0..n` exactly. Noted only because if a tile gather were ever
-short (it is not), the zero-init would silently mask it.
-**Fix:** None required; optionally `Vec::with_capacity` + extend, but the current form is clear.
+**File:** `crates/mlrs-backend/src/prims/knn_graph.rs:84`
+**Issue:** The tile size is fixed at 8 with a long doc-comment but no in-code note
+that `QUERY_TILE.min(n - r0)` (line 173) handles `n < 8` correctly, so a reader
+must trace the clamp to confirm small-`n` safety.
+**Fix:** None required for correctness; a one-line note that `tile` is clamped to
+the remaining rows suffices.
 
 ---
 
