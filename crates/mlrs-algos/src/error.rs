@@ -544,4 +544,35 @@ pub enum BuildError {
         /// Which estimator's builder rejected the value (always `"categorical_nb"`).
         estimator: &'static str,
     },
+
+    /// `UMAP` was given a `min_dist` that is non-finite or exceeds `spread`
+    /// (Phase 12, UMAP-01, T-12-02). `min_dist` controls how tightly UMAP packs
+    /// points in the low-dimensional embedding and must be a finite value
+    /// `<= spread`; a non-finite or larger-than-`spread` value is undefined.
+    /// Rejected at `build()` (data-INDEPENDENT, the D-08 split) — never at `fit`.
+    #[error(
+        "estimator '{estimator}': min_dist = {min_dist} is invalid \
+         (must be finite and <= spread)"
+    )]
+    InvalidMinDist {
+        /// Which estimator's builder rejected the value (always `"umap"`).
+        estimator: &'static str,
+        /// The offending minimum-distance value.
+        min_dist: f64,
+    },
+
+    /// `HDBSCAN` was given a `min_cluster_size` below 2 (Phase 12, HDBS-01,
+    /// T-12-02). The minimum number of samples in a cluster must be `>= 2`; a
+    /// smaller value is undefined. Rejected at `build()` (data-INDEPENDENT, the
+    /// D-08 split) — never at `fit`.
+    #[error(
+        "estimator '{estimator}': min_cluster_size = {min_cluster_size} is invalid \
+         (must be >= 2)"
+    )]
+    InvalidMinClusterSize {
+        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        estimator: &'static str,
+        /// The offending minimum-cluster-size value.
+        min_cluster_size: usize,
+    },
 }
