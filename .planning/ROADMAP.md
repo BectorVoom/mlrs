@@ -52,7 +52,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 
 **Milestone Goal:** Add UMAP + HDBSCAN on a shared KNN-graph primitive, and establish + retrofit a Rust-native builder/typestate API across the full estimator surface, plus extend the pure-Python sklearn shim.
 
-- [ ] **Phase 12: Builder + Typestate Convention Foundation** — Establish the shared idiomatic Rust builder + fit/unfit typestate convention (born-with-it for the new estimators; no retrofit yet)
+- [x] **Phase 12: Builder + Typestate Convention Foundation** — Establish the shared idiomatic Rust builder + fit/unfit typestate convention (born-with-it for the new estimators; no retrofit yet) (4/4 plans) — completed 2026-06-23
 - [ ] **Phase 13: KNN-Graph Primitive (feasibility keystone)** — Land + standalone-gate the shared `(indices, distances)` KNN-graph prim before any consumer touches it
 - [ ] **Phase 14: UMAP** — Fuzzy simplicial set → spectral/random init → vertex-owner SGD layout; deterministic stages value-gated, stochastic layout property-gated
 - [ ] **Phase 15: HDBSCAN** — Device front-end (core/mutual-reach) + host tree back-end (MST → condensed tree → stability); exact-label hard gate
@@ -84,7 +84,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 **Wave 3** *(blocked on Wave 2 completion)*
 
 - [x] 12-03-PLAN.md — trybuild compile-fail gate proving predict/transform-before-fit won't compile (BLDR-02 structural proof) — completed 2026-06-23 (1 commit dd6c99f, cpu-green; compile_fail gate + 2 ui fixtures w/ Unfit-referencing E0277/E0308 goldens; additive regression 11/11)
-- [ ] 12-04-PLAN.md — PyO3 collapse: additive `any_estimator_typestate!` macro + `PyUMAP`/`PyHDBSCAN` shells + runtime `NotFittedError` analog; existing 35 call sites stay green
+- [x] 12-04-PLAN.md — PyO3 collapse: additive `any_estimator_typestate!` macro + `PyUMAP`/`PyHDBSCAN` shells + runtime `NotFittedError` analog; existing 35 call sites stay green — completed 2026-06-23 (4 commits 547b146/618a576/e342a23/58eed06, cpu-green; closes BLDR-04; full mlrs-py suite green incl. new manifold_test 2/2; live PyO3 pytest routed to UAT)
 
 **UI hint**: no
 
