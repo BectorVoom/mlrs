@@ -1136,7 +1136,9 @@ where
 
     // --- (6) host epoch driver: per epoch, select active edges by umap's
     //     epoch_of_next_sample schedule, draw host negative samples, launch
-    //     umap_layout_step over owners = all n with move_other = true. ---
+    //     umap_layout_step over owners = all n, OWNER-ONLY (move_other = 0,
+    //     via FIT_MOVE_OTHER): the symmetric COO covers both endpoints of each
+    //     undirected pair (once per direction) with no foreign-vertex write. ---
     host_epoch_driver::<F>(
         pool,
         &mut init,
@@ -1155,6 +1157,30 @@ where
     );
 
     Ok(init.iter().map(|&v| f64_to_host::<F>(v)).collect())
+}
+
+/// Single source of truth for the fit-path `move_other` flag passed to
+/// `umap_layout_step`. **Owner-only (0)** by design (REVIEW CR-01 option b):
+/// each owner-cube writes ONLY its own slot-disjoint coordinates
+/// (`row*dim..(row+1)*dim`) and never the foreign vertex's slots, so two
+/// concurrently-scheduled cubes can never write the same `embedding` slot —
+/// the move_other==1 cross-cube WRITE-WRITE race (umap_layout.rs:155-157) is
+/// eliminated and the D-05 byte-identical contract holds on ANY parallel
+/// backend (wgpu/rocm/cuda), not just the sequential cpu-MLIR gate. Because the
+/// fuzzy graph is symmetric (the COO carries both (r,c) and (c,r)), owner-only
+/// still covers BOTH endpoints of every undirected pair — once per direction —
+/// matching umap-learn's single head/tail force pass and removing the prior
+/// CR-03 ~2-4× double-count. A regression to `1` reintroduces both hazards and
+/// is caught by the executable `fit_move_other_is_zero` invariant test.
+pub(crate) const FIT_MOVE_OTHER: u32 = 0;
+
+/// Test-reachable accessor for [`FIT_MOVE_OTHER`] (the fit-path `move_other`
+/// flag). Exposed so the `fit_move_other_is_zero` invariant test can assert the
+/// fit path drives the kernel owner-only without reaching into a `::launch`
+/// argument; a future regression to `move_other=1` is then a single-constant
+/// change the test fails on.
+pub fn fit_move_other() -> u32 {
+    FIT_MOVE_OTHER
 }
 
 /// The UMAP SGD layout host epoch driver (mirrors `prims::sgd::sgd_solve`'s
@@ -1307,7 +1333,18 @@ fn host_epoch_driver<F>(
             dim as u32,
             n as u32,
             n as u32,
-            1u32, // move_other = true (fit path)
+            // Fit path is now OWNER-ONLY over the already-symmetric COO. Each
+            // undirected pair is covered by BOTH its (r,c) and (c,r) owner-edges
+            // with NO foreign-vertex write, so: (a) no owner-cube writes another
+            // vertex's slots → the CR-01 cross-cube WRITE-WRITE race is gone
+            // (D-05 holds on any parallel backend), and (b) each pair is
+            // processed exactly once per direction → the CR-03 ~2-4× double-count
+            // is gone (matches umap-learn's single head/tail force pass). The CSR
+            // build above is intentionally left over the symmetric COO — that is
+            // precisely what makes owner-only cover both endpoints. Routed through
+            // FIT_MOVE_OTHER so the fit-path flag has ONE source of truth the
+            // `fit_move_other_is_zero` invariant test reads (regression to 1 fails).
+            FIT_MOVE_OTHER, // move_other = 0 (owner-only fit path)
         );
 
         // Read the updated coordinates back into the host buffer.
