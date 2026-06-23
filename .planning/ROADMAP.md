@@ -83,7 +83,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 12-03-PLAN.md — trybuild compile-fail gate proving predict/transform-before-fit won't compile (BLDR-02 structural proof)
+- [x] 12-03-PLAN.md — trybuild compile-fail gate proving predict/transform-before-fit won't compile (BLDR-02 structural proof) — completed 2026-06-23 (1 commit dd6c99f, cpu-green; compile_fail gate + 2 ui fixtures w/ Unfit-referencing E0277/E0308 goldens; additive regression 11/11)
 - [ ] 12-04-PLAN.md — PyO3 collapse: additive `any_estimator_typestate!` macro + `PyUMAP`/`PyHDBSCAN` shells + runtime `NotFittedError` analog; existing 35 call sites stay green
 
 **UI hint**: no
