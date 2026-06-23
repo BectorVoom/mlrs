@@ -204,6 +204,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
         PyLogisticRegression, PyMBSGDClassifier, PyMBSGDRegressor, PyRidge,
     };
+    use estimators::manifold::PyUMAP;
     use estimators::naive_bayes::{
         PyBernoulliNB, PyCategoricalNB, PyComplementNB, PyGaussianNB, PyMultinomialNB,
     };
@@ -256,5 +257,10 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBernoulliNB>()?;
     m.add_class::<PyComplementNB>()?;
     m.add_class::<PyCategoricalNB>()?;
+
+    // Phase-12 v3 builder + typestate convention-foundation shells (BLDR-04):
+    // UMAP (manifold), the first PyO3 shell over a consuming-`fit` typestate
+    // estimator (collapsed behind the additive `any_estimator_typestate!`).
+    m.add_class::<PyUMAP>()?;
     Ok(())
 }
