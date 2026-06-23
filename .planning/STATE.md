@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 status: executing
-stopped_at: Completed 12-04-PLAN.md
+stopped_at: Phase 13 context gathered
 last_updated: "2026-06-23"
-last_activity: 2026-06-23 -- Completed Phase 12 Plan 04 (PyO3 typestate collapse — PyUMAP/PyHDBSCAN, BLDR-04)
+last_activity: 2026-06-23 -- Gathered Phase 13 context (KNN-graph prim); user-directed scope expansion to multi-metric (euclidean/manhattan/cosine/chebyshev/minkowski-p), PRIM-11 + ROADMAP + PROJECT updated
 progress:
   total_phases: 5
   completed_phases: 0
@@ -21,14 +21,15 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 12 — builder-typestate-convention-foundation
+**Current focus:** Phase 13 — knn-graph-primitive-feasibility-keystone (context gathered; ready to spike/plan)
 
 ## Current Position
 
-Phase: 12 (builder-typestate-convention-foundation) — ALL PLANS COMPLETE
-Plan: 4 of 4 (Plans 01–04 complete)
-Status: Phase 12 plans complete
-Last activity: 2026-06-23 -- Completed Phase 12 Plan 04 (PyO3 typestate collapse — PyUMAP/PyHDBSCAN, BLDR-04)
+Phase: 13 (knn-graph-primitive-feasibility-keystone) — CONTEXT GATHERED
+Plan: none yet (Phase 12 plans 01–04 complete)
+Status: Phase 13 context captured; SPIKE BEFORE PLANNING flagged (multi-metric direct distance kernels + Minkowski-p pow under cpu-MLIR)
+Last activity: 2026-06-23 -- Gathered Phase 13 context; user-directed multi-metric scope expansion (PRIM-11/ROADMAP/PROJECT updated)
+Resume: .planning/phases/13-knn-graph-primitive-feasibility-keystone/13-CONTEXT.md
 
 Progress: [██░░░░░░░░] 20% (v3.0)
 
