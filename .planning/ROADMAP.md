@@ -53,7 +53,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 **Milestone Goal:** Add UMAP + HDBSCAN on a shared KNN-graph primitive, and establish + retrofit a Rust-native builder/typestate API across the full estimator surface, plus extend the pure-Python sklearn shim.
 
 - [x] **Phase 12: Builder + Typestate Convention Foundation** — Establish the shared idiomatic Rust builder + fit/unfit typestate convention (born-with-it for the new estimators; no retrofit yet) (4/4 plans) — completed 2026-06-23
-- [ ] **Phase 13: KNN-Graph Primitive (feasibility keystone)** — Land + standalone-gate the shared multi-metric `(indices, distances)` KNN-graph prim (euclidean/manhattan/cosine/chebyshev/minkowski-p) before any consumer touches it
+- [x] **Phase 13: KNN-Graph Primitive (feasibility keystone)** — Land + standalone-gate the shared multi-metric `(indices, distances)` KNN-graph prim (euclidean/manhattan/cosine/chebyshev/minkowski-p) before any consumer touches it ✅ 2026-06-23
 - [ ] **Phase 14: UMAP** — Fuzzy simplicial set → spectral/random init → vertex-owner SGD layout; deterministic stages value-gated, stochastic layout property-gated
 - [ ] **Phase 15: HDBSCAN** — Device front-end (core/mutual-reach) + host tree back-end (MST → condensed tree → stability); exact-label hard gate
 - [ ] **Phase 16: Builder Retrofit Sweep + Shim Coverage** — Retrofit the convention across all existing estimators (additive) and complete the pure-Python sklearn shim coverage
@@ -111,7 +111,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 13-03-PLAN.md — knn_graph<F> prim + Metric enum: validate-before-launch host orchestrator (metric routing, query-axis-tiled distance->top_k->self_drop composition, directed-only) — turns the per-metric oracle + memory gate GREEN (PRIM-11)
+- [x] 13-03-PLAN.md — knn_graph<F> prim + Metric enum: validate-before-launch host orchestrator (metric routing, query-axis-tiled distance->top_k + single self_drop_gather, directed-only) — turns the per-metric oracle + memory gate GREEN (PRIM-11) ✅ 2026-06-23 (all 5 metrics ≤1e-5 cpu f64+f32 / rocm f32; R-9 dup-point VALUE + query-axis memory gate GREEN)
 
 **UI hint**: no
 **Spike status**: VALIDATED (spikes 001+002, 2026-06-23) — both feasibility unknowns confirmed under --features cpu; planning built on the proven kernel shapes.

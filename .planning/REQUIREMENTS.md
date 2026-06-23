@@ -16,7 +16,7 @@ Requirements for the v3.0 milestone. Each maps to a roadmap phase.
 
 ### KNN-Graph Primitive (shared substrate — build & gate FIRST)
 
-- [ ] **PRIM-11**: A shared KNN-graph primitive returns ascending-ordered k-nearest-neighbor indices `(n, k)` and distances `(n, k)` over a **multi-metric** distance layer, with a self-inclusion parameter (UMAP self-excluded via k+1/self-drop-by-index-identity / HDBSCAN self-counted core distances). It accepts a `metric` parameter covering **Euclidean, Manhattan (L1), Cosine, Chebyshev (L∞), and parameterized Minkowski-p** — Euclidean reuses the v1 GEMM-expansion fast path, Cosine reuses GEMM on L2-normalized rows, and Manhattan/Chebyshev/Minkowski-p add new direct pairwise GATHER distance kernels. Built cpu-MLIR-safe by composition (distance → top-k GATHER, no SharedMemory/atomics/heap kernel) for **every** metric, standalone-validated **per metric** vs `sklearn.neighbors.NearestNeighbors` with the matching `metric` (indices set-equal up to tie-ordering; distances ≤1e-5 f64; lowest-index tie-break documented as the mlrs convention) with a build-failing PoolStats memory gate. Emits the **directed** `(indices, distances)` graph only — symmetrization is each consumer's responsibility (UMAP fuzzy-set union, HDBSCAN mutual-reachability). Custom/callable metrics remain out of scope.
+- [x] **PRIM-11**: A shared KNN-graph primitive returns ascending-ordered k-nearest-neighbor indices `(n, k)` and distances `(n, k)` over a **multi-metric** distance layer, with a self-inclusion parameter (UMAP self-excluded via k+1/self-drop-by-index-identity / HDBSCAN self-counted core distances). It accepts a `metric` parameter covering **Euclidean, Manhattan (L1), Cosine, Chebyshev (L∞), and parameterized Minkowski-p** — Euclidean reuses the v1 GEMM-expansion fast path, Cosine reuses GEMM on L2-normalized rows, and Manhattan/Chebyshev/Minkowski-p add new direct pairwise GATHER distance kernels. Built cpu-MLIR-safe by composition (distance → top-k GATHER, no SharedMemory/atomics/heap kernel) for **every** metric, standalone-validated **per metric** vs `sklearn.neighbors.NearestNeighbors` with the matching `metric` (indices set-equal up to tie-ordering; distances ≤1e-5 f64; lowest-index tie-break documented as the mlrs convention) with a build-failing PoolStats memory gate. Emits the **directed** `(indices, distances)` graph only — symmetrization is each consumer's responsibility (UMAP fuzzy-set union, HDBSCAN mutual-reachability). Custom/callable metrics remain out of scope.
 
 ### UMAP
 
@@ -79,7 +79,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PRIM-11 | Phase 13 | Pending |
+| PRIM-11 | Phase 13 | Complete |
 | UMAP-01 | Phase 14 | Pending |
 | UMAP-02 | Phase 14 | Pending |
 | UMAP-03 | Phase 14 | Pending |

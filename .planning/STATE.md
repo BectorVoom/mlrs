@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 status: executing
-stopped_at: Completed 13-02-PLAN.md (KNN-graph device kernels — manhattan/chebyshev/minkowski direct pairwise + self_drop_gather, re-exported from mlrs-kernels, launch-proven under cpu f32+f64 / rocm f32). Plan 2 of 3 complete.
-last_updated: "2026-06-23T04:19:55Z"
-last_activity: 2026-06-23 -- Completed 13-02-PLAN.md
+stopped_at: Completed 13-03-PLAN.md (KNN-graph primitive PRIM-11 keystone — knn_graph<F> + Metric enum; validate-before-launch host orchestrator, query-axis-tiled distance->top_k + single self_drop_gather, directed (indices, distances) (n,k); all 5 metrics oracle-GREEN <=1e-5, R-9 dup-point VALUE gate, memory gate GREEN on cpu f64+f32 / rocm f32). Plan 3 of 3 complete — Phase 13 DONE.
+last_updated: "2026-06-23T04:32:37Z"
+last_activity: 2026-06-23 -- Completed 13-03-PLAN.md (KNN-graph prim keystone, Phase 13 complete)
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 7
-  completed_plans: 6
-  percent: 27
+  completed_plans: 7
+  percent: 31
 ---
 
 # Project State
@@ -25,13 +25,13 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 13 (knn-graph-primitive-feasibility-keystone) — EXECUTING
-Plan: 3 of 3
-Status: Executing Phase 13 (13-01, 13-02 complete)
-Last activity: 2026-06-23 -- Completed 13-02-PLAN.md (KNN-graph device kernels)
-Resume: .planning/phases/13-knn-graph-primitive-feasibility-keystone/13-03-PLAN.md
+Phase: 13 (knn-graph-primitive-feasibility-keystone) — COMPLETE
+Plan: 3 of 3 (all complete)
+Status: Phase 13 complete (13-01, 13-02, 13-03 done) — PRIM-11 keystone GREEN
+Last activity: 2026-06-23 -- Completed 13-03-PLAN.md (KNN-graph prim keystone)
+Resume: next phase (UMAP — Phase 14) consumes knn_graph
 
-Progress: [███░░░░░░░] 27% (v3.0)
+Progress: [███░░░░░░░] 31% (v3.0)
 
 ## Open Follow-ups (Phase 05)
 
@@ -120,6 +120,7 @@ Progress: [███░░░░░░░] 27% (v3.0)
 | Phase 12 P03 | 12 | 1 task | 5 files |
 | Phase 13 P01 | 6 | 3 tasks (+1 Rule-1 fix commit) | 16 files |
 | Phase 13 P02 | 12 | 2 tasks | 3 files |
+| Phase 13 P03 | 7 | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -128,6 +129,7 @@ Progress: [███░░░░░░░] 27% (v3.0)
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [13-03]: PRIM-11 KEYSTONE GREEN — `knn_graph<F>` + `Metric { Euclidean, Manhattan, Cosine, Chebyshev, Minkowski { p } }` landed in `crates/mlrs-backend/src/prims/knn_graph.rs` as a THIN HOST ORCHESTRATOR carrying no new kernel: validate geometry host-side (`n*d` op "x", `1<=k<=n-1` when include_self=false op "k", `p>=1` Minkowski op "p", u32-overflow) → `PrimError::ShapeMismatch` BEFORE any launch; route Euclidean/Cosine→GEMM `distance()`, Manhattan/Chebyshev/Minkowski→the Plan-02 direct kernels (scalars by value, `p` cast f64→F); compose `distance→top_k` QUERY-AXIS TILED (`QUERY_TILE=8`, big n×d train block kept global, only tile×n resident, scratch `release_into`'d). KEY ARCH DECISION: a SINGLE `self_drop_gather` over the assembled full `(n,k+1)` top_k result (NOT per-tile) — the verbatim Plan-02 kernel compares `in_idx==CUBE_POS_X`, which is only correct when `row` is the GLOBAL query index; per-tile self-drop would compare against the LOCAL (0..tile) row and silently corrupt. Tiling therefore splits only the distance/top_k stage; the `(n,k+1)` buffer is O(n·k) so the memory gate still holds (peak_bytes=1464 << 4×n×n=14400, live_bytes=0 conserved, reuse_delta=333). Cosine: host L2-normalize rows (zero-norm guard A4) → GEMM gives squared-Euclidean-of-unit-vectors `2(1−cos)`; select on the order-preserving squared value (NO boundary sqrt — that was the initial Rule-1 bug, returned √(2(1−cos))≈0.635 vs sklearn 1−cos≈0.2017) then HALVE host-side to true `1−cos`. Two Rule-1 fixes (both surfaced by the oracle, in commit 7f73d4e): the Cosine halve, AND regenerating `knn_chebyshev_{f32,f64}` fixtures with a stable (lowest-index) argsort — the sklearn fixture had encoded idx 4 over the EXACTLY-tied idx 0 at row 25 (dist 2.0881943797), contradicting the documented lowest-index tie-break the prim implements; audit of all 5 metrics confirmed chebyshev row 25 was the SOLE divergence, distances byte-identical, no test assert weakened. Gates GREEN: all 5 metrics × {f32,f64} set-equal to sklearn ≤1e-5, R-9 dup-point VALUE gate (genuine duplicate at col 0, self dropped by identity — the only catch for FINDING 002-B), include_self col-0, geometry-rejection x/k/p, query-axis memory gate — on cpu(f64+f32) AND rocm(f32; f64 skips-with-log). Commits 8c6fb5b (feat: prim) / 7f73d4e (fix: Cosine + chebyshev fixtures). Phase 13 COMPLETE; UMAP (Phase 14, include_self=false) and HDBSCAN (Phase 15, include_self=true) consume this prim.
 - [13-02]: The four new KNN-graph device kernels (manhattan/chebyshev/minkowski direct pairwise + self_drop_gather) are transcribed VERBATIM from the VALIDATED Phase-13 spikes 001/002 — Minkowski uses STATIC `F::powf` for both the per-term power and the `1/p` root (the named cpu-MLIR unknown, now landed); self_drop_gather uses the `CUBE_POS_X`/`UNIT_POS_X==0` per-row shape with a self-contained nested-count shift (no cross-sibling accumulator) to avoid the 002-A loud and 002-B silent miscompiles. Because `mlrs-kernels` is backend-feature-free (no `cpu`/`rocm` feature → no `ActiveRuntime`), the launch smoke test MUST live in `mlrs-backend/tests/` (mirrors `spike_test.rs`); the kernels crate is build-verified bare, the cpu-MLIR launch proof runs via `cargo test -p mlrs-backend --features cpu`. Launch-proven green on cpu(f32+f64) and rocm(f32; f64 skip-with-log). PRIM-11 still Pending until 13-03 lands `Metric`+`knn_graph` and turns the oracle harness GREEN.
 - [13-01]: KNN-graph oracle fixtures carry the metric tag in the FILENAME only — never an in-blob numpy string array — because `mlrs_core::load_npz` decodes only 4/8-byte float arrays and returns `InvalidData` on any other dtype (a string `metric` array would silently break every consuming Rust test). The float `p` field carries the only metric-dependent scalar. Fixtures live at workspace-root `tests/fixtures/` (the `_FIXTURE_DIR` / `fixture()` resolver location), not crate-relative. PRIM-11 stays Pending until plan 13-03 lands `Metric`+`knn_graph` and turns `knn_graph_test.rs` GREEN.
 - [v3.0 roadmap]: Adopted Variant A (all four research streams converged) — builder *convention* leads (Phase 12: BLDR-01/02/04) so UMAP/HDBSCAN are born builder-fronted; KNN-graph prim is the feasibility keystone, landed + standalone-gated before consumers (Phase 13: PRIM-11); UMAP (Phase 14) and HDBSCAN (Phase 15) are file-disjoint and parallel-buildable after Phase 13; the broad 30-estimator builder retrofit sweep (BLDR-03) + full Python shim coverage (SHIM-*) are isolated to the last phase (Phase 16) as the one parallel-unsafe edit. BLDR is deliberately split across Phase 12 (convention) and Phase 16 (retrofit). Three spike-before-planning flags: PRIM-11 KNN symmetrize map on cpu-MLIR (P13); UMAP umap_layout_step vertex-owner GATHER on cpu-MLIR + property-gate threshold calibration vs umap-learn (P14); HDBSCAN host-MST tie-breaking exactness vs the reference (P15). Gates threaded through every phase: cpu(f64)+rocm(f32) with f64-on-rocm skip-with-log, per-phase build-failing PoolStats memory gate, tests separated from source, zero new compute dependencies.
