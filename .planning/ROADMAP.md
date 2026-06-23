@@ -129,7 +129,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
   3. UMAP's stochastic SGD layout passes a property/structural gate vs umap-learn 0.5.12 — trustworthiness / kNN-overlap ≥ umap-learn − margin and downstream-ARI within band — NOT coordinate value-match, and the same `random_state` reproduces a byte-identical mlrs embedding across runs.
   4. A user can embed new data via `transform(X_new)` against the fitted fuzzy graph, gated by a property sub-gate on the new points.
 
-**Plans**: 5/5 plans complete
+**Plans**: 5/5 complete + 2 gap-closure plans (14-06, 14-07)
 Plans:
 **Wave 1**
 
@@ -147,6 +147,11 @@ Plans:
 **Wave 4** *(blocked on Wave 3)*
 
 - [x] 14-05-PLAN.md — transform(X_new) frozen-subset path (same kernel, move_other=false) + property sub-gate + replace stale zeros shell tests
+
+**Gap closure** *(from verification gaps_found — CR-01/CR-02/CR-03)*
+
+- [ ] 14-06-PLAN.md — GAP 2 (CR-02): n_components < n guard in Umap::fit (mirror SpectralEmbedding) + typed-error test (UMAP-01, wave 1)
+- [ ] 14-07-PLAN.md — GAP 1 (CR-01+CR-03): owner-only move_other=0 fit launch (kills cross-cube race + edge double-count) + scheduling-order determinism test + property-gate recalibration (UMAP-03, wave 2, depends 14-06)
 
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — (1) confirm the vertex-owner `umap_layout_step` single-owner GATHER kernel launches under cpu-MLIR (the named cpu-MLIR unknown; precedent: v2 two-pass SGD solver launched first try); (2) calibrate the property-gate thresholds (trustworthiness / kNN-overlap floors relative to umap-learn) empirically on the first oracle fixture run.
