@@ -79,7 +79,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 12-02-PLAN.md — UMAP + HDBSCAN shells: full param surface, owned builder, single-source defaults, non-algorithmic trivial fit, Fitted-only accessors, 2 new `BuildError` variants
+- [x] 12-02-PLAN.md — UMAP + HDBSCAN shells: full param surface, owned builder, single-source defaults, non-algorithmic trivial fit, Fitted-only accessors, 2 new `BuildError` variants — completed 2026-06-23 (3 commits, cpu-green 8/8 tests; closes BLDR-01 + Rust-side of BLDR-02, the compile-fail proof is 12-03)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
