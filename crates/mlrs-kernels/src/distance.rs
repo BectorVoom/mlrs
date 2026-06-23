@@ -43,3 +43,122 @@
 //!
 //! Plan 13-02 adds the kernel bodies AND their `pub use distance::{…}` re-export
 //! line in lib.rs as part of that plan's edit (file-disjoint, single-owner).
+
+use cubecl::prelude::*;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Direct pairwise distance kernels (cpu-MLIR-safe; VALIDATED spike-001 shapes).
+//
+// One unit per output element `(i, j)`; a runtime `while kk < cols` loop over the
+// feature dim; only `F`/`u32` accumulators + `if` guards. No SharedMemory, no
+// Atomic, no infinity constant, no mutable-bool scan, no descending-shift loop.
+// `.abs()` is the jacobi-proven instance form (the one allowed instance form);
+// the general-exponent power MUST be the STATIC `F::powf` associated form (the
+// instance `x.powf()` can mis-lower in the `#[cube]` IR). Output is row-major
+// (`rows_x × rows_y`): `out[i * rows_y + j]`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Manhattan (L1) pairwise distance: `out[i*rows_y+j] = sum_k |x_ik - y_jk|`.
+///
+/// cpu-MLIR contract: per-element 2D launch (`ABSOLUTE_POS_{X,Y}`), bounded
+/// feature loop, `F`/`u32` accumulators only; the per-term absolute difference
+/// uses the allowed instance `.abs()` form, no root applied.
+#[cube(launch)]
+pub fn manhattan_dist<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    out: &mut Array<F>,
+    rows_x: u32,
+    rows_y: u32,
+    cols: u32,
+) {
+    let i = ABSOLUTE_POS_X;
+    let j = ABSOLUTE_POS_Y;
+    if i < rows_x {
+        if j < rows_y {
+            let xb = i * cols;
+            let yb = j * cols;
+            let mut acc = F::from_int(0i64);
+            let mut kk = 0u32;
+            while kk < cols {
+                let diff = (x[(xb + kk) as usize] - y[(yb + kk) as usize]).abs();
+                acc += diff;
+                kk += 1u32;
+            }
+            out[(i * rows_y + j) as usize] = acc;
+        }
+    }
+}
+
+/// Chebyshev (L-infinity) pairwise distance: `out[i*rows_y+j] = max_k |x_ik - y_jk|`.
+///
+/// cpu-MLIR contract: the running maximum is a mutable-variable STATEMENT-form
+/// `if` guard (`if diff > acc { acc = diff; }`), NEVER an `if`-expression in value
+/// position. Per-term differences are non-negative so the `F::from_int(0i64)` seed
+/// is correct.
+#[cube(launch)]
+pub fn chebyshev_dist<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    out: &mut Array<F>,
+    rows_x: u32,
+    rows_y: u32,
+    cols: u32,
+) {
+    let i = ABSOLUTE_POS_X;
+    let j = ABSOLUTE_POS_Y;
+    if i < rows_x {
+        if j < rows_y {
+            let xb = i * cols;
+            let yb = j * cols;
+            let mut acc = F::from_int(0i64);
+            let mut kk = 0u32;
+            while kk < cols {
+                let diff = (x[(xb + kk) as usize] - y[(yb + kk) as usize]).abs();
+                if diff > acc {
+                    acc = diff;
+                }
+                kk += 1u32;
+            }
+            out[(i * rows_y + j) as usize] = acc;
+        }
+    }
+}
+
+/// Minkowski-`p` pairwise distance: `out[i*rows_y+j] = (sum_k |x_ik - y_jk|^p)^(1/p)`.
+///
+/// The named cpu-MLIR feasibility unknown for this phase (VALIDATED spike 001):
+/// an in-kernel general-exponent power inside the feature-loop accumulator, then a
+/// final `^(1/p)` root. cpu-MLIR contract: BOTH powers use the STATIC associated
+/// `F::powf(base, exp)` form (the instance form can mis-lower); `p` passes by value
+/// (cubecl 0.10 has no `ScalarArg` wrapper). Subsumes L1 (`p=1`) and L2 (`p=2`) per
+/// the spike depth probe; fast-path special-casing is an optimization, not a
+/// correctness need.
+#[cube(launch)]
+pub fn minkowski_dist<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    out: &mut Array<F>,
+    rows_x: u32,
+    rows_y: u32,
+    cols: u32,
+    p: F,
+) {
+    let i = ABSOLUTE_POS_X;
+    let j = ABSOLUTE_POS_Y;
+    if i < rows_x {
+        if j < rows_y {
+            let xb = i * cols;
+            let yb = j * cols;
+            let mut acc = F::from_int(0i64);
+            let mut kk = 0u32;
+            while kk < cols {
+                let diff = (x[(xb + kk) as usize] - y[(yb + kk) as usize]).abs();
+                acc += F::powf(diff, p);
+                kk += 1u32;
+            }
+            let inv_p = F::new(1.0) / p;
+            out[(i * rows_y + j) as usize] = F::powf(acc, inv_p);
+        }
+    }
+}
