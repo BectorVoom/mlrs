@@ -493,27 +493,33 @@ fn knn_memory_gate_query_axis_tiled() {
         pool.stats()
     );
 
-    // live_bytes CONSERVES after warmup (transient scratch released back to the
-    // persistent footprint — the CR-02 honesty signal; growing live = leak).
+    // live_bytes does NOT GROW after warmup (transient scratch released back to
+    // the persistent footprint — the CR-02 honesty signal; growing live = leak).
+    // WR-05: a non-growth BOUND, not exact byte equality — exact equality would
+    // flip to a false red on any benign allocator-rounding / one-shot-cached-
+    // scratch change that does not actually leak. A real leak still trips this
+    // (live climbs each call).
     let live_baseline = live_after[1];
     for iter in 2..ITERS {
-        assert_eq!(
-            live_after[iter], live_baseline,
+        assert!(
+            live_after[iter] <= live_baseline,
             "R-6 (live_bytes conserved) FAILED on {backend}: iter {iter} \
-             live_bytes={} != baseline={live_baseline} — transient KNN scratch \
-             is NOT being released (it climbs each call). stats={:?}",
+             live_bytes={} > baseline={live_baseline} — transient KNN scratch \
+             is NOT being released (it climbs each call → leak). stats={:?}",
             live_after[iter],
             pool.stats()
         );
     }
 
-    // peak_bytes PLATEAUS after warmup (released scratch reused in place).
+    // peak_bytes does NOT GROW after warmup (released scratch reused in place).
+    // WR-05: a non-growth BOUND (see live_bytes rationale above) — a leak makes
+    // peak climb with the call count, which this still catches.
     let peak_baseline = peak_after[1];
     for iter in 2..ITERS {
-        assert_eq!(
-            peak_after[iter], peak_baseline,
+        assert!(
+            peak_after[iter] <= peak_baseline,
             "R-6 (peak_bytes bounded) FAILED on {backend}: iter {iter} \
-             peak_bytes={} != baseline={peak_baseline} — peak grows with the call \
+             peak_bytes={} > baseline={peak_baseline} — peak grows with the call \
              count (scratch not released → buffers stack). stats={:?}",
             peak_after[iter],
             pool.stats()
