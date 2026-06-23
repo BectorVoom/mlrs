@@ -471,19 +471,22 @@ See Patterns 1–5 above — all examples are grounded in `mbsgd_regressor.rs`, 
 | A5 | `Default for UmapBuilder` can pin a concrete `F` (e.g. `f64`) to read F-independent scalar defaults from `new()`. | Pattern 2 / Open Q1 | LOW — defaults are scalars/enums independent of `F`; if any default ever became F-typed, the builder would need a different source. None do today. |
 | A6 | Only `IncrementalPCA` impls `PartialFit` today (`MBSGDClassifier`/`Regressor` impl only `Fit`). The D-06 multi-transition design targets the future Phase-16 retrofit of those streaming estimators, but the only CURRENT `PartialFit` consumer is `IncrementalPCA`. | Pattern 1 (PartialFit) | LOW — verified by grep (`impl.*PartialFit` → `incremental_pca.rs` only). The new `PartialFit` trait is defined but UNUSED in Phase 12 (no shell uses it); this is intentional per D-06. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Builder `Default` and the generic `new()`.**
+   - **RESOLVED in 12-02:** builder `Default` re-derives via `Umap::<f64,_>::new().into_builder()` (pins `f64` for the const-defaults path).
    - What we know: `new()` is `impl Umap<F, Unfit>` (generic); the builder is non-generic (D-09); defaults are F-independent scalars.
    - What's unclear: whether to express `Default for UmapBuilder` as `Umap::<f64,_>::new().into_builder()` (pin an arbitrary `F`) or to factor the default scalars into a free `const`/fn that both `new()` and the builder read.
    - Recommendation: pin `f64` in `Default` (simplest, one source); the planner may instead extract a `fn defaults() -> UmapHyperparams` free function if it reads cleaner. Either satisfies D-08.
 
 2. **One shared macro variant vs a second macro for the typestate fitted-arm spelling.**
+   - **RESOLVED in 12-04:** add a SECOND `any_estimator_typestate!` macro (additive; the shared `any_estimator!` arm is NOT edited).
    - What we know: the existing `any_estimator!` is shared by 35 call sites with no `S` param; the new shells need `<f32, Fitted>`/`<f64, Fitted>`.
    - What's unclear: add an optional `fitted_marker:` token to the existing macro, or ship `any_estimator_typestate!` alongside.
    - Recommendation: a second additive macro (`any_estimator_typestate!`) is the lowest-risk to Success Criterion 3 (the existing macro is byte-for-byte untouched). Planner's call.
 
 3. **HDBSCAN PyO3 shell home (D-12 explicitly leaves this open).**
+   - **RESOLVED in 12-04:** extend `crates/mlrs-py/src/estimators/cluster.rs` (no new file).
    - Recommendation: extend `estimators/cluster.rs` (it already hosts the cluster family) unless it grows unwieldy; a new `estimators/hdbscan.rs` is equally valid. Follow whichever keeps `estimators/mod.rs` edits minimal.
 
 ## Environment Availability

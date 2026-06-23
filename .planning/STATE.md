@@ -4,7 +4,7 @@ milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 status: planning
 stopped_at: Phase 12 context gathered
-last_updated: "2026-06-22T22:30:15.170Z"
+last_updated: "2026-06-23T01:20:43.068Z"
 last_activity: "2026-06-22 — v3.0 ROADMAP.md created (Variant A: builder convention → KNN-graph prim → UMAP → HDBSCAN → retrofit sweep + shim)"
 progress:
   total_phases: 5

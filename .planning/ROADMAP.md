@@ -13,6 +13,7 @@ v3.0 adds the UMAP + HDBSCAN manifold/clustering pair on a single shared, feasib
 ## Phases
 
 **Phase Numbering:**
+
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
@@ -60,70 +61,93 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 ## Phase Details
 
 ### Phase 12: Builder + Typestate Convention Foundation
+
 **Goal**: Establish the idiomatic Rust-native estimator-construction convention — a shared owned-builder + fit/unfit typestate + typed validation error surface — so the v3 estimators (UMAP/HDBSCAN) are born builder-fronted and the later retrofit has a single target shape. Pure API foundation; no algorithm, no device work; lowest risk; unblocks everything downstream.
 **Depends on**: Phase 11 (v2.0 estimator surface + shipped `BuildError` / `any_estimator!` machinery)
 **Requirements**: BLDR-01, BLDR-02, BLDR-04
 **Success Criteria** (what must be TRUE):
+
   1. A developer can construct an estimator via `T::builder().param(..)…build() -> Result<T<Unfit>, BuildError>` with owned chained setters and typed `thiserror` validation variants, where `T::builder().build()? == T::new()` == the sklearn default (single-source defaults).
   2. The fit/unfit distinction is modeled at compile time (`T<Unfit>` → `T<Fitted>`) such that `predict`/`transform`/fitted-attr accessors exist only on the fitted type — predict-before-fit fails to compile.
   3. The PyO3 surface is unchanged: the Rust typestate collapses behind the existing `any_estimator!` `Unfit/F32/F64` enum, with a runtime `NotFittedError` analog at the Python boundary, and every existing `any_estimator!` call site still compiles and passes its suite.
   4. The convention is demonstrated end-to-end on the two new-estimator shells (UMAP/HDBSCAN homes) so Phases 14–15 inherit it from birth.
-**Plans**: 4 plans
-Plans:
+
+**Plans**: 4 plansPlans:
+**Wave 1**
+
 - [ ] 12-01-PLAN.md — typestate foundation: sealed `State` + `Unfit`/`Fitted` markers + consuming `Fit`/`Predict`/`Transform`/`PartialFit` traits (new module, `traits.rs` frozen) + trybuild dev-dep
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 12-02-PLAN.md — UMAP + HDBSCAN shells: full param surface, owned builder, single-source defaults, non-algorithmic trivial fit, Fitted-only accessors, 2 new `BuildError` variants
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 12-03-PLAN.md — trybuild compile-fail gate proving predict/transform-before-fit won't compile (BLDR-02 structural proof)
 - [ ] 12-04-PLAN.md — PyO3 collapse: additive `any_estimator_typestate!` macro + `PyUMAP`/`PyHDBSCAN` shells + runtime `NotFittedError` analog; existing 35 call sites stay green
+
 **UI hint**: no
 
 ### Phase 13: KNN-Graph Primitive (feasibility keystone)
+
 **Goal**: Land the single shared KNN-graph primitive — ascending-ordered k-nearest-neighbor indices `(n, k)` + distances `(n, k)` over the v1 distance prim, with a self-inclusion parameter — composed cpu-MLIR-safe from the launch-proven distance → top-k GATHER path (no SharedMemory/atomics/heap kernel), and standalone-validate it BEFORE UMAP or HDBSCAN consume it (primitive-first discipline). This is the milestone's feasibility keystone.
 **Depends on**: Phase 12 (born builder-fronted convention is established; the prim itself reuses v1 distance + top-k)
 **Requirements**: PRIM-11
 **Success Criteria** (what must be TRUE):
+
   1. The KNN-graph prim returns ascending-ordered neighbor indices `(n, k)` and distances `(n, k)`, with a self-inclusion parameter (UMAP self-excluded via k+1/self-drop; HDBSCAN self-counted core distances), composed from distance → top-k GATHER with no new heap kernel.
   2. The prim launches under `--features cpu` (verified at launch, not just compile) with no `Atomic`/`SharedMemory`/`F::INFINITY`/mutable-bool/shift-loop, and on rocm f32.
   3. Indices are set-equal to `sklearn.neighbors.NearestNeighbors` up to tie-ordering and distances match to ≤1e-5 (f64), with the lowest-index tie-break documented as the mlrs convention.
   4. A build-failing PoolStats memory gate passes at fixture sizes (big distance operand kept global / query-axis tiled; never the full `n×n` resident-and-leaking).
+
 **Plans**: TBD
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — confirm the composed distance → top_k → dense `[n,k]` → symmetrize-map path launches under `--features cpu`; the symmetrize-map step is new (the KNN symmetrize map on cpu-MLIR is the named unknown). Precedent (v2 top_k on cpu-MLIR) is favorable but unverified for this exact composition.
 
 ### Phase 14: UMAP
+
 **Goal**: Deliver UMAP `fit`/`fit_transform` → `embedding_` `(n, n_components)` with umap-learn/sklearn-named hyperparameters: KNN graph (reusing Phase 13) → fuzzy simplicial set (smooth-kNN ρ/σ binary search + t-conorm union) → init (random default; spectral via the v2 graph-Laplacian + v1 eig stack under the Jacobi size cap) → a new vertex-owner GATHER SGD layout kernel with negative sampling. Value-gate the deterministic stages 1–4; property-gate the stochastic layout. File-disjoint from HDBSCAN.
 **Depends on**: Phase 12 (builder convention), Phase 13 (KNN-graph prim)
 **Requirements**: UMAP-01, UMAP-02, UMAP-03, UMAP-04
 **Success Criteria** (what must be TRUE):
+
   1. A user can `fit`/`fit_transform` UMAP to produce `embedding_` `(n, n_components)` with the umap-learn-named hyperparameters and defaults (`n_neighbors=15`, `n_components=2`, `min_dist=0.1`, `init='spectral'`, `random_state`, …), with `min_dist ≤ spread` validated at build.
   2. UMAP's deterministic stages — KNN graph, fuzzy simplicial set, fuzzy-set union, spectral init (reusing the v2 graph-Laplacian + v1 eig; random-init fallback above the Jacobi cap) — value-match umap-learn intermediates to ≤1e-5 (f64).
   3. UMAP's stochastic SGD layout passes a property/structural gate vs umap-learn 0.5.12 — trustworthiness / kNN-overlap ≥ umap-learn − margin and downstream-ARI within band — NOT coordinate value-match, and the same `random_state` reproduces a byte-identical mlrs embedding across runs.
   4. A user can embed new data via `transform(X_new)` against the fitted fuzzy graph, gated by a property sub-gate on the new points.
+
 **Plans**: TBD
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — (1) confirm the vertex-owner `umap_layout_step` single-owner GATHER kernel launches under cpu-MLIR (the named cpu-MLIR unknown; precedent: v2 two-pass SGD solver launched first try); (2) calibrate the property-gate thresholds (trustworthiness / kNN-overlap floors relative to umap-learn) empirically on the first oracle fixture run.
 
 ### Phase 15: HDBSCAN
+
 **Goal**: Deliver HDBSCAN `fit`/`fit_predict` → `labels_` (`-1` = noise) + `probabilities_` with sklearn-named hyperparameters, as a device front-end (core distances + mutual-reachability via GATHER, reusing Phase 13) plus a host tree back-end (MST → single-linkage → condensed tree → EoM/leaf stability extraction), deliberately dodging the GPU-tree-atomics wall. Plus the GLOSH `outlier_scores_` differentiator and `store_centers`. Exact-label hard gate. File-disjoint from UMAP.
 **Depends on**: Phase 12 (builder convention), Phase 13 (KNN-graph prim); feature-disjoint from Phase 14 (parallel-buildable after Phase 13)
 **Requirements**: HDBS-01, HDBS-02, HDBS-03, HDBS-04
 **Success Criteria** (what must be TRUE):
+
   1. A user can `fit`/`fit_predict` HDBSCAN to produce `labels_` (`-1`=noise) and `probabilities_` ∈[0,1] with sklearn-named defaults (`min_cluster_size=5`, `min_samples=None→min_cluster_size`, `cluster_selection_method='eom'` and `'leaf'`, …), with the device front-end / host tree back-end split holding under the cpu gate.
   2. `labels_` match `sklearn.cluster.HDBSCAN` exactly up to permutation with `-1` pinned (exact on `metric='precomputed'` f64; label-perm helper extended to fix `-1→-1`); MST edge tie-breaking is stable-sorted with a documented deterministic rule; `probabilities_` agree within a documented band.
   3. A user can read per-point `outlier_scores_` (GLOSH) from a fitted HDBSCAN, gated within band vs the `hdbscan` library.
   4. A user can request cluster centers via `store_centers` (`'centroid'`/`'medoid'`) producing `centroids_`/`medoids_`.
+
 **Plans**: TBD
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — confirm the host MST (Prim's) + condensed-tree exactness vs the `hdbscan` reference on a deliberately tie-heavy fixture (host-MST tie-breaking exactness is the named label-divergence unknown); lock the stable-sort-on-weight / lowest-index tie-break convention before the exact-label gate commits.
 
 ### Phase 16: Builder Retrofit Sweep + Shim Coverage
+
 **Goal**: Retrofit the Phase-12 builder + typestate convention **additively** across all existing estimators (builder constructs the existing config struct; fit path untouched), piloted on 1–2 estimators under the green suite before the full sweep, preserving every shipped 1e-5 / exact-label gate; and complete the pure-Python sklearn shim (get_params/set_params/clone round-trip extended from the v1 12 to the v2 18 + UMAP/HDBSCAN, the two new PyO3 wraps, static Python check). This is the one broad-edit, parallel-unsafe phase — isolated last to protect file-disjoint discipline and the shipped gates.
 **Depends on**: Phase 12 (convention), Phase 14 (UMAP estimator + PyO3 wrap), Phase 15 (HDBSCAN estimator + PyO3 wrap)
 **Requirements**: BLDR-03, SHIM-01, SHIM-02, SHIM-03
 **Success Criteria** (what must be TRUE):
+
   1. The builder + typestate convention is retrofitted additively across all existing estimators (`new()` kept as a thin wrapper; fit path untouched), piloted on 1–2 estimators with the green suite first, and every shipped 1e-5 / exact-label gate still passes.
   2. Every estimator's pure-Python class stores each constructor arg unchanged in `__init__` (no validation/computation) and exposes `get_params(deep=True)` / `set_params(**kw)` that round-trip exactly and are `clone()`-compatible (coverage extended from the v1 12 to the v2 18 + the two new).
   3. UMAP and HDBSCAN are PyO3-wrapped (`#[pyclass]` on `any_estimator!`, GIL release, `guard_f64` before F64) with sklearn-named params, trailing-underscore fitted attrs, `n_features_in_` set/enforced, `fit` returns `self`, and the correct surface (UMAP `transform`/`fit_transform`; HDBSCAN `fit_predict`/`labels_`).
   4. The shim is verified by Rust-side unit tests plus a static Python check; the live `estimator_checks`/`check_estimator` run stays deferred (needs a maturin+pyarrow host this environment lacks).
+
 **Plans**: TBD
 **UI hint**: no
 
