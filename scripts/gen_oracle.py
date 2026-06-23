@@ -800,6 +800,96 @@ def gen_knn(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05). The fixed Minkowski-p
+# test exponent (p != 1, 2 so it is a genuine non-degenerate Minkowski case that
+# the general direct kernel — not a special-cased L1/L2 fast path — must satisfy).
+KNN_METRIC_P = 3.0
+# The duplicate-point design row index pair (R-9): two TRAIN rows are made
+# identical so the include_self=false self-drop must drop the SELF index by
+# IDENTITY (D-02), keeping the GENUINE duplicate as a distance-0 neighbour. This
+# is the only catch for the cpu-MLIR SILENT self-drop miscompile (FINDING 002-B).
+KNN_DUP_ROW_A, KNN_DUP_ROW_B = 0, 4
+
+
+def gen_knn_metric(
+    seed: int = SEED, dtype=np.float32, metric: str = "euclidean", p=None
+) -> str:
+    """Generate one per-metric KNN-graph oracle fixture (PRIM-11, D-05).
+
+    Fits ``sklearn.neighbors.NearestNeighbors(n_neighbors=K_query,
+    algorithm='brute', metric=metric, p=p)`` on a self-referential train set
+    (X-vs-X — the KNN graph queries the train points against themselves) and
+    stores BOTH the ``k+1`` self-inclusive neighbours (so the prim test can drop
+    the self column for ``include_self=false``) and is consumable as the
+    ``include_self=true`` ``k`` set (column 0 = self at distance 0).
+
+    ``metric`` is one of ``{"euclidean","manhattan","cosine","chebyshev",
+    "minkowski"}``; ``p`` is passed to ``NearestNeighbors`` only for
+    ``"minkowski"`` (a fixed non-degenerate exponent, ``KNN_METRIC_P``).
+
+    DUPLICATE-POINT design (R-9): train rows ``KNN_DUP_ROW_A`` and
+    ``KNN_DUP_ROW_B`` are made IDENTICAL, so for those query rows a genuine
+    neighbour sits at distance 0 alongside self. The ``include_self=false``
+    self-drop MUST drop the self index by IDENTITY (D-02), NOT "first
+    zero-distance", or it diverges from this oracle. For ``"cosine"`` no row is
+    zero-norm (A4) — the standard_normal design plus per-row offset keeps every
+    row well away from the origin.
+
+    Stores (mirrors ``gen_knn`` structure, ``c()`` dtype-cast, ``np.savez``):
+
+      - ``X`` (train, self-queried), ``k`` (the requested k true neighbours),
+      - ``distances`` / ``indices`` — the sklearn ``k+1`` self-inclusive
+        neighbours of X-vs-X (ascending; column 0 = self, distance 0),
+      - ``metric`` (string tag), ``p`` (the Minkowski exponent or NaN),
+      - ``dup_row_a`` / ``dup_row_b`` (the identical-row index pair, for the R-9
+        VALUE assert).
+
+    Returns the path written. Filename:
+    ``knn_{metric}_{dtype_tag}_seed{seed}.npz``.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    rng = np.random.default_rng(seed)
+    # Spread the train points widely so pairwise distances are distinct (Pitfall
+    # 8) EXCEPT the deliberate duplicate pair below: random + a per-row unique
+    # offset. X is queried against ITSELF (the KNN graph is X-vs-X).
+    x = rng.standard_normal((KNN_N_TRAIN, KNN_N_FEATURES)) * 3.0
+    x += np.arange(KNN_N_TRAIN)[:, None] * 0.01
+    # DUPLICATE-POINT design (R-9): make row B an EXACT copy of row A.
+    x[KNN_DUP_ROW_B, :] = x[KNN_DUP_ROW_A, :]
+
+    # Request k+1 neighbours so the prim test can drop the self column per row for
+    # include_self=false AND read column 0 = self for include_self=true.
+    k_query = KNN_K + 1
+    p_arg = KNN_METRIC_P if metric == "minkowski" else (p if p is not None else 2)
+    nn = NearestNeighbors(
+        n_neighbors=k_query, algorithm="brute", metric=metric, p=p_arg
+    ).fit(x)
+    distances, indices = nn.kneighbors(x)  # X-vs-X, ascending; col 0 = self
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    p_store = float(KNN_METRIC_P) if metric == "minkowski" else float("nan")
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"knn_{metric}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        k=c([KNN_K]),
+        distances=c(distances),
+        indices=c(indices),
+        p=c([p_store]),
+        dup_row_a=c([KNN_DUP_ROW_A]),
+        dup_row_b=c([KNN_DUP_ROW_B]),
+        metric=np.array(metric),
+    )
+    return out_path
+
+
 def gen_lasso(seed: int = SEED, dtype=np.float32) -> str:
     """Generate one seeded Lasso fixture (LINEAR-03, sklearn coordinate descent).
 
@@ -2227,6 +2317,14 @@ def main() -> None:
     # regressor; distinct distances (Pitfall 8).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_knn(dtype=dtype)}")
+    # Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05): the full fixed
+    # metric set (euclidean, manhattan, cosine, chebyshev, minkowski-p) × {f32
+    # (rocm gate), f64 (cpu gate)}, each carrying a DUPLICATE-POINT train row
+    # (R-9) so the include_self=false self-drop VALUE assert catches the cpu-MLIR
+    # silent miscompile (FINDING 002-B). X is queried against itself (X-vs-X).
+    for metric in ("euclidean", "manhattan", "cosine", "chebyshev", "minkowski"):
+        for dtype in (np.float32, np.float64):
+            print(f"wrote {gen_knn_metric(dtype=dtype, metric=metric)}")
     # Lasso (LINEAR-03): sparse coef_ with exact zeros (Pitfall 1).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_lasso(dtype=dtype)}")
