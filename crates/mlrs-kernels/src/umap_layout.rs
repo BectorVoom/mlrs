@@ -70,8 +70,12 @@ pub use self::umap_layout_step as umap_layout_kernel;
 /// - `dim` — embedding dimensionality (`n_components`).
 /// - `n_owners` — count of contiguous OWNER rows at the front of `embedding`.
 /// - `n_vertices` — total vertex count (bound for the GATHER index check).
-/// - `move_other` — `1u32` = two-sided update (push the positive neighbour too,
-///   the `fit` path); `0u32` = owner-only (the frozen-subset `transform` path).
+/// - `move_other` — `1u32` = two-sided update (the owner also writes the
+///   positive neighbour's coordinates); `0u32` = owner-only (each owner writes
+///   only its own vertex). Both the `fit` and `transform` paths launch with
+///   `0u32` (`FIT_MOVE_OTHER`) over the already-symmetric COO, so no cube writes
+///   a foreign vertex's slots — the D-05 cross-cube write race cannot occur on
+///   any parallel backend.
 ///
 /// Launch: `CubeCount::Static(n_owners, 1, 1)`, `CubeDim {x:1, y:1, z:1}` (the
 /// per-owner topk.rs shape).
