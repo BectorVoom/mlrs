@@ -36,7 +36,7 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
 
 use crate::error::{AlgoError, BuildError};
-use crate::typestate::{Fit, Fitted, Transform, Unfit};
+use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
 /// Distance metric for the UMAP neighbor graph (UMAP-01 subset). Only
 /// `Euclidean` carries meaning in the Phase-12 shell (the trivial fit ignores
@@ -389,17 +389,9 @@ where
     ) -> Result<Umap<F, Fitted>, AlgoError> {
         let (n, p) = shape;
 
-        // Data-DEPENDENT geometry guard BEFORE the allocation (mirrors
-        // mbsgd_regressor.rs:303-312; the data-INDEPENDENT params were validated
-        // at build()).
-        if n == 0 || p == 0 || x.len() != n * p {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n,
-                cols: p,
-                len: x.len(),
-            }));
-        }
+        // Data-DEPENDENT geometry guard BEFORE the allocation (shared helper, the
+        // data-INDEPENDENT params were validated at build()).
+        validate_geometry(x, shape)?;
 
         // Trivial non-algorithmic fit: zeros embedding. NO kernel, NO compute.
         let zeros = vec![F::from_int(0i64); n * self.n_components];
@@ -464,7 +456,14 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n, p) = shape;
-        if n == 0 || p == 0 || x.len() != n * p {
+        validate_geometry(x, shape)?;
+        // The fitted `n_features_in_` defines the transform contract (typestate
+        // doc: "Errors if the geometry disagrees with the fitted `n_features`"):
+        // a matrix whose column count differs from the fit-time feature count
+        // cannot be projected onto the fitted components (WR-02). Surface the
+        // same typed `ShapeMismatch` rather than silently emitting a wrong-shape
+        // all-zeros buffer.
+        if p != self.n_features_in_ {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "x",
                 rows: n,

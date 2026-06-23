@@ -38,10 +38,9 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
 
 use crate::error::{AlgoError, BuildError};
-use crate::typestate::{Fit, Fitted, Unfit};
+use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 
 /// Distance metric for the HDBSCAN neighbor graph (HDBS-01 subset). Only
 /// `Euclidean` carries meaning in the Phase-12 shell (the trivial fit ignores
@@ -294,16 +293,8 @@ where
     ) -> Result<Hdbscan<F, Fitted>, AlgoError> {
         let (n, p) = shape;
 
-        // Data-DEPENDENT geometry guard BEFORE the allocation (mirrors
-        // mbsgd_regressor.rs:303-312).
-        if n == 0 || p == 0 || x.len() != n * p {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n,
-                cols: p,
-                len: x.len(),
-            }));
-        }
+        // Data-DEPENDENT geometry guard BEFORE the allocation (shared helper).
+        validate_geometry(x, shape)?;
 
         // Trivial non-algorithmic fit: all-`-1` labels. NO kernel, NO compute.
         let labels = vec![-1_i32; n];

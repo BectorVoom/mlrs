@@ -43,7 +43,37 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
 
+use mlrs_core::PrimError;
+
 use crate::error::AlgoError;
+
+/// Validate the data-DEPENDENT geometry of a flat row-major device buffer `x`
+/// against an explicit `(rows, cols)` shape (D-08), shared by the typestate
+/// estimator shells so the `fit`/`transform` guards stay in lockstep (IN-03).
+///
+/// Rejects a degenerate `rows == 0` / `cols == 0` geometry and a `x.len()` that
+/// disagrees with `rows * cols`, surfacing the same
+/// [`PrimError::ShapeMismatch`] the inline guards previously constructed
+/// verbatim at three sites. Returning the typed error keeps an untrusted host
+/// geometry from reaching a device read (mirrors `mbsgd_regressor.rs`).
+pub(crate) fn validate_geometry<F>(
+    x: &DeviceArray<ActiveRuntime, F>,
+    shape: (usize, usize),
+) -> Result<(), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (n, p) = shape;
+    if n == 0 || p == 0 || x.len() != n * p {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "x",
+            rows: n,
+            cols: p,
+            len: x.len(),
+        }));
+    }
+    Ok(())
+}
 
 /// Private sealing supertrait. Living in a private module makes [`State`]
 /// impossible to implement outside this crate: a downstream type cannot name
