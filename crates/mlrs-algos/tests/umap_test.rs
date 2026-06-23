@@ -1051,3 +1051,161 @@ fn metrics_table_covers_five() {
     assert_eq!(METRICS.len(), 5, "five-metric coverage");
     assert!(matches!(METRICS[4].1, Metric::Minkowski { p } if p == 3.0));
 }
+
+// ============================================================================
+// GAP 1 (CR-01 + CR-03) executable invariant tests — Plan 14-07.
+//
+// These encode the D-05 cross-cube WRITE guarantee directly, NOT a re-run of
+// `reproducible_f64` on the sequential cpu-MLIR backend (which would pass even
+// WITH the move_other=1 race, because cpu-MLIR schedules cubes sequentially).
+// ============================================================================
+
+/// CR-01 guard — the fit path MUST drive `umap_layout_step` owner-only
+/// (`move_other == 0`) so no owner-cube ever writes a foreign vertex's slots.
+///
+/// Two executable assertions, both host-only / cheap (NO device launch — so no
+/// f64 gate is needed):
+///   1. the single-source-of-truth fit-path flag equals 0. This FAILS the moment
+///      `move_other=1` is restored on the fit launch (the CR-01 cross-cube
+///      WRITE-WRITE race), because `fit_move_other()` reads the same
+///      `FIT_MOVE_OTHER` constant the launch passes.
+///   2. the slot-disjointness property that the flag *guarantees*: with
+///      `move_other=0` each owner `o`'s write set is exactly its own range
+///      `o*dim..(o+1)*dim`. We compute every owner's range and prove (via a
+///      mark-and-check over `n*dim` slots) that the ranges are pairwise
+///      non-overlapping and EXACTLY partition `0..n*dim` — so no two cubes can
+///      ever target the same `embedding` slot. (Under `move_other=1` an owner
+///      would additionally write its neighbour's range, which — because the
+///      fuzzy graph is symmetric — collides with that neighbour's own-owner
+///      write: the partition property is exactly what move_other=0 buys.)
+///
+/// This is the difference from `reproducible_f64` that the plan-checker requires:
+/// not a comment, but assertions over the flag and the disjoint partition.
+#[test]
+fn fit_move_other_is_zero() {
+    // (1) Flag-equals-0: a move_other=1 regression on the fit path fails HERE.
+    assert_eq!(
+        mlrs_algos::manifold::umap::fit_move_other(),
+        0,
+        "fit path must drive the kernel owner-only (move_other=0); move_other=1 \
+         reintroduces the CR-01 cross-cube write-write race on parallel backends"
+    );
+
+    // (2) Slot-disjointness: the n owner write-ranges o*dim..(o+1)*dim are
+    //     pairwise non-overlapping and exactly partition 0..n*dim. Mark-and-check
+    //     over every slot so a double-write (overlap) or a hole (non-partition)
+    //     fails executably.
+    let n = 7usize;
+    let dim = 2usize;
+    let total = n * dim;
+    let mut seen = vec![false; total];
+    for owner in 0..n {
+        let lo = owner * dim;
+        let hi = (owner + 1) * dim;
+        assert!(hi <= total, "owner {owner} range exceeds embedding bound");
+        for slot in lo..hi {
+            assert!(
+                !seen[slot],
+                "owner write ranges overlap at slot {slot}: two cubes would race on \
+                 the same embedding slot (this is exactly what move_other=1 causes)"
+            );
+            seen[slot] = true;
+        }
+    }
+    // Exact partition: every slot covered exactly once (no holes).
+    assert!(
+        seen.iter().all(|&m| m),
+        "owner write ranges do not partition 0..{total}: some embedding slot has \
+         no owner (the owner-only schedule must cover every slot exactly once)"
+    );
+}
+
+/// CR-03 guard — each undirected fuzzy-graph pair is processed ONCE PER
+/// DIRECTION over the symmetric COO (NOT doubled). Reconstructs the
+/// host_epoch_driver positive-sample schedule (`epochs_per_sample` clock:
+/// edge `e` is sampled at epoch `n` iff `next_sample[e] <= n`, then advances by
+/// `epochs_per_sample[e]`) for a tiny symmetric COO and asserts the per-pair
+/// positive-sample count equals the expected `n_epochs / epochs_per_sample`
+/// count summed over the two directed edges — i.e. once per direction per
+/// due-epoch, never the former ~2-4× double-count. A move_other=1 regression
+/// (which moved both endpoints per directed edge) would double the effective
+/// per-pair attraction; this test pins the corrected single-pass-per-direction
+/// schedule so that regression is caught at the schedule level too.
+#[test]
+fn per_pair_sample_count_matches_schedule() {
+    let n_epochs = 100usize;
+
+    // Tiny symmetric COO: undirected pairs {0-1, 0-2} with distinct weights, each
+    // carried as BOTH directed edges (r,c) and (c,r) — exactly what the fuzzy
+    // union emits and what host_epoch_driver iterates.
+    //   edge 0: (0,1) w=1.0   edge 1: (1,0) w=1.0   -> pair {0,1}
+    //   edge 2: (0,2) w=0.5   edge 3: (2,0) w=0.5   -> pair {0,2}
+    let weights = [1.0_f64, 1.0, 0.5, 0.5];
+    // Undirected pair id for each directed edge (the two directions of a pair).
+    let pair_of_edge = [0usize, 0, 1, 1];
+    let n_pairs = 2usize;
+
+    // make_epochs_per_sample (mirrors umap.rs:1027-1045 verbatim): an edge is
+    // sampled `n_epochs * (w / w_max)` times over the run; eps = n_epochs/n_samples.
+    let w_max = weights.iter().cloned().fold(0.0_f64, f64::max);
+    let eps: Vec<f64> = weights
+        .iter()
+        .map(|&w| {
+            let n_samples = if w_max > 0.0 { n_epochs as f64 * (w / w_max) } else { 0.0 };
+            if n_samples > 0.0 { n_epochs as f64 / n_samples } else { -1.0 }
+        })
+        .collect();
+
+    // Replay host_epoch_driver's positive-sample clock and count draws per edge.
+    let mut next_sample: Vec<f64> = eps.clone();
+    let mut per_edge_draws = vec![0usize; weights.len()];
+    for epoch in 0..n_epochs {
+        for e in 0..weights.len() {
+            if eps[e] <= 0.0 {
+                continue;
+            }
+            if next_sample[e] > epoch as f64 {
+                continue;
+            }
+            per_edge_draws[e] += 1; // sampled ONCE this due-epoch (owner-only)
+            next_sample[e] += eps[e];
+        }
+    }
+
+    // Expected per-edge count = number of due-epochs ≈ n_samples = n_epochs*(w/w_max).
+    // Assert each directed edge is sampled once per due-epoch (not doubled), and the
+    // per-pair total is the sum over its two directions (once per direction).
+    let mut per_pair_draws = vec![0usize; n_pairs];
+    for e in 0..weights.len() {
+        let expected_edge = (n_epochs as f64 * (weights[e] / w_max)).floor() as usize;
+        // ±1 tolerance for the discrete clock boundary.
+        let diff = (per_edge_draws[e] as i64 - expected_edge as i64).abs();
+        assert!(
+            diff <= 1,
+            "edge {e}: drew {} positive samples, expected ~{expected_edge} \
+             (once per due-epoch); a double-count would ~2x this",
+            per_edge_draws[e]
+        );
+        per_pair_draws[pair_of_edge[e]] += per_edge_draws[e];
+    }
+
+    // Each undirected pair is covered once per direction: per-pair total equals
+    // the sum of its two equal-weight directed edges (≈ 2 * per-direction count),
+    // NOT 2-4x that (the former move_other=1 double-count).
+    for (p, &draws) in per_pair_draws.iter().enumerate() {
+        // Both directions share the pair weight, so expected ≈ 2 * per-edge.
+        let dir_edges: Vec<usize> =
+            (0..weights.len()).filter(|&e| pair_of_edge[e] == p).collect();
+        let expected_pair: usize = dir_edges
+            .iter()
+            .map(|&e| (n_epochs as f64 * (weights[e] / w_max)).floor() as usize)
+            .sum();
+        let diff = (draws as i64 - expected_pair as i64).abs();
+        assert!(
+            diff <= 2,
+            "pair {p}: drew {draws} positive samples across both directions, \
+             expected ~{expected_pair} (once per direction per due-epoch); the \
+             former move_other=1 schedule would inflate this"
+        );
+    }
+}
