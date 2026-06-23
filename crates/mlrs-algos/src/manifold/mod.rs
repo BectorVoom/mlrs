@@ -18,8 +18,11 @@ pub mod umap;
 // fill their own file WITHOUT both editing this `mod.rs` (file-disjoint,
 // parallel-safe). `umap_internals` = host numerics (smooth-kNN/membership/union,
 // + transform helper in Plan 05); `umap_init` = a/b LM fit + spectral/random
-// init. Both are `pub(crate)` — internal stages, not part of the public surface.
+// init. `umap_init` stays `pub(crate)` (Plan 03 owns it); `umap_internals` is
+// `pub` so the Plan-02 value-gate in `tests/umap_test.rs` can reach the host
+// stage fns directly (the plan key_link `umap_test.rs → umap_internals::*`):
+// an integration test is an external crate and cannot see `pub(crate)` items.
 pub(crate) mod umap_init;
-pub(crate) mod umap_internals;
+pub mod umap_internals;
 
 pub use umap::Umap;

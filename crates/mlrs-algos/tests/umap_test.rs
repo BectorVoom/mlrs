@@ -376,37 +376,48 @@ fn fit_no_leak() {
 // Phase-14 value-gate tests (RED-by-design — Plans 02–05 turn GREEN)
 // ===========================================================================
 
-/// Shared smooth-kNN ρ/σ value gate (UMAP-02). RED: the current shell exposes no
-/// host ρ/σ stage, so the fitted zeros embedding cannot reproduce the umap
-/// `sigmas`/`rhos`. Plan 02 lands the real `smooth_knn_dist` host port and this
-/// asserts ≤1e-5 per row against the dumped values via the real fit pipeline.
-fn run_smooth_knn(metric_tag: &str, metric: Metric) {
+/// Shared smooth-kNN ρ/σ value gate (UMAP-02). Plan 02: drive the real host
+/// `smooth_knn_dist` on the SAME committed `knn_dist` umap consumed and assert
+/// both `sigmas` and `rhos` match umap-learn 0.5.12 to ≤1e-5 per row, for every
+/// metric. The host f64 path matches umap's own f32-cast internals well inside
+/// the 1e-5 tolerance (no device-reduction-order drift). `metric` is unused
+/// here — these stages are metric-agnostic (they consume precomputed distances).
+fn run_smooth_knn(metric_tag: &str, _metric: Metric) {
     if gate_f64(&format!("smooth_knn_{metric_tag}")) {
         return;
     }
-    let client = runtime::active_client();
-    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
     let case = load_npz(fixture(&format!("umap_fuzzy_{metric_tag}_f64.npz")))
         .unwrap_or_else(|e| panic!("load umap_fuzzy_{metric_tag}: {e}"));
     let sigmas = case.expect_f64("sigmas");
     let rhos = case.expect_f64("rhos");
-    let (x, n, d) = upload_x(&mut pool, &case, "X");
+    let knn_dist = case.expect_f64("knn_dist");
+    let kshape = case.shape("knn_dist").expect("knn_dist shape");
+    let (n, k) = (kshape[0] as usize, kshape[1] as usize);
+    let n_neighbors = case.expect_f64("n_neighbors")[0].round() as usize;
+    let local_connectivity = case.expect_f64("local_connectivity")[0];
 
-    // RED-by-design: drive the real fit; until Plan 02 the ρ/σ stage is absent,
-    // so the produced embedding (zeros) carries no recoverable ρ/σ — the value
-    // gate below FAILS. Plan 02 exposes the stage and replaces this body with the
-    // ≤1e-5 per-row sigma/rho comparison.
-    let _embedding = fit_embedding(&mut pool, &x, n, d, metric, Some(42));
     assert_eq!(sigmas.len(), n, "one sigma per row");
     assert_eq!(rhos.len(), n, "one rho per row");
-    // The not-yet-real ρ/σ stage: assert the oracle is non-trivial AND the
-    // pipeline reproduces it (RED until Plan 02 — the zeros pipeline cannot).
-    let produced_sigmas = vec![0.0f64; n]; // placeholder: real ρ/σ stage in Plan 02
+
+    let (produced_sigmas, produced_rhos) = mlrs_algos::manifold::umap_internals::smooth_knn_dist(
+        knn_dist,
+        n,
+        k,
+        n_neighbors,
+        local_connectivity,
+    );
+
     for i in 0..n {
         assert!(
+            mlrs_core::is_close(produced_rhos[i], rhos[i], &F64_TOL),
+            "smooth_knn {metric_tag} row {i}: rho {} != umap {}",
+            produced_rhos[i],
+            rhos[i]
+        );
+        assert!(
             mlrs_core::is_close(produced_sigmas[i], sigmas[i], &F64_TOL),
-            "smooth_knn {metric_tag} row {i}: sigma {} != umap {} (RED until Plan 02)",
+            "smooth_knn {metric_tag} row {i}: sigma {} != umap {}",
             produced_sigmas[i],
             sigmas[i]
         );
