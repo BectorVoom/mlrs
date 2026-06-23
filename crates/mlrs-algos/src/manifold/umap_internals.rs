@@ -142,3 +142,128 @@ pub fn smooth_knn_dist(
 
     (sigmas, rhos)
 }
+
+/// Membership strengths for the directed fuzzy 1-skeleton — host f64 port of
+/// umap-learn 0.5.12 `compute_membership_strengths`.
+///
+/// `knn_idx` / `knn_dist` are the row-major `(n, k)` directed KNN neighbour
+/// indices (float-encoded, as the fixtures store them — rounded to `usize` here)
+/// and distances. `rhos` / `sigmas` are the per-row outputs of
+/// [`smooth_knn_dist`].
+///
+/// Emits the directed COO `(rows, cols, vals)` of length `n*k` with
+/// `rows[i*k+j] = i`, `cols[i*k+j] = knn_idx[i,j]`, and the verified membership
+/// value
+/// `val = if (d − ρ ≤ 0 || σ == 0) { 1.0 } else { exp(-(d − ρ)/σ) }`
+/// (self edges — `knn_idx[i,j] == i` — get `val = 0.0`, but the Phase-13 KNN is
+/// already self-dropped so that branch is inert here). Zeros are NOT pruned at
+/// this stage — [`fuzzy_union`] performs the `eliminate_zeros` equivalent so the
+/// directed→symmetric merge sees umap's exact entry set.
+///
+/// Bounds: `cols` come straight from the Phase-13 prim output (already validated
+/// `< n`); host indexing would panic rather than OOB-read (threat T-14-05).
+pub fn compute_membership_strengths(
+    knn_idx: &[f64],
+    knn_dist: &[f64],
+    rhos: &[f64],
+    sigmas: &[f64],
+    n: usize,
+    k: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    assert_eq!(knn_idx.len(), n * k, "knn_idx must be exactly n*k");
+    assert_eq!(knn_dist.len(), n * k, "knn_dist must be exactly n*k");
+    assert_eq!(rhos.len(), n, "one rho per row");
+    assert_eq!(sigmas.len(), n, "one sigma per row");
+
+    let mut rows = vec![0usize; n * k];
+    let mut cols = vec![0usize; n * k];
+    let mut vals = vec![0.0f64; n * k];
+
+    for i in 0..n {
+        for j in 0..k {
+            let p = i * k + j;
+            let col = knn_idx[p].round() as usize;
+            let d = knn_dist[p];
+
+            let val = if col == i {
+                0.0
+            } else if d - rhos[i] <= 0.0 || sigmas[i] == 0.0 {
+                1.0
+            } else {
+                (-((d - rhos[i]) / sigmas[i])).exp()
+            };
+
+            rows[p] = i;
+            cols[p] = col;
+            vals[p] = val;
+        }
+    }
+
+    (rows, cols, vals)
+}
+
+/// t-conorm fuzzy-set union (UMAP's symmetrization, D-04) — host f64 port of the
+/// `fuzzy_simplicial_set` union step of umap-learn 0.5.12.
+///
+/// Takes the directed membership COO from [`compute_membership_strengths`] and
+/// forms the symmetric graph
+/// `G = mix*(A + Aᵀ − A∘Aᵀ) + (1 − mix)*(A∘Aᵀ)`
+/// where `A` is the directed sparse membership matrix and `mix` is
+/// `set_op_mix_ratio` (1.0 → pure union `A + Aᵀ − A∘Aᵀ`). Zero entries are
+/// pruned (umap's `eliminate_zeros`, applied both before AND after the union).
+///
+/// The output COO is sorted ascending by `(row, col)` — scipy's canonical
+/// CSR-backed COO order after the arithmetic — so it is byte-stable for the
+/// value-gate and for downstream consumers (spectral init / layout).
+///
+/// Pure host f64; `n` is small at fixture scale so the HashMap merge is cheap.
+pub fn fuzzy_union(
+    rows: &[usize],
+    cols: &[usize],
+    vals: &[f64],
+    _n: usize,
+    set_op_mix_ratio: f64,
+) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    use std::collections::{BTreeSet, HashMap};
+
+    assert_eq!(rows.len(), cols.len(), "COO rows/cols length mismatch");
+    assert_eq!(rows.len(), vals.len(), "COO rows/vals length mismatch");
+
+    // A = directed membership matrix; umap calls `eliminate_zeros()` BEFORE the
+    // union, so we drop zero entries here. (Duplicate (r,c) keys cannot occur:
+    // each directed row has distinct neighbour columns.)
+    let mut a: HashMap<(usize, usize), f64> = HashMap::with_capacity(vals.len());
+    for e in 0..vals.len() {
+        if vals[e] != 0.0 {
+            a.insert((rows[e], cols[e]), vals[e]);
+        }
+    }
+
+    // The union touches every (r,c) that is non-zero in A OR in Aᵀ — i.e. for
+    // every directed key (r,c) both (r,c) and its transpose (c,r) appear in G.
+    let mut keys: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for &(r, c) in a.keys() {
+        keys.insert((r, c));
+        keys.insert((c, r));
+    }
+
+    let mut out_rows = Vec::with_capacity(keys.len());
+    let mut out_cols = Vec::with_capacity(keys.len());
+    let mut out_vals = Vec::with_capacity(keys.len());
+
+    // BTreeSet iterates ascending by (row, col) → scipy CSR canonical order.
+    for (r, c) in keys {
+        let a_rc = a.get(&(r, c)).copied().unwrap_or(0.0);
+        let a_cr = a.get(&(c, r)).copied().unwrap_or(0.0);
+        let prod = a_rc * a_cr;
+        let g = set_op_mix_ratio * (a_rc + a_cr - prod) + (1.0 - set_op_mix_ratio) * prod;
+        // umap's trailing `eliminate_zeros()` after the union.
+        if g != 0.0 {
+            out_rows.push(r);
+            out_cols.push(c);
+            out_vals.push(g);
+        }
+    }
+
+    (out_rows, out_cols, out_vals)
+}

@@ -445,33 +445,81 @@ fn smooth_knn_minkowski() {
     run_smooth_knn("minkowski", Metric::Minkowski { p: 3.0 });
 }
 
-/// Shared fuzzy-union (t-conorm) value gate (UMAP-02). RED: no host membership/
-/// union stage yet. Plan 02 lands `compute_membership_strengths` + `fuzzy_union`
-/// and asserts the produced graph COO matches the dumped `rows/cols/vals` ≤1e-5.
-fn run_fuzzy_union(metric_tag: &str, metric: Metric) {
+/// Shared fuzzy-union (t-conorm) value gate (UMAP-02, D-04). Plan 02: drive the
+/// real `smooth_knn_dist` → `compute_membership_strengths` → `fuzzy_union`
+/// pipeline on the committed KNN and assert the produced symmetric graph COO
+/// (rows/cols/vals, scipy CSR-canonical order) matches umap-learn 0.5.12 to
+/// ≤1e-5 for all 5 metrics. `metric` is unused (stages are metric-agnostic).
+///
+/// FLOAT32-INPUT FIDELITY (RESEARCH Pitfall 6): umap-learn feeds its stages the
+/// pynndescent KNN distances, which are **float32**, whereas the fixture dumps
+/// the f64 "true distance" array. Running the membership `exp` on the f64
+/// distances reproduces umap's COO `vals` to only ~1.0e-5 *relative* on the few
+/// edges where `(d−ρ)/σ` is largest (the `exp` amplifies the f32↔f64 distance
+/// gap past the 1e-5 bound). Casting `knn_dist` to f32 precision first — exactly
+/// the array umap's stages consumed — drives the whole pipeline to ≤1.6e-7 for
+/// all 5 metrics. The stage fns stay pure f64; the f32 round here reconstructs
+/// umap's actual numba input, which is the faithful per-stage gate.
+fn run_fuzzy_union(metric_tag: &str, _metric: Metric) {
     if gate_f64(&format!("fuzzy_union_{metric_tag}")) {
         return;
     }
-    let client = runtime::active_client();
-    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
     let case = load_npz(fixture(&format!("umap_fuzzy_{metric_tag}_f64.npz")))
         .unwrap_or_else(|e| panic!("load umap_fuzzy_{metric_tag}: {e}"));
     let rows = case.expect_f64("rows");
     let cols = case.expect_f64("cols");
     let vals = case.expect_f64("vals");
-    let (x, n, d) = upload_x(&mut pool, &case, "X");
-    let _embedding = fit_embedding(&mut pool, &x, n, d, metric, Some(42));
+    let knn_idx = case.expect_f64("knn_idx");
+    // Reconstruct umap's actual stage input: the pynndescent KNN distances are
+    // float32. Round-trip f64→f32→f64 so the host f64 numerics see the exact
+    // values umap's numba kernels consumed (see fn doc — float32-input fidelity).
+    let knn_dist: Vec<f64> = case
+        .expect_f64("knn_dist")
+        .iter()
+        .map(|&d| d as f32 as f64)
+        .collect();
+    let kshape = case.shape("knn_dist").expect("knn_dist shape");
+    let (n, k) = (kshape[0] as usize, kshape[1] as usize);
+    let n_neighbors = case.expect_f64("n_neighbors")[0].round() as usize;
+    let local_connectivity = case.expect_f64("local_connectivity")[0];
+    let set_op_mix_ratio = case.expect_f64("set_op_mix_ratio")[0];
 
     assert_eq!(rows.len(), cols.len(), "COO rows/cols same length");
     assert_eq!(rows.len(), vals.len(), "COO rows/vals same length");
-    // RED-by-design: the produced graph (none yet) cannot reproduce the union.
-    let produced_vals = vec![0.0f64; vals.len()]; // placeholder: Plan 02 union stage
+
+    use mlrs_algos::manifold::umap_internals;
+    let (sigmas, rhos) =
+        umap_internals::smooth_knn_dist(&knn_dist, n, k, n_neighbors, local_connectivity);
+    let (m_rows, m_cols, m_vals) =
+        umap_internals::compute_membership_strengths(knn_idx, &knn_dist, &rhos, &sigmas, n, k);
+    let (g_rows, g_cols, g_vals) =
+        umap_internals::fuzzy_union(&m_rows, &m_cols, &m_vals, n, set_op_mix_ratio);
+
+    assert_eq!(
+        g_vals.len(),
+        vals.len(),
+        "fuzzy_union {metric_tag}: produced {} edges, umap has {} (after eliminate_zeros)",
+        g_vals.len(),
+        vals.len()
+    );
     for e in 0..vals.len() {
+        assert_eq!(
+            g_rows[e], rows[e].round() as usize,
+            "fuzzy_union {metric_tag} edge {e}: row {} != umap {}",
+            g_rows[e], rows[e]
+        );
+        assert_eq!(
+            g_cols[e], cols[e].round() as usize,
+            "fuzzy_union {metric_tag} edge {e}: col {} != umap {}",
+            g_cols[e], cols[e]
+        );
         assert!(
-            mlrs_core::is_close(produced_vals[e], vals[e], &F64_TOL),
-            "fuzzy_union {metric_tag} edge {e}: val {} != umap {} (RED until Plan 02)",
-            produced_vals[e],
+            mlrs_core::is_close(g_vals[e], vals[e], &F64_TOL),
+            "fuzzy_union {metric_tag} edge {e} (r={},c={}): val {} != umap {}",
+            g_rows[e],
+            g_cols[e],
+            g_vals[e],
             vals[e]
         );
     }
