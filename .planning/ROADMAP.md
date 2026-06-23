@@ -54,7 +54,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 
 - [x] **Phase 12: Builder + Typestate Convention Foundation** — Establish the shared idiomatic Rust builder + fit/unfit typestate convention (born-with-it for the new estimators; no retrofit yet) (4/4 plans) — completed 2026-06-23
 - [x] **Phase 13: KNN-Graph Primitive (feasibility keystone)** — Land + standalone-gate the shared multi-metric `(indices, distances)` KNN-graph prim (euclidean/manhattan/cosine/chebyshev/minkowski-p) before any consumer touches it ✅ 2026-06-23
-- [x] **Phase 14: UMAP** — Fuzzy simplicial set → spectral/random init → vertex-owner SGD layout; deterministic stages value-gated, stochastic layout property-gated (all 5 plans executed; verification GAPS FOUND — CR-01 parallel-backend write race + CR-02 missing n_components<n guard; run /gsd-plan-phase 14 --gaps) (completed 2026-06-23)
+- [x] **Phase 14: UMAP** — Fuzzy simplicial set → spectral/random init → vertex-owner SGD layout; deterministic stages value-gated, stochastic layout property-gated (7/7 plans executed incl. gap closure 14-06/14-07; verification PASSED 4/4 — CR-01 cross-cube write race + CR-03 force double-count fixed via owner-only move_other=0, CR-02 n_components<n guard added) (completed 2026-06-24)
 - [ ] **Phase 15: HDBSCAN** — Device front-end (core/mutual-reach) + host tree back-end (MST → condensed tree → stability); exact-label hard gate
 - [ ] **Phase 16: Builder Retrofit Sweep + Shim Coverage** — Retrofit the convention across all existing estimators (additive) and complete the pure-Python sklearn shim coverage
 
