@@ -34,6 +34,11 @@ log = { workspace = true }
 # here so the test target is explicit about its oracle dependency.
 mlrs-core = { path = "../mlrs-core" }
 env_logger = { workspace = true }
+# Compile-fail test harness (D-11) for the Wave-3 typestate gate that asserts a
+# predict-before-fit does NOT compile. dtolnay crate (same author as the
+# workspace `thiserror`/`syn`), legitimacy-audited in RESEARCH § Package
+# Legitimacy Audit; dev-only, no build.rs/postinstall.
+trybuild = "1.0.117"
 
 # Backend selection passthrough. `mlrs-algos` owns NO runtime of its own; each
 # feature forwards to the matching `mlrs-backend` feature so `--features cpu`/
