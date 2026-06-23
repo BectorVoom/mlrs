@@ -28,14 +28,18 @@
 use std::marker::PhantomData;
 
 use bytemuck::Pod;
-use cubecl::prelude::{CubeElement, Float};
+use cubecl::prelude::{ArrayArg, CubeCount, CubeDim, CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::knn_graph::{self, knn_graph};
+use mlrs_backend::prims::rng::SplitMix64;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+use mlrs_kernels::umap_layout_step;
 
 use crate::error::{AlgoError, BuildError};
+use crate::manifold::{umap_init, umap_internals};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
 /// Distance metric for the UMAP neighbor graph (UMAP-01, full set — Phase 14).
@@ -164,6 +168,21 @@ where
     /// Start building an `Umap` from umap-learn's defaults (D-08 single source).
     pub fn builder() -> UmapBuilder {
         UmapBuilder::default()
+    }
+
+    /// `fit_transform` (UMAP-01): fit to `x` and return the fitted embedding host
+    /// buffer in one call — umap-learn's `UMAP.fit_transform`. CONSUMES `self`
+    /// (the `Fit::fit` contract). The returned `Vec<F>` is the row-major
+    /// `(n, n_components)` embedding; the fitted estimator is dropped (callers who
+    /// need the estimator should `fit` then `embedding`). `y` is ignored.
+    pub fn fit_transform(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<Vec<F>, AlgoError> {
+        let fitted = self.fit(pool, x, None, shape)?;
+        Ok(fitted.embedding(pool))
     }
 
     /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
@@ -394,11 +413,17 @@ where
 {
     type Fitted = Umap<F, Fitted>;
 
-    /// NON-algorithmic trivial fit (Phase-12 shell — real UMAP lands in Phase
-    /// 14). Validates the data-DEPENDENT geometry (D-08), then allocates an
-    /// all-zeros `embedding_` of shape `(n, n_components)` — NO kernel, NO
-    /// compute. CONSUMES `self`, returning the `Fitted`-tagged sibling (D-02).
-    /// `y` is ignored (UMAP is unsupervised).
+    /// Real UMAP fit (UMAP-01/03, Phase 14): runs the full deterministic pipeline
+    /// KNN graph → smooth-kNN ρ/σ → membership → t-conorm union → a/b LM fit →
+    /// spectral/random init → the stochastic SGD layout (host epoch driver +
+    /// `umap_layout_step` kernel), producing the real `(n, n_components)`
+    /// `embedding_`. CONSUMES `self`, returning the `Fitted`-tagged sibling
+    /// (D-02). `y` is ignored (UMAP is unsupervised).
+    ///
+    /// All randomness is HOST-drawn `SplitMix64` keyed as a pure function of
+    /// `(random_state, epoch, edge)` (D-05) so two same-`random_state` fits are
+    /// byte-identical per (backend, dtype). Geometry is validated BEFORE any
+    /// device launch (ASVS V5).
     fn fit(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -408,13 +433,12 @@ where
     ) -> Result<Umap<F, Fitted>, AlgoError> {
         let (n, p) = shape;
 
-        // Data-DEPENDENT geometry guard BEFORE the allocation (shared helper, the
+        // Data-DEPENDENT geometry guard BEFORE any launch (shared helper, the
         // data-INDEPENDENT params were validated at build()).
         validate_geometry(x, shape)?;
 
-        // Trivial non-algorithmic fit: zeros embedding. NO kernel, NO compute.
-        let zeros = vec![F::from_int(0i64); n * self.n_components];
-        let embedding = DeviceArray::from_host(pool, &zeros);
+        let embedding_host = run_umap_layout::<F>(pool, x, n, p, &self)?;
+        let embedding = DeviceArray::from_host(pool, &embedding_host);
 
         Ok(Umap {
             n_neighbors: self.n_neighbors,
@@ -492,5 +516,327 @@ where
         }
         let zeros = vec![F::from_int(0i64); n * self.n_components];
         Ok(DeviceArray::from_host(pool, &zeros))
+    }
+}
+
+// ===========================================================================
+// Real UMAP fit pipeline (Phase 14, Plan 04) — host orchestration over the
+// validated deterministic stages + the stochastic SGD layout.
+// ===========================================================================
+
+/// Map the estimator's [`Metric`] onto the Phase-13 [`knn_graph::Metric`]
+/// (Pitfall 4 — the enums mirror each other EXACTLY, so the mapping is total and
+/// lossless). Returns `(metric, p)` where `p` is the Minkowski exponent passed to
+/// `knn_graph` (ignored by the non-Minkowski variants).
+fn map_metric(metric: Metric) -> (knn_graph::Metric, f64) {
+    match metric {
+        Metric::Euclidean => (knn_graph::Metric::Euclidean, 2.0),
+        Metric::Manhattan => (knn_graph::Metric::Manhattan, 1.0),
+        Metric::Cosine => (knn_graph::Metric::Cosine, 2.0),
+        Metric::Chebyshev => (knn_graph::Metric::Chebyshev, 2.0),
+        Metric::Minkowski { p } => (knn_graph::Metric::Minkowski { p }, p),
+    }
+}
+
+/// umap-learn `make_epochs_per_sample` (verified): for each edge weight, the
+/// number of epochs between successive positive samples of that edge is
+/// `n_epochs / (n_epochs · w/w_max) = w_max / w`. Edges whose scaled sample
+/// count is ≤ 0 are never sampled (sentinel `-1.0`). Mirrors umap's
+/// `result[n_samples > 0] = n_epochs / n_samples[n_samples > 0]`.
+fn make_epochs_per_sample(weights: &[f64], n_epochs: usize) -> Vec<f64> {
+    let w_max = weights.iter().cloned().fold(0.0_f64, f64::max);
+    weights
+        .iter()
+        .map(|&w| {
+            // n_samples = n_epochs * (w / w_max); epochs_per_sample = n_epochs / n_samples
+            let n_samples = if w_max > 0.0 {
+                n_epochs as f64 * (w / w_max)
+            } else {
+                0.0
+            };
+            if n_samples > 0.0 {
+                n_epochs as f64 / n_samples
+            } else {
+                -1.0
+            }
+        })
+        .collect()
+}
+
+/// Run the full UMAP pipeline and return the row-major `(n, n_components)`
+/// embedding host buffer. Pure host orchestration over the Phase-13 KNN prim,
+/// the Plan-02/03 host stages, and the Plan-04 `umap_layout_step` kernel.
+fn run_umap_layout<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+    cfg: &Umap<F, Unfit>,
+) -> Result<Vec<F>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let n_components = cfg.n_components;
+
+    // --- (1) Directed KNN graph (UMAP path: include_self = false). ---
+    let (knn_metric, p) = map_metric(cfg.metric);
+    // umap clamps n_neighbors to n-1 (can't have more neighbours than points-1).
+    let k = cfg.n_neighbors.min(n.saturating_sub(1)).max(1);
+    let (knn_idx_dev, knn_dist_dev) =
+        knn_graph::<F>(pool, x, (n, d), k, knn_metric, false, p)?;
+    let knn_idx_host: Vec<f64> = knn_idx_dev
+        .to_host(pool)
+        .iter()
+        .map(|&v| v as f64)
+        .collect();
+    let knn_dist_host: Vec<f64> = knn_dist_dev
+        .to_host(pool)
+        .iter()
+        .map(|&v| host_to_f64(v))
+        .collect();
+    knn_idx_dev.release_into(pool);
+    knn_dist_dev.release_into(pool);
+
+    // --- (2) smooth-kNN ρ/σ → membership → t-conorm union (host f64). ---
+    let (sigmas, rhos) = umap_internals::smooth_knn_dist(
+        &knn_dist_host,
+        n,
+        k,
+        cfg.n_neighbors,
+        cfg.local_connectivity,
+    );
+    let (m_rows, m_cols, m_vals) = umap_internals::compute_membership_strengths(
+        &knn_idx_host,
+        &knn_dist_host,
+        &rhos,
+        &sigmas,
+        n,
+        k,
+    );
+    let (g_rows, g_cols, g_vals) =
+        umap_internals::fuzzy_union(&m_rows, &m_cols, &m_vals, n, cfg.set_op_mix_ratio);
+
+    // --- (3) a/b curve parameters (LM fit unless overridden). ---
+    let (a, b) = match (cfg.a, cfg.b) {
+        (Some(a), Some(b)) => (a, b),
+        _ => umap_init::fit_ab(cfg.min_dist, cfg.spread)?,
+    };
+
+    // --- (4) init: spectral (falls back to random above n=64) or random. ---
+    let seed = cfg.random_state.unwrap_or(42);
+    let mut init: Vec<f64> = match cfg.init {
+        Init::Spectral => {
+            // Build the dense n×n symmetric affinity from the fuzzy COO and drive
+            // the shared spectral_init (reuses laplacian → eig → recover). It
+            // internally falls back to random_init for n > MAX_DIM (umap's own
+            // behaviour) — no error.
+            let mut affinity = vec![0.0f64; n * n];
+            for e in 0..g_vals.len() {
+                affinity[g_rows[e] * n + g_cols[e]] = g_vals[e];
+            }
+            let aff_f: Vec<F> = affinity.iter().map(|&v| f64_to_host::<F>(v)).collect();
+            let aff_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &aff_f);
+            let coords = umap_init::spectral_init::<F>(pool, &aff_dev, n, n_components, seed)?;
+            aff_dev.release_into(pool);
+            coords.iter().map(|&v| host_to_f64(v)).collect()
+        }
+        Init::Random => {
+            let coords = umap_init::random_init::<F>(n, n_components, seed);
+            coords.iter().map(|&v| host_to_f64(v)).collect()
+        }
+    };
+    // umap's separate post-init stage: scale to max-coord 10 + tiny noise.
+    // Keyed off `seed` so the init is byte-deterministic (D-05).
+    umap_init::noisy_scale_coords(&mut init, n, n_components, 10.0, 1e-4, seed ^ 0x5350_4543);
+
+    // --- (5) epochs_per_sample + n_epochs resolution (A4: 500 small / 200 large). ---
+    let n_epochs = cfg.n_epochs.unwrap_or(if n <= 10_000 { 500 } else { 200 });
+    let eps = make_epochs_per_sample(&g_vals, n_epochs);
+
+    // --- (6) host epoch driver: per epoch, select active edges by umap's
+    //     epoch_of_next_sample schedule, draw host negative samples, launch
+    //     umap_layout_step over owners = all n with move_other = true. ---
+    host_epoch_driver::<F>(
+        pool,
+        &mut init,
+        &g_rows,
+        &g_cols,
+        &eps,
+        n,
+        n_components,
+        a,
+        b,
+        cfg.repulsion_strength,
+        cfg.learning_rate,
+        cfg.negative_sample_rate,
+        n_epochs,
+        seed,
+    );
+
+    Ok(init.iter().map(|&v| f64_to_host::<F>(v)).collect())
+}
+
+/// The UMAP SGD layout host epoch driver (mirrors `prims::sgd::sgd_solve`'s
+/// validate→epoch-loop→per-step launch→readback shape). Replicates umap-learn's
+/// per-edge sampling schedule:
+///   - an edge is positively sampled at epoch `n` iff
+///     `epoch_of_next_sample[e] <= n`; after sampling it advances by
+///     `epochs_per_sample[e]`.
+///   - each sampled edge draws `n_neg = floor((n − epoch_of_next_negative[e]) /
+///     epochs_per_negative[e])` host negative samples, then advances the negative
+///     clock by `n_neg · epochs_per_negative[e]`.
+/// All negative-sample indices are drawn host-side with `SplitMix64::next_below`
+/// keyed as a pure function of `(seed, epoch, edge)` (D-05, unbiased — NEVER
+/// `% n`), packed into a per-epoch `neg_idx` device buffer the kernel GATHERs.
+#[allow(clippy::too_many_arguments)]
+fn host_epoch_driver<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    embedding: &mut [f64],
+    head: &[usize],
+    tail: &[usize],
+    epochs_per_sample: &[f64],
+    n: usize,
+    dim: usize,
+    a: f64,
+    b: f64,
+    gamma: f64,
+    initial_alpha: f64,
+    negative_sample_rate: usize,
+    n_epochs: usize,
+    seed: u64,
+) where
+    F: Float + CubeElement + Pod,
+{
+    let n_edges = epochs_per_sample.len();
+    // Per-edge sample clocks (umap's epoch_of_next_sample / _negative_sample).
+    let mut next_sample: Vec<f64> = epochs_per_sample.to_vec();
+    let epochs_per_negative: Vec<f64> = epochs_per_sample
+        .iter()
+        .map(|&e| if e > 0.0 { e / negative_sample_rate as f64 } else { -1.0 })
+        .collect();
+    let mut next_negative: Vec<f64> = epochs_per_negative.clone();
+
+    let client = pool.client().clone();
+
+    for epoch in 0..n_epochs {
+        let alpha = initial_alpha * (1.0 - epoch as f64 / n_epochs as f64);
+
+        // Per-owner CSR builders for THIS epoch's active positive edges + their
+        // host-drawn negative samples.
+        let mut pos_per_owner: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut neg_per_owner: Vec<Vec<u32>> = vec![Vec::new(); n];
+
+        for e in 0..n_edges {
+            let eps_e = epochs_per_sample[e];
+            if eps_e <= 0.0 {
+                continue; // never-sampled edge (zero weight)
+            }
+            if next_sample[e] > epoch as f64 {
+                continue; // not due this epoch
+            }
+            let owner = head[e];
+            let other = tail[e];
+            pos_per_owner[owner].push(other as u32);
+
+            // How many negative samples this edge draws this epoch.
+            let epn = epochs_per_negative[e];
+            let n_neg = if epn > 0.0 {
+                ((epoch as f64 - next_negative[e]) / epn).floor() as i64
+            } else {
+                0
+            };
+            if n_neg > 0 {
+                // Deterministic per-(seed, epoch, edge) substream (D-05).
+                let sub_seed = seed
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add((epoch as u64).wrapping_mul(0x1000_0001))
+                    .wrapping_add(e as u64);
+                let mut rng = SplitMix64::new(sub_seed);
+                for _ in 0..n_neg {
+                    let k = rng.next_below(n as u64) as u32;
+                    neg_per_owner[owner].push(k);
+                }
+                next_negative[e] += n_neg as f64 * epn;
+            }
+            // Advance the positive clock.
+            next_sample[e] += eps_e;
+        }
+
+        // Flatten the per-owner buckets into CSR offsets + tail/neg arrays.
+        let mut pos_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut pos_tail: Vec<u32> = Vec::new();
+        let mut neg_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut neg_idx: Vec<u32> = Vec::new();
+        pos_offsets.push(0);
+        neg_offsets.push(0);
+        for o in 0..n {
+            pos_tail.extend_from_slice(&pos_per_owner[o]);
+            pos_offsets.push(pos_tail.len() as u32);
+            neg_idx.extend_from_slice(&neg_per_owner[o]);
+            neg_offsets.push(neg_idx.len() as u32);
+        }
+
+        // Nothing to do this epoch (no active edges) — skip the launch.
+        if pos_tail.is_empty() && neg_idx.is_empty() {
+            continue;
+        }
+        // The kernel indexes neg_idx/pos_tail by CSR ranges; an empty array would
+        // give a zero-length ArrayArg. Pad with a single sentinel that the CSR
+        // ranges never address (every owner range stays empty, offsets valid).
+        if pos_tail.is_empty() {
+            pos_tail.push(0);
+        }
+        if neg_idx.is_empty() {
+            neg_idx.push(0);
+        }
+
+        // Upload this epoch's coordinates + CSR buffers, launch, read back.
+        let emb_f: Vec<F> = embedding.iter().map(|&v| f64_to_host::<F>(v)).collect();
+        let emb_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &emb_f);
+        let pos_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_offsets);
+        let pos_tail_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_tail);
+        let neg_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_offsets);
+        let neg_idx_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_idx);
+
+        let count = CubeCount::Static(n as u32, 1, 1);
+        let cube_dim = CubeDim { x: 1, y: 1, z: 1 };
+        let emb_arg = unsafe { ArrayArg::from_raw_parts(emb_dev.handle().clone(), n * dim) };
+        let pos_off_arg =
+            unsafe { ArrayArg::from_raw_parts(pos_off_dev.handle().clone(), pos_offsets.len()) };
+        let pos_tail_arg =
+            unsafe { ArrayArg::from_raw_parts(pos_tail_dev.handle().clone(), pos_tail.len()) };
+        let neg_off_arg =
+            unsafe { ArrayArg::from_raw_parts(neg_off_dev.handle().clone(), neg_offsets.len()) };
+        let neg_idx_arg =
+            unsafe { ArrayArg::from_raw_parts(neg_idx_dev.handle().clone(), neg_idx.len()) };
+
+        umap_layout_step::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            cube_dim,
+            emb_arg,
+            pos_off_arg,
+            pos_tail_arg,
+            neg_off_arg,
+            neg_idx_arg,
+            f64_to_host::<F>(a),
+            f64_to_host::<F>(b),
+            f64_to_host::<F>(gamma),
+            f64_to_host::<F>(alpha),
+            dim as u32,
+            n as u32,
+            n as u32,
+            1u32, // move_other = true (fit path)
+        );
+
+        // Read the updated coordinates back into the host buffer.
+        let updated: Vec<f64> = emb_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        embedding.copy_from_slice(&updated);
+
+        emb_dev.release_into(pool);
+        pos_off_dev.release_into(pool);
+        pos_tail_dev.release_into(pool);
+        neg_off_dev.release_into(pool);
+        neg_idx_dev.release_into(pool);
     }
 }
