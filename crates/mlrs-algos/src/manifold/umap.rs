@@ -581,6 +581,19 @@ where
 {
     let n_components = cfg.n_components;
 
+    // Defensive boundary check (WR-02): `fit` guards `n_components >= 1` and the
+    // embedding-buffer shape, so this is currently unreachable, but the transform
+    // path must not divide by `n_components` (below) or index
+    // `embedding_train[col * n_components + d]` (in `init_graph_transform`) on a
+    // partially-built `Fitted` shell. Surface a typed error rather than panicking
+    // deep inside transform.
+    if n_components == 0 {
+        return Err(AlgoError::InvalidGraphInput {
+            estimator: "umap",
+            reason: "n_components is 0 on the fitted estimator".to_string(),
+        });
+    }
+
     // The FROZEN training embedding (host f64, row-major (n, n_components)).
     let embedding_train: Vec<f64> = cfg
         .embedding_
@@ -590,6 +603,16 @@ where
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
+    if embedding_train.len() % n_components != 0 {
+        return Err(AlgoError::InvalidGraphInput {
+            estimator: "umap",
+            reason: format!(
+                "fitted embedding length {} is not a multiple of n_components {}",
+                embedding_train.len(),
+                n_components
+            ),
+        });
+    }
     let n = embedding_train.len() / n_components;
 
     // Host f64 copies of the query (new) and the training design rows. The
