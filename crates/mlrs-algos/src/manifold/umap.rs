@@ -32,11 +32,13 @@ use cubecl::prelude::{ArrayArg, CubeCount, CubeDim, CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::distance::distance;
 use mlrs_backend::prims::knn_graph::{self, knn_graph};
 use mlrs_backend::prims::rng::SplitMix64;
+use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
-use mlrs_kernels::umap_layout_step;
+use mlrs_kernels::{chebyshev_dist, manhattan_dist, minkowski_dist, umap_layout_step};
 
 use crate::error::{AlgoError, BuildError};
 use crate::manifold::{umap_init, umap_internals};
@@ -536,6 +538,128 @@ fn map_metric(metric: Metric) -> (knn_graph::Metric, f64) {
         Metric::Chebyshev => (knn_graph::Metric::Chebyshev, 2.0),
         Metric::Minkowski { p } => (knn_graph::Metric::Minkowski { p }, p),
     }
+}
+
+/// L2-normalise each row of a row-major `r × d` host matrix
+/// (`x̂_i = x_i / ‖x_i‖₂`, zero-norm rows stay zero) — the Cosine pre-step before
+/// the GEMM `distance` path (mirrors `knn_graph::l2_normalize_rows`, kept private
+/// here so the transform query-vs-train composition is self-contained).
+fn l2_normalize_rows(x: &[f64], r: usize, d: usize) -> Vec<f64> {
+    let mut out = Vec::with_capacity(r * d);
+    for i in 0..r {
+        let row = &x[i * d..(i + 1) * d];
+        let norm = row.iter().map(|&v| v * v).sum::<f64>().sqrt();
+        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+        for &v in row {
+            out.push(v * inv);
+        }
+    }
+    out
+}
+
+/// Query-vs-train directed KNN for the transform path (UMAP-04, RESEARCH Q2/A2 —
+/// the resolution of Pitfall 5). Composes `distance(X_new, X_train)` + `top_k(k)`
+/// directly (Euclidean/Cosine → the GEMM `distance` fast path; Manhattan/
+/// Chebyshev/Minkowski → the direct pairwise kernels), with NO self-drop (the new
+/// points are NOT in the training set, so a query is never its own neighbour).
+///
+/// `x_new_host` is the row-major `(m, d)` query block (host f64); `x_train_host`
+/// is the row-major `(n, d)` training block. Returns `(knn_idx, knn_dist)` as
+/// row-major `(m, k)` host `f64` (indices float-encoded for the membership
+/// stages, ascending per row, lowest-index tie-break — the mlrs convention).
+///
+/// All geometry is validated inside the composed `distance`/`top_k` prims BEFORE
+/// any launch (T-14-15/T-14-16). The `(m × n)` distance block is small at
+/// transform scale, so no query-axis tiling is needed (single block).
+fn query_train_knn<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_new_host: &[f64],
+    x_train_host: &[f64],
+    m: usize,
+    n: usize,
+    d: usize,
+    k: usize,
+    metric: Metric,
+) -> Result<(Vec<f64>, Vec<f64>), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (knn_metric, p) = map_metric(metric);
+
+    // Euclidean uses GEMM squared distance with a top_k boundary sqrt; Cosine
+    // uses GEMM on L2-normalised rows (its returned squared value `2(1−cos)` is
+    // order-preserving with cosine distance, so the SELECTED indices are correct;
+    // the absolute distance scale is irrelevant to the membership stage, which
+    // re-derives ρ/σ from these distances). The direct kernels emit true distance.
+    let needs_sqrt = matches!(knn_metric, knn_graph::Metric::Euclidean);
+
+    // Build the (normalised, for Cosine) device operands.
+    let (q_host, t_host): (Vec<f64>, Vec<f64>) = match metric {
+        Metric::Cosine => (
+            l2_normalize_rows(x_new_host, m, d),
+            l2_normalize_rows(x_train_host, n, d),
+        ),
+        _ => (x_new_host.to_vec(), x_train_host.to_vec()),
+    };
+    let q_f: Vec<F> = q_host.iter().map(|&v| f64_to_host::<F>(v)).collect();
+    let t_f: Vec<F> = t_host.iter().map(|&v| f64_to_host::<F>(v)).collect();
+    let q_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &q_f);
+    let t_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &t_f);
+
+    // --- distance(X_new, X_train) → (m × n). ---
+    let dist: DeviceArray<ActiveRuntime, F> = match knn_metric {
+        knn_graph::Metric::Euclidean | knn_graph::Metric::Cosine => {
+            distance::<F>(pool, &q_dev, (m, d), &t_dev, (n, d), false, None)?
+        }
+        knn_graph::Metric::Manhattan
+        | knn_graph::Metric::Chebyshev
+        | knn_graph::Metric::Minkowski { .. } => {
+            let out_len = m * n;
+            let out_handle = pool.acquire(out_len * std::mem::size_of::<F>());
+            let client = pool.client().clone();
+            let bx = 16u32;
+            let count = CubeCount::Static(
+                ((m as u32) + bx - 1) / bx,
+                ((n as u32) + bx - 1) / bx,
+                1,
+            );
+            let cube_dim = CubeDim { x: bx, y: bx, z: 1 };
+            // SAFETY: lengths are validated element counts (m*d, n*d, m*n); the
+            // direct kernels bounds-check i<m && j<n and the feature loop kk<d.
+            let q_arg = unsafe { ArrayArg::from_raw_parts(q_dev.handle().clone(), q_dev.len()) };
+            let t_arg = unsafe { ArrayArg::from_raw_parts(t_dev.handle().clone(), t_dev.len()) };
+            let o_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
+            match knn_metric {
+                knn_graph::Metric::Manhattan => manhattan_dist::launch::<F, ActiveRuntime>(
+                    &client, count, cube_dim, q_arg, t_arg, o_arg, m as u32, n as u32, d as u32,
+                ),
+                knn_graph::Metric::Chebyshev => chebyshev_dist::launch::<F, ActiveRuntime>(
+                    &client, count, cube_dim, q_arg, t_arg, o_arg, m as u32, n as u32, d as u32,
+                ),
+                knn_graph::Metric::Minkowski { p: mp } => minkowski_dist::launch::<F, ActiveRuntime>(
+                    &client, count, cube_dim, q_arg, t_arg, o_arg, m as u32, n as u32, d as u32,
+                    f64_to_host::<F>(mp),
+                ),
+                _ => unreachable!("outer match restricts to the direct-kernel metrics"),
+            }
+            DeviceArray::from_raw(out_handle, out_len)
+        }
+    };
+    let _ = p; // p flows through the Minkowski enum payload (single source of truth)
+    q_dev.release_into(pool);
+    t_dev.release_into(pool);
+
+    // --- top_k(k) over the m query rows; ascending (val, idx), lowest-index
+    //     tie-break. NO self-drop (new ≠ train). sqrt boundary for Euclidean. ---
+    let (tk_val, tk_idx) = top_k::<F>(pool, &dist, m, n, k, needs_sqrt, None, None)?;
+    dist.release_into(pool);
+
+    let knn_idx_host: Vec<f64> = tk_idx.to_host(pool).iter().map(|&v| v as f64).collect();
+    let knn_dist_host: Vec<f64> = tk_val.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+    tk_idx.release_into(pool);
+    tk_val.release_into(pool);
+
+    Ok((knn_idx_host, knn_dist_host))
 }
 
 /// umap-learn `make_epochs_per_sample` (verified): for each edge weight, the

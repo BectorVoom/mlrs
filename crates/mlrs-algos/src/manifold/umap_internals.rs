@@ -267,3 +267,68 @@ pub fn fuzzy_union(
 
     (out_rows, out_cols, out_vals)
 }
+
+/// Neighbor-weighted-average initialization for the transform frozen-subset path
+/// (UMAP-04, D-03) — host f64 port of umap-learn 0.5.12's `init_graph_transform`
+/// (RESEARCH Pattern 7 step 3).
+///
+/// Each NEW point is initialized to the row-normalized weighted average of its
+/// trained-neighbor embedding coordinates:
+/// `init[new_i] = Σ_j (graph_ij / rowsum_i) · embedding_train[col_j]`,
+/// where `(rows, cols, vals)` is the transform membership graph COO of the `m`
+/// new points against the `n` training points (rows ∈ `0..m`, cols ∈ `0..n`) and
+/// `embedding_train` is the row-major `(n, n_components)` FROZEN training
+/// embedding. A new point with no membership edges (zero rowsum) is left at the
+/// origin (all-zeros) — umap's behaviour for an isolated query point.
+///
+/// Returns the row-major `(m, n_components)` init buffer for the new points.
+///
+/// Pure host f64; `m`/`n` are small at transform scale so the dense accumulation
+/// is cheap. Bounds: `cols` come from the validated query-vs-train KNN, so host
+/// indexing panics rather than OOB-reading (threat T-14-16).
+pub fn init_graph_transform(
+    rows: &[usize],
+    cols: &[usize],
+    vals: &[f64],
+    embedding_train: &[f64],
+    m: usize,
+    n: usize,
+    n_components: usize,
+) -> Vec<f64> {
+    assert_eq!(rows.len(), cols.len(), "transform COO rows/cols length mismatch");
+    assert_eq!(rows.len(), vals.len(), "transform COO rows/vals length mismatch");
+    assert_eq!(
+        embedding_train.len(),
+        n * n_components,
+        "embedding_train must be n*n_components"
+    );
+
+    let mut init = vec![0.0f64; m * n_components];
+    let mut rowsum = vec![0.0f64; m];
+
+    // Accumulate the un-normalized weighted sum of neighbor coords + the per-row
+    // membership total (the normalizer).
+    for e in 0..vals.len() {
+        let r = rows[e];
+        let c = cols[e];
+        let w = vals[e];
+        rowsum[r] += w;
+        let src = c * n_components;
+        let dst = r * n_components;
+        for d in 0..n_components {
+            init[dst + d] += w * embedding_train[src + d];
+        }
+    }
+
+    // Row-normalize (skip zero-rowsum points — they stay at the origin).
+    for r in 0..m {
+        if rowsum[r] > 0.0 {
+            let dst = r * n_components;
+            for d in 0..n_components {
+                init[dst + d] /= rowsum[r];
+            }
+        }
+    }
+
+    init
+}
