@@ -138,21 +138,6 @@ where
         HdbscanBuilder::default()
     }
 
-    /// Decompose this (unfit) estimator back into its builder, copying every
-    /// hyperparameter. Used by `HdbscanBuilder::default` to re-derive the
-    /// defaults from [`Hdbscan::new`] (D-08).
-    pub fn into_builder(self) -> HdbscanBuilder {
-        HdbscanBuilder {
-            min_cluster_size: self.min_cluster_size,
-            min_samples: self.min_samples,
-            cluster_selection_epsilon: self.cluster_selection_epsilon,
-            cluster_selection_method: self.cluster_selection_method,
-            metric: self.metric,
-            alpha: self.alpha,
-            max_cluster_size: self.max_cluster_size,
-        }
-    }
-
     /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
     /// `labels_`/`n_features_in_` fields are excluded). Used by the
     /// defaults-equality test (BLDR-01).
@@ -164,6 +149,22 @@ where
             && self.metric == other.metric
             && self.alpha == other.alpha
             && self.max_cluster_size == other.max_cluster_size
+    }
+
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by `HdbscanBuilder::default` to re-derive the
+    /// defaults from [`Hdbscan::new`] (D-08) and available to callers who want to
+    /// tweak a constructed estimator before fitting.
+    pub fn into_builder(self) -> HdbscanBuilder {
+        HdbscanBuilder {
+            min_cluster_size: self.min_cluster_size,
+            min_samples: self.min_samples,
+            cluster_selection_epsilon: self.cluster_selection_epsilon,
+            cluster_selection_method: self.cluster_selection_method,
+            metric: self.metric,
+            alpha: self.alpha,
+            max_cluster_size: self.max_cluster_size,
+        }
     }
 }
 
