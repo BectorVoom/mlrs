@@ -45,8 +45,20 @@ const NPY_FLOATMAX: f64 = f32::MAX as f64;
 ///
 /// Pure host numerics — no device launch, no `DeviceArray`. Bounded iteration
 /// (`SMOOTH_N_ITER`) + umap's zero-guards (per-row & global `MIN_K_DIST_SCALE`
-/// floor, ρ ≤ 0 fallback) → no NaN / non-termination on pathological input
+/// floor, ρ ≤ 0 fallback) → the search ALWAYS terminates at the iteration cap
+/// and the result is finite — no NaN / non-termination on pathological input
 /// (threats T-14-03 / T-14-04).
+///
+/// WR-03 caveat: when `k == 1` (reachable: fit clamps `k = n_neighbors.min(n-1)
+/// .max(1)`, so `n == 2, n_neighbors == 1` → `k == 1`), the inner sum `Σ_{1..k}`
+/// is EMPTY, so `psum == 0 < target` for every iteration and the `else` branch
+/// doubles `mid` for all `SMOOTH_N_ITER` iterations, producing a runaway σ ≈
+/// `2^64` that the per-row floor then clamps. The result is finite and the loop
+/// terminates (the "no non-termination" guarantee holds in the iteration-cap
+/// sense), but the σ for a `k == 1` row is numerically DEGENERATE — driven by
+/// the `MIN_K_DIST_SCALE` floor rather than a meaningful binary search. This
+/// matches umap-learn's own `range(1, k)` (parity-correct), so it is documented
+/// rather than special-cased.
 pub fn smooth_knn_dist(
     knn_dist: &[f64],
     n: usize,
