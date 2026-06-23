@@ -840,9 +840,12 @@ def gen_knn_metric(
       - ``X`` (train, self-queried), ``k`` (the requested k true neighbours),
       - ``distances`` / ``indices`` — the sklearn ``k+1`` self-inclusive
         neighbours of X-vs-X (ascending; column 0 = self, distance 0),
-      - ``metric`` (string tag), ``p`` (the Minkowski exponent or NaN),
+      - ``p`` (the Minkowski exponent, or NaN for non-Minkowski metrics),
       - ``dup_row_a`` / ``dup_row_b`` (the identical-row index pair, for the R-9
         VALUE assert).
+
+    The metric tag is carried in the FILENAME only (never an in-blob string
+    array — ``mlrs_core::load_npz`` decodes only 4/8-byte float arrays).
 
     Returns the path written. Filename:
     ``knn_{metric}_{dtype_tag}_seed{seed}.npz``.
@@ -885,7 +888,11 @@ def gen_knn_metric(
         p=c([p_store]),
         dup_row_a=c([KNN_DUP_ROW_A]),
         dup_row_b=c([KNN_DUP_ROW_B]),
-        metric=np.array(metric),
+        # NOTE: the metric tag lives in the FILENAME, not as an in-blob array —
+        # mlrs_core::load_npz only decodes 4/8-byte float arrays (a numpy
+        # unicode `metric` array would make load_npz return InvalidData and
+        # break the consuming Rust test). The float `p` carries the only
+        # metric-dependent scalar the test needs.
     )
     return out_path
 
