@@ -945,10 +945,19 @@ where
 
     // Euclidean uses GEMM squared distance with a top_k boundary sqrt; Cosine
     // uses GEMM on L2-normalised rows (its returned squared value `2(1−cos)` is
-    // order-preserving with cosine distance, so the SELECTED indices are correct;
-    // the absolute distance scale is irrelevant to the membership stage, which
-    // re-derives ρ/σ from these distances). The direct kernels emit true distance.
+    // order-preserving with cosine distance, so the SELECTED indices are correct).
+    // The direct kernels emit true distance.
     let needs_sqrt = matches!(knn_metric, knn_graph::Metric::Euclidean);
+    // Cosine post-scale: `1 − cos = ‖x̂ − ŷ‖² / 2`. The fit path's `knn_graph`
+    // halves the GEMM `2(1−cos)` back to the true cosine distance `1−cos`
+    // (knn_graph.rs:212-219). The transform KNN distances feed the SAME
+    // membership stage (`smooth_knn_dist`), which is NOT purely scale-invariant
+    // (the σ floor `MIN_K_DIST_SCALE * mean` and the ρ≤0 global fallback are
+    // absolute floors against the mean), so a 2×-inflated transform distance
+    // matrix would build a membership graph that does not match the one `fit`
+    // builds for the same neighbour geometry (UMAP-04 / D-03 require identical
+    // membership). Mirror the halving here so transform is on the `1−cos` scale.
+    let cosine_halve = matches!(knn_metric, knn_graph::Metric::Cosine);
 
     // Build the (normalised, for Cosine) device operands.
     let (q_host, t_host): (Vec<f64>, Vec<f64>) = match metric {
@@ -1012,7 +1021,20 @@ where
     dist.release_into(pool);
 
     let knn_idx_host: Vec<f64> = tk_idx.to_host(pool).iter().map(|&v| v as f64).collect();
-    let knn_dist_host: Vec<f64> = tk_val.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+    let knn_dist_host: Vec<f64> = tk_val
+        .to_host(pool)
+        .iter()
+        .map(|&v| {
+            let d = host_to_f64(v);
+            // Mirror knn_graph's cosine halving so transform distances are on the
+            // same `1−cos` scale as fit (CR-01).
+            if cosine_halve {
+                0.5 * d
+            } else {
+                d
+            }
+        })
+        .collect();
     tk_idx.release_into(pool);
     tk_val.release_into(pool);
 
