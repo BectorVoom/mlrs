@@ -179,7 +179,7 @@ where
         // --- 1. Distance(tile_query, full_train) → (tile × n). Big operand stays
         //        global (train_dev); only this tile×n block is resident. ---
         let dist = compute_tile_distance::<F>(
-            pool, &tile_dev, &train_dev, tile, n, d, metric, p,
+            pool, &tile_dev, &train_dev, tile, n, d, metric,
         )?;
         // The tile query block was consumed by the distance launch — release it.
         tile_dev.release_into(pool);
@@ -238,6 +238,9 @@ where
 /// `distance()` (squared, sqrt deferred to `top_k`); Manhattan/Chebyshev/
 /// Minkowski route to the Plan-02 direct pairwise kernels (true distance). The
 /// returned block is caller-owned scratch (released by the caller after `top_k`).
+///
+/// The Minkowski exponent is read from `Metric::Minkowski { p }` (the enum is the
+/// single source of truth, WR-01); there is no standalone `p` parameter here.
 #[allow(clippy::too_many_arguments)]
 fn compute_tile_distance<F>(
     pool: &mut BufferPool<ActiveRuntime>,
@@ -247,7 +250,6 @@ fn compute_tile_distance<F>(
     n: usize,
     d: usize,
     metric: Metric,
-    p: f64,
 ) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
 where
     F: Float + CubeElement + Pod,
@@ -292,10 +294,15 @@ where
                     &client, count, dim, q_arg, t_arg, o_arg,
                     tile as u32, n as u32, d as u32,
                 ),
-                Metric::Minkowski { .. } => minkowski_dist::launch::<F, ActiveRuntime>(
+                // WR-01: read the exponent from the ENUM (single source of truth),
+                // NOT the standalone `p` arg. `validate_geometry` rejects any
+                // divergence between the two up front, so they are guaranteed equal
+                // here — but reading the enum makes the compute path self-consistent
+                // with the logged/serialized `Metric` regardless.
+                Metric::Minkowski { p: mp } => minkowski_dist::launch::<F, ActiveRuntime>(
                     &client, count, dim, q_arg, t_arg, o_arg,
                     tile as u32, n as u32, d as u32,
-                    f64_to_host::<F>(p), // p cast f64 → F for the kernel exponent
+                    f64_to_host::<F>(mp), // enum-carried p cast f64 → F (kernel exponent)
                 ),
                 _ => unreachable!("outer match restricts to the direct-kernel metrics"),
             }
@@ -416,9 +423,13 @@ fn validate_geometry(
         });
     }
     // p >= 1 for Minkowski (operand "p"); ignored for the other metrics. Both the
-    // enum-carried exponent and the separately-passed argument are validated.
+    // enum-carried exponent and the separately-passed argument are validated, AND
+    // (WR-01) the two MUST agree: the compute path reads the exponent from the enum
+    // (single source of truth), so a caller passing `Metric::Minkowski { p: 3.0 }`
+    // with a divergent standalone `p` is rejected here rather than silently
+    // computing the enum's `p` while logging/serializing keyed on the other value.
     if let Metric::Minkowski { p: mp } = metric {
-        if !(mp >= 1.0) || !(p >= 1.0) {
+        if !(mp >= 1.0) || !(p >= 1.0) || (mp - p).abs() > 0.0 {
             return Err(PrimError::ShapeMismatch {
                 operand: "p",
                 rows: 1,
