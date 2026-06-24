@@ -6,14 +6,14 @@ current_phase: 15
 current_phase_name: hdbscan
 status: executing
 stopped_at: Completed 15-01-PLAN.md
-last_updated: "2026-06-24T04:44:05.484Z"
+last_updated: "2026-06-24T05:01:46.502Z"
 last_activity: 2026-06-24
 last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 20
-  completed_plans: 15
+  completed_plans: 16
   percent: 60
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 15 (hdbscan) — EXECUTING
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
 Last activity: 2026-06-24 — Phase 15 execution started
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
@@ -134,6 +134,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 14 P06 | 3 | 2 tasks | 2 files |
 | Phase 14 P07 | 70 | 3 tasks | 3 files |
 | Phase 15 P01 | 1m36s | 1 tasks | 3 files |
+| Phase 15 P02 | 75min | 2 tasks | 25 files |
 
 ## Accumulated Context
 
@@ -262,6 +263,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 14-07: fit layout owner-only (move_other=0) via FIT_MOVE_OTHER resolves CR-01 race + CR-03 double-count; D-05 holds on any parallel backend
 - [Phase ?]: 14-07: PROPERTY_EPS re-derived 0.02->0.03 (~12x worst trust margin 0.0025, <=0.04 ceiling); ARI_BAND stays 0.05; all 5 layout_property metrics green + reproducible_f64 byte-identical
 - [Phase 15]: best_match_accuracy_pinned_noise: -1 filtered from both vocabularies before greedy best_mapping, then (-1,-1) force-pinned; HDBS-02 exact-label compare primitive
+- [Phase ?]: 15-02: epsilon knob oracled vs hdbscan 0.8.44 (sklearn 1.9.0 epsilon_search crashes on merging trees)
+- [Phase ?]: 15-02: hdbscan oracle forced algorithm='generic' (default 'best' BallTree rejects cosine)
 
 ### Pending Todos
 
@@ -293,7 +296,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T04:44:05.477Z
+Last session: 2026-06-24T05:01:30.223Z
 Stopped at: Completed 15-01-PLAN.md
 Resume file: .planning/phases/15-hdbscan/15-CONTEXT.md
 
