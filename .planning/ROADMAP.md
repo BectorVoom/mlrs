@@ -236,5 +236,5 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
 | 14. UMAP | v3.0 | 7/7 | Complete    | 2026-06-23 |
-| 15. HDBSCAN | v3.0 | 7/7 | Complete   | 2026-06-24 |
+| 15. HDBSCAN | v3.0 | 7/7 | Complete    | 2026-06-24 |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |

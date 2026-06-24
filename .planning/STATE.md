@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
-current_phase: 15
-current_phase_name: hdbscan
+current_phase: 16
+current_phase_name: Builder Retrofit Sweep + Shim Coverage
 status: executing
 stopped_at: Completed 15-07-PLAN.md
-last_updated: "2026-06-24T07:06:22.737Z"
+last_updated: "2026-06-24T07:11:36.960Z"
 last_activity: 2026-06-24
-last_activity_desc: Phase 15 execution started
+last_activity_desc: Phase 15 complete, transitioned to Phase 16
 progress:
   total_phases: 5
   completed_phases: 4
@@ -28,10 +28,10 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 15 (hdbscan) — EXECUTING
-Plan: 2 of 7
+Phase: 16 — Builder Retrofit Sweep + Shim Coverage
+Plan: Not started
 Status: Ready to execute
-Last activity: 2026-06-24 — Phase 15 execution started
+Last activity: 2026-06-24 — Phase 15 complete, transitioned to Phase 16
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
 
 Progress: [██████░░░░] 60% (v3.0)
@@ -46,7 +46,7 @@ Progress: [██████░░░░] 60% (v3.0)
 
 **Velocity:**
 
-- Total plans completed: 61
+- Total plans completed: 68
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -63,6 +63,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | 11 | 5 | - | - |
 | 13 | 3 | - | - |
 | 14 | 7 | - | - |
+| 15 | 7 | - | - |
 
 **Recent Trend:**
 
