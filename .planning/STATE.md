@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 15
-current_phase_name: HDBSCAN
-status: verifying
-stopped_at: Phase 15 context gathered
-last_updated: "2026-06-24T03:50:34.223Z"
-last_activity: 2026-06-23
-last_activity_desc: Phase 14 complete, transitioned to Phase 15
+current_phase_name: hdbscan
+status: executing
+stopped_at: Completed 15-01-PLAN.md
+last_updated: "2026-06-24T04:44:05.484Z"
+last_activity: 2026-06-24
+last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 5
   completed_phases: 3
-  total_plans: 14
-  completed_plans: 14
+  total_plans: 20
+  completed_plans: 15
   percent: 60
 ---
 
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 14 — umap
+**Current focus:** Phase 15 — hdbscan
 
 ## Current Position
 
-Phase: 15 — HDBSCAN
-Plan: Not started
-Status: Gap-closure done — 14-06 closed CR-02 (n_components<n guard); 14-07 closed CR-01 (parallel-backend write race) + CR-03 (force double-count) via owner-only move_other=0 fit launch. Phase NOT yet re-verified — orchestrator/verifier must confirm before marking complete.
-Last activity: 2026-06-23 — Phase 14 complete, transitioned to Phase 15
+Phase: 15 (hdbscan) — EXECUTING
+Plan: 2 of 6
+Status: Ready to execute
+Last activity: 2026-06-24 — Phase 15 execution started
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
 
 Progress: [██████░░░░] 60% (v3.0)
@@ -133,6 +133,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 14 P05 | 180 | 2 tasks | 4 files |
 | Phase 14 P06 | 3 | 2 tasks | 2 files |
 | Phase 14 P07 | 70 | 3 tasks | 3 files |
+| Phase 15 P01 | 1m36s | 1 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -260,6 +261,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 14-06: Umap::fit guards n_components < n via typed AlgoError::InvalidNComponents before any device launch (mirrors SpectralEmbedding::fit), closing CR-02 recover underflow.
 - [Phase ?]: 14-07: fit layout owner-only (move_other=0) via FIT_MOVE_OTHER resolves CR-01 race + CR-03 double-count; D-05 holds on any parallel backend
 - [Phase ?]: 14-07: PROPERTY_EPS re-derived 0.02->0.03 (~12x worst trust margin 0.0025, <=0.04 ceiling); ARI_BAND stays 0.05; all 5 layout_property metrics green + reproducible_f64 byte-identical
+- [Phase 15]: best_match_accuracy_pinned_noise: -1 filtered from both vocabularies before greedy best_mapping, then (-1,-1) force-pinned; HDBS-02 exact-label compare primitive
 
 ### Pending Todos
 
@@ -291,8 +293,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T03:50:34.217Z
-Stopped at: Phase 15 context gathered
+Last session: 2026-06-24T04:44:05.477Z
+Stopped at: Completed 15-01-PLAN.md
 Resume file: .planning/phases/15-hdbscan/15-CONTEXT.md
 
 ## Operator Next Steps

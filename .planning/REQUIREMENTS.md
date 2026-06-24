@@ -28,7 +28,7 @@ Requirements for the v3.0 milestone. Each maps to a roadmap phase.
 ### HDBSCAN
 
 - [ ] **HDBS-01**: User can fit HDBSCAN (`fit` / `fit_predict`) to produce `labels_` (`-1` = noise) and `probabilities_` `∈[0,1]` with sklearn-named hyperparameters and defaults (`min_cluster_size=5`, `min_samples=None→min_cluster_size`, `cluster_selection_epsilon=0.0`, `cluster_selection_method='eom'` and `'leaf'`, `metric='euclidean'`, `alpha=1.0`, `max_cluster_size=0`), implemented as a device front-end (core distances + mutual-reachability) plus a host back-end (MST → single-linkage → condensed tree → EoM/leaf stability extraction), dodging the tree-atomics wall.
-- [ ] **HDBS-02**: HDBSCAN `labels_` match `sklearn.cluster.HDBSCAN` (cross-checked vs `hdbscan` 0.8.44) exactly up to permutation with `-1` pinned (exact on `metric='precomputed'` f64; the label-perm helper extended to fix `-1→-1`), and `probabilities_` agree within a documented band; MST edge tie-breaking is stable-sorted with a documented deterministic rule.
+- [x] **HDBS-02**: HDBSCAN `labels_` match `sklearn.cluster.HDBSCAN` (cross-checked vs `hdbscan` 0.8.44) exactly up to permutation with `-1` pinned (exact on `metric='precomputed'` f64; the label-perm helper extended to fix `-1→-1`), and `probabilities_` agree within a documented band; MST edge tie-breaking is stable-sorted with a documented deterministic rule.
 - [ ] **HDBS-03**: User can read per-point `outlier_scores_` (GLOSH) from a fitted HDBSCAN — a differentiator vs `sklearn.cluster.HDBSCAN`, gated within band vs the `hdbscan` library.
 - [ ] **HDBS-04**: User can request cluster centers via `store_centers` (`'centroid'`/`'medoid'`) producing `centroids_`/`medoids_` attributes (sklearn parity).
 
@@ -85,7 +85,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | UMAP-03 | Phase 14 | Complete |
 | UMAP-04 | Phase 14 | Complete |
 | HDBS-01 | Phase 15 | Pending |
-| HDBS-02 | Phase 15 | Pending |
+| HDBS-02 | Phase 15 | Complete |
 | HDBS-03 | Phase 15 | Pending |
 | HDBS-04 | Phase 15 | Pending |
 | BLDR-01 | Phase 12 | Pending |
