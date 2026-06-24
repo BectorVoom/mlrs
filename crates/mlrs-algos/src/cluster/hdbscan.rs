@@ -571,11 +571,14 @@ where
             let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
             let (cent, med) =
                 centers::weighted_cluster_center(&x_host, &labels, &probabilities, p, self.metric, which);
-            let cent_dev = cent.map(|c| {
+            // WR-03: honour the documented `None`-means-no-cluster contract. An
+            // all-noise fit yields `Some(vec![])`; filter the empty block to `None`
+            // so a consumer never receives an empty `Some`.
+            let cent_dev = cent.filter(|c| !c.is_empty()).map(|c| {
                 let c_f: Vec<F> = c.iter().map(|&v| f64_to_host::<F>(v)).collect();
                 DeviceArray::from_host(pool, &c_f)
             });
-            let med_dev = med.map(|m| {
+            let med_dev = med.filter(|m| !m.is_empty()).map(|m| {
                 let m_f: Vec<F> = m.iter().map(|&v| f64_to_host::<F>(v)).collect();
                 DeviceArray::from_host(pool, &m_f)
             });
