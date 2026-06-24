@@ -6,15 +6,15 @@ current_phase: 16
 current_phase_name: builder-retrofit-sweep-shim-coverage
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-24T11:58:13.197Z"
+last_updated: "2026-06-24T12:16:46.547Z"
 last_activity: 2026-06-24
-last_activity_desc: Completed 16-03 (LogisticRegression + LinearSVC/SVR + MBSGDClassifier typestate retrofit; linear module fully migrated)
+last_activity_desc: Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 34
-  completed_plans: 26
-  percent: 76
+  completed_plans: 27
+  percent: 79
 ---
 
 # Project State
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
-Plan: 6 of 13
+Plan: 7 of 13
 Status: Ready to execute
 Last activity: 2026-06-24 — Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
@@ -145,6 +145,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 16 P00 | 12 | 3 tasks | 3 files |
 | Phase 16 P02 | 9m | 3 tasks | 7 files |
 | Phase 16 P03 | ~16m | 3 tasks | 9 files |
+| Phase 16 P05 | 50m | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -287,6 +288,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 16-02: with_opts folds into builder setters; data-independent validation relocates to build()->BuildError (shared fit helper unchanged, byte-identical math)
 - [Phase ?]: 16-02: LinearRegression build() is infallible-but-typed (no data-independent hyperparam) for PyO3 build_err_to_py uniformity across the linear family
 - [Phase ?]: [16-03]: Linear classifier/SVM family migrated to typestate — LogisticRegression (shape A with_opts-fold; C>0 check relocated to build()->BuildError::InvalidC) + LinearSVC/LinearSVR/MBSGDClassifier (shape B trait-swap). First end-to-end use of the Plan-00 PredictLabels/PredictProba accessor traits (impl on Fitted only, Typestate* UFCS aliases at the PyO3 arms). linear.rs (PyO3) now 100% off the legacy mlrs_algos::traits glob — linear module fully migrated. 4 oracle suites green (28 tests), fit bodies byte-identical (D-03), mlrs-py builds. Commits 449dc35/1cea776/0d3033e/44e62cb.
+- [Phase ?]: [16-05]: Cluster sweep (minus KMeans) — DBSCAN (Shape-A, Fit only, no predict; eps/min_samples -> DbscanBuilder::build()->BuildError, added BuildError::InvalidEps), SpectralClustering (WIDE 6-arg->builder, .affinity(String)/.n_components(Option) setters proven for KMeans Plan 06; gamma>0 stays in fit affinity-coupled; inner KMeans bridged via LegacyFit UFCS until Plan 06), SpectralEmbedding (Shape-A', ADOPTS typestate::Fit; non-transductive so no Transform). All fit bodies byte-identical (D-03). 15 tests green; PyO3 arms -> any_estimator_typestate!. Commits 20c2154/1cb060e/e17e14b. BLDR-03 progress (NOT complete — Plan 16-11/16-12).
 
 ### Pending Todos
 
@@ -318,7 +320,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T11:58:13.191Z
+Last session: 2026-06-24T12:16:03.872Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
 
