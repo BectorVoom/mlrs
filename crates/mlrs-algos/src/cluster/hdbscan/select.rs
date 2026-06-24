@@ -50,13 +50,22 @@ impl TreeUnionFind {
         }
     }
 
-    /// Find with path compression (sklearn `find`).
+    /// Find with path compression (sklearn `find`). Iterative two-pass (walk to
+    /// root, then re-point) to avoid O(chain) recursion / stack overflow on a
+    /// freshly-built union-find before compression (WR-05; sklearn's `find` is
+    /// iterative for the same reason).
     fn find(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            let root = self.find(self.parent[x]);
-            self.parent[x] = root;
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
         }
-        self.parent[x]
+        let mut x = x;
+        while self.parent[x] != root {
+            let next = self.parent[x];
+            self.parent[x] = root;
+            x = next;
+        }
+        root
     }
 
     /// Union by rank (sklearn `union`): the lower-rank root attaches to the
@@ -100,21 +109,28 @@ fn bfs_from_cluster_tree(cluster_tree: &[CondensedNode], bfs_root: usize) -> Vec
 
 /// DFS leaves of the cluster subtree rooted at `current_node` (sklearn
 /// `recurse_leaf_dfs`): a node with no children in the cluster tree is a leaf.
+/// Explicit-stack iteration (WR-05) to avoid O(tree-height) recursion / stack
+/// overflow on a deeply nested cluster tree. Children are pushed in reverse so
+/// they pop in original (left-to-right) order, preserving the recursive
+/// version's leaf ordering.
 fn recurse_leaf_dfs(cluster_tree: &[CondensedNode], current_node: usize) -> Vec<usize> {
-    let children: Vec<usize> = cluster_tree
-        .iter()
-        .filter(|r| r.parent == current_node)
-        .map(|r| r.child)
-        .collect();
-    if children.is_empty() {
-        vec![current_node]
-    } else {
-        let mut out = Vec::new();
-        for child in children {
-            out.extend(recurse_leaf_dfs(cluster_tree, child));
+    let mut out = Vec::new();
+    let mut stack: Vec<usize> = vec![current_node];
+    while let Some(node) = stack.pop() {
+        let children: Vec<usize> = cluster_tree
+            .iter()
+            .filter(|r| r.parent == node)
+            .map(|r| r.child)
+            .collect();
+        if children.is_empty() {
+            out.push(node);
+        } else {
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
         }
-        out
     }
+    out
 }
 
 /// All leaves of the cluster tree (sklearn `get_cluster_tree_leaves`); empty when
@@ -145,24 +161,29 @@ fn traverse_upwards(
         .map(|r| r.parent)
         .min()
         .expect("non-empty cluster tree has a parent");
-    let parent = cluster_tree
-        .iter()
-        .find(|r| r.child == leaf)
-        .map(|r| r.parent)
-        .expect("leaf must have a parent edge in the cluster tree");
-    if parent == root {
-        return if allow_single_cluster { parent } else { leaf };
-    }
-    let parent_value = cluster_tree
-        .iter()
-        .find(|r| r.child == parent)
-        .map(|r| r.lambda)
-        .expect("parent must have an incoming edge");
-    let parent_eps = 1.0 / parent_value;
-    if parent_eps > cluster_selection_epsilon {
-        parent
-    } else {
-        traverse_upwards(cluster_tree, cluster_selection_epsilon, parent, allow_single_cluster)
+    // Iterative ascent (WR-05): the recursion was tail-recursive (it returned the
+    // recursive call directly), so a loop over the current node climbs each
+    // ancestor without O(tree-height) stack growth.
+    let mut leaf = leaf;
+    loop {
+        let parent = cluster_tree
+            .iter()
+            .find(|r| r.child == leaf)
+            .map(|r| r.parent)
+            .expect("leaf must have a parent edge in the cluster tree");
+        if parent == root {
+            return if allow_single_cluster { parent } else { leaf };
+        }
+        let parent_value = cluster_tree
+            .iter()
+            .find(|r| r.child == parent)
+            .map(|r| r.lambda)
+            .expect("parent must have an incoming edge");
+        let parent_eps = 1.0 / parent_value;
+        if parent_eps > cluster_selection_epsilon {
+            return parent;
+        }
+        leaf = parent;
     }
 }
 
