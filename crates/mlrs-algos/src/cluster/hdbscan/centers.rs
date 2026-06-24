@@ -33,6 +33,9 @@
 //! Tests live in `crates/mlrs-algos/tests/hdbscan_test.rs` (AGENTS.md §2).
 
 use super::super::hdbscan::Metric;
+// `host_pairwise` lives in the shared `distance` submodule (IN-03), which
+// includes the `Cosine` arm this caller needs.
+use super::distance::host_pairwise;
 
 /// Which centers to compute in [`weighted_cluster_center`] (mirrors the public
 /// `StoreCenters` enum, decoupled so this module needs no estimator state).
@@ -164,68 +167,3 @@ pub fn weighted_cluster_center(
     (centroids, medoids)
 }
 
-/// Raw pairwise distance `d(i, j)` between rows `i`/`j` of the row-major `n×p`
-/// host matrix `x`, under `metric`. Mirrors `sklearn.metrics.pairwise_distances`
-/// for the five feature-space metrics; `Precomputed` never reaches here (the
-/// `store_centers`-on-precomputed guard in `fit` rejects it before any center is
-/// computed — T-15-06-V5). All math is `f64`.
-fn host_pairwise(x: &[f64], p: usize, metric: Metric, i: usize, j: usize) -> f64 {
-    let xi = &x[i * p..(i + 1) * p];
-    let xj = &x[j * p..(j + 1) * p];
-    match metric {
-        Metric::Euclidean => {
-            let mut s = 0.0f64;
-            for k in 0..p {
-                let diff = xi[k] - xj[k];
-                s += diff * diff;
-            }
-            s.sqrt()
-        }
-        Metric::Manhattan => {
-            let mut s = 0.0f64;
-            for k in 0..p {
-                s += (xi[k] - xj[k]).abs();
-            }
-            s
-        }
-        Metric::Chebyshev => {
-            let mut m = 0.0f64;
-            for k in 0..p {
-                let diff = (xi[k] - xj[k]).abs();
-                if diff > m {
-                    m = diff;
-                }
-            }
-            m
-        }
-        Metric::Minkowski { p: pp } => {
-            let mut s = 0.0f64;
-            for k in 0..p {
-                s += (xi[k] - xj[k]).abs().powf(pp);
-            }
-            s.powf(1.0 / pp)
-        }
-        Metric::Cosine => {
-            // 1 − x̂·ŷ (zero-norm rows map to all-zeros ⇒ distance 1).
-            let ni = xi.iter().map(|&v| v * v).sum::<f64>().sqrt();
-            let nj = xj.iter().map(|&v| v * v).sum::<f64>().sqrt();
-            if ni > 0.0 && nj > 0.0 {
-                let mut dot = 0.0f64;
-                for k in 0..p {
-                    dot += (xi[k] / ni) * (xj[k] / nj);
-                }
-                let d = 1.0 - dot;
-                if d > 0.0 {
-                    d
-                } else {
-                    0.0
-                }
-            } else {
-                1.0
-            }
-        }
-        Metric::Precomputed => {
-            unreachable!("store_centers errors on Precomputed before any center compute (T-15-06-V5)")
-        }
-    }
-}

@@ -52,6 +52,7 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 // consumes.
 pub mod centers;
 pub mod condense;
+mod distance;
 pub mod glosh;
 pub mod mst;
 pub mod select;
@@ -806,7 +807,7 @@ where
             let alpha = self.alpha;
             let metric = self.metric;
             mst::mst_from_data_matrix(&core_raw, n, alpha, |i, j| {
-                host_pairwise(&x_host, p, metric, i, j)
+                distance::host_pairwise(&x_host, p, metric, i, j)
             })
         };
 
@@ -847,7 +848,7 @@ where
     /// Build the alpha-scaled dense `n×n` distance matrix for the GLOSH
     /// hdbscan-convention tree on the FEATURE-metric path: rebuild the metric
     /// `pairwise_distances(X)` host-side from the `n×p` design matrix (cosine via
-    /// [`cosine_distance_matrix`]; the four FAST metrics via [`host_pairwise`]),
+    /// [`cosine_distance_matrix`]; the four FAST metrics via [`distance::host_pairwise`]),
     /// then divide the WHOLE matrix by `alpha` (Variant-A placement, the hdbscan
     /// generic path scales the matrix before core distances). This is a host pass
     /// — the GLOSH tree is host-side and never resident on the device, so it does
@@ -866,7 +867,7 @@ where
         } else {
             for i in 0..n {
                 for j in 0..n {
-                    dist[i * n + j] = host_pairwise(&x_host, p, self.metric, i, j);
+                    dist[i * n + j] = distance::host_pairwise(&x_host, p, self.metric, i, j);
                 }
             }
         }
@@ -1039,50 +1040,5 @@ fn cosine_distance_matrix(x: &[f64], n: usize, p: usize) -> Vec<f64> {
     dist
 }
 
-/// Recompute the RAW (unscaled) pairwise distance `d(i, j)` between rows `i` and
-/// `j` of the row-major `n×p` host matrix `x`, under a FAST-metric `metric`
-/// (euclidean / manhattan / chebyshev / minkowski). The Variant-B Prim divides
-/// THIS value by `alpha` itself, so no scaling is applied here. `Cosine` and
-/// `Precomputed` never reach this closure (cosine uses the dense Variant-A path;
-/// precomputed has its own branch). All math is `f64`.
-fn host_pairwise(x: &[f64], p: usize, metric: Metric, i: usize, j: usize) -> f64 {
-    let xi = &x[i * p..(i + 1) * p];
-    let xj = &x[j * p..(j + 1) * p];
-    match metric {
-        Metric::Euclidean => {
-            let mut s = 0.0f64;
-            for k in 0..p {
-                let diff = xi[k] - xj[k];
-                s += diff * diff;
-            }
-            s.sqrt()
-        }
-        Metric::Manhattan => {
-            let mut s = 0.0f64;
-            for k in 0..p {
-                s += (xi[k] - xj[k]).abs();
-            }
-            s
-        }
-        Metric::Chebyshev => {
-            let mut m = 0.0f64;
-            for k in 0..p {
-                let diff = (xi[k] - xj[k]).abs();
-                if diff > m {
-                    m = diff;
-                }
-            }
-            m
-        }
-        Metric::Minkowski { p: pp } => {
-            let mut s = 0.0f64;
-            for k in 0..p {
-                s += (xi[k] - xj[k]).abs().powf(pp);
-            }
-            s.powf(1.0 / pp)
-        }
-        Metric::Cosine | Metric::Precomputed => {
-            unreachable!("host_pairwise is only called on the FAST (Variant-B) metrics")
-        }
-    }
-}
+// `host_pairwise` now lives in the shared `distance` submodule (IN-03); the
+// Variant-B FAST-metric callers use `distance::host_pairwise` directly.
