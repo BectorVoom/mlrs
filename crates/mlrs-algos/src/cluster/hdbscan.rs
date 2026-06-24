@@ -37,6 +37,8 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::knn_graph::{knn_graph, Metric as KnnMetric};
+use mlrs_backend::prims::mutual_reachability::mutual_reachability_device;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -455,8 +457,14 @@ where
             let (labels, probs) = self.tree_to_labels(&hierarchy, n);
             (Some(hierarchy), labels, Some(probs))
         } else {
-            // Labels-only contract for feature metrics until 15-05: all-`-1`.
-            (None, vec![-1_i32; n], None)
+            // Feature-metric device front-end (plan 15-05): core distances from the
+            // Phase-13 KNN prim (`include_self=true`), then Variant-A (cosine, dense
+            // n×n + the MR kernel) or Variant-B (the other four, source-tracking, no
+            // n×n resident) MST → single-linkage. The Wave-3 host back-end then
+            // produces labels + probabilities, identical to the precomputed path.
+            let hierarchy = self.feature_metric_single_linkage(pool, x, n, p)?;
+            let (labels, probs) = self.tree_to_labels(&hierarchy, n);
+            (Some(hierarchy), labels, Some(probs))
         };
 
         let labels_dev = DeviceArray::from_host(pool, &labels);
@@ -541,6 +549,154 @@ where
         Ok(single_linkage::make_single_linkage(&sorted, n))
     }
 
+    /// Feature-metric device front-end (HDBS-01, plan 15-05): the `X` is the row-
+    /// major `n×p` design matrix. Core distances come from the Phase-13 KNN prim
+    /// (`knn_graph(include_self=true)`, column `min_samples-1` of the ascending
+    /// per-row distances). The MST then routes by metric (RESEARCH Pitfall 2):
+    ///
+    /// - **Cosine → Variant A** (dense): build the dense `n×n` cosine distance
+    ///   matrix (`1 − x̂·ŷ`, matching sklearn `pairwise_distances('cosine')`),
+    ///   divide the WHOLE matrix by `alpha` BEFORE core distances, launch the
+    ///   `mutual_reachability` GATHER kernel on the device, read it back, and run
+    ///   the dense Variant-A Prim. (Pitfall 3: the dense matrix needs ALL pairs,
+    ///   not the kNN-only set — so cosine builds the full matrix host-side, not from
+    ///   the kNN graph.)
+    /// - **euclidean/manhattan/chebyshev/minkowski → Variant B**
+    ///   (source-tracking): recompute the pairwise distance on the host from the
+    ///   `n×p` data each step (`pair_distance /= alpha`, RAW core distances — the
+    ///   Variant-B alpha placement, DISTINCT from Variant A). No `n×n` block is ever
+    ///   resident on the device (the KNN prim is query-axis tiled; the Variant-B
+    ///   host walk keeps only the `n×p` data + `O(n)` Prim state).
+    ///
+    /// Returns the single-linkage hierarchy for the Wave-3 host back-end. Geometry
+    /// is validated host-side by `knn_graph::validate_geometry` BEFORE any launch
+    /// (T-15-05-V5); the dense-cosine path adds a `checked_mul` `n*n` guard before
+    /// the kernel launch (T-15-05-OVF).
+    fn feature_metric_single_linkage(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        n: usize,
+        p: usize,
+    ) -> Result<Vec<single_linkage::SingleLinkageEdge>, AlgoError> {
+        let min_samples = self.min_samples.unwrap_or(self.min_cluster_size);
+        // sklearn's core distance is the `(min_samples-1)`-th smallest distance
+        // INCLUDING the self-zero, i.e. column `min_samples-1` of the ascending
+        // self-inclusive kNN. We request `k = min_samples` self-inclusive neighbours
+        // (clamped to `n` so a tiny input doesn't over-request).
+        let k = min_samples.clamp(1, n);
+        let knn_metric = self.knn_metric();
+        let mink_p = match self.metric {
+            Metric::Minkowski { p } => p,
+            _ => 2.0, // ignored by non-Minkowski routes (knn_graph precedent).
+        };
+
+        // --- Core distances via the Phase-13 KNN prim (include_self=true). The prim
+        //     validates geometry host-side BEFORE any launch (T-15-05-V5). ---
+        let (idx_dev, dist_dev) = knn_graph::<F>(
+            pool,
+            x,
+            (n, p),
+            k,
+            knn_metric,
+            /* include_self */ true,
+            mink_p,
+        )
+        .map_err(AlgoError::Prim)?;
+        // The KNN indices are not needed for core distances (the ascending distance
+        // column is the core distance) — release them.
+        let knn_dist: Vec<f64> = dist_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        idx_dev.release_into(pool);
+        dist_dev.release_into(pool);
+
+        // core[i] = the (min_samples-1)-th smallest distance in row i. The ascending
+        // self-inclusive kNN puts it at column `k-1` (k = min_samples clamped). On a
+        // tiny input where k < min_samples (clamp), the last available column is the
+        // closest exact analogue (sklearn np.partition would clamp similarly).
+        let core_col = k - 1;
+        let core_raw: Vec<f64> = (0..n).map(|i| knn_dist[i * k + core_col]).collect();
+
+        // Read the design matrix to host once (for the Variant-B pairwise closure
+        // and the dense-cosine matrix construction).
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+
+        let edges = if matches!(self.metric, Metric::Cosine) {
+            // --- Variant A (cosine): dense n×n cosine distance, whole-matrix /alpha
+            //     BEFORE core, MR via the device GATHER kernel, dense Prim. ---
+            // T-15-05-OVF: guard n*n before building the dense block.
+            let nn = n.checked_mul(n).ok_or_else(|| {
+                AlgoError::Prim(PrimError::ShapeMismatch {
+                    operand: "cosine_distance_matrix",
+                    rows: n,
+                    cols: n,
+                    len: usize::MAX,
+                })
+            })?;
+            let dist_dense = cosine_distance_matrix(&x_host, n, p); // RAW (unscaled)
+            debug_assert_eq!(dist_dense.len(), nn);
+
+            // Variant-A alpha placement: scale the WHOLE matrix by alpha BEFORE core
+            // distances. Core is the (min_samples-1)-th smallest per row of the
+            // SCALED matrix (sklearn `_hdbscan_brute`). The MR kernel then receives
+            // the RAW distance + alpha and reproduces `max(core_i, core_j, d/alpha)`
+            // — identical to building MR from the scaled matrix.
+            let alpha = self.alpha;
+            let dist_scaled: Vec<f64> = dist_dense.iter().map(|&d| d / alpha).collect();
+            let core_scaled = mst::core_distances_dense(&dist_scaled, n, min_samples);
+
+            // Launch the MR GATHER kernel on the device (the dense-cosine path's use
+            // of the new kernel). Upload RAW distance + the scaled-matrix core; the
+            // kernel does the `/alpha`.
+            let dist_f: Vec<F> = dist_dense.iter().map(|&v| f64_to_host::<F>(v)).collect();
+            let core_f: Vec<F> = core_scaled.iter().map(|&v| f64_to_host::<F>(v)).collect();
+            let dist_dev2: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &dist_f);
+            let core_dev2: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &core_f);
+            let mr_dev = mutual_reachability_device::<F>(
+                pool,
+                &dist_dev2,
+                &core_dev2,
+                n,
+                n,
+                f64_to_host::<F>(alpha),
+            )
+            .map_err(AlgoError::Prim)?;
+            let mr: Vec<f64> = mr_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+            dist_dev2.release_into(pool);
+            core_dev2.release_into(pool);
+            mr_dev.release_into(pool);
+
+            mst::mst_from_mutual_reachability(&mr, n)
+        } else {
+            // --- Variant B (euclidean/manhattan/chebyshev/minkowski): source-
+            //     tracking Prim, RAW core, `pair_distance /= alpha`. Recompute the
+            //     pairwise distance host-side from the n×p data — NO n×n resident. ---
+            let alpha = self.alpha;
+            let metric = self.metric;
+            mst::mst_from_data_matrix(&core_raw, n, alpha, |i, j| {
+                host_pairwise(&x_host, p, metric, i, j)
+            })
+        };
+
+        let sorted = mst::argsort_by_weight(&edges);
+        Ok(single_linkage::make_single_linkage(&sorted, n))
+    }
+
+    /// Map the estimator's [`Metric`] onto the Phase-13 KNN prim's
+    /// [`KnnMetric`](mlrs_backend::prims::knn_graph::Metric) for the core-distance
+    /// query. `Precomputed` never reaches here (handled by the precomputed path).
+    fn knn_metric(&self) -> KnnMetric {
+        match self.metric {
+            Metric::Euclidean => KnnMetric::Euclidean,
+            Metric::Manhattan => KnnMetric::Manhattan,
+            Metric::Cosine => KnnMetric::Cosine,
+            Metric::Chebyshev => KnnMetric::Chebyshev,
+            Metric::Minkowski { p } => KnnMetric::Minkowski { p },
+            Metric::Precomputed => {
+                unreachable!("knn_metric is only called on the feature-metric path")
+            }
+        }
+    }
+
     /// Host tree back-end (HDBS-01/02, plan 15-04): condense the single-linkage
     /// `hierarchy` by `min_cluster_size`, compute stabilities, run the configured
     /// EoM/leaf + epsilon/max_cluster_size selection, label points (`-1` = noise),
@@ -611,10 +767,91 @@ where
     }
 
     /// The single-linkage hierarchy produced by the MST → `make_single_linkage`
-    /// pass (HDBS-02). `Some` after a precomputed fit (plan 15-03); `None` for the
-    /// feature-space metrics until the device front-end lands (plan 15-05). The
-    /// Wave-3 condense/select stage (plan 15-04) consumes this to drive labelling.
+    /// pass (HDBS-02). `Some` after any fit (precomputed since plan 15-03, the five
+    /// feature metrics since plan 15-05). The Wave-3 condense/select stage (plan
+    /// 15-04) consumes this to drive labelling.
     pub fn single_linkage(&self) -> Option<&[single_linkage::SingleLinkageEdge]> {
         self.single_linkage_.as_deref()
+    }
+}
+
+/// Build the dense row-major `n×n` cosine distance matrix `1 − x̂·ŷ` from feature
+/// rows `x` of shape `(n, p)`, matching `sklearn.metrics.pairwise_distances(X,
+/// 'cosine')` to ≤1e-5 (RESEARCH Pitfall 3 — the dense Variant-A path needs ALL
+/// pairs, not the kNN-only set). Rows are L2-normalised once (a zero row maps to
+/// all-zeros, so its cosine distance to anything is `1 − 0 = 1`); the diagonal is
+/// `0` for non-zero rows. All scalar math is `f64` (the host bridging domain).
+fn cosine_distance_matrix(x: &[f64], n: usize, p: usize) -> Vec<f64> {
+    // L2-normalise each row once (zero-norm guard → all-zeros row).
+    let mut xhat = vec![0.0f64; n * p];
+    for i in 0..n {
+        let row = &x[i * p..(i + 1) * p];
+        let norm = row.iter().map(|&v| v * v).sum::<f64>().sqrt();
+        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+        for k in 0..p {
+            xhat[i * p + k] = row[k] * inv;
+        }
+    }
+    let mut dist = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut dot = 0.0f64;
+            for k in 0..p {
+                dot += xhat[i * p + k] * xhat[j * p + k];
+            }
+            // 1 − cos, clamped to `>= 0` (floating dot can drift just past 1.0 on
+            // the diagonal of a non-zero row → a tiny negative distance otherwise).
+            let d = 1.0 - dot;
+            dist[i * n + j] = if d > 0.0 { d } else { 0.0 };
+        }
+    }
+    dist
+}
+
+/// Recompute the RAW (unscaled) pairwise distance `d(i, j)` between rows `i` and
+/// `j` of the row-major `n×p` host matrix `x`, under a FAST-metric `metric`
+/// (euclidean / manhattan / chebyshev / minkowski). The Variant-B Prim divides
+/// THIS value by `alpha` itself, so no scaling is applied here. `Cosine` and
+/// `Precomputed` never reach this closure (cosine uses the dense Variant-A path;
+/// precomputed has its own branch). All math is `f64`.
+fn host_pairwise(x: &[f64], p: usize, metric: Metric, i: usize, j: usize) -> f64 {
+    let xi = &x[i * p..(i + 1) * p];
+    let xj = &x[j * p..(j + 1) * p];
+    match metric {
+        Metric::Euclidean => {
+            let mut s = 0.0f64;
+            for k in 0..p {
+                let diff = xi[k] - xj[k];
+                s += diff * diff;
+            }
+            s.sqrt()
+        }
+        Metric::Manhattan => {
+            let mut s = 0.0f64;
+            for k in 0..p {
+                s += (xi[k] - xj[k]).abs();
+            }
+            s
+        }
+        Metric::Chebyshev => {
+            let mut m = 0.0f64;
+            for k in 0..p {
+                let diff = (xi[k] - xj[k]).abs();
+                if diff > m {
+                    m = diff;
+                }
+            }
+            m
+        }
+        Metric::Minkowski { p: pp } => {
+            let mut s = 0.0f64;
+            for k in 0..p {
+                s += (xi[k] - xj[k]).abs().powf(pp);
+            }
+            s.powf(1.0 / pp)
+        }
+        Metric::Cosine | Metric::Precomputed => {
+            unreachable!("host_pairwise is only called on the FAST (Variant-B) metrics")
+        }
     }
 }

@@ -208,6 +208,69 @@ fn fit_euclidean_via_precomputed(x: &[f64], n: usize, d: usize, knobs: FitKnobs)
     fit_precomputed(&dist, n, knobs)
 }
 
+/// Fit `Hdbscan` over a FEATURE matrix `x` of shape `(n, d)` under `metric` via the
+/// real device front-end (plan 15-05): the KNN-prim core distances + Variant-A
+/// (cosine) / Variant-B (the other four) MST → host back-end. Returns
+/// `(labels, probabilities)` host-side. The `f64` path runs on cpu; rocm skips f64
+/// at the call site.
+fn fit_feature_metric<F>(x: &[f64], n: usize, d: usize, metric: Metric, knobs: FitKnobs) -> (Vec<i64>, Vec<f64>)
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + bytemuck::Pod,
+{
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_f: Vec<F> = x
+        .iter()
+        .map(|&v| match std::mem::size_of::<F>() {
+            4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+            8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+            _ => unreachable!("f32/f64 only"),
+        })
+        .collect();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_f);
+
+    let fitted = Hdbscan::<F>::builder()
+        .min_cluster_size(knobs.min_cluster_size)
+        .min_samples(knobs.min_samples)
+        .cluster_selection_method(knobs.method)
+        .cluster_selection_epsilon(knobs.epsilon)
+        .max_cluster_size(knobs.max_cluster_size)
+        .alpha(knobs.alpha)
+        .allow_single_cluster(knobs.allow_single_cluster)
+        .metric(metric)
+        .build::<F>()
+        .expect("build feature metric")
+        .fit(&mut pool, &x_dev, None, (n, d))
+        .expect("feature-metric fit");
+
+    let labels: Vec<i64> = fitted.labels(&pool).iter().map(|&l| l as i64).collect();
+    let probs_f: Vec<F> = fitted
+        .probabilities(&pool)
+        .expect("feature-metric fit produces probabilities");
+    let probs: Vec<f64> = probs_f
+        .iter()
+        .map(|&v| match std::mem::size_of::<F>() {
+            4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+            8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+            _ => unreachable!("f32/f64 only"),
+        })
+        .collect();
+    (labels, probs)
+}
+
+/// The estimator [`Metric`] for a fixture tag (the per-metric label gate). Minkowski
+/// carries the fixture's `HDB_MINKOWSKI_P = 3.0` (gen_oracle.py).
+fn metric_for(tag: &str) -> Metric {
+    match tag {
+        "euclidean" => Metric::Euclidean,
+        "manhattan" => Metric::Manhattan,
+        "cosine" => Metric::Cosine,
+        "chebyshev" => Metric::Chebyshev,
+        "minkowski" => Metric::Minkowski { p: 3.0 },
+        _ => panic!("unknown metric tag {tag}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HDBS-02 / D-03: labels match sklearn exactly up to a -1-pinned permutation,
 // per metric × {f32, f64}. The exact-label gate uses the PINNED-NOISE matcher so
@@ -221,42 +284,53 @@ fn fit_euclidean_via_precomputed(x: &[f64], n: usize, d: usize, knobs: FitKnobs)
 // 15-NN.
 // ---------------------------------------------------------------------------
 
-/// Shared body: load `hdbscan_{metric}_{dtype}.npz`, assert the fitted labels are
-/// a -1-pinned permutation of sklearn's. In Wave 0 the "fitted" labels are stubbed
-/// from the oracle cross-check (sklearn vs hdbscan) so the matcher + fixture wiring
-/// is exercised; 15-NN replaces `got` with `Hdbscan::fit(...).labels()`.
-fn run_labels_match(case: &OracleCase, label: &str) {
+/// The per-metric feature-fixture geometry (all five share the `blobs` design:
+/// HDB_BLOB_N_FEATURES = 4, mcs = HDB_MIN_CLUSTER_SIZE = 5 — gen_oracle.py).
+const HDB_METRIC_N_FEATURES: usize = 4;
+
+/// Real feature-metric label gate body (plan 15-05): fit the feature `X` under
+/// `metric` via the device front-end, assert the fitted labels are a -1-pinned
+/// permutation of sklearn's. `run_labels_feature::<F>` is monomorphised per dtype.
+fn run_labels_feature<F>(case: &OracleCase, tag: &str, label: &str)
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + bytemuck::Pod,
+{
     let sklearn = labels_i64(case, "labels");
-    // 15-NN: replace `got` with the fitted mlrs labels.
-    let got = sklearn.clone();
+    let n = sklearn.len();
+    let x: Vec<f64> = case.expect_f64("X").to_vec();
+    let (got, _probs) = fit_feature_metric::<F>(
+        &x,
+        n,
+        HDB_METRIC_N_FEATURES,
+        metric_for(tag),
+        FitKnobs::defaults(HDB_BLOB_MCS),
+    );
     let acc = best_match_accuracy_pinned_noise(&got, &sklearn);
     assert!(
         (acc - 1.0).abs() < f64::EPSILON,
-        "{label}: labels not a -1-pinned permutation of sklearn (acc={acc})"
+        "{label}: labels not a -1-pinned permutation of sklearn (acc={acc})\n got={got:?}\n exp={sklearn:?}"
     );
 }
 
 macro_rules! labels_match_metric {
     ($f32_name:ident, $f64_name:ident, $metric:literal) => {
         #[test]
-        #[ignore = "un-ignore in 15-NN: needs the back-end fit + extended Metric"]
         fn $f32_name() {
             let backend = capability::active_backend_name();
             capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
             let case = load_npz(fixture(concat!("hdbscan_", $metric, "_f32_seed42.npz")))
                 .expect(concat!("load hdbscan_", $metric, "_f32"));
-            run_labels_match(&case, concat!("labels_match_sklearn ", $metric, " f32"));
+            run_labels_feature::<f32>(&case, $metric, concat!("labels_match_sklearn ", $metric, " f32"));
         }
 
         #[test]
-        #[ignore = "un-ignore in 15-NN: needs the back-end fit + extended Metric"]
         fn $f64_name() {
             if skip_f64(concat!("labels_match_sklearn ", $metric)) {
                 return;
             }
             let case = load_npz(fixture(concat!("hdbscan_", $metric, "_f64_seed42.npz")))
                 .expect(concat!("load hdbscan_", $metric, "_f64"));
-            run_labels_match(&case, concat!("labels_match_sklearn ", $metric, " f64"));
+            run_labels_feature::<f64>(&case, $metric, concat!("labels_match_sklearn ", $metric, " f64"));
         }
     };
 }
@@ -546,9 +620,29 @@ const HDB_NESTED_MCS: usize = 20;
 /// B) front-end lands. Kept here as an explicit, addressable marker so the D-09
 /// alpha knob is not silently dropped.
 #[test]
-#[ignore = "un-ignore in 15-05: labels_alpha needs the feature-metric Variant-B alpha path"]
 fn selection_knob_alpha_feature_path() {
-    // Deferred to 15-05 (feature-metric device front-end). See the doc comment.
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "alpha feature path");
+    if skip_f64("selection_knob_alpha_feature_path") {
+        return;
+    }
+    // The `labels_alpha` oracle was generated on the FEATURE path with `alpha=0.5`
+    // (gen_oracle.py:1194, eom, nested euclidean design). The feature path's
+    // Variant-B alpha placement (`pair_distance /= alpha`, RAW core) is what
+    // reproduces this partition — so we fit the FEATURE `X` directly under
+    // Euclidean (Variant B) with alpha=0.5, NOT the precomputed (Variant-A) path.
+    let case = load_npz(fixture("hdbscan_nested_f64_seed42.npz")).expect("load nested f64");
+    let x: Vec<f64> = case.expect_f64("X").to_vec();
+    let oracle = labels_i64(&case, "labels_alpha");
+    let n = oracle.len();
+    let knobs = FitKnobs { alpha: 0.5, ..FitKnobs::defaults(HDB_NESTED_MCS) };
+    let (got, _probs) =
+        fit_feature_metric::<f64>(&x, n, HDB_NESTED_N_FEATURES, Metric::Euclidean, knobs);
+    let acc = best_match_accuracy_pinned_noise(&got, &oracle);
+    assert!(
+        (acc - 1.0).abs() < f64::EPSILON,
+        "selection_knob_alpha_feature_path: labels_alpha not a -1-pinned permutation of the feature-path oracle (acc={acc})\n got={got:?}\n exp={oracle:?}"
+    );
 }
 
 /// `selection_knobs` f32 — each non-default knob's labels match its oracle.
@@ -764,15 +858,18 @@ fn build_validation() {
 // HDBS-01 / T-15-OVF: the device front-end must not leak across re-fits, and must
 // keep `peak_bytes` sub-quadratic (no full `n×n` resident — query-axis-tiled).
 //
-// WAVE-0: the shell `fit` is trivial; the re-fit-no-growth idiom (from the kept
-// Phase-12 `fit_no_leak`) runs now over Euclidean default. The sub-quadratic
-// `peak_bytes` assertion is added in 15-NN once the device front-end exists.
+// As of plan 15-05 the device front-end is wired (Euclidean default = the
+// source-tracking Variant-B path, which never materialises an `n×n` device block).
+// The gate now asserts BOTH (1) re-construct + re-fit does not grow `live_bytes`
+// AND (2) the peak device residency stays strictly below a full `n×n` f64 matrix
+// (the Variant-B no-`n×n` guarantee; the KNN prim is query-axis tiled so its peak
+// is `O(tile·n + n·k)`, not `O(n²)`).
 // ---------------------------------------------------------------------------
 
 /// `memory_gate` — re-CONSTRUCT + re-fit at the same shape does not grow
-/// `live_bytes` (the consuming `fit(self)` forces reconstruction each iteration).
-/// The kept Phase-12 PoolStats idiom; 15-NN adds the sub-quadratic `peak_bytes`
-/// gate once the n×n device front-end exists.
+/// `live_bytes` AND the device front-end's `peak_bytes` stays sub-quadratic (no
+/// full `n×n` resident for the Variant-B feature path). The consuming `fit(self)`
+/// forces reconstruction each iteration.
 #[test]
 fn memory_gate() {
     use mlrs_algos::typestate::Fit;
@@ -787,9 +884,11 @@ fn memory_gate() {
     let client = runtime::active_client();
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
-    let n = 9usize;
+    // A non-trivial n so the sub-quadratic bound is meaningful: a full n×n f64
+    // block would be n*n*8 bytes; the Variant-B path must peak well below it.
+    let n = 64usize;
     let p = 4usize;
-    let x_host: Vec<f64> = (0..n * p).map(|i| i as f64).collect();
+    let x_host: Vec<f64> = (0..n * p).map(|i| (i % 17) as f64 * 0.5).collect();
     let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
 
     let fitted = Hdbscan::<f64>::new()
@@ -797,6 +896,16 @@ fn memory_gate() {
         .expect("first fit");
     drop(fitted);
     let live_after_first = pool.stats().live_bytes;
+
+    // (2) Sub-quadratic peak: the Variant-B feature path never builds a full n×n
+    // device block. The KNN prim is query-axis tiled (peak O(tile·n + n·k)); assert
+    // the observed high-water mark is strictly below a full n×n f64 matrix.
+    let nn_bytes = (n as u64) * (n as u64) * (std::mem::size_of::<f64>() as u64);
+    let peak = pool.stats().peak_bytes;
+    assert!(
+        peak < nn_bytes,
+        "device front-end peak_bytes {peak} must stay below a full n×n f64 block {nn_bytes} (no n×n resident; Variant B)"
+    );
 
     const REFITS: usize = 4;
     for k in 0..REFITS {
