@@ -5,15 +5,15 @@ milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 15
 current_phase_name: hdbscan
 status: executing
-stopped_at: Completed 15-01-PLAN.md
-last_updated: "2026-06-24T07:00:47.798Z"
+stopped_at: Completed 15-07-PLAN.md
+last_updated: "2026-06-24T07:06:22.737Z"
 last_activity: 2026-06-24
 last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 20
-  completed_plans: 20
+  total_plans: 21
+  completed_plans: 21
   percent: 80
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 15 (hdbscan) — EXECUTING
-Plan: 6 of 6
+Plan: 2 of 7
 Status: Ready to execute
 Last activity: 2026-06-24 — Phase 15 execution started
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
@@ -139,6 +139,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 15 P04 | 70min | 2 tasks | 6 files |
 | Phase 15 P05 | single-session | 2 tasks | 7 files |
 | Phase 15 P06 | 18 | 2 tasks | 4 files |
+| Phase 15 P07 | 5 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -275,6 +276,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 15-04: labels_alpha selection knob deferred to 15-05 (feature-path Variant-B alpha, Pitfall 2)
 - [Phase ?]: 15-05: cosine=Variant-A dense via MR kernel; other 4 feature metrics=Variant-B (no n*n resident); MR kernel VALUE gate in mlrs-backend
 - [Phase ?]: 15-06: GLOSH outlier_scores_ use a parallel hdbscan-convention tree; labels_/probabilities_ stay sklearn-exact (D-06/D-07 Option A)
+- [Phase 15]: HDBS-01: Hdbscan::fit_predict consumes self (typestate Unfit->Fitted), unlike DBSCAN's &mut self
 
 ### Pending Todos
 
@@ -306,8 +308,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T06:30:23.427Z
-Stopped at: Completed 15-01-PLAN.md
+Last session: 2026-06-24T07:06:22.730Z
+Stopped at: Completed 15-07-PLAN.md
 Resume file: .planning/phases/15-hdbscan/15-CONTEXT.md
 
 ## Operator Next Steps

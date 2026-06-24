@@ -168,7 +168,7 @@ Plans:
   3. A user can read per-point `outlier_scores_` (GLOSH) from a fitted HDBSCAN, gated within band vs the `hdbscan` library.
   4. A user can request cluster centers via `store_centers` (`'centroid'`/`'medoid'`) producing `centroids_`/`medoids_`.
 
-**Plans**: 7 plans (6 complete + 1 gap-closure)
+**Plans**: 7/7 plans complete
 **Wave 1**
 
 - [x] 15-01-PLAN.md — label_perm `-1→-1` pinned matcher + unit test (HDBS-02)
@@ -195,7 +195,7 @@ Plans:
 
 **Gap closure** *(standalone — Wave 1, no deps on 15-01…15-06; closes HDBS-01 BLOCKED gap from 15-VERIFICATION.md)*
 
-- [ ] 15-07-PLAN.md — `Hdbscan::fit_predict` convenience method (typestate-correct: consumes `self`) + behavioral-equivalence test (HDBS-01)
+- [x] 15-07-PLAN.md — `Hdbscan::fit_predict` convenience method (typestate-correct: consumes `self`) + behavioral-equivalence test (HDBS-01)
 
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — RESOLVED IN PLANS: the D-04/D-05 host-MST tie-break exactness is sequenced as the Wave-3 TRUE GATE (15-03 `tie_break_exact` on the tie-heavy + duplicate-point fixture) BEFORE the device front-end (15-05) commits. The oracle-matched tie-break (sklearn `np.argsort` quicksort + the two Prim variants — NOT the mlrs lowest-index convention) is replicated; gate fixtures use distinct MST edge weights (RESEARCH Pitfall 1 option 2). An un-exactable metric is surfaced as a phase blocker per D-05, never band-demoted.
@@ -236,5 +236,5 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
 | 14. UMAP | v3.0 | 7/7 | Complete    | 2026-06-23 |
-| 15. HDBSCAN | v3.0 | 6/6 | Complete   | 2026-06-24 |
+| 15. HDBSCAN | v3.0 | 7/7 | Complete   | 2026-06-24 |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |
