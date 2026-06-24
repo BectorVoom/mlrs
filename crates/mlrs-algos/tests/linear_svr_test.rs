@@ -27,7 +27,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_algos::error::BuildError;
 use mlrs_algos::linear::linear_svr::LinearSVR;
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
-use mlrs_algos::traits::{Fit, Predict};
+use mlrs_algos::typestate::{Fit, Predict};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -116,7 +116,7 @@ where
     // EXPLICIT pinned setters (Pitfall 7) — squared_epsilon_insensitive/l2, C,
     // epsilon, intercept_scaling, max_iter; NOT the bare default (D-03 litmus
     // checks the default separately).
-    let mut reg = LinearSVR::<F>::builder()
+    let reg = LinearSVR::<F>::builder()
         .loss(Loss::SquaredEpsilonInsensitive)
         .penalty(Penalty::L2)
         .c(SVM_C)
@@ -126,18 +126,16 @@ where
         .max_iter(SVM_MAX_ITER)
         .tol(1e-4)
         .build::<F>()
-        .expect("LinearSVR builds with valid hyperparameters");
-
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("LinearSVR builds with valid hyperparameters")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("LinearSVR::fit on a valid shape");
 
     let coef: Vec<f64> = reg
         .coef(&pool)
-        .expect("coef_ after fit")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
-    let intercept = host_to_f64(reg.intercept(&pool).expect("intercept_ after fit"));
+    let intercept = host_to_f64(reg.intercept(&pool));
 
     let pred_dev = reg
         .predict(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
