@@ -6,14 +6,14 @@ current_phase: 16
 current_phase_name: builder-retrofit-sweep-shim-coverage
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-24T13:29:56.344Z"
+last_updated: "2026-06-24T13:36:00.669Z"
 last_activity: 2026-06-24
 last_activity_desc: Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 34
-  completed_plans: 31
+  completed_plans: 32
   percent: 80
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
-Plan: 11 of 13
+Plan: 12 of 13
 Status: Ready to execute
 Last activity: 2026-06-24 — Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
@@ -150,6 +150,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 16 P07 | ~12m | 3 tasks | 8 files |
 | Phase 16 P08 | ~10m | 3 tasks | 8 files |
 | Phase 16 P09 | 28m | 2 tasks | 14 files |
+| Phase 16 P10 | 6min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -298,6 +299,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 16-07: KernelDensity Shape-A' adopts typestate Fit + Fitted-gated ScoreSamples; projection+density modules complete
 - [Phase ?]: Neighbors n_neighbors builder setters are usize (not f64 A5); KNeighbors accessor trait composes on Fitted (16-08); data-DEPENDENT k vs n_train stays in neighbor_indices core (T-16-V5), only n_neighbors>=1 relocates to build()
 - [Phase ?]: 16-09: KernelRidge migrated Shape-A' (adopts typestate Fit+Predict it never had) + all 5 Naive Bayes trait-swapped; estimator sweep COMPLETE (29/29 on typestate). BLDR-03 stays In Progress until the traits.rs deletion in Plan 16-12
+- [Phase ?]: SHIM-02: PyHDBSCAN.fit_predict mutates self into Fitted arm (fit-then-return-labels, ClusterMixin semantics)
+- [Phase ?]: SHIM-02: probabilities_/outlier_scores_ getters return Option<Vec<F>> -> Python None (algos return Option until feature-space front-end lands), not an error
 
 ### Pending Todos
 
@@ -329,7 +332,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T13:29:32.197Z
+Last session: 2026-06-24T13:35:31.985Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
 

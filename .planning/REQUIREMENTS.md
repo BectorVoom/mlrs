@@ -42,7 +42,7 @@ Requirements for the v3.0 milestone. Each maps to a roadmap phase.
 ### Python sklearn Shim
 
 - [x] **SHIM-01**: Every estimator's pure-Python class stores each constructor arg unchanged in `__init__` (no validation/computation) and exposes `get_params(deep=True)` / `set_params(**kw)` that round-trip exactly and are `clone()`-compatible (extends the existing `MlrsBase` shim from the v1 12 to the v2 18 + the two new).
-- [ ] **SHIM-02**: UMAP and HDBSCAN are PyO3-wrapped (`#[pyclass]` on the existing `any_estimator!` machinery, GIL release, `guard_f64` before F64) with sklearn-named params, trailing-underscore fitted attrs, `n_features_in_` set/enforced, `fit` returns `self`, and the correct surface (UMAP `transform`/`fit_transform`; HDBSCAN `fit_predict`/`labels_`).
+- [x] **SHIM-02**: UMAP and HDBSCAN are PyO3-wrapped (`#[pyclass]` on the existing `any_estimator!` machinery, GIL release, `guard_f64` before F64) with sklearn-named params, trailing-underscore fitted attrs, `n_features_in_` set/enforced, `fit` returns `self`, and the correct surface (UMAP `transform`/`fit_transform`; HDBSCAN `fit_predict`/`labels_`).
 - [x] **SHIM-03**: The shim is verified by Rust-side unit tests plus a static Python check; the live `estimator_checks` / `check_estimator` run stays deferred (needs a maturin+pyarrow host this environment lacks).
 
 ## v2 Requirements
@@ -93,7 +93,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | BLDR-03 | Phase 16 | In Progress |
 | BLDR-04 | Phase 12 | Complete |
 | SHIM-01 | Phase 16 | Complete |
-| SHIM-02 | Phase 16 | Pending |
+| SHIM-02 | Phase 16 | Complete |
 | SHIM-03 | Phase 16 | Complete |
 
 **Coverage:**
