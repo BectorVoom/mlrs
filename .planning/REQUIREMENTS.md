@@ -90,7 +90,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HDBS-04 | Phase 15 | Complete |
 | BLDR-01 | Phase 12 | Pending |
 | BLDR-02 | Phase 12 | Complete |
-| BLDR-03 | Phase 16 | In Progress |
+| BLDR-03 | Phase 16 | Complete |
 | BLDR-04 | Phase 12 | Complete |
 | SHIM-01 | Phase 16 | Complete |
 | SHIM-02 | Phase 16 | Complete |
