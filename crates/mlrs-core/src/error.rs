@@ -17,9 +17,7 @@ use thiserror::Error;
 pub enum BridgeError {
     /// The Arrow array has a non-zero logical offset (e.g. a sliced array),
     /// so `values()` does not start at the data the caller expects.
-    #[error(
-        "arrow array has non-zero offset {offset}; expected a non-sliced (offset == 0) array"
-    )]
+    #[error("arrow array has non-zero offset {offset}; expected a non-sliced (offset == 0) array")]
     Offset {
         /// The offending logical offset, in elements.
         offset: usize,
@@ -36,9 +34,7 @@ pub enum BridgeError {
     /// The underlying byte buffer is not correctly aligned (or not size-
     /// divisible) for the target element type — surfaced from
     /// `bytemuck::try_cast_slice` rather than panicking (A7 / D-06).
-    #[error(
-        "arrow buffer is misaligned or wrongly sized for the target element type: {reason}"
-    )]
+    #[error("arrow buffer is misaligned or wrongly sized for the target element type: {reason}")]
     Misaligned {
         /// Human-readable detail from the failed cast.
         reason: String,
@@ -85,9 +81,7 @@ pub enum PrimError {
     /// Two operands disagree on a shared dimension that must match for the
     /// operation to be defined — e.g. a GEMM where `lhs` is `m×k` but `rhs` is
     /// `k'×n` with `k != k'` (the contraction dimension is incompatible).
-    #[error(
-        "primitive dimension mismatch ({dim}): lhs declares {lhs}, rhs declares {rhs}"
-    )]
+    #[error("primitive dimension mismatch ({dim}): lhs declares {lhs}, rhs declares {rhs}")]
     DimMismatch {
         /// Name of the disagreeing dimension (e.g. `"k"` for the GEMM
         /// contraction dimension).
@@ -103,9 +97,7 @@ pub enum PrimError {
     /// D-06 / ASVS V5) was handed a `rows != cols` geometry. Rejected *before*
     /// any `unsafe` kernel launch so a wrong shape is a recoverable typed error,
     /// not an out-of-bounds device read. Carries a label naming the operand.
-    #[error(
-        "primitive '{operand}' must be square: rows({rows}) != cols({cols})"
-    )]
+    #[error("primitive '{operand}' must be square: rows({rows}) != cols({cols})")]
     NotSquare {
         /// Which operand failed the squareness check (e.g. `"input"`).
         operand: &'static str,
@@ -169,5 +161,24 @@ pub enum PrimError {
         lhs: usize,
         /// The right operand of the overflowing multiplication.
         rhs: usize,
+    },
+
+    /// A primitive that documents a non-`None` guarantee on a given path
+    /// nonetheless yielded `None` — an internal invariant was violated. The
+    /// canonical case (IN-04) is `column_reduce(.., ReducePath::Shared, ..)`,
+    /// which is documented to always return `Some` on the Shared path: if that
+    /// contract ever drifts, the estimator surfaces this recoverable typed error
+    /// across the PyO3 boundary instead of panicking on an `.expect(...)` unwrap.
+    /// Carries the operand label naming the prim and a `context` label naming the
+    /// path/condition under which the unexpected `None` occurred.
+    #[error(
+        "primitive '{operand}' returned an unexpected None ({context}); an internal invariant was violated"
+    )]
+    InternalNone {
+        /// Which primitive yielded the unexpected `None` (e.g. `"column_reduce"`).
+        operand: &'static str,
+        /// The path/condition under which the `None` was unexpected
+        /// (e.g. `"ReducePath::Shared"`).
+        context: &'static str,
     },
 }
