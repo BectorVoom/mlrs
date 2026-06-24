@@ -41,7 +41,7 @@ use mlrs_algos::kernel_ridge::kernel_ridge::{KernelKind, KernelRidge};
 // typestate surface — their consuming-self `Fit`, the `Fitted`-gated
 // `Predict` (KernelRidge) and `ScoreSamples` (KernelDensity) accessors are
 // imported under disambiguating `Typestate*` aliases and called via UFCS. This
-// file is fully on the typestate surface (no `mlrs_algos::traits` reference).
+// file is fully on the typestate surface (no legacy-trait reference).
 use mlrs_algos::typestate::{
     Fit as TypestateFit, Predict as TypestatePredict, ScoreSamples as TypestateScoreSamples,
 };

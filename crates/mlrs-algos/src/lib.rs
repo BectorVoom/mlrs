@@ -8,9 +8,11 @@
 //! reductions) plus the new Phase-4 Cholesky/solve primitive in `mlrs-backend`.
 //!
 //! ## Module index (this file is OWNED by the Wave-0 scaffold plans 04-01 / 05-01)
-//! - [`traits`] — the uniform estimator surface: `Fit` / `Predict` / `Transform`
-//!   (D-04) plus the Phase-5 `PredictLabels` / `KNeighbors` / `PredictProba`
-//!   (D-05/D-07), all re-exported below.
+//! - [`typestate`] — the SINGLE estimator trait surface: the consuming-`self`
+//!   `Fit` / `Predict` / `Transform` / `PartialFit` lifecycle traits plus the
+//!   `&self` accessor traits `PredictLabels` / `KNeighbors` / `ScoreSamples` /
+//!   `PredictProba` / `PredictLogProba`. The legacy `&mut self` `traits` module
+//!   was hard-deleted in Phase 16 (D-01); `typestate` is now the only surface.
 //! - [`error`] — the estimator-facing [`AlgoError`](error::AlgoError) (invalid
 //!   hyperparameters; wraps `PrimError`).
 //! - [`linear`] — `LinearRegression` (04-03) + `Ridge` (04-05) + the Phase-5
@@ -55,19 +57,14 @@ pub mod manifold;
 pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;
-pub mod traits;
-// NEW typestate-aware surface (D-03/D-05/D-06/D-07). Deliberately NOT
-// glob-re-exported alongside `traits::*` below: the trait names collide with the
-// frozen `traits` surface, so consumers reach these via the explicit
-// `mlrs_algos::typestate::` path (e.g. `use mlrs_algos::typestate::Fit;`) to
-// keep the two surfaces from colliding at one call site (Pitfall 1, D-07).
+// The SINGLE estimator trait surface (D-01). The legacy `&mut self` `traits`
+// module was hard-deleted in Phase 16 once every estimator migrated; consumers
+// reach the lifecycle/accessor traits via the explicit `mlrs_algos::typestate::`
+// path (e.g. `use mlrs_algos::typestate::Fit;`).
 pub mod typestate;
 
-// Re-export the estimator surface so downstream crates/tests write
-// `use mlrs_algos::{Fit, PartialFit, Predict, Transform, PredictLabels,
-// KNeighbors, PredictProba, AlgoError};` directly.
+// Re-export the estimator-facing error so downstream crates/tests write
+// `use mlrs_algos::AlgoError;` directly. The trait surface is NOT re-exported at
+// the crate root — consumers import the consuming-`self` traits explicitly from
+// `mlrs_algos::typestate::*` (D-01, single trait surface).
 pub use error::AlgoError;
-pub use traits::{
-    Fit, KNeighbors, PartialFit, Predict, PredictLabels, PredictLogProba,
-    PredictProba, ScoreSamples, Transform,
-};

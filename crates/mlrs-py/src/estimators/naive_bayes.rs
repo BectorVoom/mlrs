@@ -53,7 +53,7 @@ use mlrs_algos::naive_bayes::nb_common::accuracy_score;
 // surface. The shared predict-surface free functions call `predict_labels` /
 // `predict_proba` / `predict_log_proba` via these typestate accessor traits on the
 // `Fitted`-tagged arm; the fit arms build the `Unfit` estimator and call the
-// consuming-self `TypestateFit::fit`. This file is fully off `mlrs_algos::traits`.
+// consuming-self `TypestateFit::fit`. This file is fully on the typestate surface.
 use mlrs_algos::typestate::{
     Fit as TypestateFit, PredictLabels as TypestatePredictLabels,
     PredictLogProba as TypestatePredictLogProba, PredictProba as TypestatePredictProba,

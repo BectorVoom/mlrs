@@ -12,7 +12,7 @@ use mlrs_algos::neighbors::classifier::KNeighborsClassifier;
 use mlrs_algos::neighbors::nearest::NearestNeighbors;
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
 // All three estimators in this file are on the typestate surface — the legacy
-// `mlrs_algos::traits` glob is fully removed. The lifecycle/accessor traits are
+// trait glob is fully removed. The lifecycle/accessor traits are
 // imported under `Typestate*` aliases and called via UFCS at each migrated arm
 // (the typestate module-doc warns against globbing the fit/predict/kneighbors
 // method-name collisions; aliasing + UFCS resolves it).

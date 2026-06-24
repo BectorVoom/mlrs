@@ -46,7 +46,7 @@ use mlrs_core::{f64_to_host, host_to_f64};
 use crate::cluster::spectral::recover;
 use crate::error::{AlgoError, BuildError};
 // SHAPE A' (RESEARCH Open Q3): SpectralEmbedding had an INHERENT `fit`/accessor
-// and NO `crate::traits` import. The Phase-16 retrofit ADOPTS the typestate `Fit`
+// and NO legacy-trait import. The Phase-16 retrofit ADOPTS the typestate `Fit`
 // trait (consuming-self) so the estimator joins the SINGLE trait surface and the
 // traits.rs-gone grep (Plan 11) stays clean. SpectralEmbedding is non-transductive
 // (like DBSCAN / sklearn's own SpectralEmbedding): it exposes the fitted

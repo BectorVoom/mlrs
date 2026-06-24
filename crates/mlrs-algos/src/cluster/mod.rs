@@ -2,7 +2,7 @@
 //!
 //! Module index for the two Phase-5 clustering estimators. They consume the new
 //! Phase-5 distance/clustering primitives (`prims::kmeans`, `prims::dbscan`) and
-//! return integer labels via the [`PredictLabels`](crate::traits::PredictLabels)
+//! return integer labels via the [`PredictLabels`](crate::typestate::PredictLabels)
 //! surface (D-05/D-06):
 //!
 //! - `KMeans` (CLUSTER-01) — k-means++ init (injected for the oracle, D-09) +

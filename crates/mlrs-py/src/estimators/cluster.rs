@@ -14,7 +14,7 @@ use mlrs_algos::cluster::hdbscan::{ClusterSelectionMethod, Hdbscan, Metric};
 use mlrs_algos::cluster::kmeans::KMeans;
 // All three cluster wraps in this file (PyKMeans, PyDBSCAN, PyHDBSCAN) are now on
 // the v3 typestate surface (consuming-self `Fit` returning the `Fitted` sibling;
-// `PredictLabels` reads fitted state). The legacy `mlrs_algos::traits` glob is
+// `PredictLabels` reads fitted state). The legacy trait glob is
 // gone (KMeans migrated in Plan 06). `Fit` is aliased `TypestateFit` and
 // `PredictLabels` `TypestatePredictLabels` and called via UFCS at the fit /
 // predict sites.

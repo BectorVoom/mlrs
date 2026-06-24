@@ -21,7 +21,7 @@ use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::ridge::Ridge;
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
 // Phase 16 (D-01): every estimator in this file now consumes the typestate
-// surface — the legacy `mlrs_algos::traits` glob has been removed. The typestate
+// surface — the legacy trait glob has been removed. The typestate
 // lifecycle + accessor traits are imported under disambiguating `Typestate*`
 // aliases (mirrors `cluster.rs`) and called via UFCS at each fit/predict arm so
 // the `fit`/`predict`/`predict_labels`/`predict_proba` method-name collisions

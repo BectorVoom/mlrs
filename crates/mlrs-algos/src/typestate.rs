@@ -8,15 +8,14 @@
 //!
 //! ## The single trait surface (Phase 16, D-01)
 //! This module is now the SINGLE trait surface for the whole crate. It mirrors
-//! ALL 9 legacy [`crate::traits`] traits — the four lifecycle traits
+//! ALL 9 legacy `&mut self` traits — the four lifecycle traits
 //! (`Fit` / `Predict` / `Transform` / `PartialFit`) plus the five `&self`
 //! accessor traits (`PredictLabels` / `KNeighbors` / `ScoreSamples` /
 //! `PredictProba` / `PredictLogProba`) — with the consuming-`self` typestate
-//! signatures. The legacy `traits.rs` is being HARD-DELETED this phase (D-01):
-//! every estimator migrates to consume `mlrs_algos::typestate::*`, after which
-//! `traits.rs` and its `pub mod traits;` are removed. Until that final deletion
-//! commit the two surfaces still collide by path; never glob both into the same
-//! `use` at one call site. Consumers of this surface write
+//! signatures. The legacy `traits.rs` was HARD-DELETED in Phase 16 (D-01):
+//! every estimator now consumes `mlrs_algos::typestate::*`, and the old
+//! `traits.rs` module and its `pub mod traits;` declaration are gone — this is
+//! the only trait surface. Consumers of this surface write
 //! `use mlrs_algos::typestate::Fit;` explicitly.
 //!
 //! The SIGNATURES differ from the legacy surface: the legacy `Fit::fit` takes
@@ -133,7 +132,7 @@ impl State for Fitted {}
 
 /// Fit an estimator to training data, CONSUMING `self` and returning a freshly
 /// typed [`Fit::Fitted`] value (D-05). This is the typestate counterpart of the
-/// legacy [`crate::traits::Fit`], whose `fit` took `&mut self` and returned
+/// legacy `&mut self` `Fit`, whose `fit` took `&mut self` and returned
 /// `&mut Self`; here the move-and-retag makes a `predict`-before-`fit` a
 /// compile error.
 ///
