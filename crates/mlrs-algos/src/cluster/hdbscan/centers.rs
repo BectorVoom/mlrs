@@ -93,6 +93,21 @@ pub fn weighted_cluster_center(
         .max()
         .unwrap_or(0);
 
+    // WR-06: emitting one row per `c in 0..n_clusters` is correct ONLY when the
+    // non-negative label space is dense (`0..n_clusters` with no gaps); a sparse
+    // range would leave all-zero "phantom" rows. `select::get_clusters` builds a
+    // dense `cluster_map`, so this invariant holds for the `fit` pipeline — assert
+    // it so a future selection change or direct caller cannot silently break it.
+    debug_assert!(
+        {
+            use std::collections::BTreeSet;
+            let distinct: BTreeSet<usize> =
+                labels.iter().filter(|&&l| l >= 0).map(|&l| l as usize).collect();
+            distinct.len() == n_clusters
+        },
+        "weighted_cluster_center requires a dense 0..n_clusters label range",
+    );
+
     let mut centroids = which.wants_centroid().then(|| vec![0.0f64; n_clusters * p]);
     let mut medoids = which.wants_medoid().then(|| vec![0.0f64; n_clusters * p]);
 
