@@ -6,14 +6,14 @@ current_phase: 16
 current_phase_name: builder-retrofit-sweep-shim-coverage
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-24T12:50:41.234Z"
+last_updated: "2026-06-24T13:04:08.629Z"
 last_activity: 2026-06-24
 last_activity_desc: Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 34
-  completed_plans: 29
+  completed_plans: 30
   percent: 80
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
-Plan: 9 of 13
+Plan: 10 of 13
 Status: Ready to execute
 Last activity: 2026-06-24 — Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
@@ -148,6 +148,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 16 P05 | 50m | 3 tasks | 9 files |
 | Phase 16 P06 | 12min | 3 tasks | 9 files |
 | Phase 16 P07 | ~12m | 3 tasks | 8 files |
+| Phase 16 P08 | ~10m | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -294,6 +295,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Plan 16-06: KMeans .init builder setter stores Option<Vec<f64>> narrowed to Vec<F> in build (Option-of-DATA wide-builder); KMeans/EmpiricalCovariance/LedoitWolf build() infallible-but-typed; SpectralClustering 100% off crate::traits (LegacyFit removed, inner KMeans on typestate Fit)
 - [Phase ?]: 16-07: enum-typed builder setters (NComponents/KdKernel/BandwidthSpec by value; A5 is scalar-narrowing only)
 - [Phase ?]: 16-07: KernelDensity Shape-A' adopts typestate Fit + Fitted-gated ScoreSamples; projection+density modules complete
+- [Phase ?]: Neighbors n_neighbors builder setters are usize (not f64 A5); KNeighbors accessor trait composes on Fitted (16-08); data-DEPENDENT k vs n_train stays in neighbor_indices core (T-16-V5), only n_neighbors>=1 relocates to build()
 
 ### Pending Todos
 
@@ -325,7 +327,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T12:50:26.084Z
+Last session: 2026-06-24T13:03:53.803Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
 
