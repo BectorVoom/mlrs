@@ -3,7 +3,7 @@
 //! Module index for the Phase-8 `KernelDensity` estimator. KD is given its OWN
 //! `density/` home rather than living under `neighbors/` (RESEARCH Open Q2): in
 //! mlrs's trait sense it is NOT a neighbor estimator — it implements
-//! [`ScoreSamples`](crate::traits::ScoreSamples) (per-sample log-density), not
+//! [`ScoreSamples`](crate::typestate::ScoreSamples) (per-sample log-density), not
 //! `KNeighbors` / `PredictLabels`.
 //!
 //! - `KernelDensity` (KERNEL-02) — kernel density estimation. Stores the fitted

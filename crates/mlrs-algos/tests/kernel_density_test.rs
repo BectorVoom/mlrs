@@ -36,7 +36,11 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::density::{BandwidthSpec, KdKernel, KernelDensity};
-use mlrs_algos::traits::ScoreSamples;
+// Phase 16 (D-01): KernelDensity is migrated to the typestate surface — it ADOPTS
+// the consuming-self `Fit` (builder construction) and the `ScoreSamples` accessor
+// gated on `Fitted`. The typestate traits are imported under disambiguating
+// `Typestate*` aliases and called via UFCS.
+use mlrs_algos::typestate::{Fit as TypestateFit, ScoreSamples as TypestateScoreSamples};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -160,12 +164,15 @@ where
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
     let q_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &q_host);
 
-    let mut kde = KernelDensity::<F>::new(kernel, bandwidth);
-    kde.fit(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
+    let kde = KernelDensity::<F>::builder()
+        .kernel(kernel)
+        .bandwidth(bandwidth)
+        .build::<F>()
+        .expect("KernelDensity build");
+    let kde = TypestateFit::fit(kde, &mut pool, &x_dev, None, (N_SAMPLES, N_FEATURES))
         .expect("KernelDensity::fit on a valid shape");
 
-    let ld = kde
-        .score_samples(&mut pool, &q_dev, (N_QUERY, N_FEATURES))
+    let ld = TypestateScoreSamples::score_samples(&kde, &mut pool, &q_dev, (N_QUERY, N_FEATURES))
         .expect("score_samples after fit");
     ld.to_host(&pool).iter().map(|&v| host_to_f64(v)).collect()
 }
@@ -205,10 +212,14 @@ where
             .map(|&v| f64_to::<F>(v))
             .collect();
         let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
-        let mut kde = KernelDensity::<F>::new(KdKernel::Gaussian, spec);
-        kde.fit(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
+        let kde = KernelDensity::<F>::builder()
+            .kernel(KdKernel::Gaussian)
+            .bandwidth(spec)
+            .build::<F>()
+            .expect("KernelDensity build (bandwidth rule)");
+        let kde = TypestateFit::fit(kde, &mut pool, &x_dev, None, (N_SAMPLES, N_FEATURES))
             .expect("KernelDensity::fit (bandwidth rule)");
-        let resolved = kde.bandwidth().expect("bandwidth_ after fit");
+        let resolved = kde.bandwidth();
         let expected_bw = case.expect_f64(bw_name)[0];
         assert_close(
             &[resolved],
@@ -290,5 +301,19 @@ fn score_samples_shape_f32() {
         got.len(),
         N_QUERY,
         "score_samples returns a length-n_query log-density vector (D-12)"
+    );
+}
+
+/// BLDR-01: the zero-arg `new()` and the `builder().build()` default agree on
+/// every hyperparameter (the single-source-of-defaults contract, D-08).
+#[test]
+fn kernel_density_defaults_equal() {
+    let from_new = KernelDensity::<f64>::new();
+    let from_builder = KernelDensity::<f64>::builder()
+        .build::<f64>()
+        .expect("default build");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "KernelDensity::new() and builder().build() must share defaults"
     );
 }

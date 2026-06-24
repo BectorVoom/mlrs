@@ -37,9 +37,14 @@ use pyo3::prelude::*;
 
 use mlrs_algos::density::kernel_density::{BandwidthSpec, KdKernel, KernelDensity};
 use mlrs_algos::kernel_ridge::kernel_ridge::{KernelKind, KernelRidge};
-use mlrs_algos::traits::ScoreSamples;
+// Phase 16 (D-01): KernelDensity is migrated to the typestate surface — its
+// consuming-self `Fit` and the `Fitted`-gated `ScoreSamples` accessor are
+// imported under disambiguating `Typestate*` aliases and called via UFCS.
+// KernelRidge (same file) uses INHERENT `fit`/`predict` methods (no trait glob),
+// so this file references no other estimator-trait surface.
+use mlrs_algos::typestate::{Fit as TypestateFit, ScoreSamples as TypestateScoreSamples};
 
-use crate::errors::{algo_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{
     as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype,
 };
@@ -294,7 +299,7 @@ impl PyKernelRidge {
 // KernelDensity — fit (X) + score_samples (Q); log_density
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyKernelDensity,
     algo:  mlrs_algos::density::kernel_density::KernelDensity,
     unfit: { kernel: String, bandwidth_rule: String, bandwidth: f64 },
@@ -376,16 +381,26 @@ impl PyKernelDensity {
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = KernelDensity::<f32>::new(kd_kernel, spec);
-                    est.fit(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKernelDensity::F32(est))
+                    let est = KernelDensity::<f32>::builder()
+                        .kernel(kd_kernel)
+                        .bandwidth(spec)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKernelDensity::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = KernelDensity::<f64>::new(kd_kernel, spec);
-                    est.fit(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKernelDensity::F64(est))
+                    let est = KernelDensity::<f64>::builder()
+                        .kernel(kd_kernel)
+                        .bandwidth(spec)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKernelDensity::F64(fitted))
                 }
             }
         })?;
@@ -409,8 +424,7 @@ impl PyKernelDensity {
             match &self.inner {
                 AnyKernelDensity::F32(est) => {
                     let qd = validated_f32(as_f32(&qa)?, &mut pool)?;
-                    let out = est
-                        .score_samples(&mut pool, &qd, (rows, cols))
+                    let out = TypestateScoreSamples::score_samples(est, &mut pool, &qd, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(out.to_host_metered(&mut pool))
                 }
@@ -433,8 +447,7 @@ impl PyKernelDensity {
             match &self.inner {
                 AnyKernelDensity::F64(est) => {
                     let qd = validated_f64(as_f64(&qa)?, &mut pool)?;
-                    let out = est
-                        .score_samples(&mut pool, &qd, (rows, cols))
+                    let out = TypestateScoreSamples::score_samples(est, &mut pool, &qd, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(out.to_host_metered(&mut pool))
                 }
@@ -475,8 +488,8 @@ impl PyKernelDensity {
     /// `f64` regardless of `F`).
     fn bandwidth_(&self) -> PyResult<f64> {
         match &self.inner {
-            AnyKernelDensity::F32(e) => e.bandwidth().map_err(algo_err_to_py),
-            AnyKernelDensity::F64(e) => e.bandwidth().map_err(algo_err_to_py),
+            AnyKernelDensity::F32(e) => Ok(e.bandwidth()),
+            AnyKernelDensity::F64(e) => Ok(e.bandwidth()),
             _ => Err(not_fitted("kernel_density", "bandwidth_")),
         }
     }

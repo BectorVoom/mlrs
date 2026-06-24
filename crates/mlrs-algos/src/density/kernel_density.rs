@@ -42,12 +42,14 @@
 //! validated (`InvalidBandwidth`) before any launch.
 //!
 //! ## ScoreSamples (D-12), NOT Predict
-//! KernelDensity implements [`ScoreSamples`](crate::traits::ScoreSamples) — a
+//! KernelDensity implements [`ScoreSamples`](crate::typestate::ScoreSamples) — a
 //! length-`n` per-query log-density vector — NOT a regression `Predict` / a
 //! neighbor surface (it lives in its own `density/` home, RESEARCH Open Q2).
 //!
 //! Tests live in `crates/mlrs-algos/tests/kernel_density_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
+
+use std::marker::PhantomData;
 
 use bytemuck::Pod;
 use cubecl::prelude::*;
@@ -63,8 +65,13 @@ use mlrs_kernels::{
     kde_tophat_map,
 };
 
-use crate::error::AlgoError;
-use crate::traits::ScoreSamples;
+use crate::error::{AlgoError, BuildError};
+// SHAPE A' (RESEARCH Open Q3 / A3): KernelDensity had an INHERENT `fit` plus an
+// OLD legacy-`traits`-surface `ScoreSamples` impl (no `Fit` trait). The Phase-16 retrofit
+// ADOPTS the typestate `Fit` (its inherent `fit` becomes the consuming-self trait
+// impl on `Unfit`) and moves `ScoreSamples` to the typestate version, gated on
+// `Fitted` — bringing KernelDensity fully onto the SINGLE trait surface.
+use crate::typestate::{validate_geometry, Fit, Fitted, ScoreSamples, Unfit};
 
 /// The six sklearn KernelDensity kernels (D-07). Selected at construction; the
 /// resolved numeric `bandwidth_` is computed at `fit` (D-09).
@@ -121,11 +128,14 @@ pub enum BandwidthSpec {
 /// Kernel density estimation (KERNEL-02) over the v1 `distance` prim + a
 /// density-value map + a device log-sum-exp (D-08/D-11).
 ///
-/// Construct with [`KernelDensity::new`] (`kernel`, `bandwidth`), then
-/// [`fit`](Self::fit) and [`score_samples`](crate::traits::ScoreSamples::score_samples).
-/// The fitted training matrix `X_fit_` is device-resident; the resolved
-/// `bandwidth_` is a host `f64` accessor.
-pub struct KernelDensity<F>
+/// Construct with the zero-arg [`KernelDensity::new`] (sklearn defaults:
+/// `kernel = gaussian`, `bandwidth = 1.0`) or [`KernelDensity::builder`], then
+/// the consuming [`Fit::fit`] (returns the `Fitted`-tagged sibling) and
+/// [`score_samples`](crate::typestate::ScoreSamples::score_samples). The fitted
+/// training matrix `X_fit_` is device-resident; the resolved `bandwidth_` is a
+/// host `f64` accessor that exists ONLY on `KernelDensity<F, Fitted>` (the
+/// compile-time typestate replaces the old runtime `NotFitted` guard, D-03).
+pub struct KernelDensity<F, S = Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -140,47 +150,153 @@ where
     bandwidth_: Option<f64>,
     /// Fitted `(n_samples, n_features)` geometry, `None` until `fit`.
     fit_shape_: Option<(usize, usize)>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> KernelDensity<F>
+impl<F> KernelDensity<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `KernelDensity`. `kernel` selects the family (D-07);
-    /// `bandwidth` is a numeric value or a string rule (D-09). Validation
-    /// (`bandwidth_ > 0`, kernel name) happens at `fit`, not construction.
-    pub fn new(kernel: KdKernel, bandwidth: BandwidthSpec) -> Self {
+    /// Construct an unfitted `KernelDensity` with sklearn's defaults
+    /// (`kernel = gaussian`, `bandwidth = 1.0`) directly in the `Unfit` state.
+    /// SINGLE source of truth for the defaults (D-08): the builder `Default`
+    /// re-derives via [`KernelDensity::into_builder`].
+    pub fn new() -> Self {
         Self {
-            kernel,
-            bandwidth_spec: bandwidth,
+            kernel: KdKernel::Gaussian,
+            bandwidth_spec: BandwidthSpec::Numeric(1.0),
             x_fit_: None,
             bandwidth_: None,
             fit_shape_: None,
+            _state: PhantomData,
         }
     }
 
-    /// The resolved numeric `bandwidth_` (`> 0`) after `fit`. Errors with
-    /// [`AlgoError::NotFitted`] before `fit` (D-09).
-    pub fn bandwidth(&self) -> Result<f64, AlgoError> {
-        self.bandwidth_.ok_or(AlgoError::NotFitted {
-            estimator: "kernel_density",
-            operation: "bandwidth_",
-        })
+    /// Start building a `KernelDensity` from sklearn's defaults (D-08 single
+    /// source).
+    pub fn builder() -> KernelDensityBuilder {
+        KernelDensityBuilder::default()
     }
 
-    /// Fit the density model: store `X_fit_` and resolve `bandwidth_` (D-09).
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`KernelDensityBuilder::default`] to re-derive the
+    /// defaults from [`KernelDensity::new`] (D-08).
+    pub fn into_builder(self) -> KernelDensityBuilder {
+        KernelDensityBuilder {
+            kernel: self.kernel,
+            bandwidth: self.bandwidth_spec,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `x_fit_`/`bandwidth_`/`fit_shape_` are excluded — all `None` in any `Unfit`
+    /// value). Used by the defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.kernel == other.kernel && self.bandwidth_spec == other.bandwidth_spec
+    }
+}
+
+impl<F> Default for KernelDensity<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`KernelDensity`] (D-01). `kernel` takes the [`KdKernel`] enum and
+/// `bandwidth` the [`BandwidthSpec`] (numeric value or `'scott'`/`'silverman'`
+/// rule) directly — neither is a scalar narrowing (A5). `Default` re-derives the
+/// sklearn defaults from [`KernelDensity::new`] (D-08 single source).
+#[derive(Debug, Clone, Copy)]
+pub struct KernelDensityBuilder {
+    kernel: KdKernel,
+    bandwidth: BandwidthSpec,
+}
+
+impl Default for KernelDensityBuilder {
+    /// Re-derive the sklearn defaults from [`KernelDensity::new`] (D-08 single
+    /// source). `f64` is pinned only to read the F-independent defaults — the
+    /// builder is non-generic.
+    fn default() -> Self {
+        KernelDensity::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl KernelDensityBuilder {
+    /// Set the density kernel family (D-07).
+    pub fn kernel(mut self, v: KdKernel) -> Self {
+        self.kernel = v;
+        self
+    }
+
+    /// Set the bandwidth specification (numeric value or `'scott'`/`'silverman'`
+    /// host rule, D-09).
+    pub fn bandwidth(mut self, v: BandwidthSpec) -> Self {
+        self.bandwidth = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. KernelDensity has no purely data-INDEPENDENT
+    /// hyperparameter that is unconditionally validated at construction: the
+    /// kernel name is a closed enum, and the `bandwidth_ > 0` check is
+    /// resolution-path-coupled (the `'scott'`/`'silverman'` rules resolve the
+    /// numeric bandwidth at fit against `n_samples`/`n_features`), so it stays in
+    /// the fit body (D-03 byte-identical). The `Result` is kept for family
+    /// uniformity so the `build_err_to_py` PyO3 mapper is shape-identical across
+    /// the Phase-16 builders.
+    pub fn build<F>(self) -> Result<KernelDensity<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(KernelDensity {
+            kernel: self.kernel,
+            bandwidth_spec: self.bandwidth,
+            x_fit_: None,
+            bandwidth_: None,
+            fit_shape_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> KernelDensity<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// The resolved numeric `bandwidth_` (`> 0`) after `fit`. `Some` by
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn bandwidth(&self) -> f64 {
+        self.bandwidth_
+            .expect("bandwidth_ is Some by construction on KernelDensity<F, Fitted>")
+    }
+}
+
+impl<F> Fit<F> for KernelDensity<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = KernelDensity<F, Fitted>;
+
+    /// Fit the density model: store `X_fit_` and resolve `bandwidth_` (D-09),
+    /// CONSUMING `self` and returning the `Fitted`-tagged sibling.
     ///
     /// `x` is `(n_samples × n_features)` row-major. Validates the kernel name and
     /// geometry, resolves the bandwidth (numeric or scott/silverman host closed
     /// form), and validates `bandwidth_ > 0` (`InvalidBandwidth`) — all BEFORE any
-    /// device launch (T-08-04-01 / ASVS V5). Returns `&mut Self` (sklearn
-    /// convention).
-    pub fn fit(
-        &mut self,
+    /// device launch (T-08-04-01 / ASVS V5).
+    fn fit(
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
+        // `_y` is unused: the retained `Fit`-trait slot (KernelDensity is an
+        // unsupervised density estimator) — not unfinished wiring (IN-02).
+        _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<KernelDensity<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-08-04-01 / ASVS V5: validate the kernel name + geometry BEFORE any
@@ -201,14 +317,7 @@ where
                 kernel: self.kernel.name().to_string(),
             });
         }
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
 
         // --- Bandwidth resolution (D-09, host f64). scott/silverman are the
         //     SKLEARN closed forms (no per-feature std factor — NOT scipy's). ---
@@ -235,30 +344,32 @@ where
         let x_host = x.to_host(pool);
         let x_fit: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_host);
 
-        // --- Re-fit buffer reuse (WR-07): on a re-`fit` the prior X_fit_ device
-        //     allocation must return to the pool free-list, not be dropped to the
-        //     allocator. Release the old buffer (if any) BEFORE reassigning. ---
-        if let Some(old) = self.x_fit_.take() {
-            old.release_into(pool);
-        }
-
-        self.x_fit_ = Some(x_fit);
-        self.bandwidth_ = Some(bandwidth);
-        self.fit_shape_ = Some((n_samples, n_features));
-        Ok(self)
+        // The pre-retrofit `&mut self` re-fit path released a prior `x_fit_` buffer
+        // before reassigning (WR-07); a freshly-built `Unfit` value carries no
+        // fitted state, so that release is a no-op here and is dropped (the typestate
+        // transition consumes a fresh `Unfit`; a re-fit constructs a new estimator).
+        Ok(KernelDensity {
+            kernel: self.kernel,
+            bandwidth_spec: self.bandwidth_spec,
+            x_fit_: Some(x_fit),
+            bandwidth_: Some(bandwidth),
+            fit_shape_: Some((n_samples, n_features)),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> ScoreSamples<F> for KernelDensity<F>
+impl<F> ScoreSamples<F> for KernelDensity<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
     /// Compute the length-`n_query` log-density for each row of `q` (D-12), via
     /// `distance(Q, X_fit_, sqrt=per-kernel)` → per-element density-value map →
     /// per-query (row) log-sum-exp over the v1 `reduce` prim → host assembly
-    /// `lse_row + log_norm − log(N)` (D-08/D-11). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`, or a geometry / feature-count
-    /// mismatch.
+    /// `lse_row + log_norm − log(N)` (D-08/D-11). The fitted `x_fit_`/`bandwidth_`/
+    /// `fit_shape_` are `Some` by construction on the `Fitted` state (the
+    /// compile-time typestate replaces the old runtime `NotFitted` guard, D-03);
+    /// errors only on a geometry / feature-count mismatch.
     fn score_samples(
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -267,18 +378,16 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_query, n_features) = shape;
 
-        let x_fit = self.x_fit_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "kernel_density",
-            operation: "score_samples",
-        })?;
-        let bandwidth = self.bandwidth_.ok_or(AlgoError::NotFitted {
-            estimator: "kernel_density",
-            operation: "score_samples",
-        })?;
-        let (n_samples, fit_features) = self.fit_shape_.ok_or(AlgoError::NotFitted {
-            estimator: "kernel_density",
-            operation: "score_samples",
-        })?;
+        let x_fit = self
+            .x_fit_
+            .as_ref()
+            .expect("x_fit_ is Some by construction on KernelDensity<F, Fitted>");
+        let bandwidth = self
+            .bandwidth_
+            .expect("bandwidth_ is Some by construction on KernelDensity<F, Fitted>");
+        let (n_samples, fit_features) = self
+            .fit_shape_
+            .expect("fit_shape_ is Some by construction on KernelDensity<F, Fitted>");
 
         // --- T-08-04-01 / ASVS V5: geometry + fitted-n_features consistency. ---
         if n_query == 0 || n_features == 0 || q.len() != n_query * n_features {
