@@ -51,6 +51,7 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 // make_single_linkage that the Wave-3 condense/select stage (plan 15-04)
 // consumes.
 pub mod condense;
+pub mod glosh;
 pub mod mst;
 pub mod select;
 pub mod single_linkage;
@@ -162,6 +163,12 @@ pub struct Hdbscan<F, S = Unfit> {
     /// device-resident `F`. `Some` after a precomputed fit (plan 15-04), `None`
     /// otherwise (the feature-metric device front-end lands in plan 15-05).
     probabilities_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Fitted per-point GLOSH outlier scores (length `n`, in `[0, 1]`),
+    /// device-resident `F` (HDBS-03, plan 15-06). `Some` after any successful fit
+    /// (the GLOSH pass runs over the same condensed tree that produced
+    /// `labels_`/`probabilities_`); `None` until fit. Gated vs the `hdbscan` 0.8.44
+    /// library (sklearn has no GLOSH — D-07).
+    outlier_scores_: Option<DeviceArray<ActiveRuntime, F>>,
     /// The single-linkage hierarchy from the MST → `make_single_linkage` pass
     /// (HDBS-02, plan 15-03). `Some` after a precomputed fit, `None` otherwise
     /// (the feature-metric device front-end lands in plan 15-05). Stored host-side
@@ -202,6 +209,7 @@ where
             allow_single_cluster: false,
             labels_: None,
             probabilities_: None,
+            outlier_scores_: None,
             single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -406,6 +414,7 @@ impl HdbscanBuilder {
             allow_single_cluster: self.allow_single_cluster,
             labels_: None,
             probabilities_: None,
+            outlier_scores_: None,
             single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -452,28 +461,49 @@ where
         // condense → stability → select → labelling/probabilities end-to-end; the
         // feature metrics keep the trivial all-`-1` fit (no probabilities) until
         // the device front-end lands in plan 15-05.
-        let (single_linkage_, labels, probabilities) = if self.metric == Metric::Precomputed {
-            let hierarchy = self.precomputed_single_linkage(pool, x, n, p)?;
-            let (labels, probs) = self.tree_to_labels(&hierarchy, n);
-            (Some(hierarchy), labels, Some(probs))
-        } else {
-            // Feature-metric device front-end (plan 15-05): core distances from the
-            // Phase-13 KNN prim (`include_self=true`), then Variant-A (cosine, dense
-            // n×n + the MR kernel) or Variant-B (the other four, source-tracking, no
-            // n×n resident) MST → single-linkage. The Wave-3 host back-end then
-            // produces labels + probabilities, identical to the precomputed path.
-            let hierarchy = self.feature_metric_single_linkage(pool, x, n, p)?;
-            let (labels, probs) = self.tree_to_labels(&hierarchy, n);
-            (Some(hierarchy), labels, Some(probs))
-        };
+        //
+        // `labels_`/`probabilities_` come from the sklearn-exact tree
+        // (`tree_to_labels`). GLOSH `outlier_scores_` come from a PARALLEL
+        // hdbscan-convention tree (D-07, Option A) built from the dense `n×n`
+        // distance matrix `dist_dense` (core distance at index `min_samples`,
+        // hdbscan's `mst_linkage_core` tie-order) — see `glosh::hdbscan_outlier_scores`.
+        // The dense matrix is the alpha-scaled metric distances (precomputed: `X`;
+        // feature metrics: rebuilt host-side via `dense_distance_matrix`).
+        let (single_linkage_, labels, probabilities, dist_dense) =
+            if self.metric == Metric::Precomputed {
+                let dist_dense = self.precomputed_dense_distances(pool, x, n, p)?;
+                let hierarchy = self.precomputed_single_linkage(pool, x, n, p)?;
+                let (labels, probs) = self.tree_to_labels(&hierarchy, n);
+                (Some(hierarchy), labels, probs, dist_dense)
+            } else {
+                // Feature-metric device front-end (plan 15-05): core distances from
+                // the Phase-13 KNN prim (`include_self=true`), then Variant-A
+                // (cosine, dense n×n + the MR kernel) or Variant-B (the other four,
+                // source-tracking, no n×n resident) MST → single-linkage. The Wave-3
+                // host back-end then produces labels + probabilities, identical to the
+                // precomputed path. GLOSH then runs over the hdbscan-convention tree.
+                let dist_dense = self.feature_metric_dense_distances(pool, x, n, p)?;
+                let hierarchy = self.feature_metric_single_linkage(pool, x, n, p)?;
+                let (labels, probs) = self.tree_to_labels(&hierarchy, n);
+                (Some(hierarchy), labels, probs, dist_dense)
+            };
+
+        // GLOSH `outlier_scores_` over the parallel hdbscan-convention tree (D-07).
+        let min_samples = self.min_samples.unwrap_or(self.min_cluster_size);
+        let outlier_scores =
+            glosh::hdbscan_outlier_scores(&dist_dense, n, min_samples, self.min_cluster_size);
 
         let labels_dev = DeviceArray::from_host(pool, &labels);
-        // probabilities_ is device-resident `F`; `None` for the feature-metric
-        // trivial path (the accessor returns all-0 there is NOT exposed — `None`).
-        let probabilities_ = probabilities.map(|p_host| {
-            let p_f: Vec<F> = p_host.iter().map(|&v| f64_to_host::<F>(v)).collect();
-            DeviceArray::from_host(pool, &p_f)
-        });
+        // probabilities_ is device-resident `F`.
+        let probabilities_ = {
+            let p_f: Vec<F> = probabilities.iter().map(|&v| f64_to_host::<F>(v)).collect();
+            Some(DeviceArray::from_host(pool, &p_f))
+        };
+        // outlier_scores_ is device-resident `F` (GLOSH, HDBS-03).
+        let outlier_scores_ = {
+            let s_f: Vec<F> = outlier_scores.iter().map(|&v| f64_to_host::<F>(v)).collect();
+            Some(DeviceArray::from_host(pool, &s_f))
+        };
 
         Ok(Hdbscan {
             min_cluster_size: self.min_cluster_size,
@@ -487,6 +517,7 @@ where
             allow_single_cluster: self.allow_single_cluster,
             labels_: Some(labels_dev),
             probabilities_,
+            outlier_scores_,
             single_linkage_,
             n_features_in_: p,
             _float: PhantomData,
@@ -681,6 +712,69 @@ where
         Ok(single_linkage::make_single_linkage(&sorted, n))
     }
 
+    /// Build the alpha-scaled dense `n×n` distance matrix for the GLOSH
+    /// hdbscan-convention tree on the PRECOMPUTED path: `X` is already the square
+    /// `n×n` distance matrix, so we read it to host and divide the WHOLE matrix by
+    /// `alpha` (Variant-A placement, matching `precomputed_single_linkage`). The
+    /// GLOSH pass ([`glosh::hdbscan_outlier_scores`]) then recomputes core
+    /// distances at index `min_samples` from THIS scaled matrix.
+    fn precomputed_dense_distances(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        n: usize,
+        p: usize,
+    ) -> Result<Vec<f64>, AlgoError> {
+        if n != p {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "precomputed_distance_matrix",
+                rows: n,
+                cols: p,
+                len: n * p,
+            }));
+        }
+        let alpha = self.alpha;
+        let dist: Vec<f64> = x
+            .to_host(pool)
+            .iter()
+            .map(|&v| host_to_f64(v) / alpha)
+            .collect();
+        Ok(dist)
+    }
+
+    /// Build the alpha-scaled dense `n×n` distance matrix for the GLOSH
+    /// hdbscan-convention tree on the FEATURE-metric path: rebuild the metric
+    /// `pairwise_distances(X)` host-side from the `n×p` design matrix (cosine via
+    /// [`cosine_distance_matrix`]; the four FAST metrics via [`host_pairwise`]),
+    /// then divide the WHOLE matrix by `alpha` (Variant-A placement, the hdbscan
+    /// generic path scales the matrix before core distances). This is a host pass
+    /// — the GLOSH tree is host-side and never resident on the device, so it does
+    /// not affect the `memory_gate` sub-quadratic DEVICE bound.
+    fn feature_metric_dense_distances(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        n: usize,
+        p: usize,
+    ) -> Result<Vec<f64>, AlgoError> {
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        let mut dist = vec![0.0f64; n * n];
+        if matches!(self.metric, Metric::Cosine) {
+            dist = cosine_distance_matrix(&x_host, n, p);
+        } else {
+            for i in 0..n {
+                for j in 0..n {
+                    dist[i * n + j] = host_pairwise(&x_host, p, self.metric, i, j);
+                }
+            }
+        }
+        let alpha = self.alpha;
+        for d in dist.iter_mut() {
+            *d /= alpha;
+        }
+        Ok(dist)
+    }
+
     /// Map the estimator's [`Metric`] onto the Phase-13 KNN prim's
     /// [`KnnMetric`](mlrs_backend::prims::knn_graph::Metric) for the core-distance
     /// query. `Precomputed` never reaches here (handled by the precomputed path).
@@ -701,13 +795,21 @@ where
     /// `hierarchy` by `min_cluster_size`, compute stabilities, run the configured
     /// EoM/leaf + epsilon/max_cluster_size selection, label points (`-1` = noise),
     /// and compute membership probabilities. Returns `(labels_i32, probabilities)`
-    /// of length `n`.
+    /// each of length `n`.
+    ///
+    /// GLOSH `outlier_scores_` are NOT computed here — they run over a PARALLEL
+    /// hdbscan-convention tree (D-07; see [`glosh::hdbscan_outlier_scores`]) so the
+    /// sklearn-exact labels/probabilities tree is left untouched.
     ///
     /// A `hierarchy` with fewer than one merge (`n < 2`, or every point isolated)
     /// yields all-`-1` labels and all-`0` probabilities (no cluster can form) —
-    /// matching sklearn's degenerate output without entering the condensed-tree
-    /// path (which assumes at least one internal node).
-    fn tree_to_labels(&self, hierarchy: &[single_linkage::SingleLinkageEdge], n: usize) -> (Vec<i32>, Vec<f64>) {
+    /// matching the degenerate output without entering the condensed-tree path
+    /// (which assumes at least one internal node).
+    fn tree_to_labels(
+        &self,
+        hierarchy: &[single_linkage::SingleLinkageEdge],
+        n: usize,
+    ) -> (Vec<i32>, Vec<f64>) {
         let condensed = condense::condense_tree(hierarchy, self.min_cluster_size);
         // A condensed tree with no internal cluster (every point fell out under the
         // root, or an empty hierarchy) is the all-noise degenerate case.
@@ -759,6 +861,14 @@ where
     /// Some), since the trivial feature-metric path produces no probabilities yet.
     pub fn probabilities(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
         self.probabilities_.as_ref().map(|d| d.to_host(pool))
+    }
+
+    /// Host copy of the fitted per-point GLOSH `outlier_scores_` (length `n`, in
+    /// `[0, 1]`; HDBS-03). `Some` after any successful fit (the GLOSH pass runs over
+    /// the same condensed tree as `labels_`/`probabilities_`). Gated vs the
+    /// `hdbscan` 0.8.44 library — sklearn has no GLOSH (D-07).
+    pub fn outlier_scores(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
+        self.outlier_scores_.as_ref().map(|d| d.to_host(pool))
     }
 
     /// Number of features seen at fit (`n_features_in_`).
