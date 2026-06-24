@@ -168,7 +168,7 @@ Plans:
   3. A user can read per-point `outlier_scores_` (GLOSH) from a fitted HDBSCAN, gated within band vs the `hdbscan` library.
   4. A user can request cluster centers via `store_centers` (`'centroid'`/`'medoid'`) producing `centroids_`/`medoids_`.
 
-**Plans**: 2/6 plans executed
+**Plans**: 3/6 plans executed
 **Wave 1**
 
 - [x] 15-01-PLAN.md — label_perm `-1→-1` pinned matcher + unit test (HDBS-02)
@@ -179,7 +179,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 15-03-PLAN.md — Metric enum + build validation + both oracle MST variants + single-linkage; D-04/D-05 tie-break TRUE GATE (precomputed anchor)
+- [x] 15-03-PLAN.md — Metric enum + build validation + both oracle MST variants + single-linkage; D-04/D-05 tie-break TRUE GATE (precomputed anchor)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -232,5 +232,5 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
 | 14. UMAP | v3.0 | 7/7 | Complete    | 2026-06-23 |
-| 15. HDBSCAN | v3.0 | 2/6 | In Progress|  |
+| 15. HDBSCAN | v3.0 | 3/6 | In Progress|  |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |

@@ -109,6 +109,14 @@ No blocker surfaced. The single-linkage hierarchy is deterministic and tie-free 
 - 15-05 wires the device front-end (KNN core distances + GATHER mutual-reachability) and Variant B for the five feature-space metrics.
 - 15-06 computes `centroids_`/`medoids_` from the wired `store_centers` field.
 
+## Self-Check: PASSED
+
+- FOUND: crates/mlrs-algos/src/cluster/hdbscan/mst.rs
+- FOUND: crates/mlrs-algos/src/cluster/hdbscan/single_linkage.rs
+- FOUND: .planning/phases/15-hdbscan/15-03-SUMMARY.md
+- FOUND commit: e52ac1b (Task 1)
+- FOUND commit: 7c0ef9c (Task 2)
+
 ---
 *Phase: 15-hdbscan*
 *Completed: 2026-06-24*

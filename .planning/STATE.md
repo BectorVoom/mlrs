@@ -6,14 +6,14 @@ current_phase: 15
 current_phase_name: hdbscan
 status: executing
 stopped_at: Completed 15-01-PLAN.md
-last_updated: "2026-06-24T05:01:46.502Z"
+last_updated: "2026-06-24T05:14:04.055Z"
 last_activity: 2026-06-24
 last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 20
-  completed_plans: 16
+  completed_plans: 17
   percent: 60
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 15 (hdbscan) — EXECUTING
-Plan: 3 of 6
+Plan: 4 of 6
 Status: Ready to execute
 Last activity: 2026-06-24 — Phase 15 execution started
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
@@ -135,6 +135,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 14 P07 | 70 | 3 tasks | 3 files |
 | Phase 15 P01 | 1m36s | 1 tasks | 3 files |
 | Phase 15 P02 | 75min | 2 tasks | 25 files |
+| Phase 15 P03 | 18min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -265,6 +266,8 @@ Recent decisions affecting current work:
 - [Phase 15]: best_match_accuracy_pinned_noise: -1 filtered from both vocabularies before greedy best_mapping, then (-1,-1) force-pinned; HDBS-02 exact-label compare primitive
 - [Phase ?]: 15-02: epsilon knob oracled vs hdbscan 0.8.44 (sklearn 1.9.0 epsilon_search crashes on merging trees)
 - [Phase ?]: 15-02: hdbscan oracle forced algorithm='generic' (default 'best' BallTree rejects cosine)
+- [Phase ?]: 15-03: HDBSCAN MST/single-linkage ported; precomputed path wired; oracle label gates stay ignored until 15-04 (labels all--1 in this slice)
+- [Phase ?]: 15-03: argsort_by_weight uses f64::total_cmp; gate fixtures use distinct MST edge weights so the sort is tie-free and oracle-equal (Pitfall 1 option 2)
 
 ### Pending Todos
 
@@ -296,7 +299,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T05:01:30.223Z
+Last session: 2026-06-24T05:13:34.541Z
 Stopped at: Completed 15-01-PLAN.md
 Resume file: .planning/phases/15-hdbscan/15-CONTEXT.md
 
