@@ -38,9 +38,18 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
+use mlrs_core::{host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
+
+// Host back-end submodules (HDBS-02, plan 15-03). Pure scalar Rust — the
+// deliberate GPU-tree-atomics dodge (RESEARCH). `mst` holds both oracle Prim
+// variants + argsort-by-weight; `single_linkage` holds the UnionFind +
+// make_single_linkage that the Wave-3 condense/select stage (plan 15-04)
+// consumes.
+pub mod mst;
+pub mod single_linkage;
 
 /// Distance metric for the HDBSCAN neighbor graph (HDBS-01, D-01). The five
 /// feature-space metrics mirror [`mlrs_backend::prims::knn_graph::Metric`]
@@ -138,6 +147,12 @@ pub struct Hdbscan<F, S = Unfit> {
     /// Fitted labels (length `n`, `-1` = noise), device-resident `i32`. `None`
     /// until fit.
     labels_: Option<DeviceArray<ActiveRuntime, i32>>,
+    /// The single-linkage hierarchy from the MST → `make_single_linkage` pass
+    /// (HDBS-02, plan 15-03). `Some` after a precomputed fit, `None` otherwise
+    /// (the feature-metric device front-end lands in plan 15-05). Stored host-side
+    /// for the Wave-3 condense/select stage (plan 15-04) — NOT device-resident
+    /// (the back-end is pure host).
+    single_linkage_: Option<Vec<single_linkage::SingleLinkageEdge>>,
     /// Number of features seen at fit (`n_features_in_`). `0` until fit.
     n_features_in_: usize,
     /// Phantom over the float type (the shell stores no `F` until Phase 15's real
@@ -170,6 +185,7 @@ where
             max_cluster_size: 0,
             store_centers: None,
             labels_: None,
+            single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
             _state: PhantomData,
@@ -362,6 +378,7 @@ impl HdbscanBuilder {
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
             labels_: None,
+            single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
             _state: PhantomData,
@@ -375,11 +392,20 @@ where
 {
     type Fitted = Hdbscan<F, Fitted>;
 
-    /// NON-algorithmic trivial fit (Phase-12 shell — real HDBSCAN lands in Phase
-    /// 15). Validates the data-DEPENDENT geometry (D-08), then allocates an
-    /// all-`-1` (noise sentinel) `labels_` of length `n` — NO kernel, NO
-    /// compute. CONSUMES `self`, returning the `Fitted`-tagged sibling (D-02).
-    /// `y` is ignored (HDBSCAN is unsupervised).
+    /// Fit HDBSCAN (HDBS-02, plan 15-03 slice). Validates the data-DEPENDENT
+    /// geometry (D-08), then runs the per-metric pipeline. CONSUMES `self`,
+    /// returning the `Fitted`-tagged sibling (D-02). `y` is ignored (unsupervised).
+    ///
+    /// As of plan 15-03 the **precomputed** path (`Metric::Precomputed`) runs the
+    /// exact host back-end up to the single-linkage hierarchy: validate `X` is a
+    /// square `n×n` distance matrix, divide by `alpha`, compute core distances
+    /// (the `(min_samples-1)`-th smallest per row), build the dense
+    /// mutual-reachability, run the dense Variant-A Prim's MST, argsort by weight,
+    /// and fold into `make_single_linkage`. The hierarchy is stored on
+    /// `single_linkage_` for the Wave-3 condense/select stage (plan 15-04); until
+    /// that wires the tree, `labels_` stays all-`-1` (the shell contract holds so
+    /// the estimator still fits/compiles). The five feature-space metrics keep the
+    /// trivial all-`-1` fit until the device front-end lands in plan 15-05.
     fn fit(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -389,10 +415,21 @@ where
     ) -> Result<Hdbscan<F, Fitted>, AlgoError> {
         let (n, p) = shape;
 
-        // Data-DEPENDENT geometry guard BEFORE the allocation (shared helper).
+        // Data-DEPENDENT geometry guard BEFORE any compute (shared helper).
         validate_geometry(x, shape)?;
 
-        // Trivial non-algorithmic fit: all-`-1` labels. NO kernel, NO compute.
+        // The single-linkage hierarchy is produced only by the precomputed path in
+        // this slice; the feature-metric device front-end (plan 15-05) fills it
+        // later. Labels stay all-`-1` until plan 15-04 wires the condensed tree.
+        let single_linkage_ = if self.metric == Metric::Precomputed {
+            Some(self.precomputed_single_linkage(pool, x, n, p)?)
+        } else {
+            None
+        };
+
+        // Labels-only contract holds until 15-04: all-`-1` (noise sentinel). NO
+        // kernel for the precomputed path (pure host MST); the feature metrics
+        // keep the trivial fit until 15-05.
         let labels = vec![-1_i32; n];
         let labels_dev = DeviceArray::from_host(pool, &labels);
 
@@ -406,10 +443,66 @@ where
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
             labels_: Some(labels_dev),
+            single_linkage_,
             n_features_in_: p,
             _float: PhantomData,
             _state: PhantomData,
         })
+    }
+}
+
+impl<F> Hdbscan<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Precomputed-path host back-end (D-02): `X` is interpreted as a square
+    /// `n×n` distance matrix. Validates squareness (typed error — the device
+    /// never sees a malformed shape, T-15-03-V5a), reads `X` to host, scales by
+    /// `alpha` (the Variant-A placement: the WHOLE matrix BEFORE core distances),
+    /// computes core distances, builds the dense mutual-reachability, runs the
+    /// dense Prim's MST → argsort → single-linkage. Returns the hierarchy.
+    ///
+    /// NOTE (D-02): sklearn additionally requires the precomputed matrix to be
+    /// SYMMETRIC (`np.allclose(X, X.T)`). We document that expectation here; the
+    /// dense Variant-A MST reads `mr[current_node][..]` rows, so an asymmetric
+    /// input would silently use the upper-triangle reading — callers must supply
+    /// a symmetric matrix (the committed fixtures are `pairwise_distances`, which
+    /// is symmetric by construction).
+    fn precomputed_single_linkage(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        n: usize,
+        p: usize,
+    ) -> Result<Vec<single_linkage::SingleLinkageEdge>, AlgoError> {
+        // T-15-03-V5a: a precomputed matrix MUST be square (n == p). Reject with a
+        // typed PrimError before reading anything to host.
+        if n != p {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "precomputed_distance_matrix",
+                rows: n,
+                cols: p,
+                len: n * p,
+            }));
+        }
+
+        // Read the dense matrix to host f64 (the shared bridging idiom).
+        let dist_raw: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+
+        // Variant-A alpha placement: divide the WHOLE matrix by alpha BEFORE core
+        // distances (sklearn `_hdbscan_brute`).
+        let alpha = self.alpha;
+        let dist: Vec<f64> = dist_raw.iter().map(|&d| d / alpha).collect();
+
+        // Core distance = (min_samples-1)-th smallest per row (incl. self-zero).
+        let min_samples = self.min_samples.unwrap_or(self.min_cluster_size);
+        let core = mst::core_distances_dense(&dist, n, min_samples);
+
+        // Dense mutual-reachability + Variant-A Prim's MST → argsort → linkage.
+        let mr = mst::mutual_reachability_dense(&dist, &core, n);
+        let edges = mst::mst_from_mutual_reachability(&mr, n);
+        let sorted = mst::argsort_by_weight(&edges);
+        Ok(single_linkage::make_single_linkage(&sorted, n))
     }
 }
 
@@ -430,5 +523,13 @@ where
     /// Number of features seen at fit (`n_features_in_`).
     pub fn n_features_in(&self) -> usize {
         self.n_features_in_
+    }
+
+    /// The single-linkage hierarchy produced by the MST → `make_single_linkage`
+    /// pass (HDBS-02). `Some` after a precomputed fit (plan 15-03); `None` for the
+    /// feature-space metrics until the device front-end lands (plan 15-05). The
+    /// Wave-3 condense/select stage (plan 15-04) consumes this to drive labelling.
+    pub fn single_linkage(&self) -> Option<&[single_linkage::SingleLinkageEdge]> {
+        self.single_linkage_.as_deref()
     }
 }

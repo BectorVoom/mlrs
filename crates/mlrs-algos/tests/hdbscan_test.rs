@@ -648,3 +648,179 @@ fn run_edge_cases(dtype_tag: &str, label: &str) {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// HDBS-02 / plan 15-03: the MST + single-linkage host back-end. The full
+// fit-vs-oracle label gate runs in 15-04 (condense/select) + 15-05 (device
+// front-end); here we characterize the two oracle Prim variants + the UnionFind
+// single-linkage DIRECTLY on hand-built DISTINCT-weight inputs (RESEARCH
+// Pitfall 1 option 2 — distinct weights make the sort tie-free and the hierarchy
+// deterministic). These assert VALUES (not just non-panic), per R-9.
+// ---------------------------------------------------------------------------
+
+use mlrs_algos::cluster::hdbscan::mst::{
+    argsort_by_weight, core_distances_dense, mst_from_data_matrix, mst_from_mutual_reachability,
+    mutual_reachability_dense,
+};
+use mlrs_algos::cluster::hdbscan::single_linkage::{make_single_linkage, UnionFind};
+
+/// Variant A (`mst_from_mutual_reachability`) recovers the expected spanning tree
+/// on a small dense path-graph distance matrix with DISTINCT weights, and the
+/// FIRST-min `argmin` tie-break is exercised. 4-point path 0-1-2-3 with edge
+/// weights 1, 2, 3 along the path and larger off-path distances → the MST is the
+/// path itself.
+#[test]
+fn mst_variant_a_distinct_weights() {
+    let n = 4;
+    // Symmetric distance matrix: path 0-1 (1.0), 1-2 (2.0), 2-3 (3.0); off-path
+    // distances strictly larger so the unique MST is the path.
+    let d = vec![
+        0.0, 1.0, 5.0, 9.0, //
+        1.0, 0.0, 2.0, 6.0, //
+        5.0, 2.0, 0.0, 3.0, //
+        9.0, 6.0, 3.0, 0.0, //
+    ];
+    // min_samples=1 → core distance = 0th smallest = the self-zero, so MR == d.
+    let core = core_distances_dense(&d, n, 1);
+    assert_eq!(core, vec![0.0, 0.0, 0.0, 0.0], "core dist with ms=1 is the self-zero");
+    let mr = mutual_reachability_dense(&d, &core, n);
+    assert_eq!(mr, d, "MR with zero core distances equals the distance matrix");
+
+    let mst = mst_from_mutual_reachability(&mr, n);
+    assert_eq!(mst.len(), n - 1, "an MST over n points has n-1 edges");
+    // Edge set (unordered endpoints) must be {0-1, 1-2, 2-3} with weights 1,2,3.
+    let mut weights: Vec<f64> = mst.iter().map(|&(_, _, w)| w).collect();
+    weights.sort_by(|a, b| a.total_cmp(b));
+    assert_eq!(weights, vec![1.0, 2.0, 3.0], "MST weights are the path edges");
+}
+
+/// Variant B (`mst_from_data_matrix`) on the SAME path graph via a closure that
+/// returns the raw pairwise distance: with `alpha=1.0` and zero core distances it
+/// recovers the identical path MST, and the strict-`<` lowest-`j` tie logic is
+/// exercised (no panic, deterministic).
+#[test]
+fn mst_variant_b_matches_path() {
+    let n = 4;
+    let d = vec![
+        0.0, 1.0, 5.0, 9.0, //
+        1.0, 0.0, 2.0, 6.0, //
+        5.0, 2.0, 0.0, 3.0, //
+        9.0, 6.0, 3.0, 0.0, //
+    ];
+    let core = vec![0.0; n]; // raw core distances (Variant-B placement)
+    let mst = mst_from_data_matrix(&core, n, 1.0, |i, j| d[i * n + j]);
+    assert_eq!(mst.len(), n - 1);
+    let mut weights: Vec<f64> = mst.iter().map(|&(_, _, w)| w).collect();
+    weights.sort_by(|a, b| a.total_cmp(b));
+    assert_eq!(weights, vec![1.0, 2.0, 3.0], "Variant B recovers the path MST");
+}
+
+/// The Variant-B alpha placement divides the PAIRWISE distance (not the core) by
+/// alpha: with alpha=2 and zero core, every MST weight halves.
+#[test]
+fn mst_variant_b_alpha_divides_pairwise() {
+    let n = 3;
+    let d = vec![
+        0.0, 2.0, 8.0, //
+        2.0, 0.0, 4.0, //
+        8.0, 4.0, 0.0, //
+    ];
+    let core = vec![0.0; n];
+    let mst = mst_from_data_matrix(&core, n, 2.0, |i, j| d[i * n + j]);
+    let mut weights: Vec<f64> = mst.iter().map(|&(_, _, w)| w).collect();
+    weights.sort_by(|a, b| a.total_cmp(b));
+    // raw path edges 2 and 4, divided by alpha=2 → 1 and 2.
+    assert_eq!(weights, vec![1.0, 2.0], "alpha divides the pairwise distance (Variant B)");
+}
+
+/// `make_single_linkage` relabels `N+i` per merge and accumulates sizes. On the
+/// distinct-weight path MST the hierarchy is deterministic: 3 merges, sizes
+/// 2,3,4, fresh labels 4,5,6.
+#[test]
+fn single_linkage_relabels_and_accumulates() {
+    let n = 4;
+    // Argsorted path MST: (0,1,1), (1,2,2), (2,3,3).
+    let edges = vec![(0usize, 1usize, 1.0f64), (1, 2, 2.0), (2, 3, 3.0)];
+    let sorted = argsort_by_weight(&edges);
+    assert_eq!(sorted, edges, "distinct ascending weights are already sorted");
+
+    let sl = make_single_linkage(&sorted, n);
+    assert_eq!(sl.len(), n - 1);
+    // First merge: find(0)=0, find(1)=1 → new label 4, size 2.
+    assert_eq!((sl[0].left, sl[0].right, sl[0].size), (0, 1, 2));
+    assert_eq!(sl[0].distance, 1.0);
+    // Second merge: find(1)=4 (compressed), find(2)=2 → label 5, size 3.
+    assert_eq!((sl[1].left, sl[1].right, sl[1].size), (4, 2, 3));
+    // Third merge: find(2)=5, find(3)=3 → label 6, size 4.
+    assert_eq!((sl[2].left, sl[2].right, sl[2].size), (5, 3, 4));
+}
+
+/// The UnionFind `fast_find` path-compresses and `union` mints fresh labels —
+/// the load-bearing single-linkage invariant.
+#[test]
+fn union_find_fresh_labels() {
+    let mut uf = UnionFind::new(3); // labels 0,1,2 singletons; internal 3,4
+    assert_eq!(uf.fast_find(0), 0);
+    uf.union(0, 1); // mint label 3, size 2
+    assert_eq!(uf.size_of(3), 2);
+    assert_eq!(uf.fast_find(0), 3, "0 now roots at fresh label 3");
+    assert_eq!(uf.fast_find(1), 3);
+    uf.union(3, 2); // mint label 4, size 3
+    assert_eq!(uf.size_of(4), 3);
+    assert_eq!(uf.fast_find(2), 4);
+    assert_eq!(uf.fast_find(0), 4, "path-compressed to the new root 4");
+}
+
+/// The precomputed `fit` path runs the full host MST → single-linkage pipeline
+/// and stores the hierarchy on the estimator (plan 15-03). Validates squareness
+/// rejection AND that a valid square matrix yields an `n-1`-edge hierarchy.
+#[test]
+fn precomputed_fit_builds_single_linkage() {
+    use mlrs_algos::cluster::hdbscan::Metric;
+    use mlrs_algos::typestate::Fit;
+    use mlrs_backend::device_array::DeviceArray;
+    use mlrs_backend::pool::BufferPool;
+    use mlrs_backend::runtime::{self, ActiveRuntime};
+
+    if skip_f64("precomputed_fit") {
+        return;
+    }
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let n = 4usize;
+    // A symmetric square distance matrix (path graph, distinct weights).
+    let d: Vec<f64> = vec![
+        0.0, 1.0, 5.0, 9.0, //
+        1.0, 0.0, 2.0, 6.0, //
+        5.0, 2.0, 0.0, 3.0, //
+        9.0, 6.0, 3.0, 0.0, //
+    ];
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &d);
+
+    let fitted = Hdbscan::<f64>::builder()
+        .min_cluster_size(2)
+        .metric(Metric::Precomputed)
+        .build::<f64>()
+        .expect("build precomputed")
+        .fit(&mut pool, &x_dev, None, (n, n))
+        .expect("precomputed fit");
+
+    let sl = fitted
+        .single_linkage()
+        .expect("precomputed fit stores the single-linkage hierarchy");
+    assert_eq!(sl.len(), n - 1, "hierarchy has n-1 merge rows");
+    // The top merge spans all 4 points.
+    assert_eq!(sl[n - 2].size, n, "final merge unites all points");
+
+    // Squareness rejection (T-15-03-V5a): a non-square (n, p!=n) shape errors
+    // before any host read.
+    let bad = Hdbscan::<f64>::builder()
+        .min_cluster_size(2)
+        .metric(Metric::Precomputed)
+        .build::<f64>()
+        .expect("build")
+        .fit(&mut pool, &x_dev, None, (2, 8));
+    assert!(bad.is_err(), "non-square precomputed matrix must be rejected");
+}
