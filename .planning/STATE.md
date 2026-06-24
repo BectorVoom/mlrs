@@ -33,6 +33,7 @@ Plan: 13 of 13
 Status: Phase complete — ready for verification
 Last activity: 2026-06-24 — Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
+Last quick task: 2026-06-24 — Completed quick task 260625-8ri: implement IN-04 (PrimError::InternalNone + 6 panic→typed-error conversions)
 
 Progress: [██████░░░░] 60% (v3.0)
 
@@ -322,6 +323,12 @@ None yet.
 - [03-01 RESOLVED] f64 absence on the GPU gate: the gate is now cpu(f64) + rocm(f32) from Phase 3 (D-07). f64 validates on cpu; f64-on-rocm skips-with-log (cubecl-cpp 0.10 F64 unregistered for HIP) — capability gate (skip_f64_with_log) already in place since Phase 1. Every Phase 3+ f64 oracle test must mirror the gemm_test.rs skip pattern.
 - [06-01 RESOLVED] Maturin per-backend distribution naming: confirmed via RESEARCH Pattern 1 + implemented — `[project].name` per backend (mlrs-cpu/-wgpu/-cuda/-rocm) + constant `module-name="mlrs._mlrs"` gives N dist names with one `import mlrs`. Four templates landed in pyproject/. The build-system spike is closed; Plan 05 exercises the actual `maturin develop`/`build` once the /tmp venv exists.
 - [02-01] ROADMAP Criterion 1 / REQUIREMENTS wording "wraps cubecl-matmul" must be updated to "wraps cubek-matmul" (the cubecl algorithm crates were split into tracel-ai/cubek and renamed cubek-*). Orchestrator action.
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260625-8ri | implement IN-04 — add PrimError::InternalNone variant + replace 6 Shared-path column_reduce expect() panics with typed-error propagation | 2026-06-24 | 2a0fcd4 | [260625-8ri-implement-in-04-add-a-primerror-variant-](./quick/260625-8ri-implement-in-04-add-a-primerror-variant-/) |
 
 ## Deferred Items
 
