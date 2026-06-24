@@ -218,6 +218,12 @@ fn epsilon_search(
 /// `cluster_selection_epsilon` (`> 0`) triggers the epsilon merge.
 /// `max_cluster_size` (`0` = unbounded) deselects EoM clusters larger than it.
 ///
+/// `n_samples` is the true point count (passed explicitly by the caller, as
+/// sklearn does), used to size the labels/probabilities output. It must NOT be
+/// reconstructed from the tree's singleton rows — a degenerate condensed tree
+/// with no singleton child rows would otherwise infer `n_samples = 0` and emit a
+/// mis-sized labels vector (WR-02).
+///
 /// Returns `labels` (length `n_samples`, `-1` = noise) and `probabilities`
 /// (length `n_samples`, in `[0, 1]`).
 pub fn get_clusters(
@@ -227,6 +233,7 @@ pub fn get_clusters(
     allow_single_cluster: bool,
     cluster_selection_epsilon: f64,
     max_cluster_size: usize,
+    n_samples: usize,
 ) -> (Vec<i64>, Vec<f64>) {
     // node_list = sorted(stability.keys(), reverse=True), excluding root unless
     // allow_single_cluster.
@@ -247,14 +254,25 @@ pub fn get_clusters(
     // is_cluster keyed by node id; default true for each node in node_list.
     let mut is_cluster: HashMap<usize, bool> = node_list.iter().map(|&n| (n, true)).collect();
 
-    // n_samples = max(child) over the singleton (cluster_size==1) rows + 1.
-    let n_samples = condensed_tree
-        .iter()
-        .filter(|r| r.cluster_size == 1)
-        .map(|r| r.child)
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(0);
+    // n_samples is the true point count, supplied explicitly by the caller
+    // (WR-02). It MUST NOT be inferred from the tree's singleton rows: a
+    // degenerate condensed tree with no `cluster_size == 1` children would yield
+    // `n_samples = 0` and a mis-sized labels/probabilities vector.
+    debug_assert!(
+        {
+            let inferred = condensed_tree
+                .iter()
+                .filter(|r| r.cluster_size == 1)
+                .map(|r| r.child)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            // The explicit count must be at least the highest singleton child id;
+            // sklearn passes `num_points` and never under-counts.
+            inferred <= n_samples
+        },
+        "n_samples must cover every singleton child id in the condensed tree",
+    );
 
     // max_cluster_size: 0 (unbounded) → a sentinel that never triggers.
     let max_cluster_size = if max_cluster_size == 0 {

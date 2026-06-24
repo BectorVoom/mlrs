@@ -913,6 +913,7 @@ where
             self.allow_single_cluster,
             self.cluster_selection_epsilon,
             self.max_cluster_size,
+            n,
         );
 
         // select returns labels of length `n_samples` (== n). Convert i64 -> i32
