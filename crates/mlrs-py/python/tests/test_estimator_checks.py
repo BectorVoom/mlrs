@@ -30,10 +30,15 @@ from sklearn.utils.estimator_checks import (  # noqa: E402
 
 
 def _estimators():
-    """The 12 v1 estimators, constructed with valid v1 hyperparameters.
+    """The full v1 estimator set, constructed with valid v1 hyperparameters.
 
     ``n_clusters`` / ``n_components`` are given explicitly where the v1 ctor has
     no sklearn-compatible default that the check harness's tiny fixtures admit.
+    Plan 16-11 extends this from the original 12 to the full shim set (the 15
+    newly-added classes are appended below); the fit-free subset
+    (``check_no_attributes_set_in_init`` / ``check_parameters_default_constructible``
+    / ``check_get_params_invariance``) runs GREEN for every class pre-build, and
+    is NEVER xfailed (A7 / D-07 step 4).
     """
     return [
         mlrs.LinearRegression(),
@@ -48,6 +53,22 @@ def _estimators():
         mlrs.NearestNeighbors(),
         mlrs.KNeighborsClassifier(),
         mlrs.KNeighborsRegressor(),
+        # --- Plan 16-11: the 15 newly-added shim classes. ----------------- #
+        mlrs.LinearSVC(),
+        mlrs.LinearSVR(),
+        mlrs.MBSGDClassifier(),
+        mlrs.MBSGDRegressor(),
+        mlrs.GaussianNB(),
+        mlrs.MultinomialNB(),
+        mlrs.BernoulliNB(),
+        mlrs.ComplementNB(),
+        mlrs.CategoricalNB(),
+        mlrs.KernelRidge(),
+        mlrs.KernelDensity(),
+        mlrs.SpectralClustering(n_clusters=3),
+        mlrs.SpectralEmbedding(n_components=2),
+        mlrs.UMAP(n_components=2),
+        mlrs.HDBSCAN(),
     ]
 
 
@@ -162,6 +183,28 @@ _EXPECTED = {
     "NearestNeighbors": _merge(_COMMON),
     "KNeighborsClassifier": _merge(_COMMON, _SUPERVISED, _CLASSIFIER),
     "KNeighborsRegressor": _merge(_COMMON, _SUPERVISED),
+    # --- Plan 16-11: the 15 newly-added shim classes. --------------------- #
+    # Linear SVM / MBSGD: iterative solvers (no n_iter_); SVR/MBSGDRegressor are
+    # supervised regressors, SVC/MBSGDClassifier supervised classifiers.
+    "LinearSVR": _merge(_COMMON, _SUPERVISED, _N_ITER),
+    "MBSGDRegressor": _merge(_COMMON, _SUPERVISED, _N_ITER),
+    "LinearSVC": _merge(_COMMON, _SUPERVISED, _CLASSIFIER, _N_ITER),
+    "MBSGDClassifier": _merge(_COMMON, _SUPERVISED, _CLASSIFIER, _N_ITER),
+    # Naive-Bayes: supervised classifiers with v1 contiguous-int labels.
+    "GaussianNB": _merge(_COMMON, _SUPERVISED, _CLASSIFIER),
+    "MultinomialNB": _merge(_COMMON, _SUPERVISED, _CLASSIFIER),
+    "BernoulliNB": _merge(_COMMON, _SUPERVISED, _CLASSIFIER),
+    "ComplementNB": _merge(_COMMON, _SUPERVISED, _CLASSIFIER),
+    "CategoricalNB": _merge(_COMMON, _SUPERVISED, _CLASSIFIER),
+    # KernelRidge: supervised regressor.
+    "KernelRidge": _merge(_COMMON, _SUPERVISED),
+    # KernelDensity: unsupervised density estimator (dense-float-only commons).
+    "KernelDensity": _merge(_COMMON),
+    # Cluster / manifold: unsupervised, dense-float-only commons.
+    "SpectralClustering": _merge(_COMMON),
+    "HDBSCAN": _merge(_COMMON),
+    "SpectralEmbedding": _merge(_COMMON),
+    "UMAP": _merge(_COMMON),
 }
 
 
@@ -173,6 +216,28 @@ def _expected_failed_checks(estimator):
     RELEVANT checks (not in this map) must pass.
     """
     return dict(_EXPECTED.get(type(estimator).__name__, {}))
+
+
+# The three fit-free checks that MUST run green for every estimator (they need
+# no compiled `_mlrs`): a faithful pure __init__ + zero-arg constructibility +
+# get_params invariance. They must NEVER appear in any per-class xfail map (A7 /
+# D-07 step 4) — masking one would hide a real SHIM-01 regression.
+_FIT_FREE_CHECKS = (
+    "check_no_attributes_set_in_init",
+    "check_parameters_default_constructible",
+    "check_get_params_invariance",
+)
+
+
+def test_fit_free_checks_never_xfailed():
+    """No estimator xfails the fit-free subset (they must run green)."""
+    for est in _estimators():
+        xfails = _expected_failed_checks(est)
+        leaked = [c for c in _FIT_FREE_CHECKS if c in xfails]
+        assert not leaked, (
+            f"{type(est).__name__} xfails fit-free check(s) {leaked} — these "
+            f"must run green (SHIM-01); remove them from the xfail map"
+        )
 
 
 @parametrize_with_checks(

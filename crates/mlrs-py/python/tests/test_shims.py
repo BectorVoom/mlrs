@@ -22,33 +22,43 @@ from sklearn.base import (
 from sklearn.exceptions import NotFittedError
 
 import mlrs
+from mlrs.base import MlrsBase
 
-ALL_12 = [
-    "LinearRegression",
-    "Ridge",
-    "Lasso",
-    "ElasticNet",
-    "LogisticRegression",
-    "KMeans",
-    "DBSCAN",
-    "PCA",
-    "TruncatedSVD",
-    "NearestNeighbors",
-    "KNeighborsClassifier",
-    "KNeighborsRegressor",
-]
+
+def _exported_shim_names():
+    """Every exported ``mlrs`` symbol that is an ``MlrsBase`` estimator shim.
+
+    Derived from ``mlrs.__all__`` (excludes the ``backend_supports_f64`` flag and
+    the ``johnson_lindenstrauss_min_dim`` helper) so the matrix grows
+    automatically as new shim classes are registered — no hard-coded list.
+    """
+    names = []
+    for name in mlrs.__all__:
+        obj = getattr(mlrs, name)
+        if isinstance(obj, type) and issubclass(obj, MlrsBase):
+            names.append(name)
+    return names
+
+
+# The full estimator-shim matrix (32 shims as of Plan 16-11: 17 pre-existing +
+# 15 new), derived from the exported set so it cannot drift.
+ALL_SHIMS = _exported_shim_names()
 
 
 def _ctor(name):
-    """Construct an estimator with the v1 required ctor args (PCA needs one)."""
+    """Construct an estimator with the v1 required ctor args.
+
+    PCA and IncrementalPCA require an explicit ``n_components`` (no zero-arg
+    default); every other shim is zero-arg constructible (Pitfall 6).
+    """
     cls = getattr(mlrs, name)
-    if name == "PCA":
+    if name in ("PCA", "IncrementalPCA"):
         return cls(n_components=2)
     return cls()
 
 
-@pytest.mark.parametrize("name", ALL_12)
-def test_all_12_importable(name):
+@pytest.mark.parametrize("name", ALL_SHIMS)
+def test_all_shims_importable(name):
     assert hasattr(mlrs, name)
     _ctor(name)  # constructs pure-Python (no _mlrs needed)
 
@@ -69,6 +79,58 @@ def test_family_mixins_composed():
     nn = mlrs.NearestNeighbors()
     assert not isinstance(nn, (RegressorMixin, ClassifierMixin, ClusterMixin))
     assert not isinstance(nn, TransformerMixin)
+    # --- Plan 16-11 new shims: family-mixin composition. ------------------ #
+    assert isinstance(mlrs.LinearSVR(), RegressorMixin)
+    assert isinstance(mlrs.MBSGDRegressor(), RegressorMixin)
+    assert isinstance(mlrs.KernelRidge(), RegressorMixin)
+    assert isinstance(mlrs.LinearSVC(), ClassifierMixin)
+    assert isinstance(mlrs.MBSGDClassifier(), ClassifierMixin)
+    for nb in (
+        mlrs.GaussianNB(),
+        mlrs.MultinomialNB(),
+        mlrs.BernoulliNB(),
+        mlrs.ComplementNB(),
+        mlrs.CategoricalNB(),
+    ):
+        assert isinstance(nb, ClassifierMixin)
+    assert isinstance(mlrs.SpectralClustering(), ClusterMixin)
+    assert isinstance(mlrs.HDBSCAN(), ClusterMixin)
+    assert isinstance(mlrs.SpectralEmbedding(), TransformerMixin)
+    assert isinstance(mlrs.UMAP(), TransformerMixin)
+    # KernelDensity has no scoring/transformer/cluster mixin (fit + score_samples).
+    kd = mlrs.KernelDensity()
+    assert not isinstance(
+        kd, (RegressorMixin, ClassifierMixin, ClusterMixin, TransformerMixin)
+    )
+
+
+def test_new_shim_family_surfaces():
+    """Family-specific method surface for the Plan 16-11 shims.
+
+    Transformers expose ``transform`` (UMAP) or ``fit_transform`` (SpectralEmbedding /
+    UMAP); cluster shims are labels-only (no standalone ``predict``); the
+    classifiers expose ``predict``; KernelDensity exposes ``score_samples``.
+    """
+    # UMAP: out-of-sample transform + fit_transform.
+    u = mlrs.UMAP()
+    assert hasattr(u, "transform")
+    assert hasattr(u, "fit_transform")
+    # SpectralEmbedding: fit_transform only (no out-of-sample transform).
+    se = mlrs.SpectralEmbedding()
+    assert hasattr(se, "fit_transform")
+    # Cluster shims: labels-only, no standalone predict.
+    assert not hasattr(mlrs.SpectralClustering(), "predict")
+    assert not hasattr(mlrs.HDBSCAN(), "predict")
+    # Classifiers expose predict; regressors expose predict.
+    assert hasattr(mlrs.LinearSVC(), "predict")
+    assert hasattr(mlrs.MBSGDClassifier(), "predict")
+    assert hasattr(mlrs.LinearSVR(), "predict")
+    assert hasattr(mlrs.KernelRidge(), "predict")
+    assert hasattr(mlrs.GaussianNB(), "predict")
+    # KernelDensity: score_samples, no predict.
+    kd = mlrs.KernelDensity()
+    assert hasattr(kd, "score_samples")
+    assert not hasattr(kd, "predict")
 
 
 def test_logreg_exposes_capital_C_not_c():
@@ -99,7 +161,7 @@ def test_clone_preserves_unfitted_params():
     )
 
 
-@pytest.mark.parametrize("name", ALL_12)
+@pytest.mark.parametrize("name", ALL_SHIMS)
 def test_output_type_param_present(name):
     assert "output_type" in _ctor(name).get_params()
 
@@ -127,6 +189,17 @@ def test_nearest_neighbors_has_no_predict_but_has_kneighbors():
         ("DBSCAN", "labels_"),
         ("PCA", "components_"),
         ("TruncatedSVD", "components_"),
+        # --- Plan 16-11 new shims. ----------------------------------------- #
+        ("LinearSVC", "coef_"),
+        ("LinearSVR", "coef_"),
+        ("MBSGDClassifier", "coef_"),
+        ("MBSGDRegressor", "coef_"),
+        ("KernelRidge", "dual_coef_"),
+        ("SpectralClustering", "labels_"),
+        ("SpectralEmbedding", "embedding_"),
+        ("HDBSCAN", "labels_"),
+        ("HDBSCAN", "probabilities_"),
+        ("UMAP", "embedding_"),
     ],
 )
 def test_fitted_attr_raises_before_fit(name, attr):
@@ -134,7 +207,7 @@ def test_fitted_attr_raises_before_fit(name, attr):
         getattr(_ctor(name), attr)
 
 
-@pytest.mark.parametrize("name", ALL_12)
+@pytest.mark.parametrize("name", ALL_SHIMS)
 def test_fit_returns_self_signature(name):
     # PY-01: every shim's fit must `return self`. We can't run the device path
     # here, but we can assert the source contract: fit is defined on the class
