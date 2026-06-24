@@ -462,8 +462,19 @@ fn do_labelling(
         }
     }
 
-    let mut result = vec![NOISE; root_cluster.max(n_samples)];
-    for n in 0..root_cluster {
+    // IN-05: the condense relabel convention relabels the root to `n_samples`, so
+    // `root_cluster == n_samples` always holds. Assert the invariant and size
+    // directly to `n_samples` rather than papering over a `0` `n_samples` with a
+    // defensive `.max()` over-size + truncate.
+    debug_assert_eq!(
+        root_cluster, n_samples,
+        "condense relabels root to n_samples, so root_cluster must equal n_samples",
+    );
+    let mut result = vec![NOISE; n_samples];
+    // Iterate over `n_samples` (== root_cluster by the asserted invariant): this
+    // keeps the loop bound equal to the buffer length, so the write is in-bounds
+    // even if a future change perturbed the relabel convention in release builds.
+    for n in 0..n_samples {
         let cluster = union_find.find(n);
         let mut label = NOISE;
         if cluster != root_cluster {
@@ -497,9 +508,8 @@ fn do_labelling(
         result[n] = label;
     }
 
-    // Trim to n_samples (root_cluster == n_samples when every point fell out, but
-    // result was sized root_cluster.max(n_samples) defensively).
-    result.truncate(root_cluster);
+    // `result` is already exactly `n_samples` long (== root_cluster by the
+    // asserted invariant), so no trim is needed.
     result
 }
 
