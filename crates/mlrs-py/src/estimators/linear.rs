@@ -922,7 +922,7 @@ crate::any_estimator_typestate! {
     },
 }
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyLinearSVC,
     algo:  mlrs_algos::linear::linear_svc::LinearSVC,
     unfit: {
@@ -1555,7 +1555,7 @@ impl PyLinearSVC {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = LinearSVC::<f32>::builder()
+                    let est = LinearSVC::<f32>::builder()
                         .loss(loss)
                         .penalty(penalty)
                         .c(c)
@@ -1565,14 +1565,15 @@ impl PyLinearSVC {
                         .tol(tol)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLinearSVC::F32(est))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLinearSVC::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = LinearSVC::<f64>::builder()
+                    let est = LinearSVC::<f64>::builder()
                         .loss(loss)
                         .penalty(penalty)
                         .c(c)
@@ -1582,8 +1583,9 @@ impl PyLinearSVC {
                         .tol(tol)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLinearSVC::F64(est))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLinearSVC::F64(fitted))
                 }
             }
         })?;
@@ -1599,11 +1601,11 @@ impl PyLinearSVC {
             match &self.inner {
                 AnyLinearSVC::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 AnyLinearSVC::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("linear_svc", "predict")),
             }
@@ -1622,28 +1624,28 @@ impl PyLinearSVC {
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearSVC::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLinearSVC::F32(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("linear_svc", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearSVC::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLinearSVC::F64(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("linear_svc", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearSVC::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLinearSVC::F32(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("linear_svc", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearSVC::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLinearSVC::F64(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("linear_svc", "intercept_ (f64)")),
         }
     }

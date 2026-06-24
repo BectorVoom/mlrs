@@ -42,6 +42,8 @@
 //! Tests live in `crates/mlrs-algos/tests/linear_svc_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -54,13 +56,15 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
-use crate::traits::{Fit, PredictLabels};
+use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, Unfit};
 
 /// Linear support-vector classifier (SGDSVM-03). Construct via
-/// [`LinearSVC::builder`], then [`Fit::fit`] + [`PredictLabels::predict_labels`].
-/// Fitted `coef_` (length `n_features`) / `intercept_` (length 1) are
-/// device-resident (D-03).
-pub struct LinearSVC<F> {
+/// [`LinearSVC::builder`], then the consuming [`Fit::fit`] (returns the
+/// `Fitted`-tagged sibling) + [`PredictLabels::predict_labels`]. Fitted `coef_`
+/// (length `n_features`) / `intercept_` (length 1) are device-resident (D-03);
+/// the host accessors exist ONLY on `LinearSVC<F, Fitted>` (the compile-time
+/// typestate replaces the old runtime `NotFitted` guard, D-03).
+pub struct LinearSVC<F, S = Unfit> {
     /// The lowered hyperparameter bundle (D-06); the SVM-specific knobs (`c`,
     /// `intercept_scaling`) sit alongside it.
     config: SgdConfig,
@@ -76,9 +80,11 @@ pub struct LinearSVC<F> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (device-resident), `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> LinearSVC<F>
+impl<F> LinearSVC<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -101,34 +107,39 @@ where
     pub fn intercept_scaling(&self) -> f64 {
         self.intercept_scaling
     }
+}
 
-    /// The inferred class labels (empty until `fit`).
+impl<F> LinearSVC<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// The lowered configuration (D-06).
+    pub fn config(&self) -> &SgdConfig {
+        &self.config
+    }
+
+    /// The inferred class labels (length 2 for the binary fit).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
     }
 
-    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.coef_
             .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "linear_svc",
-                operation: "coef_",
-            })
+            .expect("coef_ is Some by construction on LinearSVC<F, Fitted>")
+            .to_host(pool)
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
+    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
+    /// the `Fitted` state (D-03).
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
         self.intercept_
             .as_ref()
-            .map(|i| i.to_host(pool)[0])
-            .ok_or(AlgoError::NotFitted {
-                estimator: "linear_svc",
-                operation: "intercept_",
-            })
+            .expect("intercept_ is Some by construction on LinearSVC<F, Fitted>")
+            .to_host(pool)[0]
     }
 }
 
@@ -206,7 +217,7 @@ impl LinearSVCBuilder {
     /// Only `L1`/`L2` penalties are valid (sklearn `LinearSVC` has no `elasticnet`
     /// penalty). The `c`/`intercept_scaling` knobs are stored alongside the lowered
     /// [`SgdConfig`]; the L-BFGS fit maps `C` → the data-term weight internally.
-    pub fn build<F>(self) -> Result<LinearSVC<F>, BuildError>
+    pub fn build<F>(self) -> Result<LinearSVC<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -263,32 +274,29 @@ impl LinearSVCBuilder {
             n_features: 0,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for LinearSVC<F>
+impl<F> Fit<F> for LinearSVC<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = LinearSVC<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<LinearSVC<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
-        // --- T-10-04-02 / ASVS V5: geometry guard BEFORE any launch. ---
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        // --- T-10-04-02 / ASVS V5: data-DEPENDENT geometry guard BEFORE any
+        //     launch (the data-INDEPENDENT params were validated at build()). ---
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "linear_svc",
             operation: "fit (requires y)",
@@ -391,15 +399,20 @@ where
             },
         )?;
 
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.coef_ = Some(coef);
-        self.intercept_ = Some(intercept);
-        Ok(self)
+        Ok(LinearSVC {
+            config: self.config,
+            c: self.c,
+            intercept_scaling: self.intercept_scaling,
+            classes_,
+            n_features,
+            coef_: Some(coef),
+            intercept_: Some(intercept),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> PredictLabels<F> for LinearSVC<F>
+impl<F> PredictLabels<F> for LinearSVC<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -411,14 +424,17 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
         let (n_query, n_features) = shape;
 
-        let coef = self.coef_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "linear_svc",
-            operation: "predict_labels",
-        })?;
-        let intercept = self.intercept_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "linear_svc",
-            operation: "predict_labels",
-        })?;
+        // `coef_`/`intercept_` are `Some` by construction on the `Fitted` state
+        // (the compile-time typestate replaces the old runtime `NotFitted`
+        // guard, D-03).
+        let coef = self
+            .coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on LinearSVC<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on LinearSVC<F, Fitted>");
 
         // --- ASVS V5: geometry + fitted-n_features consistency. ---
         if n_query == 0 || n_features == 0 || x.len() != n_query * n_features {
