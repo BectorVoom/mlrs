@@ -517,7 +517,7 @@ impl PyLasso {
 // ElasticNet — Fit + Predict; alpha, l1_ratio, fit_intercept, max_iter, tol
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyElasticNet,
     algo:  mlrs_algos::linear::elastic_net::ElasticNet,
     unfit: { alpha: f64, l1_ratio: f64, fit_intercept: bool, max_iter: usize, tol: f64 },
@@ -584,17 +584,33 @@ impl PyElasticNet {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = ElasticNet::<f32>::with_opts(alpha as f32, l1_ratio as f32, fit_intercept, max_iter, tol);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyElasticNet::F32(est))
+                    let est = ElasticNet::<f32>::builder()
+                        .alpha(alpha)
+                        .l1_ratio(l1_ratio)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyElasticNet::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = ElasticNet::<f64>::with_opts(alpha, l1_ratio, fit_intercept, max_iter, tol);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyElasticNet::F64(est))
+                    let est = ElasticNet::<f64>::builder()
+                        .alpha(alpha)
+                        .l1_ratio(l1_ratio)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyElasticNet::F64(fitted))
                 }
             }
         })?;
@@ -609,7 +625,7 @@ impl PyElasticNet {
             match &self.inner {
                 AnyElasticNet::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("elastic_net", "predict (f32 path)")),
             }
@@ -622,7 +638,7 @@ impl PyElasticNet {
             match &self.inner {
                 AnyElasticNet::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("elastic_net", "predict (f64 path)")),
             }
@@ -632,28 +648,28 @@ impl PyElasticNet {
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyElasticNet::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyElasticNet::F32(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("elastic_net", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyElasticNet::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyElasticNet::F64(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("elastic_net", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyElasticNet::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyElasticNet::F32(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("elastic_net", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyElasticNet::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyElasticNet::F64(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("elastic_net", "intercept_ (f64)")),
         }
     }

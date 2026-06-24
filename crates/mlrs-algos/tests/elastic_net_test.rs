@@ -20,7 +20,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::linear::elastic_net::ElasticNet;
-use mlrs_algos::traits::Fit;
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -103,17 +103,21 @@ where
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
 
-    let mut reg = ElasticNet::<F>::new(f64_to::<F>(alpha), f64_to::<F>(l1_ratio), true);
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (CD_N_SAMPLES, CD_N_FEATURES))
+    let reg = ElasticNet::<F>::builder()
+        .alpha(alpha)
+        .l1_ratio(l1_ratio)
+        .fit_intercept(true)
+        .build::<F>()
+        .expect("ElasticNet build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (CD_N_SAMPLES, CD_N_FEATURES))
         .expect("ElasticNet::fit on a valid shape");
 
     let coef = reg
         .coef(&pool)
-        .expect("coef_ after fit")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
-    let intercept = host_to_f64(reg.intercept(&pool).expect("intercept_ after fit"));
+    let intercept = host_to_f64(reg.intercept(&pool));
     (coef, intercept)
 }
 
@@ -178,4 +182,21 @@ fn elastic_net_coef_intercept_match_sklearn_f64() {
     }
     let case = load_npz(fixture("elastic_net_f64_seed42.npz")).expect("load elastic_net_f64");
     run_oracle::<f64>(&case, &F64_TOL, "elastic_net f64");
+}
+
+/// BLDR-01 defaults equality: the zero-arg `new()` (sklearn defaults
+/// alpha=1.0/l1_ratio=0.5/fit_intercept=true/max_iter=1000/tol=1e-4) reproduces
+/// every hyperparameter of `builder().build()` — the single-source-of-defaults
+/// invariant (D-08). Exercises that the builder subsumes the former `new` /
+/// `with_opts` constructors with matching defaults.
+#[test]
+fn defaults_equal() {
+    let from_new = ElasticNet::<f64>::new();
+    let from_builder = ElasticNet::<f64>::builder()
+        .build::<f64>()
+        .expect("default ElasticNet builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "ElasticNet::new() must equal ElasticNet::builder().build()"
+    );
 }

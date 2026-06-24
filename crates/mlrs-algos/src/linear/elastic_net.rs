@@ -33,6 +33,8 @@
 //! Tests live in `crates/mlrs-algos/tests/elastic_net_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -42,23 +44,30 @@ use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
+use crate::error::{AlgoError, BuildError};
 use crate::linear::coordinate_descent::{cd_fit, CD_DEFAULT_MAX_ITER, CD_DEFAULT_TOL};
-use crate::traits::{Fit, Predict};
+use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// L1+L2-penalized least squares (LINEAR-04) fitted by the shared
 /// coordinate-descent solver.
 ///
-/// Construct with [`ElasticNet::new`] (`alpha`, `l1_ratio`, `fit_intercept`) or
-/// [`ElasticNet::with_opts`] to override `max_iter` / `tol`, then [`Fit::fit`]
-/// and [`Predict::predict`]. Fitted `coef_`/`intercept_` are device-resident
-/// (D-03); the host accessors [`coef`](Self::coef) / [`intercept`](Self::intercept)
-/// materialize them on demand.
-pub struct ElasticNet<F> {
+/// Construct with the zero-arg [`ElasticNet::new`] (sklearn defaults:
+/// `alpha = 1.0`, `l1_ratio = 0.5`, `fit_intercept = true`, `max_iter = 1000`,
+/// `tol = 1e-4`) or [`ElasticNet::builder`] (which subsumes the former
+/// `new`/`with_opts` constructors — every hyperparameter is a builder setter),
+/// then the consuming [`Fit::fit`] (returns the `Fitted`-tagged sibling) and
+/// [`Predict::predict`]. Fitted `coef_`/`intercept_` are device-resident (D-03);
+/// the host accessors [`coef`](ElasticNet::coef) /
+/// [`intercept`](ElasticNet::intercept) materialize them on demand and exist ONLY
+/// on `ElasticNet<F, Fitted>` (the compile-time typestate replaces the old
+/// runtime `NotFitted` guard, D-03).
+pub struct ElasticNet<F, S = Unfit> {
     /// Overall penalty strength (`alpha ≥ 0`; `alpha = 0` degenerates to OLS).
+    /// Validated at `build()` → [`BuildError::InvalidAlpha`] (T-05-09-01).
     alpha: F,
     /// L1/L2 mixing parameter (`0 ≤ l1_ratio ≤ 1`; `1` ⇒ Lasso, `0` ⇒ Ridge-like
-    /// pure L2). Validated at `fit` (T-05-09-01).
+    /// pure L2). Validated at `build()` → [`BuildError::InvalidL1Ratio`]
+    /// (T-05-09-01).
     l1_ratio: F,
     /// Whether to center `X`/`y` and recover a bias term (D-13).
     fit_intercept: bool,
@@ -71,84 +80,208 @@ pub struct ElasticNet<F> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (length 1), device-resident, `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> ElasticNet<F>
+impl<F> ElasticNet<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `ElasticNet` with penalty `alpha`, mixing `l1_ratio`,
-    /// and the `fit_intercept` flag (D-06 minimal surface), using sklearn's
-    /// default `max_iter = 1000` / `tol = 1e-4`. A negative `alpha`
-    /// ([`AlgoError::InvalidAlpha`]) or an `l1_ratio ∉ [0, 1]`
-    /// ([`AlgoError::InvalidL1Ratio`]) is rejected at `fit` (T-05-09-01).
-    pub fn new(alpha: F, l1_ratio: F, fit_intercept: bool) -> Self {
-        Self::with_opts(
-            alpha,
-            l1_ratio,
-            fit_intercept,
-            CD_DEFAULT_MAX_ITER,
-            CD_DEFAULT_TOL,
-        )
-    }
-
-    /// Like [`ElasticNet::new`] but overrides the coordinate-descent `max_iter`
-    /// and stopping `tol`.
-    pub fn with_opts(
-        alpha: F,
-        l1_ratio: F,
-        fit_intercept: bool,
-        max_iter: usize,
-        tol: f64,
-    ) -> Self {
+    /// Construct an `ElasticNet` with sklearn's defaults (`alpha = 1.0`,
+    /// `l1_ratio = 0.5`, `fit_intercept = true`, `max_iter = 1000`, `tol = 1e-4`)
+    /// directly in the `Unfit` state. This is the SINGLE source of truth for the
+    /// default hyperparameters (D-08): the builder `Default` re-derives from here
+    /// via [`ElasticNet::into_builder`]. Defaults are trusted valid, so this
+    /// bypasses [`ElasticNetBuilder::build`]'s validation.
+    pub fn new() -> Self {
         Self {
-            alpha,
-            l1_ratio,
-            fit_intercept,
-            max_iter,
-            tol,
+            alpha: F::from_int(1),
+            l1_ratio: f64_to_host::<F>(0.5),
+            fit_intercept: true,
+            max_iter: CD_DEFAULT_MAX_ITER,
+            tol: CD_DEFAULT_TOL,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.coef_
-            .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "elastic_net",
-                operation: "coef_",
-            })
+    /// Start building an `ElasticNet` from sklearn's defaults (D-08 single source).
+    pub fn builder() -> ElasticNetBuilder {
+        ElasticNetBuilder::default()
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
-        self.intercept_
-            .as_ref()
-            .map(|i| i.to_host(pool)[0])
-            .ok_or(AlgoError::NotFitted {
-                estimator: "elastic_net",
-                operation: "intercept_",
-            })
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`ElasticNetBuilder::default`] to re-derive the
+    /// defaults from [`ElasticNet::new`] (D-08).
+    pub fn into_builder(self) -> ElasticNetBuilder {
+        ElasticNetBuilder {
+            alpha: host_to_f64(self.alpha),
+            l1_ratio: host_to_f64(self.l1_ratio),
+            fit_intercept: self.fit_intercept,
+            max_iter: self.max_iter,
+            tol: self.tol,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `coef_`/`intercept_` fields are excluded — both are `None` in any `Unfit`
+    /// value). Used by the defaults-equality test (BLDR-01):
+    /// `ElasticNet::new().hyperparams_eq(&ElasticNet::builder().build()?)`.
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        host_to_f64(self.alpha) == host_to_f64(other.alpha)
+            && host_to_f64(self.l1_ratio) == host_to_f64(other.l1_ratio)
+            && self.fit_intercept == other.fit_intercept
+            && self.max_iter == other.max_iter
+            && self.tol == other.tol
     }
 }
 
-impl<F> Fit<F> for ElasticNet<F>
+impl<F> Default for ElasticNet<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`ElasticNet`] (D-01). It subsumes BOTH the former `new(alpha,
+/// l1_ratio, fit_intercept)` AND `with_opts(alpha, l1_ratio, fit_intercept,
+/// max_iter, tol)` constructors — every hyperparameter is a setter. Setters are
+/// `f64`/`usize` per the A5 convention; `build::<F>()` narrows `alpha`/`l1_ratio`
+/// to the target float `F`. `Default` re-derives the sklearn defaults from
+/// [`ElasticNet::new`] (D-08 single source) rather than holding literals
+/// (Pitfall 1).
+#[derive(Debug, Clone, Copy)]
+pub struct ElasticNetBuilder {
+    alpha: f64,
+    l1_ratio: f64,
+    fit_intercept: bool,
+    max_iter: usize,
+    tol: f64,
+}
+
+impl Default for ElasticNetBuilder {
+    /// Re-derive the sklearn defaults from [`ElasticNet::new`] (D-08 single
+    /// source).
+    fn default() -> Self {
+        ElasticNet::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl ElasticNetBuilder {
+    /// Set the overall penalty strength `alpha` (A5: `f64` setter).
+    pub fn alpha(mut self, v: f64) -> Self {
+        self.alpha = v;
+        self
+    }
+
+    /// Set the L1/L2 mixing parameter `l1_ratio` (A5: `f64` setter).
+    pub fn l1_ratio(mut self, v: f64) -> Self {
+        self.l1_ratio = v;
+        self
+    }
+
+    /// Set whether to center `X`/`y` and recover a bias term.
+    pub fn fit_intercept(mut self, v: bool) -> Self {
+        self.fit_intercept = v;
+        self
+    }
+
+    /// Set the coordinate-descent iteration cap (sklearn `max_iter`).
+    pub fn max_iter(mut self, v: usize) -> Self {
+        self.max_iter = v;
+        self
+    }
+
+    /// Set the coordinate-descent stopping tolerance (sklearn `tol`).
+    pub fn tol(mut self, v: f64) -> Self {
+        self.tol = v;
+        self
+    }
+
+    /// Build the (unfit) estimator, validating the data-INDEPENDENT hyperparameters
+    /// BEFORE any data is seen (relocated from the old `cd_fit` fit-body checks,
+    /// Pitfall 7; the data-DEPENDENT geometry check stays in [`Fit::fit`]):
+    ///
+    /// - `alpha >= 0` ([`BuildError::InvalidAlpha`]).
+    /// - `0 <= l1_ratio <= 1` ([`BuildError::InvalidL1Ratio`]).
+    ///
+    /// The stored `f64` `alpha`/`l1_ratio` are narrowed to the target float `F`
+    /// (A5).
+    pub fn build<F>(self) -> Result<ElasticNet<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        if !(self.alpha >= 0.0) {
+            return Err(BuildError::InvalidAlpha {
+                estimator: "elastic_net",
+                alpha: self.alpha,
+            });
+        }
+        if !(0.0..=1.0).contains(&self.l1_ratio) {
+            return Err(BuildError::InvalidL1Ratio {
+                estimator: "elastic_net",
+                l1_ratio: self.l1_ratio,
+            });
+        }
+        Ok(ElasticNet {
+            alpha: f64_to_host::<F>(self.alpha),
+            l1_ratio: f64_to_host::<F>(self.l1_ratio),
+            fit_intercept: self.fit_intercept,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            coef_: None,
+            intercept_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> ElasticNet<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
+    /// construction on the `Fitted` state (D-03).
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on ElasticNet<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
+    /// the `Fitted` state (D-03).
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
+        self.intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on ElasticNet<F, Fitted>")
+            .to_host(pool)[0]
+    }
+}
+
+impl<F> Fit<F> for ElasticNet<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = ElasticNet<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<ElasticNet<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
+
+        // Data-DEPENDENT geometry guard BEFORE any prim launch (the
+        // data-INDEPENDENT `alpha >= 0` / `l1_ratio ∈ [0, 1]` checks were validated
+        // at build() — Pitfall 7).
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "elastic_net",
             operation: "fit (requires y)",
@@ -171,13 +304,20 @@ where
             "elastic_net",
         )?;
 
-        self.coef_ = Some(coef);
-        self.intercept_ = Some(intercept);
-        Ok(self)
+        Ok(ElasticNet {
+            alpha: self.alpha,
+            l1_ratio: self.l1_ratio,
+            fit_intercept: self.fit_intercept,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            coef_: Some(coef),
+            intercept_: Some(intercept),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Predict<F> for ElasticNet<F>
+impl<F> Predict<F> for ElasticNet<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
