@@ -4,17 +4,17 @@ milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 15
 current_phase_name: hdbscan
-status: executing
+status: verifying
 stopped_at: Completed 15-01-PLAN.md
-last_updated: "2026-06-24T05:44:55.707Z"
+last_updated: "2026-06-24T06:30:29.508Z"
 last_activity: 2026-06-24
 last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 5
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 20
-  completed_plans: 19
-  percent: 60
+  completed_plans: 20
+  percent: 80
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 Phase: 15 (hdbscan) — EXECUTING
 Plan: 6 of 6
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-24 — Phase 15 execution started
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
 
@@ -138,6 +138,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 15 P03 | 18min | 2 tasks | 5 files |
 | Phase 15 P04 | 70min | 2 tasks | 6 files |
 | Phase 15 P05 | single-session | 2 tasks | 7 files |
+| Phase 15 P06 | 18 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -273,6 +274,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 15-04: HDBSCAN condensed-tree back-end ported verbatim from sklearn _tree.pyx; precomputed fit produces exact labels + <=1e-5 probabilities
 - [Phase ?]: 15-04: labels_alpha selection knob deferred to 15-05 (feature-path Variant-B alpha, Pitfall 2)
 - [Phase ?]: 15-05: cosine=Variant-A dense via MR kernel; other 4 feature metrics=Variant-B (no n*n resident); MR kernel VALUE gate in mlrs-backend
+- [Phase ?]: 15-06: GLOSH outlier_scores_ use a parallel hdbscan-convention tree; labels_/probabilities_ stay sklearn-exact (D-06/D-07 Option A)
 
 ### Pending Todos
 
@@ -304,7 +306,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T05:44:43.316Z
+Last session: 2026-06-24T06:30:23.427Z
 Stopped at: Completed 15-01-PLAN.md
 Resume file: .planning/phases/15-hdbscan/15-CONTEXT.md
 

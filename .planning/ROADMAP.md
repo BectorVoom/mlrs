@@ -55,7 +55,7 @@ Full phase detail, plans, and per-plan notes: [milestones/v2.0-ROADMAP.md](miles
 - [x] **Phase 12: Builder + Typestate Convention Foundation** — Establish the shared idiomatic Rust builder + fit/unfit typestate convention (born-with-it for the new estimators; no retrofit yet) (4/4 plans) — completed 2026-06-23
 - [x] **Phase 13: KNN-Graph Primitive (feasibility keystone)** — Land + standalone-gate the shared multi-metric `(indices, distances)` KNN-graph prim (euclidean/manhattan/cosine/chebyshev/minkowski-p) before any consumer touches it ✅ 2026-06-23
 - [x] **Phase 14: UMAP** — Fuzzy simplicial set → spectral/random init → vertex-owner SGD layout; deterministic stages value-gated, stochastic layout property-gated (7/7 plans executed incl. gap closure 14-06/14-07; verification PASSED 4/4 — CR-01 cross-cube write race + CR-03 force double-count fixed via owner-only move_other=0, CR-02 n_components<n guard added) (completed 2026-06-24)
-- [ ] **Phase 15: HDBSCAN** — Device front-end (core/mutual-reach) + host tree back-end (MST → condensed tree → stability); exact-label hard gate
+- [x] **Phase 15: HDBSCAN** — Device front-end (core/mutual-reach) + host tree back-end (MST → condensed tree → stability); exact-label hard gate (completed 2026-06-24)
 - [ ] **Phase 16: Builder Retrofit Sweep + Shim Coverage** — Retrofit the convention across all existing estimators (additive) and complete the pure-Python sklearn shim coverage
 
 ## Phase Details
@@ -168,7 +168,7 @@ Plans:
   3. A user can read per-point `outlier_scores_` (GLOSH) from a fitted HDBSCAN, gated within band vs the `hdbscan` library.
   4. A user can request cluster centers via `store_centers` (`'centroid'`/`'medoid'`) producing `centroids_`/`medoids_`.
 
-**Plans**: 5/6 plans executed
+**Plans**: 6/6 plans complete
 **Wave 1**
 
 - [x] 15-01-PLAN.md — label_perm `-1→-1` pinned matcher + unit test (HDBS-02)
@@ -191,7 +191,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 15-06-PLAN.md — GLOSH outlier_scores_ (vs hdbscan 0.8.44) + store_centers centroid/medoid (vs sklearn)
+- [x] 15-06-PLAN.md — GLOSH outlier_scores_ (vs hdbscan 0.8.44) + store_centers centroid/medoid (vs sklearn)
 
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — RESOLVED IN PLANS: the D-04/D-05 host-MST tie-break exactness is sequenced as the Wave-3 TRUE GATE (15-03 `tie_break_exact` on the tie-heavy + duplicate-point fixture) BEFORE the device front-end (15-05) commits. The oracle-matched tie-break (sklearn `np.argsort` quicksort + the two Prim variants — NOT the mlrs lowest-index convention) is replicated; gate fixtures use distinct MST edge weights (RESEARCH Pitfall 1 option 2). An un-exactable metric is surfaced as a phase blocker per D-05, never band-demoted.
@@ -232,5 +232,5 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 12. Builder + Typestate Convention Foundation | v3.0 | 0/TBD | Not started | - |
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
 | 14. UMAP | v3.0 | 7/7 | Complete    | 2026-06-23 |
-| 15. HDBSCAN | v3.0 | 5/6 | In Progress|  |
+| 15. HDBSCAN | v3.0 | 6/6 | Complete   | 2026-06-24 |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/TBD | Not started | - |
