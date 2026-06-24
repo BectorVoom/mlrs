@@ -214,8 +214,9 @@ class LogisticRegression(ClassifierMixin, MlrsBase):
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
         self._post_fit(cols)
-        # classes_ exposed as int32 labels 0..n_classes-1 (v1 contiguous labels).
-        self.classes_ = np.arange(obj.n_classes(), dtype=np.int32)
+        # classes_ are the core's DISTINCT sorted training labels, so a
+        # non-contiguous target (e.g. {0, 2}) round-trips through predict (WR-01).
+        self.classes_ = np.asarray(obj.classes_(), dtype=np.int32)
         return self
 
     def predict(self, X):

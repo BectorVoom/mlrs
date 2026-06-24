@@ -841,6 +841,17 @@ impl PyLogisticRegression {
         }
     }
 
+    /// The DISTINCT sorted training labels (`classes_`). The shim MUST use these
+    /// rather than a fabricated `0..n_classes` range so a non-contiguous target
+    /// (e.g. `{0, 2}`) round-trips through `predict` (WR-01).
+    fn classes_(&self) -> PyResult<Vec<i64>> {
+        match &self.inner {
+            AnyLogisticRegression::F32(e) => Ok(e.classes().to_vec()),
+            AnyLogisticRegression::F64(e) => Ok(e.classes().to_vec()),
+            _ => Err(not_fitted("logistic_regression", "classes_")),
+        }
+    }
+
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {

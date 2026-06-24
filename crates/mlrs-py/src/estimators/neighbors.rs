@@ -74,7 +74,7 @@ impl PyNearestNeighbors {
             _ => 5,
         };
         let fitted = py.detach(|| -> PyResult<AnyNearestNeighbors> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -108,7 +108,7 @@ impl PyNearestNeighbors {
     fn kneighbors_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize, k: usize) -> PyResult<(Vec<f32>, Vec<i32>)> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyNearestNeighbors::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -123,7 +123,7 @@ impl PyNearestNeighbors {
     fn kneighbors_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize, k: usize) -> PyResult<(Vec<f64>, Vec<i32>)> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyNearestNeighbors::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -203,7 +203,7 @@ impl PyKNeighborsClassifier {
             _ => 5,
         };
         let fitted = py.detach(|| -> PyResult<AnyKNeighborsClassifier> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -238,7 +238,7 @@ impl PyKNeighborsClassifier {
     fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKNeighborsClassifier::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -257,7 +257,7 @@ impl PyKNeighborsClassifier {
     fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKNeighborsClassifier::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -270,7 +270,7 @@ impl PyKNeighborsClassifier {
     fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKNeighborsClassifier::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
@@ -287,6 +287,20 @@ impl PyKNeighborsClassifier {
             AnyKNeighborsClassifier::F32(e) => Ok(e.n_classes()),
             AnyKNeighborsClassifier::F64(e) => Ok(e.n_classes()),
             _ => Err(not_fitted("kneighbors_classifier", "n_classes")),
+        }
+    }
+    /// The DISTINCT sorted training labels (`classes_`). The shim MUST use these
+    /// rather than a fabricated `0..n_classes` range so a non-contiguous target
+    /// (e.g. `{0, 2}`) round-trips through `predict` (WR-01).
+    fn classes_(&self) -> PyResult<Vec<i64>> {
+        match &self.inner {
+            AnyKNeighborsClassifier::F32(e) => {
+                Ok(e.classes().iter().map(|&c| c as i64).collect())
+            }
+            AnyKNeighborsClassifier::F64(e) => {
+                Ok(e.classes().iter().map(|&c| c as i64).collect())
+            }
+            _ => Err(not_fitted("kneighbors_classifier", "classes_")),
         }
     }
     fn is_fitted(&self) -> bool {
@@ -357,7 +371,7 @@ impl PyKNeighborsRegressor {
             _ => 5,
         };
         let fitted = py.detach(|| -> PyResult<AnyKNeighborsRegressor> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -391,7 +405,7 @@ impl PyKNeighborsRegressor {
     fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKNeighborsRegressor::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -404,7 +418,7 @@ impl PyKNeighborsRegressor {
     fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyKNeighborsRegressor::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;

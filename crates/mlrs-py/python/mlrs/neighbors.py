@@ -61,7 +61,9 @@ class KNeighborsClassifier(ClassifierMixin, MlrsBase):
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
         self.n_features_in_ = cols
-        self.classes_ = np.arange(obj.n_classes(), dtype=np.int32)
+        # classes_ are the core's DISTINCT sorted training labels, so a
+        # non-contiguous target (e.g. {0, 2}) round-trips through predict (WR-01).
+        self.classes_ = np.asarray(obj.classes_(), dtype=np.int32)
         return self
 
     def predict(self, X):
