@@ -35,6 +35,8 @@
 //! Tests live in `crates/mlrs-algos/tests/linear_regression_test.rs`
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -46,8 +48,8 @@ use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, Predict};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// Near-zero floor for the σ⁺ cutoff (mirrors the `svd.rs` `NEAR_ZERO_FLOOR`
 /// precedent — below the 1e-5 tolerance so it never loosens a real check). Keeps
@@ -66,89 +68,163 @@ const RCOND: f64 = 1e-6;
 
 /// Ordinary least squares (LINEAR-01) fitted by the SVD pseudo-inverse.
 ///
-/// Construct with [`LinearRegression::new`] (`fit_intercept`), then [`Fit::fit`]
-/// and [`Predict::predict`]. Fitted `coef_`/`intercept_` are device-resident
-/// (D-03); the host accessors [`coef`](Self::coef) / [`intercept`](Self::intercept)
-/// materialize them on demand.
-pub struct LinearRegression<F> {
+/// Construct with the zero-arg [`LinearRegression::new`] (sklearn default:
+/// `fit_intercept = true`) or [`LinearRegression::builder`], then the consuming
+/// [`Fit::fit`] (returns the `Fitted`-tagged sibling) and [`Predict::predict`].
+/// Fitted `coef_`/`intercept_` are device-resident (D-03); the host accessors
+/// [`coef`](LinearRegression::coef) / [`intercept`](LinearRegression::intercept)
+/// materialize them on demand and exist ONLY on
+/// `LinearRegression<F, Fitted>` (the compile-time typestate replaces the old
+/// runtime `NotFitted` guard, D-03).
+pub struct LinearRegression<F, S = Unfit> {
+    /// Whether to center `X`/`y` and recover a bias term (D-05).
     fit_intercept: bool,
     /// Fitted coefficients (length `n_features`), device-resident, `None` until
     /// `fit`.
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (length 1), device-resident, `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> LinearRegression<F>
+impl<F> LinearRegression<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `LinearRegression`. `fit_intercept = true` centers `X`
-    /// and `y` and recovers a bias term; `false` solves on the raw `X` and
-    /// leaves `intercept_ = 0` (D-06 minimal surface).
-    pub fn new(fit_intercept: bool) -> Self {
+    /// Construct a `LinearRegression` with sklearn's default `fit_intercept =
+    /// true` directly in the `Unfit` state. This is the SINGLE source of truth for
+    /// the default hyperparameter (D-08): the builder `Default` re-derives from
+    /// here via [`LinearRegression::into_builder`], rather than re-listing the
+    /// literal.
+    pub fn new() -> Self {
         Self {
-            fit_intercept,
+            fit_intercept: true,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.coef_
-            .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "linear_regression",
-                operation: "coef_",
-            })
+    /// Start building a `LinearRegression` from sklearn's defaults (D-08 single
+    /// source).
+    pub fn builder() -> LinearRegressionBuilder {
+        LinearRegressionBuilder::default()
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
-        self.intercept_
-            .as_ref()
-            .map(|i| i.to_host(pool)[0])
-            .ok_or(AlgoError::NotFitted {
-                estimator: "linear_regression",
-                operation: "intercept_",
-            })
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`LinearRegressionBuilder::default`] to re-derive
+    /// the defaults from [`LinearRegression::new`] (D-08).
+    pub fn into_builder(self) -> LinearRegressionBuilder {
+        LinearRegressionBuilder {
+            fit_intercept: self.fit_intercept,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `coef_`/`intercept_` fields are excluded — both are `None` in any `Unfit`
+    /// value). Used by the defaults-equality test (BLDR-01):
+    /// `LinearRegression::new().hyperparams_eq(&LinearRegression::builder().build()?)`.
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.fit_intercept == other.fit_intercept
     }
 }
 
-impl<F> Fit<F> for LinearRegression<F>
+impl<F> Default for LinearRegression<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`LinearRegression`] (D-01). The lone setter is `.fit_intercept`;
+/// `build::<F>()` produces the target-float estimator. `Default` re-derives the
+/// sklearn default from [`LinearRegression::new`] (D-08 single source) rather than
+/// holding a literal (Pitfall 1). OLS has no data-independent hyperparameter to
+/// validate, so `build` is infallible-but-typed (`-> Result<_, BuildError>`) for
+/// uniformity with the other linear builders.
+#[derive(Debug, Clone, Copy)]
+pub struct LinearRegressionBuilder {
+    fit_intercept: bool,
+}
+
+impl Default for LinearRegressionBuilder {
+    /// Re-derive the sklearn default from [`LinearRegression::new`] (D-08 single
+    /// source). `f64` is pinned only to read the F-independent default — the
+    /// builder is non-generic, so the choice of `F` here is irrelevant.
+    fn default() -> Self {
+        LinearRegression::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl LinearRegressionBuilder {
+    /// Set whether to center `X`/`y` and recover a bias term.
+    pub fn fit_intercept(mut self, v: bool) -> Self {
+        self.fit_intercept = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. OLS has no data-INDEPENDENT hyperparameter to
+    /// validate (the data-DEPENDENT geometry check lives in [`Fit::fit`]), so this
+    /// never errors — the `Result` is kept for uniformity with the penalized
+    /// linear builders (and so the PyO3 boundary's `build_err_to_py` mapper is
+    /// shape-identical across the family).
+    pub fn build<F>(self) -> Result<LinearRegression<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(LinearRegression {
+            fit_intercept: self.fit_intercept,
+            coef_: None,
+            intercept_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> LinearRegression<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on LinearRegression<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
+    /// the `Fitted` state (D-03).
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
+        self.intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on LinearRegression<F, Fitted>")
+            .to_host(pool)[0]
+    }
+}
+
+impl<F> Fit<F> for LinearRegression<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = LinearRegression<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<LinearRegression<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-04-03-02 / ASVS V5: validate geometry BEFORE any prim launch. ---
-        if n_samples == 0 || n_features == 0 {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
-        if x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "linear_regression",
             operation: "fit (requires y)",
@@ -299,13 +375,16 @@ where
         x_c_dev.release_into(pool);
         y_c_dev.release_into(pool);
 
-        self.coef_ = Some(coef);
-        self.intercept_ = Some(intercept_dev);
-        Ok(self)
+        Ok(LinearRegression {
+            fit_intercept: self.fit_intercept,
+            coef_: Some(coef),
+            intercept_: Some(intercept_dev),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Predict<F> for LinearRegression<F>
+impl<F> Predict<F> for LinearRegression<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -317,14 +396,17 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_samples, n_features) = shape;
 
-        let coef = self.coef_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "linear_regression",
-            operation: "predict",
-        })?;
-        let intercept = self.intercept_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "linear_regression",
-            operation: "predict",
-        })?;
+        // `coef_`/`intercept_` are `Some` by construction on
+        // `LinearRegression<F, Fitted>` (the compile-time typestate replaces the
+        // old runtime `NotFitted` guard, D-03).
+        let coef = self
+            .coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on LinearRegression<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on LinearRegression<F, Fitted>");
 
         // --- T-04-03-02 / ASVS V5: geometry + fitted-n_features consistency. ---
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {

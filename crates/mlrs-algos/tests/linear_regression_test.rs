@@ -24,7 +24,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::linear::linear_regression::LinearRegression;
-use mlrs_algos::traits::{Fit, Predict};
+use mlrs_algos::typestate::{Fit, Predict};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -100,17 +100,19 @@ where
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
 
-    let mut reg = LinearRegression::<F>::new(true);
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let reg = LinearRegression::<F>::builder()
+        .fit_intercept(true)
+        .build::<F>()
+        .expect("LinearRegression build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("LinearRegression::fit on a valid shape");
 
     let coef = reg
         .coef(&pool)
-        .expect("coef_ after fit")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
-    let intercept = host_to_f64(reg.intercept(&pool).expect("intercept_ after fit"));
+    let intercept = host_to_f64(reg.intercept(&pool));
     (coef, intercept)
 }
 
@@ -142,8 +144,11 @@ where
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
     let xt_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xt_host);
 
-    let mut reg = LinearRegression::<F>::new(true);
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let reg = LinearRegression::<F>::builder()
+        .fit_intercept(true)
+        .build::<F>()
+        .expect("LinearRegression build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("fit full-rank");
     let pred = reg
         .predict(&mut pool, &xt_dev, (N_TEST, N_FEATURES))
@@ -267,5 +272,20 @@ fn linear_regression_collinear_cutoff_f64() {
         case.expect_f64("intercept_col"),
         &F64_TOL,
         "intercept_col f64",
+    );
+}
+
+/// BLDR-01 defaults equality: the zero-arg `new()` (sklearn default
+/// `fit_intercept = true`) reproduces every hyperparameter of
+/// `builder().build()` — the single-source-of-defaults invariant (D-08).
+#[test]
+fn defaults_equal() {
+    let from_new = LinearRegression::<f64>::new();
+    let from_builder = LinearRegression::<f64>::builder()
+        .build::<f64>()
+        .expect("default LinearRegression builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "LinearRegression::new() must equal LinearRegression::builder().build()"
     );
 }

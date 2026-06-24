@@ -36,7 +36,7 @@ use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f3
 // LinearRegression — Fit + Predict; coef_ / intercept_
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyLinearRegression,
     algo:  mlrs_algos::linear::linear_regression::LinearRegression,
     unfit: { fit_intercept: bool },
@@ -96,17 +96,25 @@ impl PyLinearRegression {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = LinearRegression::<f32>::new(fit_intercept);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLinearRegression::F32(est))
+                    let est = LinearRegression::<f32>::builder()
+                        .fit_intercept(fit_intercept)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLinearRegression::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = LinearRegression::<f64>::new(fit_intercept);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLinearRegression::F64(est))
+                    let est = LinearRegression::<f64>::builder()
+                        .fit_intercept(fit_intercept)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLinearRegression::F64(fitted))
                 }
             }
         })?;
@@ -122,7 +130,7 @@ impl PyLinearRegression {
             match &self.inner {
                 AnyLinearRegression::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let out = est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
+                    let out = TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
                     Ok(out.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("linear_regression", "predict (f32 path)")),
@@ -137,7 +145,7 @@ impl PyLinearRegression {
             match &self.inner {
                 AnyLinearRegression::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let out = est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
+                    let out = TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
                     Ok(out.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("linear_regression", "predict (f64 path)")),
@@ -149,28 +157,28 @@ impl PyLinearRegression {
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearRegression::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLinearRegression::F32(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("linear_regression", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearRegression::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLinearRegression::F64(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("linear_regression", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearRegression::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLinearRegression::F32(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("linear_regression", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearRegression::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLinearRegression::F64(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("linear_regression", "intercept_ (f64)")),
         }
     }
