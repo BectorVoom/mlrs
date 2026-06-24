@@ -14,6 +14,8 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/complement_nb_test.rs` (AGENTS.md §2).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -28,13 +30,18 @@ use crate::naive_bayes::multinomial_nb::{
     decode_classes, resolve_class_log_prior, validate_discrete_alpha, validate_non_negative_counts,
 };
 use crate::naive_bayes::nb_common::{argmin_decode, class_grouped_sum, log_sum_exp_normalize};
-use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
+// Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
+// param + migration to the consuming-self `typestate` surface. fit/predict math
+// BYTE-IDENTICAL (D-03).
+use crate::typestate::{
+    validate_geometry, Fit, Fitted, PredictLabels, PredictLogProba, PredictProba, Unfit,
+};
 
 /// Complement Naive Bayes (NB-04). Construct via [`ComplementNB::builder`], then
 /// [`Fit::fit`] + (Wave-1) the predict surface (argmin decode internally, D-08).
 /// Fitted `feature_log_prob_` / `class_log_prior_` are device-resident / host f64
 /// (D-03), `None` until `fit`.
-pub struct ComplementNB<F> {
+pub struct ComplementNB<F, S = Unfit> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is when `< 1e-10` (D-02 default `true`); else clip (D-06).
@@ -57,9 +64,11 @@ pub struct ComplementNB<F> {
     feature_log_prob_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Per-class log-prior (host f64), `None` until `fit`.
     class_log_prior_: Option<Vec<f64>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> ComplementNB<F>
+impl<F> ComplementNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -67,7 +76,12 @@ where
     pub fn builder() -> ComplementNBBuilder {
         ComplementNBBuilder::default()
     }
+}
 
+impl<F> ComplementNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
@@ -149,7 +163,7 @@ impl ComplementNBBuilder {
     /// `build()` (D-05): `alpha >= 0`, finite+non-negative `class_prior`, and the
     /// D-06 `force_alpha` clip+warn (shared [`validate_discrete_alpha`]). `norm`
     /// needs no validation.
-    pub fn build<F>(self) -> Result<ComplementNB<F>, BuildError>
+    pub fn build<F>(self) -> Result<ComplementNB<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -169,30 +183,26 @@ impl ComplementNBBuilder {
             n_features: 0,
             feature_log_prob_: None,
             class_log_prior_: None,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for ComplementNB<F>
+impl<F> Fit<F> for ComplementNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = ComplementNB<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<ComplementNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "complement_nb",
             operation: "fit (requires y)",
@@ -269,23 +279,30 @@ where
             n_classes,
         )?;
 
-        if let Some(old) = self.feature_log_prob_.take() {
-            old.release_into(pool);
-        }
+        // The consuming-self transition carries no prior fitted state (fresh
+        // `Unfit` has feature_log_prob_ = None) — the old WR-07 re-fit release is
+        // vacuous and dropped; reuse across re-CONSTRUCT+fit flows via the pool.
         let flp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
             pool,
             &flp.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
         );
 
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.feature_log_prob_ = Some(flp_dev);
-        self.class_log_prior_ = Some(class_log_prior_);
-        Ok(self)
+        Ok(ComplementNB {
+            alpha: self.alpha,
+            force_alpha: self.force_alpha,
+            fit_prior: self.fit_prior,
+            class_prior: self.class_prior,
+            norm: self.norm,
+            classes_,
+            n_features,
+            feature_log_prob_: Some(flp_dev),
+            class_log_prior_: Some(class_log_prior_),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> ComplementNB<F>
+impl<F> ComplementNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -353,7 +370,7 @@ where
     }
 }
 
-impl<F> PredictLabels<F> for ComplementNB<F>
+impl<F> PredictLabels<F> for ComplementNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -372,7 +389,7 @@ where
     }
 }
 
-impl<F> PredictProba<F> for ComplementNB<F>
+impl<F> PredictProba<F> for ComplementNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -397,7 +414,7 @@ where
     }
 }
 
-impl<F> PredictLogProba<F> for ComplementNB<F>
+impl<F> PredictLogProba<F> for ComplementNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
