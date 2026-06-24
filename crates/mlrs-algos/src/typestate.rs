@@ -6,16 +6,33 @@
 //! [`Fit`] / [`Predict`] / [`Transform`] / [`PartialFit`] that re-tag an
 //! estimator's state at the type level.
 //!
-//! ## Coexistence with the frozen `traits.rs` (D-07)
-//! The trait NAMES here (`Fit` / `Predict` / `Transform` / `PartialFit`)
-//! deliberately mirror the legacy [`crate::traits`] surface, but the SIGNATURES
-//! differ: the legacy `Fit::fit` takes `&mut self` and returns `&mut Self`,
-//! whereas this module's [`Fit::fit`] CONSUMES `self` and returns an associated
-//! [`Fit::Fitted`] type — a compile-time typestate transition. The legacy
-//! `traits.rs` is FROZEN: all 30 existing estimators continue to compile against
-//! it untouched (Pitfall 1). The two surfaces collide ONLY by path; never glob
-//! both into the same `use` at one call site. Consumers of the new surface write
+//! ## The single trait surface (Phase 16, D-01)
+//! This module is now the SINGLE trait surface for the whole crate. It mirrors
+//! ALL 9 legacy [`crate::traits`] traits — the four lifecycle traits
+//! (`Fit` / `Predict` / `Transform` / `PartialFit`) plus the five `&self`
+//! accessor traits (`PredictLabels` / `KNeighbors` / `ScoreSamples` /
+//! `PredictProba` / `PredictLogProba`) — with the consuming-`self` typestate
+//! signatures. The legacy `traits.rs` is being HARD-DELETED this phase (D-01):
+//! every estimator migrates to consume `mlrs_algos::typestate::*`, after which
+//! `traits.rs` and its `pub mod traits;` are removed. Until that final deletion
+//! commit the two surfaces still collide by path; never glob both into the same
+//! `use` at one call site. Consumers of this surface write
 //! `use mlrs_algos::typestate::Fit;` explicitly.
+//!
+//! The SIGNATURES differ from the legacy surface: the legacy `Fit::fit` takes
+//! `&mut self` and returns `&mut Self`, whereas this module's [`Fit::fit`]
+//! CONSUMES `self` and returns an associated [`Fit::Fitted`] type — a
+//! compile-time typestate transition. The five accessor traits, by contrast,
+//! borrow `&self` (they READ fitted state, they do not transition lifecycle) and
+//! carry the SAME signatures as their `traits.rs` originals verbatim, so they are
+//! impl'd ONLY on the `Fitted`-tagged estimator (exactly like [`Transform`]).
+//!
+//! ## Builder-setter type convention (Phase 16, A5)
+//! Builder setters are `f64`-typed for uniformity with the shipped mbsgd/umap
+//! builders; `build::<F>()` narrows the stored `f64` hyperparameters to the
+//! target float `F` via cast. Every downstream retrofit in this phase follows
+//! this single convention — setters never take `F`, and the `f64 → F` narrowing
+//! happens once, inside `build::<F>()`.
 //!
 //! ## The sealed `State` marker (D-03)
 //! [`State`] is sealed via the private [`sealed::Sealed`] supertrait, so the set
@@ -178,6 +195,26 @@ where
         x: &DeviceArray<ActiveRuntime, F>,
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
+
+    /// Reconstruct samples from their latent representation `z`
+    /// (`shape = (n_samples, n_components)`, row-major) back into the original
+    /// feature space (`n_samples × n_features`). Implemented by PCA only
+    /// (the reconstruction path); estimators without a reconstruction (e.g.
+    /// TruncatedSVD, UMAP) leave the provided default, which returns
+    /// [`AlgoError::Unsupported`] — a compile-time-present but runtime-rejected
+    /// method, matching the legacy `traits.rs` `Transform::inverse_transform`
+    /// default verbatim (D-01).
+    fn inverse_transform(
+        &self,
+        _pool: &mut BufferPool<ActiveRuntime>,
+        _z: &DeviceArray<ActiveRuntime, F>,
+        _shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        Err(AlgoError::Unsupported {
+            estimator: "transform",
+            operation: "inverse_transform",
+        })
+    }
 }
 
 /// Incrementally fit an estimator to a single batch, CONSUMING `self` and
@@ -212,6 +249,140 @@ where
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<Self::Fitted, AlgoError>;
+}
+
+/// Predict INTEGER class/cluster labels for new samples (D-05/D-06). Unlike
+/// [`Predict`], which returns the continuous `F` regression target, this returns
+/// a length-`n_samples` `i32` label buffer — the discrete-output surface shared
+/// by `KMeans.predict` (nearest cluster centroid → cluster id) and
+/// `KNeighborsClassifier.predict` (majority neighbor vote → class id). Labels are
+/// `i32` so DBSCAN's noise sentinel `-1` is directly representable (D-06).
+///
+/// A `&self` ACCESSOR trait: it reads device-resident fitted state (D-03) and
+/// does NOT transition lifecycle, so it carries no associated `type Fitted` and
+/// is impl'd ONLY on the `Fitted`-tagged estimator (mirroring how [`Transform`]
+/// is impl'd only on the fitted sibling). Signature ported verbatim from the
+/// legacy `traits.rs::PredictLabels` (D-01).
+pub trait PredictLabels<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Predict the integer label for each sample of `x`
+    /// (`shape = (n_samples, n_features)`, row-major). Errors if the geometry
+    /// disagrees with the fitted `n_features`.
+    fn predict_labels(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError>;
+}
+
+/// Find the `k` nearest neighbors of each query sample (D-07). Returns BOTH the
+/// `n_queries × k` neighbor distances (`F`) and the `n_queries × k` neighbor
+/// indices (`i32`, indices into the fitted training set) — the sklearn
+/// `NearestNeighbors.kneighbors` contract that `KNeighborsClassifier` /
+/// `KNeighborsRegressor` build their votes on.
+///
+/// A `&self` ACCESSOR trait (no `type Fitted`), impl'd ONLY on the `Fitted`-tagged
+/// estimator. Signature ported verbatim from the legacy `traits.rs::KNeighbors`
+/// (D-01).
+pub trait KNeighbors<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// For each row of `x` (`shape = (n_queries, n_features)`, row-major) return
+    /// the `(distances, indices)` of its `k` nearest fitted-training neighbors,
+    /// each a flat `n_queries × k` row-major buffer (distances `F`, indices
+    /// `i32`). Errors if `k` exceeds the fitted sample count or the geometry
+    /// disagrees with the fitted `n_features`.
+    fn kneighbors(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+        k: usize,
+    ) -> Result<
+        (
+            DeviceArray<ActiveRuntime, F>,
+            DeviceArray<ActiveRuntime, i32>,
+        ),
+        AlgoError,
+    >;
+}
+
+/// Compute the per-sample LOG-DENSITY for new samples (D-12). This is the
+/// density-estimation surface implemented by `KernelDensity.score_samples`: given
+/// an `n_samples × n_features` query matrix it returns a length-`n_samples` buffer
+/// of natural-log probability densities `log p(xᵢ)` evaluated under the fitted
+/// kernel density model.
+///
+/// A `&self` ACCESSOR trait (no `type Fitted`), impl'd ONLY on the `Fitted`-tagged
+/// estimator. Signature ported verbatim from the legacy `traits.rs::ScoreSamples`
+/// (D-01).
+pub trait ScoreSamples<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Compute the length-`n_samples` log-density `log p(xᵢ)` for each row of `x`
+    /// (`shape = (n_samples, n_features)`, row-major) under the fitted kernel
+    /// density model. Errors if the geometry disagrees with the fitted
+    /// `n_features`.
+    fn score_samples(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
+}
+
+/// Predict per-class membership probabilities for new samples (D-07). Returns the
+/// `n_samples × n_classes` row-major matrix of class fractions (each row sums to
+/// 1) — the `predict_proba` surface implemented by `KNeighborsClassifier`
+/// (neighbor-vote fractions) and `LogisticRegression` (softmax probabilities).
+///
+/// A `&self` ACCESSOR trait (no `type Fitted`), impl'd ONLY on the `Fitted`-tagged
+/// estimator. Signature ported verbatim from the legacy `traits.rs::PredictProba`
+/// (D-01).
+pub trait PredictProba<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Predict the per-class probability row for each sample of `x`
+    /// (`shape = (n_samples, n_features)`, row-major), returning the flat
+    /// `n_samples × n_classes` row-major buffer. Errors if the geometry disagrees
+    /// with the fitted `n_features`.
+    fn predict_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
+}
+
+/// Predict the per-class LOG-probabilities for new samples (D-07, Phase 11). The
+/// sibling of [`PredictProba`]: returns the SAME `n_samples × n_classes`
+/// row-major matrix but in the log domain — the `predict_log_proba` surface the
+/// five Naive Bayes classifiers (`GaussianNB` / `MultinomialNB` / `BernoulliNB`
+/// / `ComplementNB` / `CategoricalNB`) implement alongside `predict_proba`.
+///
+/// A `&self` ACCESSOR trait (no `type Fitted`), impl'd ONLY on the `Fitted`-tagged
+/// estimator. Signature ported verbatim from the legacy
+/// `traits.rs::PredictLogProba` (D-01).
+pub trait PredictLogProba<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Predict the per-class log-probability row for each sample of `x`
+    /// (`shape = (n_samples, n_features)`, row-major), returning the flat
+    /// `n_samples × n_classes` row-major buffer of `joint_ll − logsumexp`.
+    /// Errors if the geometry disagrees with the fitted `n_features`.
+    fn predict_log_proba(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>;
 }
 
 /// Type-level guard that the consuming-`self` typestate traits compose with a
