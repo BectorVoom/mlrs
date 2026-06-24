@@ -608,4 +608,66 @@ pub enum BuildError {
         /// The offending minimum-cluster-size value.
         min_cluster_size: usize,
     },
+
+    /// `HDBSCAN` was given a `min_samples` of 0 (Phase 15, HDBS-01, T-15-03-V5b).
+    /// The core-distance smoothing count must be `>= 1` (a core point counts at
+    /// least itself); a value of 0 is undefined. Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split) — never at `fit`. This resolves the
+    /// shell's deferred `min_samples` validation TODO.
+    #[error(
+        "estimator '{estimator}': min_samples = {min_samples} is invalid \
+         (must be >= 1 when Some)"
+    )]
+    InvalidMinSamples {
+        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        estimator: &'static str,
+        /// The offending core-point smoothing count.
+        min_samples: usize,
+    },
+
+    /// `HDBSCAN` was given a `max_cluster_size` that is neither `0` (unbounded)
+    /// nor `>= min_cluster_size` (Phase 15, HDBS-01, T-15-03-V5b). A finite bound
+    /// below `min_cluster_size` is contradictory (no cluster can satisfy both at
+    /// once). Rejected at `build()` (data-INDEPENDENT, the D-08 split) — never at
+    /// `fit`. Mirrors [`BuildError::InvalidMinClusterSize`].
+    #[error(
+        "estimator '{estimator}': max_cluster_size = {max_cluster_size} is invalid \
+         (must be 0 = unbounded, or >= min_cluster_size = {min_cluster_size})"
+    )]
+    InvalidMaxClusterSize {
+        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        estimator: &'static str,
+        /// The offending maximum-cluster-size value.
+        max_cluster_size: usize,
+        /// The `min_cluster_size` it failed to reach.
+        min_cluster_size: usize,
+    },
+
+    /// `HDBSCAN` was given a non-positive `alpha` (Phase 15, HDBS-01,
+    /// T-15-03-V5b). The robust-single-linkage distance scaling divides pairwise
+    /// distances, so it must be `alpha > 0`; a non-positive value is undefined
+    /// (a zero divides by zero, a negative flips distances). Rejected at
+    /// `build()` (data-INDEPENDENT, the D-08 split) — never at `fit`.
+    #[error("estimator '{estimator}': alpha = {alpha} is invalid (must be > 0)")]
+    InvalidAlphaHdbscan {
+        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        estimator: &'static str,
+        /// The offending scaling value.
+        alpha: f64,
+    },
+
+    /// `HDBSCAN` was given a `Metric::Minkowski { p }` with `p < 1` (Phase 15,
+    /// HDBS-01, T-15-03-V5b). The Minkowski exponent must be `p >= 1` for the
+    /// metric to be a proper distance (the triangle inequality fails for `p < 1`);
+    /// mirrors the `knn_graph` precedent. Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split) — never at `fit`.
+    #[error(
+        "estimator '{estimator}': minkowski p = {p} is invalid (must be >= 1)"
+    )]
+    InvalidMinkowskiP {
+        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        estimator: &'static str,
+        /// The offending Minkowski exponent.
+        p: f64,
+    },
 }

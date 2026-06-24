@@ -45,7 +45,7 @@
 
 use std::path::PathBuf;
 
-use mlrs_algos::cluster::hdbscan::Hdbscan;
+use mlrs_algos::cluster::hdbscan::{Hdbscan, Metric};
 use mlrs_algos::error::BuildError;
 use mlrs_backend::capability;
 use mlrs_core::{
@@ -458,9 +458,104 @@ fn build_validation() {
         ),
         "min_cluster_size < 2 must be BuildError::InvalidMinClusterSize, got {bad:?}"
     );
-    // 15-NN: extend with min_samples (>= 1 when Some), max_cluster_size (0 or
-    // >= min_cluster_size), alpha (> 0), and minkowski p (>= 1) rejections as the
-    // corresponding typed BuildError variants are added.
+
+    // min_samples = Some(0) is rejected; Some(1) is accepted (15-03 / D-09).
+    let bad_ms = Hdbscan::<f64>::builder()
+        .min_samples(Some(0))
+        .build::<f64>()
+        .err();
+    assert!(
+        matches!(
+            bad_ms,
+            Some(BuildError::InvalidMinSamples { min_samples, .. }) if min_samples == 0
+        ),
+        "min_samples = Some(0) must be BuildError::InvalidMinSamples, got {bad_ms:?}"
+    );
+    assert!(
+        Hdbscan::<f64>::builder()
+            .min_samples(Some(1))
+            .build::<f64>()
+            .is_ok(),
+        "min_samples = Some(1) must be accepted"
+    );
+
+    // max_cluster_size = 3 with min_cluster_size = 5 is rejected (neither 0 nor
+    // >= mcs); 0 (unbounded) and 5 (== mcs) are accepted.
+    let bad_mxc = Hdbscan::<f64>::builder()
+        .min_cluster_size(5)
+        .max_cluster_size(3)
+        .build::<f64>()
+        .err();
+    assert!(
+        matches!(
+            bad_mxc,
+            Some(BuildError::InvalidMaxClusterSize { max_cluster_size, min_cluster_size, .. })
+                if max_cluster_size == 3 && min_cluster_size == 5
+        ),
+        "max_cluster_size below min_cluster_size must be InvalidMaxClusterSize, got {bad_mxc:?}"
+    );
+    assert!(
+        Hdbscan::<f64>::builder()
+            .min_cluster_size(5)
+            .max_cluster_size(0)
+            .build::<f64>()
+            .is_ok(),
+        "max_cluster_size = 0 (unbounded) must be accepted"
+    );
+    assert!(
+        Hdbscan::<f64>::builder()
+            .min_cluster_size(5)
+            .max_cluster_size(5)
+            .build::<f64>()
+            .is_ok(),
+        "max_cluster_size == min_cluster_size must be accepted"
+    );
+
+    // alpha <= 0 is rejected; alpha = 1.0 is accepted.
+    let bad_alpha = Hdbscan::<f64>::builder().alpha(0.0).build::<f64>().err();
+    assert!(
+        matches!(
+            bad_alpha,
+            Some(BuildError::InvalidAlphaHdbscan { alpha, .. }) if alpha == 0.0
+        ),
+        "alpha = 0.0 must be BuildError::InvalidAlphaHdbscan, got {bad_alpha:?}"
+    );
+    assert!(
+        Hdbscan::<f64>::builder().alpha(-1.0).build::<f64>().is_err(),
+        "negative alpha must be rejected"
+    );
+    assert!(
+        Hdbscan::<f64>::builder().alpha(1.0).build::<f64>().is_ok(),
+        "alpha = 1.0 must be accepted"
+    );
+
+    // Metric::Minkowski { p < 1 } is rejected; p = 2.0 accepted; Precomputed
+    // round-trips through the builder.
+    let bad_p = Hdbscan::<f64>::builder()
+        .metric(Metric::Minkowski { p: 0.5 })
+        .build::<f64>()
+        .err();
+    assert!(
+        matches!(
+            bad_p,
+            Some(BuildError::InvalidMinkowskiP { p, .. }) if p == 0.5
+        ),
+        "minkowski p < 1 must be BuildError::InvalidMinkowskiP, got {bad_p:?}"
+    );
+    assert!(
+        Hdbscan::<f64>::builder()
+            .metric(Metric::Minkowski { p: 2.0 })
+            .build::<f64>()
+            .is_ok(),
+        "minkowski p = 2.0 must be accepted"
+    );
+    assert!(
+        Hdbscan::<f64>::builder()
+            .metric(Metric::Precomputed)
+            .build::<f64>()
+            .is_ok(),
+        "Metric::Precomputed must construct"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -42,13 +42,51 @@ use mlrs_backend::runtime::ActiveRuntime;
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 
-/// Distance metric for the HDBSCAN neighbor graph (HDBS-01 subset). Only
-/// `Euclidean` carries meaning in the Phase-12 shell (the trivial fit ignores
-/// the metric); the full metric set is filled in Phase 15.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Distance metric for the HDBSCAN neighbor graph (HDBS-01, D-01). The five
+/// feature-space metrics mirror [`mlrs_backend::prims::knn_graph::Metric`]
+/// (consumed via the Phase-13 KNN prim with `include_self=true`); `Precomputed`
+/// (D-02) is the new variant where `fit` interprets `X` as a square `n×n`
+/// distance matrix and skips the device distance front-end.
+///
+/// NOTE: the `Minkowski { p: f64 }` variant carries an `f64`, which is NOT
+/// `Eq` (no total order on floats), so this enum derives `PartialEq` ONLY (the
+/// Phase-12 shell's `Eq` is dropped — see `hyperparams_eq`).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Metric {
     /// Euclidean (L2) distance — sklearn's `metric='euclidean'` default.
     Euclidean,
+    /// L1 (Manhattan) distance — sklearn's `metric='manhattan'`.
+    Manhattan,
+    /// Cosine distance `1 − x̂·ŷ` — sklearn's `metric='cosine'` (routes to the
+    /// dense brute MST variant, NOT a `FAST_METRIC`).
+    Cosine,
+    /// L∞ (Chebyshev) distance — sklearn's `metric='chebyshev'`.
+    Chebyshev,
+    /// Minkowski-`p` distance — sklearn's `metric='minkowski'` with `p`. The
+    /// exponent is validated `>= 1` host-side at [`HdbscanBuilder::build`]
+    /// (knn_graph precedent).
+    Minkowski {
+        /// The Minkowski exponent (validated `>= 1`).
+        p: f64,
+    },
+    /// Precomputed distance matrix (D-02). `X` is interpreted as a square `n×n`
+    /// distance matrix; the device distance front-end is skipped and the dense
+    /// brute MST variant is used. `fit` validates squareness host-side.
+    Precomputed,
+}
+
+/// Which cluster centers to compute and store (`store_centers`, HDBS-04 / D-08).
+/// `None` on the estimator stores neither; the actual centroid/medoid compute
+/// lands in plan 15-06 — the field is wired now so the builder surface is
+/// complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreCenters {
+    /// `'centroid'` — weighted mean per cluster → `centroids_`.
+    Centroid,
+    /// `'medoid'` — min-weighted-total-distance member per cluster → `medoids_`.
+    Medoid,
+    /// `'both'` — compute and store BOTH `centroids_` and `medoids_`.
+    Both,
 }
 
 /// Cluster-selection method for the condensed-tree extraction (HDBS-01 subset).
@@ -91,6 +129,10 @@ pub struct Hdbscan<F, S = Unfit> {
     alpha: f64,
     /// Maximum cluster size, `0` = unbounded (`max_cluster_size`, default 0).
     max_cluster_size: usize,
+    /// Which cluster centers to compute (`store_centers`, default `None`). The
+    /// compute lands in plan 15-06; wired here so the surface is complete
+    /// (HDBS-04 / D-08).
+    store_centers: Option<StoreCenters>,
 
     // --- fitted state (None / 0 until fit; Some on Fitted by construction) ---
     /// Fitted labels (length `n`, `-1` = noise), device-resident `i32`. `None`
@@ -126,6 +168,7 @@ where
             metric: Metric::Euclidean,
             alpha: 1.0,
             max_cluster_size: 0,
+            store_centers: None,
             labels_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -149,6 +192,7 @@ where
             && self.metric == other.metric
             && self.alpha == other.alpha
             && self.max_cluster_size == other.max_cluster_size
+            && self.store_centers == other.store_centers
     }
 
     /// Decompose this (unfit) estimator back into its builder, copying every
@@ -164,6 +208,7 @@ where
             metric: self.metric,
             alpha: self.alpha,
             max_cluster_size: self.max_cluster_size,
+            store_centers: self.store_centers,
         }
     }
 }
@@ -189,6 +234,7 @@ pub struct HdbscanBuilder {
     metric: Metric,
     alpha: f64,
     max_cluster_size: usize,
+    store_centers: Option<StoreCenters>,
 }
 
 impl Default for HdbscanBuilder {
@@ -237,16 +283,27 @@ impl HdbscanBuilder {
         self.max_cluster_size = v;
         self
     }
+    /// Set which cluster centers to compute `store_centers` (`None` = neither).
+    pub fn store_centers(mut self, v: Option<StoreCenters>) -> Self {
+        self.store_centers = v;
+        self
+    }
 
     /// Build the (unfit) estimator, validating the data-INDEPENDENT
     /// hyperparameters BEFORE any data is seen (D-08; the data-DEPENDENT
     /// geometry check lives in [`Fit::fit`]):
     ///
     /// - `min_cluster_size >= 2` ([`BuildError::InvalidMinClusterSize`]).
+    /// - `min_samples >= 1` when `Some` ([`BuildError::InvalidMinSamples`]).
+    /// - `max_cluster_size == 0` (unbounded) or `>= min_cluster_size`
+    ///   ([`BuildError::InvalidMaxClusterSize`]).
+    /// - `alpha > 0` ([`BuildError::InvalidAlphaHdbscan`]).
+    /// - `Metric::Minkowski { p }` requires `p >= 1`
+    ///   ([`BuildError::InvalidMinkowskiP`], knn_graph precedent).
     ///
-    /// `min_samples` is stored verbatim and is NOT validated in Phase 12 — its
-    /// semantic validation is deferred to Phase 15 (the real HDBSCAN compute).
-    /// `min_samples=None` is resolved to `min_cluster_size`.
+    /// All checks run BEFORE the estimator is constructed (T-15-03-V5b / ASVS V5
+    /// — an untrusted hyperparameter becomes a typed error, never a device
+    /// fault). `min_samples=None` is resolved to `min_cluster_size`.
     pub fn build<F>(self) -> Result<Hdbscan<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
@@ -257,11 +314,43 @@ impl HdbscanBuilder {
                 min_cluster_size: self.min_cluster_size,
             });
         }
-        // TODO(phase-15): validate min_samples (>= 1 when Some) and
-        // max_cluster_size (0 == unbounded, else >= min_cluster_size) here BEFORE
-        // the real device kernel lands — both are currently stored verbatim and
-        // unvalidated (WR-04). `AlgoError::InvalidMinSamples` is the precedent for
-        // the min_samples >= 1 guard.
+        // min_samples >= 1 when explicitly Some (None resolves to
+        // min_cluster_size, which is already >= 2). Resolves the shell's deferred
+        // validation TODO (D-09 / T-15-03-V5b).
+        if let Some(ms) = self.min_samples {
+            if ms < 1 {
+                return Err(BuildError::InvalidMinSamples {
+                    estimator: "hdbscan",
+                    min_samples: ms,
+                });
+            }
+        }
+        // max_cluster_size: 0 = unbounded; otherwise it must not be smaller than
+        // min_cluster_size (a finite bound below the floor is contradictory).
+        if self.max_cluster_size != 0 && self.max_cluster_size < self.min_cluster_size {
+            return Err(BuildError::InvalidMaxClusterSize {
+                estimator: "hdbscan",
+                max_cluster_size: self.max_cluster_size,
+                min_cluster_size: self.min_cluster_size,
+            });
+        }
+        // alpha > 0 (it divides pairwise distances in the MST; 0 → div-by-zero,
+        // negative → flipped distances).
+        if !(self.alpha > 0.0) {
+            return Err(BuildError::InvalidAlphaHdbscan {
+                estimator: "hdbscan",
+                alpha: self.alpha,
+            });
+        }
+        // Minkowski p >= 1 (proper distance; knn_graph precedent).
+        if let Metric::Minkowski { p } = self.metric {
+            if !(p >= 1.0) {
+                return Err(BuildError::InvalidMinkowskiP {
+                    estimator: "hdbscan",
+                    p,
+                });
+            }
+        }
         let min_samples = Some(self.min_samples.unwrap_or(self.min_cluster_size));
         Ok(Hdbscan {
             min_cluster_size: self.min_cluster_size,
@@ -271,6 +360,7 @@ impl HdbscanBuilder {
             metric: self.metric,
             alpha: self.alpha,
             max_cluster_size: self.max_cluster_size,
+            store_centers: self.store_centers,
             labels_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -314,6 +404,7 @@ where
             metric: self.metric,
             alpha: self.alpha,
             max_cluster_size: self.max_cluster_size,
+            store_centers: self.store_centers,
             labels_: Some(labels_dev),
             n_features_in_: p,
             _float: PhantomData,
