@@ -22,7 +22,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::covariance::LedoitWolf;
-use mlrs_algos::traits::Fit;
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -108,17 +108,19 @@ where
     let x_host: Vec<F> = x_f64.iter().map(|&v| f64_to::<F>(v)).collect();
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut est = LedoitWolf::<F>::new(false);
-    est.fit(&mut pool, &x_dev, None, (n_samples, n_features))
+    let est = LedoitWolf::<F>::builder()
+        .assume_centered(false)
+        .build::<F>()
+        .expect("LedoitWolf::build is infallible")
+        .fit(&mut pool, &x_dev, None, (n_samples, n_features))
         .expect("LedoitWolf::fit on a valid shape");
 
     let covariance = est
         .covariance_(&pool)
-        .expect("covariance_ after fit")
         .iter()
         .map(|&x| host_to_f64(x))
         .collect();
-    let shrinkage = est.shrinkage_().expect("shrinkage_ after fit");
+    let shrinkage = est.shrinkage_();
     LwFit {
         covariance,
         shrinkage,
@@ -242,5 +244,20 @@ fn ledoit_wolf_large_n_f64() {
         case.expect_f64("covariance_"),
         &F64_TOL,
         "covariance_ n40 f64",
+    );
+}
+
+/// BLDR-01 defaults equality: the zero-arg `new(false)` (sklearn default
+/// `assume_centered=false`) reproduces every hyperparameter of
+/// `builder().build()` — the single-source-of-defaults invariant (D-08).
+#[test]
+fn defaults_equal() {
+    let from_new = LedoitWolf::<f64>::new(false);
+    let from_builder = LedoitWolf::<f64>::builder()
+        .build::<f64>()
+        .expect("default LedoitWolf builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "LedoitWolf::new(false) must equal LedoitWolf::builder().build()"
     );
 }

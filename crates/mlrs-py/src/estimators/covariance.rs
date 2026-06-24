@@ -16,16 +16,16 @@ use pyo3::prelude::*;
 
 use mlrs_algos::covariance::empirical_covariance::EmpiricalCovariance;
 use mlrs_algos::covariance::ledoit_wolf::LedoitWolf;
-use mlrs_algos::traits::Fit;
+use mlrs_algos::typestate::Fit as TypestateFit;
 
-use crate::errors::{algo_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
 
 // ---------------------------------------------------------------------------
 // EmpiricalCovariance — Fit (unsupervised)
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyEmpiricalCovariance,
     algo:  mlrs_algos::covariance::empirical_covariance::EmpiricalCovariance,
     unfit: { assume_centered: bool, store_precision: bool },
@@ -86,16 +86,26 @@ impl PyEmpiricalCovariance {
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = EmpiricalCovariance::<f32>::new(assume_centered, store_precision);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyEmpiricalCovariance::F32(est))
+                    let est = EmpiricalCovariance::<f32>::builder()
+                        .assume_centered(assume_centered)
+                        .store_precision(store_precision)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyEmpiricalCovariance::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = EmpiricalCovariance::<f64>::new(assume_centered, store_precision);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyEmpiricalCovariance::F64(est))
+                    let est = EmpiricalCovariance::<f64>::builder()
+                        .assume_centered(assume_centered)
+                        .store_precision(store_precision)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyEmpiricalCovariance::F64(fitted))
                 }
             }
         })?;
@@ -106,28 +116,28 @@ impl PyEmpiricalCovariance {
     fn covariance_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyEmpiricalCovariance::F32(e) => e.covariance_(&pool).map_err(algo_err_to_py),
+            AnyEmpiricalCovariance::F32(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "covariance_ (f32)")),
         }
     }
     fn covariance_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyEmpiricalCovariance::F64(e) => e.covariance_(&pool).map_err(algo_err_to_py),
+            AnyEmpiricalCovariance::F64(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "covariance_ (f64)")),
         }
     }
     fn location_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyEmpiricalCovariance::F32(e) => e.location_(&pool).map_err(algo_err_to_py),
+            AnyEmpiricalCovariance::F32(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "location_ (f32)")),
         }
     }
     fn location_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyEmpiricalCovariance::F64(e) => e.location_(&pool).map_err(algo_err_to_py),
+            AnyEmpiricalCovariance::F64(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "location_ (f64)")),
         }
     }
@@ -161,7 +171,7 @@ impl PyEmpiricalCovariance {
 // LedoitWolf — Fit (unsupervised)
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyLedoitWolf,
     algo:  mlrs_algos::covariance::ledoit_wolf::LedoitWolf,
     unfit: { assume_centered: bool },
@@ -213,16 +223,24 @@ impl PyLedoitWolf {
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = LedoitWolf::<f32>::new(assume_centered);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLedoitWolf::F32(est))
+                    let est = LedoitWolf::<f32>::builder()
+                        .assume_centered(assume_centered)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLedoitWolf::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = LedoitWolf::<f64>::new(assume_centered);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLedoitWolf::F64(est))
+                    let est = LedoitWolf::<f64>::builder()
+                        .assume_centered(assume_centered)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLedoitWolf::F64(fitted))
                 }
             }
         })?;
@@ -233,28 +251,28 @@ impl PyLedoitWolf {
     fn covariance_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyLedoitWolf::F32(e) => e.covariance_(&pool).map_err(algo_err_to_py),
+            AnyLedoitWolf::F32(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "covariance_ (f32)")),
         }
     }
     fn covariance_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyLedoitWolf::F64(e) => e.covariance_(&pool).map_err(algo_err_to_py),
+            AnyLedoitWolf::F64(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "covariance_ (f64)")),
         }
     }
     fn location_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyLedoitWolf::F32(e) => e.location_(&pool).map_err(algo_err_to_py),
+            AnyLedoitWolf::F32(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "location_ (f32)")),
         }
     }
     fn location_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::global_pool().lock().expect("pool mutex");
         match &self.inner {
-            AnyLedoitWolf::F64(e) => e.location_(&pool).map_err(algo_err_to_py),
+            AnyLedoitWolf::F64(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "location_ (f64)")),
         }
     }
@@ -263,8 +281,8 @@ impl PyLedoitWolf {
     /// the algos estimator keeps it in `f64` regardless of `F`).
     fn shrinkage_(&self) -> PyResult<f64> {
         match &self.inner {
-            AnyLedoitWolf::F32(e) => e.shrinkage_().map_err(algo_err_to_py),
-            AnyLedoitWolf::F64(e) => e.shrinkage_().map_err(algo_err_to_py),
+            AnyLedoitWolf::F32(e) => Ok(e.shrinkage_()),
+            AnyLedoitWolf::F64(e) => Ok(e.shrinkage_()),
             _ => Err(not_fitted("ledoit_wolf", "shrinkage_")),
         }
     }

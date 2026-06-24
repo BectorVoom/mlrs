@@ -37,6 +37,7 @@
 //! Tests live in `crates/mlrs-algos/tests/ledoit_wolf_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
 use std::sync::OnceLock;
 
 use bytemuck::Pod;
@@ -46,17 +47,21 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, host_to_f64};
 
-use crate::error::AlgoError;
-use crate::traits::Fit;
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 
 /// Ledoit–Wolf shrinkage covariance estimator (COV-02).
 ///
-/// Construct with [`LedoitWolf::new`] (`assume_centered`), then [`Fit::fit`].
-/// Fitted attributes are device-resident (D-03); the host accessors materialize
-/// them on demand.
-pub struct LedoitWolf<F> {
+/// Construct with the zero-arg [`LedoitWolf::new`] (sklearn default
+/// `assume_centered = false`) or [`LedoitWolf::builder`]
+/// (`.assume_centered(bool)`), then the consuming [`Fit::fit`] (returns the
+/// `Fitted`-tagged sibling). Fitted attributes are device-resident (D-03); the
+/// host accessors materialize them on demand and exist ONLY on
+/// `LedoitWolf<F, Fitted>` (the compile-time typestate replaces the old runtime
+/// `NotFitted` guard, D-03).
+pub struct LedoitWolf<F, S = Unfit> {
     /// When `true`, skip mean subtraction and set `location_ = 0` (D-07).
     assume_centered: bool,
     /// `covariance_` (`n_features × n_features`), row-major, device-resident.
@@ -71,13 +76,18 @@ pub struct LedoitWolf<F> {
     /// Reset on every `fit`.
     cov_host: OnceLock<Vec<F>>,
     loc_host: OnceLock<Vec<F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> LedoitWolf<F>
+impl<F> LedoitWolf<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `LedoitWolf`.
+    /// Construct an unfitted `LedoitWolf` with sklearn's default
+    /// (`assume_centered = false`) directly in the `Unfit` state. SINGLE source of
+    /// truth for the default (D-08): the builder `Default` re-derives via
+    /// [`LedoitWolf::into_builder`].
     ///
     /// - `assume_centered`: when `true`, the data is assumed already centered;
     ///   `location_` is set to `0` and no mean is subtracted (D-07).
@@ -89,73 +99,141 @@ where
             shrinkage_: None,
             cov_host: OnceLock::new(),
             loc_host: OnceLock::new(),
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of `covariance_` (`n_features × n_features`, row-major).
-    /// Memoized after the first call (IN-05).
-    pub fn covariance_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.covariance_, &self.cov_host, pool, "covariance_")
+    /// Start building a `LedoitWolf` from sklearn's default (D-08 single source).
+    pub fn builder() -> LedoitWolfBuilder {
+        LedoitWolfBuilder::default()
     }
 
-    /// Host copy of `location_` (length `n_features`). Memoized (IN-05).
-    pub fn location_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.location_, &self.loc_host, pool, "location_")
+    /// Decompose this (unfit) estimator back into its builder. Used by
+    /// [`LedoitWolfBuilder::default`] to re-derive the default from
+    /// [`LedoitWolf::new`] (D-08).
+    pub fn into_builder(self) -> LedoitWolfBuilder {
+        LedoitWolfBuilder {
+            assume_centered: self.assume_centered,
+        }
     }
 
-    /// The fitted `shrinkage_` ∈ [0, 1]. Errors with `NotFitted` before `fit`.
-    pub fn shrinkage_(&self) -> Result<f64, AlgoError> {
-        self.shrinkage_.ok_or(AlgoError::NotFitted {
-            estimator: "ledoit_wolf",
-            operation: "shrinkage_",
-        })
-    }
-
-    /// Materialize a device-resident attr to the host, caching the result so
-    /// repeated accesses (e.g. the Python `@property` getters in a loop) skip the
-    /// device→host copy after the first call (IN-05). The cache is reset on every
-    /// `fit`, so it never serves stale state.
-    fn attr(
-        &self,
-        slot: &Option<DeviceArray<ActiveRuntime, F>>,
-        cache: &OnceLock<Vec<F>>,
-        pool: &BufferPool<ActiveRuntime>,
-        operation: &'static str,
-    ) -> Result<Vec<F>, AlgoError> {
-        let arr = slot.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "ledoit_wolf",
-            operation,
-        })?;
-        Ok(cache.get_or_init(|| arr.to_host(pool)).clone())
+    /// Compare the hyperparameter subset of two `Unfit` estimators. Used by the
+    /// defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.assume_centered == other.assume_centered
     }
 }
 
-impl<F> Fit<F> for LedoitWolf<F>
+impl<F> Default for LedoitWolf<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+/// Builder for [`LedoitWolf`] (D-01). `Default` re-derives the sklearn default
+/// from [`LedoitWolf::new`] (D-08 single source).
+#[derive(Debug, Clone, Copy)]
+pub struct LedoitWolfBuilder {
+    assume_centered: bool,
+}
+
+impl Default for LedoitWolfBuilder {
+    /// Re-derive the sklearn default from [`LedoitWolf::new`] (D-08 single
+    /// source). `f64` is pinned only to read the F-independent flag default — the
+    /// builder is non-generic.
+    fn default() -> Self {
+        LedoitWolf::<f64, Unfit>::new(false).into_builder()
+    }
+}
+
+impl LedoitWolfBuilder {
+    /// Set whether the data is assumed already centered (D-07).
+    pub fn assume_centered(mut self, v: bool) -> Self {
+        self.assume_centered = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. LedoitWolf has NO data-INDEPENDENT
+    /// hyperparameter to validate at construction (the single knob is a boolean),
+    /// so `build()` is infallible-but-typed (kept for family uniformity so the
+    /// `build_err_to_py` PyO3 mapper is shape-identical).
+    pub fn build<F>(self) -> Result<LedoitWolf<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(LedoitWolf {
+            assume_centered: self.assume_centered,
+            covariance_: None,
+            location_: None,
+            shrinkage_: None,
+            cov_host: OnceLock::new(),
+            loc_host: OnceLock::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> LedoitWolf<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of `covariance_` (`n_features × n_features`, row-major).
+    /// Memoized after the first call (IN-05). `Some` by construction on `Fitted`.
+    pub fn covariance_(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.cov_host
+            .get_or_init(|| {
+                self.covariance_
+                    .as_ref()
+                    .expect("covariance_ is Some by construction on Fitted")
+                    .to_host(pool)
+            })
+            .clone()
+    }
+
+    /// Host copy of `location_` (length `n_features`). Memoized (IN-05). `Some`
+    /// by construction on `Fitted`.
+    pub fn location_(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.loc_host
+            .get_or_init(|| {
+                self.location_
+                    .as_ref()
+                    .expect("location_ is Some by construction on Fitted")
+                    .to_host(pool)
+            })
+            .clone()
+    }
+
+    /// The fitted `shrinkage_` ∈ [0, 1]. `Some` by construction on `Fitted`.
+    pub fn shrinkage_(&self) -> f64 {
+        self.shrinkage_
+            .expect("shrinkage_ is Some by construction on Fitted")
+    }
+}
+
+impl<F> Fit<F> for LedoitWolf<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = LedoitWolf<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         // `_y` is unused: the retained `Fit`-trait slot for Phase-10 MBSGD reuse
-        // (this estimator is unsupervised; see traits.rs) — not unfinished wiring
-        // (IN-02).
+        // (this estimator is unsupervised; see typestate.rs) — not unfinished
+        // wiring (IN-02).
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<LedoitWolf<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-07-07 / ASVS V5: reject inconsistent geometry BEFORE any prim
         //     launch (untrusted shapes → typed error, not an OOB device read). ---
-        if n_features == 0 || n_samples == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
 
         let n = n_samples as f64;
         let p = n_features as f64;
@@ -273,14 +351,16 @@ where
         let cov_host: Vec<F> = cov_out.iter().map(|&v| f64_to_host::<F>(v)).collect();
         let covariance_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &cov_host);
 
-        // --- 4. Store device-resident fitted state (D-03). ---
-        self.covariance_ = Some(covariance_dev);
-        self.location_ = Some(location_dev);
-        self.shrinkage_ = Some(shrinkage);
-        // Invalidate any memoized host copies from a previous fit (IN-05) so a
-        // re-fit on the same instance never serves stale cached attrs.
-        self.cov_host = OnceLock::new();
-        self.loc_host = OnceLock::new();
-        Ok(self)
+        // --- 4. Reconstruct into the device-resident `Fitted` value (D-03). The
+        //        memo caches start fresh (no accessor exists on `Unfit`). ---
+        Ok(LedoitWolf {
+            assume_centered: self.assume_centered,
+            covariance_: Some(covariance_dev),
+            location_: Some(location_dev),
+            shrinkage_: Some(shrinkage),
+            cov_host: OnceLock::new(),
+            loc_host: OnceLock::new(),
+            _state: PhantomData,
+        })
     }
 }
