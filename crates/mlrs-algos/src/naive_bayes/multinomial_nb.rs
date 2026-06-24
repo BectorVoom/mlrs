@@ -10,6 +10,8 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/multinomial_nb_test.rs` (AGENTS.md §2).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -24,13 +26,18 @@ use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_sum, empirical_class_log_prior, log_sum_exp_normalize,
     NB_LABEL_INT_TOL,
 };
-use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
+// Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
+// param + migration to the consuming-self `typestate` surface. fit/predict math
+// BYTE-IDENTICAL (D-03).
+use crate::typestate::{
+    validate_geometry, Fit, Fitted, PredictLabels, PredictLogProba, PredictProba, Unfit,
+};
 
 /// Multinomial Naive Bayes (NB-02). Construct via [`MultinomialNB::builder`],
 /// then [`Fit::fit`] + (Wave-1) the predict surface. Fitted `feature_log_prob_`
 /// (`n_classes × n_features`) / `class_log_prior_` are device-resident / host f64
 /// (D-03), `None` until `fit`.
-pub struct MultinomialNB<F> {
+pub struct MultinomialNB<F, S = Unfit> {
     /// Additive (Laplace/Lidstone) smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is even when `< 1e-10` (D-02 default `true`); when `false`
@@ -52,9 +59,11 @@ pub struct MultinomialNB<F> {
     feature_log_prob_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Per-class log-prior (host f64, length `n_classes`), `None` until `fit`.
     class_log_prior_: Option<Vec<f64>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> MultinomialNB<F>
+impl<F> MultinomialNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -62,7 +71,12 @@ where
     pub fn builder() -> MultinomialNBBuilder {
         MultinomialNBBuilder::default()
     }
+}
 
+impl<F> MultinomialNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
@@ -141,7 +155,7 @@ impl MultinomialNBBuilder {
     /// - the D-06 `force_alpha` clip+warn: when `force_alpha == false` and
     ///   `alpha < 1e-10` the stored `alpha` is clipped to `1e-10` with a warning
     ///   (sklearn parity depends only on the clipped numeric, A2).
-    pub fn build<F>(self) -> Result<MultinomialNB<F>, BuildError>
+    pub fn build<F>(self) -> Result<MultinomialNB<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -160,30 +174,26 @@ impl MultinomialNBBuilder {
             n_features: 0,
             feature_log_prob_: None,
             class_log_prior_: None,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for MultinomialNB<F>
+impl<F> Fit<F> for MultinomialNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = MultinomialNB<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<MultinomialNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "multinomial_nb",
             operation: "fit (requires y)",
@@ -237,25 +247,30 @@ where
         let class_log_prior_ =
             resolve_class_log_prior("multinomial_nb", self.fit_prior, &self.class_prior, &class_count_, n_classes)?;
 
-        // --- WR-07: release the prior fitted device buffer before storing the new
-        //     one so a re-fit at the same shape conserves live_bytes. ---
-        if let Some(old) = self.feature_log_prob_.take() {
-            old.release_into(pool);
-        }
+        // The consuming-self transition carries no prior fitted state — a fresh
+        // `Unfit` has feature_log_prob_ = None, so the old WR-07 re-fit release is
+        // vacuous and dropped (the KernelDensity/IncrementalPCA precedent); buffer
+        // reuse across re-CONSTRUCT+fit cycles still flows via the pool free-list.
         let flp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
             pool,
             &flp.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
         );
 
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.feature_log_prob_ = Some(flp_dev);
-        self.class_log_prior_ = Some(class_log_prior_);
-        Ok(self)
+        Ok(MultinomialNB {
+            alpha: self.alpha,
+            force_alpha: self.force_alpha,
+            fit_prior: self.fit_prior,
+            class_prior: self.class_prior,
+            classes_,
+            n_features,
+            feature_log_prob_: Some(flp_dev),
+            class_log_prior_: Some(class_log_prior_),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> MultinomialNB<F>
+impl<F> MultinomialNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -319,7 +334,7 @@ where
     }
 }
 
-impl<F> PredictLabels<F> for MultinomialNB<F>
+impl<F> PredictLabels<F> for MultinomialNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -335,7 +350,7 @@ where
     }
 }
 
-impl<F> PredictProba<F> for MultinomialNB<F>
+impl<F> PredictProba<F> for MultinomialNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -360,7 +375,7 @@ where
     }
 }
 
-impl<F> PredictLogProba<F> for MultinomialNB<F>
+impl<F> PredictLogProba<F> for MultinomialNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
