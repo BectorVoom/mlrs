@@ -36,7 +36,7 @@ Requirements for the v3.0 milestone. Each maps to a roadmap phase.
 
 - [ ] **BLDR-01**: User can construct any estimator via an idiomatic Rust builder — `T::builder().param(..).…build() -> Result<T<Unfit>, BuildError>` — with owned chained setters, sklearn-equal defaults, and typed `thiserror` validation variants (single-source defaults so `T::builder().build()? == T::new()` == sklearn default).
 - [x] **BLDR-02**: The fit/unfit distinction is modeled as compile-time typestate (`T<Unfit>` → `T<Fitted>`); `predict` / `transform` / fitted-attr accessors exist only on `T<Fitted>`, preventing predict-before-fit at compile time (the hybrid Rust-surface design).
-- [x] **BLDR-03**: The builder + typestate convention is retrofitted across all existing estimators **additively** (builder constructs the existing config struct; fit path untouched), piloted on 1–2 estimators under the green suite before the full sweep, preserving every shipped 1e-5 / exact-label gate.
+- [ ] **BLDR-03**: The builder + typestate convention is retrofitted across all existing estimators **additively** (builder constructs the existing config struct; fit path untouched), piloted on 1–2 estimators under the green suite before the full sweep, preserving every shipped 1e-5 / exact-label gate.
 - [x] **BLDR-04**: The PyO3 surface is unchanged — the Rust typestate collapses behind the existing `any_estimator!` `Unfit/F32/F64` enum, with a runtime `NotFittedError` analog at the Python boundary.
 
 ### Python sklearn Shim
@@ -90,7 +90,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HDBS-04 | Phase 15 | Complete |
 | BLDR-01 | Phase 12 | Pending |
 | BLDR-02 | Phase 12 | Complete |
-| BLDR-03 | Phase 16 | Complete |
+| BLDR-03 | Phase 16 | In Progress |
 | BLDR-04 | Phase 12 | Complete |
 | SHIM-01 | Phase 16 | Complete |
 | SHIM-02 | Phase 16 | Pending |
