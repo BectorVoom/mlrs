@@ -34,6 +34,12 @@ pub mod knn_graph;
 // `laplacian` host-fn signature compiles today (geometry validation real;
 // compute path `todo!()` until 09-02).
 pub mod laplacian;
+// Phase-15 HDBSCAN mutual-reachability device front-end (HDBS-01, plan 15-05): the
+// host-launch wrapper for the `mlrs-kernels::mutual_reachability` GATHER kernel
+// (dense `n×n` MR `out[i*n+j] = max(core_i, core_j, d_ij/alpha)`). Owns the
+// concrete `ActiveRuntime` + the validate-before-launch guard. File-disjoint,
+// single-owner (the prim re-export precedent).
+pub mod mutual_reachability;
 // Phase-5 prim stubs (Wave-0 scaffold owns these registrations; plans
 // 05-02..06 fill their own file body — file-disjoint, parallel-safe). Each is an
 // empty compiling module until its plan adds the launch wrapper + a `pub use` of

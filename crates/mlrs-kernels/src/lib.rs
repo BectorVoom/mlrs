@@ -23,6 +23,12 @@ pub mod jacobi_eig;
 pub mod jacobi_svd;
 pub mod kmeans;
 pub mod lbfgs;
+// Phase-15 HDBSCAN mutual-reachability (HDBS-01, plan 15-05): the ONE new device
+// kernel of the phase — a SharedMemory-free per-element 2D GATHER computing
+// `out[i*n+j] = max(core_i, core_j, d_ij/alpha)` (the chebyshev_dist running-max
+// shape). This file owns its `pub mod` + `pub use` (file-disjoint, single-owner,
+// the distance/self-drop re-export precedent).
+pub mod mutual_reachability;
 pub mod reduce;
 // Phase-10 SGD kernels (Wave-0 scaffold plan 10-01 owns this registration; the
 // Wave-1 plan drives them from `prims/sgd.rs` — file-disjoint, parallel-safe).
@@ -49,6 +55,14 @@ pub use elementwise::{
 };
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
+// Phase-15 HDBSCAN mutual-reachability GATHER (HDBS-01, plan 15-05): launched by
+// the feature-metric/dense-cosine device front-end via the backend host wrapper
+// in `prims/mutual_reachability.rs`. Re-exported under an explicit alias because
+// the module and the kernel fn share the name `mutual_reachability` (a bare
+// `pub use mutual_reachability::mutual_reachability` would collide the value with
+// the module in this namespace); `mutual_reachability_kernel` is the launch
+// symbol the backend wrapper calls.
+pub use mutual_reachability::mutual_reachability as mutual_reachability_kernel;
 pub use reduce::{
     argmax_shared, argmin_shared, reduce_max_plane, reduce_max_shared, reduce_min_plane,
     reduce_min_shared, reduce_sum_plane, reduce_sum_shared, reduce_sumsq_plane, reduce_sumsq_shared,
