@@ -23,7 +23,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::error::AlgoError;
 use mlrs_algos::neighbors::nearest::NearestNeighbors;
-use mlrs_algos::traits::{Fit, KNeighbors};
+use mlrs_algos::typestate::{Fit, KNeighbors};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -98,8 +98,11 @@ where
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x);
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq);
 
-    let mut nn = NearestNeighbors::<F>::new(KNN_K);
-    nn.fit(&mut pool, &x_dev, None, (KNN_N_TRAIN, KNN_N_FEATURES))
+    let nn = NearestNeighbors::<F>::builder()
+        .n_neighbors(KNN_K)
+        .build::<F>()
+        .expect("build NearestNeighbors")
+        .fit(&mut pool, &x_dev, None, (KNN_N_TRAIN, KNN_N_FEATURES))
         .expect("fit on valid geometry");
 
     let (val_dev, idx_dev) = nn
@@ -146,6 +149,21 @@ fn fixture_loads() {
     );
 }
 
+/// BLDR-01: `NearestNeighbors::new()` equals `NearestNeighbors::builder().build()?`
+/// on the hyperparameter subset (sklearn default `n_neighbors = 5`). Pure host
+/// comparison — no device, so no f64 gate.
+#[test]
+fn defaults_equal() {
+    let from_new = NearestNeighbors::<f64>::new();
+    let from_builder = NearestNeighbors::<f64>::builder()
+        .build::<f64>()
+        .expect("default NearestNeighborsBuilder builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "NearestNeighbors::new() and builder().build()? must agree on hyperparameters (BLDR-01)"
+    );
+}
+
 /// kneighbors distances + exact indices match sklearn, f32 (runs on cpu AND rocm).
 #[test]
 fn nearest_neighbors_distances_match_sklearn_f32() {
@@ -184,8 +202,11 @@ fn nearest_neighbors_rejects_bad_k() {
     let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
     let xq_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &xq);
 
-    let mut nn = NearestNeighbors::<f32>::new(KNN_K);
-    nn.fit(&mut pool, &x_dev, None, (KNN_N_TRAIN, KNN_N_FEATURES))
+    let nn = NearestNeighbors::<f32>::builder()
+        .n_neighbors(KNN_K)
+        .build::<f32>()
+        .expect("build NearestNeighbors")
+        .fit(&mut pool, &x_dev, None, (KNN_N_TRAIN, KNN_N_FEATURES))
         .expect("fit on valid geometry");
 
     // k = 0 (< 1) is rejected.

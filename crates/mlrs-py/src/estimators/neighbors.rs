@@ -11,16 +11,24 @@ use pyo3::prelude::*;
 use mlrs_algos::neighbors::classifier::KNeighborsClassifier;
 use mlrs_algos::neighbors::nearest::NearestNeighbors;
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
-use mlrs_algos::traits::{Fit, KNeighbors, Predict, PredictLabels, PredictProba};
+// Legacy accessor traits still consumed by the not-yet-migrated classifier /
+// regressor arms in this file (removed once all three estimators migrate).
+use mlrs_algos::traits::{Fit, Predict, PredictLabels, PredictProba};
+// Typestate forms for the migrated NearestNeighbors arm; aliased so they do not
+// collide by path with the legacy `traits::*` glob above (typestate module-doc
+// warning) — called via UFCS at the migrated arm only.
+use mlrs_algos::typestate::{
+    Fit as TypestateFit, KNeighbors as TypestateKNeighbors,
+};
 
-use crate::errors::{algo_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
 
 // ---------------------------------------------------------------------------
 // NearestNeighbors — Fit + KNeighbors (distances + i32 indices); NO predict
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyNearestNeighbors,
     algo:  mlrs_algos::neighbors::nearest::NearestNeighbors,
     unfit: { n_neighbors: usize },
@@ -70,16 +78,24 @@ impl PyNearestNeighbors {
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = NearestNeighbors::<f32>::new(n_neighbors);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyNearestNeighbors::F32(est))
+                    let est = NearestNeighbors::<f32>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyNearestNeighbors::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = NearestNeighbors::<f64>::new(n_neighbors);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyNearestNeighbors::F64(est))
+                    let est = NearestNeighbors::<f64>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyNearestNeighbors::F64(fitted))
                 }
             }
         })?;
@@ -96,7 +112,8 @@ impl PyNearestNeighbors {
             match &self.inner {
                 AnyNearestNeighbors::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let (d, i) = est.kneighbors(&mut pool, &xd, (rows, cols), k).map_err(algo_err_to_py)?;
+                    let (d, i) = TypestateKNeighbors::kneighbors(est, &mut pool, &xd, (rows, cols), k)
+                        .map_err(algo_err_to_py)?;
                     Ok((d.to_host_metered(&mut pool), i.to_host_metered(&mut pool)))
                 }
                 _ => Err(not_fitted("nearest_neighbors", "kneighbors (f32 path)")),
@@ -110,7 +127,8 @@ impl PyNearestNeighbors {
             match &self.inner {
                 AnyNearestNeighbors::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let (d, i) = est.kneighbors(&mut pool, &xd, (rows, cols), k).map_err(algo_err_to_py)?;
+                    let (d, i) = TypestateKNeighbors::kneighbors(est, &mut pool, &xd, (rows, cols), k)
+                        .map_err(algo_err_to_py)?;
                     Ok((d.to_host_metered(&mut pool), i.to_host_metered(&mut pool)))
                 }
                 _ => Err(not_fitted("nearest_neighbors", "kneighbors (f64 path)")),
