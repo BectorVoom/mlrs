@@ -49,7 +49,15 @@ use mlrs_algos::naive_bayes::complement_nb::ComplementNB;
 use mlrs_algos::naive_bayes::gaussian_nb::GaussianNB;
 use mlrs_algos::naive_bayes::multinomial_nb::MultinomialNB;
 use mlrs_algos::naive_bayes::nb_common::accuracy_score;
-use mlrs_algos::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
+// Phase 16 (D-01/D-02): all five NB estimators are migrated to the typestate
+// surface. The shared predict-surface free functions call `predict_labels` /
+// `predict_proba` / `predict_log_proba` via these typestate accessor traits on the
+// `Fitted`-tagged arm; the fit arms build the `Unfit` estimator and call the
+// consuming-self `TypestateFit::fit`. This file is fully off `mlrs_algos::traits`.
+use mlrs_algos::typestate::{
+    Fit as TypestateFit, PredictLabels as TypestatePredictLabels,
+    PredictLogProba as TypestatePredictLogProba, PredictProba as TypestatePredictProba,
+};
 
 use crate::errors::{algo_err_to_py, build_err_to_py, dtype_mismatch, not_fitted};
 use crate::ingress::{
@@ -60,13 +68,13 @@ use crate::ingress::{
 // dtype-dispatch enums (D-06) — one per estimator.
 // ===========================================================================
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyGaussianNB,
     algo:  mlrs_algos::naive_bayes::gaussian_nb::GaussianNB,
     unfit: { var_smoothing: f64, priors: Option<Vec<f64>> },
 }
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyMultinomialNB,
     algo:  mlrs_algos::naive_bayes::multinomial_nb::MultinomialNB,
     unfit: {
@@ -75,7 +83,7 @@ crate::any_estimator! {
     },
 }
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyBernoulliNB,
     algo:  mlrs_algos::naive_bayes::bernoulli_nb::BernoulliNB,
     unfit: {
@@ -84,7 +92,7 @@ crate::any_estimator! {
     },
 }
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyComplementNB,
     algo:  mlrs_algos::naive_bayes::complement_nb::ComplementNB,
     unfit: {
@@ -93,7 +101,7 @@ crate::any_estimator! {
     },
 }
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyCategoricalNB,
     algo:  mlrs_algos::naive_bayes::categorical_nb::CategoricalNB,
     unfit: {
@@ -381,27 +389,27 @@ impl PyGaussianNB {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = GaussianNB::<f32>::builder()
+                    let est = GaussianNB::<f32>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyGaussianNB::F32(est))
+                    Ok(AnyGaussianNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = GaussianNB::<f64>::builder()
+                    let est = GaussianNB::<f64>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyGaussianNB::F64(est))
+                    Ok(AnyGaussianNB::F64(fitted))
                 }
             }
         })?;
@@ -525,31 +533,31 @@ impl PyMultinomialNB {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = MultinomialNB::<f32>::builder()
+                    let est = MultinomialNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .fit_prior(fit_prior)
                         .class_prior(class_prior)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyMultinomialNB::F32(est))
+                    Ok(AnyMultinomialNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = MultinomialNB::<f64>::builder()
+                    let est = MultinomialNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .fit_prior(fit_prior)
                         .class_prior(class_prior)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyMultinomialNB::F64(est))
+                    Ok(AnyMultinomialNB::F64(fitted))
                 }
             }
         })?;
@@ -668,7 +676,7 @@ impl PyBernoulliNB {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = BernoulliNB::<f32>::builder()
+                    let est = BernoulliNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .binarize(binarize)
@@ -676,15 +684,15 @@ impl PyBernoulliNB {
                         .class_prior(class_prior)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyBernoulliNB::F32(est))
+                    Ok(AnyBernoulliNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = BernoulliNB::<f64>::builder()
+                    let est = BernoulliNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .binarize(binarize)
@@ -692,9 +700,9 @@ impl PyBernoulliNB {
                         .class_prior(class_prior)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyBernoulliNB::F64(est))
+                    Ok(AnyBernoulliNB::F64(fitted))
                 }
             }
         })?;
@@ -813,7 +821,7 @@ impl PyComplementNB {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = ComplementNB::<f32>::builder()
+                    let est = ComplementNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .fit_prior(fit_prior)
@@ -821,15 +829,15 @@ impl PyComplementNB {
                         .norm(norm)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyComplementNB::F32(est))
+                    Ok(AnyComplementNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = ComplementNB::<f64>::builder()
+                    let est = ComplementNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .fit_prior(fit_prior)
@@ -837,9 +845,9 @@ impl PyComplementNB {
                         .norm(norm)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyComplementNB::F64(est))
+                    Ok(AnyComplementNB::F64(fitted))
                 }
             }
         })?;
@@ -989,7 +997,7 @@ impl PyCategoricalNB {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = CategoricalNB::<f32>::builder()
+                    let est = CategoricalNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .fit_prior(fit_prior)
@@ -997,15 +1005,15 @@ impl PyCategoricalNB {
                         .min_categories(min_categories)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyCategoricalNB::F32(est))
+                    Ok(AnyCategoricalNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = CategoricalNB::<f64>::builder()
+                    let est = CategoricalNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
                         .fit_prior(fit_prior)
@@ -1013,9 +1021,9 @@ impl PyCategoricalNB {
                         .min_categories(min_categories)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyCategoricalNB::F64(est))
+                    Ok(AnyCategoricalNB::F64(fitted))
                 }
             }
         })?;

@@ -17,6 +17,8 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/categorical_nb_test.rs` (AGENTS.md §2).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -28,7 +30,12 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::multinomial_nb::{decode_classes, resolve_class_log_prior, validate_discrete_alpha};
 use crate::naive_bayes::nb_common::{argmax_decode, log_sum_exp_normalize, NB_LABEL_INT_TOL};
-use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
+// Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
+// param + migration to the consuming-self `typestate` surface. fit/predict math
+// BYTE-IDENTICAL (D-03).
+use crate::typestate::{
+    validate_geometry, Fit, Fitted, PredictLabels, PredictLogProba, PredictProba, Unfit,
+};
 
 /// The minimum-categories-per-feature specification (D-04), modeled on the
 /// `BandwidthSpec` value-shaped-knob precedent. Captures sklearn's
@@ -53,7 +60,7 @@ pub enum MinCategories {
 /// then [`Fit::fit`] + (Wave-1) the predict surface. Fitted `feature_log_prob_`
 /// is a ragged host `Vec<Vec<f64>>` (one matrix per feature); `class_log_prior_`
 /// is host f64 (D-03), `None` until `fit`.
-pub struct CategoricalNB<F> {
+pub struct CategoricalNB<F, S = Unfit> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is when `< 1e-10` (D-02 default `true`); else clip (D-06).
@@ -89,9 +96,11 @@ pub struct CategoricalNB<F> {
     class_count_: Option<Vec<f64>>,
     /// Marker to retain the `F` type parameter (the device buffers land in Wave-1).
     _marker: std::marker::PhantomData<F>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> CategoricalNB<F>
+impl<F> CategoricalNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -99,7 +108,12 @@ where
     pub fn builder() -> CategoricalNBBuilder {
         CategoricalNBBuilder::default()
     }
+}
 
+impl<F> CategoricalNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
@@ -194,7 +208,7 @@ impl CategoricalNBBuilder {
     /// construction; the per-feature LENGTH-`== n_features` check is data-DEPENDENT
     /// and stays at `fit`. The [`BuildError::InvalidMinCategories`] variant exists
     /// for any future signed-input path (kept for the typed surface).
-    pub fn build<F>(self) -> Result<CategoricalNB<F>, BuildError>
+    pub fn build<F>(self) -> Result<CategoricalNB<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -217,30 +231,26 @@ impl CategoricalNBBuilder {
             class_log_prior_: None,
             class_count_: None,
             _marker: std::marker::PhantomData,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for CategoricalNB<F>
+impl<F> Fit<F> for CategoricalNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = CategoricalNB<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<CategoricalNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "categorical_nb",
             operation: "fit (requires y)",
@@ -353,20 +363,28 @@ where
             n_classes,
         )?;
 
-        // WR-07: the only device scratch was the host read of `x`; the ragged
-        // tables are host f64. Re-fit simply overwrites the host-resident fitted
-        // state (no device buffers held), so live_bytes is conserved.
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.n_categories_ = Some(n_categories_);
-        self.feature_log_prob_ = Some(feature_log_prob_);
-        self.class_log_prior_ = Some(class_log_prior_);
-        self.class_count_ = Some(class_count_);
-        Ok(self)
+        // The ragged fitted tables are host f64 (CategoricalNB holds NO device
+        // buffer), so the consuming-self transition just moves the host state into
+        // the Fitted value; buffer reuse across re-CONSTRUCT+fit is a non-issue.
+        Ok(CategoricalNB {
+            alpha: self.alpha,
+            force_alpha: self.force_alpha,
+            fit_prior: self.fit_prior,
+            class_prior: self.class_prior,
+            min_categories: self.min_categories,
+            classes_,
+            n_features,
+            n_categories_: Some(n_categories_),
+            feature_log_prob_: Some(feature_log_prob_),
+            class_log_prior_: Some(class_log_prior_),
+            class_count_: Some(class_count_),
+            _marker: std::marker::PhantomData,
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> CategoricalNB<F>
+impl<F> CategoricalNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -461,7 +479,7 @@ where
     }
 }
 
-impl<F> PredictLabels<F> for CategoricalNB<F>
+impl<F> PredictLabels<F> for CategoricalNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -477,7 +495,7 @@ where
     }
 }
 
-impl<F> PredictProba<F> for CategoricalNB<F>
+impl<F> PredictProba<F> for CategoricalNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -502,7 +520,7 @@ where
     }
 }
 
-impl<F> PredictLogProba<F> for CategoricalNB<F>
+impl<F> PredictLogProba<F> for CategoricalNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
