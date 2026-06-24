@@ -524,7 +524,10 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_samples, n_features) = shape;
         let s = self.fitted_state();
-        if n_features != self.n_features || x.len() != n_samples * n_features {
+        // WR-04: reject an empty query (n_samples == 0) before the GEMM; without
+        // it `x.len() == 0 == 0 * n_features` passes the shape check and a
+        // zero-row transform reaches the device, unlike every other path.
+        if n_samples == 0 || n_features != self.n_features || x.len() != n_samples * n_features {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "x",
                 rows: n_samples,
@@ -586,7 +589,10 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_samples, n_components) = shape;
         let s = self.fitted_state();
-        if n_components != s.n_components || z.len() != n_samples * n_components {
+        // WR-04: reject an empty query (n_samples == 0) before the GEMM; without
+        // it `z.len() == 0 == 0 * n_components` passes the shape check and a
+        // zero-row inverse-transform reaches the device, unlike every other path.
+        if n_samples == 0 || n_components != s.n_components || z.len() != n_samples * n_components {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "z",
                 rows: n_samples,

@@ -371,7 +371,11 @@ where
         estimator,
         operation: "transform",
     })?;
-    if n_features != fitted_n_features || x.len() != n_samples * n_features {
+    // WR-04: reject an empty query (n_samples == 0) before launching a zero-row
+    // GEMM. Without this guard `x.len() == 0 == 0 * n_features` passes the shape
+    // check and a degenerate transform reaches the device; every other
+    // transform/predict path in the crate rejects n_samples == 0 first.
+    if n_samples == 0 || n_features != fitted_n_features || x.len() != n_samples * n_features {
         return Err(AlgoError::Prim(PrimError::ShapeMismatch {
             operand: "x",
             rows: n_samples,
