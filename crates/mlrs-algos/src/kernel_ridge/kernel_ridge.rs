@@ -349,14 +349,20 @@ where
             len: 0,
         }))?;
         // Recover n_targets from y's length (the Fit trait carries no n_targets
-        // slot). y.len() must be a positive multiple of n_samples; the geometry
-        // guard below (y.len() == n_samples * n_targets) is then trivially true and
-        // an n_samples == 0 / empty y is rejected by the shared shape guards.
-        let n_targets = if n_samples > 0 {
-            y.len() / n_samples
-        } else {
-            0
-        };
+        // slot). y.len() must be a POSITIVE MULTIPLE of n_samples. WR-05: enforce
+        // the divisibility intent explicitly here rather than relying on the
+        // post-hoc `y.len() == n_samples * n_targets` equality below, so a future
+        // refactor that relaxes that clause cannot let a non-multiple y through
+        // with a silently-truncated target count.
+        if n_samples == 0 || y.len() == 0 || y.len() % n_samples != 0 {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 0,
+                len: y.len(),
+            }));
+        }
+        let n_targets = y.len() / n_samples;
 
         // --- T-08-03-01 / ASVS V5: validate the untrusted hyperparameters and
         //     geometry BEFORE any prim launch. alpha < 0 is now rejected at
