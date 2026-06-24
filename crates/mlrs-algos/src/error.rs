@@ -424,6 +424,19 @@ pub enum BuildError {
         l1_ratio: f64,
     },
 
+    /// DBSCAN was given a non-positive (or non-finite) neighborhood radius `eps`.
+    /// The radius must be `eps >= 0` (a negative radius is geometrically
+    /// meaningless and would make every point noise). Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split, T-05-07-01) — the construction-time
+    /// sibling of [`AlgoError::InvalidEps`].
+    #[error("estimator '{estimator}': eps = {eps} is invalid (must be >= 0)")]
+    InvalidEps {
+        /// Which estimator's builder rejected the value (e.g. `"dbscan"`).
+        estimator: &'static str,
+        /// The offending radius.
+        eps: f64,
+    },
+
     /// A linear-SVM estimator (LinearSVC / LinearSVR) was given a non-positive
     /// inverse-regularization `C`. `C` scales the data-fit (hinge / epsilon-tube)
     /// term against the L2 penalty and must be `C > 0` (sklearn's contract); a
@@ -609,17 +622,18 @@ pub enum BuildError {
         min_cluster_size: usize,
     },
 
-    /// `HDBSCAN` was given a `min_samples` of 0 (Phase 15, HDBS-01, T-15-03-V5b).
-    /// The core-distance smoothing count must be `>= 1` (a core point counts at
-    /// least itself); a value of 0 is undefined. Rejected at `build()`
-    /// (data-INDEPENDENT, the D-08 split) — never at `fit`. This resolves the
-    /// shell's deferred `min_samples` validation TODO.
+    /// A density estimator (`HDBSCAN` min_samples — Phase 15, HDBS-01,
+    /// T-15-03-V5b; or `DBSCAN` min_samples — Phase 16, CLUSTER-02, T-05-07-01)
+    /// was given a `min_samples` of 0. The core-point count must be `>= 1` (a
+    /// core point counts at least itself); a value of 0 is undefined. Rejected at
+    /// `build()` (data-INDEPENDENT, the D-08 split) — never at `fit`. The
+    /// construction-time sibling of [`AlgoError::InvalidMinSamples`].
     #[error(
         "estimator '{estimator}': min_samples = {min_samples} is invalid \
          (must be >= 1 when Some)"
     )]
     InvalidMinSamples {
-        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        /// Which estimator's builder rejected the value (`"hdbscan"` / `"dbscan"`).
         estimator: &'static str,
         /// The offending core-point smoothing count.
         min_samples: usize,

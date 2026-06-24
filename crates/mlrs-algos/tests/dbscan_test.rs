@@ -25,7 +25,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::cluster::dbscan::DBSCAN;
-use mlrs_algos::traits::Fit;
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -68,19 +68,17 @@ where
     let eps = case.expect_f64("eps")[0];
     let min_samples = case.expect_f64("min_samples")[0] as usize;
 
-    let mut db = DBSCAN::<F>::new(eps, min_samples);
-    db.fit(&mut pool, &x_dev, None, (DB_N_SAMPLES, DB_N_FEATURES))
+    let db = DBSCAN::<F>::builder()
+        .eps(eps)
+        .min_samples(min_samples)
+        .build::<F>()
+        .expect("DBSCAN build with valid hyperparameters");
+    let db = db
+        .fit(&mut pool, &x_dev, None, (DB_N_SAMPLES, DB_N_FEATURES))
         .expect("DBSCAN::fit on a valid shape");
 
-    let labels: Vec<i64> = db
-        .labels(&pool)
-        .expect("labels_ after fit")
-        .iter()
-        .map(|&l| l as i64)
-        .collect();
-    let core: Vec<i32> = db
-        .core_sample_indices(&pool)
-        .expect("core_sample_indices_ after fit");
+    let labels: Vec<i64> = db.labels(&pool).iter().map(|&l| l as i64).collect();
+    let core: Vec<i32> = db.core_sample_indices(&pool);
     (labels, core)
 }
 
@@ -160,12 +158,16 @@ fn dbscan_fit_predict_consistency_f32() {
     let eps = case.expect_f64("eps")[0];
     let min_samples = case.expect_f64("min_samples")[0] as usize;
 
-    let mut db = DBSCAN::<f32>::new(eps, min_samples);
-    let fp = db
+    let db = DBSCAN::<f32>::builder()
+        .eps(eps)
+        .min_samples(min_samples)
+        .build::<f32>()
+        .expect("DBSCAN build with valid hyperparameters");
+    let (db, fp) = db
         .fit_predict(&mut pool, &x_dev, (DB_N_SAMPLES, DB_N_FEATURES))
         .expect("DBSCAN::fit_predict");
     let fp_labels: Vec<i32> = fp.to_host(&pool);
-    let fitted_labels: Vec<i32> = db.labels(&pool).unwrap();
+    let fitted_labels: Vec<i32> = db.labels(&pool);
 
     assert_eq!(
         fp_labels, fitted_labels,
@@ -177,35 +179,51 @@ fn dbscan_fit_predict_consistency_f32() {
     );
 }
 
-/// Invalid hyperparameters are rejected at `fit` BEFORE any launch (ASVS V5):
-/// `eps < 0` → `InvalidEps`, `min_samples == 0` → `InvalidMinSamples`.
+/// Invalid hyperparameters are rejected at `build()` BEFORE any data is seen
+/// (ASVS V5, the D-08 split): `eps < 0` → `BuildError::InvalidEps`,
+/// `min_samples == 0` → `BuildError::InvalidMinSamples`. The data-INDEPENDENT
+/// validation now lives in the builder, not the fit body (Phase 16 retrofit).
 #[test]
 fn dbscan_rejects_invalid_hyperparameters_f32() {
-    let case = load_npz(fixture("dbscan_f32_seed42.npz")).expect("load dbscan_f32");
-    let client = runtime::active_client();
-    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
-    let x_host: Vec<f32> = case.expect_f64("X").iter().map(|&v| v as f32).collect();
-    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
-
-    // fit returns Result<&mut Self, _>; &mut Self is not Debug, so map the Ok arm
-    // away before inspecting the error (cannot use expect_err on a non-Debug Ok).
-    let mut bad_eps = DBSCAN::<f32>::new(-1.0, 4);
-    let err = bad_eps
-        .fit(&mut pool, &x_dev, None, (DB_N_SAMPLES, DB_N_FEATURES))
-        .map(|_| ())
-        .expect_err("eps < 0 must be rejected");
+    // build() returns Result<DBSCAN<F, Unfit>, BuildError>; DBSCAN is not Debug,
+    // so map the Ok arm away (.err()) before inspecting the error.
+    let bad_eps = DBSCAN::<f32>::builder()
+        .eps(-1.0)
+        .min_samples(4)
+        .build::<f32>()
+        .err();
     assert!(
-        matches!(err, mlrs_algos::AlgoError::InvalidEps { .. }),
-        "eps < 0 should surface InvalidEps, got {err:?}"
+        matches!(
+            bad_eps,
+            Some(mlrs_algos::error::BuildError::InvalidEps { .. })
+        ),
+        "eps < 0 should surface BuildError::InvalidEps, got {bad_eps:?}"
     );
 
-    let mut bad_min = DBSCAN::<f32>::new(0.7, 0);
-    let err = bad_min
-        .fit(&mut pool, &x_dev, None, (DB_N_SAMPLES, DB_N_FEATURES))
-        .map(|_| ())
-        .expect_err("min_samples == 0 must be rejected");
+    let bad_min = DBSCAN::<f32>::builder()
+        .eps(0.7)
+        .min_samples(0)
+        .build::<f32>()
+        .err();
     assert!(
-        matches!(err, mlrs_algos::AlgoError::InvalidMinSamples { .. }),
-        "min_samples == 0 should surface InvalidMinSamples, got {err:?}"
+        matches!(
+            bad_min,
+            Some(mlrs_algos::error::BuildError::InvalidMinSamples { .. })
+        ),
+        "min_samples == 0 should surface BuildError::InvalidMinSamples, got {bad_min:?}"
+    );
+}
+
+/// BLDR-01: `DBSCAN::new()` (the single-source defaults) equals
+/// `DBSCAN::builder().build()` (the builder defaults re-derived from `new`).
+#[test]
+fn dbscan_defaults_equal() {
+    let from_new = DBSCAN::<f32>::new();
+    let from_builder = DBSCAN::<f32>::builder()
+        .build::<f32>()
+        .expect("default DBSCAN builder build");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "DBSCAN::new() must equal DBSCAN::builder().build() (BLDR-01)"
     );
 }
