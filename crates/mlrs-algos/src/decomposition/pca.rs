@@ -31,6 +31,8 @@
 //! Tests live in `crates/mlrs-algos/tests/pca_test.rs` (AGENTS.md §2), never an
 //! in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -43,15 +45,19 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::sign_flip::align_rows;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, Transform};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{Fit, Fitted, Transform, Unfit};
 
 /// Principal component analysis (DECOMP-01) fitted by the SVD of centered `X`.
 ///
-/// Construct with [`Pca::new`] (`n_components`), then [`Fit::fit`] and
+/// Construct with the zero-arg [`Pca::new`] (sklearn-style default
+/// `n_components = 2`) or [`Pca::builder`] (`.n_components(usize)`), then the
+/// consuming [`Fit::fit`] (returns the `Fitted`-tagged sibling) and
 /// [`Transform::transform`] / [`Transform::inverse_transform`]. Fitted attributes
-/// are device-resident (D-03); the host accessors materialize them on demand.
-pub struct Pca<F> {
+/// are device-resident (D-03); the host accessors materialize them on demand and
+/// exist ONLY on `Pca<F, Fitted>` (the compile-time typestate replaces the old
+/// runtime `NotFitted` guard, D-03).
+pub struct Pca<F, S = Unfit> {
     /// Number of components to keep (`1 ..= min(n_samples, n_features)`).
     n_components: usize,
     /// `components_` (`n_components × n_features`), row-major, device-resident.
@@ -66,87 +72,168 @@ pub struct Pca<F> {
     mean_: Option<DeviceArray<ActiveRuntime, F>>,
     /// `n_features` seen at fit, for `transform`/`inverse_transform` geometry.
     n_features: usize,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> Pca<F>
+impl<F> Pca<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `PCA` keeping `n_components` principal components
-    /// (D-06 minimal surface — v1 takes an int `k ≤ min(m, n)`).
-    pub fn new(n_components: usize) -> Self {
+    /// Create an unfitted `PCA` with the sklearn-style default `n_components = 2`
+    /// directly in the `Unfit` state. This is the SINGLE source of truth for the
+    /// default hyperparameter (D-08): the builder `Default` re-derives from here
+    /// via [`Pca::into_builder`], rather than re-listing the literal. The actual
+    /// `n_components` is validated against `min(n_samples, n_features)` at `fit`
+    /// (it is a data-DEPENDENT bound), so [`PcaBuilder::build`] is infallible.
+    pub fn new() -> Self {
         Self {
-            n_components,
+            n_components: 2,
             components_: None,
             explained_variance_: None,
             explained_variance_ratio_: None,
             singular_values_: None,
             mean_: None,
             n_features: 0,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of `components_` (`n_components × n_features`, row-major).
-    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.components_, pool, "components_")
+    /// Start building a `PCA` from the default `n_components` (D-08 single source).
+    pub fn builder() -> PcaBuilder {
+        PcaBuilder::default()
+    }
+
+    /// Decompose this (unfit) estimator back into its builder, copying the
+    /// hyperparameter. Used by [`PcaBuilder::default`] to re-derive the default
+    /// from [`Pca::new`] (D-08).
+    pub fn into_builder(self) -> PcaBuilder {
+        PcaBuilder {
+            n_components: self.n_components,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// device fields are excluded — all are `None` in any `Unfit` value). Used by
+    /// the defaults-equality test (BLDR-01):
+    /// `Pca::new().hyperparams_eq(&Pca::builder().build()?)`.
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.n_components == other.n_components
+    }
+}
+
+impl<F> Default for Pca<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`Pca`] (D-01). `Default` re-derives the default `n_components`
+/// from [`Pca::new`] (D-08 single source) rather than holding a literal
+/// (Pitfall 1: default-drift breaks the oracle gate silently).
+#[derive(Debug, Clone, Copy)]
+pub struct PcaBuilder {
+    n_components: usize,
+}
+
+impl Default for PcaBuilder {
+    /// Re-derive the default `n_components` from [`Pca::new`] (D-08 single source).
+    fn default() -> Self {
+        Pca::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl PcaBuilder {
+    /// Set the number of principal components to keep
+    /// (`1 ..= min(n_samples, n_features)`; validated against the data shape at
+    /// `fit`).
+    pub fn n_components(mut self, v: usize) -> Self {
+        self.n_components = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. PCA's `n_components` bound is
+    /// `1 ..= min(n_samples, n_features)` — a data-DEPENDENT bound that cannot be
+    /// validated before the data shape is seen, so it stays in [`Fit::fit`]
+    /// (`AlgoError::InvalidNComponents`). This `build()` is therefore
+    /// infallible-but-typed (`Result<_, BuildError>` that never errs), kept for
+    /// uniformity with the penalized builders so the `build_err_to_py` PyO3 mapper
+    /// is shape-identical across the family.
+    pub fn build<F>(self) -> Result<Pca<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(Pca {
+            n_components: self.n_components,
+            components_: None,
+            explained_variance_: None,
+            explained_variance_ratio_: None,
+            singular_values_: None,
+            mean_: None,
+            n_features: 0,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> Pca<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of `components_` (`n_components × n_features`, row-major). `Some`
+    /// by construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.components_, pool)
     }
 
     /// Host copy of `explained_variance_` (length `n_components`).
-    pub fn explained_variance(
-        &self,
-        pool: &BufferPool<ActiveRuntime>,
-    ) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.explained_variance_, pool, "explained_variance_")
+    pub fn explained_variance(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.explained_variance_, pool)
     }
 
     /// Host copy of `explained_variance_ratio_` (length `n_components`).
-    pub fn explained_variance_ratio(
-        &self,
-        pool: &BufferPool<ActiveRuntime>,
-    ) -> Result<Vec<F>, AlgoError> {
-        self.attr(
-            &self.explained_variance_ratio_,
-            pool,
-            "explained_variance_ratio_",
-        )
+    pub fn explained_variance_ratio(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.explained_variance_ratio_, pool)
     }
 
     /// Host copy of `singular_values_` (length `n_components`).
-    pub fn singular_values(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.singular_values_, pool, "singular_values_")
+    pub fn singular_values(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.singular_values_, pool)
     }
 
     /// Host copy of `mean_` (length `n_features`).
-    pub fn mean(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.mean_, pool, "mean_")
+    pub fn mean(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.mean_, pool)
     }
 
     fn attr(
         &self,
         slot: &Option<DeviceArray<ActiveRuntime, F>>,
         pool: &BufferPool<ActiveRuntime>,
-        operation: &'static str,
-    ) -> Result<Vec<F>, AlgoError> {
+    ) -> Vec<F> {
         slot.as_ref()
-            .map(|a| a.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "pca",
-                operation,
-            })
+            .expect("fitted attribute is Some by construction on Pca<F, Fitted>")
+            .to_host(pool)
     }
 }
 
-impl<F> Fit<F> for Pca<F>
+impl<F> Fit<F> for Pca<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = Pca<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<Pca<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         let k = n_samples.min(n_features);
 
@@ -261,17 +348,20 @@ where
         vt.release_into(pool);
         x_c_dev.release_into(pool);
 
-        self.components_ = Some(components_dev);
-        self.explained_variance_ = Some(ev_dev);
-        self.explained_variance_ratio_ = Some(ratio_dev);
-        self.singular_values_ = Some(sv_dev);
-        self.mean_ = Some(mean_dev);
-        self.n_features = n_features;
-        Ok(self)
+        Ok(Pca {
+            n_components: self.n_components,
+            components_: Some(components_dev),
+            explained_variance_: Some(ev_dev),
+            explained_variance_ratio_: Some(ratio_dev),
+            singular_values_: Some(sv_dev),
+            mean_: Some(mean_dev),
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Transform<F> for Pca<F>
+impl<F> Transform<F> for Pca<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {

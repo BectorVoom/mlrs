@@ -24,7 +24,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::decomposition::pca::Pca;
-use mlrs_algos::traits::{Fit, Transform};
+use mlrs_algos::typestate::{Fit, Transform};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -147,20 +147,20 @@ where
     let x_host: Vec<F> = x_f64.iter().map(|&v| f64_to::<F>(v)).collect();
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut pca = Pca::<F>::new(nc);
-    pca.fit(&mut pool, &x_dev, None, (n_samples, n_features))
+    let pca = Pca::<F>::builder()
+        .n_components(nc)
+        .build::<F>()
+        .expect("PcaBuilder::build is infallible")
+        .fit(&mut pool, &x_dev, None, (n_samples, n_features))
         .expect("Pca::fit on a valid shape");
 
     let promote = |v: Vec<F>| v.iter().map(|&x| host_to_f64(x)).collect::<Vec<f64>>();
 
-    let components = promote(pca.components(&pool).expect("components_ after fit"));
-    let explained_variance = promote(pca.explained_variance(&pool).expect("explained_variance_"));
-    let explained_variance_ratio = promote(
-        pca.explained_variance_ratio(&pool)
-            .expect("explained_variance_ratio_"),
-    );
-    let singular_values = promote(pca.singular_values(&pool).expect("singular_values_"));
-    let mean = promote(pca.mean(&pool).expect("mean_"));
+    let components = promote(pca.components(&pool));
+    let explained_variance = promote(pca.explained_variance(&pool));
+    let explained_variance_ratio = promote(pca.explained_variance_ratio(&pool));
+    let singular_values = promote(pca.singular_values(&pool));
+    let mean = promote(pca.mean(&pool));
 
     let z = pca
         .transform(&mut pool, &x_dev, (n_samples, n_features))
@@ -182,6 +182,20 @@ where
         inverse,
         x: x_f64,
     }
+}
+
+/// BLDR-01: the zero-arg `new()` defaults equal the builder's `build()` defaults
+/// (single-source invariant — `Pca::new().hyperparams_eq(&Pca::builder().build()?)`).
+#[test]
+fn pca_defaults_equal() {
+    let from_new = Pca::<f64>::new();
+    let from_builder = Pca::<f64>::builder()
+        .build::<f64>()
+        .expect("PcaBuilder::build is infallible");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "Pca::new() defaults must equal Pca::builder().build() defaults"
+    );
 }
 
 // ===========================================================================

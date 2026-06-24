@@ -12,16 +12,27 @@ use pyo3::prelude::*;
 use mlrs_algos::decomposition::incremental_pca::IncrementalPCA;
 use mlrs_algos::decomposition::pca::Pca;
 use mlrs_algos::decomposition::truncated_svd::TruncatedSvd;
+// Phase 16 (D-01): the decomposition wrappers are mid-migration to the typestate
+// surface. PCA has migrated; TruncatedSVD/IncrementalPCA still call the legacy
+// `mlrs_algos::traits` surface, so that glob stays until they migrate too (the
+// final `traits.rs` deletion is Plan 16-11). The typestate lifecycle traits are
+// imported under disambiguating `Typestate*` aliases (mirrors `linear.rs`/
+// `cluster.rs`) and called via UFCS at the migrated PCA arms so the
+// `fit`/`partial_fit`/`transform` method-name collisions across the two surfaces
+// resolve unambiguously.
 use mlrs_algos::traits::{Fit, PartialFit, Transform};
+use mlrs_algos::typestate::{
+    Fit as TypestateFit, Transform as TypestateTransform,
+};
 
-use crate::errors::{algo_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
 
 // ---------------------------------------------------------------------------
 // PCA — Fit (unsupervised) + Transform + inverse_transform
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyPca,
     algo:  mlrs_algos::decomposition::pca::Pca,
     unfit: { n_components: usize },
@@ -66,20 +77,28 @@ impl PyPCA {
             _ => 0,
         };
         let fitted = py.detach(|| -> PyResult<AnyPca> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = Pca::<f32>::new(n_components);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyPca::F32(est))
+                    let est = Pca::<f32>::builder()
+                        .n_components(n_components)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyPca::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = Pca::<f64>::new(n_components);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyPca::F64(est))
+                    let est = Pca::<f64>::builder()
+                        .n_components(n_components)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyPca::F64(fitted))
                 }
             }
         })?;
@@ -91,11 +110,11 @@ impl PyPCA {
     fn transform_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyPca::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("pca", "transform (f32 path)")),
             }
@@ -104,11 +123,11 @@ impl PyPCA {
     fn transform_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyPca::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("pca", "transform (f64 path)")),
             }
@@ -120,11 +139,11 @@ impl PyPCA {
     fn inverse_transform_f32(&self, py: Python<'_>, z: &Bound<'_, PyAny>, rows: usize, k: usize) -> PyResult<Vec<f32>> {
         let za = capsule_to_array(z)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyPca::F32(est) => {
                     let zd = validated_f32(as_f32(&za)?, &mut pool)?;
-                    Ok(est.inverse_transform(&mut pool, &zd, (rows, k)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::inverse_transform(est, &mut pool, &zd, (rows, k)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("pca", "inverse_transform (f32 path)")),
             }
@@ -133,11 +152,11 @@ impl PyPCA {
     fn inverse_transform_f64(&self, py: Python<'_>, z: &Bound<'_, PyAny>, rows: usize, k: usize) -> PyResult<Vec<f64>> {
         let za = capsule_to_array(z)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyPca::F64(est) => {
                     let zd = validated_f64(as_f64(&za)?, &mut pool)?;
-                    Ok(est.inverse_transform(&mut pool, &zd, (rows, k)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::inverse_transform(est, &mut pool, &zd, (rows, k)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("pca", "inverse_transform (f64 path)")),
             }
@@ -145,58 +164,58 @@ impl PyPCA {
     }
 
     fn components_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F32(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnyPca::F32(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("pca", "components_ (f32)")),
         }
     }
     fn components_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F64(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnyPca::F64(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("pca", "components_ (f64)")),
         }
     }
     fn mean_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F32(e) => e.mean(&pool).map_err(algo_err_to_py),
+            AnyPca::F32(e) => Ok(e.mean(&pool)),
             _ => Err(not_fitted("pca", "mean_ (f32)")),
         }
     }
     fn mean_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F64(e) => e.mean(&pool).map_err(algo_err_to_py),
+            AnyPca::F64(e) => Ok(e.mean(&pool)),
             _ => Err(not_fitted("pca", "mean_ (f64)")),
         }
     }
     fn explained_variance_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F32(e) => e.explained_variance(&pool).map_err(algo_err_to_py),
+            AnyPca::F32(e) => Ok(e.explained_variance(&pool)),
             _ => Err(not_fitted("pca", "explained_variance_ (f32)")),
         }
     }
     fn explained_variance_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F64(e) => e.explained_variance(&pool).map_err(algo_err_to_py),
+            AnyPca::F64(e) => Ok(e.explained_variance(&pool)),
             _ => Err(not_fitted("pca", "explained_variance_ (f64)")),
         }
     }
     fn explained_variance_ratio_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F32(e) => e.explained_variance_ratio(&pool).map_err(algo_err_to_py),
+            AnyPca::F32(e) => Ok(e.explained_variance_ratio(&pool)),
             _ => Err(not_fitted("pca", "explained_variance_ratio_ (f32)")),
         }
     }
     fn explained_variance_ratio_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyPca::F64(e) => e.explained_variance_ratio(&pool).map_err(algo_err_to_py),
+            AnyPca::F64(e) => Ok(e.explained_variance_ratio(&pool)),
             _ => Err(not_fitted("pca", "explained_variance_ratio_ (f64)")),
         }
     }
