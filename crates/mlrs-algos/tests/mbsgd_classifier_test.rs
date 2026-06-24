@@ -30,7 +30,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_algos::error::BuildError;
 use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
-use mlrs_algos::traits::{Fit, PredictLabels, PredictProba};
+use mlrs_algos::typestate::{Fit, PredictLabels, PredictProba};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -166,20 +166,18 @@ where
     if lr != LearningRate::Optimal {
         builder = builder.eta0(SGD_ETA0);
     }
-    let mut clf = builder
+    let clf = builder
         .build::<F>()
-        .expect("MBSGDClassifier builds with valid hyperparameters");
-
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("MBSGDClassifier builds with valid hyperparameters")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("MBSGDClassifier::fit on a valid shape");
 
     let coef: Vec<f64> = clf
         .coef(&pool)
-        .expect("coef_ after fit")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
-    let intercept = host_to_f64(clf.intercept(&pool).expect("intercept_ after fit"));
+    let intercept = host_to_f64(clf.intercept(&pool));
 
     let labels_dev = clf
         .predict_labels(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
@@ -361,7 +359,7 @@ where
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq_host);
 
-    let mut clf = MBSGDClassifier::<F>::builder()
+    let clf = MBSGDClassifier::<F>::builder()
         .loss(Loss::Log)
         .penalty(Penalty::L2)
         .alpha(SGD_ALPHA)
@@ -373,9 +371,8 @@ where
         .batch_size(1)
         .fit_intercept(true)
         .build::<F>()
-        .expect("MBSGDClassifier(log) builds");
-
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("MBSGDClassifier(log) builds")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("MBSGDClassifier(log)::fit");
 
     let proba_dev = clf

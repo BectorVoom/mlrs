@@ -20,13 +20,12 @@ use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
 use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::ridge::Ridge;
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
-use mlrs_algos::traits::{Fit, PredictLabels, PredictProba};
-// Phase 16 (D-01): Ridge + MBSGDRegressor have migrated to the typestate
-// surface; the rest of this file's estimators still consume `mlrs_algos::traits`.
-// The two surfaces collide by path (both define `fit`/`predict`), so the
-// typestate forms are imported under disambiguating aliases and called via UFCS
-// at the migrated Ridge/MBSGDRegressor arms only (mirrors `cluster.rs`'s
-// `TypestateFit`).
+// Phase 16 (D-01): every estimator in this file now consumes the typestate
+// surface — the legacy `mlrs_algos::traits` glob has been removed. The typestate
+// lifecycle + accessor traits are imported under disambiguating `Typestate*`
+// aliases (mirrors `cluster.rs`) and called via UFCS at each fit/predict arm so
+// the `fit`/`predict`/`predict_labels`/`predict_proba` method-name collisions
+// across the trait family resolve unambiguously.
 use mlrs_algos::typestate::{
     Fit as TypestateFit, Predict as TypestatePredict, PredictLabels as TypestatePredictLabels,
     PredictProba as TypestatePredictProba,
@@ -900,7 +899,7 @@ impl PyLogisticRegression {
 // the pyclasses that consume the F32/F64 arms.
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyMBSGDClassifier,
     algo:  mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier,
     unfit: {
@@ -1070,7 +1069,7 @@ impl PyMBSGDClassifier {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = MBSGDClassifier::<f32>::builder()
+                    let est = MBSGDClassifier::<f32>::builder()
                         .loss(loss)
                         .penalty(penalty)
                         .alpha(alpha)
@@ -1086,14 +1085,15 @@ impl PyMBSGDClassifier {
                         .seed(seed)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyMBSGDClassifier::F32(est))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyMBSGDClassifier::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = MBSGDClassifier::<f64>::builder()
+                    let est = MBSGDClassifier::<f64>::builder()
                         .loss(loss)
                         .penalty(penalty)
                         .alpha(alpha)
@@ -1109,8 +1109,9 @@ impl PyMBSGDClassifier {
                         .seed(seed)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyMBSGDClassifier::F64(est))
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyMBSGDClassifier::F64(fitted))
                 }
             }
         })?;
@@ -1126,11 +1127,11 @@ impl PyMBSGDClassifier {
             match &self.inner {
                 AnyMBSGDClassifier::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 AnyMBSGDClassifier::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("mbsgd_classifier", "predict")),
             }
@@ -1146,7 +1147,7 @@ impl PyMBSGDClassifier {
             match &self.inner {
                 AnyMBSGDClassifier::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictProba::predict_proba(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("mbsgd_classifier", "predict_proba (f32 path)")),
             }
@@ -1159,7 +1160,7 @@ impl PyMBSGDClassifier {
             match &self.inner {
                 AnyMBSGDClassifier::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictProba::predict_proba(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("mbsgd_classifier", "predict_proba (f64 path)")),
             }
@@ -1178,28 +1179,28 @@ impl PyMBSGDClassifier {
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyMBSGDClassifier::F32(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyMBSGDClassifier::F64(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyMBSGDClassifier::F32(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyMBSGDClassifier::F64(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f64)")),
         }
     }

@@ -13,6 +13,8 @@
 //! Tests live in `crates/mlrs-algos/tests/mbsgd_classifier_test.rs`
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -25,14 +27,16 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
-use crate::traits::{Fit, PredictLabels, PredictProba};
+use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, PredictProba, Unfit};
 
 /// Minibatch-SGD linear classifier (SGDSVM-01). Construct via
-/// [`MBSGDClassifier::builder`], then [`Fit::fit`] +
-/// [`PredictLabels::predict_labels`] / [`PredictProba::predict_proba`]. Fitted
-/// `coef_` (length `n_features`) / `intercept_` (length 1) are device-resident
-/// (D-03).
-pub struct MBSGDClassifier<F> {
+/// [`MBSGDClassifier::builder`], then the consuming [`Fit::fit`] (returns the
+/// `Fitted`-tagged sibling) + [`PredictLabels::predict_labels`] /
+/// [`PredictProba::predict_proba`]. Fitted `coef_` (length `n_features`) /
+/// `intercept_` (length 1) are device-resident (D-03); the host accessors exist
+/// ONLY on `MBSGDClassifier<F, Fitted>` (the compile-time typestate replaces the
+/// old runtime `NotFitted` guard, D-03).
+pub struct MBSGDClassifier<F, S = Unfit> {
     /// The lowered, validated hyperparameter bundle (D-06).
     config: SgdConfig,
     /// DISTINCT sorted class labels inferred at `fit` (Pitfall 4 — ±1 encoding).
@@ -43,9 +47,11 @@ pub struct MBSGDClassifier<F> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (device-resident), `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> MBSGDClassifier<F>
+impl<F> MBSGDClassifier<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -59,34 +65,39 @@ where
     pub fn config(&self) -> &SgdConfig {
         &self.config
     }
+}
 
-    /// The inferred class labels (empty until `fit`).
+impl<F> MBSGDClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// The lowered configuration (D-06).
+    pub fn config(&self) -> &SgdConfig {
+        &self.config
+    }
+
+    /// The inferred class labels (length 2 for the binary fit).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
     }
 
-    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.coef_
             .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "mbsgd_classifier",
-                operation: "coef_",
-            })
+            .expect("coef_ is Some by construction on MBSGDClassifier<F, Fitted>")
+            .to_host(pool)
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
+    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
+    /// the `Fitted` state (D-03).
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
         self.intercept_
             .as_ref()
-            .map(|i| i.to_host(pool)[0])
-            .ok_or(AlgoError::NotFitted {
-                estimator: "mbsgd_classifier",
-                operation: "intercept_",
-            })
+            .expect("intercept_ is Some by construction on MBSGDClassifier<F, Fitted>")
+            .to_host(pool)[0]
     }
 }
 
@@ -215,7 +226,7 @@ impl MBSGDClassifierBuilder {
     ///
     /// On success the lowered [`SgdConfig`] is stored and the fitted state is
     /// `None`.
-    pub fn build<F>(self) -> Result<MBSGDClassifier<F>, BuildError>
+    pub fn build<F>(self) -> Result<MBSGDClassifier<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -282,34 +293,30 @@ impl MBSGDClassifierBuilder {
             n_features: 0,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for MBSGDClassifier<F>
+impl<F> Fit<F> for MBSGDClassifier<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = MBSGDClassifier<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<MBSGDClassifier<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-10-03-02 / ASVS V5: data-DEPENDENT geometry guard BEFORE any
         //     launch (D-08 — the data-INDEPENDENT params were validated at
         //     build()). ---
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "mbsgd_classifier",
             operation: "fit (requires y)",
@@ -388,15 +395,18 @@ where
         // buffer release).
         yp_dev.release_into(pool);
 
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.coef_ = Some(coef);
-        self.intercept_ = Some(intercept);
-        Ok(self)
+        Ok(MBSGDClassifier {
+            config: self.config,
+            classes_,
+            n_features,
+            coef_: Some(coef),
+            intercept_: Some(intercept),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> PredictLabels<F> for MBSGDClassifier<F>
+impl<F> PredictLabels<F> for MBSGDClassifier<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -425,7 +435,7 @@ where
     }
 }
 
-impl<F> PredictProba<F> for MBSGDClassifier<F>
+impl<F> PredictProba<F> for MBSGDClassifier<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -460,7 +470,7 @@ where
     }
 }
 
-impl<F> MBSGDClassifier<F>
+impl<F> MBSGDClassifier<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -478,14 +488,17 @@ where
     ) -> Result<Vec<f64>, AlgoError> {
         let (n_query, n_features) = shape;
 
-        let coef = self.coef_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "mbsgd_classifier",
-            operation: "predict",
-        })?;
-        let intercept = self.intercept_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "mbsgd_classifier",
-            operation: "predict",
-        })?;
+        // `coef_`/`intercept_` are `Some` by construction on the `Fitted` state
+        // (the compile-time typestate replaces the old runtime `NotFitted`
+        // guard, D-03).
+        let coef = self
+            .coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on MBSGDClassifier<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on MBSGDClassifier<F, Fitted>");
 
         if n_query == 0 || n_features == 0 || x.len() != n_query * n_features {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
