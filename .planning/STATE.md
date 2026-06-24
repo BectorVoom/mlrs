@@ -6,14 +6,14 @@ current_phase: 16
 current_phase_name: builder-retrofit-sweep-shim-coverage
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-24T13:36:00.669Z"
+last_updated: "2026-06-24T13:50:08.896Z"
 last_activity: 2026-06-24
 last_activity_desc: Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 34
-  completed_plans: 32
+  completed_plans: 33
   percent: 80
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
-Plan: 12 of 13
+Plan: 13 of 13
 Status: Ready to execute
 Last activity: 2026-06-24 — Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
@@ -151,6 +151,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 16 P08 | ~10m | 3 tasks | 8 files |
 | Phase 16 P09 | 28m | 2 tasks | 14 files |
 | Phase 16 P10 | 6min | 2 tasks | 2 files |
+| Phase 16 P11 | 28m | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -301,6 +302,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 16-09: KernelRidge migrated Shape-A' (adopts typestate Fit+Predict it never had) + all 5 Naive Bayes trait-swapped; estimator sweep COMPLETE (29/29 on typestate). BLDR-03 stays In Progress until the traits.rs deletion in Plan 16-12
 - [Phase ?]: SHIM-02: PyHDBSCAN.fit_predict mutates self into Fitted arm (fit-then-return-labels, ClusterMixin semantics)
 - [Phase ?]: SHIM-02: probabilities_/outlier_scores_ getters return Option<Vec<F>> -> Python None (algos return Option until feature-space front-end lands), not an error
+- [Phase ?]: 16-11: shimmed every PyO3-wrapped estimator (32 total); full pure-Python sklearn parity, live check_estimator deferred to UAT
+- [Phase ?]: 16-11: shim test matrix auto-derives from mlrs.__all__ (ALL_SHIMS, 32 shims) so it cannot drift; the 3 fit-free estimator_checks are guarded never-xfailed (A7)
 
 ### Pending Todos
 
@@ -332,7 +335,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T13:35:31.985Z
+Last session: 2026-06-24T13:49:49.213Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
 
