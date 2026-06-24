@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use mlrs_core::compare::assert_slice_close;
 use mlrs_core::label_perm::{
-    best_match_accuracy, best_match_accuracy_pinned_noise, best_mapping, is_perfect_match, remap,
+    best_mapping, best_match_accuracy, best_match_accuracy_pinned_noise, is_perfect_match, remap,
 };
 use mlrs_core::oracle::load_npz;
 use mlrs_core::sign_flip::{align_rows, align_sign, canonical_sign};
@@ -37,7 +37,10 @@ fn genuinely_different_vector_still_fails_after_alignment() {
     let b = align_sign(&different);
     // Aligned, but they are NOT equal -> assert_slice_close must panic.
     let result = std::panic::catch_unwind(|| assert_slice_close(&a, &b, &F32_TOL));
-    assert!(result.is_err(), "genuinely different vectors must still fail");
+    assert!(
+        result.is_err(),
+        "genuinely different vectors must still fail"
+    );
 }
 
 #[test]
@@ -121,7 +124,10 @@ fn pinned_noise_counts_noise_vs_cluster_confusion_as_mismatch() {
     let pred = [0, 0, 1, -1, -1];
     let reference = [0, 0, 1, 1, -1];
     let acc = best_match_accuracy_pinned_noise(&pred, &reference);
-    assert!(acc < 1.0, "noise/cluster confusion must score < 1.0, got {acc}");
+    assert!(
+        acc < 1.0,
+        "noise/cluster confusion must score < 1.0, got {acc}"
+    );
     assert!((acc - 0.8).abs() < 1e-12, "expected 4/5 correct, got {acc}");
 }
 

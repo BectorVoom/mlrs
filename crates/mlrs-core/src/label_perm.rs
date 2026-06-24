@@ -23,10 +23,16 @@ use std::collections::HashMap;
 fn confusion(pred: &[i64], reference: &[i64]) -> (Vec<Vec<u64>>, Vec<i64>, Vec<i64>) {
     let pred_labels = sorted_unique(pred);
     let ref_labels = sorted_unique(reference);
-    let pred_idx: HashMap<i64, usize> =
-        pred_labels.iter().enumerate().map(|(i, &l)| (l, i)).collect();
-    let ref_idx: HashMap<i64, usize> =
-        ref_labels.iter().enumerate().map(|(i, &l)| (l, i)).collect();
+    let pred_idx: HashMap<i64, usize> = pred_labels
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (l, i))
+        .collect();
+    let ref_idx: HashMap<i64, usize> = ref_labels
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (l, i))
+        .collect();
 
     let mut conf = vec![vec![0u64; ref_labels.len()]; pred_labels.len()];
     for (&p, &r) in pred.iter().zip(reference.iter()) {
@@ -106,6 +112,54 @@ pub fn best_match_accuracy(pred: &[i64], reference: &[i64]) -> f64 {
         .iter()
         .zip(reference.iter())
         .filter(|(a, b)| a == b)
+        .count();
+    correct as f64 / pred.len() as f64
+}
+
+/// Like [`best_match_accuracy`], but with the noise sentinel `-1` pinned as a
+/// fixed point: `-1` maps ONLY to `-1`, and `-1` is reachable ONLY from `-1`.
+///
+/// HDBSCAN labels are a permutation of sklearn's EXCEPT the `-1` noise class,
+/// which is *not* a relabelable cluster id. A point sklearn calls noise that
+/// mlrs calls a cluster member (or vice-versa) is a genuine failure, never a
+/// relabeling — so [`best_match_accuracy`] (which would happily permute `-1`
+/// into a cluster id to maximize the match) is wrong for the HDBSCAN gate.
+///
+/// The non-noise labels match up to permutation via the existing greedy
+/// matcher: `-1` is filtered out of *both* label vocabularies before the
+/// confusion matrix / greedy assignment is built, then `(-1 → -1)` is force-
+/// inserted. A remapped `pred[i]` of `-1` therefore stays `-1`, scoring correct
+/// only where `reference[i]` is also `-1`.
+///
+/// Returns `1.0` for a perfect (noise-pinned) permutation match; empty input is
+/// a vacuous `1.0`. Panics if the slices differ in length.
+pub fn best_match_accuracy_pinned_noise(pred: &[i64], reference: &[i64]) -> f64 {
+    assert_eq!(
+        pred.len(),
+        reference.len(),
+        "best_match_accuracy_pinned_noise: length mismatch pred={} reference={}",
+        pred.len(),
+        reference.len()
+    );
+    if pred.is_empty() {
+        return 1.0;
+    }
+
+    // Filter -1 out of BOTH vocabularies so noise never enters the confusion
+    // matrix or the greedy assignment — only genuine cluster ids are permuted.
+    let pred_clusters: Vec<i64> = pred.iter().copied().filter(|&l| l != -1).collect();
+    let ref_clusters: Vec<i64> = reference.iter().copied().filter(|&l| l != -1).collect();
+
+    // Greedy cluster-id mapping over the noise-free slices; then pin -1 -> -1.
+    let mut map = best_mapping(&pred_clusters, &ref_clusters);
+    map.insert(-1, -1);
+
+    // Remap each pred label (a -1 stays -1 via the forced pin; an unmapped
+    // cluster id passes through and registers as a mismatch downstream).
+    let correct = pred
+        .iter()
+        .zip(reference.iter())
+        .filter(|(p, r)| map.get(p).unwrap_or(p) == *r)
         .count();
     correct as f64 / pred.len() as f64
 }
