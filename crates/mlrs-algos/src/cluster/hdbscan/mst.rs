@@ -205,8 +205,11 @@ pub fn argsort_by_weight(mst: &[MstEdge]) -> Vec<MstEdge> {
 /// `n` on a tiny input; sklearn's `np.partition` would clamp similarly). The dense
 /// matrix is assumed already alpha-scaled by the caller (Variant-A placement).
 pub fn core_distances_dense(dist: &[f64], n: usize, min_samples: usize) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
     debug_assert_eq!(dist.len(), n * n, "dist must be a dense n×n matrix");
-    let k = min_samples.clamp(1, n) - 1;
+    let k = min_samples.clamp(1, n.max(1)) - 1;
     let mut core = Vec::with_capacity(n);
     for i in 0..n {
         let mut row: Vec<f64> = dist[i * n..(i + 1) * n].to_vec();

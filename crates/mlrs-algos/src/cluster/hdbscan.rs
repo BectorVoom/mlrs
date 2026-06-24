@@ -692,6 +692,10 @@ where
         p: usize,
     ) -> Result<Vec<single_linkage::SingleLinkageEdge>, AlgoError> {
         let min_samples = self.min_samples.unwrap_or(self.min_cluster_size);
+        // INVARIANT: `validate_geometry` (T-15-05-V5) rejects `n == 0` before this
+        // function is reached, so `n >= 1` always holds here. The `clamp(1, n)` below
+        // would panic (`min > max`) if `n == 0`, hence the documented guard.
+        debug_assert!(n >= 1, "feature_metric_single_linkage requires n >= 1 (validate_geometry guarantees this)");
         // sklearn's core distance is the `(min_samples-1)`-th smallest distance
         // INCLUDING the self-zero, i.e. column `min_samples-1` of the ascending
         // self-inclusive kNN. We request `k = min_samples` self-inclusive neighbours
