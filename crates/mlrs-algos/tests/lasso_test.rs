@@ -20,7 +20,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::linear::lasso::Lasso;
-use mlrs_algos::traits::Fit;
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -103,17 +103,20 @@ where
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
 
-    let mut reg = Lasso::<F>::new(f64_to::<F>(alpha), true);
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (CD_N_SAMPLES, CD_N_FEATURES))
+    let reg = Lasso::<F>::builder()
+        .alpha(alpha)
+        .fit_intercept(true)
+        .build::<F>()
+        .expect("Lasso build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (CD_N_SAMPLES, CD_N_FEATURES))
         .expect("Lasso::fit on a valid shape");
 
     let coef = reg
         .coef(&pool)
-        .expect("coef_ after fit")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
-    let intercept = host_to_f64(reg.intercept(&pool).expect("intercept_ after fit"));
+    let intercept = host_to_f64(reg.intercept(&pool));
     (coef, intercept)
 }
 
@@ -176,4 +179,21 @@ fn lasso_coef_intercept_match_sklearn_f64() {
     }
     let case = load_npz(fixture("lasso_f64_seed42.npz")).expect("load lasso_f64");
     run_oracle::<f64>(&case, &F64_TOL, "lasso f64");
+}
+
+/// BLDR-01 defaults equality: the zero-arg `new()` (sklearn defaults
+/// alpha=1.0/fit_intercept=true/max_iter=1000/tol=1e-4) reproduces every
+/// hyperparameter of `builder().build()` — the single-source-of-defaults
+/// invariant (D-08). Exercises that the builder subsumes the former `new` /
+/// `with_opts` constructors with matching defaults.
+#[test]
+fn defaults_equal() {
+    let from_new = Lasso::<f64>::new();
+    let from_builder = Lasso::<f64>::builder()
+        .build::<f64>()
+        .expect("default Lasso builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "Lasso::new() must equal Lasso::builder().build()"
+    );
 }

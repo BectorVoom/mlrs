@@ -357,7 +357,7 @@ impl PyRidge {
 // Lasso — Fit + Predict; alpha, fit_intercept, max_iter, tol
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyLasso,
     algo:  mlrs_algos::linear::lasso::Lasso,
     unfit: { alpha: f64, fit_intercept: bool, max_iter: usize, tol: f64 },
@@ -414,17 +414,31 @@ impl PyLasso {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = Lasso::<f32>::with_opts(alpha as f32, fit_intercept, max_iter, tol);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLasso::F32(est))
+                    let est = Lasso::<f32>::builder()
+                        .alpha(alpha)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLasso::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = Lasso::<f64>::with_opts(alpha, fit_intercept, max_iter, tol);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLasso::F64(est))
+                    let est = Lasso::<f64>::builder()
+                        .alpha(alpha)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLasso::F64(fitted))
                 }
             }
         })?;
@@ -439,7 +453,7 @@ impl PyLasso {
             match &self.inner {
                 AnyLasso::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("lasso", "predict (f32 path)")),
             }
@@ -452,7 +466,7 @@ impl PyLasso {
             match &self.inner {
                 AnyLasso::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("lasso", "predict (f64 path)")),
             }
@@ -462,28 +476,28 @@ impl PyLasso {
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLasso::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLasso::F32(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("lasso", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLasso::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLasso::F64(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("lasso", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<f32> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLasso::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLasso::F32(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("lasso", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<f64> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLasso::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLasso::F64(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("lasso", "intercept_ (f64)")),
         }
     }
