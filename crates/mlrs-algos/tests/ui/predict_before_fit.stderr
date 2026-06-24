@@ -1,10 +1,10 @@
-error[E0277]: the trait bound `Umap<f32>: mlrs_algos::typestate::Transform<f32>` is not satisfied
+error[E0277]: the trait bound `Umap<f32>: Transform<f32>` is not satisfied
   --> tests/ui/predict_before_fit.rs:29:29
    |
 29 |     assert_fitted_surface::<Umap<f32, Unfit>>();
-   |                             ^^^^^^^^^^^^^^^^ the trait `mlrs_algos::typestate::Transform<f32>` is not implemented for `Umap<f32>`
+   |                             ^^^^^^^^^^^^^^^^ the trait `Transform<f32>` is not implemented for `Umap<f32>`
    |
-help: the trait `mlrs_algos::typestate::Transform<f32>` is not implemented for `Umap<f32, Unfit>`
+help: the trait `Transform<f32>` is not implemented for `Umap<f32, Unfit>`
       but it is implemented for `Umap<f32, Fitted>`
   --> src/manifold/umap.rs
    |
