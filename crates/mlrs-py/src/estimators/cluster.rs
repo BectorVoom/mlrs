@@ -492,10 +492,71 @@ impl PyHDBSCAN {
         Ok(())
     }
 
+    /// `fit_predict(X)` (`rows × cols`, row-major) — fit on `x` then return the
+    /// fitted `labels_` (i32, noise = -1), sklearn `ClusterMixin.fit_predict`
+    /// semantics. Mutates `self` into the `Fitted` arm (so a subsequent
+    /// `labels_`/`probabilities_`/`outlier_scores_` reads the same fit). Same GIL /
+    /// guard / lock contract as `fit`: data-INDEPENDENT hyperparameters validated at
+    /// `build()` BEFORE the device upload (T-12-02); GIL released (PY-03);
+    /// `guard_f64()` BEFORE the F64 upload (T-16-GUARDF64); `lock_pool()`
+    /// poison-recovering (T-16-POISON).
+    fn fit_predict(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
+        self.fit(py, x, rows, cols)?;
+        py.detach(|| {
+            let pool = crate::lock_pool();
+            match &self.inner {
+                AnyHdbscan::F32(e) => Ok(e.labels(&pool)),
+                AnyHdbscan::F64(e) => Ok(e.labels(&pool)),
+                _ => Err(not_fitted("hdbscan", "fit_predict")),
+            }
+        })
+    }
+
     /// Fitted `labels_` (i32, noise = -1), either dtype arm; the runtime
     /// [`not_fitted`] analog on the `Unfit` arm (D-13).
     fn labels_(&self) -> PyResult<Vec<i32>> {
         self.labels_inner()
+    }
+
+    /// Fitted per-point membership `probabilities_` (f32 arm, length `n`, in
+    /// `[0, 1]`). `None` until the feature-space probability front-end lands
+    /// (algos plan 15-05) — surfaces as Python `None`. The runtime [`not_fitted`]
+    /// analog on the `Unfit`/wrong-dtype arm (D-13).
+    fn probabilities_f32(&self) -> PyResult<Option<Vec<f32>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F32(e) => Ok(e.probabilities(&pool)),
+            _ => Err(not_fitted("hdbscan", "probabilities_ (f32)")),
+        }
+    }
+    /// Fitted per-point membership `probabilities_` (f64 arm) or the [`not_fitted`]
+    /// analog.
+    fn probabilities_f64(&self) -> PyResult<Option<Vec<f64>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F64(e) => Ok(e.probabilities(&pool)),
+            _ => Err(not_fitted("hdbscan", "probabilities_ (f64)")),
+        }
+    }
+
+    /// Fitted per-point GLOSH `outlier_scores_` (f32 arm, length `n`, in `[0, 1]`;
+    /// HDBS-03). `Some` after any successful fit; the runtime [`not_fitted`] analog
+    /// on the `Unfit`/wrong-dtype arm (D-13).
+    fn outlier_scores_f32(&self) -> PyResult<Option<Vec<f32>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F32(e) => Ok(e.outlier_scores(&pool)),
+            _ => Err(not_fitted("hdbscan", "outlier_scores_ (f32)")),
+        }
+    }
+    /// Fitted per-point GLOSH `outlier_scores_` (f64 arm) or the [`not_fitted`]
+    /// analog.
+    fn outlier_scores_f64(&self) -> PyResult<Option<Vec<f64>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F64(e) => Ok(e.outlier_scores(&pool)),
+            _ => Err(not_fitted("hdbscan", "outlier_scores_ (f64)")),
+        }
     }
 
     fn is_fitted(&self) -> bool {
