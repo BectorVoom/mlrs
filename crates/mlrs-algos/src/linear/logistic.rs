@@ -309,6 +309,14 @@ where
     pub fn n_classes(&self) -> usize {
         self.n_classes
     }
+
+    /// The DISTINCT sorted training labels (`classes_`, CR-02). `predict_labels`
+    /// maps the argmax column back through these, so callers exposing a public
+    /// `classes_` attribute MUST use this (not a fabricated `0..n_classes`
+    /// range) to honour the sklearn `classes_`/`predict` consistency contract.
+    pub fn classes(&self) -> &[i64] {
+        &self.classes_
+    }
 }
 
 impl<F> Fit<F> for LogisticRegression<F, Unfit>
@@ -360,12 +368,16 @@ where
             let lf = host_to_f64(yv);
             let li = lf.round();
             if !(li >= 0.0) || (li - lf).abs() > 1e-6 {
-                return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                    operand: "logistic.y (labels must be integers in 0..n_classes)",
-                    rows: n_samples,
-                    cols: 1,
-                    len: y.len(),
-                }));
+                // IN-01: a non-integer/negative label is a data-VALIDITY failure
+                // (the shape is valid, the content is not), so the honest variant
+                // is InvalidLabels — not a fabricated ShapeMismatch — matching the
+                // sibling classifiers (mbsgd_classifier / NB family).
+                return Err(AlgoError::InvalidLabels {
+                    estimator: "logistic_regression",
+                    reason: format!(
+                        "labels must be non-negative integers in 0..n_classes (got {lf})"
+                    ),
+                });
             }
             raw_labels.push(li as i64);
         }
@@ -377,12 +389,15 @@ where
         // sklearn requires >= 2 classes; a single-class (or empty) target is a
         // degenerate problem, not a binary one (max+1 silently forced it to 2).
         if classes_.len() < 2 {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "logistic.y (needs at least 2 distinct classes)",
-                rows: n_samples,
-                cols: classes_.len(),
-                len: y.len(),
-            }));
+            // IN-01: too-few-classes is a data-VALIDITY failure; report it as
+            // InvalidLabels (the honest variant) rather than a fabricated shape.
+            return Err(AlgoError::InvalidLabels {
+                estimator: "logistic_regression",
+                reason: format!(
+                    "binary/multiclass fit needs at least 2 distinct classes, found {}",
+                    classes_.len()
+                ),
+            });
         }
         let n_classes = classes_.len();
         // Remap each sample's raw label to its dense class index (classes_ is
