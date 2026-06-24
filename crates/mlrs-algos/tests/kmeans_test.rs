@@ -24,7 +24,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::cluster::kmeans::KMeans;
-use mlrs_algos::traits::{Fit, PredictLabels};
+use mlrs_algos::typestate::{Fit, PredictLabels};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -93,31 +93,30 @@ where
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
     let x_host: Vec<F> = case.expect_f64("X").iter().map(|&v| f64_to::<F>(v)).collect();
-    let init_host: Vec<F> = case
-        .expect_f64("init")
-        .iter()
-        .map(|&v| f64_to::<F>(v))
-        .collect();
+    // The builder `init` setter takes `Option<Vec<f64>>` (A5 — narrowed to `F`
+    // inside `build::<F>()`), so the injected init stays in f64 here.
+    let init_host: Vec<f64> = case.expect_f64("init").to_vec();
 
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut km = KMeans::<F>::with_init(KM_K, init_host);
-    km.fit(&mut pool, &x_dev, None, (KM_N_SAMPLES, KM_N_FEATURES))
+    // The builder fully folds the legacy `with_init(KM_K, init_host)` (D-09 injected
+    // init) into `.n_clusters(KM_K).init(Some(init_host))`; the consuming `fit`
+    // returns the `Fitted`-tagged sibling.
+    let km = KMeans::<F>::builder()
+        .n_clusters(KM_K)
+        .init(Some(init_host))
+        .build::<F>()
+        .expect("KMeans::build is infallible")
+        .fit(&mut pool, &x_dev, None, (KM_N_SAMPLES, KM_N_FEATURES))
         .expect("KMeans::fit on a valid shape");
 
     let centers: Vec<f64> = km
         .cluster_centers(&pool)
-        .expect("cluster_centers_ after fit")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
-    let labels: Vec<i64> = km
-        .labels(&pool)
-        .expect("labels_ after fit")
-        .iter()
-        .map(|&l| l as i64)
-        .collect();
-    let inertia = host_to_f64(km.inertia().expect("inertia_ after fit"));
+    let labels: Vec<i64> = km.labels(&pool).iter().map(|&l| l as i64).collect();
+    let inertia = host_to_f64(km.inertia());
     (centers, labels, inertia)
 }
 
@@ -227,14 +226,18 @@ fn kmeans_predict_assigns_to_centers_f32() {
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
     let x_host: Vec<f32> = case.expect_f64("X").iter().map(|&v| v as f32).collect();
-    let init_host: Vec<f32> = case.expect_f64("init").iter().map(|&v| v as f32).collect();
+    let init_host: Vec<f64> = case.expect_f64("init").to_vec();
     let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut km = KMeans::<f32>::with_init(KM_K, init_host);
-    km.fit(&mut pool, &x_dev, None, (KM_N_SAMPLES, KM_N_FEATURES))
+    let km = KMeans::<f32>::builder()
+        .n_clusters(KM_K)
+        .init(Some(init_host))
+        .build::<f32>()
+        .expect("KMeans::build is infallible")
+        .fit(&mut pool, &x_dev, None, (KM_N_SAMPLES, KM_N_FEATURES))
         .expect("KMeans::fit");
 
-    let fitted_labels: Vec<i64> = km.labels(&pool).unwrap().iter().map(|&l| l as i64).collect();
+    let fitted_labels: Vec<i64> = km.labels(&pool).iter().map(|&l| l as i64).collect();
     let predicted = km
         .predict_labels(&mut pool, &x_dev, (KM_N_SAMPLES, KM_N_FEATURES))
         .expect("KMeans::predict_labels on training X");
@@ -279,8 +282,12 @@ fn wr03_constant_feature_design_does_not_error() {
     // Inject a deterministic init: two distinct rows (so the two centers start
     // apart even though the data is constant); avoids the k-means++ PRNG so the
     // test is fully reproducible.
-    let init: Vec<f32> = vec![1.0f32; K * D];
-    let mut km = KMeans::<f32>::with_init(K, init);
+    let init: Vec<f64> = vec![1.0f64; K * D];
+    let km = KMeans::<f32>::builder()
+        .n_clusters(K)
+        .init(Some(init))
+        .build::<f32>()
+        .expect("KMeans::build is infallible");
 
     let res = km.fit(&mut pool, &x_dev, None, (N, D));
     assert!(
@@ -288,8 +295,9 @@ fn wr03_constant_feature_design_does_not_error() {
         "KMeans on a constant-feature (tol_scaled == 0) design must not error: {:?}",
         res.err()
     );
+    let km = res.expect("fitted KMeans");
 
-    let labels = km.labels(&pool).expect("labels_ after fit");
+    let labels = km.labels(&pool);
     assert_eq!(labels.len(), N, "one label per sample");
     for &l in labels.iter() {
         assert!(
@@ -297,4 +305,21 @@ fn wr03_constant_feature_design_does_not_error() {
             "label {l} out of range 0..{K}"
         );
     }
+}
+
+/// BLDR-01 defaults equality: the zero-arg `new()` (sklearn defaults
+/// `n_clusters=8`, `max_iter=300`, `tol=1e-4`, `seed=0`, `init=None`) reproduces
+/// every hyperparameter of `builder().build()` — the single-source-of-defaults
+/// invariant (D-08). Exercises that the WIDE builder subsumes the former
+/// `new`/`with_init`/`with_opts` constructors with matching defaults.
+#[test]
+fn defaults_equal() {
+    let from_new = KMeans::<f64>::new();
+    let from_builder = KMeans::<f64>::builder()
+        .build::<f64>()
+        .expect("default KMeans builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "KMeans::new() must equal KMeans::builder().build()"
+    );
 }

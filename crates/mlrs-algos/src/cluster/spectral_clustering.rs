@@ -53,10 +53,6 @@ use crate::cluster::kmeans::KMeans;
 // builder (formerly duplicated in this file).
 use crate::cluster::spectral::recover;
 use crate::error::{AlgoError, BuildError};
-// The inner v1 `KMeans` is still on the LEGACY `traits::Fit` (`&mut self`) — it is
-// migrated to typestate in Plan 06. Import it under an alias so it does not collide
-// with this file's typestate `Fit` impl, and call it via UFCS at the KMeans site.
-use crate::traits::Fit as LegacyFit;
 use crate::typestate::{Fit, Fitted, Unfit};
 
 /// The v1 dense-eig MAX_DIM cap (`eig.rs` `MAX_DIM = 64`). The normalized
@@ -466,15 +462,27 @@ where
             recover::<F>(&v_host, &dd_host, n_samples, n_components, false, true);
         let maps_dev = DeviceArray::from_host(pool, &maps_host);
 
-        // --- v1 KMeans on the embedding (D-10): KMeans::new (kmeans++, n_init=1;
-        //     NOT with_init — init-injection is rejected for SC). The
+        // --- v1 KMeans on the embedding (D-10): the typestate builder (kmeans++,
+        //     n_init=1; NO injected init — init-injection is rejected for SC). The
         //     well-separated fixture makes the partition unique up to permutation,
-        //     so the SplitMix64-vs-MT19937 RNG gap is immaterial to the labels. ---
-        let mut kmeans = KMeans::<F>::new(self.n_clusters, self.seed);
-        LegacyFit::fit(&mut kmeans, pool, &maps_dev, None, (n_samples, n_components))?;
+        //     so the SplitMix64-vs-MT19937 RNG gap is immaterial to the labels.
+        //     The inner KMeans is now on the typestate `Fit` (Plan 06): build via
+        //     the builder, then the consuming `Fit::fit` returns the `Fitted`
+        //     sibling. The byte-identical kmeans++ compute is preserved (D-03). ---
+        // KMeans's `build()` is infallible-but-typed (no data-INDEPENDENT
+        // hyperparameter validation — the `1 ≤ k ≤ n_samples` and injected-init
+        // checks are data-DEPENDENT and stay in its `fit`), so this `expect` cannot
+        // trigger; `n_clusters` is re-validated against `n_components` inside the
+        // inner `fit` exactly as before.
+        let kmeans = KMeans::<F>::builder()
+            .n_clusters(self.n_clusters)
+            .seed(self.seed)
+            .build::<F>()
+            .expect("KMeans::build is infallible (no data-independent validation)");
+        let kmeans = kmeans.fit(pool, &maps_dev, None, (n_samples, n_components))?;
         maps_dev.release_into(pool);
 
-        let labels_host = kmeans.labels(pool)?;
+        let labels_host = kmeans.labels(pool);
         // WR-01: the function-local KMeans owns fitted device buffers
         // (cluster_centers_ k×n_components, labels_ i32 length n). DeviceArray has
         // no Drop, so return them to the pool before `kmeans` falls out of scope —

@@ -12,15 +12,14 @@ use pyo3::prelude::*;
 use mlrs_algos::cluster::dbscan::DBSCAN;
 use mlrs_algos::cluster::hdbscan::{ClusterSelectionMethod, Hdbscan, Metric};
 use mlrs_algos::cluster::kmeans::KMeans;
-use mlrs_algos::traits::{Fit, PredictLabels};
-// NOTE: the v3 typestate `Fit` (consuming-self, returns `Fitted` sibling) shares
-// the NAME `Fit` with the legacy `traits::Fit` (`&mut self`) above; PyKMeans
-// still uses the legacy one (KMeans is migrated in Plan 06), while PyDBSCAN and
-// PyHDBSCAN use the typestate one. Import the typestate `Fit` under an ALIAS so
-// the two names do not collide in this file (RESEARCH § Pitfall 1, call-site
-// level). The legacy `traits::{Fit, PredictLabels}` glob stays while PyKMeans is
-// the file's remaining legacy consumer.
+// All three cluster wraps in this file (PyKMeans, PyDBSCAN, PyHDBSCAN) are now on
+// the v3 typestate surface (consuming-self `Fit` returning the `Fitted` sibling;
+// `PredictLabels` reads fitted state). The legacy `mlrs_algos::traits` glob is
+// gone (KMeans migrated in Plan 06). `Fit` is aliased `TypestateFit` and
+// `PredictLabels` `TypestatePredictLabels` and called via UFCS at the fit /
+// predict sites.
 use mlrs_algos::typestate::Fit as TypestateFit;
+use mlrs_algos::typestate::PredictLabels as TypestatePredictLabels;
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
@@ -33,7 +32,7 @@ const DEFAULT_SEED: u64 = 0;
 // KMeans — Fit + PredictLabels (i32); cluster_centers_, labels_, inertia_
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyKMeans,
     algo:  mlrs_algos::cluster::kmeans::KMeans,
     unfit: { n_clusters: usize, seed: u64, max_iter: usize, tol: f64 },
@@ -90,16 +89,30 @@ impl PyKMeans {
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = KMeans::<f32>::with_opts(n_clusters, seed, max_iter, tol);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKMeans::F32(est))
+                    let est = KMeans::<f32>::builder()
+                        .n_clusters(n_clusters)
+                        .seed(seed)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKMeans::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = KMeans::<f64>::with_opts(n_clusters, seed, max_iter, tol);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKMeans::F64(est))
+                    let est = KMeans::<f64>::builder()
+                        .n_clusters(n_clusters)
+                        .seed(seed)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKMeans::F64(fitted))
                 }
             }
         })?;
@@ -129,14 +142,14 @@ impl PyKMeans {
     fn cluster_centers_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyKMeans::F32(e) => e.cluster_centers(&pool).map_err(algo_err_to_py),
+            AnyKMeans::F32(e) => Ok(e.cluster_centers(&pool)),
             _ => Err(not_fitted("kmeans", "cluster_centers_ (f32)")),
         }
     }
     fn cluster_centers_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyKMeans::F64(e) => e.cluster_centers(&pool).map_err(algo_err_to_py),
+            AnyKMeans::F64(e) => Ok(e.cluster_centers(&pool)),
             _ => Err(not_fitted("kmeans", "cluster_centers_ (f64)")),
         }
     }
@@ -144,20 +157,20 @@ impl PyKMeans {
     fn labels_(&self) -> PyResult<Vec<i32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyKMeans::F32(e) => e.labels(&pool).map_err(algo_err_to_py),
-            AnyKMeans::F64(e) => e.labels(&pool).map_err(algo_err_to_py),
+            AnyKMeans::F32(e) => Ok(e.labels(&pool)),
+            AnyKMeans::F64(e) => Ok(e.labels(&pool)),
             _ => Err(not_fitted("kmeans", "labels_")),
         }
     }
     fn inertia_f32(&self) -> PyResult<f32> {
         match &self.inner {
-            AnyKMeans::F32(e) => e.inertia().map_err(algo_err_to_py),
+            AnyKMeans::F32(e) => Ok(e.inertia()),
             _ => Err(not_fitted("kmeans", "inertia_ (f32)")),
         }
     }
     fn inertia_f64(&self) -> PyResult<f64> {
         match &self.inner {
-            AnyKMeans::F64(e) => e.inertia().map_err(algo_err_to_py),
+            AnyKMeans::F64(e) => Ok(e.inertia()),
             _ => Err(not_fitted("kmeans", "inertia_ (f64)")),
         }
     }

@@ -36,10 +36,25 @@
 //!
 //! ## Discrete-output surface: PredictLabels, NOT Predict<F> (D-08)
 //! `KMeans.predict` returns INTEGER cluster ids, so it implements
-//! [`PredictLabels`](crate::traits::PredictLabels) (i32 labels), NOT the
-//! continuous-target [`Predict`](crate::traits::Predict) (which returns an
+//! [`PredictLabels`](crate::typestate::PredictLabels) (i32 labels), NOT the
+//! continuous-target [`Predict`](crate::typestate::Predict) (which returns an
 //! `F` buffer — that is the regressor surface). A new sample is assigned to its
 //! nearest fitted center via the same `distance` + `argmin_rows` path.
+//!
+//! ## Builder-fronted construction (Phase 16 retrofit, D-01/D-08)
+//! Construct with the zero-arg [`KMeans::new`] (sklearn defaults) or the WIDE
+//! [`KMeansBuilder`], which fully folds the THREE legacy constructors
+//! (`new(n_clusters, seed)`, `with_init(n_clusters, init)`, and
+//! `with_opts(n_clusters, seed, max_iter, tol)`) into setters:
+//! `.n_clusters(usize)`/`.seed(u64)`/`.max_iter(usize)`/`.tol(f64)` plus the
+//! injected-init `.init(Option<Vec<f64>>)` (the `with_init` replacement). The
+//! `init` setter is the wide-builder `Option`-of-data shape: the builder stores
+//! the init as `Option<Vec<f64>>` and narrows it to `Vec<F>` in `build::<F>()`
+//! (A5 — all setters are `f64`-typed, the `f64 → F` narrowing happens once in
+//! `build`). All hyperparameter / init validation is data-DEPENDENT (it depends
+//! on `n_samples`/`n_features`), so `build()` is infallible-but-typed (kept for
+//! `build_err_to_py` family uniformity); the geometry / `InvalidK` / injected-init
+//! dimension checks stay in `fit` (D-03 byte-identical).
 //!
 //! ## Validate the untrusted hyperparameter BEFORE any launch (ASVS V5)
 //! `fit` rejects `n_clusters < 1` or `n_clusters > n_samples` with
@@ -48,6 +63,8 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/kmeans_test.rs` (AGENTS.md §2), never
 //! an in-source `#[cfg(test)] mod tests`.
+
+use std::marker::PhantomData;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -58,22 +75,27 @@ use mlrs_backend::prims::distance::distance;
 use mlrs_backend::prims::kmeans::{inertia, inertia_rows_host, kmeanspp_sample, lloyd_update};
 use mlrs_backend::prims::reduce::argmin_rows;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, PredictLabels};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, Unfit};
 
 /// sklearn's default `max_iter` for `KMeans` (Pitfall 6).
 const DEFAULT_MAX_ITER: usize = 300;
 
 /// K-means clustering (CLUSTER-01) fitted by k-means++ init + the Lloyd loop.
 ///
-/// Construct with [`KMeans::new`] (`n_clusters`, `seed`) for the default
-/// k-means++ init, or [`KMeans::with_init`] to INJECT a fixed `k × d` init (the
-/// deterministic oracle, D-09). Then [`Fit::fit`] and
-/// [`PredictLabels::predict_labels`]. Fitted `cluster_centers_` / `labels_` are
-/// device-resident (D-03); the host accessors materialize them on demand.
-pub struct KMeans<F> {
+/// Construct with the zero-arg [`KMeans::new`] (sklearn defaults: `n_clusters = 8`,
+/// `max_iter = 300`, `tol = 1e-4`, `seed = 0`, default k-means++ init) or the WIDE
+/// [`KMeans::builder`] (the three legacy constructors `new`/`with_init`/`with_opts`
+/// are fully folded into the `.n_clusters`/`.seed`/`.max_iter`/`.tol`/`.init`
+/// setters; `.init(Some(..))` INJECTS a fixed `k × d` init — the deterministic
+/// oracle, D-09). Then the consuming [`Fit::fit`] (returns the `Fitted`-tagged
+/// sibling) and [`PredictLabels::predict_labels`]. Fitted `cluster_centers_` /
+/// `labels_` are device-resident (D-03); the host accessors materialize them on
+/// demand and exist ONLY on `KMeans<F, Fitted>` (the compile-time typestate
+/// replaces the old runtime `NotFitted` guard, D-03).
+pub struct KMeans<F, S = Unfit> {
     /// Number of clusters `k`. Validated `1 <= k <= n_samples` at `fit` time
     /// → [`AlgoError::InvalidK`] BEFORE any launch (T-05-07-01).
     n_clusters: usize,
@@ -99,103 +121,210 @@ pub struct KMeans<F> {
     /// Fitted `n_features` (set at `fit`), used to validate `predict_labels`
     /// geometry against the trained centers.
     n_features_: usize,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> KMeans<F>
+impl<F> KMeans<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `KMeans` with `n_clusters` and the k-means++ PRNG
-    /// `seed` (default init). `max_iter = 300`, `tol = 1e-4` (sklearn defaults,
-    /// Pitfall 6). A bad `n_clusters` is rejected at `fit` time
-    /// ([`AlgoError::InvalidK`]).
-    pub fn new(n_clusters: usize, seed: u64) -> Self {
+    /// Construct an unfitted `KMeans` with sklearn's `KMeans` defaults
+    /// (`n_clusters = 8`, `max_iter = 300`, `tol = 1e-4`, `seed = 0`, default
+    /// k-means++ init — `init = None`) directly in the `Unfit` state. SINGLE
+    /// source of truth for the defaults (D-08): the builder `Default` re-derives
+    /// via [`KMeans::into_builder`]. A bad `n_clusters` (or injected init) is
+    /// rejected at `fit` time ([`AlgoError::InvalidK`] / dimension mismatch).
+    pub fn new() -> Self {
         Self {
-            n_clusters,
-            max_iter: DEFAULT_MAX_ITER,
-            tol: 1e-4,
-            seed,
-            init: None,
-            cluster_centers_: None,
-            labels_: None,
-            inertia_: None,
-            n_features_: 0,
-        }
-    }
-
-    /// Create an unfitted `KMeans` with an INJECTED `k × d` row-major init array
-    /// (D-09 — the deterministic oracle: both mlrs and sklearn run Lloyd from
-    /// the SAME centers). `init.len()` must equal `n_clusters · n_features`;
-    /// this is checked at `fit` time against the data geometry.
-    pub fn with_init(n_clusters: usize, init: Vec<F>) -> Self {
-        Self {
-            n_clusters,
+            n_clusters: 8,
             max_iter: DEFAULT_MAX_ITER,
             tol: 1e-4,
             seed: 0,
-            init: Some(init),
-            cluster_centers_: None,
-            labels_: None,
-            inertia_: None,
-            n_features_: 0,
-        }
-    }
-
-    /// IN-03: like [`new`](Self::new) (k-means++ default init from `seed`) but with
-    /// explicit `max_iter` and `tol` overrides, for parity with
-    /// [`Lasso::with_opts`](crate::linear::lasso) /
-    /// [`LogisticRegression::with_opts`](crate::linear::logistic) — the other
-    /// iterative estimators expose the same two knobs. `max_iter` is the Lloyd
-    /// iteration cap (sklearn default 300) and `tol` is the unscaled convergence
-    /// tolerance (sklearn default 1e-4; scaled by the mean feature variance at
-    /// `fit`). A bad `n_clusters` is rejected at `fit` ([`AlgoError::InvalidK`]).
-    pub fn with_opts(n_clusters: usize, seed: u64, max_iter: usize, tol: f64) -> Self {
-        Self {
-            n_clusters,
-            max_iter,
-            tol,
-            seed,
             init: None,
             cluster_centers_: None,
             labels_: None,
             inertia_: None,
             n_features_: 0,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of the fitted `cluster_centers_` (`k × d` row-major). Errors
-    /// with [`AlgoError::NotFitted`] before `fit`.
-    pub fn cluster_centers(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.cluster_centers_
-            .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "kmeans",
-                operation: "cluster_centers_",
-            })
+    /// Start building a `KMeans` from sklearn's defaults (D-08 single source).
+    pub fn builder() -> KMeansBuilder {
+        KMeansBuilder::default()
     }
 
-    /// Host copy of the fitted `labels_` (length `n`, `i32`). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn labels(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<i32>, AlgoError> {
-        self.labels_
-            .as_ref()
-            .map(|l| l.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "kmeans",
-                operation: "labels_",
-            })
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter (the injected `init` is promoted `Vec<F> → Vec<f64>` so the
+    /// builder stays non-generic, A5). Used by [`KMeansBuilder::default`] to
+    /// re-derive the defaults from [`KMeans::new`] (D-08).
+    pub fn into_builder(self) -> KMeansBuilder {
+        KMeansBuilder {
+            n_clusters: self.n_clusters,
+            seed: self.seed,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            init: self
+                .init
+                .map(|v| v.iter().map(|&e| host_to_f64(e)).collect()),
+        }
     }
 
-    /// The fitted `inertia_` scalar. Errors with [`AlgoError::NotFitted`] before
-    /// `fit`.
-    pub fn inertia(&self) -> Result<F, AlgoError> {
-        self.inertia_.ok_or(AlgoError::NotFitted {
-            estimator: "kmeans",
-            operation: "inertia_",
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `cluster_centers_`/`labels_`/`inertia_` are excluded — `None` in any
+    /// `Unfit` value). Used by the defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.n_clusters == other.n_clusters
+            && self.seed == other.seed
+            && self.max_iter == other.max_iter
+            && self.tol == other.tol
+            && match (&self.init, &other.init) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.len() == b.len()
+                        && a.iter()
+                            .zip(b.iter())
+                            .all(|(&x, &y)| host_to_f64(x) == host_to_f64(y))
+                }
+                _ => false,
+            }
+    }
+}
+
+impl<F> Default for KMeans<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`KMeans`] (D-01) — the WIDE builder that subsumes the three legacy
+/// constructors (`new`/`with_init`/`with_opts`). Scalar setters are `f64`-typed
+/// (A5); the injected `init` is stored as `Option<Vec<f64>>` and narrowed to
+/// `Vec<F>` in [`KMeansBuilder::build`]. `Default` re-derives the sklearn defaults
+/// from [`KMeans::new`] (D-08 single source).
+#[derive(Debug, Clone)]
+pub struct KMeansBuilder {
+    n_clusters: usize,
+    seed: u64,
+    max_iter: usize,
+    tol: f64,
+    init: Option<Vec<f64>>,
+}
+
+impl Default for KMeansBuilder {
+    /// Re-derive the sklearn defaults from [`KMeans::new`] (D-08 single source).
+    /// `f64` is pinned only to read the F-independent scalar defaults — the
+    /// builder is non-generic, so the choice of `F` here is irrelevant.
+    fn default() -> Self {
+        KMeans::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl KMeansBuilder {
+    /// Set the number of clusters `k` (sklearn default `8`). Validated
+    /// `1 ≤ k ≤ n_samples` at `fit` (data-DEPENDENT → stays in `fit`).
+    pub fn n_clusters(mut self, v: usize) -> Self {
+        self.n_clusters = v;
+        self
+    }
+
+    /// Set the k-means++ host-PRNG seed (used only when `init` is `None`).
+    pub fn seed(mut self, v: u64) -> Self {
+        self.seed = v;
+        self
+    }
+
+    /// Set the maximum Lloyd iteration cap (sklearn default `300`, Pitfall 6).
+    pub fn max_iter(mut self, v: usize) -> Self {
+        self.max_iter = v;
+        self
+    }
+
+    /// Set the unscaled convergence tolerance `tol` (sklearn default `1e-4`;
+    /// scaled by the mean feature variance at `fit`, Pitfall 6).
+    pub fn tol(mut self, v: f64) -> Self {
+        self.tol = v;
+        self
+    }
+
+    /// INJECT a fixed `k × d` row-major init array (D-09 — the deterministic
+    /// oracle: both mlrs and sklearn run Lloyd from the SAME centers), or `None`
+    /// for the default k-means++ init. The wide-builder `Option`-of-data setter
+    /// shape (the `with_init` replacement). Stored as `f64` and narrowed to `F` in
+    /// [`build`](Self::build); its `len() == k · n_features` is checked at `fit`
+    /// against the data geometry.
+    pub fn init(mut self, v: Option<Vec<f64>>) -> Self {
+        self.init = v;
+        self
+    }
+
+    /// Build the (unfit) estimator, narrowing the stored `f64` scalars + the
+    /// injected `init` to the target float `F` (A5). KMeans has NO data-INDEPENDENT
+    /// hyperparameter to validate at construction: `1 ≤ n_clusters ≤ n_samples`,
+    /// the injected-init dimension (`len == k · n_features`), and the geometry are
+    /// all data-DEPENDENT and stay in [`Fit::fit`] (D-03 byte-identical). The
+    /// `Result` is kept for family uniformity with the other Phase-16 builders so
+    /// the `build_err_to_py` PyO3 mapper is shape-identical.
+    pub fn build<F>(self) -> Result<KMeans<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(KMeans {
+            n_clusters: self.n_clusters,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            seed: self.seed,
+            init: self
+                .init
+                .map(|v| v.iter().map(|&e| f64_to_host::<F>(e)).collect()),
+            cluster_centers_: None,
+            labels_: None,
+            inertia_: None,
+            n_features_: 0,
+            _state: PhantomData,
         })
     }
+}
 
+impl<F> KMeans<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of the fitted `cluster_centers_` (`k × d` row-major). `Some` by
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed (the
+    /// compile-time typestate replaces the runtime guard, D-03).
+    pub fn cluster_centers(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.cluster_centers_
+            .as_ref()
+            .expect("cluster_centers_ is Some by construction on KMeans<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// Host copy of the fitted `labels_` (length `n`, `i32`). `Some` by
+    /// construction on the `Fitted` state (D-03).
+    pub fn labels(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<i32> {
+        self.labels_
+            .as_ref()
+            .expect("labels_ is Some by construction on KMeans<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// The fitted `inertia_` scalar. `Some` by construction on the `Fitted` state
+    /// (D-03).
+    pub fn inertia(&self) -> F {
+        self.inertia_
+            .expect("inertia_ is Some by construction on KMeans<F, Fitted>")
+    }
+}
+
+impl<F, S> KMeans<F, S>
+where
+    F: Float + CubeElement + Pod,
+{
     /// Assign each row of `x` (`n × d`) to its nearest center in `centers`
     /// (`k × d`) via the Phase-2 `distance(sqrt=false)` + per-row `argmin`
     /// (lowest-index tie-break, D-02). Shared by the Lloyd loop and
@@ -217,17 +346,19 @@ where
     }
 }
 
-impl<F> Fit<F> for KMeans<F>
+impl<F> Fit<F> for KMeans<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = KMeans<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<KMeans<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         let k = self.n_clusters;
 
@@ -242,14 +373,7 @@ where
                 n_samples,
             });
         }
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
 
         // --- Init centers: injected (D-09, the deterministic oracle) or the
         //     k-means++ D²-weighted host sampler (D-09a, n_init=1 D-09b). ---
@@ -389,15 +513,22 @@ where
         let labels_i32: Vec<i32> = labels.iter().map(|&l| l as i32).collect();
         let labels_dev: DeviceArray<ActiveRuntime, i32> = DeviceArray::from_host(pool, &labels_i32);
 
-        self.cluster_centers_ = Some(centers);
-        self.labels_ = Some(labels_dev);
-        self.inertia_ = Some(inertia_val);
-        self.n_features_ = n_features;
-        Ok(self)
+        Ok(KMeans {
+            n_clusters: self.n_clusters,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            seed: self.seed,
+            init: self.init,
+            cluster_centers_: Some(centers),
+            labels_: Some(labels_dev),
+            inertia_: Some(inertia_val),
+            n_features_: n_features,
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> PredictLabels<F> for KMeans<F>
+impl<F> PredictLabels<F> for KMeans<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -409,10 +540,12 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
         let (n_samples, n_features) = shape;
 
-        let centers = self.cluster_centers_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "kmeans",
-            operation: "predict_labels",
-        })?;
+        // `Some` by construction on the `Fitted` state (D-03 — the compile-time
+        // typestate replaces the old runtime `NotFitted` guard).
+        let centers = self
+            .cluster_centers_
+            .as_ref()
+            .expect("cluster_centers_ is Some by construction on KMeans<F, Fitted>");
 
         // --- ASVS V5: geometry + fitted-n_features consistency BEFORE launch. ---
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
@@ -439,7 +572,7 @@ where
     }
 }
 
-impl<F> KMeans<F>
+impl<F> KMeans<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -450,7 +583,8 @@ where
     /// before the KMeans drops — otherwise the acquired bytes are never returned
     /// and `live_bytes` grows monotonically across re-fits, forfeiting buffer
     /// reuse (the FOUND-05 memory invariant). No-op for buffers still `None`
-    /// (unfitted). The scalar `inertia_` / `n_features_` carry no device memory.
+    /// (an empty fitted value never occurs — `Fitted` always carries both). The
+    /// scalar `inertia_` / `n_features_` carry no device memory.
     pub fn release_into(self, pool: &mut BufferPool<ActiveRuntime>) {
         if let Some(centers) = self.cluster_centers_ {
             centers.release_into(pool);
@@ -459,18 +593,25 @@ where
             labels.release_into(pool);
         }
     }
+}
 
+impl<F> KMeans<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
     /// Convenience `fit_predict` (sklearn `ClusterMixin`): fit to `x` then return
-    /// the fitted `labels_` as a fresh device-resident `i32` buffer. Equivalent
-    /// to `fit` followed by reading `labels_`.
+    /// BOTH the `Fitted`-tagged estimator and the fitted `labels_` as a fresh
+    /// device-resident `i32` buffer. CONSUMES `self` (the typestate `fit`
+    /// transition). Equivalent to `fit` followed by reading `labels_`.
     pub fn fit_predict(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         shape: (usize, usize),
-    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
-        self.fit(pool, x, None, shape)?;
-        let labels = self.labels(pool)?;
-        Ok(DeviceArray::from_host(pool, &labels))
+    ) -> Result<(KMeans<F, Fitted>, DeviceArray<ActiveRuntime, i32>), AlgoError> {
+        let fitted = self.fit(pool, x, None, shape)?;
+        let labels = fitted.labels(pool);
+        let labels_dev = DeviceArray::from_host(pool, &labels);
+        Ok((fitted, labels_dev))
     }
 }
