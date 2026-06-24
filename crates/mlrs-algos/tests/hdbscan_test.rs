@@ -1416,3 +1416,51 @@ fn precomputed_fit_builds_single_linkage() {
         .fit(&mut pool, &x_dev, None, (2, 8));
     assert!(bad.is_err(), "non-square precomputed matrix must be rejected");
 }
+
+/// HDBS-01: `Hdbscan::fit_predict` is a faithful thin wrapper — it returns
+/// exactly the labels that `Fit::fit` followed by `Hdbscan::<F, Fitted>::labels`
+/// would. We do NOT re-gate oracle correctness here (the 39-test suite already
+/// does that exhaustively); this only proves the convenience method is behaviorally
+/// equivalent to the construct-then-fit-then-read path. Self-contained: a tiny
+/// in-memory two-cluster Euclidean blob, no fixture loaded.
+#[test]
+fn fit_predict_matches_fit_then_labels() {
+    if skip_f64("fit_predict_matches_fit_then_labels") {
+        return;
+    }
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Two visually separable clusters: 8 rows near the origin, 8 rows near (10,10),
+    // 2 features. (i / 8) flips the cluster; cheap and deterministic.
+    let n = 16usize;
+    let p = 2usize;
+    let mut x_host: Vec<f64> = Vec::with_capacity(n * p);
+    for i in 0..n {
+        let base = if i < 8 { 0.0 } else { 10.0 };
+        let jitter = (i % 8) as f64 * 0.1;
+        x_host.push(base + jitter);
+        x_host.push(base + jitter);
+    }
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
+
+    // REFERENCE path: fit, then read labels off the Fitted estimator.
+    let reference = Hdbscan::<f64>::new();
+    let fitted = Fit::fit(reference, &mut pool, &x_dev, None, (n, p))
+        .expect("reference fit succeeds on the cpu f64 gate");
+    let expected: Vec<i32> = fitted.labels(&pool);
+
+    // SUBJECT path: a SECOND identical estimator (both fit/fit_predict move self),
+    // fit_predict returns a device i32 buffer of the same labels.
+    let subject = Hdbscan::<f64>::new();
+    let labels_dev = subject
+        .fit_predict(&mut pool, &x_dev, (n, p))
+        .expect("fit_predict succeeds on the cpu f64 gate");
+    let actual: Vec<i32> = labels_dev.to_host(&pool);
+
+    assert_eq!(
+        actual, expected,
+        "fit_predict must return exactly the labels fit-then-labels() would (noise = -1)"
+    );
+}
