@@ -37,12 +37,14 @@ use pyo3::prelude::*;
 
 use mlrs_algos::density::kernel_density::{BandwidthSpec, KdKernel, KernelDensity};
 use mlrs_algos::kernel_ridge::kernel_ridge::{KernelKind, KernelRidge};
-// Phase 16 (D-01): KernelDensity is migrated to the typestate surface — its
-// consuming-self `Fit` and the `Fitted`-gated `ScoreSamples` accessor are
-// imported under disambiguating `Typestate*` aliases and called via UFCS.
-// KernelRidge (same file) uses INHERENT `fit`/`predict` methods (no trait glob),
-// so this file references no other estimator-trait surface.
-use mlrs_algos::typestate::{Fit as TypestateFit, ScoreSamples as TypestateScoreSamples};
+// Phase 16 (D-01): BOTH KernelRidge and KernelDensity are migrated to the
+// typestate surface — their consuming-self `Fit`, the `Fitted`-gated
+// `Predict` (KernelRidge) and `ScoreSamples` (KernelDensity) accessors are
+// imported under disambiguating `Typestate*` aliases and called via UFCS. This
+// file is fully on the typestate surface (no `mlrs_algos::traits` reference).
+use mlrs_algos::typestate::{
+    Fit as TypestateFit, Predict as TypestatePredict, ScoreSamples as TypestateScoreSamples,
+};
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{
@@ -102,7 +104,7 @@ fn parse_bandwidth(value: &str, numeric: f64) -> PyResult<BandwidthSpec> {
 // KernelRidge — fit (X, y) + predict (X_test); dual_coef_
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyKernelRidge,
     algo:  mlrs_algos::kernel_ridge::kernel_ridge::KernelRidge,
     unfit: { kernel: String, alpha: f64, gamma: Option<f64>, degree: f64, coef0: f64 },
@@ -190,26 +192,40 @@ impl PyKernelRidge {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = KernelRidge::<f32>::new(
-                        kind,
-                        alpha as f32,
-                        gamma.map(|g| g as f32),
-                        degree as f32,
-                        coef0 as f32,
-                    );
-                    est.fit(&mut pool, &xd, &yd, (rows, cols), n_targets)
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyKernelRidge::F32(est))
+                    // n_targets is recovered from y's length by the consuming-self
+                    // Fit (yd has length rows * n_targets); the explicit n_targets
+                    // arg is retained for the PyO3 signature but no longer threaded.
+                    let _ = n_targets;
+                    let est = KernelRidge::<f32>::builder()
+                        .kernel(kind)
+                        .alpha(alpha)
+                        .gamma(gamma)
+                        .degree(degree)
+                        .coef0(coef0)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted =
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                            .map_err(algo_err_to_py)?;
+                    Ok(AnyKernelRidge::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est =
-                        KernelRidge::<f64>::new(kind, alpha, gamma, degree, coef0);
-                    est.fit(&mut pool, &xd, &yd, (rows, cols), n_targets)
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyKernelRidge::F64(est))
+                    let _ = n_targets;
+                    let est = KernelRidge::<f64>::builder()
+                        .kernel(kind)
+                        .alpha(alpha)
+                        .gamma(gamma)
+                        .degree(degree)
+                        .coef0(coef0)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted =
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                            .map_err(algo_err_to_py)?;
+                    Ok(AnyKernelRidge::F64(fitted))
                 }
             }
         })?;
@@ -232,8 +248,7 @@ impl PyKernelRidge {
             match &self.inner {
                 AnyKernelRidge::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let out = est
-                        .predict(&mut pool, &xd, (rows, cols))
+                    let out = TypestatePredict::predict(est, &mut pool, &xd, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(out.to_host_metered(&mut pool))
                 }
@@ -256,8 +271,7 @@ impl PyKernelRidge {
             match &self.inner {
                 AnyKernelRidge::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let out = est
-                        .predict(&mut pool, &xd, (rows, cols))
+                    let out = TypestatePredict::predict(est, &mut pool, &xd, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(out.to_host_metered(&mut pool))
                 }
@@ -271,7 +285,9 @@ impl PyKernelRidge {
     fn dual_coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyKernelRidge::F32(e) => e.dual_coef(&pool).map_err(algo_err_to_py),
+            // dual_coef() is infallible on the Fitted arm (no NotFitted Result —
+            // the compile-time typestate replaces the runtime guard, D-03).
+            AnyKernelRidge::F32(e) => Ok(e.dual_coef(&pool)),
             _ => Err(not_fitted("kernel_ridge", "dual_coef_ (f32)")),
         }
     }
@@ -279,7 +295,7 @@ impl PyKernelRidge {
     fn dual_coef_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyKernelRidge::F64(e) => e.dual_coef(&pool).map_err(algo_err_to_py),
+            AnyKernelRidge::F64(e) => Ok(e.dual_coef(&pool)),
             _ => Err(not_fitted("kernel_ridge", "dual_coef_ (f64)")),
         }
     }

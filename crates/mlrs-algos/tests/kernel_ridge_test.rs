@@ -28,6 +28,11 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::kernel_ridge::{KernelKind, KernelRidge};
+// Phase 16 (D-01): KernelRidge is migrated to the typestate surface — its
+// consuming-self `Fit` and the `Fitted`-gated `Predict` accessor are consumed
+// via UFCS through these aliases (the inherent `fit`/`predict` became trait
+// impls).
+use mlrs_algos::typestate::{Fit as TypestateFit, Predict as TypestatePredict};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -146,26 +151,24 @@ where
 
     let degree = case.expect_f64("degree")[0];
     let coef0 = case.expect_f64("coef0")[0];
-    let gamma_f: Option<F> = gamma.map(|g| f64_to::<F>(g));
 
-    let mut reg = KernelRidge::<F>::new(
-        kind,
-        f64_to::<F>(1.0),
-        gamma_f,
-        f64_to::<F>(degree),
-        f64_to::<F>(coef0),
-    );
-    reg.fit(
-        &mut pool,
-        &x_dev,
-        &y_dev,
-        (N_SAMPLES, N_FEATURES),
-        n_targets,
-    )
-    .expect("KernelRidge::fit on a valid shape");
+    // n_targets is recovered from `y.len() / n_samples` by the consuming-self
+    // `Fit::fit` (the trait carries no n_targets slot); the multi-target case
+    // passes a `y_dev` whose length is `n_samples * n_targets`, so the recovered
+    // value matches the explicit one used pre-retrofit.
+    let _ = n_targets;
+    let reg = KernelRidge::<F>::builder()
+        .kernel(kind)
+        .alpha(1.0)
+        .gamma(gamma)
+        .degree(degree)
+        .coef0(coef0)
+        .build::<F>()
+        .expect("KernelRidge::builder().build() with valid hyperparameters");
+    let reg = TypestateFit::fit(reg, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("KernelRidge::fit on a valid shape");
 
-    let pred = reg
-        .predict(&mut pool, &x_test_dev, (N_TEST, N_FEATURES))
+    let pred = TypestatePredict::predict(&reg, &mut pool, &x_test_dev, (N_TEST, N_FEATURES))
         .expect("KernelRidge::predict on X_test");
     pred.to_host(&pool).iter().map(|&v| host_to_f64(v)).collect()
 }
@@ -302,6 +305,22 @@ fn kernel_ridge_multi_target_f64() {
     let case = load_npz(fixture("kernel_ridge_f64_seed42.npz")).expect("load kernel_ridge_f64");
     let max_abs = run_multi_target::<f64>(&case, &F64_TOL, "kernel_ridge f64");
     println!("kernel_ridge f64 multi-target max_abs_err = {max_abs:e}");
+}
+
+/// BLDR-01 single-source-defaults litmus: `KernelRidge::new()` must equal
+/// `KernelRidge::builder().build()?` on the hyperparameter subset (the builder
+/// `Default` re-derives the sklearn defaults from `new()` via `into_builder()`,
+/// D-08). Pure host-side hyperparameter check; no device launch.
+#[test]
+fn kernel_ridge_defaults_equal() {
+    let from_new = KernelRidge::<f64>::new();
+    let from_builder = KernelRidge::<f64>::builder()
+        .build::<f64>()
+        .expect("default KernelRidge builder builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "KernelRidge::new() and KernelRidge::builder().build() must share defaults"
+    );
 }
 
 /// KERNEL-01 multi-target prediction vs sklearn at the documented f32 band.
