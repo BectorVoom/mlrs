@@ -240,3 +240,298 @@ class LogisticRegression(ClassifierMixin, MlrsBase):
         return self._to_output(
             self._suffixed("intercept")(), (-1,), None, self._np_float()
         )
+
+
+class MBSGDRegressor(RegressorMixin, MlrsBase):
+    """Mini-batch SGD regressor (LINEAR-06).
+
+    sklearn-named ctor params stored verbatim (``seed`` is the Rust field for
+    sklearn ``random_state``-style reproducibility; the wrap exposes ``seed``
+    directly, matching PyMBSGDRegressor ``#[new]`` at linear.rs:1264-1300).
+    """
+
+    def __init__(
+        self,
+        loss="squared_error",
+        penalty="l2",
+        alpha=1e-4,
+        l1_ratio=0.15,
+        fit_intercept=True,
+        max_iter=1000,
+        tol=1e-3,
+        learning_rate="invscaling",
+        eta0=0.01,
+        power_t=0.25,
+        epsilon=0.1,
+        batch_size=1,
+        shuffle=True,
+        seed=0,
+        output_type="input",
+    ):
+        self.loss = loss
+        self.penalty = penalty
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.fit_intercept = fit_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.learning_rate = learning_rate
+        self.eta0 = eta0
+        self.power_t = power_t
+        self.epsilon = epsilon
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.output_type = output_type
+
+    def fit(self, X, y):
+        xa, rows, cols = self._normalize(X)
+        ya = self._normalize_y(y, dtype=LinearRegression._x_float(xa))
+        obj = self._ext().MBSGDRegressor(
+            self.loss,
+            self.penalty,
+            self.alpha,
+            self.l1_ratio,
+            self.fit_intercept,
+            self.max_iter,
+            self.tol,
+            self.learning_rate,
+            self.eta0,
+            self.power_t,
+            self.epsilon,
+            self.batch_size,
+            self.shuffle,
+            self.seed,
+        )
+        obj.fit(xa, ya, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        return self
+
+    def predict(self, X):
+        xa, rows, cols = self._check_predict_X(X)
+        out = self._suffixed("predict")(xa, rows, cols)
+        return self._to_output(out, (rows,), X, self._np_float())
+
+    @property
+    def coef_(self):
+        return self._to_output(
+            self._suffixed("coef")(), (-1,), None, self._np_float()
+        )
+
+    @property
+    def intercept_(self):
+        self._check_fitted()
+        return getattr(self._mlrs_obj, "intercept" + self._suffix())()
+
+
+class MBSGDClassifier(ClassifierMixin, MlrsBase):
+    """Mini-batch SGD classifier (LINEAR-07).
+
+    sklearn-named ctor params stored verbatim (matches PyMBSGDClassifier
+    ``#[new]`` at linear.rs:991-1030).
+    """
+
+    def __init__(
+        self,
+        loss="hinge",
+        penalty="l2",
+        alpha=1e-4,
+        l1_ratio=0.15,
+        fit_intercept=True,
+        max_iter=1000,
+        tol=1e-3,
+        learning_rate="optimal",
+        eta0=0.01,
+        power_t=0.5,
+        batch_size=1,
+        shuffle=True,
+        seed=0,
+        output_type="input",
+    ):
+        self.loss = loss
+        self.penalty = penalty
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.fit_intercept = fit_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.learning_rate = learning_rate
+        self.eta0 = eta0
+        self.power_t = power_t
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.output_type = output_type
+
+    def fit(self, X, y):
+        xa, rows, cols = self._normalize(X)
+        ya = self._normalize_y(y, dtype=LinearRegression._x_float(xa))
+        obj = self._ext().MBSGDClassifier(
+            self.loss,
+            self.penalty,
+            self.alpha,
+            self.l1_ratio,
+            self.fit_intercept,
+            self.max_iter,
+            self.tol,
+            self.learning_rate,
+            self.eta0,
+            self.power_t,
+            self.batch_size,
+            self.shuffle,
+            self.seed,
+        )
+        obj.fit(xa, ya, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        self.classes_ = np.asarray(obj.classes_(), dtype=np.int32)
+        return self
+
+    def predict(self, X):
+        xa, rows, cols = self._check_predict_X(X)
+        out = self._mlrs_obj.predict_labels(xa, rows, cols)
+        return self._to_output(out, (rows,), X, np.int32)
+
+    def predict_proba(self, X):
+        xa, rows, cols = self._check_predict_X(X)
+        out = self._suffixed("predict_proba")(xa, rows, cols)
+        n_classes = int(self.classes_.shape[0])
+        return self._to_output(out, (rows, n_classes), X, self._np_float())
+
+    @property
+    def coef_(self):
+        return self._to_output(
+            self._suffixed("coef")(), (-1,), None, self._np_float()
+        )
+
+    @property
+    def intercept_(self):
+        self._check_fitted()
+        return getattr(self._mlrs_obj, "intercept" + self._suffix())()
+
+
+class LinearSVR(RegressorMixin, MlrsBase):
+    """Linear support-vector regression (SVM-02).
+
+    sklearn name ``C`` (the Rust field is ``c``); stored verbatim as ``self.C``
+    (purity rule). Matches PyLinearSVR ``#[new]`` at linear.rs:1705-1745.
+    """
+
+    def __init__(
+        self,
+        loss="squared_epsilon_insensitive",
+        penalty="l2",
+        C=1.0,
+        epsilon=0.0,
+        intercept_scaling=1.0,
+        fit_intercept=True,
+        max_iter=1000,
+        tol=1e-4,
+        output_type="input",
+    ):
+        self.loss = loss
+        self.penalty = penalty
+        self.C = C
+        self.epsilon = epsilon
+        self.intercept_scaling = intercept_scaling
+        self.fit_intercept = fit_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.output_type = output_type
+
+    def fit(self, X, y):
+        xa, rows, cols = self._normalize(X)
+        ya = self._normalize_y(y, dtype=LinearRegression._x_float(xa))
+        obj = self._ext().LinearSVR(
+            self.loss,
+            self.penalty,
+            self.C,
+            self.epsilon,
+            self.intercept_scaling,
+            self.fit_intercept,
+            self.max_iter,
+            self.tol,
+        )
+        obj.fit(xa, ya, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        return self
+
+    def predict(self, X):
+        xa, rows, cols = self._check_predict_X(X)
+        out = self._suffixed("predict")(xa, rows, cols)
+        return self._to_output(out, (rows,), X, self._np_float())
+
+    @property
+    def coef_(self):
+        return self._to_output(
+            self._suffixed("coef")(), (-1,), None, self._np_float()
+        )
+
+    @property
+    def intercept_(self):
+        self._check_fitted()
+        return getattr(self._mlrs_obj, "intercept" + self._suffix())()
+
+
+class LinearSVC(ClassifierMixin, MlrsBase):
+    """Linear support-vector classification (SVM-01).
+
+    sklearn name ``C`` (the Rust field is ``c``); stored verbatim as ``self.C``
+    (purity rule). Matches PyLinearSVC ``#[new]`` at linear.rs:1501-1540.
+    """
+
+    def __init__(
+        self,
+        loss="squared_hinge",
+        penalty="l2",
+        C=1.0,
+        intercept_scaling=1.0,
+        fit_intercept=True,
+        max_iter=1000,
+        tol=1e-4,
+        output_type="input",
+    ):
+        self.loss = loss
+        self.penalty = penalty
+        self.C = C
+        self.intercept_scaling = intercept_scaling
+        self.fit_intercept = fit_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.output_type = output_type
+
+    def fit(self, X, y):
+        xa, rows, cols = self._normalize(X)
+        ya = self._normalize_y(y, dtype=LinearRegression._x_float(xa))
+        obj = self._ext().LinearSVC(
+            self.loss,
+            self.penalty,
+            self.C,
+            self.intercept_scaling,
+            self.fit_intercept,
+            self.max_iter,
+            self.tol,
+        )
+        obj.fit(xa, ya, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        self.classes_ = np.asarray(obj.classes_(), dtype=np.int32)
+        return self
+
+    def predict(self, X):
+        xa, rows, cols = self._check_predict_X(X)
+        out = self._mlrs_obj.predict_labels(xa, rows, cols)
+        return self._to_output(out, (rows,), X, np.int32)
+
+    @property
+    def coef_(self):
+        return self._to_output(
+            self._suffixed("coef")(), (-1,), None, self._np_float()
+        )
+
+    @property
+    def intercept_(self):
+        self._check_fitted()
+        return getattr(self._mlrs_obj, "intercept" + self._suffix())()
