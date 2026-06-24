@@ -17,7 +17,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::neighbors::classifier::KNeighborsClassifier;
-use mlrs_algos::traits::{Fit, PredictLabels, PredictProba};
+use mlrs_algos::typestate::{Fit, PredictLabels, PredictProba};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -92,11 +92,14 @@ where
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq);
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_class);
 
-    let mut clf = KNeighborsClassifier::<F>::new(KNN_K);
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (KNN_N_TRAIN, KNN_N_FEATURES))
+    let clf = KNeighborsClassifier::<F>::builder()
+        .n_neighbors(KNN_K)
+        .build::<F>()
+        .expect("build KNeighborsClassifier")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (KNN_N_TRAIN, KNN_N_FEATURES))
         .expect("fit on valid geometry");
     assert_eq!(
-        clf.n_classes().expect("fitted"),
+        clf.n_classes(),
         KNN_N_CLASSES,
         "inferred n_classes (max+1) should match the fixture"
     );
@@ -146,6 +149,21 @@ fn fixture_loads() {
     assert_len(&case, "predict_class", KNN_N_QUERY);
     assert_len(&case, "predict_proba", KNN_N_QUERY * KNN_N_CLASSES);
     assert_len(&case, "y_class", KNN_N_TRAIN);
+}
+
+/// BLDR-01: `KNeighborsClassifier::new()` equals
+/// `KNeighborsClassifier::builder().build()?` on the hyperparameter subset
+/// (sklearn default `n_neighbors = 5`). Pure host comparison — no device.
+#[test]
+fn defaults_equal() {
+    let from_new = KNeighborsClassifier::<f64>::new();
+    let from_builder = KNeighborsClassifier::<f64>::builder()
+        .build::<f64>()
+        .expect("default KNeighborsClassifierBuilder builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "KNeighborsClassifier::new() and builder().build()? must agree on hyperparameters (BLDR-01)"
+    );
 }
 
 /// predict (majority vote, i32) + predict_proba match sklearn, f32 (cpu AND rocm).

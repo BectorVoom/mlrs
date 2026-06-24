@@ -11,14 +11,17 @@ use pyo3::prelude::*;
 use mlrs_algos::neighbors::classifier::KNeighborsClassifier;
 use mlrs_algos::neighbors::nearest::NearestNeighbors;
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
-// Legacy accessor traits still consumed by the not-yet-migrated classifier /
-// regressor arms in this file (removed once all three estimators migrate).
-use mlrs_algos::traits::{Fit, Predict, PredictLabels, PredictProba};
-// Typestate forms for the migrated NearestNeighbors arm; aliased so they do not
-// collide by path with the legacy `traits::*` glob above (typestate module-doc
-// warning) — called via UFCS at the migrated arm only.
+// Legacy accessor traits still consumed by the not-yet-migrated regressor arm in
+// this file (removed once all three estimators migrate). `Fit` is kept as the
+// legacy method-call surface for the regressor arm; the migrated NearestNeighbors
+// and KNeighborsClassifier arms call the typestate forms via UFCS aliases below.
+use mlrs_algos::traits::{Fit, Predict};
+// Typestate forms for the migrated arms; aliased so they do not collide by path
+// with the legacy `traits::*` glob above (typestate module-doc warning) — called
+// via UFCS at the migrated arms only.
 use mlrs_algos::typestate::{
     Fit as TypestateFit, KNeighbors as TypestateKNeighbors,
+    PredictLabels as TypestatePredictLabels, PredictProba as TypestatePredictProba,
 };
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
@@ -151,7 +154,7 @@ impl PyNearestNeighbors {
 // KNeighborsClassifier — Fit + KNeighbors + PredictLabels (i32) + PredictProba
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyKNeighborsClassifier,
     algo:  mlrs_algos::neighbors::classifier::KNeighborsClassifier,
     unfit: { n_neighbors: usize },
@@ -208,17 +211,25 @@ impl PyKNeighborsClassifier {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = KNeighborsClassifier::<f32>::new(n_neighbors);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKNeighborsClassifier::F32(est))
+                    let est = KNeighborsClassifier::<f32>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKNeighborsClassifier::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = KNeighborsClassifier::<f64>::new(n_neighbors);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKNeighborsClassifier::F64(est))
+                    let est = KNeighborsClassifier::<f64>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKNeighborsClassifier::F64(fitted))
                 }
             }
         })?;
@@ -234,11 +245,11 @@ impl PyKNeighborsClassifier {
             match &self.inner {
                 AnyKNeighborsClassifier::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 AnyKNeighborsClassifier::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("kneighbors_classifier", "predict")),
             }
@@ -253,7 +264,7 @@ impl PyKNeighborsClassifier {
             match &self.inner {
                 AnyKNeighborsClassifier::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictProba::predict_proba(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("kneighbors_classifier", "predict_proba (f32 path)")),
             }
@@ -266,7 +277,7 @@ impl PyKNeighborsClassifier {
             match &self.inner {
                 AnyKNeighborsClassifier::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictProba::predict_proba(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("kneighbors_classifier", "predict_proba (f64 path)")),
             }
@@ -276,8 +287,8 @@ impl PyKNeighborsClassifier {
     /// Number of classes inferred at fit (errors before fit).
     fn n_classes(&self) -> PyResult<usize> {
         match &self.inner {
-            AnyKNeighborsClassifier::F32(e) => e.n_classes().map_err(algo_err_to_py),
-            AnyKNeighborsClassifier::F64(e) => e.n_classes().map_err(algo_err_to_py),
+            AnyKNeighborsClassifier::F32(e) => Ok(e.n_classes()),
+            AnyKNeighborsClassifier::F64(e) => Ok(e.n_classes()),
             _ => Err(not_fitted("kneighbors_classifier", "n_classes")),
         }
     }
