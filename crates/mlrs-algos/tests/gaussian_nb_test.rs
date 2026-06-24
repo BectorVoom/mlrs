@@ -28,7 +28,13 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::error::BuildError;
 use mlrs_algos::naive_bayes::GaussianNB;
-use mlrs_algos::traits::{Fit, PredictLabels, PredictProba};
+// Phase 16 (D-02): GaussianNB migrated to the typestate surface — consuming-self
+// `Fit` and the `Fitted`-gated `PredictLabels`/`PredictProba` accessors are
+// consumed via UFCS through these aliases.
+use mlrs_algos::typestate::{
+    Fit as TypestateFit, PredictLabels as TypestatePredictLabels,
+    PredictProba as TypestatePredictProba,
+};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -135,23 +141,23 @@ where
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq_host);
 
-    let mut clf = GaussianNB::<F>::builder()
+    let clf = GaussianNB::<F>::builder()
         .build::<F>()
         .expect("default GaussianNB builds");
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let clf = TypestateFit::fit(clf, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("GaussianNB::fit on a valid shape");
 
-    let labels = clf
-        .predict_labels(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
-        .expect("predict_labels after fit")
-        .to_host(&pool);
-    let proba: Vec<f64> = clf
-        .predict_proba(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
-        .expect("predict_proba after fit")
-        .to_host(&pool)
-        .iter()
-        .map(|&v| host_to_f64(v))
-        .collect();
+    let labels =
+        TypestatePredictLabels::predict_labels(&clf, &mut pool, &xq_dev, (N_QUERY, N_FEATURES))
+            .expect("predict_labels after fit")
+            .to_host(&pool);
+    let proba: Vec<f64> =
+        TypestatePredictProba::predict_proba(&clf, &mut pool, &xq_dev, (N_QUERY, N_FEATURES))
+            .expect("predict_proba after fit")
+            .to_host(&pool)
+            .iter()
+            .map(|&v| host_to_f64(v))
+            .collect();
 
     (labels, proba)
 }
@@ -291,9 +297,13 @@ fn build_rejects_bad_var_smoothing() {
     );
 }
 
-/// PoolStats no-leak gate (WR-07): live_bytes does not grow across a re-fit at
-/// the same shape — the fit releases the prior `theta_`/`var_` device buffers
-/// before storing the new ones (and the GATHER helpers release their scratch).
+/// PoolStats no-leak gate (WR-07): live_bytes does not grow across a
+/// re-CONSTRUCT + re-fit at the same shape. The consuming-self typestate `Fit`
+/// makes a `&mut self` re-fit a type error, so the gate becomes the
+/// born-with-convention "build a fresh `Unfit`, fit (consuming it), drop the
+/// `Fitted` value" cycle (the umap_test `fit_no_leak` precedent): the dropped
+/// `Fitted` returns its `theta_`/`var_` device buffers to the pool free-list,
+/// which the next construct+fit reuses — so `live_bytes` stays flat.
 #[test]
 fn refit_releases_buffers() {
     let backend = capability::active_backend_name();
@@ -313,25 +323,31 @@ fn refit_releases_buffers() {
     let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
     let y_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y_host);
 
-    let mut clf = GaussianNB::<f64>::builder()
+    // Warm up: first construct+fit allocates theta_/var_; drop the Fitted value
+    // (returns its buffers to the free-list) and record the steady live_bytes.
+    let clf = GaussianNB::<f64>::builder()
         .build::<f64>()
         .expect("default GaussianNB builds");
-
-    // Warm up: first fit allocates theta_/var_; record the steady live_bytes.
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let fitted = TypestateFit::fit(clf, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("first fit");
+    drop(fitted);
     let live_after_first = pool.stats().live_bytes;
 
-    // Re-fit several times at the SAME shape; live_bytes must not climb (the old
-    // theta_/var_ are released into the free-list and reused — WR-07).
+    // Re-CONSTRUCT + re-fit several times at the SAME shape; live_bytes must not
+    // climb (the dropped theta_/var_ are released into the free-list and reused).
     const REFITS: usize = 4;
     for k in 0..REFITS {
-        clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
-            .expect("re-fit");
+        let clf = GaussianNB::<f64>::builder()
+            .build::<f64>()
+            .expect("default GaussianNB builds");
+        let fitted =
+            TypestateFit::fit(clf, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+                .expect("re-fit");
+        drop(fitted);
         let live = pool.stats().live_bytes;
         assert!(
             live <= live_after_first,
-            "live_bytes grew across re-fit {k}: {live} > first {live_after_first} (WR-07 leak)"
+            "live_bytes grew across re-construct+fit {k}: {live} > first {live_after_first} (WR-07 leak)"
         );
     }
 }

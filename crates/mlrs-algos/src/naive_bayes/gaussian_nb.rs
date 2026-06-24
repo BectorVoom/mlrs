@@ -9,6 +9,8 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/gaussian_nb_test.rs` (AGENTS.md §2).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -22,7 +24,13 @@ use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_sum, class_grouped_sumsq, empirical_class_log_prior,
     log_sum_exp_normalize, NB_LABEL_INT_TOL,
 };
-use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
+// Phase 16 (D-02 shape-B trait-swap): the pre-existing builder is UNTOUCHED; the
+// estimator gains the `<F, S = Unfit>` state param and migrates from the legacy
+// trait surface to the consuming-self `typestate` surface. fit/predict math is
+// BYTE-IDENTICAL (D-03).
+use crate::typestate::{
+    validate_geometry, Fit, Fitted, PredictLabels, PredictLogProba, PredictProba, Unfit,
+};
 
 /// `ln(2π)`, the constant term of the Gaussian log-likelihood
 /// `−0.5·Σ_j[log(2π·var) + (x−mean)²/var]` factored as
@@ -34,7 +42,7 @@ const LN_2PI: f64 = 1.837_877_066_409_345_6; // (2.0 * std::f64::consts::PI).ln(
 /// `predict_log_proba`. Fitted `theta_` (means) / `var_` (variances) /
 /// `class_prior_` are device-resident / host f64 small tensors (D-03), `None`
 /// until `fit`.
-pub struct GaussianNB<F> {
+pub struct GaussianNB<F, S = Unfit> {
     /// User-supplied class priors, or `None` → empirical from `class_count_`.
     priors: Option<Vec<f64>>,
     /// Portion of the largest feature variance added to all variances (D-02
@@ -59,9 +67,11 @@ pub struct GaussianNB<F> {
     /// (population, ddof=0) — the GLOBAL floor added to every `var_` cell
     /// (Pitfall 3), `None` until `fit`.
     epsilon_: Option<f64>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> GaussianNB<F>
+impl<F> GaussianNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -69,7 +79,12 @@ where
     pub fn builder() -> GaussianNBBuilder {
         GaussianNBBuilder::default()
     }
+}
 
+impl<F> GaussianNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
@@ -135,7 +150,7 @@ impl GaussianNBBuilder {
     /// - every `priors` entry finite + non-negative
     ///   ([`BuildError::InvalidClassPrior`]) — the data-DEPENDENT
     ///   length-`== n_classes` / sum-to-one checks stay at `fit`.
-    pub fn build<F>(self) -> Result<GaussianNB<F>, BuildError>
+    pub fn build<F>(self) -> Result<GaussianNB<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -163,31 +178,27 @@ impl GaussianNBBuilder {
             class_log_prior_: None,
             class_count_: None,
             epsilon_: None,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for GaussianNB<F>
+impl<F> Fit<F> for GaussianNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = GaussianNB<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<GaussianNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         // Data-DEPENDENT geometry guard BEFORE any launch (T-11-02 / ASVS V5).
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "gaussian_nb",
             operation: "fit (requires y)",
@@ -326,17 +337,13 @@ where
             }
         };
 
-        // --- WR-07: release any prior fitted device buffers BEFORE storing the
-        //     new ones so a re-fit at the same shape conserves live_bytes. ---
-        if let Some(old) = self.theta_.take() {
-            old.release_into(pool);
-        }
-        if let Some(old) = self.var_.take() {
-            old.release_into(pool);
-        }
-
         // Store fitted state. theta_/var_ are device-resident (per the stub's
-        // field types); the host materializes them at predict / accessor.
+        // field types); the host materializes them at predict / accessor. The
+        // consuming-self transition means there is no prior fitted state to
+        // release — a freshly-built `Unfit` carries theta_/var_ = None, so the old
+        // WR-07 re-fit buffer-release pass is vacuous and dropped (the
+        // KernelDensity/IncrementalPCA precedent, 16-07/16-04); buffer reuse across
+        // re-CONSTRUCT+fit cycles still flows through the pool free-list.
         let theta_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
             pool,
             &theta.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
@@ -346,18 +353,22 @@ where
             &var.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
         );
 
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.theta_ = Some(theta_dev);
-        self.var_ = Some(var_dev);
-        self.class_log_prior_ = Some(class_log_prior_);
-        self.class_count_ = Some(class_count_);
-        self.epsilon_ = Some(epsilon_);
-        Ok(self)
+        Ok(GaussianNB {
+            priors: self.priors,
+            var_smoothing: self.var_smoothing,
+            classes_,
+            n_features,
+            theta_: Some(theta_dev),
+            var_: Some(var_dev),
+            class_log_prior_: Some(class_log_prior_),
+            class_count_: Some(class_count_),
+            epsilon_: Some(epsilon_),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> GaussianNB<F>
+impl<F> GaussianNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -420,7 +431,7 @@ where
     }
 }
 
-impl<F> PredictLabels<F> for GaussianNB<F>
+impl<F> PredictLabels<F> for GaussianNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -436,7 +447,7 @@ where
     }
 }
 
-impl<F> PredictProba<F> for GaussianNB<F>
+impl<F> PredictProba<F> for GaussianNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -461,7 +472,7 @@ where
     }
 }
 
-impl<F> PredictLogProba<F> for GaussianNB<F>
+impl<F> PredictLogProba<F> for GaussianNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
