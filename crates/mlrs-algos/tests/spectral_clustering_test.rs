@@ -25,6 +25,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::cluster::SpectralClustering;
 use mlrs_algos::error::AlgoError;
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -75,23 +76,21 @@ where
 
     // sklearn's own SpectralClustering defaults: rbf affinity, gamma=1.0 literal
     // (D-04), n_components=None → n_clusters (D-11). seed immaterial on the
-    // well-separated fixture (D-10).
-    let mut sc = SpectralClustering::<F>::new(
-        N_CLUSTERS,
-        None,
-        "rbf".to_string(),
-        f64_to::<F>(1.0),
-        10,
-        42,
-    );
-    sc.fit(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
+    // well-separated fixture (D-10). The wide builder folds the 6-arg legacy new.
+    let sc = SpectralClustering::<F>::builder()
+        .n_clusters(N_CLUSTERS)
+        .n_components(None)
+        .affinity("rbf".to_string())
+        .gamma(1.0)
+        .n_neighbors(10)
+        .seed(42)
+        .build::<F>()
+        .expect("SpectralClustering build with valid hyperparameters");
+    let sc = sc
+        .fit(&mut pool, &x_dev, None, (N_SAMPLES, N_FEATURES))
         .expect("SpectralClustering::fit on a valid shape");
 
-    sc.labels(&pool)
-        .expect("labels_ after fit")
-        .iter()
-        .map(|&l| l as i64)
-        .collect()
+    sc.labels(&pool).iter().map(|&l| l as i64).collect()
 }
 
 /// SPECTRAL-02: `labels_` matches sklearn EXACTLY up to a label permutation on the
@@ -156,9 +155,16 @@ fn reject_oversize() {
     let x_host: Vec<f64> = vec![0.0; n * d];
     let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut sc =
-        SpectralClustering::<f64>::new(N_CLUSTERS, None, "rbf".to_string(), 1.0, 10, 42);
-    let err = match sc.fit(&mut pool, &x_dev, (n, d)) {
+    let sc = SpectralClustering::<f64>::builder()
+        .n_clusters(N_CLUSTERS)
+        .n_components(None)
+        .affinity("rbf".to_string())
+        .gamma(1.0)
+        .n_neighbors(10)
+        .seed(42)
+        .build::<f64>()
+        .expect("SpectralClustering build with valid hyperparameters");
+    let err = match sc.fit(&mut pool, &x_dev, None, (n, d)) {
         Ok(_) => panic!("fit(n=65) must reject before any device work"),
         Err(e) => e,
     };
@@ -180,4 +186,19 @@ fn reject_oversize() {
         }
         other => panic!("expected NSamplesExceedsMaxDim, got {other:?}"),
     }
+}
+
+/// BLDR-01: `SpectralClustering::new()` (the single-source defaults) equals
+/// `SpectralClustering::builder().build()` (the builder defaults re-derived from
+/// `new`). The wide 6-field builder must round-trip the defaults exactly.
+#[test]
+fn spectral_clustering_defaults_equal() {
+    let from_new = SpectralClustering::<f32>::new();
+    let from_builder = SpectralClustering::<f32>::builder()
+        .build::<f32>()
+        .expect("default SpectralClustering builder build");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "SpectralClustering::new() must equal SpectralClustering::builder().build() (BLDR-01)"
+    );
 }

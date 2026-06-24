@@ -38,8 +38,12 @@ use pyo3::prelude::*;
 
 use mlrs_algos::cluster::spectral_clustering::SpectralClustering;
 use mlrs_algos::cluster::spectral_embedding::SpectralEmbedding;
+// The v3 typestate `Fit` (consuming-self, returns the `Fitted` sibling) is imported
+// under an alias so the per-arm UFCS call disambiguates from any legacy surface and
+// the multiple-method-name collision the typestate module-doc warns about.
+use mlrs_algos::typestate::Fit as TypestateFit;
 
-use crate::errors::{algo_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{
     as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype,
 };
@@ -223,7 +227,7 @@ impl PySpectralEmbedding {
 // SpectralClustering — fit (X) + labels_ (i32)
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnySpectralClustering,
     algo:  mlrs_algos::cluster::spectral_clustering::SpectralClustering,
     unfit: { n_clusters: usize, n_components: Option<usize>, affinity: String, gamma: f64, n_neighbors: usize, seed: u64 },
@@ -354,30 +358,36 @@ impl PySpectralClustering {
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = SpectralClustering::<f32>::new(
-                        n_clusters,
-                        n_components,
-                        affinity,
-                        gamma as f32,
-                        n_neighbors,
-                        seed,
-                    );
-                    est.fit(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnySpectralClustering::F32(est))
+                    // Builder setters are f64; drop the legacy `gamma as f32` cast
+                    // (the f64→F narrowing happens once inside build::<f32>(), A5).
+                    let est = SpectralClustering::<f32>::builder()
+                        .n_clusters(n_clusters)
+                        .n_components(n_components)
+                        .affinity(affinity)
+                        .gamma(gamma)
+                        .n_neighbors(n_neighbors)
+                        .seed(seed)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnySpectralClustering::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = SpectralClustering::<f64>::new(
-                        n_clusters,
-                        n_components,
-                        affinity,
-                        gamma,
-                        n_neighbors,
-                        seed,
-                    );
-                    est.fit(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnySpectralClustering::F64(est))
+                    let est = SpectralClustering::<f64>::builder()
+                        .n_clusters(n_clusters)
+                        .n_components(n_components)
+                        .affinity(affinity)
+                        .gamma(gamma)
+                        .n_neighbors(n_neighbors)
+                        .seed(seed)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnySpectralClustering::F64(fitted))
                 }
             }
         })?;
@@ -385,12 +395,13 @@ impl PySpectralClustering {
         Ok(())
     }
 
-    /// Fitted `labels_` (i32), either dtype arm. `NotFitted` if unfit.
+    /// Fitted `labels_` (i32), either dtype arm; the runtime [`not_fitted`] analog
+    /// on the `Unfit` arm (D-13).
     fn labels_(&self) -> PyResult<Vec<i32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnySpectralClustering::F32(e) => e.labels(&pool).map_err(algo_err_to_py),
-            AnySpectralClustering::F64(e) => e.labels(&pool).map_err(algo_err_to_py),
+            AnySpectralClustering::F32(e) => Ok(e.labels(&pool)),
+            AnySpectralClustering::F64(e) => Ok(e.labels(&pool)),
             _ => Err(not_fitted("spectral_clustering", "labels_")),
         }
     }
