@@ -30,6 +30,8 @@
 //! Tests live in `crates/mlrs-algos/tests/truncated_svd_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -41,16 +43,21 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::sign_flip::align_rows;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, Transform};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{Fit, Fitted, Transform, Unfit};
 
 /// Truncated SVD (DECOMP-02) fitted by the thin SVD of the UNCENTERED `X`.
 ///
-/// Construct with [`TruncatedSvd::new`] (`n_components`), then [`Fit::fit`] and
+/// Construct with the zero-arg [`TruncatedSvd::new`] (sklearn-style default
+/// `n_components = 2`) or [`TruncatedSvd::builder`] (`.n_components(usize)`), then
+/// the consuming [`Fit::fit`] (returns the `Fitted`-tagged sibling) and
 /// [`Transform::transform`]. Fitted attributes are device-resident (D-03); the
-/// host accessors materialize them on demand. Unlike [`Pca`](super::pca::Pca),
-/// there is no `mean_` (no centering) and `inverse_transform` is unsupported.
-pub struct TruncatedSvd<F> {
+/// host accessors materialize them on demand and exist ONLY on
+/// `TruncatedSvd<F, Fitted>` (the compile-time typestate replaces the old runtime
+/// `NotFitted` guard, D-03). Unlike [`Pca`](super::pca::Pca), there is no `mean_`
+/// (no centering) and `inverse_transform` is unsupported (the typestate
+/// `Transform::inverse_transform` default → `AlgoError::Unsupported`).
+pub struct TruncatedSvd<F, S = Unfit> {
     /// Number of components to keep (`1 ..= min(n_samples, n_features)`).
     n_components: usize,
     /// `components_` (`n_components × n_features`), row-major, device-resident.
@@ -64,80 +71,156 @@ pub struct TruncatedSvd<F> {
     singular_values_: Option<DeviceArray<ActiveRuntime, F>>,
     /// `n_features` seen at fit, for `transform` geometry.
     n_features: usize,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> TruncatedSvd<F>
+impl<F> TruncatedSvd<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `TruncatedSVD` keeping `n_components` components (D-06).
-    pub fn new(n_components: usize) -> Self {
+    /// Create an unfitted `TruncatedSVD` with the sklearn-style default
+    /// `n_components = 2` directly in the `Unfit` state. This is the SINGLE source
+    /// of truth for the default hyperparameter (D-08): the builder `Default`
+    /// re-derives from here via [`TruncatedSvd::into_builder`]. The actual
+    /// `n_components` is validated against `min(n_samples, n_features)` at `fit`
+    /// (a data-DEPENDENT bound), so [`TruncatedSvdBuilder::build`] is infallible.
+    pub fn new() -> Self {
         Self {
-            n_components,
+            n_components: 2,
             components_: None,
             explained_variance_: None,
             explained_variance_ratio_: None,
             singular_values_: None,
             n_features: 0,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of `components_` (`n_components × n_features`, row-major).
-    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.components_, pool, "components_")
+    /// Start building a `TruncatedSVD` from the default `n_components` (D-08).
+    pub fn builder() -> TruncatedSvdBuilder {
+        TruncatedSvdBuilder::default()
+    }
+
+    /// Decompose this (unfit) estimator back into its builder, copying the
+    /// hyperparameter. Used by [`TruncatedSvdBuilder::default`] to re-derive the
+    /// default from [`TruncatedSvd::new`] (D-08).
+    pub fn into_builder(self) -> TruncatedSvdBuilder {
+        TruncatedSvdBuilder {
+            n_components: self.n_components,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// device fields are excluded — all are `None` in any `Unfit` value). Used by
+    /// the defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.n_components == other.n_components
+    }
+}
+
+impl<F> Default for TruncatedSvd<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`TruncatedSvd`] (D-01). `Default` re-derives the default
+/// `n_components` from [`TruncatedSvd::new`] (D-08 single source) rather than
+/// holding a literal (Pitfall 1).
+#[derive(Debug, Clone, Copy)]
+pub struct TruncatedSvdBuilder {
+    n_components: usize,
+}
+
+impl Default for TruncatedSvdBuilder {
+    /// Re-derive the default `n_components` from [`TruncatedSvd::new`] (D-08).
+    fn default() -> Self {
+        TruncatedSvd::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl TruncatedSvdBuilder {
+    /// Set the number of components to keep (`1 ..= min(n_samples, n_features)`;
+    /// validated against the data shape at `fit`).
+    pub fn n_components(mut self, v: usize) -> Self {
+        self.n_components = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. TruncatedSVD's `n_components` bound is
+    /// `1 ..= min(n_samples, n_features)` — a data-DEPENDENT bound validated in
+    /// [`Fit::fit`] (`AlgoError::InvalidNComponents`). This `build()` is therefore
+    /// infallible-but-typed (`Result<_, BuildError>` that never errs), kept for
+    /// family uniformity so the PyO3 `build_err_to_py` mapper stays shape-identical.
+    pub fn build<F>(self) -> Result<TruncatedSvd<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(TruncatedSvd {
+            n_components: self.n_components,
+            components_: None,
+            explained_variance_: None,
+            explained_variance_ratio_: None,
+            singular_values_: None,
+            n_features: 0,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> TruncatedSvd<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of `components_` (`n_components × n_features`, row-major). `Some`
+    /// by construction on the `Fitted` state (D-03).
+    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.components_, pool)
     }
 
     /// Host copy of `explained_variance_` (length `n_components`).
-    pub fn explained_variance(
-        &self,
-        pool: &BufferPool<ActiveRuntime>,
-    ) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.explained_variance_, pool, "explained_variance_")
+    pub fn explained_variance(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.explained_variance_, pool)
     }
 
     /// Host copy of `explained_variance_ratio_` (length `n_components`).
-    pub fn explained_variance_ratio(
-        &self,
-        pool: &BufferPool<ActiveRuntime>,
-    ) -> Result<Vec<F>, AlgoError> {
-        self.attr(
-            &self.explained_variance_ratio_,
-            pool,
-            "explained_variance_ratio_",
-        )
+    pub fn explained_variance_ratio(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.explained_variance_ratio_, pool)
     }
 
     /// Host copy of `singular_values_` (length `n_components`).
-    pub fn singular_values(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.singular_values_, pool, "singular_values_")
+    pub fn singular_values(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.attr(&self.singular_values_, pool)
     }
 
     fn attr(
         &self,
         slot: &Option<DeviceArray<ActiveRuntime, F>>,
         pool: &BufferPool<ActiveRuntime>,
-        operation: &'static str,
-    ) -> Result<Vec<F>, AlgoError> {
+    ) -> Vec<F> {
         slot.as_ref()
-            .map(|a| a.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "truncated_svd",
-                operation,
-            })
+            .expect("fitted attribute is Some by construction on TruncatedSvd<F, Fitted>")
+            .to_host(pool)
     }
 }
 
-impl<F> Fit<F> for TruncatedSvd<F>
+impl<F> Fit<F> for TruncatedSvd<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = TruncatedSvd<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<TruncatedSvd<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         let k = n_samples.min(n_features);
 
@@ -256,16 +339,19 @@ where
         s.release_into(pool);
         vt.release_into(pool);
 
-        self.components_ = Some(components_dev);
-        self.explained_variance_ = Some(ev_dev);
-        self.explained_variance_ratio_ = Some(ratio_dev);
-        self.singular_values_ = Some(sv_dev);
-        self.n_features = n_features;
-        Ok(self)
+        Ok(TruncatedSvd {
+            n_components: self.n_components,
+            components_: Some(components_dev),
+            explained_variance_: Some(ev_dev),
+            explained_variance_ratio_: Some(ratio_dev),
+            singular_values_: Some(sv_dev),
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Transform<F> for TruncatedSvd<F>
+impl<F> Transform<F> for TruncatedSvd<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {

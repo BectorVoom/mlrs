@@ -23,7 +23,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::decomposition::truncated_svd::TruncatedSvd;
-use mlrs_algos::traits::{Fit, Transform};
+use mlrs_algos::typestate::{Fit, Transform};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -139,15 +139,18 @@ where
         .collect();
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut tsvd = TruncatedSvd::<F>::new(N_COMPONENTS);
-    tsvd.fit(&mut pool, &x_dev, None, (N_SAMPLES, N_FEATURES))
+    let tsvd = TruncatedSvd::<F>::builder()
+        .n_components(N_COMPONENTS)
+        .build::<F>()
+        .expect("TruncatedSvdBuilder::build is infallible")
+        .fit(&mut pool, &x_dev, None, (N_SAMPLES, N_FEATURES))
         .expect("TruncatedSvd::fit on a valid shape");
 
     let promote = |v: Vec<F>| v.iter().map(|&x| host_to_f64(x)).collect::<Vec<f64>>();
 
-    let components = promote(tsvd.components(&pool).expect("components_ after fit"));
-    let explained_variance = promote(tsvd.explained_variance(&pool).expect("explained_variance_"));
-    let singular_values = promote(tsvd.singular_values(&pool).expect("singular_values_"));
+    let components = promote(tsvd.components(&pool));
+    let explained_variance = promote(tsvd.explained_variance(&pool));
+    let singular_values = promote(tsvd.singular_values(&pool));
 
     let z = tsvd
         .transform(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
@@ -160,6 +163,20 @@ where
         singular_values,
         transform,
     }
+}
+
+/// BLDR-01: the zero-arg `new()` defaults equal the builder's `build()` defaults
+/// (`TruncatedSvd::new().hyperparams_eq(&TruncatedSvd::builder().build()?)`).
+#[test]
+fn truncated_svd_defaults_equal() {
+    let from_new = TruncatedSvd::<f64>::new();
+    let from_builder = TruncatedSvd::<f64>::builder()
+        .build::<f64>()
+        .expect("TruncatedSvdBuilder::build is infallible");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "TruncatedSvd::new() defaults must equal builder().build() defaults"
+    );
 }
 
 /// `components_`/`singular_values_` vs sklearn arpack after `align_rows`, f32.

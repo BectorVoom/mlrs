@@ -235,7 +235,7 @@ impl PyPCA {
 // TruncatedSVD — Fit (unsupervised) + Transform
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyTruncatedSvd,
     algo:  mlrs_algos::decomposition::truncated_svd::TruncatedSvd,
     unfit: { n_components: usize },
@@ -279,20 +279,28 @@ impl PyTruncatedSVD {
             _ => 2,
         };
         let fitted = py.detach(|| -> PyResult<AnyTruncatedSvd> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = TruncatedSvd::<f32>::new(n_components);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyTruncatedSvd::F32(est))
+                    let est = TruncatedSvd::<f32>::builder()
+                        .n_components(n_components)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyTruncatedSvd::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = TruncatedSvd::<f64>::new(n_components);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyTruncatedSvd::F64(est))
+                    let est = TruncatedSvd::<f64>::builder()
+                        .n_components(n_components)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyTruncatedSvd::F64(fitted))
                 }
             }
         })?;
@@ -303,11 +311,11 @@ impl PyTruncatedSVD {
     fn transform_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyTruncatedSvd::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("truncated_svd", "transform (f32 path)")),
             }
@@ -316,11 +324,11 @@ impl PyTruncatedSVD {
     fn transform_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyTruncatedSvd::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("truncated_svd", "transform (f64 path)")),
             }
@@ -328,44 +336,44 @@ impl PyTruncatedSVD {
     }
 
     fn components_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyTruncatedSvd::F32(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnyTruncatedSvd::F32(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("truncated_svd", "components_ (f32)")),
         }
     }
     fn components_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyTruncatedSvd::F64(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnyTruncatedSvd::F64(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("truncated_svd", "components_ (f64)")),
         }
     }
     fn singular_values_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyTruncatedSvd::F32(e) => e.singular_values(&pool).map_err(algo_err_to_py),
+            AnyTruncatedSvd::F32(e) => Ok(e.singular_values(&pool)),
             _ => Err(not_fitted("truncated_svd", "singular_values_ (f32)")),
         }
     }
     fn singular_values_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyTruncatedSvd::F64(e) => e.singular_values(&pool).map_err(algo_err_to_py),
+            AnyTruncatedSvd::F64(e) => Ok(e.singular_values(&pool)),
             _ => Err(not_fitted("truncated_svd", "singular_values_ (f64)")),
         }
     }
     fn explained_variance_ratio_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyTruncatedSvd::F32(e) => e.explained_variance_ratio(&pool).map_err(algo_err_to_py),
+            AnyTruncatedSvd::F32(e) => Ok(e.explained_variance_ratio(&pool)),
             _ => Err(not_fitted("truncated_svd", "explained_variance_ratio_ (f32)")),
         }
     }
     fn explained_variance_ratio_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyTruncatedSvd::F64(e) => e.explained_variance_ratio(&pool).map_err(algo_err_to_py),
+            AnyTruncatedSvd::F64(e) => Ok(e.explained_variance_ratio(&pool)),
             _ => Err(not_fitted("truncated_svd", "explained_variance_ratio_ (f64)")),
         }
     }
