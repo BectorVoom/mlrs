@@ -168,7 +168,7 @@ Plans:
   3. A user can read per-point `outlier_scores_` (GLOSH) from a fitted HDBSCAN, gated within band vs the `hdbscan` library.
   4. A user can request cluster centers via `store_centers` (`'centroid'`/`'medoid'`) producing `centroids_`/`medoids_`.
 
-**Plans**: 6/6 plans complete
+**Plans**: 7 plans (6 complete + 1 gap-closure)
 **Wave 1**
 
 - [x] 15-01-PLAN.md — label_perm `-1→-1` pinned matcher + unit test (HDBS-02)
@@ -192,6 +192,10 @@ Plans:
 **Wave 6** *(blocked on Wave 5 completion)*
 
 - [x] 15-06-PLAN.md — GLOSH outlier_scores_ (vs hdbscan 0.8.44) + store_centers centroid/medoid (vs sklearn)
+
+**Gap closure** *(standalone — Wave 1, no deps on 15-01…15-06; closes HDBS-01 BLOCKED gap from 15-VERIFICATION.md)*
+
+- [ ] 15-07-PLAN.md — `Hdbscan::fit_predict` convenience method (typestate-correct: consumes `self`) + behavioral-equivalence test (HDBS-01)
 
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — RESOLVED IN PLANS: the D-04/D-05 host-MST tie-break exactness is sequenced as the Wave-3 TRUE GATE (15-03 `tie_break_exact` on the tie-heavy + duplicate-point fixture) BEFORE the device front-end (15-05) commits. The oracle-matched tie-break (sklearn `np.argsort` quicksort + the two Prim variants — NOT the mlrs lowest-index convention) is replicated; gate fixtures use distinct MST edge weights (RESEARCH Pitfall 1 option 2). An un-exactable metric is surfaced as a phase blocker per D-05, never band-demoted.
