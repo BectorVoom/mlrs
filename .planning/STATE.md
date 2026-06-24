@@ -6,15 +6,15 @@ current_phase: 16
 current_phase_name: builder-retrofit-sweep-shim-coverage
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-24T09:53:11.423Z"
+last_updated: "2026-06-24T10:07:54.638Z"
 last_activity: 2026-06-24
-last_activity_desc: Phase 16 execution started
+last_activity_desc: Completed 16-01 (Ridge + MBSGDRegressor typestate pilots)
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 34
-  completed_plans: 23
-  percent: 68
+  completed_plans: 24
+  percent: 71
 ---
 
 # Project State
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
-Plan: 3 of 13
+Plan: 4 of 13
 Status: Ready to execute
 Last activity: 2026-06-24 — Completed 16-01 (Ridge + MBSGDRegressor typestate pilots)
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-02..16-12); do not mark phase complete until verification passes
@@ -143,6 +143,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 15 P06 | 18 | 2 tasks | 4 files |
 | Phase 15 P07 | 5 | 2 tasks | 2 files |
 | Phase 16 P00 | 12 | 3 tasks | 3 files |
+| Phase 16 P02 | 9m | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -281,6 +282,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 15-05: cosine=Variant-A dense via MR kernel; other 4 feature metrics=Variant-B (no n*n resident); MR kernel VALUE gate in mlrs-backend
 - [Phase ?]: 15-06: GLOSH outlier_scores_ use a parallel hdbscan-convention tree; labels_/probabilities_ stay sklearn-exact (D-06/D-07 Option A)
 - [Phase 15]: HDBS-01: Hdbscan::fit_predict consumes self (typestate Unfit->Fitted), unlike DBSCAN's &mut self
+- [Phase ?]: 16-02: with_opts folds into builder setters; data-independent validation relocates to build()->BuildError (shared fit helper unchanged, byte-identical math)
+- [Phase ?]: 16-02: LinearRegression build() is infallible-but-typed (no data-independent hyperparam) for PyO3 build_err_to_py uniformity across the linear family
 
 ### Pending Todos
 
@@ -312,7 +315,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T09:53:11.416Z
+Last session: 2026-06-24T10:07:32.570Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
 
