@@ -38,7 +38,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
@@ -50,6 +50,7 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 // consumes.
 pub mod condense;
 pub mod mst;
+pub mod select;
 pub mod single_linkage;
 pub mod stability;
 
@@ -144,11 +145,21 @@ pub struct Hdbscan<F, S = Unfit> {
     /// compute lands in plan 15-06; wired here so the surface is complete
     /// (HDBS-04 / D-08).
     store_centers: Option<StoreCenters>,
+    /// Whether the EoM selector may pick the single root cluster
+    /// (`allow_single_cluster`, default `false`). A homogeneous blob with no
+    /// density split yields all-noise under default EoM unless this is `true`
+    /// (sklearn `allow_single_cluster`); wired in plan 15-04 so the single-cluster
+    /// edge case matches sklearn.
+    allow_single_cluster: bool,
 
     // --- fitted state (None / 0 until fit; Some on Fitted by construction) ---
     /// Fitted labels (length `n`, `-1` = noise), device-resident `i32`. `None`
     /// until fit.
     labels_: Option<DeviceArray<ActiveRuntime, i32>>,
+    /// Fitted per-point membership probabilities (length `n`, in `[0, 1]`),
+    /// device-resident `F`. `Some` after a precomputed fit (plan 15-04), `None`
+    /// otherwise (the feature-metric device front-end lands in plan 15-05).
+    probabilities_: Option<DeviceArray<ActiveRuntime, F>>,
     /// The single-linkage hierarchy from the MST → `make_single_linkage` pass
     /// (HDBS-02, plan 15-03). `Some` after a precomputed fit, `None` otherwise
     /// (the feature-metric device front-end lands in plan 15-05). Stored host-side
@@ -186,7 +197,9 @@ where
             alpha: 1.0,
             max_cluster_size: 0,
             store_centers: None,
+            allow_single_cluster: false,
             labels_: None,
+            probabilities_: None,
             single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -211,6 +224,7 @@ where
             && self.alpha == other.alpha
             && self.max_cluster_size == other.max_cluster_size
             && self.store_centers == other.store_centers
+            && self.allow_single_cluster == other.allow_single_cluster
     }
 
     /// Decompose this (unfit) estimator back into its builder, copying every
@@ -227,6 +241,7 @@ where
             alpha: self.alpha,
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
+            allow_single_cluster: self.allow_single_cluster,
         }
     }
 }
@@ -253,6 +268,7 @@ pub struct HdbscanBuilder {
     alpha: f64,
     max_cluster_size: usize,
     store_centers: Option<StoreCenters>,
+    allow_single_cluster: bool,
 }
 
 impl Default for HdbscanBuilder {
@@ -304,6 +320,12 @@ impl HdbscanBuilder {
     /// Set which cluster centers to compute `store_centers` (`None` = neither).
     pub fn store_centers(mut self, v: Option<StoreCenters>) -> Self {
         self.store_centers = v;
+        self
+    }
+    /// Set whether the EoM selector may pick the single root cluster
+    /// `allow_single_cluster` (default `false`).
+    pub fn allow_single_cluster(mut self, v: bool) -> Self {
+        self.allow_single_cluster = v;
         self
     }
 
@@ -379,7 +401,9 @@ impl HdbscanBuilder {
             alpha: self.alpha,
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
+            allow_single_cluster: self.allow_single_cluster,
             labels_: None,
+            probabilities_: None,
             single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -422,18 +446,26 @@ where
 
         // The single-linkage hierarchy is produced only by the precomputed path in
         // this slice; the feature-metric device front-end (plan 15-05) fills it
-        // later. Labels stay all-`-1` until plan 15-04 wires the condensed tree.
-        let single_linkage_ = if self.metric == Metric::Precomputed {
-            Some(self.precomputed_single_linkage(pool, x, n, p)?)
+        // later. For the precomputed path (plan 15-04) the host tree back-end runs
+        // condense → stability → select → labelling/probabilities end-to-end; the
+        // feature metrics keep the trivial all-`-1` fit (no probabilities) until
+        // the device front-end lands in plan 15-05.
+        let (single_linkage_, labels, probabilities) = if self.metric == Metric::Precomputed {
+            let hierarchy = self.precomputed_single_linkage(pool, x, n, p)?;
+            let (labels, probs) = self.tree_to_labels(&hierarchy, n);
+            (Some(hierarchy), labels, Some(probs))
         } else {
-            None
+            // Labels-only contract for feature metrics until 15-05: all-`-1`.
+            (None, vec![-1_i32; n], None)
         };
 
-        // Labels-only contract holds until 15-04: all-`-1` (noise sentinel). NO
-        // kernel for the precomputed path (pure host MST); the feature metrics
-        // keep the trivial fit until 15-05.
-        let labels = vec![-1_i32; n];
         let labels_dev = DeviceArray::from_host(pool, &labels);
+        // probabilities_ is device-resident `F`; `None` for the feature-metric
+        // trivial path (the accessor returns all-0 there is NOT exposed — `None`).
+        let probabilities_ = probabilities.map(|p_host| {
+            let p_f: Vec<F> = p_host.iter().map(|&v| f64_to_host::<F>(v)).collect();
+            DeviceArray::from_host(pool, &p_f)
+        });
 
         Ok(Hdbscan {
             min_cluster_size: self.min_cluster_size,
@@ -444,7 +476,9 @@ where
             alpha: self.alpha,
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
+            allow_single_cluster: self.allow_single_cluster,
             labels_: Some(labels_dev),
+            probabilities_,
             single_linkage_,
             n_features_in_: p,
             _float: PhantomData,
@@ -506,6 +540,46 @@ where
         let sorted = mst::argsort_by_weight(&edges);
         Ok(single_linkage::make_single_linkage(&sorted, n))
     }
+
+    /// Host tree back-end (HDBS-01/02, plan 15-04): condense the single-linkage
+    /// `hierarchy` by `min_cluster_size`, compute stabilities, run the configured
+    /// EoM/leaf + epsilon/max_cluster_size selection, label points (`-1` = noise),
+    /// and compute membership probabilities. Returns `(labels_i32, probabilities)`
+    /// of length `n`.
+    ///
+    /// A `hierarchy` with fewer than one merge (`n < 2`, or every point isolated)
+    /// yields all-`-1` labels and all-`0` probabilities (no cluster can form) —
+    /// matching sklearn's degenerate output without entering the condensed-tree
+    /// path (which assumes at least one internal node).
+    fn tree_to_labels(&self, hierarchy: &[single_linkage::SingleLinkageEdge], n: usize) -> (Vec<i32>, Vec<f64>) {
+        let condensed = condense::condense_tree(hierarchy, self.min_cluster_size);
+        // A condensed tree with no internal cluster (every point fell out under the
+        // root, or an empty hierarchy) is the all-noise degenerate case.
+        if condensed.is_empty() {
+            return (vec![-1_i32; n], vec![0.0_f64; n]);
+        }
+        let stability = stability::compute_stability(&condensed);
+        let method = match self.cluster_selection_method {
+            ClusterSelectionMethod::Eom => select::SelectionMethod::Eom,
+            ClusterSelectionMethod::Leaf => select::SelectionMethod::Leaf,
+        };
+        let (labels_i64, probs) = select::get_clusters(
+            &condensed,
+            &stability,
+            method,
+            self.allow_single_cluster,
+            self.cluster_selection_epsilon,
+            self.max_cluster_size,
+        );
+
+        // select returns labels of length `n_samples` (== n). Convert i64 -> i32
+        // (cluster ids are small; noise is -1). Pad/truncate to `n` defensively.
+        let mut labels_i32: Vec<i32> = labels_i64.iter().map(|&l| l as i32).collect();
+        labels_i32.resize(n, -1);
+        let mut probs = probs;
+        probs.resize(n, 0.0);
+        (labels_i32, probs)
+    }
 }
 
 impl<F> Hdbscan<F, Fitted>
@@ -520,6 +594,15 @@ where
             .as_ref()
             .expect("labels_ is Some by construction on Hdbscan<F, Fitted>")
             .to_host(pool)
+    }
+
+    /// Host copy of the fitted per-point membership `probabilities_` (length `n`,
+    /// in `[0, 1]`). `Some` after a precomputed fit (plan 15-04); `None` for the
+    /// feature-space metrics until the device front-end lands (plan 15-05) — so
+    /// this mirrors `single_linkage()` (Option) rather than `labels()` (always
+    /// Some), since the trivial feature-metric path produces no probabilities yet.
+    pub fn probabilities(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
+        self.probabilities_.as_ref().map(|d| d.to_host(pool))
     }
 
     /// Number of features seen at fit (`n_features_in_`).

@@ -110,6 +110,105 @@ fn skip_f64(test: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Precomputed-path fit helpers (plan 15-04). The host tree back-end is wired only
+// for `Metric::Precomputed` in this wave (the feature-metric device front-end
+// lands in 15-05). Both gate helpers therefore route through the precomputed
+// path: the `precomputed` fixture ships an n×n distance matrix directly, while the
+// euclidean/nested/edge fixtures ship feature `X` — we build the EXACT euclidean
+// pairwise distance matrix host-side (precomputed-euclidean == euclidean for
+// labels/probabilities, since the oracle's precomputed fixture is exactly
+// `pairwise_distances(X, 'euclidean')` of the same design). Builder knobs
+// (min_cluster_size, selection method, epsilon, max_cluster_size, alpha,
+// allow_single_cluster) are threaded through so every D-09 knob exercises the real
+// selection code.
+// ---------------------------------------------------------------------------
+
+use mlrs_algos::cluster::hdbscan::ClusterSelectionMethod;
+use mlrs_algos::typestate::Fit;
+use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::runtime::{self, ActiveRuntime};
+
+/// Knob bundle for a precomputed-path fit (defaults mirror sklearn).
+#[derive(Clone, Copy)]
+struct FitKnobs {
+    min_cluster_size: usize,
+    min_samples: Option<usize>,
+    method: ClusterSelectionMethod,
+    epsilon: f64,
+    max_cluster_size: usize,
+    alpha: f64,
+    allow_single_cluster: bool,
+}
+
+impl FitKnobs {
+    fn defaults(min_cluster_size: usize) -> Self {
+        Self {
+            min_cluster_size,
+            min_samples: None,
+            method: ClusterSelectionMethod::Eom,
+            epsilon: 0.0,
+            max_cluster_size: 0,
+            alpha: 1.0,
+            allow_single_cluster: false,
+        }
+    }
+}
+
+/// Dense euclidean pairwise distance matrix (row-major `n×n`) from feature rows
+/// `x` of shape `(n, d)`. Matches `sklearn.metrics.pairwise_distances(X,
+/// 'euclidean')` exactly (the oracle's precomputed-fixture construction).
+fn euclidean_distance_matrix(x: &[f64], n: usize, d: usize) -> Vec<f64> {
+    let mut dist = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut s = 0.0f64;
+            for k in 0..d {
+                let diff = x[i * d + k] - x[j * d + k];
+                s += diff * diff;
+            }
+            dist[i * n + j] = s.sqrt();
+        }
+    }
+    dist
+}
+
+/// Fit `Hdbscan` over a precomputed `n×n` distance matrix `dist` with the given
+/// knobs; return `(labels, probabilities)` host-side. Pure precomputed path.
+fn fit_precomputed(dist: &[f64], n: usize, knobs: FitKnobs) -> (Vec<i64>, Vec<f64>) {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, dist);
+
+    let fitted = Hdbscan::<f64>::builder()
+        .min_cluster_size(knobs.min_cluster_size)
+        .min_samples(knobs.min_samples)
+        .cluster_selection_method(knobs.method)
+        .cluster_selection_epsilon(knobs.epsilon)
+        .max_cluster_size(knobs.max_cluster_size)
+        .alpha(knobs.alpha)
+        .allow_single_cluster(knobs.allow_single_cluster)
+        .metric(Metric::Precomputed)
+        .build::<f64>()
+        .expect("build precomputed")
+        .fit(&mut pool, &x_dev, None, (n, n))
+        .expect("precomputed fit");
+
+    let labels: Vec<i64> = fitted.labels(&pool).iter().map(|&l| l as i64).collect();
+    let probs = fitted
+        .probabilities(&pool)
+        .expect("precomputed fit produces probabilities");
+    (labels, probs)
+}
+
+/// Fit over a feature matrix `x` of shape `(n, d)` by first building its euclidean
+/// distance matrix and routing through the precomputed path (== euclidean fit).
+fn fit_euclidean_via_precomputed(x: &[f64], n: usize, d: usize, knobs: FitKnobs) -> (Vec<i64>, Vec<f64>) {
+    let dist = euclidean_distance_matrix(x, n, d);
+    fit_precomputed(&dist, n, knobs)
+}
+
+// ---------------------------------------------------------------------------
 // HDBS-02 / D-03: labels match sklearn exactly up to a -1-pinned permutation,
 // per metric × {f32, f64}. The exact-label gate uses the PINNED-NOISE matcher so
 // a noise/cluster mismatch is a genuine failure (never permuted away).
@@ -190,11 +289,47 @@ labels_match_metric!(
     labels_match_sklearn_minkowski_f64,
     "minkowski"
 );
-labels_match_metric!(
-    labels_match_sklearn_precomputed_f32,
-    labels_match_sklearn_precomputed_f64,
-    "precomputed"
-);
+// The precomputed metric is the ONLY end-to-end-fittable path in plan 15-04 (the
+// feature-metric device front-end lands in 15-05), so its label gate runs the REAL
+// fit (not the Wave-0 oracle self-consistency placeholder). The precomputed
+// fixture's `X` is the n×n euclidean distance matrix of the `blobs` design;
+// min_cluster_size = HDB_MIN_CLUSTER_SIZE = 5, eom default.
+const HDB_BLOB_MCS: usize = 5;
+
+/// `labels_match_sklearn` precomputed f32 — the real precomputed-path fit's labels
+/// are a -1-pinned permutation of sklearn's (HDBS-02 / D-03).
+#[test]
+fn labels_match_sklearn_precomputed_f32() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
+    run_precomputed_labels("f32", "labels_match_sklearn precomputed f32");
+}
+
+/// `labels_match_sklearn` precomputed f64 — real fit labels vs sklearn (cpu; rocm
+/// skips-with-log).
+#[test]
+fn labels_match_sklearn_precomputed_f64() {
+    if skip_f64("labels_match_sklearn precomputed") {
+        return;
+    }
+    run_precomputed_labels("f64", "labels_match_sklearn precomputed f64");
+}
+
+fn run_precomputed_labels(dtype_tag: &str, label: &str) {
+    let name = format!("hdbscan_precomputed_{dtype_tag}_seed42.npz");
+    let case = load_npz(fixture(&name)).unwrap_or_else(|e| panic!("load {name}: {e}"));
+    let sklearn = labels_i64(&case, "labels");
+    let n = sklearn.len();
+    let dist: Vec<f64> = case.expect_f64("X").to_vec();
+    assert_eq!(dist.len(), n * n, "precomputed X is the n×n distance matrix");
+
+    let (got, _probs) = fit_precomputed(&dist, n, FitKnobs::defaults(HDB_BLOB_MCS));
+    let acc = best_match_accuracy_pinned_noise(&got, &sklearn);
+    assert!(
+        (acc - 1.0).abs() < f64::EPSILON,
+        "{label}: labels not a -1-pinned permutation of sklearn (acc={acc})\n got={got:?}\n exp={sklearn:?}"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // HDBS-02 / D-04 TRUE GATE: the tie-heavy + duplicate-point fixture. Same
@@ -202,9 +337,12 @@ labels_match_metric!(
 // duplicate row (R-9) must carry its partner's label.
 // ---------------------------------------------------------------------------
 
+/// The tie-heavy fixture geometry (2 features, mcs = HDB_TIE_MCS = 3).
+const HDB_TIE_N_FEATURES: usize = 2;
+const HDB_TIE_MCS: usize = 3;
+
 /// `tie_break_exact` f32 — the D-04 TRUE GATE on the tie-heavy lattice + duplicate.
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit (tie-heavy MST handling)"]
 fn tie_break_exact_f32() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
@@ -214,7 +352,6 @@ fn tie_break_exact_f32() {
 
 /// `tie_break_exact` f64 — the D-04 TRUE GATE (cpu runs; rocm skips-with-log).
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit (tie-heavy MST handling)"]
 fn tie_break_exact_f64() {
     if skip_f64("tie_break_exact") {
         return;
@@ -225,8 +362,14 @@ fn tie_break_exact_f64() {
 
 fn run_tie_break(case: &OracleCase, label: &str) {
     let sklearn = labels_i64(case, "labels");
-    // 15-NN: replace `got` with the fitted mlrs labels on the tie-heavy fixture.
-    let got = sklearn.clone();
+    let n = sklearn.len();
+    let x: Vec<f64> = case.expect_f64("X").to_vec();
+    let (got, _probs) = fit_euclidean_via_precomputed(
+        &x,
+        n,
+        HDB_TIE_N_FEATURES,
+        FitKnobs::defaults(HDB_TIE_MCS),
+    );
     let acc = best_match_accuracy_pinned_noise(&got, &sklearn);
     assert!(
         (acc - 1.0).abs() < f64::EPSILON,
@@ -247,9 +390,12 @@ fn run_tie_break(case: &OracleCase, label: &str) {
 // HDBS-01 / D-06: per-point `probabilities_` match sklearn ≤1e-5.
 // ---------------------------------------------------------------------------
 
+/// The euclidean blob fixture geometry (HDB_BLOB_N_FEATURES = 4, mcs = 5).
+const HDB_BLOB_N_FEATURES: usize = 4;
+
 /// `probabilities_match` f32 — per-point membership strength vs sklearn ≤1e-5.
+/// Routes the euclidean feature fixture through the precomputed path (plan 15-04).
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit + probabilities accessor"]
 fn probabilities_match_f32() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
@@ -259,7 +405,6 @@ fn probabilities_match_f32() {
 
 /// `probabilities_match` f64 — per-point membership strength (cpu; rocm skips).
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit + probabilities accessor"]
 fn probabilities_match_f64() {
     if skip_f64("probabilities_match") {
         return;
@@ -270,8 +415,21 @@ fn probabilities_match_f64() {
 
 fn run_probabilities(case: &OracleCase, tol: &Tolerance, label: &str) {
     let probabilities = case.expect_f64("probabilities").to_vec();
-    // 15-NN: replace `got` with the fitted mlrs `probabilities_`.
-    let got = probabilities.clone();
+    let n = probabilities.len();
+    let x: Vec<f64> = case.expect_f64("X").to_vec();
+    let (got_labels, got) = fit_euclidean_via_precomputed(
+        &x,
+        n,
+        HDB_BLOB_N_FEATURES,
+        FitKnobs::defaults(HDB_BLOB_MCS),
+    );
+    // Sanity: labels match too (probabilities only make sense under matched labels).
+    let sklearn = labels_i64(case, "labels");
+    let acc = best_match_accuracy_pinned_noise(&got_labels, &sklearn);
+    assert!(
+        (acc - 1.0).abs() < f64::EPSILON,
+        "{label}: labels diverged before the probability compare (acc={acc})"
+    );
     assert_close(&got, &probabilities, tol, label);
 }
 
@@ -376,9 +534,25 @@ fn run_centers(case: &OracleCase, tol: &Tolerance, label: &str) {
 // sklearn 1.9.0's epsilon_search crashes on merging trees; see gen_oracle.py.)
 // ---------------------------------------------------------------------------
 
+/// The nested-density fixture geometry (2 features, mcs = HDB_NESTED_MCS = 20).
+const HDB_NESTED_N_FEATURES: usize = 2;
+const HDB_NESTED_MCS: usize = 20;
+
+/// `labels_alpha` is the FEATURE-path (Variant-B) alpha gate (Pitfall 2): the
+/// oracle was generated on the feature matrix, whose `alpha` scaling differs from
+/// the precomputed (Variant-A) path wired in 15-04 — sklearn itself partitions
+/// differently (precomputed+α=0.5 → 2 clusters, feature+α=0.5 → 3). It is un-
+/// ignored by plan 15-05 once the feature-metric `mst_from_data_matrix` (Variant
+/// B) front-end lands. Kept here as an explicit, addressable marker so the D-09
+/// alpha knob is not silently dropped.
+#[test]
+#[ignore = "un-ignore in 15-05: labels_alpha needs the feature-metric Variant-B alpha path"]
+fn selection_knob_alpha_feature_path() {
+    // Deferred to 15-05 (feature-metric device front-end). See the doc comment.
+}
+
 /// `selection_knobs` f32 — each non-default knob's labels match its oracle.
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit + selection knobs"]
 fn selection_knobs_f32() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
@@ -388,7 +562,6 @@ fn selection_knobs_f32() {
 
 /// `selection_knobs` f64 — each non-default knob's labels (cpu; rocm skips).
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit + selection knobs"]
 fn selection_knobs_f64() {
     if skip_f64("selection_knobs") {
         return;
@@ -398,21 +571,50 @@ fn selection_knobs_f64() {
 }
 
 fn run_selection_knobs(case: &OracleCase, label: &str) {
-    // Each non-default-knob oracle label vector. 15-NN: fit `Hdbscan` with each
-    // knob and replace the `got_*` clone with the fitted labels.
-    for knob in [
-        "labels_eom",
-        "labels_leaf",
-        "labels_maxcluster",
-        "labels_alpha",
-        "labels_epsilon",
-    ] {
+    let x: Vec<f64> = case.expect_f64("X").to_vec();
+    let n = case.expect_f64("labels").len();
+    let dist = euclidean_distance_matrix(&x, n, HDB_NESTED_N_FEATURES);
+
+    // Each oracle knob → the matching builder configuration (gen_oracle.py:1182).
+    // eom: default; leaf: method=Leaf; maxcluster: max_cluster_size=35;
+    // epsilon: leaf + cluster_selection_epsilon=1.0 (the hdbscan-0.8.44 oracle).
+    //
+    // NOTE (Pitfall 2 / plan 15-05 scope): the `labels_alpha` oracle was generated
+    // on the FEATURE path, whose alpha placement is `pair_distance /= alpha` with
+    // RAW core distances (Variant B). The precomputed path used here divides the
+    // WHOLE matrix by alpha BEFORE core distances (Variant A) — a genuinely
+    // different reachability that sklearn ITSELF resolves to a different partition
+    // (precomputed+alpha=0.5 → 2 clusters vs feature+alpha=0.5 → 3). So the alpha
+    // knob is the FEATURE-path (Variant B) gate owned by plan 15-05; here we
+    // exercise every knob the precomputed path can reproduce exactly (alpha=1.0).
+    let mcs = HDB_NESTED_MCS;
+    let configs: [(&str, FitKnobs); 4] = [
+        ("labels_eom", FitKnobs::defaults(mcs)),
+        (
+            "labels_leaf",
+            FitKnobs { method: ClusterSelectionMethod::Leaf, ..FitKnobs::defaults(mcs) },
+        ),
+        (
+            "labels_maxcluster",
+            FitKnobs { max_cluster_size: 35, ..FitKnobs::defaults(mcs) },
+        ),
+        (
+            "labels_epsilon",
+            FitKnobs {
+                method: ClusterSelectionMethod::Leaf,
+                epsilon: 1.0,
+                ..FitKnobs::defaults(mcs)
+            },
+        ),
+    ];
+
+    for (knob, knobs) in configs {
         let oracle = labels_i64(case, knob);
-        let got = oracle.clone();
+        let (got, _probs) = fit_precomputed(&dist, n, knobs);
         let acc = best_match_accuracy_pinned_noise(&got, &oracle);
         assert!(
             (acc - 1.0).abs() < f64::EPSILON,
-            "{label} [{knob}]: labels not a -1-pinned permutation of the oracle (acc={acc})"
+            "{label} [{knob}]: labels not a -1-pinned permutation of the oracle (acc={acc})\n got={got:?}\n exp={oracle:?}"
         );
     }
 }
@@ -617,7 +819,6 @@ fn memory_gate() {
 
 /// `edge_cases` f32 — all-noise / single-cluster / tiny fixtures match sklearn.
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit"]
 fn edge_cases_f32() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
@@ -626,7 +827,6 @@ fn edge_cases_f32() {
 
 /// `edge_cases` f64 — degenerate fixtures match sklearn (cpu; rocm skips).
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit"]
 fn edge_cases_f64() {
     if skip_f64("edge_cases") {
         return;
@@ -635,16 +835,41 @@ fn edge_cases_f64() {
 }
 
 fn run_edge_cases(dtype_tag: &str, label: &str) {
-    for structure in ["allnoise", "single", "tiny"] {
+    // The edge fixtures all use HDB_MIN_CLUSTER_SIZE = 5 features-of-3 designs, with
+    // per-structure overrides matching gen_oracle.py:1124-1132:
+    //   - allnoise: defaults (eom) → every point is noise.
+    //   - single:   allow_single_cluster=True + min_samples=2 (a homogeneous blob
+    //               has no density split; eom selects the root as the one cluster).
+    //   - tiny:     min_samples=1 (n < mcs would over-flag; sklearn yields all-noise).
+    let edge_mcs = 5usize;
+    let n_features = 3usize;
+    let cases: [(&str, FitKnobs); 3] = [
+        ("allnoise", FitKnobs::defaults(edge_mcs)),
+        (
+            "single",
+            FitKnobs {
+                min_samples: Some(2),
+                allow_single_cluster: true,
+                ..FitKnobs::defaults(edge_mcs)
+            },
+        ),
+        (
+            "tiny",
+            FitKnobs { min_samples: Some(1), ..FitKnobs::defaults(edge_mcs) },
+        ),
+    ];
+
+    for (structure, knobs) in cases {
         let name = format!("hdbscan_{structure}_{dtype_tag}_seed42.npz");
         let case = load_npz(fixture(&name)).unwrap_or_else(|e| panic!("load {name}: {e}"));
         let sklearn = labels_i64(&case, "labels");
-        // 15-NN: replace `got` with the fitted mlrs labels on each edge fixture.
-        let got = sklearn.clone();
+        let n = sklearn.len();
+        let x: Vec<f64> = case.expect_f64("X").to_vec();
+        let (got, _probs) = fit_euclidean_via_precomputed(&x, n, n_features, knobs);
         let acc = best_match_accuracy_pinned_noise(&got, &sklearn);
         assert!(
             (acc - 1.0).abs() < f64::EPSILON,
-            "{label} [{structure}]: labels not a -1-pinned permutation of sklearn (acc={acc})"
+            "{label} [{structure}]: labels not a -1-pinned permutation of sklearn (acc={acc})\n got={got:?}\n exp={sklearn:?}"
         );
     }
 }
