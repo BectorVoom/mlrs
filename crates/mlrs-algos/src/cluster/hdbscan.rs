@@ -269,6 +269,28 @@ where
             allow_single_cluster: self.allow_single_cluster,
         }
     }
+
+    /// sklearn `ClusterMixin` convenience (HDBS-01): fit this estimator to `x`
+    /// and immediately return the resulting cluster `labels_` (length `n`, with
+    /// noise pinned at `-1`) as a fresh device-resident `i32` buffer.
+    ///
+    /// CONSUMES `self` (typestate: the `Unfit` estimator is fitted into its
+    /// `Fitted` sibling, then dropped after its labels are read). This differs
+    /// from DBSCAN's `&mut self` `fit_predict`: `Hdbscan`'s [`Fit::fit`] moves
+    /// `self` and yields a *new* `Hdbscan<F, Fitted>` (D-02), so the wrapper must
+    /// consume `self` too. The returned buffer holds exactly the labels that
+    /// `Fit::fit(self, …)` followed by `Hdbscan::<F, Fitted>::labels` would yield.
+    pub fn fit_predict(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
+        // Feature-data path (`_y` precomputed-distance argument is `None`).
+        let fitted = Fit::fit(self, pool, x, None, shape)?;
+        let labels = fitted.labels(pool);
+        Ok(DeviceArray::from_host(pool, &labels))
+    }
 }
 
 impl<F> Default for Hdbscan<F, Unfit>
