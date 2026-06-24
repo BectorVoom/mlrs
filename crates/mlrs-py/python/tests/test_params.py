@@ -15,6 +15,9 @@ These are pure-Python (no compiled ``_mlrs`` needed): they exercise only the
 sklearn ``BaseEstimator`` machinery over the faithful ``__init__`` (PY-02).
 """
 
+import ast
+import inspect
+
 import pytest
 
 import mlrs
@@ -125,6 +128,62 @@ def test_init_purity_stores_kwargs_verbatim(name):
     est = cls(**kwargs)
     assert getattr(est, param) == value  # stored under the SAME name
     assert est.get_params()[param] == value
+
+
+@pytest.mark.parametrize("name", ALL_12)
+def test_init_purity_ast(name):
+    """(c') STATIC __init__ purity — the strongest SHIM-01 guarantee without FFI.
+
+    Parses ``cls.__init__`` with the ``ast`` module (no instance constructed, no
+    compiled ``_mlrs`` extension imported) and asserts every statement in the
+    body is a bare ``self.<name> = <name>`` assignment: each ctor arg stored
+    verbatim under the SAME name, with NO computation/validation node
+    (``ast.Call`` / ``ast.BinOp`` / ``ast.Compare`` / etc.). This makes any
+    impure ``self.x = validate(x)`` body a hard test FAILURE rather than a
+    runtime surprise (SHIM-01 invariant, D-07 step 3). The parametrization draws
+    from the shared ``ALL_12`` list so it grows automatically as Plan 10 expands
+    the shim matrix.
+    """
+    cls = getattr(mlrs, name)
+    src = inspect.getsource(cls.__init__).strip()
+    tree = ast.parse(src)
+    fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef), (
+        f"{name}.__init__ did not parse as a function def"
+    )
+    assert fn.body, f"{name}.__init__ has an empty body"
+
+    for stmt in fn.body:
+        # Only assignments — no `if`/`for`/`raise`/`assert`/expression calls.
+        assert isinstance(stmt, ast.Assign), (
+            f"{name}.__init__ has a non-assignment statement "
+            f"{type(stmt).__name__} — __init__ must be pure (store-only)"
+        )
+        # Exactly one target, of the shape `self.<attr>`.
+        assert len(stmt.targets) == 1, (
+            f"{name}.__init__ has a multi-target assignment — only "
+            f"`self.<name> = <name>` is allowed"
+        )
+        tgt = stmt.targets[0]
+        assert (
+            isinstance(tgt, ast.Attribute)
+            and isinstance(tgt.value, ast.Name)
+            and tgt.value.id == "self"
+        ), (
+            f"{name}.__init__ assigns to {ast.dump(tgt)} — only attributes of "
+            f"`self` may be set in __init__"
+        )
+        # Value must be a BARE Name (no Call/BinOp/Compare/etc.).
+        assert isinstance(stmt.value, ast.Name), (
+            f"{name}.__init__ stores a computed value "
+            f"({type(stmt.value).__name__}) into self.{tgt.attr} — __init__ "
+            f"must store each ctor arg verbatim with no computation/validation"
+        )
+        # Stored under the SAME identifier (`self.x = x`, never `self.x = y`).
+        assert tgt.attr == stmt.value.id, (
+            f"{name}.__init__ stores `{stmt.value.id}` into self.{tgt.attr} — "
+            f"each arg must be stored under its own name"
+        )
 
 
 def test_logreg_exposes_capital_C():
