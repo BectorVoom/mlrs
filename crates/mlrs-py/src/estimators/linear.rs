@@ -27,7 +27,10 @@ use mlrs_algos::traits::{Fit, Predict, PredictLabels, PredictProba};
 // typestate forms are imported under disambiguating aliases and called via UFCS
 // at the migrated Ridge/MBSGDRegressor arms only (mirrors `cluster.rs`'s
 // `TypestateFit`).
-use mlrs_algos::typestate::{Fit as TypestateFit, Predict as TypestatePredict};
+use mlrs_algos::typestate::{
+    Fit as TypestateFit, Predict as TypestatePredict, PredictLabels as TypestatePredictLabels,
+    PredictProba as TypestatePredictProba,
+};
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
@@ -689,7 +692,7 @@ impl PyElasticNet {
 // LogisticRegression — Fit + PredictLabels (i32) + PredictProba; C, ...
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyLogisticRegression,
     algo:  mlrs_algos::linear::logistic::LogisticRegression,
     unfit: { c: f64, fit_intercept: bool, max_iter: usize, tol: f64 },
@@ -751,17 +754,31 @@ impl PyLogisticRegression {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = LogisticRegression::<f32>::with_opts(c as f32, fit_intercept, max_iter, tol as f32);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLogisticRegression::F32(est))
+                    let est = LogisticRegression::<f32>::builder()
+                        .c(c)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLogisticRegression::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = LogisticRegression::<f64>::with_opts(c, fit_intercept, max_iter, tol);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyLogisticRegression::F64(est))
+                    let est = LogisticRegression::<f64>::builder()
+                        .c(c)
+                        .fit_intercept(fit_intercept)
+                        .max_iter(max_iter)
+                        .tol(tol)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyLogisticRegression::F64(fitted))
                 }
             }
         })?;
@@ -777,11 +794,11 @@ impl PyLogisticRegression {
             match &self.inner {
                 AnyLogisticRegression::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 AnyLogisticRegression::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict_labels(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("logistic_regression", "predict")),
             }
@@ -796,7 +813,7 @@ impl PyLogisticRegression {
             match &self.inner {
                 AnyLogisticRegression::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictProba::predict_proba(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("logistic_regression", "predict_proba (f32 path)")),
             }
@@ -809,7 +826,7 @@ impl PyLogisticRegression {
             match &self.inner {
                 AnyLogisticRegression::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredictProba::predict_proba(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("logistic_regression", "predict_proba (f64 path)")),
             }
@@ -828,28 +845,28 @@ impl PyLogisticRegression {
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLogisticRegression::F32(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLogisticRegression::F32(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("logistic_regression", "coef_ (f32)")),
         }
     }
     fn coef_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLogisticRegression::F64(e) => e.coef(&pool).map_err(algo_err_to_py),
+            AnyLogisticRegression::F64(e) => Ok(e.coef(&pool)),
             _ => Err(not_fitted("logistic_regression", "coef_ (f64)")),
         }
     }
     fn intercept_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLogisticRegression::F32(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLogisticRegression::F32(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("logistic_regression", "intercept_ (f32)")),
         }
     }
     fn intercept_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLogisticRegression::F64(e) => e.intercept(&pool).map_err(algo_err_to_py),
+            AnyLogisticRegression::F64(e) => Ok(e.intercept(&pool)),
             _ => Err(not_fitted("logistic_regression", "intercept_ (f64)")),
         }
     }

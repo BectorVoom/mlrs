@@ -45,6 +45,8 @@
 //! Tests live in `crates/mlrs-algos/tests/logistic_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -57,8 +59,8 @@ use mlrs_backend::prims::lbfgs::{
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, PredictLabels, PredictProba};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, PredictProba, Unfit};
 
 /// Default `max_iter` — the L-BFGS iteration cap. sklearn's `LogisticRegression`
 /// default is 100; we give the solver headroom (`300`) so the tightened `gtol`
@@ -90,13 +92,17 @@ const LOG_DEFAULT_TOL: f64 = 1e-5;
 /// Multinomial (symmetric-softmax) logistic regression (LINEAR-05) fitted by the
 /// L-BFGS iterative solver.
 ///
-/// Construct with [`LogisticRegression::new`] (`c`, `fit_intercept`) or
-/// [`LogisticRegression::with_opts`] (also `max_iter` / `tol`), then [`Fit::fit`]
-/// and [`PredictProba::predict_proba`] / [`PredictLabels::predict_labels`].
-/// Fitted `coef_` (K×d) / `intercept_` (K) are device-resident (D-03); the host
+/// Construct with the zero-arg [`LogisticRegression::new`] (sklearn defaults:
+/// `c = 1.0`, `fit_intercept = true`, `max_iter = 300`, `tol = 1e-5`) or
+/// [`LogisticRegression::builder`] (`.c(f64).fit_intercept(bool).max_iter(usize)
+/// .tol(f64)` — subsumes the old `new`/`with_opts` constructors), then the
+/// consuming [`Fit::fit`] (returns the `Fitted`-tagged sibling) and
+/// [`PredictProba::predict_proba`] / [`PredictLabels::predict_labels`]. Fitted
+/// `coef_` (K×d) / `intercept_` (K) are device-resident (D-03); the host
 /// accessors [`coef`](Self::coef) / [`intercept`](Self::intercept) materialize
-/// them on demand.
-pub struct LogisticRegression<F> {
+/// them on demand and exist ONLY on `LogisticRegression<F, Fitted>` (the
+/// compile-time typestate replaces the old runtime `NotFitted` guard, D-03).
+pub struct LogisticRegression<F, S = Unfit> {
     /// Inverse-regularization strength (`C > 0`; larger = weaker L2 penalty).
     /// Maps to `l2_reg = 1/(C·n_samples)` at fit (Pitfall 3). A non-positive `C`
     /// is rejected at `fit` with [`AlgoError::InvalidC`] (T-05-10-01).
@@ -122,97 +128,209 @@ pub struct LogisticRegression<F> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercepts `b` (length K), device-resident, `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> LogisticRegression<F>
+impl<F> LogisticRegression<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `LogisticRegression` with inverse-regularization `C`
-    /// and the `fit_intercept` flag, using sklearn's defaults `max_iter = 100`
-    /// and `tol = 1e-4`. A non-positive `C` is rejected at `fit` with
-    /// [`AlgoError::InvalidC`].
-    pub fn new(c: F, fit_intercept: bool) -> Self {
-        Self::with_opts(c, fit_intercept, LOG_DEFAULT_MAX_ITER, f64_to_host::<F>(LOG_DEFAULT_TOL))
-    }
-
-    /// Like [`new`](Self::new) but with an explicit L-BFGS `max_iter` cap and
-    /// convergence `tol` (the `gtol` on `max |grad|`).
-    pub fn with_opts(c: F, fit_intercept: bool, max_iter: usize, tol: F) -> Self {
+    /// Construct a `LogisticRegression` with sklearn's defaults (`c = 1.0`,
+    /// `fit_intercept = true`, `max_iter = 300`, `tol = 1e-5`) directly in the
+    /// `Unfit` state. This is the SINGLE source of truth for the default
+    /// hyperparameters (D-08): the builder `Default` re-derives from here via
+    /// [`LogisticRegression::into_builder`], rather than re-listing the literals.
+    /// Defaults are trusted valid, so this bypasses
+    /// [`LogisticRegressionBuilder::build`]'s validation.
+    pub fn new() -> Self {
         Self {
-            c,
-            fit_intercept,
-            max_iter,
-            tol,
+            c: F::from_int(1),
+            fit_intercept: true,
+            max_iter: LOG_DEFAULT_MAX_ITER,
+            tol: f64_to_host::<F>(LOG_DEFAULT_TOL),
             n_classes: 0,
             classes_: Vec::new(),
             n_features: 0,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of the fitted `coef_` (K×d, row-major). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+    /// Start building a `LogisticRegression` from sklearn's defaults (D-08 single
+    /// source).
+    pub fn builder() -> LogisticRegressionBuilder {
+        LogisticRegressionBuilder::default()
+    }
+
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`LogisticRegressionBuilder::default`] to
+    /// re-derive the defaults from [`LogisticRegression::new`] (D-08).
+    pub fn into_builder(self) -> LogisticRegressionBuilder {
+        LogisticRegressionBuilder {
+            c: host_to_f64(self.c),
+            fit_intercept: self.fit_intercept,
+            max_iter: self.max_iter,
+            tol: host_to_f64(self.tol),
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `coef_`/`intercept_`/`classes_` fields are excluded). Used by the
+    /// defaults-equality test (BLDR-01):
+    /// `LogisticRegression::new().hyperparams_eq(&LogisticRegression::builder().build()?)`.
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        host_to_f64(self.c) == host_to_f64(other.c)
+            && self.fit_intercept == other.fit_intercept
+            && self.max_iter == other.max_iter
+            && host_to_f64(self.tol) == host_to_f64(other.tol)
+    }
+}
+
+impl<F> Default for LogisticRegression<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`LogisticRegression`] (D-01). Setters are `f64`/`usize`/`bool`
+/// per the A5 convention; `build::<F>()` narrows the `c`/`tol` scalars to the
+/// target float `F`. Subsumes the old `new(c, fit_intercept)` / `with_opts(c,
+/// fit_intercept, max_iter, tol)` constructors — every former argument is now a
+/// setter. `Default` re-derives the sklearn defaults from
+/// [`LogisticRegression::new`] (D-08 single source) rather than holding literals
+/// (Pitfall 1: default-drift breaks the oracle gate silently).
+#[derive(Debug, Clone, Copy)]
+pub struct LogisticRegressionBuilder {
+    c: f64,
+    fit_intercept: bool,
+    max_iter: usize,
+    tol: f64,
+}
+
+impl Default for LogisticRegressionBuilder {
+    /// Re-derive the sklearn defaults from [`LogisticRegression::new`] (D-08
+    /// single source). `f64` is pinned only to read the F-independent scalar
+    /// defaults — the builder is non-generic.
+    fn default() -> Self {
+        LogisticRegression::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl LogisticRegressionBuilder {
+    /// Set the inverse-regularization strength `C` (A5: `f64` setter).
+    pub fn c(mut self, v: f64) -> Self {
+        self.c = v;
+        self
+    }
+
+    /// Set whether to fit an (unpenalized) intercept term per class.
+    pub fn fit_intercept(mut self, v: bool) -> Self {
+        self.fit_intercept = v;
+        self
+    }
+
+    /// Set the L-BFGS iteration cap.
+    pub fn max_iter(mut self, v: usize) -> Self {
+        self.max_iter = v;
+        self
+    }
+
+    /// Set the L-BFGS convergence tolerance (the `gtol` on `max |grad|`).
+    pub fn tol(mut self, v: f64) -> Self {
+        self.tol = v;
+        self
+    }
+
+    /// Build the (unfit) estimator, validating the data-INDEPENDENT
+    /// hyperparameters BEFORE any data is seen (D-08; the data-DEPENDENT geometry
+    /// / label checks live in [`Fit::fit`]):
+    ///
+    /// - `C > 0` ([`BuildError::InvalidC`]) — a non-positive `C` makes
+    ///   `l2_reg = 1/(C·n)` non-positive (degenerate / unbounded objective),
+    ///   relocated from the old fit-body [`AlgoError::InvalidC`] check
+    ///   (T-05-10-01 / Pitfall 7).
+    ///
+    /// The stored `f64` `c`/`tol` are narrowed to the target float `F` via cast
+    /// (A5).
+    pub fn build<F>(self) -> Result<LogisticRegression<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        if !(self.c > 0.0) {
+            return Err(BuildError::InvalidC {
+                estimator: "logistic_regression",
+                c: self.c,
+            });
+        }
+        Ok(LogisticRegression {
+            c: f64_to_host::<F>(self.c),
+            fit_intercept: self.fit_intercept,
+            max_iter: self.max_iter,
+            tol: f64_to_host::<F>(self.tol),
+            n_classes: 0,
+            classes_: Vec::new(),
+            n_features: 0,
+            coef_: None,
+            intercept_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> LogisticRegression<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of the fitted `coef_` (K×d, row-major). `Some` by construction
+    /// on the `Fitted` state, so no `NotFitted` branch is needed (the
+    /// compile-time typestate replaces the runtime guard, D-03).
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.coef_
             .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "logistic_regression",
-                operation: "coef_",
-            })
+            .expect("coef_ is Some by construction on LogisticRegression<F, Fitted>")
+            .to_host(pool)
     }
 
-    /// Host copy of the fitted `intercept_` (length K). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+    /// Host copy of the fitted `intercept_` (length K). `Some` by construction on
+    /// the `Fitted` state (D-03).
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.intercept_
             .as_ref()
-            .map(|i| i.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "logistic_regression",
-                operation: "intercept_",
-            })
+            .expect("intercept_ is Some by construction on LogisticRegression<F, Fitted>")
+            .to_host(pool)
     }
 
-    /// Number of classes inferred at `fit` (binary = 2). 0 before `fit`.
+    /// Number of classes inferred at `fit` (binary = 2).
     pub fn n_classes(&self) -> usize {
         self.n_classes
     }
 }
 
-impl<F> Fit<F> for LogisticRegression<F>
+impl<F> Fit<F> for LogisticRegression<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = LogisticRegression<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<LogisticRegression<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
-        // --- T-05-10-01 / ASVS V5: validate the untrusted hyperparameter and
-        //     geometry BEFORE any prim launch. C ≤ 0 makes l2_reg = 1/(C·n)
-        //     non-positive (degenerate / unbounded objective). ---
+        // --- T-05-10-01 / ASVS V5: data-DEPENDENT geometry guard BEFORE any prim
+        //     launch (the data-INDEPENDENT `C > 0` check was validated at
+        //     build() — Pitfall 7). `c64` is still needed for l2_reg below. ---
         let c64 = host_to_f64(self.c);
-        if !(c64 > 0.0) {
-            return Err(AlgoError::InvalidC {
-                estimator: "logistic_regression",
-                c: c64,
-            });
-        }
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "logistic_regression",
             operation: "fit (requires y)",
@@ -465,16 +583,22 @@ where
         // The remapped-label device buffer is only needed during the solve.
         y_remap_dev.release_into(pool);
 
-        self.n_classes = n_classes;
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.coef_ = Some(coef_dev);
-        self.intercept_ = Some(intercept_dev);
-        Ok(self)
+        Ok(LogisticRegression {
+            c: self.c,
+            fit_intercept: self.fit_intercept,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            n_classes,
+            classes_,
+            n_features,
+            coef_: Some(coef_dev),
+            intercept_: Some(intercept_dev),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> PredictProba<F> for LogisticRegression<F>
+impl<F> PredictProba<F> for LogisticRegression<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -486,14 +610,17 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_query, n_features) = shape;
 
-        let coef = self.coef_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "logistic_regression",
-            operation: "predict_proba",
-        })?;
-        let intercept = self.intercept_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "logistic_regression",
-            operation: "predict_proba",
-        })?;
+        // `coef_`/`intercept_` are `Some` by construction on the `Fitted` state
+        // (the compile-time typestate replaces the old runtime `NotFitted`
+        // guard, D-03).
+        let coef = self
+            .coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on LogisticRegression<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on LogisticRegression<F, Fitted>");
 
         // --- T-05-10-01 / ASVS V5: geometry + fitted-n_features consistency. ---
         if n_query == 0 || n_features == 0 || x.len() != n_query * n_features {
@@ -564,7 +691,7 @@ where
     }
 }
 
-impl<F> PredictLabels<F> for LogisticRegression<F>
+impl<F> PredictLabels<F> for LogisticRegression<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {

@@ -54,7 +54,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::linear::logistic::LogisticRegression;
-use mlrs_algos::traits::{Fit, PredictLabels, PredictProba};
+use mlrs_algos::typestate::{Fit, PredictLabels, PredictProba};
 use mlrs_algos::AlgoError;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -142,8 +142,12 @@ where
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq_host);
 
-    let mut clf = LogisticRegression::<F>::new(f64_to::<F>(c), true);
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (n_samples, LOG_N_FEATURES))
+    let clf = LogisticRegression::<F>::builder()
+        .c(c)
+        .fit_intercept(true)
+        .build::<F>()
+        .expect("LogisticRegression::build on valid hyperparameters")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (n_samples, LOG_N_FEATURES))
         .expect("LogisticRegression::fit on a valid shape");
 
     let k = clf.n_classes();
@@ -158,10 +162,9 @@ where
         .expect("predict_labels after fit");
     let labels: Vec<i32> = labels_dev.to_host(&pool);
 
-    let coef: Vec<f64> = clf.coef(&pool).expect("coef_").iter().map(|&v| host_to_f64(v)).collect();
+    let coef: Vec<f64> = clf.coef(&pool).iter().map(|&v| host_to_f64(v)).collect();
     let intercept: Vec<f64> = clf
         .intercept(&pool)
-        .expect("intercept_")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
@@ -275,6 +278,22 @@ fn assert_gauge_note(got: &[f64], expected: &[f64], tol: &Tolerance, what: &str)
     } else {
         println!("{what}: gauge-fixed coef_ within the 1e-4 secondary bound.");
     }
+}
+
+/// BLDR-01 defaults equality: the zero-arg `new()` (the single source of sklearn
+/// defaults) must agree hyperparameter-for-hyperparameter with
+/// `builder().build()` (whose `Default` re-derives from `new()` via
+/// `into_builder()`). A drift here would silently change the oracle baseline.
+#[test]
+fn defaults_equal() {
+    let from_new = LogisticRegression::<f64>::new();
+    let from_builder = LogisticRegression::<f64>::builder()
+        .build::<f64>()
+        .expect("default LogisticRegression builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "LogisticRegression::new() defaults must equal builder().build() defaults"
+    );
 }
 
 /// LOAD-NOT-JUST-PRESENT: BOTH fixtures load with well-formed arrays.
@@ -393,9 +412,15 @@ fn logistic_cap_hit_still_not_converged_f32() {
 
     // max_iter = 1: the solver takes a single step and hits the cap nowhere near
     // the gauge floor, so the gauge-floor accept must NOT fire.
-    let mut clf =
-        LogisticRegression::<f32>::with_opts(f64_to::<f32>(c), true, 1, f64_to::<f32>(1e-5));
-    // Map the Ok payload (`&mut Self`, not Debug) to `()` so we can match the error.
+    let clf = LogisticRegression::<f32>::builder()
+        .c(c)
+        .fit_intercept(true)
+        .max_iter(1)
+        .tol(1e-5)
+        .build::<f32>()
+        .expect("LogisticRegression::build on valid hyperparameters");
+    // Map the Ok payload (the `Fitted` value, not Debug) to `()` so we can match
+    // the error.
     let res = clf
         .fit(&mut pool, &x_dev, Some(&y_dev), (n_samples, LOG_N_FEATURES))
         .map(|_| ());
