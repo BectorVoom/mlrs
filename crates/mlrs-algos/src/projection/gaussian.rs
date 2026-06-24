@@ -30,6 +30,8 @@
 //! Tests live in `crates/mlrs-algos/tests/random_projection_test.rs`
 //! (AGENTS.md §2 — never an in-source `#[cfg(test)] mod tests`).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -40,8 +42,8 @@ use mlrs_backend::prims::rng;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, Transform};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
 /// `n_components` selector for the random-projection transformers (D-06 minimal
 /// surface). [`NComponents::Auto`] sizes the embedding via
@@ -87,11 +89,16 @@ pub fn johnson_lindenstrauss_min_dim(n_samples: f64, eps: f64) -> Result<usize, 
 
 /// Gaussian random-projection transformer (PROJ-01).
 ///
-/// Construct with [`GaussianRandomProjection::new`] (`n_components`, `seed`,
-/// `eps`), then [`Fit::fit`] to draw the `N(0, 1/n_components)` `components_`
-/// and [`Transform::transform`] to project `X` (`X · components_ᵀ`, one GEMM,
-/// NO centering). The fitted `components_` is device-resident (D-03).
-pub struct GaussianRandomProjection<F> {
+/// Construct with the zero-arg [`GaussianRandomProjection::new`] (sklearn
+/// defaults: `n_components = 'auto'` → [`NComponents::Auto`], `eps = 0.1`,
+/// `seed = 0`) or [`GaussianRandomProjection::builder`], then the consuming
+/// [`Fit::fit`] (returns the `Fitted`-tagged sibling) to draw the
+/// `N(0, 1/n_components)` `components_` and [`Transform::transform`] to project
+/// `X` (`X · components_ᵀ`, one GEMM, NO centering). The fitted `components_` is
+/// device-resident (D-03); the host accessors exist ONLY on
+/// `GaussianRandomProjection<F, Fitted>` (the compile-time typestate replaces the
+/// old runtime `NotFitted` guard, D-03).
+pub struct GaussianRandomProjection<F, S = Unfit> {
     /// Requested embedding dimension (`Auto` → resolved at fit via JL).
     n_components: NComponents,
     /// Documented `u64` seed driving the host SplitMix64 stream (T-07-02 —
@@ -105,41 +112,146 @@ pub struct GaussianRandomProjection<F> {
     n_components_: usize,
     /// `n_features` seen at fit, for the `transform` geometry check.
     n_features: usize,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> GaussianRandomProjection<F>
+impl<F> GaussianRandomProjection<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `GaussianRandomProjection`.
-    ///
-    /// - `n_components`: [`NComponents::Auto`] (JL-sized) or
-    ///   [`NComponents::Fixed`].
-    /// - `seed`: the documented `u64` driving SplitMix64 (reproducibility
-    ///   source — never `OsRng`, T-07-02).
-    /// - `eps`: the JL distortion bound for the `Auto` path (`eps ∈ (0, 1)`);
-    ///   ignored when `n_components` is `Fixed`, but still validated at fit so a
-    ///   bad value never silently passes.
-    pub fn new(n_components: NComponents, seed: u64, eps: f64) -> Self {
+    /// Construct an unfitted `GaussianRandomProjection` with sklearn's defaults
+    /// (`n_components = 'auto'` → [`NComponents::Auto`], `eps = 0.1`, `seed = 0`)
+    /// directly in the `Unfit` state. SINGLE source of truth for the defaults
+    /// (D-08): the builder `Default` re-derives via
+    /// [`GaussianRandomProjection::into_builder`]. Defaults are trusted valid, so
+    /// this bypasses [`GaussianRandomProjectionBuilder::build`]'s validation.
+    pub fn new() -> Self {
         Self {
-            n_components,
-            seed,
-            eps,
+            n_components: NComponents::Auto,
+            seed: 0,
+            eps: 0.1,
             components_: None,
             n_components_: 0,
             n_features: 0,
+            _state: PhantomData,
         }
     }
 
+    /// Start building a `GaussianRandomProjection` from sklearn's defaults (D-08
+    /// single source).
+    pub fn builder() -> GaussianRandomProjectionBuilder {
+        GaussianRandomProjectionBuilder::default()
+    }
+
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`GaussianRandomProjectionBuilder::default`] to
+    /// re-derive the defaults from [`GaussianRandomProjection::new`] (D-08).
+    pub fn into_builder(self) -> GaussianRandomProjectionBuilder {
+        GaussianRandomProjectionBuilder {
+            n_components: self.n_components,
+            seed: self.seed,
+            eps: self.eps,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `components_` is excluded — `None` in any `Unfit` value). Used by the
+    /// defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.n_components == other.n_components
+            && self.seed == other.seed
+            && self.eps == other.eps
+    }
+}
+
+impl<F> Default for GaussianRandomProjection<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`GaussianRandomProjection`] (D-01). The `n_components` setter
+/// takes the [`NComponents`] enum directly (the `'auto'` / fixed selector is not
+/// a scalar, A5); `seed` is `u64`, `eps` is `f64`. `Default` re-derives the
+/// sklearn defaults from [`GaussianRandomProjection::new`] (D-08 single source).
+#[derive(Debug, Clone, Copy)]
+pub struct GaussianRandomProjectionBuilder {
+    n_components: NComponents,
+    seed: u64,
+    eps: f64,
+}
+
+impl Default for GaussianRandomProjectionBuilder {
+    /// Re-derive the sklearn defaults from [`GaussianRandomProjection::new`]
+    /// (D-08 single source). `f64` is pinned only to read the F-independent
+    /// scalar defaults — the builder is non-generic.
+    fn default() -> Self {
+        GaussianRandomProjection::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl GaussianRandomProjectionBuilder {
+    /// Set the requested embedding dimension ([`NComponents::Auto`] JL-sized or
+    /// [`NComponents::Fixed`]). The setter takes the enum directly (A5 — the
+    /// `'auto'`/fixed selector is not a scalar narrowing).
+    pub fn n_components(mut self, v: NComponents) -> Self {
+        self.n_components = v;
+        self
+    }
+
+    /// Set the documented `u64` seed driving SplitMix64 (never `OsRng`, T-07-02).
+    pub fn seed(mut self, v: u64) -> Self {
+        self.seed = v;
+        self
+    }
+
+    /// Set the JL distortion bound for the `Auto` path (`eps ∈ (0, 1)`).
+    pub fn eps(mut self, v: f64) -> Self {
+        self.eps = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. GaussianRandomProjection has no purely
+    /// data-INDEPENDENT hyperparameter that is unconditionally validated: the
+    /// `eps ∈ (0, 1)` check is resolution-path-coupled (the `Auto` path resolves
+    /// it via [`johnson_lindenstrauss_min_dim`] against the fit `n_samples`, and
+    /// the `Fixed` path validates it inline) and the `n_components < 1` check is
+    /// data-DEPENDENT (it compares against `n_features`), so both stay in the fit
+    /// body (D-03 byte-identical). The `Result` is kept for family uniformity so
+    /// the `build_err_to_py` PyO3 mapper is shape-identical across the Phase-16
+    /// builders.
+    pub fn build<F>(self) -> Result<GaussianRandomProjection<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(GaussianRandomProjection {
+            n_components: self.n_components,
+            seed: self.seed,
+            eps: self.eps,
+            components_: None,
+            n_components_: 0,
+            n_features: 0,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> GaussianRandomProjection<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
     /// Host copy of `components_` (`n_components_ × n_features`, row-major).
-    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+    /// `Some` by construction on the `Fitted` state, so no `NotFitted` branch is
+    /// needed (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.components_
             .as_ref()
-            .map(|a| a.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "gaussian_random_projection",
-                operation: "components_",
-            })
+            .expect("components_ is Some by construction on GaussianRandomProjection<F, Fitted>")
+            .to_host(pool)
     }
 
     /// The resolved embedding dimension (`Auto` → JL value) after fit.
@@ -148,31 +260,26 @@ where
     }
 }
 
-impl<F> Fit<F> for GaussianRandomProjection<F>
+impl<F> Fit<F> for GaussianRandomProjection<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = GaussianRandomProjection<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         // `_y` is unused: the retained `Fit`-trait slot for Phase-10 MBSGD reuse
-        // (this estimator is unsupervised; see traits.rs) — not unfinished wiring
-        // (IN-02).
+        // (this estimator is unsupervised; see typestate.rs) — not unfinished
+        // wiring (IN-02).
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<GaussianRandomProjection<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-07-10 / ASVS V5: geometry consistency BEFORE any RNG launch. ---
-        if n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
 
         // --- Resolve n_components: Auto → johnson_lindenstrauss_min_dim
         //     (which itself validates eps ∈ (0,1)); Fixed → the caller's int. ---
@@ -205,14 +312,19 @@ where
         let components_dev =
             rng::gaussian_matrix::<F>(pool, self.seed, nc, n_features)?;
 
-        self.components_ = Some(components_dev);
-        self.n_components_ = nc;
-        self.n_features = n_features;
-        Ok(self)
+        Ok(GaussianRandomProjection {
+            n_components: self.n_components,
+            seed: self.seed,
+            eps: self.eps,
+            components_: Some(components_dev),
+            n_components_: nc,
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Transform<F> for GaussianRandomProjection<F>
+impl<F> Transform<F> for GaussianRandomProjection<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {

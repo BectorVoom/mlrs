@@ -25,9 +25,14 @@ use mlrs_algos::projection::gaussian::{
     johnson_lindenstrauss_min_dim as algo_jl_min_dim, GaussianRandomProjection, NComponents,
 };
 use mlrs_algos::projection::sparse::SparseRandomProjection;
+// Phase 16 (D-01): GaussianRandomProjection is migrated to the typestate surface
+// (consuming-self builder + `Fit`/`Transform` via UFCS aliases); the
+// SparseRandomProjection arm is still on the legacy `traits` glob at the Task-1
+// commit (mid-migration, per the sequential-execution recipe — Task 2 drops it).
 use mlrs_algos::traits::{Fit, Transform};
+use mlrs_algos::typestate::{Fit as TypestateFit, Transform as TypestateTransform};
 
-use crate::errors::{algo_err_to_py, not_fitted};
+use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
 
 /// Resolve the optional `n_components` sentinel from the Python shim into the
@@ -44,7 +49,7 @@ fn resolve_n_components(n_components: Option<usize>) -> NComponents {
 // GaussianRandomProjection — Fit (unsupervised) + Transform
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyGaussianRandomProjection,
     algo:  mlrs_algos::projection::gaussian::GaussianRandomProjection,
     unfit: { n_components: Option<usize>, eps: f64, seed: u64 },
@@ -100,20 +105,32 @@ impl PyGaussianRandomProjection {
         };
         let nc = resolve_n_components(n_components);
         let fitted = py.detach(|| -> PyResult<AnyGaussianRandomProjection> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = GaussianRandomProjection::<f32>::new(nc, seed, eps);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyGaussianRandomProjection::F32(est))
+                    let est = GaussianRandomProjection::<f32>::builder()
+                        .n_components(nc)
+                        .seed(seed)
+                        .eps(eps)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyGaussianRandomProjection::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = GaussianRandomProjection::<f64>::new(nc, seed, eps);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyGaussianRandomProjection::F64(est))
+                    let est = GaussianRandomProjection::<f64>::builder()
+                        .n_components(nc)
+                        .seed(seed)
+                        .eps(eps)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyGaussianRandomProjection::F64(fitted))
                 }
             }
         })?;
@@ -124,11 +141,11 @@ impl PyGaussianRandomProjection {
     fn transform_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyGaussianRandomProjection::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("gaussian_random_projection", "transform (f32 path)")),
             }
@@ -137,11 +154,11 @@ impl PyGaussianRandomProjection {
     fn transform_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyGaussianRandomProjection::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("gaussian_random_projection", "transform (f64 path)")),
             }
@@ -149,16 +166,16 @@ impl PyGaussianRandomProjection {
     }
 
     fn components_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyGaussianRandomProjection::F32(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnyGaussianRandomProjection::F32(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("gaussian_random_projection", "components_ (f32)")),
         }
     }
     fn components_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnyGaussianRandomProjection::F64(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnyGaussianRandomProjection::F64(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("gaussian_random_projection", "components_ (f64)")),
         }
     }

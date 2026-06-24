@@ -26,7 +26,14 @@ use mlrs_algos::projection::gaussian::{
     johnson_lindenstrauss_min_dim, GaussianRandomProjection, NComponents,
 };
 use mlrs_algos::projection::sparse::SparseRandomProjection;
+// Phase 16 (D-01): GaussianRandomProjection is migrated to the typestate surface
+// (consuming-self `Fit`/`Transform`, builder construction); SparseRandomProjection
+// is still on the legacy `crate::traits` surface at the Task-1 commit, so the
+// test imports BOTH — the typestate traits under disambiguating `Typestate*`
+// aliases (called via UFCS at the migrated Gaussian sites) and the legacy glob
+// for the unmigrated Sparse sites. Task 2 drops the legacy glob.
 use mlrs_algos::traits::{Fit, Transform};
+use mlrs_algos::typestate::{Fit as TypestateFit, Transform as TypestateTransform};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -165,16 +172,16 @@ where
     let mut mean_acc = 0.0_f64;
     let mut var_acc = 0.0_f64;
     for trial in 0..JL_TRIALS {
-        let mut rp = GaussianRandomProjection::<F>::new(
-            NComponents::Fixed(PROP_COMPONENTS),
-            BASE_SEED + trial as u64,
-            0.1,
-        );
-        rp.fit(&mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+        let rp = GaussianRandomProjection::<F>::builder()
+            .n_components(NComponents::Fixed(PROP_COMPONENTS))
+            .seed(BASE_SEED + trial as u64)
+            .eps(0.1)
+            .build::<F>()
+            .expect("gaussian build");
+        let rp = TypestateFit::fit(rp, &mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
             .expect("gaussian fit");
         let comp: Vec<f64> = rp
             .components(&pool)
-            .expect("components_")
             .iter()
             .map(|&v| host_to_f64(v))
             .collect();
@@ -220,24 +227,23 @@ where
     let x_host: Vec<F> = data_matrix::<F>(7, PROP_SAMPLES, PROP_FEATURES);
     let x_dev = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut rp = GaussianRandomProjection::<F>::new(
-        NComponents::Fixed(PROP_COMPONENTS),
-        BASE_SEED,
-        0.1,
-    );
-    rp.fit(&mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+    let rp = GaussianRandomProjection::<F>::builder()
+        .n_components(NComponents::Fixed(PROP_COMPONENTS))
+        .seed(BASE_SEED)
+        .eps(0.1)
+        .build::<F>()
+        .expect("gaussian build");
+    let rp = TypestateFit::fit(rp, &mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
         .expect("gaussian fit");
     let nc = rp.n_components_();
     assert_eq!(nc, PROP_COMPONENTS, "Fixed n_components resolves verbatim");
 
-    let z = rp
-        .transform(&mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
+    let z = TypestateTransform::transform(&rp, &mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
         .expect("transform");
     let z_host: Vec<f64> = z.to_host(&pool).iter().map(|&v| host_to_f64(v)).collect();
 
     let comp: Vec<f64> = rp
         .components(&pool)
-        .expect("components_")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
@@ -309,14 +315,15 @@ where
                 .map(|&v| host_to_f64(v))
                 .collect()
         } else {
-            let mut rp = GaussianRandomProjection::<F>::new(
-                NComponents::Fixed(PROP_COMPONENTS),
-                seed,
-                0.1,
-            );
-            rp.fit(&mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+            let rp = GaussianRandomProjection::<F>::builder()
+                .n_components(NComponents::Fixed(PROP_COMPONENTS))
+                .seed(seed)
+                .eps(0.1)
+                .build::<F>()
+                .expect("gaussian build");
+            let rp = TypestateFit::fit(rp, &mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
                 .expect("gaussian fit");
-            rp.transform(&mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
+            TypestateTransform::transform(&rp, &mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
                 .expect("transform")
                 .to_host(&pool)
                 .iter()
@@ -373,14 +380,15 @@ where
     let x_dev = DeviceArray::from_host(&mut pool, &x_host);
 
     let fit_components = |pool: &mut BufferPool<ActiveRuntime>, seed: u64| -> Vec<F> {
-        let mut rp = GaussianRandomProjection::<F>::new(
-            NComponents::Fixed(PROP_COMPONENTS),
-            seed,
-            0.1,
-        );
-        rp.fit(pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+        let rp = GaussianRandomProjection::<F>::builder()
+            .n_components(NComponents::Fixed(PROP_COMPONENTS))
+            .seed(seed)
+            .eps(0.1)
+            .build::<F>()
+            .expect("gaussian build");
+        let rp = TypestateFit::fit(rp, pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
             .expect("gaussian fit");
-        rp.components(pool).expect("components_")
+        rp.components(pool)
     };
 
     let a = fit_components(&mut pool, BASE_SEED);
@@ -396,8 +404,13 @@ where
     assert_ne!(a64, c64, "different seed → different components_");
 
     // 'auto' n_components resolves via JL and is reproducible too.
-    let mut auto = GaussianRandomProjection::<F>::new(NComponents::Auto, BASE_SEED, 0.5);
-    auto.fit(&mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+    let auto = GaussianRandomProjection::<F>::builder()
+        .n_components(NComponents::Auto)
+        .seed(BASE_SEED)
+        .eps(0.5)
+        .build::<F>()
+        .expect("auto build");
+    let auto = TypestateFit::fit(auto, &mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
         .expect("auto fit");
     let expected_nc = johnson_lindenstrauss_min_dim(PROP_SAMPLES as f64, 0.5)
         .expect("jl");
@@ -405,6 +418,20 @@ where
         auto.n_components_(),
         expected_nc,
         "Auto n_components resolves via johnson_lindenstrauss_min_dim"
+    );
+}
+
+/// BLDR-01: the zero-arg `new()` and the `builder().build()` default agree on
+/// every hyperparameter (the single-source-of-defaults contract, D-08).
+#[test]
+fn gaussian_random_projection_defaults_equal() {
+    let from_new = GaussianRandomProjection::<f64>::new();
+    let from_builder = GaussianRandomProjection::<f64>::builder()
+        .build::<f64>()
+        .expect("default build");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "GaussianRandomProjection::new() and builder().build() must share defaults"
     );
 }
 
