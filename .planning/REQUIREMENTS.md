@@ -36,14 +36,14 @@ Requirements for the v3.0 milestone. Each maps to a roadmap phase.
 
 - [ ] **BLDR-01**: User can construct any estimator via an idiomatic Rust builder — `T::builder().param(..).…build() -> Result<T<Unfit>, BuildError>` — with owned chained setters, sklearn-equal defaults, and typed `thiserror` validation variants (single-source defaults so `T::builder().build()? == T::new()` == sklearn default).
 - [x] **BLDR-02**: The fit/unfit distinction is modeled as compile-time typestate (`T<Unfit>` → `T<Fitted>`); `predict` / `transform` / fitted-attr accessors exist only on `T<Fitted>`, preventing predict-before-fit at compile time (the hybrid Rust-surface design).
-- [ ] **BLDR-03**: The builder + typestate convention is retrofitted across all existing estimators **additively** (builder constructs the existing config struct; fit path untouched), piloted on 1–2 estimators under the green suite before the full sweep, preserving every shipped 1e-5 / exact-label gate.
+- [x] **BLDR-03**: The builder + typestate convention is retrofitted across all existing estimators **additively** (builder constructs the existing config struct; fit path untouched), piloted on 1–2 estimators under the green suite before the full sweep, preserving every shipped 1e-5 / exact-label gate.
 - [x] **BLDR-04**: The PyO3 surface is unchanged — the Rust typestate collapses behind the existing `any_estimator!` `Unfit/F32/F64` enum, with a runtime `NotFittedError` analog at the Python boundary.
 
 ### Python sklearn Shim
 
-- [ ] **SHIM-01**: Every estimator's pure-Python class stores each constructor arg unchanged in `__init__` (no validation/computation) and exposes `get_params(deep=True)` / `set_params(**kw)` that round-trip exactly and are `clone()`-compatible (extends the existing `MlrsBase` shim from the v1 12 to the v2 18 + the two new).
+- [x] **SHIM-01**: Every estimator's pure-Python class stores each constructor arg unchanged in `__init__` (no validation/computation) and exposes `get_params(deep=True)` / `set_params(**kw)` that round-trip exactly and are `clone()`-compatible (extends the existing `MlrsBase` shim from the v1 12 to the v2 18 + the two new).
 - [ ] **SHIM-02**: UMAP and HDBSCAN are PyO3-wrapped (`#[pyclass]` on the existing `any_estimator!` machinery, GIL release, `guard_f64` before F64) with sklearn-named params, trailing-underscore fitted attrs, `n_features_in_` set/enforced, `fit` returns `self`, and the correct surface (UMAP `transform`/`fit_transform`; HDBSCAN `fit_predict`/`labels_`).
-- [ ] **SHIM-03**: The shim is verified by Rust-side unit tests plus a static Python check; the live `estimator_checks` / `check_estimator` run stays deferred (needs a maturin+pyarrow host this environment lacks).
+- [x] **SHIM-03**: The shim is verified by Rust-side unit tests plus a static Python check; the live `estimator_checks` / `check_estimator` run stays deferred (needs a maturin+pyarrow host this environment lacks).
 
 ## v2 Requirements
 
@@ -90,11 +90,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HDBS-04 | Phase 15 | Complete |
 | BLDR-01 | Phase 12 | Pending |
 | BLDR-02 | Phase 12 | Complete |
-| BLDR-03 | Phase 16 | Pending |
+| BLDR-03 | Phase 16 | Complete |
 | BLDR-04 | Phase 12 | Complete |
-| SHIM-01 | Phase 16 | Pending |
+| SHIM-01 | Phase 16 | Complete |
 | SHIM-02 | Phase 16 | Pending |
-| SHIM-03 | Phase 16 | Pending |
+| SHIM-03 | Phase 16 | Complete |
 
 **Coverage:**
 

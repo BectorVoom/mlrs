@@ -3,18 +3,18 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 16
-current_phase_name: Builder Retrofit Sweep + Shim Coverage
+current_phase_name: builder-retrofit-sweep-shim-coverage
 status: executing
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-24T08:06:28.907Z"
+last_updated: "2026-06-24T09:40:48.116Z"
 last_activity: 2026-06-24
-last_activity_desc: Phase 15 complete, transitioned to Phase 16
+last_activity_desc: Phase 16 execution started
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 21
-  completed_plans: 21
-  percent: 80
+  total_plans: 34
+  completed_plans: 22
+  percent: 65
 ---
 
 # Project State
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-11)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 15 — hdbscan
+**Current focus:** Phase 16 — builder-retrofit-sweep-shim-coverage
 
 ## Current Position
 
-Phase: 16 — Builder Retrofit Sweep + Shim Coverage
-Plan: Not started
+Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
+Plan: 2 of 13
 Status: Ready to execute
-Last activity: 2026-06-24 — Phase 15 complete, transitioned to Phase 16
+Last activity: 2026-06-24 — Phase 16 execution started
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
 
 Progress: [██████░░░░] 60% (v3.0)
@@ -141,6 +141,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 15 P05 | single-session | 2 tasks | 7 files |
 | Phase 15 P06 | 18 | 2 tasks | 4 files |
 | Phase 15 P07 | 5 | 2 tasks | 2 files |
+| Phase 16 P00 | 12 | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -309,7 +310,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T08:06:28.900Z
+Last session: 2026-06-24T09:40:35.813Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
 

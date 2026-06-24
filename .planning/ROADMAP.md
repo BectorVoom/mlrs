@@ -212,8 +212,9 @@ Plans:
   3. UMAP and HDBSCAN are PyO3-wrapped (`#[pyclass]` on `any_estimator!`, GIL release, `guard_f64` before F64) with sklearn-named params, trailing-underscore fitted attrs, `n_features_in_` set/enforced, `fit` returns `self`, and the correct surface (UMAP `transform`/`fit_transform`; HDBSCAN `fit_predict`/`labels_`).
   4. The shim is verified by Rust-side unit tests plus a static Python check; the live `estimator_checks`/`check_estimator` run stays deferred (needs a maturin+pyarrow host this environment lacks).
 
-**Plans**: 13 plans (sequential, parallel-unsafe — shared traits.rs/typestate.rs/Any* enums; worktrees off)
-- [ ] 16-00-PLAN.md — Wave 0 (BLOCKING): add 5 missing typestate traits + Transform::inverse_transform default; lock builder-setter convention; add AST __init__-purity test
+**Plans**: 1/13 plans executed
+
+- [x] 16-00-PLAN.md — Wave 0 (BLOCKING): add 5 missing typestate traits + Transform::inverse_transform default; lock builder-setter convention; add AST __init__-purity test
 - [ ] 16-01-PLAN.md — Pilots: Ridge (shape A full build-out) + MBSGDRegressor (shape B trait-swap)
 - [ ] 16-02-PLAN.md — linear/ pt1: LinearRegression, Lasso, ElasticNet
 - [ ] 16-03-PLAN.md — linear/ pt2: LogisticRegression, LinearSVC, LinearSVR, MBSGDClassifier
@@ -226,6 +227,7 @@ Plans:
 - [ ] 16-10-PLAN.md — SHIM-02: PyUMAP transform/fit_transform + PyHDBSCAN fit_predict/probabilities_/outlier_scores_
 - [ ] 16-11-PLAN.md — SHIM-01/03: 15 pure-Python shim classes + full static test matrix + AST purity
 - [ ] 16-12-PLAN.md — Final: delete traits.rs (grep-gated) + phase-end gate (compile_fail + oracle + Python static)
+
 **UI hint**: no
 
 ## Progress
@@ -250,4 +252,4 @@ Phases execute in numeric order: 12 → 13 → 14 → 15 → 16 (14 and 15 are f
 | 13. KNN-Graph Primitive (feasibility keystone) | v3.0 | 3/3 | Complete    | 2026-06-23 |
 | 14. UMAP | v3.0 | 7/7 | Complete    | 2026-06-23 |
 | 15. HDBSCAN | v3.0 | 7/7 | Complete    | 2026-06-24 |
-| 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 0/13 | Not started | - |
+| 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 1/13 | In Progress|  |
