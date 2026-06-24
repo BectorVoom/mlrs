@@ -31,6 +31,7 @@
 //! Tests live in `crates/mlrs-algos/tests/empirical_covariance_test.rs`
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
 use std::sync::OnceLock;
 
 use bytemuck::Pod;
@@ -42,10 +43,10 @@ use mlrs_backend::prims::covariance::covariance;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, host_to_f64};
 
-use crate::error::AlgoError;
-use crate::traits::Fit;
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 
 /// Near-zero floor for the pinvh eigenvalue cutoff (mirrors the
 /// `linear_regression.rs` precedent — below the 1e-5 tolerance so it never
@@ -62,10 +63,15 @@ const RCOND: f64 = 1e-6;
 
 /// Maximum-likelihood (biased, `ddof = 0`) covariance estimator (COV-01).
 ///
-/// Construct with [`EmpiricalCovariance::new`] (`assume_centered`,
-/// `store_precision`), then [`Fit::fit`]. Fitted attributes are device-resident
-/// (D-03); the host accessors materialize them on demand.
-pub struct EmpiricalCovariance<F> {
+/// Construct with the zero-arg [`EmpiricalCovariance::new`] (sklearn defaults:
+/// `assume_centered = false`, `store_precision = true`) or
+/// [`EmpiricalCovariance::builder`] (`.assume_centered(bool)`/
+/// `.store_precision(bool)`), then the consuming [`Fit::fit`] (returns the
+/// `Fitted`-tagged sibling). Fitted attributes are device-resident (D-03); the
+/// host accessors materialize them on demand and exist ONLY on
+/// `EmpiricalCovariance<F, Fitted>` (the compile-time typestate replaces the old
+/// runtime `NotFitted` guard, D-03).
+pub struct EmpiricalCovariance<F, S = Unfit> {
     /// When `true`, skip mean subtraction and set `location_ = 0` (D-07).
     assume_centered: bool,
     /// When `true`, compute and store `precision_ = pinvh(covariance_)` (D-08).
@@ -84,13 +90,18 @@ pub struct EmpiricalCovariance<F> {
     cov_host: OnceLock<Vec<F>>,
     loc_host: OnceLock<Vec<F>>,
     prec_host: OnceLock<Vec<F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> EmpiricalCovariance<F>
+impl<F> EmpiricalCovariance<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `EmpiricalCovariance`.
+    /// Construct an unfitted `EmpiricalCovariance` with sklearn's defaults
+    /// (`assume_centered = false`, `store_precision = true`) directly in the
+    /// `Unfit` state. SINGLE source of truth for the defaults (D-08): the builder
+    /// `Default` re-derives via [`EmpiricalCovariance::into_builder`].
     ///
     /// - `assume_centered`: when `true`, the data is assumed already centered;
     ///   `location_` is set to `0` and no mean is subtracted (D-07).
@@ -106,22 +117,130 @@ where
             cov_host: OnceLock::new(),
             loc_host: OnceLock::new(),
             prec_host: OnceLock::new(),
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of `covariance_` (`n_features × n_features`, row-major).
-    /// Memoized after the first call (IN-05).
-    pub fn covariance_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.covariance_, &self.cov_host, pool, "covariance_")
+    /// Start building an `EmpiricalCovariance` from sklearn's defaults (D-08
+    /// single source).
+    pub fn builder() -> EmpiricalCovarianceBuilder {
+        EmpiricalCovarianceBuilder::default()
     }
 
-    /// Host copy of `location_` (length `n_features`). Memoized (IN-05).
-    pub fn location_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.attr(&self.location_, &self.loc_host, pool, "location_")
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`EmpiricalCovarianceBuilder::default`] to
+    /// re-derive the defaults from [`EmpiricalCovariance::new`] (D-08).
+    pub fn into_builder(self) -> EmpiricalCovarianceBuilder {
+        EmpiricalCovarianceBuilder {
+            assume_centered: self.assume_centered,
+            store_precision: self.store_precision,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators. Used by the
+    /// defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.assume_centered == other.assume_centered
+            && self.store_precision == other.store_precision
+    }
+}
+
+impl<F> Default for EmpiricalCovariance<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new(false, true)
+    }
+}
+
+/// Builder for [`EmpiricalCovariance`] (D-01). `Default` re-derives the sklearn
+/// defaults from [`EmpiricalCovariance::new`] (D-08 single source).
+#[derive(Debug, Clone, Copy)]
+pub struct EmpiricalCovarianceBuilder {
+    assume_centered: bool,
+    store_precision: bool,
+}
+
+impl Default for EmpiricalCovarianceBuilder {
+    /// Re-derive the sklearn defaults from [`EmpiricalCovariance::new`] (D-08
+    /// single source). `f64` is pinned only to read the F-independent flag
+    /// defaults — the builder is non-generic.
+    fn default() -> Self {
+        EmpiricalCovariance::<f64, Unfit>::new(false, true).into_builder()
+    }
+}
+
+impl EmpiricalCovarianceBuilder {
+    /// Set whether the data is assumed already centered (D-07).
+    pub fn assume_centered(mut self, v: bool) -> Self {
+        self.assume_centered = v;
+        self
+    }
+
+    /// Set whether the eig-based pinvh `precision_` is computed and stored at
+    /// `fit` (D-08).
+    pub fn store_precision(mut self, v: bool) -> Self {
+        self.store_precision = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. EmpiricalCovariance has NO data-INDEPENDENT
+    /// hyperparameter to validate at construction (both knobs are booleans), so
+    /// `build()` is infallible-but-typed (kept for family uniformity so the
+    /// `build_err_to_py` PyO3 mapper is shape-identical).
+    pub fn build<F>(self) -> Result<EmpiricalCovariance<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(EmpiricalCovariance {
+            assume_centered: self.assume_centered,
+            store_precision: self.store_precision,
+            covariance_: None,
+            location_: None,
+            precision_: None,
+            cov_host: OnceLock::new(),
+            loc_host: OnceLock::new(),
+            prec_host: OnceLock::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> EmpiricalCovariance<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of `covariance_` (`n_features × n_features`, row-major).
+    /// Memoized after the first call (IN-05). `Some` by construction on `Fitted`.
+    pub fn covariance_(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.cov_host
+            .get_or_init(|| {
+                self.covariance_
+                    .as_ref()
+                    .expect("covariance_ is Some by construction on Fitted")
+                    .to_host(pool)
+            })
+            .clone()
+    }
+
+    /// Host copy of `location_` (length `n_features`). Memoized (IN-05). `Some`
+    /// by construction on `Fitted`.
+    pub fn location_(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.loc_host
+            .get_or_init(|| {
+                self.location_
+                    .as_ref()
+                    .expect("location_ is Some by construction on Fitted")
+                    .to_host(pool)
+            })
+            .clone()
     }
 
     /// Host copy of `precision_` (`n_features × n_features`). Errors with
-    /// `NotFitted` when `store_precision` was `false`. Memoized (IN-05).
+    /// `NotFitted` when `store_precision` was `false` (the attribute was not
+    /// stored — a runtime "not stored" condition, distinct from the unfitted
+    /// state which the typestate now rules out). Memoized (IN-05).
     pub fn precision_(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
         self.attr(&self.precision_, &self.prec_host, pool, "precision_")
     }
@@ -145,32 +264,27 @@ where
     }
 }
 
-impl<F> Fit<F> for EmpiricalCovariance<F>
+impl<F> Fit<F> for EmpiricalCovariance<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = EmpiricalCovariance<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         // `_y` is unused: the retained `Fit`-trait slot for Phase-10 MBSGD reuse
-        // (this estimator is unsupervised; see traits.rs) — not unfinished wiring
-        // (IN-02).
+        // (this estimator is unsupervised; see typestate.rs) — not unfinished
+        // wiring (IN-02).
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<EmpiricalCovariance<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-07-07 / ASVS V5: reject inconsistent geometry BEFORE any prim
         //     launch (untrusted shapes → typed error, not an OOB device read). ---
-        if n_features == 0 || n_samples == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
 
         // --- 1. location_ = column means (or 0 when assume_centered, D-07). ---
         let location_dev: DeviceArray<ActiveRuntime, F> = if self.assume_centered {
@@ -210,16 +324,20 @@ where
             None
         };
 
-        // --- 4. Store device-resident fitted state (D-03). ---
-        self.covariance_ = Some(covariance_dev);
-        self.location_ = Some(location_dev);
-        self.precision_ = precision_dev;
-        // Invalidate any memoized host copies from a previous fit (IN-05) so a
-        // re-fit on the same instance never serves stale cached attrs.
-        self.cov_host = OnceLock::new();
-        self.loc_host = OnceLock::new();
-        self.prec_host = OnceLock::new();
-        Ok(self)
+        // --- 4. Reconstruct into the device-resident `Fitted` value (D-03). The
+        //        memo caches start fresh (`OnceLock::new()`) — the `Unfit` value's
+        //        caches were always empty (no accessor exists on `Unfit`). ---
+        Ok(EmpiricalCovariance {
+            assume_centered: self.assume_centered,
+            store_precision: self.store_precision,
+            covariance_: Some(covariance_dev),
+            location_: Some(location_dev),
+            precision_: precision_dev,
+            cov_host: OnceLock::new(),
+            loc_host: OnceLock::new(),
+            prec_host: OnceLock::new(),
+            _state: PhantomData,
+        })
     }
 }
 

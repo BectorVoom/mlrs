@@ -21,7 +21,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::covariance::EmpiricalCovariance;
-use mlrs_algos::traits::Fit;
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -114,14 +114,18 @@ where
     let x_host: Vec<F> = x_f64.iter().map(|&v| f64_to::<F>(v)).collect();
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut est = EmpiricalCovariance::<F>::new(assume_centered, true);
-    est.fit(&mut pool, &x_dev, None, (n_samples, n_features))
+    let est = EmpiricalCovariance::<F>::builder()
+        .assume_centered(assume_centered)
+        .store_precision(true)
+        .build::<F>()
+        .expect("EmpiricalCovariance::build is infallible")
+        .fit(&mut pool, &x_dev, None, (n_samples, n_features))
         .expect("EmpiricalCovariance::fit on a valid shape");
 
     let promote = |v: Vec<F>| v.iter().map(|&x| host_to_f64(x)).collect::<Vec<f64>>();
     EmpCovFit {
-        covariance: promote(est.covariance_(&pool).expect("covariance_ after fit")),
-        location: promote(est.location_(&pool).expect("location_ after fit")),
+        covariance: promote(est.covariance_(&pool)),
+        location: promote(est.location_(&pool)),
         precision: promote(est.precision_(&pool).expect("precision_ after fit")),
     }
 }
@@ -349,5 +353,21 @@ fn empirical_covariance_assume_centered_attrs_f64() {
         case.expect_f64("precision_"),
         &F64_TOL,
         "precision_ assume_centered f64",
+    );
+}
+
+/// BLDR-01 defaults equality: the zero-arg `new(false, true)` (sklearn defaults
+/// `assume_centered=false`, `store_precision=true`) reproduces every
+/// hyperparameter of `builder().build()` — the single-source-of-defaults
+/// invariant (D-08).
+#[test]
+fn defaults_equal() {
+    let from_new = EmpiricalCovariance::<f64>::new(false, true);
+    let from_builder = EmpiricalCovariance::<f64>::builder()
+        .build::<f64>()
+        .expect("default EmpiricalCovariance builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "EmpiricalCovariance::new(false, true) must equal builder().build()"
     );
 }
