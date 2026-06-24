@@ -30,6 +30,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::cluster::SpectralEmbedding;
 use mlrs_algos::error::AlgoError;
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -87,20 +88,18 @@ where
 
     // gamma=None → 1/n_features resolved at fit (D-04). The rbf path uses it; the
     // nearest_neighbors path ignores it.
-    let mut se = SpectralEmbedding::<F>::new(
-        N_COMPONENTS,
-        affinity.to_string(),
-        None,
-        n_neighbors,
-    );
-    se.fit(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
+    let se = SpectralEmbedding::<F>::builder()
+        .n_components(N_COMPONENTS)
+        .affinity(affinity.to_string())
+        .gamma(None)
+        .n_neighbors(n_neighbors)
+        .build::<F>()
+        .expect("SpectralEmbedding build with valid hyperparameters");
+    let se = se
+        .fit(&mut pool, &x_dev, None, (N_SAMPLES, N_FEATURES))
         .expect("SpectralEmbedding::fit on a valid shape");
 
-    se.embedding(&pool)
-        .expect("embedding_ after fit")
-        .iter()
-        .map(|&v| host_to_f64(v))
-        .collect()
+    se.embedding(&pool).iter().map(|&v| host_to_f64(v)).collect()
 }
 
 /// Column-wise sign-aligned `allclose`: each embedding column is defined only up
@@ -330,9 +329,14 @@ fn reject_oversize() {
     let x_host: Vec<f64> = vec![0.0; n * d];
     let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut se =
-        SpectralEmbedding::<f64>::new(N_COMPONENTS, "rbf".to_string(), None, 0);
-    let err = match se.fit(&mut pool, &x_dev, (n, d)) {
+    let se = SpectralEmbedding::<f64>::builder()
+        .n_components(N_COMPONENTS)
+        .affinity("rbf".to_string())
+        .gamma(None)
+        .n_neighbors(0)
+        .build::<f64>()
+        .expect("SpectralEmbedding build with valid hyperparameters");
+    let err = match se.fit(&mut pool, &x_dev, None, (n, d)) {
         Ok(_) => panic!("fit(n=65) must reject before any device work"),
         Err(e) => e,
     };
@@ -354,4 +358,19 @@ fn reject_oversize() {
         }
         other => panic!("expected NSamplesExceedsMaxDim, got {other:?}"),
     }
+}
+
+/// BLDR-01: `SpectralEmbedding::new()` (the single-source defaults) equals
+/// `SpectralEmbedding::builder().build()` (the builder defaults re-derived from
+/// `new`).
+#[test]
+fn spectral_embedding_defaults_equal() {
+    let from_new = SpectralEmbedding::<f32>::new();
+    let from_builder = SpectralEmbedding::<f32>::builder()
+        .build::<f32>()
+        .expect("default SpectralEmbedding builder build");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "SpectralEmbedding::new() must equal SpectralEmbedding::builder().build() (BLDR-01)"
+    );
 }

@@ -52,7 +52,7 @@ use crate::ingress::{
 // SpectralEmbedding — fit (X) + embedding_ (n × n_components)
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnySpectralEmbedding,
     algo:  mlrs_algos::cluster::spectral_embedding::SpectralEmbedding,
     unfit: { n_components: usize, affinity: String, gamma: Option<f64>, n_neighbors: usize },
@@ -168,22 +168,32 @@ impl PySpectralEmbedding {
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = SpectralEmbedding::<f32>::new(
-                        n_components,
-                        affinity,
-                        gamma.map(|g| g as f32),
-                        n_neighbors,
-                    );
-                    est.fit(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnySpectralEmbedding::F32(est))
+                    // Builder gamma setter is Option<f64>; drop the legacy
+                    // `gamma.map(|g| g as f32)` cast (narrowed inside build::<f32>(), A5).
+                    let est = SpectralEmbedding::<f32>::builder()
+                        .n_components(n_components)
+                        .affinity(affinity)
+                        .gamma(gamma)
+                        .n_neighbors(n_neighbors)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnySpectralEmbedding::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est =
-                        SpectralEmbedding::<f64>::new(n_components, affinity, gamma, n_neighbors);
-                    est.fit(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnySpectralEmbedding::F64(est))
+                    let est = SpectralEmbedding::<f64>::builder()
+                        .n_components(n_components)
+                        .affinity(affinity)
+                        .gamma(gamma)
+                        .n_neighbors(n_neighbors)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnySpectralEmbedding::F64(fitted))
                 }
             }
         })?;
@@ -192,11 +202,11 @@ impl PySpectralEmbedding {
     }
 
     /// Host copy of the fitted `embedding_` (row-major `n × n_components`), f32
-    /// arm. `NotFitted` if not in the f32 arm.
+    /// arm; the runtime [`not_fitted`] analog if not in the f32 arm (D-13).
     fn embedding_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnySpectralEmbedding::F32(e) => e.embedding(&pool).map_err(algo_err_to_py),
+            AnySpectralEmbedding::F32(e) => Ok(e.embedding(&pool)),
             _ => Err(not_fitted("spectral_embedding", "embedding_ (f32)")),
         }
     }
@@ -205,7 +215,7 @@ impl PySpectralEmbedding {
     fn embedding_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnySpectralEmbedding::F64(e) => e.embedding(&pool).map_err(algo_err_to_py),
+            AnySpectralEmbedding::F64(e) => Ok(e.embedding(&pool)),
             _ => Err(not_fitted("spectral_embedding", "embedding_ (f64)")),
         }
     }

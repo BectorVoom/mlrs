@@ -29,6 +29,8 @@
 //! Tests live in `crates/mlrs-algos/tests/spectral_embedding_test.rs`
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -38,11 +40,19 @@ use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::kernel_matrix::{kernel_matrix, Kernel};
 use mlrs_backend::prims::laplacian::laplacian;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, host_to_f64};
 
 // WR-06: shared spectral host recovery math (formerly duplicated in this file).
 use crate::cluster::spectral::recover;
-use crate::error::AlgoError;
+use crate::error::{AlgoError, BuildError};
+// SHAPE A' (RESEARCH Open Q3): SpectralEmbedding had an INHERENT `fit`/accessor
+// and NO `crate::traits` import. The Phase-16 retrofit ADOPTS the typestate `Fit`
+// trait (consuming-self) so the estimator joins the SINGLE trait surface and the
+// traits.rs-gone grep (Plan 11) stays clean. SpectralEmbedding is non-transductive
+// (like DBSCAN / sklearn's own SpectralEmbedding): it exposes the fitted
+// `embedding_` accessor but NO `transform` for new points, so it does not adopt
+// `Transform` (there is no inherent transform to adopt).
+use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 
 /// The v1 dense-eig MAX_DIM cap (`eig.rs` `MAX_DIM = 64`). The normalized
 /// Laplacian is `n_samples × n_samples`, so `n_samples ≤ 64` is the documented
@@ -54,14 +64,17 @@ const MAX_DIM: usize = 64;
 /// Spectral embedding (SPECTRAL-01) of an affinity graph onto the smallest
 /// non-trivial eigenvectors of the normalized Laplacian.
 ///
-/// Construct with [`SpectralEmbedding::new`] (`n_components`, `affinity`,
-/// `gamma`, `n_neighbors`), then `fit` and read `embedding_`. Fitted
-/// `embedding_` (`n × n_components`) is device-resident; the host accessor
-/// materializes it on demand.
-pub struct SpectralEmbedding<F>
-where
-    F: Float + CubeElement + Pod,
-{
+/// Construct with the zero-arg [`SpectralEmbedding::new`] (sklearn defaults:
+/// `n_components = 2`, `affinity = "nearest_neighbors"`, `gamma = None`,
+/// `n_neighbors = 10`) or [`SpectralEmbedding::builder`], then the consuming
+/// [`Fit::fit`] (returns the `Fitted`-tagged sibling) and read `embedding_`.
+/// Fitted `embedding_` (`n × n_components`) is device-resident; the host accessor
+/// materializes it on demand and exists ONLY on `SpectralEmbedding<F, Fitted>`
+/// (the compile-time typestate replaces the old runtime `NotFitted` guard, D-03).
+/// SpectralEmbedding is non-transductive: there is NO `transform` for new points
+/// (sklearn's own `SpectralEmbedding` likewise exposes only `fit_transform` /
+/// `embedding_`).
+pub struct SpectralEmbedding<F, S = Unfit> {
     /// Embedding dimensionality (sklearn default `2`, D-08). The smallest
     /// `n_components + 1` eigenvectors are computed and the trivial ≈0 one dropped.
     n_components: usize,
@@ -75,48 +88,164 @@ where
     n_neighbors: usize,
     /// Fitted `n × n_components` embedding, device-resident, `None` until `fit`.
     embedding_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> SpectralEmbedding<F>
+impl<F> SpectralEmbedding<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `SpectralEmbedding`. `n_components` is the embedding
-    /// dimensionality (sklearn default `2`, D-08), `affinity` selects the graph
-    /// (`"nearest_neighbors"` default / `"rbf"`, D-01), `gamma` is the rbf kernel
-    /// coefficient (`None` → `1/n_features` at `fit`, D-04), and `n_neighbors` is
-    /// the kNN-connectivity neighbor count (D-03). Invalid hyperparameters are
-    /// rejected at `fit`, not construction.
-    pub fn new(
-        n_components: usize,
-        affinity: String,
-        gamma: Option<F>,
-        n_neighbors: usize,
-    ) -> Self {
+    /// Construct an unfitted `SpectralEmbedding` with sklearn's
+    /// `SpectralEmbedding` defaults (`n_components = 2`,
+    /// `affinity = "nearest_neighbors"`, `gamma = None`, `n_neighbors = 10`)
+    /// directly in the `Unfit` state. SINGLE source of truth for the defaults
+    /// (D-08): the builder `Default` re-derives via
+    /// [`SpectralEmbedding::into_builder`]. Defaults are trusted valid, so this
+    /// bypasses [`SpectralEmbeddingBuilder::build`]'s validation.
+    pub fn new() -> Self {
         Self {
-            n_components,
-            affinity,
-            gamma,
-            n_neighbors,
+            n_components: 2,
+            affinity: "nearest_neighbors".to_string(),
+            gamma: None,
+            n_neighbors: 10,
             embedding_: None,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of the fitted `embedding_` (`n × n_components` row-major). Errors
-    /// with [`AlgoError::NotFitted`] before `fit`.
-    pub fn embedding(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.embedding_
-            .as_ref()
-            .map(|e| e.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "spectral_embedding",
-                operation: "embedding_",
-            })
+    /// Start building a `SpectralEmbedding` from sklearn's defaults (D-08 single
+    /// source).
+    pub fn builder() -> SpectralEmbeddingBuilder {
+        SpectralEmbeddingBuilder::default()
     }
 
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`SpectralEmbeddingBuilder::default`] to re-derive
+    /// the defaults from [`SpectralEmbedding::new`] (D-08).
+    pub fn into_builder(self) -> SpectralEmbeddingBuilder {
+        SpectralEmbeddingBuilder {
+            n_components: self.n_components,
+            affinity: self.affinity,
+            gamma: self.gamma.map(host_to_f64),
+            n_neighbors: self.n_neighbors,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `embedding_` is excluded — `None` in any `Unfit` value). Used by the
+    /// defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.n_components == other.n_components
+            && self.affinity == other.affinity
+            && self.gamma.map(host_to_f64) == other.gamma.map(host_to_f64)
+            && self.n_neighbors == other.n_neighbors
+    }
+}
+
+impl<F> Default for SpectralEmbedding<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`SpectralEmbedding`] (D-01). `gamma` is `Option<f64>` (A5: the
+/// scalar narrows to `Option<F>` at `build::<F>()`); `affinity` (`String`) takes
+/// its value directly. `Default` re-derives the sklearn defaults from
+/// [`SpectralEmbedding::new`] (D-08 single source).
+#[derive(Debug, Clone)]
+pub struct SpectralEmbeddingBuilder {
+    n_components: usize,
+    affinity: String,
+    gamma: Option<f64>,
+    n_neighbors: usize,
+}
+
+impl Default for SpectralEmbeddingBuilder {
+    /// Re-derive the sklearn defaults from [`SpectralEmbedding::new`] (D-08 single
+    /// source). `f64` is pinned only to read the F-independent scalar defaults.
+    fn default() -> Self {
+        SpectralEmbedding::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl SpectralEmbeddingBuilder {
+    /// Set the embedding dimensionality.
+    pub fn n_components(mut self, v: usize) -> Self {
+        self.n_components = v;
+        self
+    }
+
+    /// Set the affinity construction (`"nearest_neighbors"` / `"rbf"`).
+    pub fn affinity(mut self, v: String) -> Self {
+        self.affinity = v;
+        self
+    }
+
+    /// Set the rbf kernel coefficient `γ` (`None` → `1/n_features` at fit). The
+    /// `Option<f64>` narrows to `Option<F>` at `build::<F>()` (A5).
+    pub fn gamma(mut self, v: Option<f64>) -> Self {
+        self.gamma = v;
+        self
+    }
+
+    /// Set the neighbor count for the `"nearest_neighbors"` affinity.
+    pub fn n_neighbors(mut self, v: usize) -> Self {
+        self.n_neighbors = v;
+        self
+    }
+
+    /// Build the (unfit) estimator, narrowing the stored `Option<f64>` `gamma` to
+    /// the target float `Option<F>` (A5). SpectralEmbedding has no purely
+    /// data-INDEPENDENT hyperparameter that is unconditionally validated: the
+    /// `gamma > 0` check is affinity-branch-coupled (only the `"rbf"` path uses
+    /// gamma) and the `n_components` check is data-DEPENDENT (it compares against
+    /// `n_samples`), so both stay in the fit body (D-03 byte-identical). The
+    /// `Result` is kept for family uniformity so the `build_err_to_py` PyO3 mapper
+    /// is shape-identical across the Phase-16 builders.
+    pub fn build<F>(self) -> Result<SpectralEmbedding<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(SpectralEmbedding {
+            n_components: self.n_components,
+            affinity: self.affinity,
+            gamma: self.gamma.map(f64_to_host::<F>),
+            n_neighbors: self.n_neighbors,
+            embedding_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SpectralEmbedding<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of the fitted `embedding_` (`n × n_components` row-major). `Some`
+    /// by construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn embedding(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.embedding_
+            .as_ref()
+            .expect("embedding_ is Some by construction on SpectralEmbedding<F, Fitted>")
+            .to_host(pool)
+    }
+}
+
+impl<F> Fit<F> for SpectralEmbedding<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = SpectralEmbedding<F, Fitted>;
+
     /// Fit the spectral embedding to the affinity graph of `x`
-    /// (`shape = (n_samples, n_features)`, row-major). Rejects `n_samples > 64`
-    /// with [`AlgoError::NSamplesExceedsMaxDim`] BEFORE any launch (D-06).
+    /// (`shape = (n_samples, n_features)`, row-major), CONSUMING `self`. Rejects
+    /// `n_samples > 64` with [`AlgoError::NSamplesExceedsMaxDim`] BEFORE any launch
+    /// (D-06).
     ///
     /// Pipeline (RESEARCH System Diagram, pinned to sklearn `_spectral_embedding`
     /// order, D-07/D-08): affinity (rbf via `kernel_matrix(Rbf)` OR the
@@ -124,12 +253,13 @@ where
     /// reversed to ascending) → slice the smallest `n_components + 1` columns →
     /// `/dd` recovery → `_deterministic_vector_sign_flip` → drop the trivial
     /// row 0 → transpose → `embedding_` (`n × n_components`).
-    pub fn fit(
-        &mut self,
+    fn fit(
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
+        _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<SpectralEmbedding<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-9-VAL / ASVS V5: validate the untrusted hyperparameters +
@@ -143,14 +273,7 @@ where
                 max: MAX_DIM,
             });
         }
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         // The smallest `n_components + 1` eigenvectors must exist (drop_first).
         if self.n_components < 1 || self.n_components + 1 > n_samples {
             return Err(AlgoError::InvalidNComponents {
@@ -283,13 +406,14 @@ where
             recover::<F>(&v_host, &dd_host, n_samples, self.n_components, true, true);
         let embedding_dev = DeviceArray::from_host(pool, &embedding_host);
 
-        // --- Re-fit buffer reuse (WR-07): release a prior embedding allocation
-        //     back to the pool free-list before reassigning. ---
-        if let Some(old) = self.embedding_.take() {
-            old.release_into(pool);
-        }
-        self.embedding_ = Some(embedding_dev);
-        Ok(self)
+        Ok(SpectralEmbedding {
+            n_components: self.n_components,
+            affinity: self.affinity,
+            gamma: self.gamma,
+            n_neighbors: self.n_neighbors,
+            embedding_: Some(embedding_dev),
+            _state: PhantomData,
+        })
     }
 }
 
