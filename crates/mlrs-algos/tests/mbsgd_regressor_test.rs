@@ -28,7 +28,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_algos::error::BuildError;
 use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
-use mlrs_algos::traits::{Fit, Predict};
+use mlrs_algos::typestate::{Fit, Predict};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -119,7 +119,7 @@ where
 
     // EXPLICIT pinned setters (Pitfall 7) — squared_error/l2, invscaling, eta0,
     // power_t, alpha, max_iter, tol=0, shuffle=false, batch_size=1.
-    let mut reg = MBSGDRegressor::<F>::builder()
+    let reg = MBSGDRegressor::<F>::builder()
         .loss(Loss::SquaredLoss)
         .penalty(Penalty::L2)
         .alpha(SGD_ALPHA)
@@ -132,18 +132,12 @@ where
         .batch_size(1)
         .fit_intercept(true)
         .build::<F>()
-        .expect("MBSGDRegressor builds with valid hyperparameters");
-
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("MBSGDRegressor builds with valid hyperparameters")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("MBSGDRegressor::fit on a valid shape");
 
-    let coef: Vec<f64> = reg
-        .coef(&pool)
-        .expect("coef_ after fit")
-        .iter()
-        .map(|&v| host_to_f64(v))
-        .collect();
-    let intercept = host_to_f64(reg.intercept(&pool).expect("intercept_ after fit"));
+    let coef: Vec<f64> = reg.coef(&pool).iter().map(|&v| host_to_f64(v)).collect();
+    let intercept = host_to_f64(reg.intercept(&pool));
 
     let pred_dev = reg
         .predict(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
@@ -221,7 +215,7 @@ fn oracle_epsilon_f32() {
 
     // epsilon-insensitive tube with a small epsilon; constant schedule isolates
     // the tube subgradient (no schedule decay) so this is a clean loss-path probe.
-    let mut reg = MBSGDRegressor::<f32>::builder()
+    let reg = MBSGDRegressor::<f32>::builder()
         .loss(Loss::EpsilonInsensitive)
         .penalty(Penalty::L2)
         .alpha(SGD_ALPHA)
@@ -234,12 +228,11 @@ fn oracle_epsilon_f32() {
         .batch_size(1)
         .fit_intercept(true)
         .build::<f32>()
-        .expect("epsilon-insensitive MBSGDRegressor builds");
-
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("epsilon-insensitive MBSGDRegressor builds")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("epsilon-insensitive fit");
 
-    let coef = reg.coef(&pool).expect("coef_ after epsilon fit");
+    let coef = reg.coef(&pool);
     assert!(
         coef.iter().all(|&c| c.is_finite()),
         "epsilon-insensitive coef_ must be finite, got {coef:?}"

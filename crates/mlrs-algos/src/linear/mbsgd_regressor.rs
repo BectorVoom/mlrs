@@ -2,7 +2,7 @@
 //! `sklearn.linear_model.SGDRegressor`.
 //!
 //! The struct, the [`MBSGDRegressorBuilder`] (D-01/D-03 — sklearn-default field
-//! initializers), the `build() -> Result<MBSGDRegressor<F>, BuildError>`
+//! initializers), the `build() -> Result<MBSGDRegressor<F, Unfit>, BuildError>`
 //! validation, and the `fit`/`predict` bodies are all SHIPPED: `fit` lowers the
 //! validated `SgdConfig` into the flat `SgdParams` and drives the PRIM-10
 //! `sgd_solve` minibatch-SGD solver; `predict` runs the on-device linear matvec.
@@ -13,6 +13,8 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/mbsgd_regressor_test.rs`
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
+
+use std::marker::PhantomData;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -27,22 +29,27 @@ use crate::error::{AlgoError, BuildError};
 use crate::linear::elastic_net::predict_linear;
 use crate::linear::mbsgd_classifier::lower_config;
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
-use crate::traits::{Fit, Predict};
+use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// Minibatch-SGD linear regressor (SGDSVM-02). Construct via
-/// [`MBSGDRegressor::builder`], then [`Fit::fit`] + [`Predict::predict`]. Fitted
-/// `coef_` (length `n_features`) / `intercept_` (length 1) are device-resident
-/// (D-03).
-pub struct MBSGDRegressor<F> {
+/// [`MBSGDRegressor::builder`], then the consuming [`Fit::fit`] (returns the
+/// `Fitted`-tagged sibling) + [`Predict::predict`]. Fitted `coef_` (length
+/// `n_features`) / `intercept_` (length 1) are device-resident (D-03); the host
+/// accessors [`coef`](MBSGDRegressor::coef) / [`intercept`](MBSGDRegressor::intercept)
+/// exist ONLY on `MBSGDRegressor<F, Fitted>` (the compile-time typestate
+/// replaces the old runtime `NotFitted` guard, D-03).
+pub struct MBSGDRegressor<F, S = Unfit> {
     /// The lowered, validated hyperparameter bundle (D-06).
     config: SgdConfig,
     /// Fitted coefficients (device-resident), `None` until `fit`.
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (device-resident), `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> MBSGDRegressor<F>
+impl<F> MBSGDRegressor<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -56,29 +63,34 @@ where
     pub fn config(&self) -> &SgdConfig {
         &self.config
     }
+}
 
-    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.coef_
-            .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "mbsgd_regressor",
-                operation: "coef_",
-            })
+impl<F> MBSGDRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// The lowered configuration (D-06).
+    pub fn config(&self) -> &SgdConfig {
+        &self.config
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
+    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on MBSGDRegressor<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
+    /// the `Fitted` state (D-03).
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
         self.intercept_
             .as_ref()
-            .map(|i| i.to_host(pool)[0])
-            .ok_or(AlgoError::NotFitted {
-                estimator: "mbsgd_regressor",
-                operation: "intercept_",
-            })
+            .expect("intercept_ is Some by construction on MBSGDRegressor<F, Fitted>")
+            .to_host(pool)[0]
     }
 }
 
@@ -210,7 +222,7 @@ impl MBSGDRegressorBuilder {
     ///   `EpsilonInsensitive`, `SquaredEpsilonInsensitive`}); a classification loss
     ///   (`Hinge` / `Log` / `SquaredHinge`) is
     ///   [`BuildError::InvalidLossForEstimator`].
-    pub fn build<F>(self) -> Result<MBSGDRegressor<F>, BuildError>
+    pub fn build<F>(self) -> Result<MBSGDRegressor<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -283,33 +295,29 @@ impl MBSGDRegressorBuilder {
             config,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for MBSGDRegressor<F>
+impl<F> Fit<F> for MBSGDRegressor<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = MBSGDRegressor<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
-        let (n_samples, n_features) = shape;
+    ) -> Result<MBSGDRegressor<F, Fitted>, AlgoError> {
+        let (n_samples, _n_features) = shape;
 
         // --- T-10-03-02 / ASVS V5: data-DEPENDENT geometry guard BEFORE any launch
         //     (D-08 — the data-INDEPENDENT params were validated at build()). ---
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "mbsgd_regressor",
             operation: "fit (requires y)",
@@ -331,13 +339,16 @@ where
         let params = lower_config(&self.config);
         let (coef, intercept) = sgd_solve::<F>(pool, x, y, shape, &params)?;
 
-        self.coef_ = Some(coef);
-        self.intercept_ = Some(intercept);
-        Ok(self)
+        Ok(MBSGDRegressor {
+            config: self.config,
+            coef_: Some(coef),
+            intercept_: Some(intercept),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Predict<F> for MBSGDRegressor<F>
+impl<F> Predict<F> for MBSGDRegressor<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
