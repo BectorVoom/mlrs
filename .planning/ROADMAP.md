@@ -169,12 +169,30 @@ Plans:
   4. A user can request cluster centers via `store_centers` (`'centroid'`/`'medoid'`) producing `centroids_`/`medoids_`.
 
 **Plans**: 6 plans
+**Wave 1**
+
 - [ ] 15-01-PLAN.md — label_perm `-1→-1` pinned matcher + unit test (HDBS-02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 15-02-PLAN.md — gen_hdbscan_* fixtures + committed .npz blobs + oracle gate suite (Wave 0)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 15-03-PLAN.md — Metric enum + build validation + both oracle MST variants + single-linkage; D-04/D-05 tie-break TRUE GATE (precomputed anchor)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 15-04-PLAN.md — condense + stability + eom/leaf/ε/max selection + labelling + probabilities (precomputed exact labels + ≤1e-5 probs)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 15-05-PLAN.md — mutual_reachability GATHER kernel + feature-metric device front-end (all 5 metrics exact) + memory gate
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 15-06-PLAN.md — GLOSH outlier_scores_ (vs hdbscan 0.8.44) + store_centers centroid/medoid (vs sklearn)
+
 **UI hint**: no
 **Spike flag**: SPIKE BEFORE PLANNING — RESOLVED IN PLANS: the D-04/D-05 host-MST tie-break exactness is sequenced as the Wave-3 TRUE GATE (15-03 `tie_break_exact` on the tie-heavy + duplicate-point fixture) BEFORE the device front-end (15-05) commits. The oracle-matched tie-break (sklearn `np.argsort` quicksort + the two Prim variants — NOT the mlrs lowest-index convention) is replicated; gate fixtures use distinct MST edge weights (RESEARCH Pitfall 1 option 2). An un-exactable metric is surfaced as a phase blocker per D-05, never band-demoted.
 
