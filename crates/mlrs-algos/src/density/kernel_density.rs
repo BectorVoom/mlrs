@@ -445,7 +445,10 @@ where
             ScalarOp::Sum,
             ReducePath::Shared,
         )?
-        .expect("shared path is never plane-gated to None");
+        .ok_or(AlgoError::Prim(PrimError::InternalNone {
+            operand: "column_reduce",
+            context: "ReducePath::Shared",
+        }))?;
         dmat.release_into(pool);
 
         // --- 4. Host assembly (the single log applied ONCE at the end, D-11):

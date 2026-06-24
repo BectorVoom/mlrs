@@ -43,7 +43,7 @@ use mlrs_backend::prims::covariance::covariance;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64};
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
@@ -298,7 +298,10 @@ where
                 ScalarOp::Mean,
                 ReducePath::Shared,
             )?
-            .expect("shared path is never plane-gated to None")
+            .ok_or(AlgoError::Prim(PrimError::InternalNone {
+                operand: "column_reduce",
+                context: "ReducePath::Shared",
+            }))?
         };
 
         // --- 2. covariance_ = MLE Gram, ddof=0 (Pitfall 1; the prim folds ddof

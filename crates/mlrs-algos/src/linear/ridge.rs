@@ -312,7 +312,10 @@ where
             ScalarOp::Mean,
             ReducePath::Shared,
         )?
-        .expect("shared path is never plane-gated to None");
+        .ok_or(AlgoError::Prim(PrimError::InternalNone {
+            operand: "column_reduce",
+            context: "ReducePath::Shared",
+        }))?;
         let _ = _centered_means.to_host(pool);
         _centered_means.release_into(pool);
 

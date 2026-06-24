@@ -275,7 +275,10 @@ where
             ScalarOp::Mean,
             ReducePath::Shared,
         )?
-        .expect("shared path is never plane-gated to None");
+        .ok_or(AlgoError::Prim(PrimError::InternalNone {
+            operand: "column_reduce",
+            context: "ReducePath::Shared",
+        }))?;
         let mean_host = mean_dev.to_host(pool);
         let mean64: Vec<f64> = mean_host.iter().map(|&v| host_to_f64(v)).collect();
 

@@ -47,7 +47,7 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64};
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
@@ -262,7 +262,10 @@ where
                     ScalarOp::Mean,
                     ReducePath::Shared,
                 )?
-                .expect("shared path is never plane-gated to None");
+                .ok_or(AlgoError::Prim(PrimError::InternalNone {
+                    operand: "column_reduce",
+                    context: "ReducePath::Shared",
+                }))?;
                 let mean_host = mean_dev.to_host(pool);
                 let mean64: Vec<f64> = mean_host.iter().map(|&v| host_to_f64(v)).collect();
                 (mean_dev, mean64)
