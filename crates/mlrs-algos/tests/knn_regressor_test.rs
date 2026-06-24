@@ -16,7 +16,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
-use mlrs_algos::traits::{Fit, Predict};
+use mlrs_algos::typestate::{Fit, Predict};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -89,8 +89,11 @@ where
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq);
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_reg);
 
-    let mut reg = KNeighborsRegressor::<F>::new(KNN_K);
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (KNN_N_TRAIN, KNN_N_FEATURES))
+    let reg = KNeighborsRegressor::<F>::builder()
+        .n_neighbors(KNN_K)
+        .build::<F>()
+        .expect("build KNeighborsRegressor")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (KNN_N_TRAIN, KNN_N_FEATURES))
         .expect("fit on valid geometry");
 
     let pred_dev = reg
@@ -118,6 +121,21 @@ fn fixture_loads() {
     let case = load_npz(fixture("knn_f64_seed42.npz")).expect("load knn_f64");
     assert_len(&case, "y_reg", KNN_N_TRAIN);
     assert_len(&case, "predict_reg", KNN_N_QUERY);
+}
+
+/// BLDR-01: `KNeighborsRegressor::new()` equals
+/// `KNeighborsRegressor::builder().build()?` on the hyperparameter subset
+/// (sklearn default `n_neighbors = 5`). Pure host comparison — no device.
+#[test]
+fn defaults_equal() {
+    let from_new = KNeighborsRegressor::<f64>::new();
+    let from_builder = KNeighborsRegressor::<f64>::builder()
+        .build::<f64>()
+        .expect("default KNeighborsRegressorBuilder builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "KNeighborsRegressor::new() and builder().build()? must agree on hyperparameters (BLDR-01)"
+    );
 }
 
 /// predict (neighbor mean) matches sklearn within 1e-5, f32 (cpu AND rocm).

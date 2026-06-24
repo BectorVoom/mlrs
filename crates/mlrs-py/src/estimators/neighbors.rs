@@ -11,16 +11,13 @@ use pyo3::prelude::*;
 use mlrs_algos::neighbors::classifier::KNeighborsClassifier;
 use mlrs_algos::neighbors::nearest::NearestNeighbors;
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
-// Legacy accessor traits still consumed by the not-yet-migrated regressor arm in
-// this file (removed once all three estimators migrate). `Fit` is kept as the
-// legacy method-call surface for the regressor arm; the migrated NearestNeighbors
-// and KNeighborsClassifier arms call the typestate forms via UFCS aliases below.
-use mlrs_algos::traits::{Fit, Predict};
-// Typestate forms for the migrated arms; aliased so they do not collide by path
-// with the legacy `traits::*` glob above (typestate module-doc warning) — called
-// via UFCS at the migrated arms only.
+// All three estimators in this file are on the typestate surface — the legacy
+// `mlrs_algos::traits` glob is fully removed. The lifecycle/accessor traits are
+// imported under `Typestate*` aliases and called via UFCS at each migrated arm
+// (the typestate module-doc warns against globbing the fit/predict/kneighbors
+// method-name collisions; aliasing + UFCS resolves it).
 use mlrs_algos::typestate::{
-    Fit as TypestateFit, KNeighbors as TypestateKNeighbors,
+    Fit as TypestateFit, KNeighbors as TypestateKNeighbors, Predict as TypestatePredict,
     PredictLabels as TypestatePredictLabels, PredictProba as TypestatePredictProba,
 };
 
@@ -308,7 +305,7 @@ impl PyKNeighborsClassifier {
 // KNeighborsRegressor — Fit + Predict (continuous neighbor mean)
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnyKNeighborsRegressor,
     algo:  mlrs_algos::neighbors::regressor::KNeighborsRegressor,
     unfit: { n_neighbors: usize },
@@ -365,17 +362,25 @@ impl PyKNeighborsRegressor {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let mut est = KNeighborsRegressor::<f32>::new(n_neighbors);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKNeighborsRegressor::F32(est))
+                    let est = KNeighborsRegressor::<f32>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKNeighborsRegressor::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let mut est = KNeighborsRegressor::<f64>::new(n_neighbors);
-                    est.fit(&mut pool, &xd, Some(&yd), (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnyKNeighborsRegressor::F64(est))
+                    let est = KNeighborsRegressor::<f64>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyKNeighborsRegressor::F64(fitted))
                 }
             }
         })?;
@@ -390,7 +395,7 @@ impl PyKNeighborsRegressor {
             match &self.inner {
                 AnyKNeighborsRegressor::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("kneighbors_regressor", "predict (f32 path)")),
             }
@@ -403,7 +408,7 @@ impl PyKNeighborsRegressor {
             match &self.inner {
                 AnyKNeighborsRegressor::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("kneighbors_regressor", "predict (f64 path)")),
             }

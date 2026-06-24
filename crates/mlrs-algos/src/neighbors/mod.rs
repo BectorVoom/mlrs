@@ -3,9 +3,10 @@
 //! Module index for the three Phase-5 neighbor estimators. They consume the new
 //! Phase-5 top-k select primitive (`prims::topk`, composed on the Phase-2
 //! pairwise-distance prim) and expose the
-//! [`KNeighbors`](crate::traits::KNeighbors) /
-//! [`PredictLabels`](crate::traits::PredictLabels) /
-//! [`PredictProba`](crate::traits::PredictProba) surface (D-07):
+//! [`KNeighbors`](crate::typestate::KNeighbors) /
+//! [`PredictLabels`](crate::typestate::PredictLabels) /
+//! [`PredictProba`](crate::typestate::PredictProba) surface (D-07), retrofitted
+//! onto the typestate `<F, S = Unfit>` builder surface in Phase 16:
 //!
 //! - `NearestNeighbors` (NEIGH-01) — `kneighbors` returns the `k` nearest
 //!   (distances `F`, indices `i32`) per query, matching sklearn within 1e-5.
