@@ -28,6 +28,8 @@
 //! Tests live in `crates/mlrs-algos/tests/random_projection_test.rs`
 //! (AGENTS.md §2).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -35,20 +37,24 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::rng;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
 
-use crate::error::AlgoError;
+use crate::error::{AlgoError, BuildError};
 use crate::projection::gaussian::{johnson_lindenstrauss_min_dim, project, NComponents};
-use crate::traits::{Fit, Transform};
+use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
 /// Sparse (Achlioptas) random-projection transformer (PROJ-02), `components_`
 /// stored DENSE (D-12).
 ///
-/// Construct with [`SparseRandomProjection::new`] (`n_components`, `seed`, `eps`,
-/// `density`), then [`Fit::fit`] to draw the Achlioptas `components_` and
+/// Construct with the zero-arg [`SparseRandomProjection::new`] (sklearn defaults:
+/// `n_components = 'auto'` → [`NComponents::Auto`], `eps = 0.1`, `seed = 0`,
+/// `density = None` → `1/sqrt(n_features)`) or
+/// [`SparseRandomProjection::builder`], then the consuming [`Fit::fit`] (returns
+/// the `Fitted`-tagged sibling) to draw the Achlioptas `components_` and
 /// [`Transform::transform`] (`X · components_ᵀ`, one GEMM, NO centering). Fitted
-/// state is device-resident (D-03).
-pub struct SparseRandomProjection<F> {
+/// state is device-resident (D-03); the host accessors exist ONLY on
+/// `SparseRandomProjection<F, Fitted>` (the compile-time typestate replaces the
+/// old runtime `NotFitted` guard, D-03).
+pub struct SparseRandomProjection<F, S = Unfit> {
     /// Requested embedding dimension (`Auto` → resolved at fit via JL).
     n_components: NComponents,
     /// Documented `u64` seed driving SplitMix64 (T-07-02 — never `OsRng`).
@@ -66,47 +72,159 @@ pub struct SparseRandomProjection<F> {
     density_: f64,
     /// `n_features` seen at fit, for the `transform` geometry check.
     n_features: usize,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> SparseRandomProjection<F>
+impl<F> SparseRandomProjection<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `SparseRandomProjection`.
-    ///
-    /// - `n_components`: [`NComponents::Auto`] (JL-sized) or
-    ///   [`NComponents::Fixed`].
-    /// - `seed`: documented `u64` driving SplitMix64 (never `OsRng`, T-07-02).
-    /// - `eps`: JL distortion bound for the `Auto` path (`eps ∈ (0, 1)`).
-    /// - `density`: `None` → sklearn default `1/sqrt(n_features)`; otherwise the
-    ///   explicit density `∈ (0, 1]`.
-    pub fn new(
-        n_components: NComponents,
-        seed: u64,
-        eps: f64,
-        density: Option<f64>,
-    ) -> Self {
+    /// Construct an unfitted `SparseRandomProjection` with sklearn's defaults
+    /// (`n_components = 'auto'` → [`NComponents::Auto`], `eps = 0.1`, `seed = 0`,
+    /// `density = None` → `1/sqrt(n_features)` at fit) directly in the `Unfit`
+    /// state. SINGLE source of truth for the defaults (D-08): the builder
+    /// `Default` re-derives via [`SparseRandomProjection::into_builder`].
+    pub fn new() -> Self {
         Self {
-            n_components,
-            seed,
-            eps,
-            density,
+            n_components: NComponents::Auto,
+            seed: 0,
+            eps: 0.1,
+            density: None,
             components_: None,
             n_components_: 0,
             density_: 0.0,
             n_features: 0,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of `components_` (`n_components_ × n_features`, row-major, dense).
-    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
+    /// Start building a `SparseRandomProjection` from sklearn's defaults (D-08
+    /// single source).
+    pub fn builder() -> SparseRandomProjectionBuilder {
+        SparseRandomProjectionBuilder::default()
+    }
+
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`SparseRandomProjectionBuilder::default`] to
+    /// re-derive the defaults from [`SparseRandomProjection::new`] (D-08).
+    pub fn into_builder(self) -> SparseRandomProjectionBuilder {
+        SparseRandomProjectionBuilder {
+            n_components: self.n_components,
+            seed: self.seed,
+            eps: self.eps,
+            density: self.density,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `components_` is excluded — `None` in any `Unfit` value). Used by the
+    /// defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.n_components == other.n_components
+            && self.seed == other.seed
+            && self.eps == other.eps
+            && self.density == other.density
+    }
+}
+
+impl<F> Default for SparseRandomProjection<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`SparseRandomProjection`] (D-01). The `n_components` setter takes
+/// the [`NComponents`] enum directly; `seed` is `u64`, `eps` is `f64`, `density`
+/// is `Option<f64>` (`None` → `1/sqrt(n_features)` at fit). `Default` re-derives
+/// the sklearn defaults from [`SparseRandomProjection::new`] (D-08 single source).
+#[derive(Debug, Clone, Copy)]
+pub struct SparseRandomProjectionBuilder {
+    n_components: NComponents,
+    seed: u64,
+    eps: f64,
+    density: Option<f64>,
+}
+
+impl Default for SparseRandomProjectionBuilder {
+    /// Re-derive the sklearn defaults from [`SparseRandomProjection::new`] (D-08
+    /// single source). `f64` is pinned only to read the F-independent scalar
+    /// defaults — the builder is non-generic.
+    fn default() -> Self {
+        SparseRandomProjection::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl SparseRandomProjectionBuilder {
+    /// Set the requested embedding dimension ([`NComponents::Auto`] JL-sized or
+    /// [`NComponents::Fixed`]).
+    pub fn n_components(mut self, v: NComponents) -> Self {
+        self.n_components = v;
+        self
+    }
+
+    /// Set the documented `u64` seed driving SplitMix64 (never `OsRng`, T-07-02).
+    pub fn seed(mut self, v: u64) -> Self {
+        self.seed = v;
+        self
+    }
+
+    /// Set the JL distortion bound for the `Auto` path (`eps ∈ (0, 1)`).
+    pub fn eps(mut self, v: f64) -> Self {
+        self.eps = v;
+        self
+    }
+
+    /// Set the sparsity density (`None` → sklearn's `1/sqrt(n_features)` at fit;
+    /// otherwise the explicit density `∈ (0, 1]`).
+    pub fn density(mut self, v: Option<f64>) -> Self {
+        self.density = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. SparseRandomProjection has no purely
+    /// data-INDEPENDENT hyperparameter that is unconditionally validated: the
+    /// `eps ∈ (0, 1)` and `density ∈ (0, 1]` checks are resolution-path-coupled
+    /// (`density = None` resolves to `1/sqrt(n_features)` against the fit
+    /// geometry; the `Auto`/`Fixed` eps paths validate inline) and the
+    /// `n_components < 1` check is data-DEPENDENT, so all stay in the fit body
+    /// (D-03 byte-identical). The `Result` is kept for family uniformity so the
+    /// `build_err_to_py` PyO3 mapper is shape-identical across the Phase-16
+    /// builders.
+    pub fn build<F>(self) -> Result<SparseRandomProjection<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(SparseRandomProjection {
+            n_components: self.n_components,
+            seed: self.seed,
+            eps: self.eps,
+            density: self.density,
+            components_: None,
+            n_components_: 0,
+            density_: 0.0,
+            n_features: 0,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SparseRandomProjection<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of `components_` (`n_components_ × n_features`, row-major,
+    /// dense). `Some` by construction on the `Fitted` state, so no `NotFitted`
+    /// branch is needed (the compile-time typestate replaces the runtime guard,
+    /// D-03).
+    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.components_
             .as_ref()
-            .map(|a| a.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "sparse_random_projection",
-                operation: "components_",
-            })
+            .expect("components_ is Some by construction on SparseRandomProjection<F, Fitted>")
+            .to_host(pool)
     }
 
     /// The resolved embedding dimension (`Auto` → JL value) after fit.
@@ -120,31 +238,26 @@ where
     }
 }
 
-impl<F> Fit<F> for SparseRandomProjection<F>
+impl<F> Fit<F> for SparseRandomProjection<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = SparseRandomProjection<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         // `_y` is unused: the retained `Fit`-trait slot for Phase-10 MBSGD reuse
-        // (this estimator is unsupervised; see traits.rs) — not unfinished wiring
-        // (IN-02).
+        // (this estimator is unsupervised; see typestate.rs) — not unfinished
+        // wiring (IN-02).
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<SparseRandomProjection<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- T-07-10 / ASVS V5: geometry consistency BEFORE any RNG launch. ---
-        if n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
 
         // --- Resolve density: None → 1/sqrt(n_features) (sklearn default);
         //     validate density ∈ (0, 1] (ASVS V5 / T-07-10) BEFORE generation. ---
@@ -185,15 +298,21 @@ where
         let components_dev =
             rng::sparse_achlioptas_matrix::<F>(pool, self.seed, nc, n_features, density)?;
 
-        self.components_ = Some(components_dev);
-        self.n_components_ = nc;
-        self.density_ = density;
-        self.n_features = n_features;
-        Ok(self)
+        Ok(SparseRandomProjection {
+            n_components: self.n_components,
+            seed: self.seed,
+            eps: self.eps,
+            density: self.density,
+            components_: Some(components_dev),
+            n_components_: nc,
+            density_: density,
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Transform<F> for SparseRandomProjection<F>
+impl<F> Transform<F> for SparseRandomProjection<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {

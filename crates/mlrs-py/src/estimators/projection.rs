@@ -25,11 +25,10 @@ use mlrs_algos::projection::gaussian::{
     johnson_lindenstrauss_min_dim as algo_jl_min_dim, GaussianRandomProjection, NComponents,
 };
 use mlrs_algos::projection::sparse::SparseRandomProjection;
-// Phase 16 (D-01): GaussianRandomProjection is migrated to the typestate surface
-// (consuming-self builder + `Fit`/`Transform` via UFCS aliases); the
-// SparseRandomProjection arm is still on the legacy `traits` glob at the Task-1
-// commit (mid-migration, per the sequential-execution recipe — Task 2 drops it).
-use mlrs_algos::traits::{Fit, Transform};
+// Phase 16 (D-01): BOTH random-projection wrappers consume the typestate surface
+// now — the legacy estimator-trait glob has been dropped (projection module
+// complete). The typestate lifecycle traits are imported under disambiguating
+// `Typestate*` aliases and called via UFCS at each fit/transform arm.
 use mlrs_algos::typestate::{Fit as TypestateFit, Transform as TypestateTransform};
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
@@ -204,7 +203,7 @@ impl PyGaussianRandomProjection {
 // SparseRandomProjection — Fit (unsupervised) + Transform
 // ---------------------------------------------------------------------------
 
-crate::any_estimator! {
+crate::any_estimator_typestate! {
     any:   AnySparseRandomProjection,
     algo:  mlrs_algos::projection::sparse::SparseRandomProjection,
     unfit: { n_components: Option<usize>, eps: f64, seed: u64, density: Option<f64> },
@@ -263,20 +262,34 @@ impl PySparseRandomProjection {
         };
         let nc = resolve_n_components(n_components);
         let fitted = py.detach(|| -> PyResult<AnySparseRandomProjection> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let mut est = SparseRandomProjection::<f32>::new(nc, seed, eps, density);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnySparseRandomProjection::F32(est))
+                    let est = SparseRandomProjection::<f32>::builder()
+                        .n_components(nc)
+                        .seed(seed)
+                        .eps(eps)
+                        .density(density)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnySparseRandomProjection::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let mut est = SparseRandomProjection::<f64>::new(nc, seed, eps, density);
-                    est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(AnySparseRandomProjection::F64(est))
+                    let est = SparseRandomProjection::<f64>::builder()
+                        .n_components(nc)
+                        .seed(seed)
+                        .eps(eps)
+                        .density(density)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnySparseRandomProjection::F64(fitted))
                 }
             }
         })?;
@@ -287,11 +300,11 @@ impl PySparseRandomProjection {
     fn transform_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnySparseRandomProjection::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("sparse_random_projection", "transform (f32 path)")),
             }
@@ -300,11 +313,11 @@ impl PySparseRandomProjection {
     fn transform_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
         let xa = capsule_to_array(x)?;
         py.detach(|| {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnySparseRandomProjection::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(est.transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    Ok(TypestateTransform::transform(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
                 }
                 _ => Err(not_fitted("sparse_random_projection", "transform (f64 path)")),
             }
@@ -312,16 +325,16 @@ impl PySparseRandomProjection {
     }
 
     fn components_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnySparseRandomProjection::F32(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnySparseRandomProjection::F32(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("sparse_random_projection", "components_ (f32)")),
         }
     }
     fn components_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
-            AnySparseRandomProjection::F64(e) => e.components(&pool).map_err(algo_err_to_py),
+            AnySparseRandomProjection::F64(e) => Ok(e.components(&pool)),
             _ => Err(not_fitted("sparse_random_projection", "components_ (f64)")),
         }
     }

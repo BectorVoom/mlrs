@@ -26,13 +26,10 @@ use mlrs_algos::projection::gaussian::{
     johnson_lindenstrauss_min_dim, GaussianRandomProjection, NComponents,
 };
 use mlrs_algos::projection::sparse::SparseRandomProjection;
-// Phase 16 (D-01): GaussianRandomProjection is migrated to the typestate surface
-// (consuming-self `Fit`/`Transform`, builder construction); SparseRandomProjection
-// is still on the legacy `crate::traits` surface at the Task-1 commit, so the
-// test imports BOTH — the typestate traits under disambiguating `Typestate*`
-// aliases (called via UFCS at the migrated Gaussian sites) and the legacy glob
-// for the unmigrated Sparse sites. Task 2 drops the legacy glob.
-use mlrs_algos::traits::{Fit, Transform};
+// Phase 16 (D-01): BOTH random-projection estimators are now on the typestate
+// surface (consuming-self `Fit`/`Transform`, builder construction); the legacy
+// `crate::traits` glob is gone (projection module complete). The typestate traits
+// are imported under disambiguating `Typestate*` aliases and called via UFCS.
 use mlrs_algos::typestate::{Fit as TypestateFit, Transform as TypestateTransform};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -300,15 +297,16 @@ where
     for trial in 0..JL_TRIALS {
         let seed = BASE_SEED + trial as u64;
         let z_host: Vec<f64> = if sparse {
-            let mut rp = SparseRandomProjection::<F>::new(
-                NComponents::Fixed(PROP_COMPONENTS),
-                seed,
-                0.1,
-                None,
-            );
-            rp.fit(&mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+            let rp = SparseRandomProjection::<F>::builder()
+                .n_components(NComponents::Fixed(PROP_COMPONENTS))
+                .seed(seed)
+                .eps(0.1)
+                .density(None)
+                .build::<F>()
+                .expect("sparse build");
+            let rp = TypestateFit::fit(rp, &mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
                 .expect("sparse fit");
-            rp.transform(&mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
+            TypestateTransform::transform(&rp, &mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
                 .expect("transform")
                 .to_host(&pool)
                 .iter()
@@ -468,18 +466,18 @@ where
 
     let mut frac_acc = 0.0_f64;
     for trial in 0..JL_TRIALS {
-        let mut rp = SparseRandomProjection::<F>::new(
-            NComponents::Fixed(PROP_COMPONENTS),
-            BASE_SEED + trial as u64,
-            0.1,
-            Some(density),
-        );
-        rp.fit(&mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+        let rp = SparseRandomProjection::<F>::builder()
+            .n_components(NComponents::Fixed(PROP_COMPONENTS))
+            .seed(BASE_SEED + trial as u64)
+            .eps(0.1)
+            .density(Some(density))
+            .build::<F>()
+            .expect("sparse build");
+        let rp = TypestateFit::fit(rp, &mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
             .expect("sparse fit");
         assert_eq!(rp.density_(), density, "density resolves verbatim");
         let comp: Vec<f64> = rp
             .components(&pool)
-            .expect("components_")
             .iter()
             .map(|&val| host_to_f64(val))
             .collect();
@@ -525,13 +523,14 @@ where
     let x_dev = DeviceArray::from_host(&mut pool, &x_host);
 
     // density=None → 1/sqrt(n_features) sklearn default.
-    let mut rp = SparseRandomProjection::<F>::new(
-        NComponents::Fixed(PROP_COMPONENTS),
-        BASE_SEED,
-        0.1,
-        None,
-    );
-    rp.fit(&mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
+    let rp = SparseRandomProjection::<F>::builder()
+        .n_components(NComponents::Fixed(PROP_COMPONENTS))
+        .seed(BASE_SEED)
+        .eps(0.1)
+        .density(None)
+        .build::<F>()
+        .expect("sparse build");
+    let rp = TypestateFit::fit(rp, &mut pool, &x_dev, None, (PROP_SAMPLES, PROP_FEATURES))
         .expect("sparse fit");
     let expected_density = 1.0 / (PROP_FEATURES as f64).sqrt();
     assert!(
@@ -540,13 +539,11 @@ where
     );
     let nc = rp.n_components_();
 
-    let z = rp
-        .transform(&mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
+    let z = TypestateTransform::transform(&rp, &mut pool, &x_dev, (PROP_SAMPLES, PROP_FEATURES))
         .expect("transform");
     let z_host: Vec<f64> = z.to_host(&pool).iter().map(|&v| host_to_f64(v)).collect();
     let comp: Vec<f64> = rp
         .components(&pool)
-        .expect("components_")
         .iter()
         .map(|&v| host_to_f64(v))
         .collect();
@@ -576,4 +573,18 @@ fn random_projection_sparse_jl_distortion() {
     if !capability::skip_f64_with_log() {
         run_jl_distortion::<f64>(true);
     }
+}
+
+/// BLDR-01: the zero-arg `new()` and the `builder().build()` default agree on
+/// every hyperparameter (the single-source-of-defaults contract, D-08).
+#[test]
+fn sparse_random_projection_defaults_equal() {
+    let from_new = SparseRandomProjection::<f64>::new();
+    let from_builder = SparseRandomProjection::<f64>::builder()
+        .build::<f64>()
+        .expect("default build");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "SparseRandomProjection::new() and builder().build() must share defaults"
+    );
 }
