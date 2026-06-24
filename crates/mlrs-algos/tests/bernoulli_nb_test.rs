@@ -27,7 +27,12 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::error::BuildError;
 use mlrs_algos::naive_bayes::BernoulliNB;
-use mlrs_algos::traits::{Fit, PredictLabels, PredictProba};
+// Phase 16 (D-02): BernoulliNB migrated to the typestate surface — consuming-self
+// `Fit` + `Fitted`-gated accessors consumed via UFCS through these aliases.
+use mlrs_algos::typestate::{
+    Fit as TypestateFit, PredictLabels as TypestatePredictLabels,
+    PredictProba as TypestatePredictProba,
+};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -113,23 +118,23 @@ where
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
     let xq_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xq_host);
 
-    let mut clf = BernoulliNB::<F>::builder()
+    let clf = BernoulliNB::<F>::builder()
         .build::<F>()
         .expect("default BernoulliNB builds");
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let clf = TypestateFit::fit(clf, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("BernoulliNB::fit on a valid shape");
 
-    let labels = clf
-        .predict_labels(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
-        .expect("predict_labels after fit")
-        .to_host(&pool);
-    let proba: Vec<f64> = clf
-        .predict_proba(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
-        .expect("predict_proba after fit")
-        .to_host(&pool)
-        .iter()
-        .map(|&v| host_to_f64(v))
-        .collect();
+    let labels =
+        TypestatePredictLabels::predict_labels(&clf, &mut pool, &xq_dev, (N_QUERY, N_FEATURES))
+            .expect("predict_labels after fit")
+            .to_host(&pool);
+    let proba: Vec<f64> =
+        TypestatePredictProba::predict_proba(&clf, &mut pool, &xq_dev, (N_QUERY, N_FEATURES))
+            .expect("predict_proba after fit")
+            .to_host(&pool)
+            .iter()
+            .map(|&v| host_to_f64(v))
+            .collect();
 
     (labels, proba)
 }
@@ -240,21 +245,21 @@ fn binarize_none() {
     let y_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y_host);
     let xq_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &xq_host);
 
-    let mut clf = BernoulliNB::<f64>::builder()
+    let clf = BernoulliNB::<f64>::builder()
         .binarize(None)
         .build::<f64>()
         .expect("binarize=None BernoulliNB builds");
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let clf = TypestateFit::fit(clf, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("fit on pre-binarized data");
 
-    let labels = clf
-        .predict_labels(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
-        .expect("predict_labels")
-        .to_host(&pool);
-    let proba: Vec<f64> = clf
-        .predict_proba(&mut pool, &xq_dev, (N_QUERY, N_FEATURES))
-        .expect("predict_proba")
-        .to_host(&pool);
+    let labels =
+        TypestatePredictLabels::predict_labels(&clf, &mut pool, &xq_dev, (N_QUERY, N_FEATURES))
+            .expect("predict_labels")
+            .to_host(&pool);
+    let proba: Vec<f64> =
+        TypestatePredictProba::predict_proba(&clf, &mut pool, &xq_dev, (N_QUERY, N_FEATURES))
+            .expect("predict_proba")
+            .to_host(&pool);
 
     let predict_ref: Vec<i32> = case.expect_f64("predict").iter().map(|&v| v.round() as i32).collect();
     let proba_ref = case.expect_f64("predict_proba");
@@ -293,22 +298,29 @@ fn refit_releases_buffers() {
     let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
     let y_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y_host);
 
-    let mut clf = BernoulliNB::<f64>::builder()
+    // Consuming-self Fit makes &mut self re-fit a type error; the gate becomes the
+    // construct → fit (consuming) → drop(Fitted) cycle (umap_test fit_no_leak).
+    let clf = BernoulliNB::<f64>::builder()
         .build::<f64>()
         .expect("default BernoulliNB builds");
-
-    clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let fitted = TypestateFit::fit(clf, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("first fit");
+    drop(fitted);
     let live_after_first = pool.stats().live_bytes;
 
     const REFITS: usize = 4;
     for k in 0..REFITS {
-        clf.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
-            .expect("re-fit");
+        let clf = BernoulliNB::<f64>::builder()
+            .build::<f64>()
+            .expect("default BernoulliNB builds");
+        let fitted =
+            TypestateFit::fit(clf, &mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+                .expect("re-fit");
+        drop(fitted);
         let live = pool.stats().live_bytes;
         assert!(
             live <= live_after_first,
-            "live_bytes grew across re-fit {k}: {live} > first {live_after_first} (WR-07 leak)"
+            "live_bytes grew across re-construct+fit {k}: {live} > first {live_after_first} (WR-07 leak)"
         );
     }
 }

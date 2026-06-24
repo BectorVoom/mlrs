@@ -16,6 +16,8 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/bernoulli_nb_test.rs` (AGENTS.md §2).
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -30,12 +32,17 @@ use crate::naive_bayes::multinomial_nb::{
     decode_classes, resolve_class_log_prior, validate_discrete_alpha, validate_non_negative_counts,
 };
 use crate::naive_bayes::nb_common::{argmax_decode, class_grouped_sum, log_sum_exp_normalize};
-use crate::traits::{Fit, PredictLabels, PredictLogProba, PredictProba};
+// Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
+// param + migration to the consuming-self `typestate` surface. fit/predict math
+// BYTE-IDENTICAL (D-03).
+use crate::typestate::{
+    validate_geometry, Fit, Fitted, PredictLabels, PredictLogProba, PredictProba, Unfit,
+};
 
 /// Bernoulli Naive Bayes (NB-03). Construct via [`BernoulliNB::builder`], then
 /// [`Fit::fit`] + (Wave-1) the predict surface. Fitted `feature_log_prob_` /
 /// `class_log_prior_` are device-resident / host f64 (D-03), `None` until `fit`.
-pub struct BernoulliNB<F> {
+pub struct BernoulliNB<F, S = Unfit> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
     /// Keep `alpha` as-is when `< 1e-10` (D-02 default `true`); else clip (D-06).
@@ -64,9 +71,11 @@ pub struct BernoulliNB<F> {
     neg_prob_sum_: Option<Vec<f64>>,
     /// Per-class log-prior (host f64), `None` until `fit`.
     class_log_prior_: Option<Vec<f64>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> BernoulliNB<F>
+impl<F> BernoulliNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
@@ -74,7 +83,12 @@ where
     pub fn builder() -> BernoulliNBBuilder {
         BernoulliNBBuilder::default()
     }
+}
 
+impl<F> BernoulliNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
     /// The inferred class labels (empty until `fit`).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
@@ -167,7 +181,7 @@ impl BernoulliNBBuilder {
     /// `class_prior` entries, and the D-06 `force_alpha` clip+warn (shared
     /// [`validate_discrete_alpha`]). `binarize` needs no validation (any finite or
     /// `None` threshold is valid).
-    pub fn build<F>(self) -> Result<BernoulliNB<F>, BuildError>
+    pub fn build<F>(self) -> Result<BernoulliNB<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
@@ -188,30 +202,26 @@ impl BernoulliNBBuilder {
             feature_log_prob_: None,
             neg_prob_sum_: None,
             class_log_prior_: None,
+            _state: PhantomData,
         })
     }
 }
 
-impl<F> Fit<F> for BernoulliNB<F>
+impl<F> Fit<F> for BernoulliNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    type Fitted = BernoulliNB<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<BernoulliNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "bernoulli_nb",
             operation: "fit (requires y)",
@@ -288,24 +298,31 @@ where
             n_classes,
         )?;
 
-        if let Some(old) = self.feature_log_prob_.take() {
-            old.release_into(pool);
-        }
+        // The consuming-self transition carries no prior fitted state (fresh
+        // `Unfit` has feature_log_prob_ = None) — the old WR-07 re-fit release is
+        // vacuous and dropped; reuse across re-CONSTRUCT+fit flows via the pool.
         let flp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
             pool,
             &flp_delta.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
         );
 
-        self.classes_ = classes_;
-        self.n_features = n_features;
-        self.feature_log_prob_ = Some(flp_dev);
-        self.neg_prob_sum_ = Some(neg_prob_sum);
-        self.class_log_prior_ = Some(class_log_prior_);
-        Ok(self)
+        Ok(BernoulliNB {
+            alpha: self.alpha,
+            force_alpha: self.force_alpha,
+            binarize: self.binarize,
+            fit_prior: self.fit_prior,
+            class_prior: self.class_prior,
+            classes_,
+            n_features,
+            feature_log_prob_: Some(flp_dev),
+            neg_prob_sum_: Some(neg_prob_sum),
+            class_log_prior_: Some(class_log_prior_),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> BernoulliNB<F>
+impl<F> BernoulliNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -381,7 +398,7 @@ where
     }
 }
 
-impl<F> PredictLabels<F> for BernoulliNB<F>
+impl<F> PredictLabels<F> for BernoulliNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -397,7 +414,7 @@ where
     }
 }
 
-impl<F> PredictProba<F> for BernoulliNB<F>
+impl<F> PredictProba<F> for BernoulliNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -422,7 +439,7 @@ where
     }
 }
 
-impl<F> PredictLogProba<F> for BernoulliNB<F>
+impl<F> PredictLogProba<F> for BernoulliNB<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
