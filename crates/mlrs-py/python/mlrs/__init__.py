@@ -19,15 +19,35 @@ This file:
      driver probe -> ``ImportError`` when a backend's runtime is absent.
 """
 
-from .cluster import DBSCAN, KMeans
+from .cluster import (
+    DBSCAN,
+    HDBSCAN,
+    KMeans,
+    SpectralClustering,
+    SpectralEmbedding,
+)
 from .covariance import EmpiricalCovariance, LedoitWolf
 from .decomposition import PCA, IncrementalPCA, TruncatedSVD
+from .density import KernelDensity
+from .kernel_ridge import KernelRidge
 from .linear import (
     ElasticNet,
     Lasso,
     LinearRegression,
+    LinearSVC,
+    LinearSVR,
     LogisticRegression,
+    MBSGDClassifier,
+    MBSGDRegressor,
     Ridge,
+)
+from .manifold import UMAP
+from .naive_bayes import (
+    BernoulliNB,
+    CategoricalNB,
+    ComplementNB,
+    GaussianNB,
+    MultinomialNB,
 )
 from .neighbors import (
     KNeighborsClassifier,
@@ -46,8 +66,23 @@ __all__ = [
     "Lasso",
     "ElasticNet",
     "LogisticRegression",
+    "LinearSVC",
+    "LinearSVR",
+    "MBSGDClassifier",
+    "MBSGDRegressor",
+    "GaussianNB",
+    "MultinomialNB",
+    "BernoulliNB",
+    "ComplementNB",
+    "CategoricalNB",
+    "KernelRidge",
+    "KernelDensity",
     "KMeans",
     "DBSCAN",
+    "HDBSCAN",
+    "SpectralClustering",
+    "SpectralEmbedding",
+    "UMAP",
     "PCA",
     "TruncatedSVD",
     "IncrementalPCA",

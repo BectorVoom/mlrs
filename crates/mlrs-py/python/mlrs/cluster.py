@@ -8,7 +8,7 @@ standalone ``predict`` (algos D-08) — only ``fit`` + ``labels_``.
 """
 
 import numpy as np
-from sklearn.base import ClusterMixin
+from sklearn.base import ClusterMixin, TransformerMixin
 
 from .base import MlrsBase
 
@@ -96,3 +96,166 @@ class DBSCAN(ClusterMixin, MlrsBase):
         return self._to_output(
             self._mlrs_obj.core_sample_indices_(), (-1,), None, np.int32
         )
+
+
+class SpectralClustering(ClusterMixin, MlrsBase):
+    """Spectral clustering (SPECTRAL-02).
+
+    sklearn ``random_state`` is stored verbatim and mapped to the Rust ``seed``
+    only at the ``_mlrs`` boundary inside ``fit`` (``None`` -> a fixed default
+    seed). No standalone ``predict`` — labels-only (``fit`` + ``labels_``).
+    Defaults mirror ``PySpectralClustering`` ``#[new]`` at spectral.rs:313-314.
+    """
+
+    def __init__(
+        self,
+        n_clusters=8,
+        n_components=None,
+        affinity="rbf",
+        gamma=1.0,
+        n_neighbors=10,
+        random_state=None,
+        output_type="input",
+    ):
+        self.n_clusters = n_clusters
+        self.n_components = n_components
+        self.affinity = affinity
+        self.gamma = gamma
+        self.n_neighbors = n_neighbors
+        self.random_state = random_state
+        self.output_type = output_type
+
+    def fit(self, X, y=None):
+        xa, rows, cols = self._normalize(X)
+        seed = 0 if self.random_state is None else int(self.random_state)
+        obj = self._ext().SpectralClustering(
+            self.n_clusters,
+            self.n_components,
+            self.affinity,
+            self.gamma,
+            self.n_neighbors,
+            seed,
+        )
+        obj.fit(xa, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        return self
+
+    @property
+    def labels_(self):
+        self._check_fitted()
+        return self._to_output(self._mlrs_obj.labels_(), (-1,), None, np.int32)
+
+
+class SpectralEmbedding(TransformerMixin, MlrsBase):
+    """Spectral embedding / Laplacian eigenmaps (SPECTRAL-01).
+
+    sklearn's ``SpectralEmbedding`` supports ``fit`` + ``fit_transform`` only
+    (no out-of-sample ``transform``); the embedding is materialized via the
+    ``embedding_`` fitted attribute. Defaults mirror ``PySpectralEmbedding``
+    ``#[new]`` at spectral.rs:121-122.
+    """
+
+    def __init__(
+        self,
+        n_components=2,
+        affinity="nearest_neighbors",
+        gamma=None,
+        n_neighbors=10,
+        output_type="input",
+    ):
+        self.n_components = n_components
+        self.affinity = affinity
+        self.gamma = gamma
+        self.n_neighbors = n_neighbors
+        self.output_type = output_type
+
+    def fit(self, X, y=None):
+        xa, rows, cols = self._normalize(X)
+        obj = self._ext().SpectralEmbedding(
+            self.n_components, self.affinity, self.gamma, self.n_neighbors
+        )
+        obj.fit(xa, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        self._n_rows = rows
+        return self
+
+    def fit_transform(self, X, y=None):
+        self.fit(X, y)
+        return self.embedding_
+
+    @property
+    def embedding_(self):
+        out = self._suffixed("embedding")()
+        return self._to_output(
+            out, (-1, self.n_components), None, self._np_float()
+        )
+
+
+class HDBSCAN(ClusterMixin, MlrsBase):
+    """Hierarchical density-based clustering (CLUSTER-03 / SHIM-01 pair).
+
+    ``ClusterMixin`` provides ``fit_predict``; the shim forwards ``fit`` to the
+    ``_mlrs.HDBSCAN`` wrapper and exposes ``labels_`` / ``probabilities_`` /
+    ``outlier_scores_`` (the GLOSH scores surface as ``None`` until the
+    feature-space front-end lands — see 16-10-SUMMARY). Defaults mirror
+    ``PyHDBSCAN`` ``#[new]`` at cluster.rs:375-379.
+    """
+
+    def __init__(
+        self,
+        min_cluster_size=5,
+        min_samples=None,
+        cluster_selection_epsilon=0.0,
+        cluster_selection_method="eom",
+        metric="euclidean",
+        alpha=1.0,
+        max_cluster_size=0,
+        output_type="input",
+    ):
+        self.min_cluster_size = min_cluster_size
+        self.min_samples = min_samples
+        self.cluster_selection_epsilon = cluster_selection_epsilon
+        self.cluster_selection_method = cluster_selection_method
+        self.metric = metric
+        self.alpha = alpha
+        self.max_cluster_size = max_cluster_size
+        self.output_type = output_type
+
+    def fit(self, X, y=None):
+        xa, rows, cols = self._normalize(X)
+        obj = self._ext().HDBSCAN(
+            self.min_cluster_size,
+            self.min_samples,
+            self.cluster_selection_epsilon,
+            self.cluster_selection_method,
+            self.metric,
+            self.alpha,
+            self.max_cluster_size,
+        )
+        obj.fit(xa, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        return self
+
+    @property
+    def labels_(self):
+        self._check_fitted()
+        return self._to_output(self._mlrs_obj.labels_(), (-1,), None, np.int32)
+
+    @property
+    def probabilities_(self):
+        self._check_fitted()
+        out = self._suffixed("probabilities")()
+        if out is None:
+            return None
+        return self._to_output(out, (-1,), None, self._np_float())
+
+    @property
+    def outlier_scores_(self):
+        self._check_fitted()
+        out = self._suffixed("outlier_scores")()
+        if out is None:
+            return None
+        return self._to_output(out, (-1,), None, self._np_float())
