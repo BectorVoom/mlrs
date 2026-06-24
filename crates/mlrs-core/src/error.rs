@@ -152,4 +152,22 @@ pub enum PrimError {
         /// The non-positive pivot value (the negative/zero `√` argument).
         pivot_value: f64,
     },
+
+    /// A `usize` multiplication that sizes a device buffer (e.g. `rows * cols`
+    /// for an `n×n` block) overflowed, so the requested geometry cannot be
+    /// allocated. Rejected *before* any `unsafe` kernel launch (the `checked_mul`
+    /// guard) so an out-of-range geometry is a recoverable typed error rather than
+    /// a fabricated `usize::MAX` length in a `ShapeMismatch`. Carries the operand
+    /// label and the two operands whose product overflowed.
+    #[error(
+        "primitive '{operand}' geometry overflows usize: {lhs} * {rhs} does not fit in usize"
+    )]
+    Overflow {
+        /// Which operand's geometry overflowed (e.g. `"d"`, `"cosine_distance_matrix"`).
+        operand: &'static str,
+        /// The left operand of the overflowing multiplication.
+        lhs: usize,
+        /// The right operand of the overflowing multiplication.
+        rhs: usize,
+    },
 }

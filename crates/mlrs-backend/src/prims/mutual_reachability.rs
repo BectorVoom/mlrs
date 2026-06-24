@@ -69,11 +69,10 @@ where
     // expected `d` length.
     let out_len = rows_x
         .checked_mul(rows_y)
-        .ok_or(PrimError::ShapeMismatch {
+        .ok_or(PrimError::Overflow {
             operand: "d",
-            rows: rows_x,
-            cols: rows_y,
-            len: usize::MAX,
+            lhs: rows_x,
+            rhs: rows_y,
         })?;
     if d.len() != out_len {
         return Err(PrimError::ShapeMismatch {

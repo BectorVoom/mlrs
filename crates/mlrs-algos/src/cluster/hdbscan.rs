@@ -755,11 +755,10 @@ where
             //     BEFORE core, MR via the device GATHER kernel, dense Prim. ---
             // T-15-05-OVF: guard n*n before building the dense block.
             let nn = n.checked_mul(n).ok_or_else(|| {
-                AlgoError::Prim(PrimError::ShapeMismatch {
+                AlgoError::Prim(PrimError::Overflow {
                     operand: "cosine_distance_matrix",
-                    rows: n,
-                    cols: n,
-                    len: usize::MAX,
+                    lhs: n,
+                    rhs: n,
                 })
             })?;
             let dist_dense = cosine_distance_matrix(&x_host, n, p); // RAW (unscaled)
