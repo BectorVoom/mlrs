@@ -50,6 +50,7 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 // variants + argsort-by-weight; `single_linkage` holds the UnionFind +
 // make_single_linkage that the Wave-3 condense/select stage (plan 15-04)
 // consumes.
+pub mod centers;
 pub mod condense;
 pub mod glosh;
 pub mod mst;
@@ -169,6 +170,18 @@ pub struct Hdbscan<F, S = Unfit> {
     /// `labels_`/`probabilities_`); `None` until fit. Gated vs the `hdbscan` 0.8.44
     /// library (sklearn has no GLOSH — D-07).
     outlier_scores_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Fitted cluster centroids (`store_centers='centroid'`/`'both'`, HDBS-04 /
+    /// plan 15-06): a row-major `n_clusters × n_features` block (cluster id `c` at
+    /// rows `c*p..(c+1)*p`), each a probability-weighted mean of its members.
+    /// `Some` only when `store_centers` requests centroids AND the fit produced at
+    /// least one cluster; `None` otherwise (incl. when `store_centers` is unset).
+    /// Gated vs sklearn ≤1e-5 under the same label permutation.
+    centroids_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Fitted cluster medoids (`store_centers='medoid'`/`'both'`, HDBS-04 / plan
+    /// 15-06): a row-major `n_clusters × n_features` block, each the cluster member
+    /// minimizing the strength-weighted total distance to its peers. `Some`/`None`
+    /// on the same condition as `centroids_`. Gated vs sklearn ≤1e-5.
+    medoids_: Option<DeviceArray<ActiveRuntime, F>>,
     /// The single-linkage hierarchy from the MST → `make_single_linkage` pass
     /// (HDBS-02, plan 15-03). `Some` after a precomputed fit, `None` otherwise
     /// (the feature-metric device front-end lands in plan 15-05). Stored host-side
@@ -210,6 +223,8 @@ where
             labels_: None,
             probabilities_: None,
             outlier_scores_: None,
+            centroids_: None,
+            medoids_: None,
             single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -415,6 +430,8 @@ impl HdbscanBuilder {
             labels_: None,
             probabilities_: None,
             outlier_scores_: None,
+            centroids_: None,
+            medoids_: None,
             single_linkage_: None,
             n_features_in_: 0,
             _float: PhantomData,
@@ -454,6 +471,18 @@ where
 
         // Data-DEPENDENT geometry guard BEFORE any compute (shared helper).
         validate_geometry(x, shape)?;
+
+        // store_centers is FEATURE-ARRAY ONLY (HDBS-04 / T-15-06-V5): there are no
+        // feature rows to average when `X` is a precomputed distance matrix, so
+        // requesting centers with `Metric::Precomputed` is a typed error (sklearn
+        // parity) — rejected BEFORE any compute so the misuse never produces garbage
+        // centers.
+        if self.store_centers.is_some() && self.metric == Metric::Precomputed {
+            return Err(AlgoError::Unsupported {
+                estimator: "hdbscan",
+                operation: "store_centers with Metric::Precomputed (feature-array only)",
+            });
+        }
 
         // The single-linkage hierarchy is produced only by the precomputed path in
         // this slice; the feature-metric device front-end (plan 15-05) fills it
@@ -505,6 +534,34 @@ where
             Some(DeviceArray::from_host(pool, &s_f))
         };
 
+        // store_centers → centroids_/medoids_ (HDBS-04, plan 15-06). Feature-array
+        // only (the Precomputed guard above rejects that path), so `x` is the
+        // genuine `n×p` feature matrix. Centroid = probability-weighted mean per
+        // cluster; medoid = strength-weighted min-total-distance member. Computed
+        // host-side over the fitted labels + probabilities (sklearn parity, ≤1e-5
+        // under the same permutation). `None` unless `store_centers` requests them.
+        let (centroids_, medoids_) = if let Some(sc) = self.store_centers {
+            let which = match sc {
+                StoreCenters::Centroid => centers::Centers::Centroid,
+                StoreCenters::Medoid => centers::Centers::Medoid,
+                StoreCenters::Both => centers::Centers::Both,
+            };
+            let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+            let (cent, med) =
+                centers::weighted_cluster_center(&x_host, &labels, &probabilities, p, self.metric, which);
+            let cent_dev = cent.map(|c| {
+                let c_f: Vec<F> = c.iter().map(|&v| f64_to_host::<F>(v)).collect();
+                DeviceArray::from_host(pool, &c_f)
+            });
+            let med_dev = med.map(|m| {
+                let m_f: Vec<F> = m.iter().map(|&v| f64_to_host::<F>(v)).collect();
+                DeviceArray::from_host(pool, &m_f)
+            });
+            (cent_dev, med_dev)
+        } else {
+            (None, None)
+        };
+
         Ok(Hdbscan {
             min_cluster_size: self.min_cluster_size,
             min_samples: self.min_samples,
@@ -518,6 +575,8 @@ where
             labels_: Some(labels_dev),
             probabilities_,
             outlier_scores_,
+            centroids_,
+            medoids_,
             single_linkage_,
             n_features_in_: p,
             _float: PhantomData,
@@ -869,6 +928,24 @@ where
     /// `hdbscan` 0.8.44 library — sklearn has no GLOSH (D-07).
     pub fn outlier_scores(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
         self.outlier_scores_.as_ref().map(|d| d.to_host(pool))
+    }
+
+    /// Host copy of the fitted cluster `centroids_` (row-major
+    /// `n_clusters × n_features`; HDBS-04). `Some` only when `store_centers` was
+    /// `Centroid`/`Both` AND the fit produced at least one cluster; `None`
+    /// otherwise. Each row `c` is the probability-weighted mean of cluster `c`'s
+    /// members. Gated vs sklearn ≤1e-5 under the same label permutation.
+    pub fn centroids(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
+        self.centroids_.as_ref().map(|d| d.to_host(pool))
+    }
+
+    /// Host copy of the fitted cluster `medoids_` (row-major
+    /// `n_clusters × n_features`; HDBS-04). `Some` only when `store_centers` was
+    /// `Medoid`/`Both` AND the fit produced at least one cluster; `None` otherwise.
+    /// Each row `c` is the cluster member minimizing the strength-weighted total
+    /// distance to its peers. Gated vs sklearn ≤1e-5.
+    pub fn medoids(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
+        self.medoids_.as_ref().map(|d| d.to_host(pool))
     }
 
     /// Number of features seen at fit (`n_features_in_`).

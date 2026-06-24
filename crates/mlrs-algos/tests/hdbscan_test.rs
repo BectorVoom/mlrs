@@ -609,39 +609,87 @@ where
 
 /// `centers_match` f32 — `centroids_`/`medoids_` vs sklearn (same permutation).
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit + store_centers accessors"]
 fn centers_match_f32() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
     let case = load_npz(fixture("hdbscan_euclidean_f32_seed42.npz")).expect("load euclidean f32");
-    run_centers(&case, &F32_TOL, "centers_match f32");
+    run_centers::<f32>(&case, &F32_TOL, "centers_match f32");
 }
 
 /// `centers_match` f64 — `centroids_`/`medoids_` vs sklearn (cpu; rocm skips).
 #[test]
-#[ignore = "un-ignore in 15-NN: needs the back-end fit + store_centers accessors"]
 fn centers_match_f64() {
     if skip_f64("centers_match") {
         return;
     }
     let case = load_npz(fixture("hdbscan_euclidean_f64_seed42.npz")).expect("load euclidean f64");
-    run_centers(&case, &F64_TOL, "centers_match f64");
+    run_centers::<f64>(&case, &F64_TOL, "centers_match f64");
 }
 
-fn run_centers(case: &OracleCase, tol: &Tolerance, label: &str) {
+/// Fit the euclidean blob fixture under the real device front-end with
+/// `store_centers='both'` and return `(labels, centroids, medoids)` host-side
+/// (HDBS-04, plan 15-06). `centroids`/`medoids` are row-major
+/// `n_clusters × n_features`. Monomorphised per dtype.
+fn fit_centers<F>(x: &[f64], n: usize, d: usize, mcs: usize) -> (Vec<i64>, Vec<f64>, Vec<f64>)
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + bytemuck::Pod,
+{
+    use mlrs_algos::cluster::hdbscan::StoreCenters;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_f: Vec<F> = x
+        .iter()
+        .map(|&v| match std::mem::size_of::<F>() {
+            4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+            8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+            _ => unreachable!("f32/f64 only"),
+        })
+        .collect();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_f);
+
+    let fitted = Hdbscan::<F>::builder()
+        .min_cluster_size(mcs)
+        .metric(Metric::Euclidean)
+        .store_centers(Some(StoreCenters::Both))
+        .build::<F>()
+        .expect("build euclidean store_centers")
+        .fit(&mut pool, &x_dev, None, (n, d))
+        .expect("euclidean fit");
+
+    let labels: Vec<i64> = fitted.labels(&pool).iter().map(|&l| l as i64).collect();
+    let to_f64 = |v: &[F]| -> Vec<f64> {
+        v.iter()
+            .map(|&x| match std::mem::size_of::<F>() {
+                4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&x)) as f64,
+                8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&x)),
+                _ => unreachable!("f32/f64 only"),
+            })
+            .collect()
+    };
+    let centroids = to_f64(&fitted.centroids(&pool).expect("store_centers='both' produces centroids"));
+    let medoids = to_f64(&fitted.medoids(&pool).expect("store_centers='both' produces medoids"));
+    (labels, centroids, medoids)
+}
+
+fn run_centers<F>(case: &OracleCase, tol: &Tolerance, label: &str)
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + bytemuck::Pod,
+{
     let sklearn = labels_i64(case, "labels");
     let centroids_ref = case.expect_f64("centroids");
     let medoids_ref = case.expect_f64("medoids");
     let n_features = 4usize; // euclidean fixture geometry (HDB_BLOB_N_FEATURES).
     let n_clusters = centroids_ref.len() / n_features;
 
-    // 15-NN: replace `got_labels`/`got_centroids`/`got_medoids` with the fitted
-    // mlrs labels + `centroids_`/`medoids_`. The Wave-0 placeholder maps the oracle
-    // onto itself (identity permutation) so the `best_mapping` + per-cluster
-    // `assert_close` plumbing (Pitfall 6) is exercised.
-    let got_labels = sklearn.clone();
-    let got_centroids = centroids_ref.to_vec();
-    let got_medoids = medoids_ref.to_vec();
+    // Fit the real estimator with store_centers='both' (HDBS-04). Compare the
+    // fitted centroids_/medoids_ to sklearn under the SAME label permutation
+    // (Pitfall 6): `best_mapping` maps each fitted cluster id to its sklearn id via
+    // the label confusion, then per-cluster `assert_close` checks the centre rows.
+    let n = sklearn.len();
+    let x: Vec<f64> = case.expect_f64("X").to_vec();
+    let (got_labels, got_centroids, got_medoids) =
+        fit_centers::<F>(&x, n, n_features, HDB_BLOB_MCS);
 
     let mapping = best_mapping(&got_labels, &sklearn);
     for fitted_c in 0..n_clusters {
@@ -661,6 +709,42 @@ fn run_centers(case: &OracleCase, tol: &Tolerance, label: &str) {
         let me = &medoids_ref[ref_c * n_features..(ref_c + 1) * n_features];
         assert_close(mg, me, tol, &format!("{label} medoid[{fitted_c}->{ref_c}]"));
     }
+}
+
+/// HDBS-04 / T-15-06-V5: `store_centers` is FEATURE-ARRAY ONLY — requesting it with
+/// `Metric::Precomputed` is a typed error (there are no feature rows to average),
+/// matching sklearn. The fit must reject BEFORE producing garbage centers.
+#[test]
+fn store_centers_precomputed_errors() {
+    use mlrs_algos::cluster::hdbscan::StoreCenters;
+    use mlrs_algos::error::AlgoError;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // A small symmetric square distance matrix (precomputed path).
+    let n = 4usize;
+    let d: Vec<f64> = vec![
+        0.0, 1.0, 5.0, 9.0, //
+        1.0, 0.0, 2.0, 6.0, //
+        5.0, 2.0, 0.0, 3.0, //
+        9.0, 6.0, 3.0, 0.0, //
+    ];
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &d);
+
+    let err = Hdbscan::<f64>::builder()
+        .min_cluster_size(2)
+        .metric(Metric::Precomputed)
+        .store_centers(Some(StoreCenters::Both))
+        .build::<f64>()
+        .expect("build precomputed store_centers")
+        .fit(&mut pool, &x_dev, None, (n, n))
+        .err();
+
+    assert!(
+        matches!(err, Some(AlgoError::Unsupported { estimator: "hdbscan", .. })),
+        "store_centers with Metric::Precomputed must be AlgoError::Unsupported, got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
