@@ -37,6 +37,8 @@
 //! Tests live in `crates/mlrs-algos/tests/incremental_pca_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -47,8 +49,8 @@ use mlrs_backend::prims::incremental_svd::{merge, IncrementalSvdState};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, PartialFit, Transform};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{Fit, Fitted, PartialFit, Transform, Unfit};
 
 /// Whiten-scale floor: `1/sqrt(explained_variance_)` is guarded against a
 /// (near-)zero variance so a degenerate component never produces a non-finite
@@ -60,11 +62,21 @@ const WHITEN_VAR_FLOOR: f64 = 1e-12;
 /// Streaming principal component analysis (DECOMP-03), fitted by merging batches
 /// through the PRIM-07 incremental-SVD merge.
 ///
-/// Construct with [`IncrementalPCA::new`] (`n_components`, `whiten`,
-/// `batch_size`), then either stream batches with [`PartialFit::partial_fit`] or
-/// fit the whole matrix in one call with [`Fit::fit`] (which loops `partial_fit`
-/// over `gen_batches`). Fitted attributes are exposed via the host accessors.
-pub struct IncrementalPCA<F> {
+/// Construct with the zero-arg [`IncrementalPCA::new`] (sklearn-style defaults
+/// `n_components = 2`, `whiten = false`, `batch_size = None`) or
+/// [`IncrementalPCA::builder`] (`.n_components(usize).whiten(bool).
+/// batch_size(Option<usize>)`), then either stream batches with the consuming
+/// [`PartialFit::partial_fit`] or fit the whole matrix in one call with the
+/// consuming [`Fit::fit`] (which loops `partial_fit` over `gen_batches`). Fitted
+/// attributes are exposed via the host accessors, which exist ONLY on
+/// `IncrementalPCA<F, Fitted>` (the compile-time typestate replaces the old
+/// runtime `NotFitted` guard, D-03).
+///
+/// `PartialFit` is implemented on BOTH lifecycle states — the `Unfit` first batch
+/// (`Unfit → Fitted`) AND the `Fitted` subsequent batches (`Fitted → Fitted`) — so
+/// a stream of `partial_fit` calls accumulates running state across batches
+/// (Pitfall 5 — a naive single-`Unfit` impl breaks multi-batch streaming).
+pub struct IncrementalPCA<F, S = Unfit> {
     /// Number of components to keep (`1 ..= min(n_samples_seen, n_features)`).
     n_components: usize,
     /// Whether to whiten the transform output (scale by `1/sqrt(ev_)`, D-06).
@@ -78,39 +90,135 @@ pub struct IncrementalPCA<F> {
     n_features: usize,
     /// Phantom: the estimator is generic over the upload/compute precision `F`,
     /// even though the running statistics are kept in `f64`.
-    _marker: std::marker::PhantomData<F>,
+    _marker: PhantomData<F>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> IncrementalPCA<F>
+impl<F> IncrementalPCA<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `IncrementalPCA`.
-    ///
-    /// - `n_components` — number of principal components to retain
-    ///   (`1 ..= min(n_samples, n_features)`; validated at fit).
-    /// - `whiten` — if `true`, scale the transform output so each component has
-    ///   unit variance (D-06).
-    /// - `batch_size` — explicit `partial_fit` batch size used by [`Fit::fit`];
-    ///   `None` defaults to `5 · n_features` at fit time (D-03/D-09).
-    pub fn new(n_components: usize, whiten: bool, batch_size: Option<usize>) -> Self {
+    /// Create an unfitted `IncrementalPCA` with the sklearn-style defaults
+    /// (`n_components = 2`, `whiten = false`, `batch_size = None`) directly in the
+    /// `Unfit` state. This is the SINGLE source of truth for the default
+    /// hyperparameters (D-08): the builder `Default` re-derives from here via
+    /// [`IncrementalPCA::into_builder`]. `n_components` is validated against the
+    /// data shape at `fit` (a data-DEPENDENT bound), so
+    /// [`IncrementalPcaBuilder::build`] is infallible.
+    pub fn new() -> Self {
         Self {
-            n_components,
-            whiten,
-            batch_size,
+            n_components: 2,
+            whiten: false,
+            batch_size: None,
             state: None,
             n_features: 0,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
+            _state: PhantomData,
         }
     }
 
-    /// Total samples merged so far (`n_samples_seen_`), accumulated across
-    /// `partial_fit` calls (D-03). `0` before the first batch.
-    pub fn n_samples_seen(&self) -> usize {
-        self.state.as_ref().map(|s| s.n_samples_seen_).unwrap_or(0)
+    /// Start building an `IncrementalPCA` from the sklearn defaults (D-08 single
+    /// source).
+    pub fn builder() -> IncrementalPcaBuilder {
+        IncrementalPcaBuilder::default()
     }
 
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`IncrementalPcaBuilder::default`] to re-derive the
+    /// defaults from [`IncrementalPCA::new`] (D-08).
+    pub fn into_builder(self) -> IncrementalPcaBuilder {
+        IncrementalPcaBuilder {
+            n_components: self.n_components,
+            whiten: self.whiten,
+            batch_size: self.batch_size,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the running
+    /// `state` is excluded — `None` in any `Unfit` value). Used by the
+    /// defaults-equality test (BLDR-01).
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        self.n_components == other.n_components
+            && self.whiten == other.whiten
+            && self.batch_size == other.batch_size
+    }
+}
+
+impl<F> Default for IncrementalPCA<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`IncrementalPCA`] (D-01). `Default` re-derives the sklearn
+/// defaults from [`IncrementalPCA::new`] (D-08 single source) rather than holding
+/// literals (Pitfall 1).
+#[derive(Debug, Clone, Copy)]
+pub struct IncrementalPcaBuilder {
+    n_components: usize,
+    whiten: bool,
+    batch_size: Option<usize>,
+}
+
+impl Default for IncrementalPcaBuilder {
+    /// Re-derive the sklearn defaults from [`IncrementalPCA::new`] (D-08).
+    fn default() -> Self {
+        IncrementalPCA::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl IncrementalPcaBuilder {
+    /// Set the number of components to keep (`1 ..= min(n_samples, n_features)`;
+    /// validated against the data shape at `fit`).
+    pub fn n_components(mut self, v: usize) -> Self {
+        self.n_components = v;
+        self
+    }
+
+    /// Set whether to whiten the transform output (scale by `1/sqrt(ev_)`, D-06).
+    pub fn whiten(mut self, v: bool) -> Self {
+        self.whiten = v;
+        self
+    }
+
+    /// Set the explicit `partial_fit` batch size used by [`Fit::fit`] (`None`
+    /// defaults to `5 · n_features` at fit time, D-03/D-09).
+    pub fn batch_size(mut self, v: Option<usize>) -> Self {
+        self.batch_size = v;
+        self
+    }
+
+    /// Build the (unfit) estimator. The `n_components` bound (data-DEPENDENT) and
+    /// the `batch_size >= 1` check both stay in [`Fit::fit`] (they depend on the
+    /// data shape / the `Some(bs)` form), so this `build()` is infallible-but-typed
+    /// (`Result<_, BuildError>` that never errs), kept for family uniformity so the
+    /// PyO3 `build_err_to_py` mapper stays shape-identical.
+    pub fn build<F>(self) -> Result<IncrementalPCA<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        Ok(IncrementalPCA {
+            n_components: self.n_components,
+            whiten: self.whiten,
+            batch_size: self.batch_size,
+            state: None,
+            n_features: 0,
+            _marker: PhantomData,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F, S> IncrementalPCA<F, S>
+where
+    F: Float + CubeElement + Pod,
+{
     /// The configured `n_components` hyperparameter (sklearn `__init__` arg).
+    /// Available in any state (read by the PyO3 re-fit path from a fitted arm).
     pub fn n_components(&self) -> usize {
         self.n_components
     }
@@ -126,55 +234,10 @@ where
         self.batch_size
     }
 
-    /// Host copy of `components_` (`n_components × n_features`, row-major), in the
-    /// estimator precision `F`.
-    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        let s = self.fitted("components_")?;
-        let comp64 = s.components_.to_host(pool);
-        Ok(comp64.iter().map(|&v| f64_to_host::<F>(v)).collect())
-    }
-
-    /// Host copy of `explained_variance_` (length `n_components`), `S²/(n−1)`.
-    pub fn explained_variance(&self, _pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        let s = self.fitted("explained_variance_")?;
-        Ok(s.explained_variance_.iter().map(|&v| f64_to_host::<F>(v)).collect())
-    }
-
-    /// Host copy of `explained_variance_ratio_` (length `n_components`); the
-    /// denominator is `sum(col_var)·n_total` (Pitfall 6).
-    pub fn explained_variance_ratio(
-        &self,
-        _pool: &BufferPool<ActiveRuntime>,
-    ) -> Result<Vec<F>, AlgoError> {
-        let s = self.fitted("explained_variance_ratio_")?;
-        Ok(s.explained_variance_ratio_.iter().map(|&v| f64_to_host::<F>(v)).collect())
-    }
-
-    /// Host copy of `singular_values_` (length `n_components`).
-    pub fn singular_values(&self, _pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        let s = self.fitted("singular_values_")?;
-        Ok(s.singular_values_.iter().map(|&v| f64_to_host::<F>(v)).collect())
-    }
-
-    /// Host copy of `mean_` (length `n_features`), the running per-feature mean.
-    pub fn mean(&self, _pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        let s = self.fitted("mean_")?;
-        Ok(s.mean_.iter().map(|&v| f64_to_host::<F>(v)).collect())
-    }
-
-    /// Host copy of `var_` (length `n_features`), the running per-feature
-    /// population variance (ddof=0, matches sklearn's `var_`).
-    pub fn var(&self, _pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        let s = self.fitted("var_")?;
-        Ok(s.var_.iter().map(|&v| f64_to_host::<F>(v)).collect())
-    }
-
-    /// Borrow the fitted running state or return [`AlgoError::NotFitted`].
-    fn fitted(&self, operation: &'static str) -> Result<&IncrementalSvdState, AlgoError> {
-        self.state.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "incremental_pca",
-            operation,
-        })
+    /// Total samples merged so far (`n_samples_seen_`), accumulated across
+    /// `partial_fit` calls (D-03). `0` before the first batch.
+    pub fn n_samples_seen(&self) -> usize {
+        self.state.as_ref().map(|s| s.n_samples_seen_).unwrap_or(0)
     }
 
     /// Validate a single batch's hyperparameters/geometry BEFORE any merge
@@ -215,44 +278,143 @@ where
         }
         Ok(())
     }
-}
 
-impl<F> PartialFit<F> for IncrementalPCA<F>
-where
-    F: Float + CubeElement + Pod,
-{
-    fn partial_fit(
-        &mut self,
+    /// Merge a single validated batch into the running `state`, CONSUMING `self`
+    /// and returning the next `Fitted`-tagged value. Shared by the `Unfit` and
+    /// `Fitted` `PartialFit` impls (Pitfall 5) so the merge compute stays in one
+    /// place. The `merge` call is BYTE-IDENTICAL to the pre-retrofit body — only
+    /// `self.state.take()` becomes the owned `self.state` move (consuming `self`).
+    fn merge_batch(
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
-        _y: Option<&DeviceArray<ActiveRuntime, F>>,
-        shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
-        let (b, p) = shape;
+        b: usize,
+        p: usize,
+    ) -> Result<IncrementalPCA<F, Fitted>, AlgoError> {
         self.validate_batch(b, p, x.len())?;
 
         // Merge this batch into the running state (PRIM-07 incremental_svd). The
         // merge owns the Chan-Golub-LeVeque running mean/var update, the
         // stacked-matrix branch (first vs subsequent), the SVD-cap validation,
         // `align_rows`, and the ddof=1 / ratio finalize — we consume it (D-01).
-        let new_state = merge::<F>(pool, self.state.take(), x, (b, p), self.n_components)?;
-        self.n_features = new_state.n_features;
-        self.state = Some(new_state);
-        Ok(self)
+        let new_state = merge::<F>(pool, self.state, x, (b, p), self.n_components)?;
+        let n_features = new_state.n_features;
+        Ok(IncrementalPCA {
+            n_components: self.n_components,
+            whiten: self.whiten,
+            batch_size: self.batch_size,
+            state: Some(new_state),
+            n_features,
+            _marker: PhantomData,
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Fit<F> for IncrementalPCA<F>
+impl<F> IncrementalPCA<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
-    fn fit(
-        &mut self,
+    /// Host copy of `components_` (`n_components × n_features`, row-major), in the
+    /// estimator precision `F`. `Some` by construction on the `Fitted` state (D-03).
+    pub fn components(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        let s = self.fitted_state();
+        let comp64 = s.components_.to_host(pool);
+        comp64.iter().map(|&v| f64_to_host::<F>(v)).collect()
+    }
+
+    /// Host copy of `explained_variance_` (length `n_components`), `S²/(n−1)`.
+    pub fn explained_variance(&self, _pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        let s = self.fitted_state();
+        s.explained_variance_.iter().map(|&v| f64_to_host::<F>(v)).collect()
+    }
+
+    /// Host copy of `explained_variance_ratio_` (length `n_components`); the
+    /// denominator is `sum(col_var)·n_total` (Pitfall 6).
+    pub fn explained_variance_ratio(&self, _pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        let s = self.fitted_state();
+        s.explained_variance_ratio_.iter().map(|&v| f64_to_host::<F>(v)).collect()
+    }
+
+    /// Host copy of `singular_values_` (length `n_components`).
+    pub fn singular_values(&self, _pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        let s = self.fitted_state();
+        s.singular_values_.iter().map(|&v| f64_to_host::<F>(v)).collect()
+    }
+
+    /// Host copy of `mean_` (length `n_features`), the running per-feature mean.
+    pub fn mean(&self, _pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        let s = self.fitted_state();
+        s.mean_.iter().map(|&v| f64_to_host::<F>(v)).collect()
+    }
+
+    /// Host copy of `var_` (length `n_features`), the running per-feature
+    /// population variance (ddof=0, matches sklearn's `var_`).
+    pub fn var(&self, _pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        let s = self.fitted_state();
+        s.var_.iter().map(|&v| f64_to_host::<F>(v)).collect()
+    }
+
+    /// Borrow the running state — `Some` by construction on `Fitted` (D-03).
+    fn fitted_state(&self) -> &IncrementalSvdState {
+        self.state
+            .as_ref()
+            .expect("state is Some by construction on IncrementalPCA<F, Fitted>")
+    }
+}
+
+impl<F> PartialFit<F> for IncrementalPCA<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    // First batch: `Unfit → Fitted` (Pitfall 5).
+    type Fitted = IncrementalPCA<F, Fitted>;
+
+    fn partial_fit(
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<IncrementalPCA<F, Fitted>, AlgoError> {
+        let (b, p) = shape;
+        self.merge_batch(pool, x, b, p)
+    }
+}
+
+impl<F> PartialFit<F> for IncrementalPCA<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    // Subsequent batches: `Fitted → Fitted` (Pitfall 5) — the running `state`
+    // accumulates across the stream.
+    type Fitted = Self;
+
+    fn partial_fit(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        _y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<Self, AlgoError> {
+        let (b, p) = shape;
+        self.merge_batch(pool, x, b, p)
+    }
+}
+
+impl<F> Fit<F> for IncrementalPCA<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = IncrementalPCA<F, Fitted>;
+
+    fn fit(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        _y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<IncrementalPCA<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
         // --- ASVS V5 (T-07-09): reject a malformed geometry + an out-of-range
@@ -304,27 +466,53 @@ where
             });
         }
 
-        // --- sklearn-faithful fit (D-02): RESET all fitted state, then loop
-        //     partial_fit over gen_batches(n_samples, batch_size). The whole
-        //     matrix is already on-device; slice each batch on the host and
-        //     re-upload (the batches are tiny — the SVD merge is the cost). ---
-        self.state = None;
-        self.n_features = 0;
-
+        // --- sklearn-faithful fit (D-02): a fresh `Unfit` carries no running
+        //     state (the old `self.state = None; self.n_features = 0` reset is a
+        //     no-op now that `fit` consumes a freshly-built `Unfit` value — D-05).
+        //     Loop partial_fit over gen_batches(n_samples, batch_size), threading
+        //     the running state through the typestate transition: the FIRST batch
+        //     consumes the `Unfit` self (`Unfit → Fitted`), every SUBSEQUENT batch
+        //     consumes the `Fitted` value (`Fitted → Fitted`), accumulating the
+        //     merge — exactly the multi-transition stream the explicit `partial_fit`
+        //     callers drive (Pitfall 5). The whole matrix is already on-device;
+        //     slice each batch on the host and re-upload (the batches are tiny —
+        //     the SVD merge is the cost). ---
         let x_host = x.to_host(pool);
-        for (start, end) in gen_batches(n_samples, batch_size, self.n_components) {
-            let b = end - start;
-            let batch_host: Vec<F> = x_host[start * n_features..end * n_features].to_vec();
-            let batch_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &batch_host);
-            let res = self.partial_fit(pool, &batch_dev, None, (b, n_features));
+        let batches = gen_batches(n_samples, batch_size, self.n_components);
+
+        let mut iter = batches.into_iter();
+        // n_samples >= 1 and batch_size >= 1 guarantee gen_batches yields >= 1
+        // range (it always appends the trailing `start..n`), so the first batch
+        // always exists; the `ok_or` is a defensive guard, never reached.
+        let (start0, end0) = iter.next().ok_or(AlgoError::NotFitted {
+            estimator: "incremental_pca",
+            operation: "fit (no batches)",
+        })?;
+        let upload_batch =
+            |pool: &mut BufferPool<ActiveRuntime>, start: usize, end: usize| -> (DeviceArray<ActiveRuntime, F>, usize) {
+                let b = end - start;
+                let batch_host: Vec<F> = x_host[start * n_features..end * n_features].to_vec();
+                (DeviceArray::from_host(pool, &batch_host), b)
+            };
+
+        // FIRST batch: Unfit → Fitted.
+        let (batch_dev, b0) = upload_batch(pool, start0, end0);
+        let res = self.merge_batch(pool, &batch_dev, b0, n_features);
+        batch_dev.release_into(pool);
+        let mut fitted = res?;
+
+        // SUBSEQUENT batches: Fitted → Fitted.
+        for (start, end) in iter {
+            let (batch_dev, b) = upload_batch(pool, start, end);
+            let res = fitted.merge_batch(pool, &batch_dev, b, n_features);
             batch_dev.release_into(pool);
-            res?;
+            fitted = res?;
         }
-        Ok(self)
+        Ok(fitted)
     }
 }
 
-impl<F> Transform<F> for IncrementalPCA<F>
+impl<F> Transform<F> for IncrementalPCA<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -335,7 +523,7 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_samples, n_features) = shape;
-        let s = self.fitted("transform")?;
+        let s = self.fitted_state();
         if n_features != self.n_features || x.len() != n_samples * n_features {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "x",
@@ -397,7 +585,7 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_samples, n_components) = shape;
-        let s = self.fitted("inverse_transform")?;
+        let s = self.fitted_state();
         if n_components != s.n_components || z.len() != n_samples * n_components {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "z",
@@ -455,7 +643,7 @@ where
     }
 }
 
-impl<F> IncrementalPCA<F>
+impl<F> IncrementalPCA<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {

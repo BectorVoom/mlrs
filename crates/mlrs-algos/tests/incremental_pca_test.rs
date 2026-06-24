@@ -26,7 +26,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::decomposition::IncrementalPCA;
-use mlrs_algos::traits::{Fit, PartialFit, Transform};
+use mlrs_algos::typestate::{Fit, Fitted, PartialFit, Transform};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -147,7 +147,7 @@ struct IpcaFit {
 /// Promote a fitted `IncrementalPCA<F>` plus `transform(X)` /
 /// `inverse_transform(transform(X))` to host f64 attributes.
 fn collect_fit<F>(
-    pca: &IncrementalPCA<F>,
+    pca: &IncrementalPCA<F, Fitted>,
     pool: &mut BufferPool<ActiveRuntime>,
     x_dev: &DeviceArray<ActiveRuntime, F>,
     n_samples: usize,
@@ -159,13 +159,12 @@ where
 {
     let promote = |v: Vec<F>| v.iter().map(|&x| host_to_f64(x)).collect::<Vec<f64>>();
 
-    let components = promote(pca.components(pool).expect("components_ after fit"));
-    let explained_variance = promote(pca.explained_variance(pool).expect("explained_variance_"));
-    let explained_variance_ratio =
-        promote(pca.explained_variance_ratio(pool).expect("explained_variance_ratio_"));
-    let singular_values = promote(pca.singular_values(pool).expect("singular_values_"));
-    let mean = promote(pca.mean(pool).expect("mean_"));
-    let var = promote(pca.var(pool).expect("var_"));
+    let components = promote(pca.components(pool));
+    let explained_variance = promote(pca.explained_variance(pool));
+    let explained_variance_ratio = promote(pca.explained_variance_ratio(pool));
+    let singular_values = promote(pca.singular_values(pool));
+    let mean = promote(pca.mean(pool));
+    let var = promote(pca.var(pool));
     let n_samples_seen = pca.n_samples_seen();
 
     let z = pca
@@ -206,21 +205,39 @@ where
     let x_host: Vec<F> = x_f64.iter().map(|&v| f64_to::<F>(v)).collect();
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut pca = IncrementalPCA::<F>::new(IPCA_N_COMPONENTS, whiten, Some(IPCA_BATCH_SIZE));
+    let unfit = IncrementalPCA::<F>::builder()
+        .n_components(IPCA_N_COMPONENTS)
+        .whiten(whiten)
+        .batch_size(Some(IPCA_BATCH_SIZE))
+        .build::<F>()
+        .expect("IncrementalPcaBuilder::build is infallible");
 
     // Naive equal chunking (== sklearn gen_batches ONLY when
     // IPCA_N % IPCA_BATCH_SIZE == 0, which holds here: 30 % 10 == 0). For a
     // non-divisible geometry this would emit a SHORT trailing batch, whereas
     // the real gen_batches(min_batch=n_components) FOLDS the remainder into the
     // prior batch — a different stream and a different merged state (WR-04).
-    let mut start = 0usize;
+    //
+    // The consuming-self typestate `partial_fit` (Pitfall 5): the FIRST batch
+    // consumes the `Unfit` value (`Unfit → Fitted`); every SUBSEQUENT batch
+    // consumes the `Fitted` value (`Fitted → Fitted`), accumulating the stream.
+    let first_b = IPCA_BATCH_SIZE.min(IPCA_N);
+    let first_host: Vec<F> = x_host[0..first_b * IPCA_P].to_vec();
+    let first_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &first_host);
+    let mut pca = unfit
+        .partial_fit(&mut pool, &first_dev, None, (first_b, IPCA_P))
+        .expect("partial_fit first batch (Unfit -> Fitted)");
+    first_dev.release_into(&mut pool);
+
+    let mut start = first_b;
     while start < IPCA_N {
         let b = IPCA_BATCH_SIZE.min(IPCA_N - start);
         let batch_host: Vec<F> = x_host[start * IPCA_P..(start + b) * IPCA_P].to_vec();
         let batch_dev: DeviceArray<ActiveRuntime, F> =
             DeviceArray::from_host(&mut pool, &batch_host);
-        pca.partial_fit(&mut pool, &batch_dev, None, (b, IPCA_P))
-            .expect("partial_fit batch");
+        pca = pca
+            .partial_fit(&mut pool, &batch_dev, None, (b, IPCA_P))
+            .expect("partial_fit batch (Fitted -> Fitted)");
         batch_dev.release_into(&mut pool);
         start += b;
     }
@@ -243,8 +260,13 @@ where
     let x_host: Vec<F> = x_f64.iter().map(|&v| f64_to::<F>(v)).collect();
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
 
-    let mut pca = IncrementalPCA::<F>::new(IPCA_N_COMPONENTS, whiten, Some(IPCA_BATCH_SIZE));
-    pca.fit(&mut pool, &x_dev, None, (IPCA_N, IPCA_P))
+    let pca = IncrementalPCA::<F>::builder()
+        .n_components(IPCA_N_COMPONENTS)
+        .whiten(whiten)
+        .batch_size(Some(IPCA_BATCH_SIZE))
+        .build::<F>()
+        .expect("IncrementalPcaBuilder::build is infallible")
+        .fit(&mut pool, &x_dev, None, (IPCA_N, IPCA_P))
         .expect("IncrementalPCA::fit on a valid shape");
 
     let fit = collect_fit(&pca, &mut pool, &x_dev, IPCA_N, IPCA_P, IPCA_N_COMPONENTS);
@@ -305,6 +327,24 @@ fn assert_transforms(fit: &IpcaFit, case: &OracleCase, tol: &Tolerance, label: &
         case.expect_f64("inverse_transform"),
         tol,
         &format!("{label} inverse_transform"),
+    );
+}
+
+// ===========================================================================
+// defaults-equality (BLDR-01)
+// ===========================================================================
+
+/// BLDR-01: the zero-arg `new()` defaults equal the builder's `build()` defaults
+/// (`IncrementalPCA::new().hyperparams_eq(&IncrementalPCA::builder().build()?)`).
+#[test]
+fn incremental_pca_defaults_equal() {
+    let from_new = IncrementalPCA::<f64>::new();
+    let from_builder = IncrementalPCA::<f64>::builder()
+        .build::<f64>()
+        .expect("IncrementalPcaBuilder::build is infallible");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "IncrementalPCA::new() defaults must equal builder().build() defaults"
     );
 }
 
@@ -439,20 +479,42 @@ fn incremental_pca_n_samples_seen_f64() {
 
     let client = runtime::active_client();
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
-    let mut pca = IncrementalPCA::<f64>::new(IPCA_N_COMPONENTS, false, Some(IPCA_BATCH_SIZE));
+    let unfit = IncrementalPCA::<f64>::builder()
+        .n_components(IPCA_N_COMPONENTS)
+        .whiten(false)
+        .batch_size(Some(IPCA_BATCH_SIZE))
+        .build::<f64>()
+        .expect("IncrementalPcaBuilder::build is infallible");
 
-    // Before any partial_fit, n_samples_seen_ == 0 (D-03).
-    assert_eq!(pca.n_samples_seen(), 0, "n_samples_seen_ starts at 0");
+    // Before any partial_fit, n_samples_seen_ == 0 on the Unfit value (D-03).
+    assert_eq!(unfit.n_samples_seen(), 0, "n_samples_seen_ starts at 0");
 
-    let mut start = 0usize;
-    let mut expected = 0usize;
+    // FIRST batch: Unfit -> Fitted (Pitfall 5).
+    let first_b = IPCA_BATCH_SIZE.min(IPCA_N);
+    let first_host: Vec<f64> = x_f64[0..first_b * IPCA_P].to_vec();
+    let first_dev: DeviceArray<ActiveRuntime, f64> =
+        DeviceArray::from_host(&mut pool, &first_host);
+    let mut pca = unfit
+        .partial_fit(&mut pool, &first_dev, None, (first_b, IPCA_P))
+        .expect("partial_fit first batch (Unfit -> Fitted)");
+    first_dev.release_into(&mut pool);
+    let mut expected = first_b;
+    assert_eq!(
+        pca.n_samples_seen(),
+        expected,
+        "n_samples_seen_ after the first batch"
+    );
+
+    // SUBSEQUENT batches: Fitted -> Fitted, accumulating n_samples_seen_.
+    let mut start = first_b;
     while start < IPCA_N {
         let b = IPCA_BATCH_SIZE.min(IPCA_N - start);
         let batch_host: Vec<f64> = x_f64[start * IPCA_P..(start + b) * IPCA_P].to_vec();
         let batch_dev: DeviceArray<ActiveRuntime, f64> =
             DeviceArray::from_host(&mut pool, &batch_host);
-        pca.partial_fit(&mut pool, &batch_dev, None, (b, IPCA_P))
-            .expect("partial_fit batch");
+        pca = pca
+            .partial_fit(&mut pool, &batch_dev, None, (b, IPCA_P))
+            .expect("partial_fit batch (Fitted -> Fitted)");
         batch_dev.release_into(&mut pool);
         expected += b;
         assert_eq!(
