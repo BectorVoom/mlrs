@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 
 use mlrs_core::compare::assert_slice_close;
-use mlrs_core::label_perm::{best_match_accuracy, best_mapping, is_perfect_match, remap};
+use mlrs_core::label_perm::{
+    best_match_accuracy, best_match_accuracy_pinned_noise, best_mapping, is_perfect_match, remap,
+};
 use mlrs_core::oracle::load_npz;
 use mlrs_core::sign_flip::{align_rows, align_sign, canonical_sign};
 use mlrs_core::F32_TOL;
@@ -100,6 +102,49 @@ fn three_cluster_permutation_matches() {
     let pred = [2, 0, 1, 2, 0, 1];
     let reference = [0, 1, 2, 0, 1, 2];
     assert!(is_perfect_match(&pred, &reference));
+}
+
+// --- label_perm: -1-pinned noise (HDBS-02) ----------------------------------
+
+#[test]
+fn pinned_noise_permutes_clusters_but_fixes_noise() {
+    // Cluster ids 0/1 are swapped (a valid relabeling); -1 stays -1.
+    let pred = [0, 0, 1, 1, -1];
+    let reference = [1, 1, 0, 0, -1];
+    assert_eq!(best_match_accuracy_pinned_noise(&pred, &reference), 1.0);
+}
+
+#[test]
+fn pinned_noise_counts_noise_vs_cluster_confusion_as_mismatch() {
+    // pred index 3 is -1 (noise) where reference says cluster 1 — a genuine
+    // confusion that must NOT be permuted away. Exactly one of five wrong.
+    let pred = [0, 0, 1, -1, -1];
+    let reference = [0, 0, 1, 1, -1];
+    let acc = best_match_accuracy_pinned_noise(&pred, &reference);
+    assert!(acc < 1.0, "noise/cluster confusion must score < 1.0, got {acc}");
+    assert!((acc - 0.8).abs() < 1e-12, "expected 4/5 correct, got {acc}");
+}
+
+#[test]
+fn pinned_noise_all_noise_matches() {
+    let pred = [-1, -1, -1];
+    let reference = [-1, -1, -1];
+    assert_eq!(best_match_accuracy_pinned_noise(&pred, &reference), 1.0);
+}
+
+#[test]
+fn pinned_noise_pure_permutation_no_noise_present() {
+    // No -1 anywhere: behaves like a plain permutation match.
+    let pred = [0, 1, 2];
+    let reference = [2, 0, 1];
+    assert_eq!(best_match_accuracy_pinned_noise(&pred, &reference), 1.0);
+}
+
+#[test]
+fn pinned_noise_empty_is_vacuous_match() {
+    let pred: [i64; 0] = [];
+    let reference: [i64; 0] = [];
+    assert_eq!(best_match_accuracy_pinned_noise(&pred, &reference), 1.0);
 }
 
 // --- oracle::load_npz -------------------------------------------------------
