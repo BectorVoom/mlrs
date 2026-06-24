@@ -26,7 +26,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::linear::ridge::Ridge;
-use mlrs_algos::traits::{Fit, Predict};
+use mlrs_algos::typestate::{Fit, Predict};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -111,17 +111,16 @@ where
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
     let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
 
-    let mut reg = Ridge::<F>::new(f64_to::<F>(alpha), true);
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let reg = Ridge::<F>::builder()
+        .alpha(alpha)
+        .fit_intercept(true)
+        .build::<F>()
+        .expect("Ridge builds with valid hyperparameters")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("Ridge::fit on a valid shape");
 
-    let coef = reg
-        .coef(&pool)
-        .expect("coef_ after fit")
-        .iter()
-        .map(|&v| host_to_f64(v))
-        .collect();
-    let intercept = host_to_f64(reg.intercept(&pool).expect("intercept_ after fit"));
+    let coef = reg.coef(&pool).iter().map(|&v| host_to_f64(v)).collect();
+    let intercept = host_to_f64(reg.intercept(&pool));
     (coef, intercept)
 }
 
@@ -273,8 +272,12 @@ fn ridge_predict_consistency_f32() {
     let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
     let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y_host);
 
-    let mut reg = Ridge::<f32>::new(1.0f32, true);
-    reg.fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+    let reg = Ridge::<f32>::builder()
+        .alpha(1.0)
+        .fit_intercept(true)
+        .build::<f32>()
+        .expect("Ridge builds")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
         .expect("Ridge::fit");
     let pred = reg
         .predict(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
@@ -282,8 +285,8 @@ fn ridge_predict_consistency_f32() {
     let pred_host: Vec<f64> = pred.to_host(&pool).iter().map(|&v| v as f64).collect();
 
     // Reference: X·coef_ + intercept_ from the materialized fitted state.
-    let coef: Vec<f64> = reg.coef(&pool).unwrap().iter().map(|&v| v as f64).collect();
-    let intercept = reg.intercept(&pool).unwrap() as f64;
+    let coef: Vec<f64> = reg.coef(&pool).iter().map(|&v| v as f64).collect();
+    let intercept = reg.intercept(&pool) as f64;
     let x64 = case.expect_f64("X");
     let mut reference = vec![0.0f64; N_SAMPLES];
     for r in 0..N_SAMPLES {
@@ -298,5 +301,20 @@ fn ridge_predict_consistency_f32() {
         &reference,
         &F32_TOL,
         "ridge predict==X·coef+b f32",
+    );
+}
+
+/// BLDR-01: `Ridge::new()` equals `Ridge::builder().build()?` on the
+/// hyperparameter subset (sklearn defaults: `alpha = 1.0`, `fit_intercept =
+/// true`). Pure host comparison — no device, so no f64 gate.
+#[test]
+fn defaults_equal() {
+    let from_new = Ridge::<f64>::new();
+    let from_builder = Ridge::<f64>::builder()
+        .build::<f64>()
+        .expect("default RidgeBuilder builds");
+    assert!(
+        from_new.hyperparams_eq(&from_builder),
+        "Ridge::new() and builder().build()? must agree on hyperparameters (BLDR-01)"
     );
 }

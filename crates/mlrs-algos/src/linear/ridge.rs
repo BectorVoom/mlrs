@@ -44,6 +44,8 @@
 //! Tests live in `crates/mlrs-algos/tests/ridge_test.rs` (AGENTS.md §2), never
 //! an in-source `#[cfg(test)] mod tests`.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
@@ -55,17 +57,20 @@ use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
-use crate::error::AlgoError;
-use crate::traits::{Fit, Predict};
+use crate::error::{AlgoError, BuildError};
+use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// L2-penalized least squares (LINEAR-02) fitted by the Cholesky
 /// normal-equations solver.
 ///
-/// Construct with [`Ridge::new`] (`alpha`, `fit_intercept`), then [`Fit::fit`]
-/// and [`Predict::predict`]. Fitted `coef_`/`intercept_` are device-resident
-/// (D-03); the host accessors [`coef`](Self::coef) / [`intercept`](Self::intercept)
-/// materialize them on demand.
-pub struct Ridge<F> {
+/// Construct with the zero-arg [`Ridge::new`] (sklearn defaults: `alpha = 1.0`,
+/// `fit_intercept = true`) or [`Ridge::builder`], then the consuming
+/// [`Fit::fit`] (returns the `Fitted`-tagged sibling) and [`Predict::predict`].
+/// Fitted `coef_`/`intercept_` are device-resident (D-03); the host accessors
+/// [`coef`](Ridge::coef) / [`intercept`](Ridge::intercept) materialize them on
+/// demand and exist ONLY on `Ridge<F, Fitted>` (the compile-time typestate
+/// replaces the old runtime `NotFitted` guard, D-03).
+pub struct Ridge<F, S = Unfit> {
     /// L2 penalty strength (`alpha ≥ 0`; `alpha = 0` degenerates to OLS).
     /// Added to the Gram diagonal only — never to the intercept (D-05).
     alpha: F,
@@ -76,82 +81,171 @@ pub struct Ridge<F> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (length 1), device-resident, `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Compile-time lifecycle marker (zero-sized).
+    _state: PhantomData<S>,
 }
 
-impl<F> Ridge<F>
+impl<F> Ridge<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Create an unfitted `Ridge` with penalty `alpha` and the `fit_intercept`
-    /// flag (D-06 minimal surface). `fit_intercept = true` centers `X` and `y`
-    /// and recovers a bias term (α never penalizes it, D-05); `false` solves on
-    /// the raw `X` and leaves `intercept_ = 0`. A negative `alpha` is rejected at
-    /// `fit` time with [`AlgoError::InvalidAlpha`] (T-04-05-03).
-    pub fn new(alpha: F, fit_intercept: bool) -> Self {
+    /// Construct an `Ridge` with sklearn's `Ridge` defaults (`alpha = 1.0`,
+    /// `fit_intercept = true`) directly in the `Unfit` state. This is the SINGLE
+    /// source of truth for the default hyperparameters (D-08): the builder
+    /// `Default` re-derives from here via [`Ridge::into_builder`], rather than
+    /// re-listing the literals. Defaults are trusted valid, so this bypasses
+    /// [`RidgeBuilder::build`]'s validation.
+    pub fn new() -> Self {
         Self {
-            alpha,
-            fit_intercept,
+            alpha: F::from_int(1),
+            fit_intercept: true,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
         }
     }
 
-    /// Host copy of the fitted `coef_` (length `n_features`). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Result<Vec<F>, AlgoError> {
-        self.coef_
-            .as_ref()
-            .map(|c| c.to_host(pool))
-            .ok_or(AlgoError::NotFitted {
-                estimator: "ridge",
-                operation: "coef_",
-            })
+    /// Start building a `Ridge` from sklearn's defaults (D-08 single source).
+    pub fn builder() -> RidgeBuilder {
+        RidgeBuilder::default()
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). Errors with
-    /// [`AlgoError::NotFitted`] before `fit`.
-    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> Result<F, AlgoError> {
-        self.intercept_
-            .as_ref()
-            .map(|i| i.to_host(pool)[0])
-            .ok_or(AlgoError::NotFitted {
-                estimator: "ridge",
-                operation: "intercept_",
-            })
+    /// Decompose this (unfit) estimator back into its builder, copying every
+    /// hyperparameter. Used by [`RidgeBuilder::default`] to re-derive the
+    /// defaults from [`Ridge::new`] (D-08), and available to callers who want to
+    /// tweak a constructed estimator before fitting.
+    pub fn into_builder(self) -> RidgeBuilder {
+        RidgeBuilder {
+            alpha: host_to_f64(self.alpha),
+            fit_intercept: self.fit_intercept,
+        }
+    }
+
+    /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
+    /// `coef_`/`intercept_` fields are excluded — both are `None` in any `Unfit`
+    /// value). Used by the defaults-equality test (BLDR-01):
+    /// `Ridge::new().hyperparams_eq(&Ridge::builder().build()?)`.
+    pub fn hyperparams_eq(&self, other: &Self) -> bool {
+        host_to_f64(self.alpha) == host_to_f64(other.alpha)
+            && self.fit_intercept == other.fit_intercept
     }
 }
 
-impl<F> Fit<F> for Ridge<F>
+impl<F> Default for Ridge<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Builder for [`Ridge`] (D-01). Setters are `f64`-typed per the A5 convention;
+/// `build::<F>()` narrows to the target float `F`. `Default` re-derives the
+/// sklearn defaults from [`Ridge::new`] (D-08 single source) rather than holding
+/// literals (Pitfall 1: default-drift breaks the oracle gate silently).
+#[derive(Debug, Clone, Copy)]
+pub struct RidgeBuilder {
+    alpha: f64,
+    fit_intercept: bool,
+}
+
+impl Default for RidgeBuilder {
+    /// Re-derive the sklearn defaults from [`Ridge::new`] (D-08 single source).
+    /// `f64` is pinned only to read the F-independent scalar defaults — the
+    /// builder is non-generic, so the choice of `F` here is irrelevant.
+    fn default() -> Self {
+        Ridge::<f64, Unfit>::new().into_builder()
+    }
+}
+
+impl RidgeBuilder {
+    /// Set the L2 penalty strength `alpha` (A5: `f64` setter).
+    pub fn alpha(mut self, v: f64) -> Self {
+        self.alpha = v;
+        self
+    }
+
+    /// Set whether to center `X`/`y` and recover a bias term.
+    pub fn fit_intercept(mut self, v: bool) -> Self {
+        self.fit_intercept = v;
+        self
+    }
+
+    /// Build the (unfit) estimator, validating the data-INDEPENDENT
+    /// hyperparameters BEFORE any data is seen (D-08; the data-DEPENDENT
+    /// geometry check lives in [`Fit::fit`]):
+    ///
+    /// - `alpha >= 0` ([`BuildError::InvalidAlpha`]) — a negative penalty makes
+    ///   `(XᵀX + αI)` indefinite and the Cholesky factorization undefined
+    ///   (relocated from the old fit-body check, T-04-05-03 / Pitfall 7).
+    ///
+    /// The stored `f64` `alpha` is narrowed to the target float `F` via cast
+    /// (A5).
+    pub fn build<F>(self) -> Result<Ridge<F, Unfit>, BuildError>
+    where
+        F: Float + CubeElement + Pod,
+    {
+        if !(self.alpha >= 0.0) {
+            return Err(BuildError::InvalidAlpha {
+                estimator: "ridge",
+                alpha: self.alpha,
+            });
+        }
+        Ok(Ridge {
+            alpha: f64_to_host::<F>(self.alpha),
+            fit_intercept: self.fit_intercept,
+            coef_: None,
+            intercept_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> Ridge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed
+    /// (the compile-time typestate replaces the runtime guard, D-03).
+    pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on Ridge<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
+    /// the `Fitted` state (D-03).
+    pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
+        self.intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on Ridge<F, Fitted>")
+            .to_host(pool)[0]
+    }
+}
+
+impl<F> Fit<F> for Ridge<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = Ridge<F, Fitted>;
+
     fn fit(
-        &mut self,
+        self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
-    ) -> Result<&mut Self, AlgoError> {
+    ) -> Result<Ridge<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
 
-        // --- T-04-05-03 / ASVS V5: validate the untrusted hyperparameter and
-        //     geometry BEFORE any prim launch. alpha < 0 makes (XᵀX + αI)
-        //     indefinite and the Cholesky factorization undefined. ---
+        // --- T-04-05-03 / ASVS V5: data-DEPENDENT geometry guard BEFORE any
+        //     prim launch (the data-INDEPENDENT `alpha >= 0` check was validated
+        //     at build() — Pitfall 7). ---
         let alpha64 = host_to_f64(self.alpha);
-        if alpha64 < 0.0 {
-            return Err(AlgoError::InvalidAlpha {
-                estimator: "ridge",
-                alpha: alpha64,
-            });
-        }
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "ridge",
             operation: "fit (requires y)",
@@ -304,13 +398,17 @@ where
         x_c_dev.release_into(pool);
         y_c_dev.release_into(pool);
 
-        self.coef_ = Some(coef);
-        self.intercept_ = Some(intercept_dev);
-        Ok(self)
+        Ok(Ridge {
+            alpha: self.alpha,
+            fit_intercept: self.fit_intercept,
+            coef_: Some(coef),
+            intercept_: Some(intercept_dev),
+            _state: PhantomData,
+        })
     }
 }
 
-impl<F> Predict<F> for Ridge<F>
+impl<F> Predict<F> for Ridge<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
@@ -322,14 +420,17 @@ where
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_samples, n_features) = shape;
 
-        let coef = self.coef_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "ridge",
-            operation: "predict",
-        })?;
-        let intercept = self.intercept_.as_ref().ok_or(AlgoError::NotFitted {
-            estimator: "ridge",
-            operation: "predict",
-        })?;
+        // `coef_`/`intercept_` are `Some` by construction on `Ridge<F, Fitted>`
+        // (the compile-time typestate replaces the old runtime `NotFitted`
+        // guard, D-03).
+        let coef = self
+            .coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on Ridge<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on Ridge<F, Fitted>");
 
         // --- T-04-05-03 / ASVS V5: geometry + fitted-n_features consistency. ---
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
