@@ -921,6 +921,328 @@ def gen_knn_metric(
 
 
 # ---------------------------------------------------------------------------
+# Phase-15 HDBSCAN oracle fixtures (HDBS-01..04, D-03/D-04/D-06/D-07). Per-metric
+# × per-dtype committed blobs dumping sklearn.cluster.HDBSCAN's OWN labels /
+# probabilities / centroids / medoids (the PRIMARY, zero-new-dep oracle) PLUS
+# hdbscan 0.8.44's labels / outlier_scores (the GLOSH oracle + cross-check, D-07).
+# All arrays are 4/8-byte floats (load_npz constraint, oracle.rs:115-135): labels
+# are stored float-valued and cast `as i64` in the Rust test; the metric + dtype
+# tag rides the FILENAME only (never an in-blob unicode string). Regenerate ONLY
+# in a /tmp venv with `numpy>=1.26 scikit-learn==1.9.0 hdbscan==0.8.44` (PEP-668);
+# the resulting blobs are committed, CI never runs this script.
+#
+# HDBS-02 D-04 exactness (Pitfall 1): the per-metric GATE fixtures spread points so
+# the MST edge weights are DISTINCT (the sort is tie-free → exactness holds under
+# any stable tie rule). A SEPARATE tie-heavy + duplicate-point fixture
+# (`hdbscan_tieheavy_*`) deliberately collides distances (grid + an exact duplicate
+# row, R-9) so the spike/back-end can characterise whether ties flip labels — the
+# D-04 TRUE GATE. Nested-density fixtures (`hdbscan_nested_*`, two sub-blobs inside
+# each of two super-clusters) make the non-default eom/leaf/ε/max_cluster_size/alpha
+# knobs DEMONSTRABLY diverge from defaults (Pitfall 5) — asserted in-script before
+# writing. Edge cases (`hdbscan_allnoise_*`, `hdbscan_single_*`, `hdbscan_tiny_*`)
+# pin the all-noise / single-cluster / n<min_cluster_size degenerate paths.
+# ---------------------------------------------------------------------------
+
+# HDBSCAN gate-fixture geometry. The per-metric blob design: 3 well-separated
+# blobs (so the partition is unambiguous up to permutation) + a per-row 1e-3
+# offset that makes every pairwise — hence every MST edge — weight DISTINCT
+# (Pitfall 1 option 2: tie-free sort → exact under any stable rule). A handful of
+# uniform-scatter noise points exercises the `-1` sentinel.
+HDB_BLOB_N_PER = 12
+HDB_BLOB_K = 3
+HDB_BLOB_N_FEATURES = 4
+HDB_BLOB_NOISE = 5
+HDB_MIN_CLUSTER_SIZE = 5
+HDB_MINKOWSKI_P = 3.0
+# Tie-heavy + duplicate-point design (R-9 / D-04 TRUE GATE): TWO well-separated
+# integer-lattice clusters (so the partition is real, not all-noise) whose
+# INTERNAL pairwise — hence MST — distances COLLIDE heavily (a unit grid yields
+# many equal 1 / √2 / 2 edges), plus one row that is an EXACT copy of another in
+# the same cluster (a genuine distance-0 duplicate). The MST tie handling must
+# reproduce the oracle partition on this adversarial design.
+HDB_TIE_DUP_A, HDB_TIE_DUP_B = 0, 7
+# Tie-heavy uses a smaller min_cluster_size: each lattice cluster has 9 points, so
+# mcs=3 lets both form while keeping the runt-fallout behaviour exercised.
+HDB_TIE_MCS = 3
+# Nested-density design (Pitfall 5 / D-09): two sub-blobs (gap 1.5) inside each of
+# two well-separated super-clusters (gap 30). eom MERGES each pair → 2 clusters;
+# leaf SPLITS → 4. min_cluster_size 20 sits between sub-blob (30) and the runts.
+HDB_NESTED_SUB_GAP = 1.5
+HDB_NESTED_SUPER_GAP = 30.0
+HDB_NESTED_SPREAD = 0.25
+HDB_NESTED_N_SUB = 30
+HDB_NESTED_MCS = 20
+
+
+def _hdbscan_blob_design(rng) -> np.ndarray:
+    """3 well-separated blobs + scatter noise, per-row offset → distinct MST edges."""
+    centers = np.array(
+        [[0.0, 0.0, 0.0, 0.0], [10.0, 10.0, 10.0, 10.0], [-10.0, 10.0, -10.0, 10.0]]
+    )[: HDB_BLOB_K]
+    x = np.vstack(
+        [
+            centers[c] + 0.35 * rng.standard_normal((HDB_BLOB_N_PER, HDB_BLOB_N_FEATURES))
+            for c in range(HDB_BLOB_K)
+        ]
+    )
+    # Per-row 1e-3 offset: pushes every pairwise distance apart so the MST sort is
+    # tie-free (Pitfall 1 option 2 — exactness holds under any stable tie rule).
+    x = x + np.arange(x.shape[0])[:, None] * 1e-3
+    noise = rng.uniform(low=-6.0, high=6.0, size=(HDB_BLOB_NOISE, HDB_BLOB_N_FEATURES))
+    return np.vstack([x, noise])
+
+
+def _hdbscan_tieheavy_design(rng) -> np.ndarray:
+    """Two integer-lattice clusters (tie-heavy MST) + one EXACT duplicate row (R-9).
+
+    Each cluster is a 3×3 unit grid → many INTERNAL pairwise distances are equal
+    (1, √2, 2, …), so the MST sort is deliberately TIE-HEAVY (the D-04 stress). The
+    two grids are well separated (gap 20) so a genuine 2-cluster partition forms
+    (not all-noise). No per-row offset — we WANT the collisions here.
+    """
+    ax, ay = np.meshgrid(np.arange(3.0), np.arange(3.0))
+    cluster_a = np.column_stack([ax.ravel(), ay.ravel()])  # 9 points around origin
+    cluster_b = cluster_a + np.array([20.0, 20.0])  # 9 points far away
+    x = np.vstack([cluster_a, cluster_b])  # 18 points
+    # R-9: make row B an EXACT copy of row A (both inside cluster A) — a genuine
+    # distance-0 duplicate. The MST/labelling must keep both in the same cluster,
+    # identically to the oracle.
+    x[HDB_TIE_DUP_B, :] = x[HDB_TIE_DUP_A, :]
+    return x
+
+
+def _hdbscan_nested_design(rng) -> np.ndarray:
+    """Two sub-blobs inside each of two super-clusters (eom merges, leaf splits)."""
+    pts = []
+    for super_c in ([0.0, 0.0], [HDB_NESTED_SUPER_GAP, HDB_NESTED_SUPER_GAP]):
+        for s in (0.0, HDB_NESTED_SUB_GAP):
+            c = np.array([super_c[0] + s, super_c[1]])
+            pts.append(c + HDB_NESTED_SPREAD * rng.standard_normal((HDB_NESTED_N_SUB, 2)))
+    x = np.vstack(pts)
+    # Tiny per-row offset → distinct MST edges so eom/leaf divergence is the only
+    # source of label difference (not tie flips).
+    return x + np.arange(x.shape[0])[:, None] * 1e-4
+
+
+def gen_hdbscan(
+    seed: int = SEED,
+    dtype=np.float32,
+    metric: str = "euclidean",
+    structure: str = "blobs",
+) -> str:
+    """Generate one HDBSCAN oracle fixture (HDBS-01..04, D-03/D-04/D-06/D-07).
+
+    Fits ``sklearn.cluster.HDBSCAN`` (PRIMARY oracle — ``copy=True`` pins the
+    sklearn-1.10 ``FutureWarning``) AND ``hdbscan.HDBSCAN`` 0.8.44 (for GLOSH
+    ``outlier_scores_`` and the labels cross-check, D-07) on a per-``structure``
+    design, then ``np.savez`` the float-cast arrays. ``metric`` is one of
+    ``{euclidean, manhattan, cosine, chebyshev, minkowski, precomputed}``; for
+    ``minkowski`` the sklearn ``metric_params={'p': HDB_MINKOWSKI_P}`` is passed;
+    for ``precomputed`` the design is converted to a square Euclidean distance
+    matrix via ``pairwise_distances`` and stored as ``X`` (sklearn refuses
+    ``store_centers`` with a precomputed matrix, so the centre arrays are empty
+    there).
+
+    ``structure`` is one of ``{blobs, tieheavy, nested, allnoise, single, tiny}``.
+    The ``blobs`` design (default) uses distinct-MST-edge-weight spreading
+    (Pitfall 1 option 2) so the labels gate is tie-free; ``tieheavy`` is the D-04
+    TRUE GATE (integer grid + an exact duplicate row, R-9); ``nested`` carries the
+    hierarchical density that makes the non-default knobs diverge (Pitfall 5).
+
+    Stores (all 4/8-byte float, ``c()``-cast — labels are float-valued, cast
+    ``as i64`` in the Rust test): ``X``; sklearn ``labels`` / ``probabilities`` /
+    ``centroids`` / ``medoids``; hdbscan-0.8.44 ``hdb_labels`` / ``outlier_scores``;
+    and for the ``nested`` structure the per-knob label vectors
+    ``labels_eom`` / ``labels_leaf`` / ``labels_maxcluster`` / ``labels_alpha``
+    (sklearn) and ``labels_epsilon`` (hdbscan 0.8.44 — sklearn 1.9.0's
+    ``epsilon_search`` crashes on any merging-epsilon tree, so the epsilon knob is
+    cross-oracled against the hdbscan library per D-07). The metric + dtype tag
+    rides the FILENAME ONLY.
+
+    Returns the path written. Filename: ``hdbscan_{tag}_{dtype}_seed{seed}.npz``
+    where ``tag`` is the ``metric`` for the per-metric gate or the ``structure``
+    name for the metric-agnostic specials.
+    """
+    from sklearn.cluster import HDBSCAN as SkHDBSCAN
+    from sklearn.metrics import pairwise_distances
+
+    import hdbscan as hdb  # /tmp venv, pinned 0.8.44 — GLOSH + cross-check oracle.
+
+    rng = np.random.default_rng(seed)
+    if structure == "blobs":
+        x_design = _hdbscan_blob_design(rng)
+    elif structure == "tieheavy":
+        x_design = _hdbscan_tieheavy_design(rng)
+    elif structure == "nested":
+        x_design = _hdbscan_nested_design(rng)
+    elif structure == "allnoise":
+        # Pure uniform scatter, no density structure → every point is noise (-1).
+        x_design = rng.uniform(low=-20.0, high=20.0, size=(20, 3))
+    elif structure == "single":
+        # One tight homogeneous blob. A single Gaussian has NO density split, so
+        # eom would reject the root (all-noise) UNLESS allow_single_cluster=True
+        # (set below) — which makes the whole blob the one selected cluster.
+        x_design = np.array([2.0, -1.0, 3.0]) + 0.4 * rng.standard_normal((40, 3))
+        x_design = x_design + np.arange(x_design.shape[0])[:, None] * 1e-3
+    elif structure == "tiny":
+        # n < min_cluster_size → sklearn yields all-noise (no cluster can form).
+        x_design = rng.standard_normal((HDB_MIN_CLUSTER_SIZE - 2, 3))
+    else:
+        raise ValueError(f"unknown hdbscan structure {structure!r}")
+
+    # The per-structure min_cluster_size: nested needs the larger mcs that sits
+    # between the sub-blob size and the runt threshold for eom/leaf to diverge;
+    # tieheavy uses the smaller lattice-cluster mcs so both 9-point grids form.
+    if structure == "nested":
+        mcs = HDB_NESTED_MCS
+    elif structure == "tieheavy":
+        mcs = HDB_TIE_MCS
+    else:
+        mcs = HDB_MIN_CLUSTER_SIZE
+
+    # precomputed (D-02): square Euclidean distance matrix; sklearn refuses
+    # store_centers on it, so centres come out empty.
+    is_precomputed = metric == "precomputed"
+    if is_precomputed:
+        x_in = pairwise_distances(x_design, metric="euclidean")
+        sk_metric = "precomputed"
+        store = None
+    else:
+        x_in = x_design
+        sk_metric = metric
+        store = "both"
+
+    sk_kw = dict(
+        min_cluster_size=mcs,
+        metric=sk_metric,
+        cluster_selection_method="eom",
+        copy=True,  # pin the sklearn-1.10 FutureWarning (copy default flips False→True).
+    )
+    # The `tiny` edge case has n < min_cluster_size; min_samples defaults to
+    # min_cluster_size and would exceed n. Pin min_samples=1 so sklearn (and
+    # hdbscan) run and yield the expected all-noise labelling instead of erroring.
+    if structure == "tiny":
+        sk_kw["min_samples"] = 1
+    # The `single` edge case: a homogeneous blob needs allow_single_cluster=True
+    # for eom to select the (split-free) root as the one cluster (else all-noise),
+    # plus a small min_samples so the blob's body is dense-reachable (the default
+    # min_samples=min_cluster_size over-flags a loose single blob as noise).
+    if structure == "single":
+        sk_kw["allow_single_cluster"] = True
+        sk_kw["min_samples"] = 2
+    if store is not None:
+        sk_kw["store_centers"] = store
+    if metric == "minkowski":
+        sk_kw["metric_params"] = {"p": HDB_MINKOWSKI_P}
+    h = SkHDBSCAN(**sk_kw).fit(x_in)
+
+    centroids = getattr(h, "centroids_", None)
+    medoids = getattr(h, "medoids_", None)
+    if centroids is None:
+        centroids = np.empty((0, 0))
+    if medoids is None:
+        medoids = np.empty((0, 0))
+
+    # hdbscan 0.8.44 cross-check + GLOSH outlier_scores (D-07). Force
+    # ``algorithm='generic'``: the default ``'best'`` routes to a BallTree that
+    # rejects ``cosine`` (and is an APPROXIMATION for the others); ``'generic'``
+    # is the exact brute-force path supporting every metric uniformly, matching
+    # sklearn's dense ``algorithm='brute'``/'auto' computation (D-07 cross-check).
+    hdb_kw = dict(
+        min_cluster_size=mcs,
+        metric=metric,
+        cluster_selection_method="eom",
+        algorithm="generic",
+    )
+    if metric == "minkowski":
+        hdb_kw["p"] = HDB_MINKOWSKI_P
+    if structure == "tiny":
+        hdb_kw["min_samples"] = 1
+    if structure == "single":
+        hdb_kw["allow_single_cluster"] = True
+        hdb_kw["min_samples"] = 2
+    hl = hdb.HDBSCAN(**hdb_kw).fit(x_in)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    save_kw = dict(
+        X=c(x_in),
+        labels=c(h.labels_),
+        probabilities=c(h.probabilities_),
+        centroids=c(centroids),
+        medoids=c(medoids),
+        hdb_labels=c(hl.labels_),
+        outlier_scores=c(hl.outlier_scores_),
+    )
+
+    # Nested-density knob fixtures (Pitfall 5 / D-09): produce the non-default
+    # eom/leaf/max_cluster_size/alpha label vectors (sklearn) + epsilon (hdbscan),
+    # and ASSERT each genuinely differs from the eom default BEFORE writing.
+    if structure == "nested":
+        def sk_labels(**over):
+            kw = dict(
+                min_cluster_size=mcs, metric=sk_metric, copy=True,
+                cluster_selection_method="eom",
+            )
+            kw.update(over)
+            return SkHDBSCAN(**kw).fit(x_in).labels_
+
+        labels_eom = h.labels_
+        labels_leaf = sk_labels(cluster_selection_method="leaf")
+        labels_maxcluster = sk_labels(max_cluster_size=35)
+        labels_alpha = sk_labels(alpha=0.5)
+        # epsilon: sklearn 1.9.0 epsilon_search crashes on merging trees; oracle the
+        # epsilon knob against hdbscan 0.8.44 (D-07 cross-oracle), leaf+eps merges.
+        labels_leaf_hdb = hdb.HDBSCAN(
+            min_cluster_size=mcs, metric=metric, cluster_selection_method="leaf",
+            algorithm="generic",
+        ).fit(x_in).labels_
+        labels_epsilon = hdb.HDBSCAN(
+            min_cluster_size=mcs, metric=metric,
+            cluster_selection_method="leaf", cluster_selection_epsilon=1.0,
+            algorithm="generic",
+        ).fit(x_in).labels_
+
+        # Pitfall 5: each non-default knob MUST demonstrably diverge from default.
+        assert not np.array_equal(labels_eom, labels_leaf), (
+            "nested eom/leaf must differ (Pitfall 5)"
+        )
+        assert not np.array_equal(labels_eom, labels_maxcluster), (
+            "nested max_cluster_size must change eom labels (Pitfall 5)"
+        )
+        assert not np.array_equal(labels_eom, labels_alpha), (
+            "nested alpha!=1.0 must change eom labels (Pitfall 5)"
+        )
+        assert not np.array_equal(labels_leaf_hdb, labels_epsilon), (
+            "nested cluster_selection_epsilon>0 must merge leaf labels (Pitfall 5)"
+        )
+        save_kw.update(
+            labels_eom=c(labels_eom),
+            labels_leaf=c(labels_leaf),
+            labels_maxcluster=c(labels_maxcluster),
+            labels_alpha=c(labels_alpha),
+            labels_leaf_default=c(labels_leaf_hdb),
+            labels_epsilon=c(labels_epsilon),
+        )
+
+    # Tie-heavy fixture (R-9): record the duplicate-row index pair for the VALUE
+    # assert (the duplicate must share its partner's label).
+    if structure == "tieheavy":
+        save_kw.update(
+            dup_row_a=c([HDB_TIE_DUP_A]),
+            dup_row_b=c([HDB_TIE_DUP_B]),
+        )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    tag = metric if structure == "blobs" else structure
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"hdbscan_{tag}_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, **save_kw)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Phase-14 UMAP oracle fixtures (UMAP-01..04, D-02). Per-stage × per-metric
 # committed blobs dumping umap-learn 0.5.12's OWN internals (NEVER recomputed in
 # numpy — RESEARCH Pitfall 6). All arrays are 4/8-byte floats (load_npz
@@ -2728,6 +3050,24 @@ def main() -> None:
         print(f"wrote {gen_umap_transform(dtype=np.float64, metric=metric)}")
     # a/b curve fit is metric-independent — one fixture.
     print(f"wrote {gen_umap_ab(dtype=np.float64)}")
+    # ---- Phase-15 HDBSCAN oracle fixtures (HDBS-01..04, D-03/D-04/D-06/D-07) ----
+    # Per-metric GATE blobs (distinct-MST-edge-weight, Pitfall 1 opt 2) over the
+    # full metric set × {f32 (rocm gate), f64 (cpu gate)}; each carries sklearn
+    # labels/probabilities/centroids/medoids (PRIMARY oracle) + hdbscan 0.8.44
+    # hdb_labels/outlier_scores (GLOSH + cross-check, D-07). Regen in a /tmp venv
+    # with `numpy>=1.26 scikit-learn==1.9.0 hdbscan==0.8.44` (PEP-668).
+    for metric in (
+        "euclidean", "manhattan", "cosine", "chebyshev", "minkowski", "precomputed"
+    ):
+        for dtype in (np.float32, np.float64):
+            print(f"wrote {gen_hdbscan(dtype=dtype, metric=metric, structure='blobs')}")
+    # Metric-agnostic specials (euclidean): the D-04 TRUE GATE tie-heavy +
+    # duplicate-point fixture (R-9), the nested-density knob fixture (eom/leaf/
+    # epsilon/max_cluster_size/alpha diverge — Pitfall 5, asserted in-script), and
+    # the all-noise / single-cluster / n<min_cluster_size edge cases.
+    for structure in ("tieheavy", "nested", "allnoise", "single", "tiny"):
+        for dtype in (np.float32, np.float64):
+            print(f"wrote {gen_hdbscan(dtype=dtype, metric='euclidean', structure=structure)}")
     # Lasso (LINEAR-03): sparse coef_ with exact zeros (Pitfall 1).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_lasso(dtype=dtype)}")
