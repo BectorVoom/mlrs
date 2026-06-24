@@ -4,17 +4,17 @@ milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
 current_phase: 16
 current_phase_name: builder-retrofit-sweep-shim-coverage
-status: executing
+status: verifying
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-24T13:50:08.896Z"
+last_updated: "2026-06-24T14:42:22.604Z"
 last_activity: 2026-06-24
 last_activity_desc: Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 progress:
   total_phases: 5
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 34
-  completed_plans: 33
-  percent: 80
+  completed_plans: 34
+  percent: 100
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
 Plan: 13 of 13
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-24 — Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
 
@@ -152,6 +152,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 16 P09 | 28m | 2 tasks | 14 files |
 | Phase 16 P10 | 6min | 2 tasks | 2 files |
 | Phase 16 P11 | 28m | 3 tasks | 10 files |
+| Phase 16 P12 | 47m | 2 tasks | 12 files |
 
 ## Accumulated Context
 
@@ -304,6 +305,8 @@ Recent decisions affecting current work:
 - [Phase ?]: SHIM-02: probabilities_/outlier_scores_ getters return Option<Vec<F>> -> Python None (algos return Option until feature-space front-end lands), not an error
 - [Phase ?]: 16-11: shimmed every PyO3-wrapped estimator (32 total); full pure-Python sklearn parity, live check_estimator deferred to UAT
 - [Phase ?]: 16-11: shim test matrix auto-derives from mlrs.__all__ (ALL_SHIMS, 32 shims) so it cannot drift; the 3 fit-free estimator_checks are guarded never-xfailed (A7)
+- [Phase ?]: Phase 16: traits.rs hard-deleted — mlrs_algos::typestate is the single trait surface (D-01)
+- [Phase ?]: BLDR-03 COMPLETE: all 29 estimators retrofitted to builder+typestate, legacy traits.rs deleted, phase-end gate green
 
 ### Pending Todos
 
@@ -335,7 +338,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T13:49:49.213Z
+Last session: 2026-06-24T14:41:37.818Z
 Stopped at: Phase 16 context gathered
 Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
 
