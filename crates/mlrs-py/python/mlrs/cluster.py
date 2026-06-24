@@ -38,9 +38,12 @@ class KMeans(ClusterMixin, MlrsBase):
 
     def fit(self, X, y=None):
         xa, rows, cols = self._normalize(X)
-        obj = self._ext().KMeans(
-            self.n_clusters, self.max_iter, self.tol, self.random_state
-        )
+        # Normalize random_state at the boundary (WR-06): a numpy integer scalar
+        # is not guaranteed to coerce to PyO3's u64 extractor, and a negative
+        # value would fail with an opaque OverflowError. int() coercion mirrors
+        # SpectralClustering.fit; None stays None (PyKMeans maps it to a default).
+        seed = None if self.random_state is None else int(self.random_state)
+        obj = self._ext().KMeans(self.n_clusters, self.max_iter, self.tol, seed)
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
         self._post_fit(cols)
