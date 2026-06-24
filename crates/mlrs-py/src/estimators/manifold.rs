@@ -28,7 +28,7 @@
 use pyo3::prelude::*;
 
 use mlrs_algos::manifold::umap::{Init, Metric, Umap};
-use mlrs_algos::typestate::Fit;
+use mlrs_algos::typestate::{Fit, Transform};
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
@@ -113,6 +113,31 @@ impl PyUMAP {
     /// the [`not_fitted`] analog on the `Unfit` arm.
     pub fn embedding_f32_for_test(&self) -> PyResult<Vec<f32>> {
         self.embedding_f32_inner()
+    }
+
+    /// Extract the dtype-INDEPENDENT hyperparameter tuple from the `Unfit` arm for
+    /// the `fit_transform_*` builder path. Returns the [`not_fitted`] analog on an
+    /// already-fitted arm (sklearn `fit_transform` re-fits from the constructed
+    /// estimator; re-fit on a fitted wrap is the same boundary error as `fit`).
+    #[allow(clippy::type_complexity)]
+    fn unfit_hyperparams(
+        &self,
+    ) -> PyResult<(
+        usize, usize, f64, f64, String, Option<usize>, String, Option<u64>, f64, f64, f64, f64, usize, Option<f64>, Option<f64>,
+    )> {
+        match &self.inner {
+            AnyUmap::Unfit {
+                n_neighbors, n_components, min_dist, spread, metric, n_epochs,
+                init, random_state, learning_rate, set_op_mix_ratio,
+                local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+            } => Ok((
+                *n_neighbors, *n_components, *min_dist, *spread, metric.clone(),
+                *n_epochs, init.clone(), *random_state, *learning_rate,
+                *set_op_mix_ratio, *local_connectivity, *repulsion_strength,
+                *negative_sample_rate, *a, *b,
+            )),
+            _ => Err(not_fitted("umap", "fit_transform (re-fit)")),
+        }
     }
 
     fn embedding_f32_inner(&self) -> PyResult<Vec<f32>> {
@@ -268,6 +293,126 @@ impl PyUMAP {
         })?;
         self.inner = fitted;
         Ok(())
+    }
+
+    /// `transform(X_new)` (f32 arm) — embed `rows × cols` NEW points against the
+    /// fitted fuzzy graph and return the host `(rows × n_components)` embedding
+    /// (row-major). Forwards to the Rust `Umap<f32, Fitted>` [`Transform::transform`]
+    /// (umap.rs:568). GIL released (PY-03); the `Unfit`/wrong-dtype arm returns the
+    /// runtime [`not_fitted`] analog (D-13). The fit-time `n_features_in_` is
+    /// enforced inside the Rust method (T-16-V5 / WR-02).
+    fn transform_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyUmap::F32(est) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    Ok(Transform::transform(est, &mut pool, &xd, (rows, cols))
+                        .map_err(algo_err_to_py)?
+                        .to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("umap", "transform (f32 path)")),
+            }
+        })
+    }
+
+    /// `transform(X_new)` (f64 arm) — see [`Self::transform_f32`]. `guard_f64()` is
+    /// applied BEFORE the device upload on the f64-incapable backend (T-16-GUARDF64).
+    fn transform_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyUmap::F64(est) => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    Ok(Transform::transform(est, &mut pool, &xd, (rows, cols))
+                        .map_err(algo_err_to_py)?
+                        .to_host_metered(&mut pool))
+                }
+                _ => Err(not_fitted("umap", "transform (f64 path)")),
+            }
+        })
+    }
+
+    /// `fit_transform(X)` (f32 path) — fit to `x` (`rows × cols`, row-major) and
+    /// return the fitted embedding host buffer in one call (umap-learn's
+    /// `UMAP.fit_transform`). Unsupervised — no `y`. Builds via the umap builder
+    /// (data-INDEPENDENT validation → `ValueError`, T-12-02), releases the GIL
+    /// (PY-03), and consumes the `Unfit` estimator through
+    /// `Umap::<f32, Unfit>::fit_transform` (umap.rs:215). Does NOT mutate `self`
+    /// (the fitted estimator is dropped — sklearn `fit_transform` semantics return
+    /// the embedding; call `fit` then `embedding_f32` to retain the estimator).
+    fn fit_transform_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+        let xa = capsule_to_array(x)?;
+        let (
+            n_neighbors, n_components, min_dist, spread, metric_s, n_epochs,
+            init_s, random_state, learning_rate, set_op_mix_ratio,
+            local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+        ) = self.unfit_hyperparams()?;
+        let metric = parse_metric(&metric_s)?;
+        let init = parse_init(&init_s)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+            let est = Umap::<f32>::builder()
+                .n_neighbors(n_neighbors)
+                .n_components(n_components)
+                .min_dist(min_dist)
+                .spread(spread)
+                .metric(metric)
+                .n_epochs(n_epochs)
+                .init(init)
+                .random_state(random_state)
+                .learning_rate(learning_rate)
+                .set_op_mix_ratio(set_op_mix_ratio)
+                .local_connectivity(local_connectivity)
+                .repulsion_strength(repulsion_strength)
+                .negative_sample_rate(negative_sample_rate)
+                .a(a)
+                .b(b)
+                .build::<f32>()
+                .map_err(build_err_to_py)?;
+            est.fit_transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)
+        })
+    }
+
+    /// `fit_transform(X)` (f64 path) — see [`Self::fit_transform_f32`].
+    /// `guard_f64()` is applied BEFORE the device upload (T-16-GUARDF64).
+    fn fit_transform_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+        let xa = capsule_to_array(x)?;
+        let (
+            n_neighbors, n_components, min_dist, spread, metric_s, n_epochs,
+            init_s, random_state, learning_rate, set_op_mix_ratio,
+            local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+        ) = self.unfit_hyperparams()?;
+        let metric = parse_metric(&metric_s)?;
+        let init = parse_init(&init_s)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            crate::capability::guard_f64()?;
+            let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+            let est = Umap::<f64>::builder()
+                .n_neighbors(n_neighbors)
+                .n_components(n_components)
+                .min_dist(min_dist)
+                .spread(spread)
+                .metric(metric)
+                .n_epochs(n_epochs)
+                .init(init)
+                .random_state(random_state)
+                .learning_rate(learning_rate)
+                .set_op_mix_ratio(set_op_mix_ratio)
+                .local_connectivity(local_connectivity)
+                .repulsion_strength(repulsion_strength)
+                .negative_sample_rate(negative_sample_rate)
+                .a(a)
+                .b(b)
+                .build::<f64>()
+                .map_err(build_err_to_py)?;
+            est.fit_transform(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)
+        })
     }
 
     /// Host `embedding_` (f32 arm, length `rows × n_components`, row-major) or the
