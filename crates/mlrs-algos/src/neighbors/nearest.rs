@@ -178,7 +178,7 @@ impl NearestNeighborsBuilder {
     /// hyperparameter BEFORE any data is seen (D-08; the data-DEPENDENT
     /// `k <= n_train` check lives in [`KNeighbors::kneighbors`]):
     ///
-    /// - `n_neighbors >= 1` ([`BuildError::InvalidNComponents`]) — a zero
+    /// - `n_neighbors >= 1` ([`BuildError::InvalidNNeighbors`]) — a zero
     ///   neighbor count is always invalid regardless of the training data. The
     ///   data-DEPENDENT `k > n_train` half stays in the `kneighbors` core
     ///   (T-16-V5; the fit/kneighbors `k` validation is NOT dropped).
@@ -187,10 +187,11 @@ impl NearestNeighborsBuilder {
         F: Float + CubeElement + Pod,
     {
         if self.n_neighbors == 0 {
-            return Err(BuildError::InvalidNComponents {
+            // IN-02: name the neighbor-honest variant so the construction-time
+            // error matches the hyperparameter (`n_neighbors`), not `n_components`.
+            return Err(BuildError::InvalidNNeighbors {
                 estimator: "nearest_neighbors",
-                param: "n_neighbors",
-                value: self.n_neighbors,
+                n_neighbors: self.n_neighbors,
             });
         }
         Ok(NearestNeighbors {

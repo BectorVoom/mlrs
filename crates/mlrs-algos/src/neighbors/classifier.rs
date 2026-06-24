@@ -155,6 +155,14 @@ where
     pub fn n_classes(&self) -> usize {
         self.n_classes_
     }
+
+    /// The DISTINCT sorted training labels (`classes_`, CR-03). `predict_labels`
+    /// maps the argmax column back through these, so callers exposing a public
+    /// `classes_` attribute MUST use this (not a fabricated `0..n_classes`
+    /// range) to honour the sklearn `classes_`/`predict` consistency contract.
+    pub fn classes(&self) -> &[i32] {
+        &self.classes_
+    }
 }
 
 /// Builder for [`KNeighborsClassifier`] (D-01). `Default` re-derives the sklearn
@@ -184,17 +192,18 @@ impl KNeighborsClassifierBuilder {
     /// hyperparameter BEFORE any data is seen (D-08; the data-DEPENDENT
     /// `k <= n_train` check lives in the `kneighbors` core):
     ///
-    /// - `n_neighbors >= 1` ([`BuildError::InvalidNComponents`]). The
+    /// - `n_neighbors >= 1` ([`BuildError::InvalidNNeighbors`]). The
     ///   data-DEPENDENT `k > n_train` half stays in the predict path (T-16-V5).
     pub fn build<F>(self) -> Result<KNeighborsClassifier<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
         if self.n_neighbors == 0 {
-            return Err(BuildError::InvalidNComponents {
+            // IN-02: name the neighbor-honest variant so the construction-time
+            // error matches the hyperparameter (`n_neighbors`), not `n_components`.
+            return Err(BuildError::InvalidNNeighbors {
                 estimator: "knn_classifier",
-                param: "n_neighbors",
-                value: self.n_neighbors,
+                n_neighbors: self.n_neighbors,
             });
         }
         Ok(KNeighborsClassifier {
@@ -251,10 +260,25 @@ where
         // the original id. The WR-02 `class >= n_classes` guard cannot catch this
         // GAP, so the fix is the dense remap + inverse map at predict.
         let y_host = y.to_host(pool);
-        let raw_class: Vec<i32> = y_host
-            .iter()
-            .map(|&v| host_to_f64(v).round() as i32)
-            .collect();
+        // WR-02: validate each label is a finite, integer-valued, i32-range value
+        // before remapping — every sibling classifier guards this. Without it a
+        // NaN target silently becomes 0 (saturating cast) and an out-of-i32 label
+        // saturates, producing a spurious/wrong class with no error.
+        let mut raw_class: Vec<i32> = Vec::with_capacity(n_train);
+        for &v in y_host.iter() {
+            let lf = host_to_f64(v);
+            let lr = lf.round();
+            if !lr.is_finite()
+                || (lr - lf).abs() > 1e-6
+                || i32::try_from(lr as i64).is_err()
+            {
+                return Err(AlgoError::InvalidLabels {
+                    estimator: "knn_classifier",
+                    reason: format!("labels must be i32-range integers (got {lf})"),
+                });
+            }
+            raw_class.push(lr as i32);
+        }
         let mut classes_: Vec<i32> = raw_class.clone();
         classes_.sort_unstable();
         classes_.dedup();

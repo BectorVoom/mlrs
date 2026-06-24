@@ -607,6 +607,23 @@ pub enum BuildError {
         value: usize,
     },
 
+    /// A neighbor estimator (`KNeighborsClassifier` / `KNeighborsRegressor` /
+    /// `NearestNeighbors`) was given `n_neighbors == 0` (IN-02). The neighbor
+    /// count must be `>= 1`; a value of 0 has no meaning. Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split) — the data-DEPENDENT `k > n_train`
+    /// half stays in the `kneighbors` core as [`AlgoError::InvalidK`]. This is
+    /// the construction-time, neighbor-honest sibling of `InvalidK`; it is
+    /// distinct from `InvalidNComponents` so the variant name matches the
+    /// hyperparameter it guards.
+    #[error("estimator '{estimator}': n_neighbors = {n_neighbors} is invalid (must be >= 1)")]
+    InvalidNNeighbors {
+        /// Which estimator's builder rejected the value (e.g.
+        /// `"knn_classifier"` / `"knn_regressor"` / `"nearest_neighbors"`).
+        estimator: &'static str,
+        /// The offending neighbor count (0).
+        n_neighbors: usize,
+    },
+
     /// `HDBSCAN` was given a `min_cluster_size` below 2 (Phase 12, HDBS-01,
     /// T-12-02). The minimum number of samples in a cluster must be `>= 2`; a
     /// smaller value is undefined. Rejected at `build()` (data-INDEPENDENT, the

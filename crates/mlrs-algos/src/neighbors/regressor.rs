@@ -153,17 +153,18 @@ impl KNeighborsRegressorBuilder {
     /// hyperparameter BEFORE any data is seen (D-08; the data-DEPENDENT
     /// `k <= n_train` check lives in the `kneighbors` core):
     ///
-    /// - `n_neighbors >= 1` ([`BuildError::InvalidNComponents`]). The
+    /// - `n_neighbors >= 1` ([`BuildError::InvalidNNeighbors`]). The
     ///   data-DEPENDENT `k > n_train` half stays in the predict path (T-16-V5).
     pub fn build<F>(self) -> Result<KNeighborsRegressor<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
         if self.n_neighbors == 0 {
-            return Err(BuildError::InvalidNComponents {
+            // IN-02: name the neighbor-honest variant so the construction-time
+            // error matches the hyperparameter (`n_neighbors`), not `n_components`.
+            return Err(BuildError::InvalidNNeighbors {
                 estimator: "knn_regressor",
-                param: "n_neighbors",
-                value: self.n_neighbors,
+                n_neighbors: self.n_neighbors,
             });
         }
         Ok(KNeighborsRegressor {
