@@ -463,20 +463,25 @@ def gen_hdbscan(seed, dtype, metric, mcs=5, ms=None, csm='eom', eps=0.0, mxc=0, 
 
 **If any HIGH-risk assumption (A3) fails in the spike, D-05 makes it a phase blocker — surface immediately.**
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All three pre-planning unknowns are discharged in the Phase-15 plans (ROADMAP spike flag: "SPIKE BEFORE PLANNING — RESOLVED IN PLANS"). The D-04/D-05 exactness spike is sequenced as the Wave-3 TRUE GATE (`15-03`) before the device front-end (`15-05`) commits. Resolution per question below.
 
 1. **Does any metric's real-data MST contain weight ties that flip labels?** (D-04 TRUE GATE)
    - What we know: the sort is unstable; ties exist on duplicate points and integer-grid data.
    - What's unclear: whether the gate fixtures (random f64 blobs) produce tied MST weights in practice.
    - Recommendation: **pre-planning spike** runs all 6 metrics on (a) a distinct-weight blob fixture and (b) a deliberately tie-heavy + duplicate-point fixture, asserting `best_match_accuracy_pinned_noise == 1.0`. If (a) passes and (b) fails, gate on distinct-weight designs + document; if (a) fails, port introsort or escalate (D-05/D-06).
+   - **RESOLVED:** Plan `15-02` builds the distinct-weight + tie-heavy + duplicate-point fixtures; plan `15-03` Task 2 makes `tie_break_exact` the Wave-3 TRUE GATE (sequenced before `15-05`), replicating the oracle's `np.argsort`-by-weight ordering (NOT the mlrs lowest-index convention) and surfacing any un-exactable metric as a **phase BLOCKER per D-05** — never band-demoted.
 
 2. **Precomputed alpha + symmetry validation exact behavior.**
    - What we know: sklearn divides the whole matrix by alpha, then mutual_reachability recomputes core distances from the scaled matrix; validates square + `allclose(X, X.T)`.
    - Recommendation: replicate `distance_matrix /= alpha` BEFORE core-distance for the dense path; validate squareness (error) and document symmetry expectation (D-02).
+   - **RESOLVED:** Plan `15-03` ports both MST variants with their distinct per-path alpha placements (Pattern 2 / Pitfall 2): the dense `mst_from_mutual_reachability` path (cosine + precomputed) scales the matrix before core-distance, with square-validation (error) + documented symmetry expectation per D-02 in the plan's `<threat_model>` (V5).
 
 3. **Memory gate shape for dense n×n mutual reachability** (Claude's discretion).
    - The dense Prim (cosine/precomputed) needs the full n×n MR matrix; feature-metric Prim B recomputes pairwise on the fly (no n×n resident).
    - Recommendation: for Variant B keep it n×d resident (no n×n); for Variant A the n×n is unavoidable but should be a single host buffer (back-end is host) — set the PoolStats gate on the DEVICE front-end (core-dist KNN + any device MR), not the host tree. Planner sets the exact assertion.
+   - **RESOLVED:** Plan `15-05` scopes the PoolStats `memory_gate` to the DEVICE front-end (core-distance KNN + the GATHER MR kernel), not the host tree; Variant B stays n×d-resident. Exact assertion set in `15-05` Task 2.
 
 ## Environment Availability
 
