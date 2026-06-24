@@ -626,7 +626,8 @@ where
     /// dense Variant-A MST reads `mr[current_node][..]` rows, so an asymmetric
     /// input would silently use the upper-triangle reading — callers must supply
     /// a symmetric matrix (the committed fixtures are `pairwise_distances`, which
-    /// is symmetric by construction).
+    /// is symmetric by construction). A `debug_assert!` of near-symmetry (within
+    /// `1e-9`) below enforces this in test builds (WR-04).
     fn precomputed_single_linkage(
         &self,
         pool: &BufferPool<ActiveRuntime>,
@@ -647,6 +648,16 @@ where
 
         // Read the dense matrix to host f64 (the shared bridging idiom).
         let dist_raw: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+
+        // WR-04: sklearn requires the precomputed matrix to be SYMMETRIC
+        // (`np.allclose(X, X.T)`); the dense Variant-A MST reads `mr[current_node]`
+        // rows, so an asymmetric input would silently use the upper-triangle
+        // reading and produce a wrong MST. Catch fixture/caller regressions in test
+        // builds (debug-only to keep the release fit path O(n²)-free of an extra scan).
+        debug_assert!(
+            (0..n).all(|i| (0..n).all(|j| (dist_raw[i * n + j] - dist_raw[j * n + i]).abs() <= 1e-9)),
+            "precomputed distance matrix must be symmetric (np.allclose(X, X.T))",
+        );
 
         // Variant-A alpha placement: divide the WHOLE matrix by alpha BEFORE core
         // distances (sklearn `_hdbscan_brute`).
