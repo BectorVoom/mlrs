@@ -48,8 +48,10 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 // variants + argsort-by-weight; `single_linkage` holds the UnionFind +
 // make_single_linkage that the Wave-3 condense/select stage (plan 15-04)
 // consumes.
+pub mod condense;
 pub mod mst;
 pub mod single_linkage;
+pub mod stability;
 
 /// Distance metric for the HDBSCAN neighbor graph (HDBS-01, D-01). The five
 /// feature-space metrics mirror [`mlrs_backend::prims::knn_graph::Metric`]

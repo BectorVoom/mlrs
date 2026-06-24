@@ -662,7 +662,119 @@ use mlrs_algos::cluster::hdbscan::mst::{
     argsort_by_weight, core_distances_dense, mst_from_data_matrix, mst_from_mutual_reachability,
     mutual_reachability_dense,
 };
-use mlrs_algos::cluster::hdbscan::single_linkage::{make_single_linkage, UnionFind};
+use mlrs_algos::cluster::hdbscan::single_linkage::{make_single_linkage, SingleLinkageEdge, UnionFind};
+
+use mlrs_algos::cluster::hdbscan::condense::{condense_tree, CondensedNode};
+use mlrs_algos::cluster::hdbscan::stability::{compute_stability, max_lambdas};
+
+/// A balanced two-cluster single-linkage hierarchy over `n=8` points used by the
+/// condense/stability characterization gates (plan 15-04). Two clusters
+/// `{0,1,2,3}` and `{4,5,6,7}` each merge tightly (d=1,1.5,2) then join at the
+/// top (d=10). The internal node ids follow the `N+i` convention so the BFS root
+/// is `2*(N-1) = 14`. Ground truth taken from sklearn `_condense_tree` /
+/// `tree_to_labels` (verbatim oracle).
+fn hand_hierarchy_n8() -> Vec<SingleLinkageEdge> {
+    let mk = |left, right, distance, size| SingleLinkageEdge {
+        left,
+        right,
+        distance,
+        size,
+    };
+    vec![
+        mk(0, 1, 1.0, 2),  // node 8
+        mk(8, 2, 1.5, 3),  // node 9
+        mk(9, 3, 2.0, 4),  // node 10  -> cluster {0,1,2,3}
+        mk(4, 5, 1.0, 2),  // node 11
+        mk(11, 6, 1.5, 3), // node 12
+        mk(12, 7, 2.0, 4), // node 13  -> cluster {4,5,6,7}
+        mk(10, 13, 10.0, 8), // node 14 -> top
+    ]
+}
+
+/// HDBS-02 / Pattern 5: `condense_tree` runt-prunes the single-linkage hierarchy
+/// by `min_cluster_size` (NOT `min_samples`), producing the sklearn condensed
+/// tree exactly. At `mcs=2` the top split keeps both 4-point children (relabeled
+/// 9 and 10 from root 8) at `lambda = 1/10 = 0.1`, then each sub-cluster sheds its
+/// points as runts. Ground truth from sklearn `_condense_tree(H, 2)`.
+#[test]
+fn condense_tree_runt_prunes_by_min_cluster_size() {
+    let h = hand_hierarchy_n8();
+    let ct = condense_tree(&h, 2);
+
+    let expect = vec![
+        CondensedNode { parent: 8, child: 9, lambda: 0.1, cluster_size: 4 },
+        CondensedNode { parent: 8, child: 10, lambda: 0.1, cluster_size: 4 },
+        CondensedNode { parent: 9, child: 3, lambda: 0.5, cluster_size: 1 },
+        CondensedNode { parent: 10, child: 7, lambda: 0.5, cluster_size: 1 },
+        CondensedNode { parent: 9, child: 2, lambda: 2.0 / 3.0, cluster_size: 1 },
+        CondensedNode { parent: 10, child: 6, lambda: 2.0 / 3.0, cluster_size: 1 },
+        CondensedNode { parent: 9, child: 0, lambda: 1.0, cluster_size: 1 },
+        CondensedNode { parent: 9, child: 1, lambda: 1.0, cluster_size: 1 },
+        CondensedNode { parent: 10, child: 4, lambda: 1.0, cluster_size: 1 },
+        CondensedNode { parent: 10, child: 5, lambda: 1.0, cluster_size: 1 },
+    ];
+    assert_eq!(ct, expect, "mcs=2 condensed tree must match sklearn _condense_tree");
+
+    // mcs=4: the sub-clusters (size 3 after the first runt drop) fall below 4, so
+    // ONLY the top split survives; all 8 points fall out under 9 / 10 at lambda
+    // 1/2 = 0.5. Ground truth from sklearn _condense_tree(H, 4).
+    let ct4 = condense_tree(&h, 4);
+    let parents4: Vec<usize> = ct4.iter().map(|r| r.parent).collect();
+    assert_eq!(parents4[0..2], [8, 8], "mcs=4 keeps the top split (root children 9,10)");
+    // All point children fall out at lambda 0.5 under 9 / 10.
+    for r in &ct4[2..] {
+        assert!(r.child < 8, "mcs=4 sheds singleton points");
+        assert!((r.lambda - 0.5).abs() < 1e-12, "mcs=4 points fall out at 1/2=0.5");
+        assert_eq!(r.cluster_size, 1);
+    }
+}
+
+/// HDBS-02 / Pattern 5: a distance-0 merge yields `lambda = INFTY` (the runt
+/// fall-out branch). A 3-point hierarchy where the final merge has distance 0.
+#[test]
+fn condense_tree_infty_on_zero_distance() {
+    let mk = |left, right, distance, size| SingleLinkageEdge { left, right, distance, size };
+    // n=3: node3=(0,1,d=0,size2); node4=(3,2,d=1,size3). Root = 2*(3-1) = 4.
+    let h = vec![mk(0, 1, 0.0, 2), mk(3, 2, 1.0, 3)];
+    let ct = condense_tree(&h, 2);
+    // The d=0 merge produces lambda=INFTY for whichever rows carry it.
+    assert!(
+        ct.iter().any(|r| r.lambda.is_infinite()),
+        "a distance-0 merge must produce a lambda=INFTY condensed row"
+    );
+}
+
+/// HDBS-02 / Pattern 6: `compute_stability` accumulates
+/// `(lambda - births[parent]) * cluster_size` per parent, with `births[root]=0`.
+/// Ground truth from sklearn (`_compute_stability` semantics): mcs=2 →
+/// `{8: 0.8, 9: 2.766667, 10: 2.766667}`, mcs=4 → `{8: 0.8, 9: 1.6, 10: 1.6}`.
+#[test]
+fn compute_stability_matches_sklearn() {
+    let h = hand_hierarchy_n8();
+
+    let s2 = compute_stability(&condense_tree(&h, 2));
+    assert!((s2[&8] - 0.8).abs() < 1e-9, "stability[8] mcs=2: {}", s2[&8]);
+    assert!((s2[&9] - 2.766666666).abs() < 1e-6, "stability[9] mcs=2: {}", s2[&9]);
+    assert!((s2[&10] - 2.766666666).abs() < 1e-6, "stability[10] mcs=2: {}", s2[&10]);
+
+    let s4 = compute_stability(&condense_tree(&h, 4));
+    assert!((s4[&8] - 0.8).abs() < 1e-9, "stability[8] mcs=4: {}", s4[&8]);
+    assert!((s4[&9] - 1.6).abs() < 1e-9, "stability[9] mcs=4: {}", s4[&9]);
+    assert!((s4[&10] - 1.6).abs() < 1e-9, "stability[10] mcs=4: {}", s4[&10]);
+}
+
+/// HDBS-02 / Pattern 6: `max_lambdas` returns the per-parent maximum lambda
+/// ("death" lambda). On the mcs=2 condensed tree the max lambda under parents 9
+/// and 10 is `1.0` (their points' final fall-out); parent 8's max is `0.1`.
+#[test]
+fn max_lambdas_per_parent() {
+    let h = hand_hierarchy_n8();
+    let ct = condense_tree(&h, 2);
+    let deaths = max_lambdas(&ct);
+    assert!((deaths[8] - 0.1).abs() < 1e-12, "deaths[8]: {}", deaths[8]);
+    assert!((deaths[9] - 1.0).abs() < 1e-12, "deaths[9]: {}", deaths[9]);
+    assert!((deaths[10] - 1.0).abs() < 1e-12, "deaths[10]: {}", deaths[10]);
+}
 
 /// Variant A (`mst_from_mutual_reachability`) recovers the expected spanning tree
 /// on a small dense path-graph distance matrix with DISTINCT weights, and the
