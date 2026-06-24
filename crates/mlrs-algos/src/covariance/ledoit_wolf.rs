@@ -182,6 +182,11 @@ where
 {
     /// Host copy of `covariance_` (`n_features × n_features`, row-major).
     /// Memoized after the first call (IN-05). `Some` by construction on `Fitted`.
+    ///
+    /// IN-03: `pool` is consulted ONLY on the FIRST call (the device→host
+    /// download). Every subsequent call returns the cached `Vec<F>` and the
+    /// passed `pool` is ignored — this is sound because the device buffer is
+    /// immutable post-fit, but callers must NOT assume a fresh download per call.
     pub fn covariance_(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.cov_host
             .get_or_init(|| {
@@ -195,6 +200,9 @@ where
 
     /// Host copy of `location_` (length `n_features`). Memoized (IN-05). `Some`
     /// by construction on `Fitted`.
+    ///
+    /// IN-03: `pool` is consulted ONLY on the FIRST call (see `covariance_`);
+    /// subsequent calls return the cached `Vec<F>` and ignore the passed `pool`.
     pub fn location_(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.loc_host
             .get_or_init(|| {
