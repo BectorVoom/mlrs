@@ -753,7 +753,11 @@ where
         let edges = if matches!(self.metric, Metric::Cosine) {
             // --- Variant A (cosine): dense n×n cosine distance, whole-matrix /alpha
             //     BEFORE core, MR via the device GATHER kernel, dense Prim. ---
-            // T-15-05-OVF: guard n*n before building the dense block.
+            // T-15-05-OVF: guard n*n before building the dense block. IN-02: the
+            // `checked_mul` `?` short-circuit is the LOAD-BEARING part (it rejects
+            // an overflowing geometry in release too); the `nn` binding's only
+            // *consumer* is the debug-only length assert below, so it is compiled
+            // out in release — that is intentional, not dead code.
             let nn = n.checked_mul(n).ok_or_else(|| {
                 AlgoError::Prim(PrimError::Overflow {
                     operand: "cosine_distance_matrix",
