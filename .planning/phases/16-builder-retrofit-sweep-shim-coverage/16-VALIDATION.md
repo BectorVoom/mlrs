@@ -1,8 +1,8 @@
 ---
 phase: 16
 slug: builder-retrofit-sweep-shim-coverage
-status: draft
-nyquist_compliant: false
+status: planned
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-06-24
 ---
@@ -86,4 +86,4 @@ created: 2026-06-24
 - [ ] Feedback latency < one per-estimator suite run
 - [ ] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved — 13 plans created; every task carries an `<automated>` verify (per-estimator `cargo test --test <est>_test` + `cargo build -p mlrs-py`); Wave 0 (Plan 00) covers all MISSING references (5 typestate traits, AST purity test, builder-setter convention lock); SHIM-02 method gaps in Plan 10; phase-end gate (compile_fail + targeted oracle + Python static + traits.rs-gone grep) in Plan 12.
