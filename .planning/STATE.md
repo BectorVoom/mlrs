@@ -6,14 +6,14 @@ current_phase: 15
 current_phase_name: hdbscan
 status: executing
 stopped_at: Completed 15-01-PLAN.md
-last_updated: "2026-06-24T05:30:48.837Z"
+last_updated: "2026-06-24T05:44:55.707Z"
 last_activity: 2026-06-24
 last_activity_desc: Phase 15 execution started
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 20
-  completed_plans: 18
+  completed_plans: 19
   percent: 60
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 ## Current Position
 
 Phase: 15 (hdbscan) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute
 Last activity: 2026-06-24 — Phase 15 execution started
 Resume: /gsd-execute-phase 14 (re-run verifier) — do not mark phase complete until verification passes
@@ -137,6 +137,7 @@ Progress: [██████░░░░] 60% (v3.0)
 | Phase 15 P02 | 75min | 2 tasks | 25 files |
 | Phase 15 P03 | 18min | 2 tasks | 5 files |
 | Phase 15 P04 | 70min | 2 tasks | 6 files |
+| Phase 15 P05 | single-session | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -271,6 +272,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 15-03: argsort_by_weight uses f64::total_cmp; gate fixtures use distinct MST edge weights so the sort is tie-free and oracle-equal (Pitfall 1 option 2)
 - [Phase ?]: 15-04: HDBSCAN condensed-tree back-end ported verbatim from sklearn _tree.pyx; precomputed fit produces exact labels + <=1e-5 probabilities
 - [Phase ?]: 15-04: labels_alpha selection knob deferred to 15-05 (feature-path Variant-B alpha, Pitfall 2)
+- [Phase ?]: 15-05: cosine=Variant-A dense via MR kernel; other 4 feature metrics=Variant-B (no n*n resident); MR kernel VALUE gate in mlrs-backend
 
 ### Pending Todos
 
@@ -302,7 +304,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T05:30:48.830Z
+Last session: 2026-06-24T05:44:43.316Z
 Stopped at: Completed 15-01-PLAN.md
 Resume file: .planning/phases/15-hdbscan/15-CONTEXT.md
 
