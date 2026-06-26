@@ -15,6 +15,23 @@ install` the package for their backend and use familiar `fit`/`predict`/`transfo
 CubeCL backend from a single generic codebase.** If everything else fails, the numerical results
 must be right and the backend abstraction must hold.
 
+## Current Milestone: v4.0 Tree Ensembles, Time-Series & Full-Surface Completion
+
+**Goal:** Close out the remaining cuML algorithm surface (everything except kernel SVM/SMO) — bringing mlrs to near-complete cuML parity — by landing the tree-ensemble family, time-series, model-agnostic explainers, the genetic subsystem, the sklearn-utility surface, and the transparent `cuml.accel` drop-in layer.
+
+**Target features:**
+- **RandomForest feasibility spike** — GPU histogram/split under the cpu-MLIR no-atomics/no-SharedMemory constraint, run **first as a gating phase** (make-or-break, à la Phase 13's KNN-graph spike)
+- **RandomForestClassifier + RandomForestRegressor** — GPU tree construction (gated by the spike)
+- **FIL (Forest Inference Library)** — batched tree traversal over the tree format
+- **TreeSHAP** — tree-model explainer (depends on FIL)
+- **ARIMA / AutoARIMA** — Kalman filter + batched L-BFGS (+ order search)
+- **Kernel + Permutation SHAP** — model-agnostic explainers (oracle: the `shap` library)
+- **cuml.accel** — transparent sklearn/umap/hdbscan import-hook drop-in (reverses the prior Out-of-Scope decision)
+- **sklearn-utility surface** — metrics / preprocessing / feature_extraction / model_selection
+- **genetic / symbolic regression** — evolutionary search (oracle: `gplearn`)
+
+**Key context:** One large milestone; phase numbering continues from v3.0 (last was Phase 16 → v4.0 starts at Phase 17). RandomForest is spike-gated — the tree family (RF→FIL→TreeSHAP) is contingent on the feasibility spike passing under cpu-MLIR; if it fails, scope adjusts before committing. Same backend gate as v1–v3 (cpu f64 + rocm f32, f64-on-rocm skips-with-log). Oracles broaden: sklearn for RF/ARIMA/utility/preprocessing; the `shap` library for explainers; `gplearn` for symbolic regression. Kept primitive-first. `cuml.accel` moves Out of Scope → Active; kernel SVM/SMO stays deferred.
+
 ## Latest Milestone: v3.0 Manifold Algorithms & Rust-Native API — ✅ SHIPPED 2026-06-26
 
 **Status:** Shipped (Phases 12–16, 34 plans, 16/16 requirements complete). Archive: [milestones/v3.0-ROADMAP.md](milestones/v3.0-ROADMAP.md) + [milestones/v3.0-REQUIREMENTS.md](milestones/v3.0-REQUIREMENTS.md).
@@ -72,16 +89,24 @@ must be right and the backend abstraction must hold.
 
 <!-- Current scope. Building toward these. All are hypotheses until shipped and validated. -->
 
-_v3.0 milestone fully shipped (Phases 12–16). Next scope to be detailed via `/gsd-new-milestone`._
+_v4.0 scope (hypotheses until shipped — detailed REQ-IDs in REQUIREMENTS.md):_
+- RandomForest GPU histogram/split **feasibility spike** under cpu-MLIR (gating, first phase)
+- RandomForestClassifier + RandomForestRegressor (spike-gated)
+- FIL (Forest Inference Library) — batched tree traversal
+- TreeSHAP — tree-model explainer (depends on FIL)
+- ARIMA / AutoARIMA — Kalman filter + batched L-BFGS + order search
+- Kernel + Permutation SHAP — model-agnostic explainers (`shap` oracle)
+- cuml.accel — transparent sklearn/umap/hdbscan import-hook drop-in
+- sklearn-utility surface — metrics / preprocessing / feature_extraction / model_selection
+- genetic / symbolic regression — evolutionary search (`gplearn` oracle)
 
 ### Out of Scope
 
 <!-- Explicit boundaries. Includes reasoning to prevent re-adding. -->
 
 - Multi-GPU / distributed (cuml.dask, NCCL/UCX, `*_mg` paths) — single-device first; distribution is a separate milestone
-- cuml.accel transparent acceleration (sklearn import-hook proxying) — magic-proxy layer adds large surface area with no algorithmic value
-- Tree / ensemble (RandomForest → FIL → TreeSHAP) — GPU tree construction fights the cpu-MLIR no-SharedMemory/no-atomics constraint; deferred past v3 (the keystone lift; needs a feasibility spike first — see `notes/v3-hard-algorithm-backlog.md`)
-- Time-series (ARIMA/AutoARIMA), kernel SVM (SVC/SVR via SMO), genetic/symbolic regression, explainers (SHAP) — deferred to a later milestone (`notes/v3-hard-algorithm-backlog.md`). NOTE: UMAP + HDBSCAN moved into v3.0 Active (manifold/cluster pair on a shared KNN-graph prim, dodging tree-atomics risk); *linear* SVM (LinearSVC/SVR) and SpectralClustering/Embedding shipped in v2.
+- Kernel SVM (SVC/SVR via SMO) — the SMO solver is the hardest to make GPU-friendly; deferred past v4.0 (`notes/v3-hard-algorithm-backlog.md`). NOTE: *linear* SVM (LinearSVC/SVR) shipped in v2.
+- _(v4.0 reversal)_ Tree/ensemble (RandomForest → FIL → TreeSHAP), Time-series (ARIMA/AutoARIMA), genetic/symbolic regression, explainers (Kernel/Permutation SHAP), and `cuml.accel` transparent acceleration — **moved into v4.0 Active**. RandomForest is spike-gated (GPU histogram/split feasibility under cpu-MLIR no-SharedMemory/no-atomics is the make-or-break question). The `cuml.accel` Out-of-Scope rationale ("magic-proxy, no algorithmic value") was reversed by user decision now that 32 estimators exist for it to proxy to.
 - Live FFI `estimator_checks` re-triage — needs a maturin+pyarrow host this environment lacks; deferred (the pure-Python sklearn shim IS in v3 scope)
 - Bit-exact reproduction of cuML internals — goal is numerical agreement with scikit-learn (≤1e-5), not kernel-for-kernel parity with cuML
 - Half-precision (f16/bf16) validated paths — infrastructure may allow it but not a near-term deliverable
@@ -161,4 +186,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-26 after v3.0 milestone close — UMAP + HDBSCAN on the shared KNN-graph prim, builder/typestate retrofit across all 32 estimators, pure-Python shim, live PyO3 FFI sign-off (22/22). v3.0 archived + tagged; next milestone via `/gsd-new-milestone`.*
+*Last updated: 2026-06-26 — v4.0 milestone opened (Tree Ensembles, Time-Series & Full-Surface Completion): RandomForest→FIL→TreeSHAP (spike-gated), ARIMA/AutoARIMA, Kernel/Permutation SHAP, cuml.accel (Out-of-Scope reversal), sklearn-utility surface, genetic/symbolic regression. One large milestone, phases continue from 17. Kernel SVM/SMO stays deferred. Requirements + roadmap to follow.*
