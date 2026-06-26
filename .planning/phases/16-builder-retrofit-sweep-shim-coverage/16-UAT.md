@@ -1,21 +1,14 @@
 ---
-status: testing
+status: complete
 phase: 16-builder-retrofit-sweep-shim-coverage
 source: [16-VERIFICATION.md]
 started: 2026-06-25T05:05:00Z
-updated: 2026-06-25T05:05:00Z
+updated: 2026-06-26T00:00:00Z
 ---
 
 ## Current Test
 
-number: 1
-name: UMAP full oracle suite — fit/transform/fit_transform numeric property gates after typestate convergence
-expected: |
-  `cargo test -p mlrs-algos --features cpu --test umap_test` passes ALL tests, in
-  particular the transform sub-gate (`transform_property_{euclidean,manhattan,cosine,
-  chebyshev,minkowski}`) on out-of-sample points, plus trustworthiness / kNN-overlap /
-  same-random_state reproducibility property gates.
-awaiting: user response
+[testing complete]
 
 ## Tests
 
@@ -30,15 +23,25 @@ expected: |
   after ~30 min — the documented "backend test suite slow" landmine under the CPU-MLIR
   backend. This UAT item confirms the transform sub-gate completes green on a host that
   can run the full suite to completion (CI, or a longer local run).
-result: [pending]
+result: pass
+evidence: |
+  Full suite run to completion on 2026-06-26:
+  `test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished
+  in 14237.04s` (exit 0). All 5 `transform_property_{euclidean,manhattan,cosine,chebyshev,
+  minkowski}` out-of-sample gates passed, plus all 5 `layout_property_*`, all 5
+  `spectral_init_*`, `reproducible_f64`, `fit_roundtrip`, and the `fit_no_leak` PoolStats
+  memory gate. Zero failures — the typestate convergence did not perturb any UMAP numeric
+  path. The single behavior-unverified item from 16-VERIFICATION.md is now settled GREEN.
 
 ## Summary
 
 total: 1
-passed: 0
+passed: 1
 issues: 0
-pending: 1
+pending: 0
 skipped: 0
 blocked: 0
 
 ## Gaps
+
+[none]
