@@ -1,331 +1,372 @@
-# Architecture Research — v3.0 Manifold Algorithms & Rust-Native API
+# Architecture Research — mlrs v4.0 (Tree Ensembles, Time-Series & Full-Surface Completion)
 
-**Domain:** sklearn-compatible ML estimator library (Rust/CubeCL rewrite of cuML), v3.0 manifold + builder-API milestone
-**Researched:** 2026-06-22
-**Confidence:** HIGH for placement / trait deltas / dispatch / shim / build order / the device-host split of each new prim (every claim mirrors a shipped file read this pass). MEDIUM for the HDBSCAN on-device MST feasibility and the UMAP negative-sampling layout kernel under cpu-MLIR — the two genuine unknowns that each need a per-phase research spike before planning.
+**Domain:** Integration of the final cuML algorithm surface (RandomForest→FIL→TreeSHAP, ARIMA, Kernel/Permutation SHAP, cuml.accel, sklearn-utility surface, genetic/symbolic regression) into the existing 5-crate CubeCL/PyO3 workspace.
+**Researched:** 2026-06-26
+**Confidence:** HIGH for crate/layer placement & build order (grounded in the shipped v1–v3 architecture read in-source); MEDIUM-HIGH for the GPU-tree feasibility framing (analogous to the proven Phase-13 spike pattern, but the histogram/split kernel is genuinely unproven under cpu-MLIR — that is exactly what the spike must answer).
 
-**Supersedes for v3:** the v2.0 `v2.0-research/ARCHITECTURE.md` is VALIDATED (shipped). This file is the v3 integration architecture: how the KNN-graph prim + UMAP + HDBSCAN + the builder-API retrofit slot into the shipped five-crate layering. The v1/v2 architecture is REUSED, not re-researched.
+> **Scope note.** This document answers *how the v4.0 features attach to the architecture that already exists* and *what new primitives/components each needs*. It does NOT re-derive the existing workspace (mlrs-core / -kernels / -backend / -algos / -py), the builder/typestate convention, the Arrow bridge, the oracle harness, the four per-backend wheels, or the cpu-MLIR GATHER discipline — all shipped and validated in v1–v3. It integrates **with** them.
 
 ---
 
 ## Standard Architecture
 
-### The fixed five-crate seam (REUSE — do not change)
+### The existing 5-crate spine (unchanged; everything v4.0 attaches here)
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│ mlrs-kernels  #[cube] generic-float kernels, BACKEND-FEATURE-FREE      │
-│   v3 NEW: knn_graph symmetrize map, umap_layout (neg-sample) update,   │
-│           mutual_reach map, (mst/condense are HOST — see HDBSCAN)      │
-├──────────────────────────────────────────────────────────────────────┤
-│ mlrs-backend  prims/*  validate-geometry → unsafe launch → Result      │
-│   owns ActiveRuntime, BufferPool, DeviceArray; the ONLY launch site    │
-│   v3 NEW: prims/knn_graph.rs  (reuses distance + topk)                 │
-│           prims/umap_layout.rs (new neg-sample SGD-layout solver)      │
-│           prims/mutual_reach.rs (small, reuses distance/topk)          │
-│           prims/mst.rs + prims/condense.rs are HOST-side (no kernel)   │
-│   reuse: distance, topk, eig, laplacian, reduce, gemm, rng             │
-├──────────────────────────────────────────────────────────────────────┤
-│ mlrs-algos  estimator structs<F>; impl Fit/Transform/PredictLabels     │
-│   COMPOSE prims, never launch kernels (D-13)                           │
-│   v3 NEW: manifold/umap.rs, cluster/hdbscan.rs                         │
-│   v3 NEW: a shared builder convention (trait/derive) + retrofit        │
-├──────────────────────────────────────────────────────────────────────┤
-│ mlrs-py  #[pyclass] via any_estimator! enum (Unfit/F32/F64);           │
-│   dtype-suffixed accessors; py.detach + guard_f64                      │
-│   v3 NEW: estimators/manifold.rs (UMAP), add hdbscan to cluster.rs     │
-│   v3 REUSE: python/mlrs/*.py shim (MlrsBase + sklearn mixins)          │
-├──────────────────────────────────────────────────────────────────────┤
-│ scripts/gen_oracle.py + tests/fixtures/*.npz (committed blobs)         │
-│   v3 NEW: umap-learn oracle (property gate), hdbscan oracle (labels)   │
-└──────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  mlrs-py        PyO3 #[pyclass] estimators (src/estimators/*.rs)            │
+│                 + pure-Python sklearn shim (python/mlrs/*.py)               │
+│                 + NEW: python/mlrs/accel/  (pure-Python import-hook proxy)  │
+├──────────────────────────────────────────────────────────────────────────┤
+│  mlrs-algos     sklearn-compatible estimators assembled from prims         │
+│                 (linear/ cluster/ decomposition/ … + NEW ensemble/ tree/   │
+│                  fil/ tsa/ explainer/ genetic/)  — builder/typestate        │
+├──────────────────────────────────────────────────────────────────────────┤
+│  mlrs-backend   prim host-orchestrators over BufferPool/PoolStats          │
+│                 (distance/ topk/ svd/ … + NEW tree_hist/ best_split/        │
+│                  node_partition/ tree_traverse/ batched_kalman/ program_eval)│
+├──────────────────────────────────────────────────────────────────────────┤
+│  mlrs-kernels   feature-free #[cube(launch)] kernels, generic over F+runtime│
+│                 (distance/ topk/ reduce/ … + NEW tree.rs/ kalman.rs/        │
+│                  program.rs)  — cpu-MLIR-safe GATHER idiom ONLY             │
+├──────────────────────────────────────────────────────────────────────────┤
+│  mlrs-core      device arrays, BufferPool, Arrow bridge, ORACLE HARNESS     │
+│                 (compare/ label_perm/ sign_flip/ tolerance + NEW tree/SHAP  │
+│                  comparison helpers)                                        │
+└──────────────────────────────────────────────────────────────────────────┘
+        ▲ ActiveRuntime feature-selected once: cuda(compile) / rocm(f32) / wgpu / cpu(f64)
 ```
 
-The dependency arrows are **acyclic and unchanged**. Every algorithm addition is a *new file + a `pub mod`/`pub use` line* in the relevant crate root. The single shared-edit points stay `mlrs-py/src/lib.rs` (pyclass registration) and the family-module `mod.rs` files. The builder retrofit is the ONE v3 work item that touches existing estimator files broadly — see §Pattern 3 and the build-order sequencing.
+The architectural rule that dominates v4.0: **a compute primitive is validated standalone (feature-free, GATHER idiom, cpu-MLIR-safe, oracle-gated) in mlrs-kernels+mlrs-backend BEFORE any mlrs-algos estimator consumes it.** This is the primitive-first discipline that made v1/v2/v3 estimators "mostly assembly." v4.0's hard new primitives all live in the tree family and ARIMA.
 
-### Component Responsibilities (v3 deltas only)
+### Component Responsibilities (v4.0 additions)
 
-| Component | Responsibility | Implementation |
-|-----------|----------------|----------------|
-| `prims/knn_graph.rs` | Build the shared (indices, distances) KNN graph + symmetrize; the single feasibility-critical prim | distance → topk → host/device symmetrize; feature-free, GATHER idiom |
-| `prims/umap_layout.rs` | The new neg-sampling SGD layout solver (the one genuinely new UMAP kernel) | host epoch/edge-sampling loop + per-edge attract/repel device update (GATHER, single-owner) |
-| `prims/mutual_reach.rs` | Mutual-reachability distance for HDBSCAN | core-dist (= k-th col of KNN dist) + pairwise max; reuses topk/distance |
-| `prims/mst.rs` (HOST) | Minimum spanning tree over mutual-reach (Prim's) | pure host CPU loop — pointer-chasing, NOT on device |
-| `prims/condense.rs` (HOST) | Condensed tree + stability extraction | pure host CPU — recursive tree walk, NOT on device |
-| `manifold/umap.rs` | UMAP estimator: KNN→fuzzy set→init→optimize | composes knn_graph + (eig\|rng) init + umap_layout |
-| `cluster/hdbscan.rs` | HDBSCAN estimator: mutual-reach→MST→condense→extract | composes mutual_reach (device) + mst/condense (host) |
-| builder convention | Idiomatic Rust `Estimator::builder().setter().build()?` across all 30+ estimators | a `derive`-or-macro standard generalizing the Phase-10 `*Builder` precedent |
+| Component | Responsibility | Crate / lands-in | NEW or MODIFIED |
+|-----------|----------------|------------------|-----------------|
+| Tree histogram prim | Per-node × per-feature × per-bin gradient/count histograms via single-owner GATHER (no atomics, no SharedMemory) | mlrs-kernels `tree.rs` + mlrs-backend `prims/tree_hist.rs` | **NEW (spike-gated)** |
+| Best-split reduction prim | Per-node argmax over (feature, bin) of the split-gain objective (gini/entropy/mse) | mlrs-kernels `tree.rs` + mlrs-backend `prims/best_split.rs` | **NEW (spike-gated)** |
+| Node-partition prim | Stable partition of a node's sample-index range into left/right child ranges under the chosen split | mlrs-kernels `tree.rs` + mlrs-backend `prims/node_partition.rs` | **NEW (spike-gated)** |
+| Quantile/bin-edge prim | Per-feature bin boundaries (quantile sketch) computed once before tree build | mlrs-backend `prims/quantiles.rs` (reuses `topk`/`reduce`/sort) | **NEW** |
+| Tree node store + traversal (FIL) | Flat `SparseTreeNode{colid, threshold, left_child, value}` array; batched root→leaf traversal kernel | mlrs-kernels `tree.rs::traverse` + mlrs-backend `prims/tree_traverse.rs` | **NEW (depends on tree store)** |
+| DecisionTree core | Level-wise (breadth-first) builder host loop driving the three tree prims | mlrs-algos `tree/` | **NEW (spike-gated)** |
+| RandomForest estimator | Bagging/feature-subsampling over N decision trees; majority/mean aggregate | mlrs-algos `ensemble/` | **NEW (spike-gated)** |
+| Batched Kalman prim | Sequential state-space recursion (one unit per series, sequential time loop), returns log-likelihood + residuals | mlrs-kernels `kalman.rs` + mlrs-backend `prims/batched_kalman.rs` | **NEW** |
+| Batched L-BFGS | Many independent small optimizations (one per series/order) sharing the v1 L-BFGS prim | mlrs-backend `prims/lbfgs.rs` (MODIFY: batched wrapper) | **MODIFIED** |
+| ARIMA / AutoARIMA estimator | Kalman-likelihood objective under batched L-BFGS + (Auto) order search host loop | mlrs-algos `tsa/` | **NEW** |
+| Kernel/Permutation SHAP | Coalition sampling (host) → many `predict` calls on an existing fitted estimator → weighted linear solve (reuse) | mlrs-algos `explainer/` (+ thin Python) | **NEW (model-agnostic; no new device prim)** |
+| TreeSHAP | Path-dependent expected-value traversal over the tree node store | mlrs-algos `explainer/tree_shap` | **NEW (depends on tree store/FIL)** |
+| Program-eval prim (genetic) | Batch-evaluate a population of stack-programs over the dataset (device fitness) | mlrs-kernels `program.rs` + mlrs-backend `prims/program_eval.rs` | **NEW** |
+| Symbolic regression estimator | Host-driven evolutionary loop (selection/crossover/mutation on expression trees), device-evaluated fitness | mlrs-algos `genetic/` | **NEW** |
+| sklearn-utility surface | metrics / preprocessing / feature_extraction / model_selection | mostly **Python** `python/mlrs/`; light-device pieces reuse `reduce`/`distance` prims | **NEW (mostly host)** |
+| cuml.accel drop-in | sys.modules import-hook proxy mapping sklearn/umap/hdbscan classes → existing mlrs estimators with CPU fallback | **pure-Python** `python/mlrs/accel/` | **NEW (zero Rust/PyO3)** |
+| Oracle harness extensions | Tree-structure / forest-prediction comparison; SHAP-value tolerance; gplearn/shap/statsmodels oracles | mlrs-core `oracle.rs` + `scripts/gen_oracle.py` | **MODIFIED** |
 
 ---
 
-## Integration Points — new vs modified vs reused, per feature
+## The spike's central question — GPU tree construction under cpu-MLIR
 
-### Feature 1 — KNN-graph primitive (the shared, feasibility-critical prim)
+This is the make-or-break feasibility question and the gating first phase (model it on Phase 13's KNN-graph keystone). The spike must produce **VALIDATED verbatim kernel shapes** (à la spike 001/002) captured into a `spike-findings-mlrs`-style skill, and either GREEN-light the tree family or trigger scope adjustment.
 
-**This is the keystone. Land it standalone with its own gate test BEFORE UMAP/HDBSCAN consume it** (primitive-first discipline; the v1/v2 pattern where the prim is gated and the estimator is "mostly assembly").
+### Why cuML's approach does not port
 
-| Aspect | Disposition | Detail |
-|---|---|---|
-| Pairwise distance | **REUSE** | `prims/distance.rs::distance` (squared, order-preserving) — already validated. |
-| k-NN selection | **REUSE** | `prims/topk.rs::top_k(dist, rows, cols, k, sqrt, ...)` returns `(distances F, indices u32)` per query row, lowest-index tie-break, optional boundary-sqrt. **This IS the NearestNeighbors prim.** |
-| Self-exclusion / k+1 | **NEW (host glue)** | When the graph is over the training set itself, request `k+1` and drop the self-column (the precedent already lives in the spectral kNN-connectivity builder). |
-| Symmetrization | **NEW** | A small symmetrize step producing the union/intersection graph that BOTH consumers need. **Device path:** a `knn_graph_symmetrize` elementwise/scatter map over a dense `n×n` working buffer at v3 oracle sizes (GATHER-safe: single-owner write per output cell, no atomics). **Host path fallback:** build the COO/CSR adjacency on host from the read-back `(indices, distances)` when `n` is large enough that dense `n×n` is wasteful — flag the size cutoff in PITFALLS. |
-| Output contract | **NEW (the shared seam)** | Return BOTH `indices (n×k, i32)` AND `distances (n×k, F)` in the **un-symmetrized neighbor-list form** plus a **symmetrized weighted-graph form** (COO triplets `(row, col, weight)` or dense `n×n`). UMAP needs the symmetrized *fuzzy union* (probabilistic t-conorm `a + b − a·b`); HDBSCAN needs the raw `(indices, distances)` to compute core-distance + mutual reachability. **Contract: emit the neighbor-list `(idx, dist)` as the primitive output; let each estimator apply its own edge-weighting** (UMAP fuzzy-set vs HDBSCAN mutual-reach). The symmetrize helper is a shared utility both call. |
+cuML's `batched-levelalgo` builder (`cuml-main/cpp/src/decisiontree/batched-levelalgo/`) is the canonical GPU decision tree. Its histogram kernel (`builder_kernels_impl.cuh`) uses **`__shared__` memory + `atomicAdd`**: each thread reads one sample, computes its bin, and **scatter-adds** into a shared per-(node,feature,bin) histogram. cpu-MLIR (`cubecl-cpu` 0.10) **bans both `SharedMemory` and cross-unit `Atomic`** (project memory: panics at launch). The entire histogram strategy must be inverted.
 
-**Device/host split (the cpu-MLIR answer):**
-- **Device:** distance (reuse), top-k select (reuse — already proven on cpu-MLIR), and the symmetrize map (new, single-owner GATHER write per cell — no SharedMemory, no cross-unit atomics).
-- **Host:** the k+1/self-drop bookkeeping and the choice of dense-vs-COO representation. No pointer-chasing here — the KNN graph is *embarrassingly parallel per query row*, so it is fully GATHER-idiom-compatible. **This prim is feature-free and standalone-gateable**, exactly like the v2 prims.
+### The GATHER inversion the spike must prove
 
-**Is it feature-free?** YES. It is `distance` + `topk` + a symmetrize map, all generic over `<F: Float + CubeElement + Pod>` and over runtime, no backend feature. Its gate test is a `tests/knn_graph_test.rs` with PoolStats memory gate + a sklearn `kneighbors_graph` oracle (the connectivity/distances are 1e-5-comparable since selection is deterministic).
+The proven mlrs idiom (Phase 13 `self_drop_gather`, all v2 prims) is **single-owner GATHER**: assign exactly one unit to each *output* slot; that unit *loops over inputs and accumulates locally*, so there is never a contended write. Applied to tree histograms:
 
-### Feature 2 — UMAP
+- **Scatter (cuML, banned):** one unit per *sample* → `atomicAdd(hist[bin(sample)])`. Contended writes → needs atomics.
+- **Gather (mlrs, the hypothesis to prove):** one unit per *(node, feature, bin)* output cell → loop over the node's sample-index range, count/sum the samples whose feature value falls in this bin. Each output cell is written by exactly one owner — **no atomics, no shared memory**. This is the `CUBE_POS_X`/`UNIT_POS_X==0`-style per-output-row shape that already lowers under cpu-MLIR.
 
-UMAP = KNN graph → fuzzy simplicial set → low-dim init → SGD layout optimization.
+The spike must concretely answer, each with a launched-under-`--features cpu` VALUE-asserting probe (not compile-only):
 
-| Stage | Disposition | Detail |
-|---|---|---|
-| KNN graph | **REUSE (Feature 1)** | `knn_graph` prim provides `(indices, distances)`. |
-| Fuzzy simplicial set | **NEW (mostly host + small device map)** | Per-point: find ρ (distance to nearest neighbor) + binary-search σ for the local connectivity target (host loop, like the LR-schedule host arithmetic in `sgd.rs`); membership strength `exp(−(d−ρ)/σ)` is a small elementwise device map (new `umap_fuzzy_map` kernel, GATHER-safe). Symmetrize via the probabilistic t-conorm (reuse the Feature-1 symmetrize helper with the fuzzy-union weight). |
-| Low-dim init | **REUSE — with a hard caveat** | Spectral init = smallest nontrivial eigenvectors of the graph Laplacian → **reuse `prims/laplacian.rs` + `prims/eig.rs` (the v2 spectral path verbatim)**. **CAVEAT:** the Jacobi `eig` prim has `MAX_DIM` (= 64, per `jacobi_eig`); the spectral estimators already cap `n_samples > MAX_DIM`. Dense Jacobi eig does NOT scale to UMAP-sized graphs. **Recommendation: ship `init="random"` (reuse `prims/rng.rs`) as the DEFAULT correctness path, and offer `init="spectral"` only under the eig `MAX_DIM` cap** — flag the size limit loudly in PITFALLS (Lanczos/sparse-eig is deferred, same call as v2). This keeps UMAP runnable at realistic sizes without a new eigensolver. |
-| SGD layout optimization | **NEW kernel — does NOT reuse the two-pass SGD solver** | The v2 `prims/sgd.rs` is a *supervised linear-model* solver (per-sample margin → weight update over a fixed coef vector). UMAP layout is a *fundamentally different* update: **edge-sampled attractive forces + negative-sampled repulsive forces over the embedding coordinate matrix**, with per-epoch learning-rate decay. The host loop shape (epoch loop + LR schedule + per-batch device launch) is the SAME orchestration pattern as `sgd.rs`/`lbfgs.rs`, but the device kernel is new: `umap_layout_step` applying attract/repel gradient to embedding rows. **Build it as `prims/umap_layout.rs` with a new `umap_layout_step` kernel.** Negative sampling = host-drawn negative indices (reuse `prims/rng.rs` SplitMix64) fed to the GATHER kernel (single-owner update per embedding row — no atomics; this is the cpu-MLIR feasibility question to spike). |
+1. **Histogram (the crux).** Does the single-owner gather histogram — one unit per (node,feature,bin), inner `while` over the node's sample range, `if value < edge[b] && value >= edge[b-1] { acc += 1 / acc_grad += g }` — lower under cpu-MLIR and match a host reference on a duplicate-/tie-heavy fixture? Confirm both classification (count + per-class counts) and regression (sum + sum-of-squares / sum-of-gradients) accumulators. **Open risk:** the per-cell scan is O(bins × samples) work where cuML's scatter is O(samples); the spike must also confirm this is *tractable* (tiled over node-batch), not just correct.
+2. **Best-split reduction.** Does a per-node argmax over (feature × bin) of the split-gain (gini/entropy for classification, MSE/variance-reduction for regression) — statement-form running-max with a `u32` best-index accumulator, read within the same outer iteration (the 002-B landmine: NO cross-sibling-loop accumulator) — lower and select the lowest-index tie correctly?
+3. **Node partition.** Does a stable left/right partition of a node's sample-index slice (single-owner: one unit per node computes the two contiguous child ranges by a counted two-pass — count-left, then place — never a cross-loop carry) lower under cpu-MLIR? This is the "scan/compaction" shape; the spike must find the GATHER-safe form (likely per-node sequential placement, like `self_drop_gather`).
+4. **Level-wise host loop.** Does the breadth-first driver (process a *batch* of frontier nodes per level, launch hist→split→partition, append children, recurse) compose without ever materializing a per-sample×per-node structure that blows the PoolStats memory gate? (Quantile bin-edges are precomputed once; histograms are node-batch × bins × features × outputs, tiled.)
+5. **Node storage format.** Confirm the flat node array works: `SparseTreeNode { colid: u32, threshold: F, left_child: i32 (-1 = leaf), value: F or class-logits }`, right child = `left_child + 1` (cuML `flatnode.h` convention). One contiguous `DeviceArray` per tree; the forest is a concatenation + per-tree offset table. This format is the **contract between RF (writer), FIL (batched reader), and TreeSHAP (path reader)** — fixing it is part of the spike.
 
-**Data flow:** `X → knn_graph(X,k) → (idx, dist) → fuzzy_set (host σ/ρ + device map + symmetrize) → init (rng default | eig under cap) → umap_layout_step × epochs → embedding_`.
-
-**Device/host split:** device = distance, topk, fuzzy map, symmetrize, layout step; host = σ/ρ binary search, edge/negative sampling schedule, LR decay, epoch loop. **The layout step's per-row single-owner GATHER update under cpu-MLIR is the MEDIUM-confidence item — spike it before planning the UMAP phase** (precedent: the v2 SGD solver launched on cpu-MLIR first try, which is encouraging).
-
-**Correctness gate:** stochastic layout → NOT element-wise 1e-5. Property/structural gate à la RandomProjection (D-12): trustworthiness/continuity metric vs `umap-learn`, k-NN preservation in the embedding, seed-reproducibility. Oracle broadens to `umap-learn`.
-
-### Feature 3 — HDBSCAN
-
-HDBSCAN = mutual-reachability → MST → condensed cluster tree → stability extraction.
-
-| Stage | Disposition | Detail |
-|---|---|---|
-| KNN graph / core distance | **REUSE (Feature 1)** | Core distance of point i = distance to its k-th neighbor = the k-th column of `knn_graph` distances. Pure reuse. |
-| Mutual-reachability distance | **NEW (small device map)** | `mreach(a,b) = max(core_a, core_b, d(a,b))`. A small elementwise map over the (dense or neighbor-list) distance graph — `prims/mutual_reach.rs` with a `mutual_reach_map` kernel (GATHER-safe, no atomics). |
-| **MST construction** | **NEW — HOST-SIDE (Prim's / Boruvka)** | This is the inherently sequential / pointer-chasing stage. **Prim's algorithm over the mutual-reach graph runs on the HOST** (read the mutual-reach graph back once, build the MST in a CPU loop). GPU Boruvka needs atomics for the parallel edge-contraction and fights the cpu-MLIR no-atomics constraint head-on — **do NOT attempt on-device MST in v3.** cuML uses a GPU MST (raft); mlrs deliberately stays host here. Feasible because at v3 oracle sizes the MST is cheap and the device→host read-back is a one-time cost. |
-| Condensed tree + stability | **NEW — HOST-SIDE** | Building the single-linkage hierarchy from the MST, condensing it (min_cluster_size), and computing per-cluster stability is a recursive tree walk — pure host CPU. NOT on device (pointer-chasing, no parallelism win, no atomics available). |
-| Label extraction (EOM) | **NEW — HOST-SIDE** | Excess-of-mass cluster selection from the condensed tree → final labels (`-1` noise sentinel, already representable in the `i32` `PredictLabels` contract). Host. |
-
-**Data flow:** `X → knn_graph(X,k) → core_dist (k-th col) → mutual_reach (device map) → [READ BACK] → MST (host Prim's) → single-linkage tree (host) → condense (host) → stability/EOM (host) → labels_`.
-
-**Device/host split (the cpu-MLIR answer):** **device = only the embarrassingly-parallel front half** (distance, topk, mutual-reach map); **host = the entire tree half** (MST, condensation, stability, extraction). This is the correct split *regardless* of backend — the tree algorithms have no data-parallel structure to exploit and the no-atomics constraint makes a GPU MST infeasible in v3. HDBSCAN is therefore a "device front-end, host tree back-end" estimator. The host code is plain Rust (`Vec`/union-find), no CubeCL.
-
-**Correctness gate:** exact labels up to permutation (the hard gate), oracle = `hdbscan` / `sklearn.cluster.HDBSCAN`. Reuse the v1 `label_perm` helper.
-
-### Feature 4 — Rust-native builder-pattern API
-
-**Critical finding: the builder pattern is ALREADY PARTIALLY SHIPPED.** Phase 10 (`linear/mod.rs`) and Phase 11 (`naive_bayes/mod.rs`) INTRODUCED `Estimator::builder().setter(..).build() -> Result<_, BuildError>` for high-arity estimators, with `BuildError` already defined in `mlrs-algos/src/error.rs`. The v1 low-arity estimators (LogisticRegression, LinearRegression, Ridge, PCA, KMeans, NN…) still use `new(...)` / `with_opts(...)` and were **deliberately NOT retrofitted (D-02)**. So v3 work is: (a) elevate the existing ad-hoc per-estimator `*Builder` structs into ONE shared convention, (b) add typestate, (c) retrofit the ~24 estimators that don't have a builder yet.
-
-| Aspect | Disposition | Detail |
-|---|---|---|
-| Where it lives | **mlrs-algos** (NOT mlrs-core) | The builder is an estimator-construction concern; `mlrs-core` holds only float/oracle/error infra and must stay estimator-agnostic. Put the convention next to `traits.rs` in `mlrs-algos` — a `builder` module (a `derive` macro or a small declarative `builder!` macro + a shared `BuildError`, which already exists). It does NOT belong in `mlrs-backend` (no estimators there) or `mlrs-core`. |
-| Typestate (Unfit→Fitted) | **NEW** | Two designs are viable. **(A) Type-level typestate:** `Estimator<F, Unfit>` → `fit` returns `Estimator<F, Fitted>`; predict/transform only impl'd on `Fitted`. Clean but multiplies the generic surface and complicates the PyO3 enum. **(B) Runtime fitted-flag (recommended for v3):** keep the single `Estimator<F>` struct, `build()` produces it Unfit, fitted attributes are `Option<DeviceArray>` (already the shipped pattern — see `gaussian_nb.rs` `theta_: None`), accessors/predict return `AlgoError::NotFitted` if `None`. **Recommendation: runtime fitted-flag** — it matches the shipped device-resident-`Option` state pattern, keeps the `any_estimator!` enum unchanged, and the *typestate guarantee surfaces in the Python shim* via `check_is_fitted`/`NotFittedError` (already wired in `MlrsBase`). Type-level typestate is gold-plating that fights the PyO3 `Unfit/F32/F64` enum. |
-| Coexistence with `any_estimator!` | **REUSE — no conflict** | The PyO3 `any_estimator!` enum already has an `Unfit { hyperparameters }` arm. The Rust builder produces the *Rust* `Estimator<F>` that lands in the `F32(..)`/`F64(..)` arms after fit; the PyO3 `#[new]` keeps storing sklearn-named hyperparameters into the enum's `Unfit` arm. **The builder is the Rust-native front door; the PyO3 enum is the Python front door; both construct the same `Estimator<F>`.** No machinery change to dispatch.rs. |
-| Coexistence with sklearn-mirror ctors | **MODIFIED (keep both)** | Keep `new`/`with_opts` as thin wrappers over `builder().…build().unwrap()` for backward compat, OR deprecate them. **Recommendation: builder is canonical; `new` becomes `builder().build().expect("defaults valid")` for the zero-required-arg estimators** so existing call sites and tests keep compiling. |
-| Sequencing | **CONVENTION FIRST, retrofit as a sweep** | Establish the shared builder convention + typestate decision in an EARLY v3 phase so the NEW v3 estimators (UMAP/HDBSCAN) are *born with it*. Retrofit the existing 30 as a dedicated sweep phase. See build order. |
-
-### Feature 5 — Pure-Python sklearn shim
-
-**Critical finding: the shim ALREADY EXISTS and is shipped** (`crates/mlrs-py/python/mlrs/{base,linear,cluster,decomposition,neighbors,covariance,random_projection}.py`). `MlrsBase` subclasses sklearn `BaseEstimator` directly, giving `get_params`/`set_params`/`clone`/`__repr__` for free, plus `_normalize`/`_to_output` IO routing, `_check_fitted` (→ `NotFittedError`), and a `__sklearn_tags__` override. The PROJECT.md "shim not built / carried-forward" note refers specifically to **`check_estimator` live-FFI re-triage** (needs a maturin+pyarrow host this env lacks — deferred), NOT the shim package.
-
-| Aspect | Disposition | Detail |
-|---|---|---|
-| Where it sits | **REUSE** | Above the PyO3 `_mlrs` extension (`from . import _io`; estimators call `_ext().PyX(...)`). It sits in `mlrs-py/python/mlrs/`, packaged INTO each of the four per-backend wheels (the shim is pure-Python and backend-agnostic; the `_mlrs` cdylib differs per wheel). |
-| v3 additions | **NEW (assembly only)** | `python/mlrs/manifold.py` (UMAP — `TransformerMixin`, `fit_transform` primary, `embedding_`) and add HDBSCAN to `cluster.py` (`ClusterMixin`, `labels_`, `-1` noise). UMAP and HDBSCAN get PyO3 `#[pyclass]` wrappers (`estimators/manifold.rs`, extend `cluster.rs`) registered in `lib.rs`. No new shim machinery — `MlrsBase` covers dtype-suffix routing + output mirroring already. |
-| `check_estimator` / get/set_params | **REUSE + extend coverage** | `get_params`/`set_params` come free from `BaseEstimator` given the `__init__`-purity rule (already enforced). Extend the existing `test_params.py`/`test_estimator_checks.py` to the new estimators. Live `check_estimator` triage stays deferred (no maturin+pyarrow host). |
+**If the spike fails** (histogram/split cannot be made both correct AND tractable under cpu-MLIR): the documented fallbacks, in preference order, are (a) **CPU-side host tree build** (build trees on the host in plain Rust, keep only FIL inference on device — sacrifices "single generic codebase" for trees but preserves the inference path and the surface); (b) restrict to small-data exact trees; (c) drop the tree family from v4.0 and re-scope (PROJECT.md explicitly allows "scope adjusts before committing"). The spike's deliverable is the GREEN/RED decision plus, if GREEN, the verbatim kernel shapes.
 
 ---
 
-## Recommended Project Structure (v3 deltas)
+## Recommended Project Structure (v4.0 additions only)
 
 ```
-crates/
-├── mlrs-kernels/src/
-│   ├── knn_graph.rs        # NEW: symmetrize map kernel
-│   ├── umap_layout.rs      # NEW: umap_layout_step (attract/repel GATHER)
-│   ├── mutual_reach.rs     # NEW: mutual_reach_map (small elementwise)
-│   └── elementwise.rs      # MODIFY: + umap_fuzzy_map
-├── mlrs-backend/src/prims/
-│   ├── knn_graph.rs        # NEW: distance→topk→symmetrize (the shared prim)
-│   ├── umap_layout.rs      # NEW: host epoch/neg-sample loop + layout kernel
-│   ├── mutual_reach.rs     # NEW: core-dist + mutual-reach (device front-end)
-│   ├── mst.rs              # NEW: HOST Prim's (no kernel — pointer-chasing)
-│   └── condense.rs         # NEW: HOST condensed-tree + stability (no kernel)
-├── mlrs-algos/src/
-│   ├── builder.rs          # NEW: shared builder convention + typestate
-│   ├── manifold/umap.rs    # NEW: UMAP estimator
-│   ├── cluster/hdbscan.rs  # NEW: HDBSCAN estimator
-│   └── {all 30 estimators} # MODIFY (retrofit sweep): builder + fitted-flag
-└── mlrs-py/
-    ├── src/estimators/manifold.rs  # NEW: PyUMAP
-    ├── src/estimators/cluster.rs   # MODIFY: + PyHDBSCAN
-    ├── src/lib.rs                  # MODIFY: register PyUMAP/PyHDBSCAN
-    └── python/mlrs/
-        ├── manifold.py             # NEW: UMAP shim (TransformerMixin)
-        └── cluster.py              # MODIFY: + HDBSCAN (ClusterMixin)
+crates/mlrs-kernels/src/
+├── tree.rs              # NEW: gather-histogram, split-gain-reduce, node-partition,
+│                        #      batched root→leaf traverse (FIL)  — cpu-MLIR-safe
+├── kalman.rs            # NEW: per-series sequential state-space recursion (one unit/series)
+├── program.rs           # NEW: stack-program batch evaluator (genetic fitness)
+└── lib.rs               # MODIFY: pub mod + pub use of new kernel symbols
+
+crates/mlrs-backend/src/prims/
+├── quantiles.rs         # NEW: per-feature bin edges (sort/reduce reuse) — pre-pass for trees
+├── tree_hist.rs         # NEW: histogram prim (host launch wrapper, node-batch tiled)
+├── best_split.rs        # NEW: best-split reduction prim
+├── node_partition.rs    # NEW: partition prim
+├── tree_traverse.rs     # NEW: FIL batched-inference prim over the node store
+├── batched_kalman.rs    # NEW: ARIMA likelihood/residual prim
+├── program_eval.rs      # NEW: genetic fitness prim
+├── lbfgs.rs             # MODIFY: add a batched wrapper (many small independent solves)
+└── mod.rs               # MODIFY: pub mod the new prims
+
+crates/mlrs-algos/src/
+├── tree/                # NEW: DecisionTree core (level-wise builder host loop) + node store type
+├── ensemble/            # NEW: RandomForestClassifier + RandomForestRegressor (bagging)
+├── fil/                 # NEW: forest inference (predict/predict_proba over node store)
+├── tsa/                 # NEW: ARIMA + AutoARIMA (Kalman objective + batched L-BFGS + order search)
+├── explainer/           # NEW: kernel_shap, permutation_shap, tree_shap
+├── genetic/             # NEW: SymbolicRegressor (host evolutionary loop, device fitness)
+└── lib.rs               # MODIFY: register new modules
+
+crates/mlrs-py/src/estimators/
+├── ensemble.rs          # NEW: #[pyclass] RandomForest*  (f32/f64 dispatch, GIL release)
+├── tsa.rs               # NEW: #[pyclass] ARIMA / AutoARIMA
+├── explainer.rs         # NEW: #[pyclass] KernelExplainer / PermutationExplainer / TreeExplainer
+├── genetic.rs           # NEW: #[pyclass] SymbolicRegressor
+└── mod.rs               # MODIFY: register new estimator arms in any_estimator!/dispatch
+
+crates/mlrs-py/python/mlrs/
+├── ensemble.py          # NEW shim          ├── tsa.py            # NEW shim
+├── fil.py               # NEW shim          ├── explainer.py      # NEW shim
+├── genetic.py           # NEW shim
+├── metrics.py           # NEW (mostly host) ├── preprocessing.py  # NEW (light-device)
+├── feature_extraction.py# NEW (mostly host) ├── model_selection.py # NEW (pure host)
+├── accel/               # NEW pure-Python subpackage (import-hook proxy)
+│   ├── __init__.py      #   install()/uninstall() — sys.modules swap
+│   ├── _hook.py         #   MetaPathFinder / module proxy machinery
+│   └── _overrides.py    #   { "sklearn.ensemble.RandomForestClassifier": mlrs.RandomForestClassifier, … }
+└── __init__.py          # MODIFY: re-export the new estimators + utility namespaces
+
+crates/mlrs-core/src/
+└── oracle.rs            # MODIFY: tree/forest-prediction & SHAP-value comparison helpers
+scripts/gen_oracle.py    # MODIFY: sklearn RF, statsmodels/sklearn ARIMA, shap, gplearn fixtures
 ```
 
 ### Structure Rationale
 
-- **`mst.rs`/`condense.rs` live in `mlrs-backend/src/prims/` but contain NO CubeCL** — they are host-side algorithm primitives. Placing them under `prims/` keeps the "estimators compose prims, never implement algorithm internals" discipline (D-13) intact: HDBSCAN's `cluster/hdbscan.rs` composes `mutual_reach` (device) + `mst` + `condense` (host) prims, it does not inline a Prim's loop.
-- **`builder.rs` in mlrs-algos, not mlrs-core** — keeps `mlrs-core` estimator-agnostic; the builder is an estimator-construction concern co-located with `traits.rs`.
+- **All hard compute lands in mlrs-kernels + mlrs-backend first** (tree.rs, kalman.rs, program.rs and their prim wrappers) so it is standalone-validated before any estimator imports it. The three tree prims (hist/split/partition) are the spike's deliverables promoted to production prims.
+- **mlrs-algos mirrors cuML's module names** (`ensemble/`, `fil/`, `tsa/`, `explainer/`, `genetic/`) — consistent with the existing `cluster/`, `manifold/`, etc., and with the codebase map's "where to add new code."
+- **The tree node store is a first-class type in `mlrs-algos/src/tree/`**, owned by the tree builder, *read* by `fil/` and `explainer/tree_shap`. This is the single integration contract for the RF→FIL→TreeSHAP chain.
+- **cuml.accel is pure Python, parallel to the family shims** — it imports the *already-sklearn-subclassing* mlrs estimators (every shim extends `MlrsBase(BaseEstimator)`) and swaps them into `sys.modules`. It needs **zero** Rust/PyO3/kernel work; it is a Python-only subsystem layered over the surface that already exists. CPU fallback = leave the real sklearn/umap/hdbscan class in place when mlrs has no equivalent or the config is unsupported.
+- **The utility surface is mostly host Python.** metrics (accuracy/r2/pairwise) and model_selection (train_test_split/cross_val_score/KFold) are numpy/host; preprocessing scalers (StandardScaler/MinMax) are the only ones wanting a light-device pass and they reuse the existing `reduce` prim — almost no new kernels.
 
 ---
 
 ## Architectural Patterns
 
-### Pattern 1: Device front-end, host tree back-end (HDBSCAN)
+### Pattern 1: Single-owner GATHER histogram (the v4.0 keystone kernel)
 
-**What:** Run the embarrassingly-parallel, GATHER-friendly stages (distance, topk, mutual-reach) on device; read back once; run the inherently-sequential tree stages (MST, condense, stability) on the host in plain Rust.
-**When to use:** Any algorithm whose back half is pointer-chasing / recursive with no data-parallel structure, under the cpu-MLIR no-atomics constraint.
-**Trade-offs:** One device→host read-back (cheap at v3 sizes); avoids the infeasible GPU-MST atomics problem entirely; the host code is simple, testable Rust. The cost is it won't scale to millions of points without a GPU MST (deferred, same posture as cuML's raft MST which mlrs deliberately does not port in v3).
+**What:** Invert cuML's atomic scatter into a per-output-cell gather. One unit owns one (node, feature, bin) cell and loops over the node's samples, accumulating locally. No shared memory, no atomics — the only cpu-MLIR-safe way to build histograms.
+**When to use:** All tree histogram construction (classification counts + per-class, regression sum/sum-sq or gradient/hessian).
+**Trade-offs:** Correctness & cpu-MLIR-safety vs O(bins × samples) redundant reads (cuML's scatter is O(samples)). Mitigate by node-batch tiling and precomputed integer bin indices. **This is the spike's tractability risk.**
 
-### Pattern 2: Reuse the topk/distance prims as the KNN graph (no new neighbor prim)
-
-**What:** The KNN graph IS `distance → top_k` (already shipped + cpu-MLIR-proven) plus a symmetrize map. Do not build a new neighbor search.
-**When to use:** Both UMAP and HDBSCAN front-ends.
-**Trade-offs:** Dense `n×n` distance at v3 oracle sizes is fine (same as the kernel-matrix prim); approximate-NN (NN-Descent, like umap-learn's default) is deferred — flag the exact-vs-approximate divergence in PITFALLS since umap-learn uses approximate KNN.
-
-### Pattern 3: Builder convention generalizing the Phase-10 precedent
-
-**What:** Promote the per-estimator `*Builder` structs (shipped for the 9 Phase-10/11 estimators) into ONE shared convention — a `derive`/macro that emits `builder()` + setters + `build() -> Result<_, BuildError>`, reusing the existing `BuildError` enum.
-**When to use:** All estimators; new v3 estimators adopt it from birth.
-**Trade-offs:** A retrofit sweep touches ~24 existing files (the one broad-edit work item in v3 — schedule it as its own phase, not interleaved with algorithm phases, to keep waves feature-disjoint). Runtime fitted-flag (not type-level typestate) keeps the PyO3 enum unchanged.
-
-**Example (the shipped builder shape to generalize):**
 ```rust
-// Already shipped in gaussian_nb.rs — generalize this into builder.rs:
-GaussianNB::builder().priors(p).var_smoothing(1e-9).build::<f32>()?  // -> GaussianNB<f32>, Unfit
+// SHAPE TO PROVE in the spike (cpu-MLIR-safe; NOT yet validated):
+//   one unit per (node, feature, bin) output cell; inner while over node's samples.
+#[cube(launch)]
+pub fn gather_hist<F: Float + CubeElement>(
+    binned: &Array<u32>,        // per-(sample,feature) precomputed bin index
+    sample_idx: &Array<u32>,    // node's sample-index slice (gather, not contiguous)
+    node_start: &Array<u32>, node_len: &Array<u32>,
+    out_count: &mut Array<u32>, // [node, feature, bin]
+    n_feat: u32, n_bins: u32, /* … */
+) {
+    let cell = ABSOLUTE_POS_X;                 // one owner per output cell
+    // decode (node, feat, bin) from cell; bounds-guard
+    let mut acc = 0u32;
+    let mut s = 0u32;
+    while s < len {                            // loop over THIS node's samples
+        let smp = sample_idx[(start + s) as usize];
+        if binned[(smp * n_feat + feat) as usize] == bin { acc += 1u32; }
+        s += 1u32;
+    }
+    out_count[cell as usize] = acc;            // single writer — no atomic
+}
 ```
 
-### Pattern 4: Host orchestration + GATHER device step (UMAP layout, reusing the sgd.rs shape)
+### Pattern 2: Per-series sequential recursion (ARIMA Kalman)
 
-**What:** The host owns the epoch loop, LR schedule, and edge/negative-index sampling (SplitMix64); the device runs a single-owner per-row update kernel. Same *orchestration shape* as `prims/sgd.rs`/`prims/lbfgs.rs`, but a NEW layout kernel (not the SGD weight-update kernel).
-**When to use:** UMAP layout optimization.
-**Trade-offs:** The per-embedding-row single-owner update is the cpu-MLIR feasibility unknown to spike. Precedent is favorable (the v2 SGD two-pass GATHER solver launched on cpu-MLIR first try).
+**What:** State-space / Kalman recursion is inherently sequential in time but embarrassingly parallel across series. Assign one unit per series; loop the time axis sequentially inside that unit (the `self_drop_gather` per-row shape). Returns log-likelihood + standardized residuals to the host.
+**When to use:** ARIMA likelihood evaluation under the optimizer.
+**Trade-offs:** Parallelism = number of series (fine for AutoARIMA's many-candidate search; a single long series is under-parallel — acceptable, matches cuML's batched design). Host owns the L-BFGS outer loop; device owns the likelihood eval.
+
+```rust
+// one unit per series; sequential time loop — cpu-MLIR-safe (no atomics/shared mem)
+let series = CUBE_POS_X;
+if series < n_series { if UNIT_POS_X == 0u32 {
+    // init state; for t in 0..T { predict; update; accumulate loglik } — F/u32 accumulators only
+}}
+```
+
+### Pattern 3: Host-orchestrated, device-evaluated (SHAP & genetic)
+
+**What:** The *search/sampling* logic stays on the host (Rust); the device is called only to **batch-evaluate** a model or population. Kernel/Permutation SHAP: host samples coalitions → calls the wrapped estimator's existing `predict` → host weighted-least-squares (reuse the v1 solver). Symbolic regression: host runs selection/crossover/mutation on expression trees → device batch-evaluates the population's fitness over the data (`program_eval` prim).
+**When to use:** Any algorithm whose parallelism is "evaluate many candidates," not "one big kernel."
+**Trade-offs:** Simple, reuses existing predict/solve paths, no exotic kernels — but host↔device round-trips per generation/coalition-batch. Keep batches large; never round-trip per individual.
+
+### Pattern 4: Batched-small-solve over the existing L-BFGS prim
+
+**What:** AutoARIMA fits many (p,d,q) candidates; each is a small independent optimization. Rather than a new batched-L-BFGS kernel, wrap the existing `lbfgs` prim in a host loop / batched dispatch — many small problems, shared prim. (cuML uses a true `batched_lbfgs`; mlrs can start host-batched and only build a device-batched variant if profiling demands it.)
+**When to use:** ARIMA/AutoARIMA, any "many small optimizations" estimator.
+**Trade-offs:** Host-batched is simplest and reuses a proven prim; device-batched is a later optimization, not a v4.0 requirement.
+
+### Pattern 5: cuml.accel sys.modules import-hook (pure Python)
+
+**What:** `mlrs.accel.install()` registers a `MetaPathFinder` / swaps `sys.modules` entries so `from sklearn.ensemble import RandomForestClassifier` resolves to the mlrs estimator. An `_overrides` table maps qualified sklearn/umap/hdbscan names → mlrs classes; unmapped names pass through to the real library (CPU fallback). Because every mlrs shim already subclasses `sklearn.base.BaseEstimator` (`MlrsBase`), the proxied objects satisfy `get_params`/`set_params`/`clone`/pipeline usage transparently.
+**When to use:** Drop-in acceleration of existing sklearn scripts without code change.
+**Trade-offs:** Zero compute work — it is *pure plumbing over the estimator surface that already exists*. The risk is behavioral parity (params mlrs doesn't support must fall back, not silently differ). Belongs LAST so it can proxy the full v4.0 surface.
+
+---
 
 ## Data Flow
 
-### KNN-graph → UMAP
+### RF → FIL → TreeSHAP (the gated dependency chain)
+
 ```
-X →[device]→ distance → topk(k+1) →[host]→ self-drop, σ/ρ binary-search
-  →[device]→ fuzzy_map + symmetrize(t-conorm) → init(rng default | eig≤MAX_DIM)
-  →[host loop + device step]→ umap_layout_step × epochs → embedding_
+fit:  X,y ─▶ quantiles prim (bin edges, once)
+              ▼
+        level-wise host loop  ──▶ gather_hist prim ──▶ best_split prim ──▶ node_partition prim
+              ▲  (append children, recurse per frontier-node batch)            │
+              └───────────────────────────────────────────────────────────────┘
+              ▼
+        flat SparseTreeNode store  (per-tree DeviceArray + forest offset table)
+              │  ── the single contract ──────────────────────────────────────┐
+predict:      ▼                                                                ▼
+        FIL tree_traverse prim (batched root→leaf, one unit per (row,tree))   TreeSHAP
+              ▼                                                          (path-dependent
+        aggregate (vote / mean) ─▶ predict / predict_proba               expected-value walk
+                                                                          over the SAME store)
 ```
 
-### KNN-graph → HDBSCAN
+### ARIMA
+
 ```
-X →[device]→ distance → topk → core_dist(k-th col) → mutual_reach_map
-  →[READ BACK]→[host]→ MST(Prim's) → single-linkage → condense → stability/EOM → labels_
+y (n series) ─▶ host L-BFGS (per series / per candidate order)
+                   │  proposes params θ
+                   ▼
+             batched_kalman prim (one unit/series, sequential time) ─▶ loglik, residuals
+                   ▲────────────────────── gradient/value back to optimizer ──┘
+AutoARIMA: stationarity test (host) → enumerate (p,d,q)(P,D,Q) → batched fit → AIC/BIC select
 ```
 
-## Scaling Considerations
+### Kernel/Permutation SHAP (model-agnostic)
 
-| Scale | Architecture Adjustments |
-|-------|--------------------------|
-| v3 oracle sizes (≤ few thousand pts) | Dense `n×n` distance + host MST + dense symmetrize all fine; eig-spectral-init only under `MAX_DIM`=64 cap. |
-| Larger (10k+) | Switch KNN symmetrize to COO/CSR (host); UMAP must use `init="random"` (eig caps out); host MST still OK to ~100k. |
-| Much larger (deferred) | Approximate-NN (NN-Descent), sparse-eig (Lanczos), GPU-MST (atomics — blocked by cpu-MLIR) — all deferred past v3, same posture as v2's Nyström/Lanczos deferrals. |
+```
+fitted estimator + background data ─▶ host: sample coalitions/permutations
+        ─▶ build masked design matrix ─▶ estimator.predict (existing device path, batched)
+        ─▶ host weighted least squares (reuse v1 OLS/solver) ─▶ shap values
+```
 
-### Scaling Priorities
-1. **First bottleneck:** dense `n×n` distance/symmetrize memory → COO/CSR on host.
-2. **Second bottleneck:** spectral-init eig `MAX_DIM` cap → default to random init.
+### Symbolic regression
+
+```
+host: init population (expression trees) ─▶ program_eval prim (batch fitness over X) 
+   ─▶ host: tournament select / crossover / mutate ─▶ next generation ─▶ … ─▶ best program
+```
+
+---
+
+## Build Order (honors primitive-first + spike gate + RF→FIL→TreeSHAP)
+
+> Phase numbering continues from v3.0 (last = Phase 16); v4.0 starts at **Phase 17**. The order puts the RF feasibility spike FIRST as a gate, runs the independent (non-tree) tracks in parallel where the workspace allows, and respects the tree dependency chain.
+
+| # | Phase | Depends on | Crate work | Gate role |
+|---|-------|-----------|------------|-----------|
+| **17** | **RandomForest GPU histogram/split FEASIBILITY SPIKE** (cpu-MLIR, GATHER hist + split + partition + node format) | — | mlrs-kernels probes | **GATING — make-or-break. GREEN/RED before any tree commit.** Models Phase 13. Emits verbatim kernel shapes + node-format contract, captured to a spike-findings skill. |
+| 18 | Tree primitives (quantiles, gather-hist, best-split, node-partition) standalone-validated + DecisionTree core | 17 GREEN | mlrs-kernels `tree.rs`, mlrs-backend prims, mlrs-algos `tree/` | Primitive-first: prims oracle-gated vs sklearn `DecisionTree` BEFORE RF. |
+| 19 | RandomForestClassifier + RandomForestRegressor (+ PyO3 + shim) | 18 | mlrs-algos `ensemble/`, mlrs-py | sklearn RF oracle (exact-label / prediction gate). |
+| 20 | FIL — batched tree traversal over the node store | 18 (node format), 19 (a forest to infer) | mlrs-kernels traverse, mlrs-backend `tree_traverse.rs`, mlrs-algos `fil/` | predict/predict_proba parity. |
+| 21 | TreeSHAP | 20 (FIL/tree store) | mlrs-algos `explainer/tree_shap` | `shap` library oracle. |
+| 22 | ARIMA / AutoARIMA (batched Kalman prim + batched L-BFGS + order search) | independent of trees | mlrs-kernels `kalman.rs`, mlrs-backend `batched_kalman.rs`+`lbfgs` batched, mlrs-algos `tsa/` | Primitive-first: Kalman prim validated before ARIMA. **Can run parallel to 18–21.** |
+| 23 | Kernel + Permutation SHAP (model-agnostic) | needs ≥1 fitted estimator surface (have it) | mlrs-algos `explainer/`, thin Python | `shap` oracle. No new device prim. **Parallel-eligible.** |
+| 24 | sklearn-utility surface (metrics / preprocessing / feature_extraction / model_selection) | mostly independent | mostly Python; light `reduce` reuse for scalers | sklearn parity per-function. **Parallel-eligible.** |
+| 25 | genetic / symbolic regression (program_eval prim + host evolutionary loop) | independent | mlrs-kernels `program.rs`, mlrs-backend `program_eval.rs`, mlrs-algos `genetic/` | `gplearn` oracle. Primitive-first: fitness prim before the loop. **Parallel-eligible.** |
+| 26 | cuml.accel drop-in (pure-Python import-hook) | **the broadest possible estimator surface** | Python-only `python/mlrs/accel/` | LAST so it proxies the full v4.0 + v1–v3 surface; CPU fallback for the rest. |
+
+**Ordering rationale.**
+- **17 gates 18–21.** Nothing in the tree chain is committed until the spike answers the cpu-MLIR histogram/split question. This mirrors how Phase 13 gated UMAP/HDBSCAN.
+- **18 before 19** (primitive-first): hist/split/partition prims are oracle-validated as standalone prims (vs a single sklearn DecisionTree) before RF assembles many of them.
+- **19 before 20 before 21**: FIL needs a forest to traverse and the node-format contract; TreeSHAP needs FIL's tree store. Hard chain.
+- **22 (ARIMA), 23 (model-agnostic SHAP), 24 (utility), 25 (genetic) are independent of the tree spike** and of each other — they can be sequenced in parallel waves or interleaved while the tree chain proceeds. Each still obeys primitive-first internally (Kalman prim → ARIMA; program_eval prim → symbolic regression).
+- **26 (cuml.accel) is last** because its value is proportional to how much surface exists to proxy; building it after every estimator lands maximizes its override table and lets CPU-fallback handle only the genuinely-missing.
+
+---
 
 ## Anti-Patterns
 
-### Anti-Pattern 1: Attempting on-device MST / GPU tree construction in v3
-**What people do:** Try a GPU Boruvka MST or device-side condensed-tree build for HDBSCAN.
-**Why it's wrong:** Both need cross-unit atomics / dynamic parallelism that the cpu-MLIR backend cannot lower (the exact reason RandomForest/tree work is deferred past v3 per PROJECT.md Out-of-Scope). It will panic on the cpu gate.
-**Do this instead:** Read the mutual-reach graph back once; run Prim's + condensation in plain host Rust (Pattern 1).
+### Anti-Pattern 1: Porting cuML's atomic/shared-memory histogram
+**What people do:** Translate `builder_kernels_impl.cuh`'s `atomicAdd` shared-memory scatter histogram directly into CubeCL.
+**Why it's wrong:** cpu-MLIR bans `SharedMemory` and cross-unit `Atomic` (panics at launch). It would compile for cuda/wgpu but break the f64 cpu correctness gate.
+**Do this instead:** Single-owner GATHER histogram (Pattern 1) — one unit per output cell loops over inputs. This is the spike's whole job.
 
-### Anti-Pattern 2: Reusing the v2 SGD weight-update kernel for UMAP layout
-**What people do:** Try to force UMAP's attract/repel embedding optimization through `prims/sgd.rs`.
-**Why it's wrong:** `sgd.rs` updates a fixed-length coef vector from per-sample margins (supervised linear model); UMAP updates an `n×d_embed` coordinate matrix from sampled edges + negative samples — a different gradient and data layout.
-**Do this instead:** New `prims/umap_layout.rs` + `umap_layout_step` kernel; reuse only the *host orchestration shape* and `rng.rs` for sampling.
+### Anti-Pattern 2: Cross-sibling-loop accumulator in the split/partition kernels
+**What people do:** Write a best-feature flag/index in one `while` loop and read it in a separate sibling loop (e.g. "find best gain, then in a second pass mark the split").
+**Why it's wrong:** cpu-MLIR **silently miscompiles** this (FINDING 002-B) — compiles, launches, returns plausible wrong splits. A happy-path test passes; tie-heavy data diverges.
+**Do this instead:** Recompute positional values with a self-contained nested accumulate inside the consuming loop (the `self_drop_gather` shape). Gate every tree prim with a duplicate-/tie-heavy fixture asserting VALUES (R-9 discipline).
 
-### Anti-Pattern 3: Interleaving the builder retrofit with algorithm phases
-**What people do:** Retrofit builders to existing estimators inside the UMAP/HDBSCAN phases.
-**Why it's wrong:** Breaks the file-disjoint, parallel-safe wave discipline — the retrofit touches ~24 existing estimator files; mixing it with new-estimator phases creates merge contention.
-**Do this instead:** Establish the convention in an early phase; do the retrofit as its own dedicated sweep phase.
+### Anti-Pattern 3: Bypassing primitive-first for the tree family
+**What people do:** Build RandomForest end-to-end and only then test it against sklearn.
+**Why it's wrong:** The hist/split/partition prims are the risky parts; burying them inside a forest makes failures un-localizable and violates the discipline that made v1–v3 estimators "mostly assembly."
+**Do this instead:** Validate quantiles/hist/split/partition as standalone oracle-gated prims (Phase 18) against a single sklearn DecisionTree before RF (Phase 19) consumes them.
 
-### Anti-Pattern 4: Building a new KNN/neighbor primitive
-**What people do:** Write a fresh k-NN search for UMAP/HDBSCAN.
-**Why it's wrong:** `distance` + `topk` already do this, are cpu-MLIR-proven, and are the shipped NearestNeighbors prim.
-**Do this instead:** `prims/knn_graph.rs` composes them + a symmetrize map.
+### Anti-Pattern 4: Putting cuml.accel logic in Rust/PyO3
+**What people do:** Try to implement the import-hook or class-proxying in the compiled extension.
+**Why it's wrong:** It is purely a Python `sys.modules`/`MetaPathFinder` concern over classes that already subclass `BaseEstimator`. Rust adds nothing and can't touch `sys.modules`.
+**Do this instead:** A pure-Python `python/mlrs/accel/` subpackage; zero changes to mlrs-py Rust. (Mirrors cuML's own `cuml/accel/` being pure Python.)
+
+### Anti-Pattern 5: A bespoke device-batched L-BFGS before proving the need
+**What people do:** Build a new batched-L-BFGS kernel for ARIMA up front.
+**Why it's wrong:** The existing `lbfgs` prim is proven; ARIMA's many-small-solves can be host-batched first. A device-batched variant is a perf optimization, not a correctness requirement.
+**Do this instead:** Host-batch over the existing prim (Pattern 4); build device-batched only if profiling demands it.
+
+### Anti-Pattern 6: A new device kernel for model-agnostic SHAP or the utility surface
+**What people do:** Write SHAP coalition kernels or reimplement metrics on-device.
+**Why it's wrong:** Kernel/Permutation SHAP is host sampling + existing `predict` + existing solver; metrics/model_selection are host numpy. New kernels add cpu-MLIR risk for no benefit.
+**Do this instead:** Host-orchestrate, device-evaluate (Pattern 3); reuse existing predict/reduce/solve paths.
+
+---
 
 ## Integration Points
 
-### Internal Boundaries
+### New external oracle dependencies (test-only, host)
+
+| Oracle | Used by | Integration pattern | Notes |
+|--------|---------|---------------------|-------|
+| `scikit-learn` (RandomForest, DecisionTree, metrics, preprocessing, model_selection) | Phases 18,19,24 | committed `.npz` via `scripts/gen_oracle.py` + `mlrs_core::load_npz` | already the project oracle; extend `gen_oracle.py`. Tree gate = prediction/label agreement, not bit-exact internal structure. |
+| `shap` library | Phases 21, 23 | `.npz` SHAP-value fixtures; tolerance gate (not 1e-5 — sampling-based) | new test dep; SHAP values are approximate → property/tolerance gate like UMAP. |
+| `statsmodels` / `sklearn` ARIMA reference | Phase 22 | `.npz` series + fitted params/forecasts | confirm which reference cuML matches; likelihood/forecast tolerance gate. |
+| `gplearn` | Phase 25 | `.npz` fitness/best-program fixtures | symbolic regression is stochastic → property/structural gate (à la RandomProjection D-12). |
+| `umap-learn` / `hdbscan` | Phase 26 (accel) | already present (v3) | accel proxies to mlrs UMAP/HDBSCAN; CPU fallback to these. |
+
+Regen requires a `/tmp` venv with numpy/sklearn/shap/gplearn (PEP 668; MEMORY.md `oracle-fixture-regen-needs-venv`). Fixtures are committed blobs.
+
+### Internal boundaries (the load-bearing contracts)
 
 | Boundary | Communication | Notes |
 |----------|---------------|-------|
-| knn_graph prim ↔ UMAP / HDBSCAN | `(indices i32, distances F)` neighbor-list + shared symmetrize helper | Each estimator applies its own edge weighting (fuzzy-union vs mutual-reach). |
-| mutual_reach (device) ↔ mst/condense (host) | one device→host read-back of the mutual-reach graph | The HDBSCAN device/host seam. |
-| Rust builder ↔ `any_estimator!` Unfit arm | both construct the same `Estimator<F>` | No dispatch.rs change. |
-| `mlrs-py` shim (Python) ↔ `_mlrs` cdylib | `_ext().PyX(...)`, dtype-suffixed accessors | Shim is pure-Python, packaged into all four wheels. |
+| Tree builder (writer) ↔ FIL & TreeSHAP (readers) | flat `SparseTreeNode{colid,threshold,left_child,value}` `DeviceArray` + forest offset table | **The single most important new contract.** Fix its layout in the Phase-17 spike; all three consumers depend on it. |
+| mlrs-algos estimators ↔ mlrs-backend prims | `fn prim<F>(pool, operands…, out: Option<…>) -> Result<_, PrimError>`, validate-before-launch, device-resident | unchanged v1–v3 prim shape; every new prim follows it. |
+| mlrs-py shims ↔ existing `MlrsBase(BaseEstimator)` | new shims subclass `MlrsBase`; dtype-suffix (`_f32`/`_f64`) delegation; `n_features_in_`, `_post_fit` | reuse the v1 binding machinery (`any_estimator!`, ingress/egress, capability) — v2 added zero binding infra across 18 estimators; expect the same. |
+| cuml.accel ↔ mlrs estimator surface | `sys.modules` swap + `_overrides` name→class table; pass-through = CPU fallback | pure Python; depends only on shims being importable without the extension (already true). |
+| Batched L-BFGS ↔ existing `lbfgs` prim | host loop / batched wrapper over the proven prim | MODIFY, not rewrite. |
+| Backend gate | `capability::skip_f64_with_log()` per f64 test; cpu(f64)+rocm(f32) | unchanged; every new prim test uses it; f64-on-rocm skips-with-log. |
+| PoolStats memory gate | per-phase build-failing `peak_bytes`/`live_bytes`/`reuses` asserts | tree histograms (node-batch×bins×feat×outputs) and ARIMA batches must be tiled, never quadratic-resident — same discipline as Phase 13's query-axis tiling. |
 
-## Suggested phase / build order (continuing from Phase 12)
-
-Primitive-first, dependencies respected (KNN-graph before UMAP/HDBSCAN; builder convention before retrofit), feature-disjoint waves.
-
-```
-Phase 12  Builder convention + typestate  [DO FIRST — born-with-it for new estimators]
-   NEW: mlrs-algos/src/builder.rs (shared builder; runtime fitted-flag; reuse BuildError)
-   establishes the convention so UMAP/HDBSCAN (P14/P15) adopt it from birth
-   NO algorithm work — pure API foundation; lowest risk; unblocks everything
-   (does NOT retrofit existing estimators yet — that is P16)
-
-Phase 13  KNN-graph primitive  [the shared, feasibility-critical prim]
-   NEW: prims/knn_graph.rs (distance + topk + symmetrize map) + knn_graph kernel
-   reuse: distance, topk (cpu-MLIR-proven)
-   gate: tests/knn_graph_test.rs (sklearn kneighbors_graph oracle + PoolStats)
-   feature-free, standalone-validated — NOTHING consumes it yet (primitive-first)
-
-Phase 14  UMAP   [HARD DEP on P12 builder + P13 knn_graph]
-   NEW: prims/umap_layout.rs + umap_layout_step kernel (the one new solver)
-   NEW: umap_fuzzy_map kernel; reuse rng (init+neg-sample), eig/laplacian (spectral init ≤MAX_DIM)
-   NEW: manifold/umap.rs estimator (builder-fronted), estimators/manifold.rs PyUMAP, manifold.py shim
-   SPIKE FIRST: layout-step single-owner GATHER on cpu-MLIR (MEDIUM-confidence unknown)
-   gate: property/structural vs umap-learn (trustworthiness, kNN-preservation, seed-repro)
-
-Phase 15  HDBSCAN   [HARD DEP on P12 builder + P13 knn_graph; feature-disjoint from P14]
-   NEW: prims/mutual_reach.rs + mutual_reach_map kernel (device front-end)
-   NEW: prims/mst.rs (HOST Prim's), prims/condense.rs (HOST condensed-tree + stability)
-   NEW: cluster/hdbscan.rs estimator (builder-fronted), PyHDBSCAN in cluster.rs, cluster.py shim
-   SPIKE FIRST: confirm host MST/condense matches hdbscan condensation exactly
-   gate: exact labels up to permutation vs hdbscan/sklearn.cluster.HDBSCAN (label_perm helper)
-
-Phase 16  Builder retrofit sweep + shim coverage  [DO LAST — broad-edit, parallel-unsafe]
-   MODIFY: retrofit the ~24 pre-Phase-10 estimators to the P12 builder convention
-   MODIFY: keep new()/with_opts as thin builder wrappers for back-compat
-   EXTEND: test_params.py / test_estimator_checks.py to UMAP/HDBSCAN + retrofitted set
-   isolate as its own phase so it never contends with new-estimator files
-```
-
-**Critical ordering facts:**
-- **P12 (builder convention) FIRST** so UMAP/HDBSCAN are born builder-fronted — avoids re-touching them in the retrofit. P12 is pure API, no algorithm, lowest risk.
-- **P13 (knn_graph) before P14/P15** — both consume it; land + gate it standalone (primitive-first; the v1/v2 "prim gated, estimator assembly" pattern).
-- **P14 (UMAP) and P15 (HDBSCAN) are feature-disjoint waves** — different new files (manifold/ vs cluster/, umap_layout/fuzzy vs mutual_reach/mst/condense). They share ONLY the P13 knn_graph prim (already landed) → can be planned/built in parallel after P13.
-- **P16 (retrofit) LAST** — it is the one broad, parallel-unsafe edit; isolating it preserves the file-disjoint wave discipline for P12–P15.
-- **Two research spikes gate planning:** UMAP layout-step on cpu-MLIR (P14) and host MST/condense exactness (P15). Both MEDIUM-confidence; budget a spike before each phase's planning, exactly as v2 did for the SGD solver.
+---
 
 ## Sources
 
-- Shipped code (HIGH): `crates/mlrs-algos/src/{traits.rs, lib.rs, error.rs}`,
-  `crates/mlrs-algos/src/{naive_bayes/{mod,gaussian_nb}.rs, linear/{mod,logistic}.rs, cluster/spectral_embedding.rs}`,
-  `crates/mlrs-backend/src/{lib.rs, prims/{topk,sgd,laplacian,eig,distance}.rs}`,
-  `crates/mlrs-kernels/src/lib.rs` (incl. `jacobi_eig::MAX_DIM`),
-  `crates/mlrs-py/src/{dispatch.rs, lib.rs}`, `crates/mlrs-py/python/mlrs/base.py`,
-  the `crates/mlrs-py/python/mlrs/*.py` shim package (confirms shim already shipped).
-- Planning (HIGH): `.planning/PROJECT.md`, `.planning/notes/v3-hard-algorithm-backlog.md`,
-  `.planning/codebase/{ARCHITECTURE,STRUCTURE}.md`, `.planning/milestones/v2.0-research/ARCHITECTURE.md`.
-- cuML reference (read-only, behavior only): `cuml-main/cpp/src/{umap,hdbscan}/`,
-  `cuml-main/python/cuml/cuml/{manifold,cluster}/`.
-- MEDIUM-confidence unknowns to spike before P14/P15: UMAP `umap_layout_step` single-owner
-  GATHER on cpu-MLIR; host MST/condense exactness vs `hdbscan`; KNN approximate-vs-exact
-  divergence from umap-learn's NN-Descent default.
+- `.planning/PROJECT.md` — v4.0 milestone scope, constraints, key decisions (read in-source, HIGH)
+- `.planning/notes/v3-hard-algorithm-backlog.md`, `notes/cuml-mlrs-gap-inventory.md` — dependency ordering, tree feasibility flag (HIGH)
+- `.planning/milestones/v3.0-phases/13-knn-graph-primitive-feasibility-keystone/` — `13-CONTEXT.md`, `13-RESEARCH.md`, `13-PATTERNS.md` — the keystone-spike-first model to mirror for Phase 17 (HIGH)
+- `Skill("spike-findings-mlrs")` + `references/cpu-mlir-kernel-authoring.md` — proven cpu-MLIR GATHER op-set, the 002-A (loud) / 002-B (silent) landmines, single-owner per-output-cell idiom (HIGH)
+- On-disk crate layout: `crates/mlrs-{core,kernels,backend,algos,py}/` (prims/, kernels, estimators, shims) read in-source (HIGH)
+- `crates/mlrs-py/python/mlrs/{__init__.py,base.py}` — `MlrsBase(BaseEstimator)` shim contract that cuml.accel proxies (HIGH)
+- cuML reference (behavior, NOT to port): `cuml-main/cpp/src/decisiontree/batched-levelalgo/` (atomic+shared-memory histogram → confirms the inversion need), `cpp/include/cuml/tree/flatnode.h` (`SparseTreeNode` format, right=left+1), `cpp/src/arima/batched_kalman.cu` (sequential Kalman), `cpp/src/explainer/{kernel,permutation,tree}_shap.cu`, `cpp/src/genetic/{program,node,reg_stack}` (host-evolve/device-evaluate), `cuml/accel/` (pure-Python proxy) (HIGH for structure)
+- Project MEMORY.md — cpu-MLIR no-SharedMemory/atomics, rocm f64-unsupported gate, oracle-venv, disk/suite-slowness (MEDIUM)
 
 ---
-*Architecture research for: mlrs v3.0 manifold algorithms & Rust-native builder API*
-*Researched: 2026-06-22*
+*Architecture research for: mlrs v4.0 integration (tree ensembles, time-series, explainers, genetic, utility surface, cuml.accel)*
+*Researched: 2026-06-26*

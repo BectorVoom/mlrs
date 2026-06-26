@@ -1,192 +1,228 @@
 # Project Research Summary
 
-**Project:** mlrs v3.0 — Manifold Algorithms & Rust-Native API
-**Domain:** UMAP + HDBSCAN on a shared KNN-graph primitive; Rust builder/typestate API retrofit; pure-Python sklearn shim
-**Researched:** 2026-06-22
-**Confidence:** HIGH overall (grounded in shipped codebase, project memory, and stable documented APIs); MEDIUM on two specific execution unknowns (see Gaps)
+**Project:** mlrs v4.0 — Tree Ensembles, Time-Series & Full-Surface Completion
+**Domain:** CubeCL/cpu-MLIR-gated Rust ML library; final cuML algorithm surface close-out
+**Researched:** 2026-06-26
+**Confidence:** HIGH (all four research areas grounded in primary in-tree sources and shipped project decisions)
+
+---
 
 ## Executive Summary
 
-v3.0 adds two high-value algorithms — UMAP (nonlinear manifold embedding) and HDBSCAN (density-based variable-cluster clustering) — on a shared KNN-graph primitive built from the already-validated v1 NearestNeighbors (top-k) prim, and completes the Rust-native builder-pattern API retrofit across all 30+ estimators plus a pure-Python sklearn shim. The critical architectural insight from all four research streams is that the KNN-graph primitive is the feasibility keystone for the entire milestone: it is cpu-MLIR-safe by COMPOSITION of already-shipped prims (distance + top-k + a single-owner GATHER symmetrize map, no new heap/scatter kernel), it must be built and standalone-gated before either estimator consumes it, and the GATHER idiom that makes it viable directly constrains how UMAP's SGD layout step and HDBSCAN's mutual-reachability are structured. Zero new runtime crate dependencies are needed; the five-crate workspace structure, pyo3 0.28/arrow-59 ABI pin, cubecl 0.10, and cubek-{matmul,reduce} 0.2.0 stay entirely unchanged.
+v4.0 is the milestone that closes out the remaining cuML algorithm surface — tree ensembles (RandomForest → FIL → TreeSHAP), time-series (ARIMA / AutoARIMA), model-agnostic explainers (Kernel/Permutation SHAP), genetic/symbolic regression, the sklearn-utility surface, and the transparent `cuml.accel` drop-in. The core architectural verdict from all four research streams is identical: **every new feature is built from the existing primitive stack and plain Rust data structures; zero new compute/algorithm Rust crates are added**, continuing the v2/v3 record. The only additive dependencies are three Python test-oracle packages (`shap 0.52.0`, `statsmodels 0.14.4`, `gplearn 0.4.3`) and the already-pinned `scikit-learn >=1.6`. `pyo3` stays at `0.28` and `cubecl` stays at `0.10.0` — both hard-pinned; bumping either breaks the wheel or the cpu-MLIR correctness gate.
 
-The three correctness-gate regimes are distinct and must not be conflated. The KNN-graph prim and UMAP's deterministic stages 1-4 (fuzzy simplicial set through spectral init) use the standard value gate (<=1e-5 vs sklearn NearestNeighbors / umap-learn intermediate arrays). UMAP's SGD layout stage 5 uses a property/structural gate (trustworthiness + kNN-overlap relative to umap-learn, plus seed-reproducibility within mlrs) — attempting a value oracle here is not merely unhelpful, it will report total failure on a correct implementation, exactly the trap v2 hit with RandomProjection D-12. HDBSCAN uses an exact-labels-up-to-permutation hard gate (the v2 classifier exact-label rule), with -1 noise pinned in the permutation search, against sklearn.cluster.HDBSCAN as the primary oracle; hdbscan 0.8.44 as a secondary cross-check.
+The defining structural tension of v4.0 is **mixed oracle/gate types across a single milestone**. Prior milestones had a single gate regime (v1/v2: 1e-5 value match or exact-label; v3: those plus property/structural for stochastic UMAP). v4.0 spans all four gate types simultaneously: exact value (FIL deterministic traversal; TreeSHAP ≤1e-5 plus additive-efficiency); exact-label (NOT applicable to RF — scoped to deterministic SGD/SVM/NB only); band-on-likelihood/forecast (ARIMA — sklearn has no ARIMA, `statsmodels` is the correct oracle, raw coefficients are multimodal and ungatable); and property/structural-plus-band (RF ensemble, Kernel/Permutation SHAP, genetic — SplitMix64 ≠ MT19937 makes element-wise match impossible). The recommended resolution is to establish the **two-tier stochastic gate** as a milestone-wide convention in the RF feasibility spike (Phase 17): a deterministic injected-fixed-index single-tree tier (tight, the real correctness witness) plus an ensemble/predictive-quality band tier (RNG-tolerant).
 
-The two cross-cutting surface features — the Rust builder API and the Python shim — are extensions of already-shipped infrastructure, not greenfield work. Nine v2 estimators already carry hand-written T::builder() -> TBuilder -> build() -> Result (LinearSVR, LinearSVC, MBSGDClassifier, MBSGDRegressor, all five Naive Bayes variants), and the MlrsBase(BaseEstimator) shim already ships for the v1 12 estimators in mlrs-py/python/mlrs/base.py. v3 extends and retrofits both; derive-macro builder crates are explicitly rejected as they add proc-macro dependencies for a pattern already hand-written and proven, and they fight the hand-written any_estimator! PyO3 macro machinery.
+The single highest risk is **GPU tree construction under cpu-MLIR**: the textbook GPU histogram kernel (cuML's and every CUDA reference's) uses `SharedMemory` + `atomicAdd`, both of which the `cubecl-cpu` MLIR backend panics on at launch. The GATHER inversion is the hypothesis — one unit per `(node, feature, bin)` output cell loops over the node's sample range with no contended writes — and it must be proven in a dedicated feasibility spike before any tree-family estimator work begins. This spike (Phase 17) is gating: if the GATHER histogram is not both correct AND tractable under cpu-MLIR, the tree chain (RF → FIL → TreeSHAP) is re-scoped before commitment. Every other v4.0 track (ARIMA, model-agnostic SHAP, sklearn-utility surface, genetic, cuml.accel) is **independent of the tree spike** and proceeds regardless.
+
+---
 
 ## Key Findings
 
 ### Recommended Stack
 
-Zero new runtime crate dependencies. The entire v3.0 surface — UMAP, HDBSCAN, KNN-graph, builders, shim — is implemented as new modules in the existing five-crate workspace. The workspace Cargo.toml [workspace.dependencies] block is unchanged. New oracle-regen dev-venv deps (umap-learn 0.5.12, hdbscan 0.8.44) are confined to the /tmp/oracle-venv pattern established in v1/v2 and never enter the shipped wheel.
+**Zero new Rust compute dependencies** — the headline finding from STACK.md, confirmed by ARCHITECTURE.md, FEATURES.md, and PITFALLS.md independently. All v4.0 features assemble from existing validated primitives: GEMM, reductions, distance, SVD/eig, Cholesky, top-k, L-BFGS, coordinate descent, RNG, KNN-graph, two-pass SGD solver. Tree histogram/split/partition kernels are **new CubeCL kernels** authored in-house (the spike's deliverable) but consume no new crates. The Kalman filter is GEMM + Cholesky recursion already in-tree; batched ARIMA extends the existing L-BFGS prim with a batched wrapper, not a new crate. `cuml.accel` is pure-Python `importlib` machinery — zero Rust, zero PyO3 changes.
 
-**Core technologies (all pinned, all unchanged):**
-- `cubecl` 0.10 (`default-features=false`): device-kernel layer; new v3 kernels (knn_graph symmetrize, umap_fuzzy_map, umap_layout_step, mutual_reach_map) follow the feature-free GATHER idiom — SharedMemory-free, atomic-free, no mutable-bool/F::INFINITY/shift-loops
-- `cubek-reduce` 0.2.0: per-point sigma/rho row reductions (UMAP fuzzy set) and core-distance (HDBSCAN k-th NN distance) already wired
-- `pyo3` 0.28 / `arrow` 59 (pyarrow): HARD pin — arrow-59's pyarrow transitively pins pyo3 0.28; mixing ABIs crashes wheel at import (D-09/PY-05); UMAP/HDBSCAN add #[pyclass] wrappers only
-- `mimalloc` 0.1, `bytemuck` 1, `thiserror` 2, `anyhow` 1, `log`/`env_logger` 0.4/0.11: all unchanged
+**Core technologies (new for v4.0):**
+- `shap 0.52.0` (test-only oracle): Kernel/Permutation/Tree SHAP reference values — pin `>=0.46,<0.53`
+- `statsmodels 0.14.4` (test-only oracle): ARIMA log-likelihood / forecast / KPSS stationarity reference — stay on `0.14.x` (0.15 is dev)
+- `gplearn 0.4.3` (test-only oracle): symbolic regression property gate — pin exact (infrequent releases)
+- `scikit-learn >=1.6` (already pinned): covers RF/metrics/preprocessing/feature_extraction/model_selection oracles — no version bump
 
-**Builder strategy: hand-written builders + runtime fitted-flag. Reject all derive-macro crates.**
-The hand-rolled convention is already shipped on 9 estimators. v3 retrofits the same shape across the remaining ~24 estimators plus the 2 new ones, and adds Option<DeviceArray> fitted-flag runtime state (not per-param PhantomData typestate, which would explode the generic surface and break the any_estimator! enum). bon, typed-builder, and derive_builder are all rejected: proc-macro dependencies for a pattern already proven, fighting the hand-written trait-impl machinery.
-
-**Oracle libraries (dev-venv only, never shipped):**
-- `umap-learn` 0.5.12: UMAP property gate only; pulls numba transitively (oracle-regen watch-item — numba may lag numpy 2.5.0; mitigation: pin compatible numba at regen time; CI uses committed .npz blobs and is fully decoupled)
-- `hdbscan` 0.8.44: HDBSCAN cross-check oracle; no numba dep — clean against existing pins
-- `sklearn.cluster.HDBSCAN` (scikit-learn >= 1.6, already pinned): PRIMARY HDBSCAN gate oracle; zero new dependency
+**Hard pins that must not change:**
+- `pyo3 = 0.28` — arrow-59 `pyarrow` feature pins this; two PyInit ABIs in one cdylib crash the wheel at import (D-09)
+- `cubecl = 0.10.0` — the entire cpu-MLIR safety story (GATHER idiom, F64 registration on HIP, MLIR lowering quirks) is characterized at this pin
 
 ### Expected Features
 
-**Must have (v3.0 table stakes):**
-- **KNN-graph primitive** — (n x k) neighbor indices + distances; self-inclusion control (k+1/self-drop); directed output; standalone value-gated (<=1e-5 vs sklearn.neighbors.NearestNeighbors); consumed by both UMAP and HDBSCAN
-- **UMAP** fit/fit_transform -> embedding_ (n, n_components); table-stakes params (n_neighbors=15, min_dist=0.1, n_components=2, metric='euclidean', init='spectral'/'random', random_state, n_epochs); stages 1-4 value-gated at <=1e-5, stage 5 property-gated
-- **HDBSCAN** fit/fit_predict -> labels_ (-1 = noise), probabilities_; table-stakes params (min_cluster_size=5, min_samples=None->min_cluster_size, cluster_selection_method='eom'/'leaf'); exact-label gate via metric='precomputed'
-- **Rust builder + typestate convention** — T::builder().setter().build()? -> T (runtime fitted-flag; build() validates params; new() stays as thin wrapper for any_estimator! compatibility); retrofit across all 30 existing + 2 new estimators
-- **Pure-Python sklearn shim** — extend MlrsBase subclassing to v2 18 + UMAP/HDBSCAN; get_params/set_params/clone semantics; PyO3-wrap UMAP/HDBSCAN; FFI-free invariant unit tests in CI
+All four research files agree on the dependency topology. The tree chain is a hard dependency chain; everything else is spike-independent.
 
-**Should have (differentiators):**
-- f32 + f64 device path for both algorithms (cuML is GPU f32-only for both — differentiator)
-- Single shared KNN-graph prim feeding both UMAP and HDBSCAN (primitive-first; reusable by future SpectralEmbedding affinity)
-- outlier_scores_ (GLOSH) on HDBSCAN — differentiator vs sklearn.cluster.HDBSCAN (which omits it)
+**Must have — table stakes (P1):**
+- RandomForest GPU histogram/split **feasibility spike** — the gating make-or-break phase; runs first; delivers GO/ADJUST/ABORT verdict with A1–A5 evaluated
+- RandomForestClassifier + RandomForestRegressor — spike-gated; property/predictive-quality two-tier gate
+- FIL (Forest Inference Library) — exact deterministic inference over the mlrs tree format; the one exact tree-stack gate
+- ARIMA(p,d,q) + forecast — batched Kalman filter + batched L-BFGS; `statsmodels` band gate on likelihood/forecasts
+- metrics core (accuracy, confusion_matrix, r2, mse, mae) — reductions; exact/<=1e-5; degenerate fixtures mandatory
+- preprocessing scalers (Standard/MinMax/MaxAbs/Robust/Normalizer) — column-stat fit + elementwise transform; <=1e-5
+- model_selection splitters (train_test_split, KFold, StratifiedKFold) — structural gate; MT19937-host-match decision required
 
-**Defer to v3.x / future:**
-- UMAP transform (new-data embedding) — fast-follow once fit property gate is stable
-- HDBSCAN approximate_predict/membership_vector, store_centers, condensed-tree plot objects
-- Supervised/semi-supervised UMAP, inverse_transform
-- Approximate/NN-Descent KNN graph build (exact brute-force is correct for v3 oracle sizes)
-- Custom callable metrics (no numba on CubeCL)
-- Live FFI check_estimator re-triage (needs maturin+pyarrow host; routed to UAT)
+**Should have — differentiators (P2):**
+- TreeSHAP — exact <=1e-5 vs `shap.TreeExplainer` on mlrs's own tree (NOT sklearn's forest); additive-efficiency invariant mandatory; after FIL
+- Kernel SHAP + Permutation SHAP — model-agnostic; additive-efficiency invariant (exact) + convergence band vs `shap`; independent of tree stack
+- AutoARIMA — order search via KPSS/seasonality + IC grid/stepwise; exact selected-order gate on clean synthetic series
+- preprocessing encoders (OneHot/Ordinal/Label/LabelBinarizer/SimpleImputer)
+- roc_auc_score / log_loss / precision_recall_curve
+- symbolic/genetic regression — `gplearn` property gate (R^2 band + seed-reproducibility within mlrs)
+- cuml.accel — pure-Python sys.modules import-hook; land LAST so it proxies the full v4.0 + v1-v3 surface
+
+**Defer (out-of-v4.0 scope):**
+- GridSearchCV/RandomizedSearchCV — delegate to sklearn passthrough (cuML itself does this via `__getattr__`)
+- feature_extraction (TfidfVectorizer/CountVectorizer) — P3; text-heavy, host-side, lower demand
+- Interventional/feature-perturbation TreeSHAP with background data — path-dependent TreeSHAP first
+- Seasonal ARIMA (P,D,Q,s) + full exog in first cut — graded sub-requirements; non-seasonal first
+- Treelite / XGBoost / LightGBM model ingestion into FIL — external-model import is a later milestone
+- SymbolicClassifier / SymbolicTransformer (gplearn) — SymbolicRegressor first
 
 ### Architecture Approach
 
-v3.0 extends the fixed five-crate workspace (mlrs-kernels -> mlrs-backend -> mlrs-algos -> mlrs-py -> scripts/fixtures) with new files only. The dependency graph is acyclic and unchanged. HDBSCAN uses the "device front-end, host tree back-end" split: the embarrassingly-parallel stages (distance, top-k, mutual-reachability map) run on device via GATHER; the MST (Prim's), condensed-tree, stability extraction, and cluster selection run in plain host Rust — deliberately avoiding the GPU-MST atomics wall that blocks RandomForest. UMAP uses a new umap_layout_step GATHER kernel (one thread per embedding vertex i, owning y[i], scanning incident edges + negative samples into private registers, single write) plus reuse of the v2 graph-Laplacian + eig prims for spectral init (capped at MAX_DIM=64 — init='random' is the default correctness path for realistic sizes).
+v4.0 attaches to the existing 5-crate spine (`mlrs-core` / `-kernels` / `-backend` / `-algos` / `-py`) without structural changes. The primitive-first discipline holds: every new compute primitive (GATHER histogram/split/partition, batched Kalman, program-eval) is validated standalone in `mlrs-kernels` + `mlrs-backend` before any `mlrs-algos` estimator consumes it. The tree node store — `SparseTreeNode { colid: u32, threshold: F, left_child: i32 (-1 = leaf), value: F }`, right child = `left_child + 1` (cuML `flatnode.h` convention) — is the single load-bearing contract binding RF (writer), FIL (reader), and TreeSHAP (reader); it is fixed in the Phase 17 spike. `cuml.accel` is a pure-Python subpackage (`python/mlrs/accel/`) layered over the shim surface; zero Rust changes.
 
-**Major components (v3 deltas only):**
-1. `mlrs-kernels`: knn_graph.rs (symmetrize map), umap_layout.rs (attract/repel GATHER), mutual_reach.rs (elementwise max), elementwise.rs += umap_fuzzy_map
-2. `mlrs-backend/prims`: knn_graph.rs (distance+topk+symmetrize — the shared prim), umap_layout.rs (host epoch/neg-sample loop + layout kernel), mutual_reach.rs (device front-end), mst.rs (HOST Prim's), condense.rs (HOST condensed-tree + stability)
-3. `mlrs-algos`: builder.rs (shared builder convention), manifold/umap.rs, cluster/hdbscan.rs
-4. `mlrs-py`: estimators/manifold.rs (PyUMAP), extend cluster.rs + lib.rs, python/mlrs/manifold.py, extend cluster.py
+**Major new components (v4.0 additions by crate):**
+1. `mlrs-kernels/tree.rs` — GATHER histogram, best-split reduction, node-partition, batched FIL traversal (spike-gated; all cpu-MLIR-safe; no SharedMemory, no atomics, no `F::INFINITY`)
+2. `mlrs-kernels/kalman.rs` — per-series sequential Kalman recursion (one unit/series; sequential time loop; cpu-MLIR-safe)
+3. `mlrs-kernels/program.rs` — batch stack-program evaluator for genetic fitness
+4. `mlrs-backend` prims: `quantiles`, `tree_hist`, `best_split`, `node_partition`, `tree_traverse`, `batched_kalman`, `program_eval`; `lbfgs.rs` (MODIFY: batched wrapper)
+5. `mlrs-algos` new modules: `tree/` (DecisionTree core), `ensemble/` (RF clf/reg), `fil/` (batched inference), `tsa/` (ARIMA/AutoARIMA), `explainer/` (Kernel/Perm/Tree SHAP), `genetic/` (SymbolicRegressor)
+6. `mlrs-py` estimator wrappers: `ensemble.rs`, `tsa.rs`, `explainer.rs`, `genetic.rs`; corresponding Python shims
+7. `python/mlrs/accel/` — pure-Python MetaPathFinder + AccelModule + `_overrides` table (zero Rust)
 
 ### Critical Pitfalls
 
-1. **KNN-graph reaches for atomics/SharedMemory (cpu-MLIR panic)** — Compose from the launch-proven top_k prim (distance -> top_k per row -> dense [n,k] pair); no new heap kernel; materialise the graph as [n,k] index+distance arrays (single-owner per row), never as scatter-built CSR. Guard: no Atomic/SharedMemory/F::INFINITY/mutable-bool/shift-loop imports in any KNN kernel. Spike the composed path under --features cpu before UMAP/HDBSCAN consume it.
+1. **GPU tree histogram assumes atomics/SharedMemory (P1 — CRITICAL)** — cuML's histogram kernel uses `__shared__` + `atomicAdd`; both cause `cubecl-cpu` MLIR to panic at launch. Avoid by: running the feasibility spike first (Phase 17) to prove the GATHER inversion — one unit per `(node, feature, bin)` loops over the node's sample range with local accumulation; relabel (not scan/compaction) for node partition; `seed-from-first` statement-form `if` for gain argmax (never `F::INFINITY` init). Five abort signals (A1–A5) must be evaluated; the spike delivers an explicit GO/ADJUST/ABORT verdict.
 
-2. **UMAP layout parallelised over edges (cpu-MLIR panic + nondeterminism)** — Invert to one thread per embedding vertex i (single owner of y[i]), scanning its incident edges + negative samples into private registers, writing y[i] once. This is the vertex-owner GATHER analog of the v2 SGD two-pass solver. Do NOT reuse prims/sgd.rs (wrong gradient/layout); build prims/umap_layout.rs with a new umap_layout_step kernel.
+2. **Stochastic estimators gated element-wise (P2 — CRITICAL)** — mlrs SplitMix64 != NumPy MT19937; RF, Kernel/Permutation SHAP, and symbolic regression will never match sklearn/shap/gplearn element-wise. The exact-predicted-label gate (for deterministic SGD/SVM/NB) does NOT apply to RF. Avoid by: two-tier gate established in the RF spike: (a) deterministic-core tier — inject fixed bootstrap/feature-subset indices into both mlrs and sklearn; (b) ensemble score-band tier — accuracy/R^2 within a documented margin. SHAP: additive-efficiency invariant (exact) + brute-force enumeration on small `n` + convergence band on large `n`. Genetic: R^2-band + internal seed-reproducibility.
 
-3. **UMAP value oracle instead of property gate** — Forcing <=1e-5 against umap-learn coordinates reports total failure on a correct implementation (SplitMix64 != NumPy RNG). Gate: (a) value-gate stages 1-4 (fuzzy set, spectral init) at <=1e-5 against umap-learn intermediate arrays; (b) property-gate stage 5 on trustworthiness + kNN-overlap relative to umap-learn's own scores + seed-reproducibility. Never a coordinate value oracle for the layout.
+3. **ARIMA oracle is statsmodels, not sklearn (P3) — and a PROJECT.md slip** — sklearn has no ARIMA; gating ARIMA coefficients <=1e-5 against any library is wrong (multimodal optima). Avoid by: `statsmodels.tsa.arima.model.ARIMA` as the oracle; gate on log-likelihood / forecast-band / known-coefficient recovery via Jones/PACF transform; accumulate Kalman log-likelihood in f64 even on the f32 rocm path; per-series convergence flags so one non-converging series cannot NaN-poison the batch.
 
-4. **HDBSCAN labels diverge from oracle (MST tie-breaking, noise label, min_samples semantics)** — Use stable-sort MST edge ordering (matching np.argsort reference); extend label_perm to pin -1->-1 (noise is not permutable); resolve min_samples=None->min_cluster_size exactly matching hdbscan semantics; gate against sklearn.cluster.HDBSCAN (not cuML — cuML's epsilon/outlier paths are incomplete). Use jittered AND explicitly-tied fixtures.
+4. **cuml.accel silently returns wrong results instead of CPU fallback (P4)** — any unsupported param/config silently ignored rather than falling back to sklearn is a data-integrity failure worse than not accelerating. Avoid by: fail-closed capability gate per proxied estimator — unsupported config signals CPU sklearn fallback, never silent approximation. Install hook before any sklearn import; implement caller-module exclusion list; mirror sklearn's exact fitted-attribute names/shapes.
 
-5. **Builder retrofit breaks any_estimator! PyO3 machinery** — Keep new() as a thin wrapper over builder().build().expect("defaults valid"); builder is additive. Establish the convention + pilot on 1-2 estimators with the PyO3 suite green before the 28-estimator mechanical sweep. No per-param PhantomData (typestate explosion). Audit every any_estimator! call site when touching any constructor.
+5. **Data-dependent memory blow-up on tree/ARIMA/SHAP structures (P6)** — naive full-histogram tensor `(nodes x features x bins x classes)`, full `batch x state^2` Kalman state, or `2^n` coalition enumeration fail the build-failing PoolStats gate. Avoid by: frontier-only histogramming; compact flat node arrays; tile over series batch for ARIMA; stream coalition blocks for Kernel SHAP; iterative `node_id` machine for FIL/TreeSHAP (no recursion — CubeCL kernels cannot recurse).
+
+---
 
 ## Implications for Roadmap
 
-Based on all four research streams, the milestone requires five phases (continuing from v2's Phase 11 -> Phase 12+). Two sequencing variants were proposed across the research files; both are presented here so the roadmapper can decide.
+Phase numbering continues from v3.0 (last = Phase 16). v4.0 starts at **Phase 17**.
 
----
+### Phase 17: RandomForest GPU Histogram/Split Feasibility Spike (GATING)
+**Rationale:** The make-or-break question — does the single-owner GATHER histogram lower under `cubecl-cpu` MLIR, and is it tractable? This gates the entire tree chain (RF -> FIL -> TreeSHAP). Must run first and deliver an explicit GO/ADJUST/ABORT verdict with abort signals A1-A5 evaluated. Models Phase 13 (KNN-graph keystone spike). Nothing in the tree family is committed until this answers GREEN.
+**Delivers:** GATHER histogram + relabel partition + seed-from-first split-find kernels standalone-launching on cpu(f64) + rocm(f32); VALUE-asserting correctness test vs `sklearn.tree.DecisionTree*` on injected fixed bootstrap indices; per-tree cost benchmark; `SparseTreeNode` format contract finalized; two-tier stochastic gate convention established as a milestone-wide standard.
+**Addresses:** RF table-stakes; node-format contract (hard dependency for FIL + TreeSHAP)
+**Avoids:** P1 (atomic/SharedMemory histogram discovered mid-build); P2 (stochastic gate convention set here)
+**Research flag:** NEEDS `/gsd-plan-phase --research-phase 17` — consult `Skill("spike-findings-mlrs")` for proven GATHER op-set and 002-A/002-B landmines.
 
-### Variant A: Builder convention leads (ARCHITECTURE.md preferred ordering)
+### Phase 18: Tree Primitives + DecisionTree Core (standalone-validated)
+**Rationale:** Primitive-first — hist/split/partition prims must be oracle-gated standalone vs a single sklearn `DecisionTree` BEFORE RF assembles many of them. Promotes spike's kernel probes to production prims with full prim contract.
+**Delivers:** `quantiles`, `tree_hist`, `best_split`, `node_partition` prims in mlrs-backend; `tree.rs` in mlrs-kernels; `mlrs-algos/tree/` DecisionTree core (level-wise host loop); oracle-gated vs `sklearn.tree.DecisionTreeClassifier/Regressor` on injected fixed indices.
+**Avoids:** Anti-pattern of building RF end-to-end before validating prims; P6 (frontier-only histogram memory gate established here)
+**Research flag:** Standard primitive-first pattern after spike; skip research-phase.
 
-**Phase 12 — Builder Convention + Typestate Foundation**
-**Rationale:** Establish the shared builder convention FIRST so UMAP/HDBSCAN (Phases 14-15) are born builder-fronted, avoiding a retroactive re-touch. Pure API work, no algorithm, lowest risk, unblocks everything downstream. Does NOT retrofit existing estimators yet (that is Phase 16).
-**Delivers:** mlrs-algos/src/builder.rs (shared builder macro/convention; runtime fitted-flag via Option<DeviceArray>; reuse existing BuildError); convention applied to the 2 new estimator shells.
-**Addresses:** Builder DX feature; foundation for the 30-estimator retrofit.
-**Avoids:** Pitfall 9 (typestate explosion / any_estimator! break) by establishing the safe convention before scale.
-**Research flag:** STANDARD PATTERN — the convention is already proven on 9 estimators; no additional phase research needed.
+### Phase 19: RandomForestClassifier + RandomForestRegressor
+**Rationale:** Depends on Phase 18 prims. Full two-tier gate applies here for the first time against sklearn `RandomForest*`; OOB score, `feature_importances_`, and PyO3 shim land together.
+**Delivers:** RF clf/reg estimators; PyO3 `ensemble.rs`; Python shim `mlrs/ensemble.py`; two-tier oracle gate; `feature_importances_` / `oob_score_` structural-gated.
+**Avoids:** P2 (two-tier gate enforced, not exact-predicted-label against the ensemble)
+**Research flag:** Skip research-phase — two-tier gate convention established in Phase 17.
 
-**Phase 13 — KNN-Graph Primitive (the feasibility keystone)**
-**Rationale:** The shared substrate both UMAP and HDBSCAN depend on; must be standalone-validated before either consumes it (primitive-first discipline). The cpu-MLIR feasibility answer lives here.
-**Delivers:** prims/knn_graph.rs (distance+topk+symmetrize); knn_graph_test.rs (exact gate vs sklearn.neighbors.NearestNeighbors; PoolStats memory gate); self-inclusion parameter; directed output contract.
-**Addresses:** KNN-graph primitive feature; UMAP + HDBSCAN prerequisite.
-**Avoids:** Pitfalls 1, 3, 4 (atomics/SharedMemory; self-neighbour/symmetrisation; n x n memory overflow).
-**Research flag:** SPIKE NEEDED before planning — confirm the composed-from-top_k path launches on --features cpu (MEDIUM confidence; precedent is favorable but not verified for this exact composition).
+### Phase 20: FIL — Batched Forest Inference
+**Rationale:** Depends on node format (Phase 18) and a forest (Phase 19). The one tree-stack gate that is exact: device traversal must equal a CPU reference walk of the identical node arrays.
+**Delivers:** `tree_traverse` prim; `mlrs-algos/fil/` batched inference (iterative `node_id` machine, no recursion); `predict`/`predict_proba`; exact gate vs host reference traversal (same arrays); PoolStats gate on row-streaming.
+**Avoids:** P6 (recursive tree walk forbidden; stream output rows)
+**Research flag:** Skip research-phase — deterministic traversal with clear oracle.
 
-**Phase 14 — UMAP**
-**Rationale:** Hard dep on Phase 12 (builder) and Phase 13 (KNN-graph). The stochastic layout introduces a new GATHER kernel (umap_layout_step) that requires a cpu-MLIR spike. UMAP is file-disjoint from HDBSCAN.
-**Delivers:** prims/umap_layout.rs + umap_layout_step kernel; umap_fuzzy_map kernel; manifold/umap.rs estimator; estimators/manifold.rs PyUMAP; python/mlrs/manifold.py shim; property-gate test suite (trustworthiness + kNN-overlap + seed-reproducibility vs umap-learn 0.5.12) + value gate for stages 1-4.
-**Addresses:** UMAP feature; spectral init reuses v2 graph-Laplacian + eig prims (default init='random' for realistic sizes).
-**Avoids:** Pitfalls 2 and 5 (edge-scatter SGD; wrong oracle type).
-**Research flag:** SPIKE NEEDED before planning — vertex-owner GATHER umap_layout_step under cpu-MLIR (MEDIUM confidence); also exact property-gate thresholds need measurement on a first fixture run.
+### Phase 21: TreeSHAP
+**Rationale:** Depends on FIL/tree store (Phase 20). Deterministic — path-dependent Lundberg algorithm — so <=1e-5 gate applies, but ONLY against `shap.TreeExplainer` fed mlrs's own tree, NOT sklearn's forest. Additive-efficiency invariant is mandatory.
+**Delivers:** `mlrs-algos/explainer/tree_shap`; `shap.TreeExplainer` oracle on mlrs trees; <=1e-5 + additive-efficiency gate; brute-force exact Shapley oracle on small hand-built trees.
+**Avoids:** P2 (gated on mlrs's own tree, explicitly NOT sklearn's forest); P6 (iterative traversal, not recursive)
+**Research flag:** Skip research-phase — deterministic algorithm with clear oracle.
 
-**Phase 15 — HDBSCAN**
-**Rationale:** Hard dep on Phase 12 (builder) and Phase 13 (KNN-graph); feature-disjoint from Phase 14 (can be built in parallel after Phase 13 if resources allow). Device front-end + host tree back-end split is clear.
-**Delivers:** prims/mutual_reach.rs + mutual_reach_map kernel; prims/mst.rs (HOST Prim's); prims/condense.rs (HOST condensed-tree + stability); cluster/hdbscan.rs estimator; PyHDBSCAN; cluster.py shim extension; exact-label test suite (label_perm with -1-pinned; jittered + tied fixtures; precomputed-distance oracle path).
-**Addresses:** HDBSCAN feature; device/host split dodges GPU-tree-atomics wall.
-**Avoids:** Pitfalls 6 and 7 (label divergence; MST/tree atomics + float reorder).
-**Research flag:** SPIKE NEEDED before planning — confirm host MST + condensed-tree matches hdbscan reference exactly on tie-heavy fixtures.
+### Phase 22: ARIMA / AutoARIMA
+**Rationale:** Spike-independent — can run in parallel with the tree chain. New device kernels: batched Kalman sequential recursion and batched L-BFGS wrapper. Primitive-first: Kalman prim standalone-validated before ARIMA estimator consumes it.
+**Delivers:** `kalman.rs` kernel; `batched_kalman.rs` prim; batched L-BFGS wrapper; `mlrs-algos/tsa/` ARIMA + AutoARIMA; `statsmodels` oracle — log-likelihood band + forecast band + known-coefficient recovery via Jones/PACF transform; order-selection gate for AutoARIMA.
+**Avoids:** P3 (Jones/PACF transform mandatory — no raw-coefficient optimization; `statsmodels` oracle not `sklearn`; per-series convergence flags; f64 Kalman accumulation); P6 (tile over series batch)
+**Research flag:** NEEDS `/gsd-plan-phase --research-phase 22` — Kalman ARIMA + Jones transform is novel for this codebase; batched L-BFGS convergence flag design needs care.
 
-**Phase 16 — Builder Retrofit Sweep + Shim Coverage**
-**Rationale:** The one broad-edit, parallel-unsafe phase. Touching ~24 existing estimator files must be isolated so it never contends with new-estimator phases. Placed last to minimize blast radius.
-**Delivers:** Builder convention retrofitted to the ~24 pre-Phase-10 estimators (new() kept as thin wrappers); test_params.py/test_estimator_checks.py extended to UMAP/HDBSCAN + retrofitted set; all FFI-free invariant unit tests (get_params/set_params/clone/double-fit reset/pre-fit-raises) green in CI.
-**Addresses:** 30-estimator builder retrofit; full Python shim coverage.
-**Avoids:** Pitfalls 9, 10, 11 (typestate explosion; default drift; check_estimator failures).
-**Research flag:** STANDARD PATTERN — the retrofit is mechanical; the any_estimator! compatibility invariants are well-understood from v2. Pilot on 1-2 estimators under the PyO3 suite before the 28-estimator sweep.
+### Phase 23: Kernel SHAP + Permutation SHAP
+**Rationale:** Model-agnostic — depends only on having a fitted estimator and reuses existing GEMM/lstsq prims. Spike-independent. No new device kernels beyond the existing predict path.
+**Delivers:** `mlrs-algos/explainer/` kernel_shap + permutation_shap; `SHAPBase`; additive-efficiency invariant gate (exact); brute-force exact Shapley oracle for small `n`; convergence-band gate vs `shap` for large `n`; PyO3 `explainer.rs` + Python shim.
+**Avoids:** P2 (sampling-based -> never element-wise vs `shap`; axiom gate is the correct contract); P6 (stream coalition blocks, never enumerate 2^n)
+**Research flag:** Skip research-phase — SHAP axioms and weighted-lstsq are well-documented.
 
----
+### Phase 24: sklearn-Utility Surface (metrics / preprocessing / model_selection)
+**Rationale:** Spike-independent and foundational. Mostly host/reduction work; preprocessing scalers reuse the existing `reduce` prim. Degenerate fixtures (zero-variance column, empty class, constant target, single sample) are mandatory.
+**Delivers:** `python/mlrs/metrics.py` (accuracy, confusion_matrix, r2, mse, mae, roc_auc, log_loss, precision_recall_curve); `python/mlrs/preprocessing.py` (Standard/MinMax/MaxAbs/Robust/Normalizer/Binarizer/OneHot/Ordinal/Label/LabelBinarizer/SimpleImputer); `python/mlrs/model_selection.py` (train_test_split, KFold, StratifiedKFold); MT19937-host-match decision for model_selection recorded.
+**Avoids:** P5 (degenerate fixtures mandatory; MT19937-host match for split reproducibility; fit/transform statefulness enforced — stats learned only in `fit`, applied in `transform`)
+**Research flag:** Skip research-phase — deterministic functions with well-defined sklearn contracts.
 
-### Variant B: Retrofit trails (alternative — PITFALLS.md and STACK.md implicit ordering)
+### Phase 25: Genetic / Symbolic Regression
+**Rationale:** Spike-independent. Primitive-first: `program_eval` prim validated standalone before the evolutionary host loop. Property gate (R^2 band + valid program trees + internal seed-reproducibility) — never match gplearn's evolved expression.
+**Delivers:** `program.rs` kernel; `program_eval.rs` prim; `mlrs-algos/genetic/` SymbolicRegressor (host evolutionary loop, device-evaluated fitness); PyO3 `genetic.rs` + Python shim; `gplearn` oracle (R^2 band + structural gate).
+**Avoids:** P2 (stochastic — two-tier gate: internal seed-reproducibility + R^2-band vs gplearn; never element-wise expression match)
+**Research flag:** Skip research-phase — gplearn API is well-documented; host-evolve/device-evaluate pattern is established.
 
-The PITFALLS.md phase numbering assumed: Phase 12 = KNN-graph prim, Phase 13 = UMAP, Phase 14 = HDBSCAN, Phase 15 = builder convention + retrofit, Phase 16 = sklearn shim. Under this variant, UMAP and HDBSCAN are born with new(...) constructors and the builder is added in a cleanup sweep afterward.
-
-**Trade-off:** Under Variant B, UMAP and HDBSCAN must be lightly re-touched in Phase 15 to add the builder front door. Under Variant A, the builder is established first (one extra phase before any algorithm work) and the algorithm phases carry it from birth. Both variants agree the retrofit sweep is the higher blast-radius work and must be isolated as its own phase. The disagreement is only whether the convention-foundation phase belongs first (A) or after the algorithms are working (B).
-
-**Recommendation for roadmapper:** Variant A is preferred. The cost of a dedicated builder-convention phase (Phase 12) is low (pure API, no device work, no algorithm risk); the benefit is that UMAP and HDBSCAN are born idiomatic and never need a re-touch. Variant B is acceptable if the roadmapper wants algorithm value (KNN graph, UMAP, HDBSCAN) to land as early as possible and is comfortable with a minor re-touch to UMAP/HDBSCAN in the retrofit sweep.
-
----
+### Phase 26: cuml.accel Drop-in (pure Python, last)
+**Rationale:** Must land LAST because its value is proportional to the estimator surface it can proxy. After Phases 17-25 it can proxy the full v4.0 + v1-v3 surface (32 existing + new RF/ARIMA/SHAP/genetic estimators). Zero Rust changes. Fail-closed capability gate mandatory.
+**Delivers:** `python/mlrs/accel/__init__.py` (install/uninstall), `_hook.py` (MetaPathFinder/AccelModule/caller-exclusion), `_overrides.py` (name->class override table); fallback-matrix test (every proxied estimator + unsupported-config -> CPU fallback); import-ordering test; fitted-attribute parity verification.
+**Avoids:** P4 (fail-closed capability gate; caller-module exclusion list; detect-and-warn if sklearn already imported; exact fitted-attribute surface mirrored)
+**Research flag:** Skip research-phase — sys.modules import-hook is standard-library Python; cuML's own `accel/` is the direct reference already read in-source.
 
 ### Phase Ordering Rationale
 
-- KNN-graph before UMAP/HDBSCAN is mandatory in both variants: it is the shared substrate; primitive-first discipline requires standalone validation before consumers exist.
-- UMAP and HDBSCAN are file-disjoint (manifold/ vs cluster/, separate prim sets) and can be planned/built in parallel after the KNN-graph prim lands — same pattern as v2's parallel five-family wave after PRIM-06 through PRIM-10.
-- Retrofit sweep last in both variants: the ~24-file broad edit is the one parallel-unsafe work item in the milestone; isolating it prevents merge contention with algorithm phases.
-- Builder convention leads in Variant A because UMAP/HDBSCAN adopting it from birth is cheaper than a retroactive re-touch; in Variant B the algorithms land first and the convention arrives as cleanup.
+- Phase 17 gates Phases 18-21. The tree family is worthless if the histogram kernel cannot be made both correct AND tractable under cpu-MLIR. Spend one phase to answer cheaply (a handful of kernel probes) rather than discover the failure inside a half-built forest.
+- Phase 18 before Phase 19 (primitive-first). Hist/split/partition prims validated standalone vs a single sklearn DecisionTree before RF assembles N of them. Failures are localizable; rework is cheap at the prim level.
+- Phases 19 -> 20 -> 21 are a hard chain. FIL needs the node format (Phase 18) and a forest (Phase 19) to traverse. TreeSHAP needs FIL's tree store. These cannot be parallelized.
+- Phases 22-25 are spike-independent and parallel-eligible. ARIMA, model-agnostic SHAP, sklearn-utility, and genetic have no dependency on the tree spike result. Each still obeys primitive-first internally.
+- Phase 26 (cuml.accel) is last. Its override table is complete only when the entire estimator surface exists. Building it earlier means maintaining an incomplete proxy table.
 
 ### Research Flags
 
-Phases needing spikes before planning (MEDIUM confidence unknowns):
+Phases needing deeper research during planning:
+- **Phase 17 (RF feasibility spike):** Novel kernel authoring — consult `Skill("spike-findings-mlrs")` for the proven GATHER op-set, the 002-A (loud) / 002-B (silent) landmines, and the Phase 13 spike-as-model structure. GATHER histogram + relabel + seed-from-first argmax shapes need careful specification before any code is written.
+- **Phase 22 (ARIMA/AutoARIMA):** Jones/PACF transform parameterization, Joseph-form stable Kalman, batched L-BFGS convergence flags, and `statsmodels` oracle matching strategy are domain-specific and not covered by existing project patterns.
 
-- **Phase 13 (Variant A) / Phase 12 (Variant B) — KNN-graph prim:** Spike the composed-from-top_k GATHER path (distance -> top_k -> dense [n,k] -> symmetrize map) under --features cpu. Precedent is strongly favorable (v2 top_k launches on cpu-MLIR first try; same idiom), but the symmetrize-map step is new and must be confirmed.
-- **Phase 14 (Variant A) / Phase 13 (Variant B) — UMAP:** Spike the vertex-owner umap_layout_step GATHER kernel on cpu-MLIR before planning the estimator. Also determine the exact property-gate thresholds (trustworthiness floor relative to umap-learn) by running a small prototype.
-- **Phase 15 (both variants) — HDBSCAN:** Spike host MST (Prim's) + condensed-tree exactness vs the hdbscan reference on a tied-distance fixture. MST tie-breaking is the main label-divergence risk.
+Phases with standard patterns (skip research-phase):
+- **Phase 18 (tree prims + DecisionTree):** Primitive-first pattern is established; spike delivers the kernel shapes.
+- **Phase 19 (RF clf/reg):** Two-tier gate convention established in Phase 17.
+- **Phase 20 (FIL):** Deterministic traversal; exact gate; no novel kernel shapes beyond what the spike proves.
+- **Phase 21 (TreeSHAP):** Deterministic algorithm; oracle is `shap.TreeExplainer` on mlrs's own tree.
+- **Phase 23 (Kernel/Permutation SHAP):** SHAP axioms and weighted-lstsq are well-documented.
+- **Phase 24 (sklearn-utility):** Deterministic functions with exhaustively-documented sklearn contracts.
+- **Phase 25 (symbolic regression):** `gplearn` API is stable; host-evolve/device-evaluate pattern is established.
+- **Phase 26 (cuml.accel):** `importlib.abc` MetaPathFinder is standard-library Python; cuML's `accel/` is the direct reference.
 
-Phases with standard patterns (no phase-level research needed):
-
-- **Phase 12 (Variant A) — Builder convention:** The pattern is proven on 9 shipped estimators; BuildError already exists; the runtime fitted-flag via Option<DeviceArray> matches gaussian_nb.rs's shipped state model. Plan directly.
-- **Phase 16 (Variant A) / Phase 15-16 (Variant B) — Builder retrofit + shim coverage:** Mechanical retrofit following the established convention. The any_estimator! compatibility rules are well-documented from v2. Pilot on 1-2 estimators before sweeping; no dedicated research phase.
+---
 
 ## Confidence Assessment
 
 | Area | Confidence | Notes |
 |------|------------|-------|
-| Stack | HIGH | Zero new dependencies; all pins verified from shipped workspace Cargo.toml and pyproject.tomls; oracle-venv strategy proven from v1/v2. One watch-item: numba/numpy-2.5 compat in the oracle-regen venv — fully mitigated by committed .npz fixture blobs (CI is decoupled). |
-| Features | HIGH | Algorithm parameter surfaces verified against cuML v26.08 source (local), umap-learn and hdbscan stable documented APIs, and sklearn estimator contract. MEDIUM item: exact f32-on-rocm band magnitudes for UMAP/HDBSCAN continuous outputs — measured empirically per family during Phase 14/15 validation, same posture as every prior phase. |
-| Architecture | HIGH (placement/boundaries/device-host split) / MEDIUM (two execution unknowns) | File placement, trait deltas, data-flow seams, and the device-host split are grounded in shipped code reads. Two MEDIUM items: (1) umap_layout_step single-owner GATHER on cpu-MLIR (precedent strongly favorable but unconfirmed); (2) host MST/condensed-tree exactness on tie-heavy fixtures. Both are SPIKE NEEDED before their respective phase plans. |
-| Pitfalls | HIGH | Every pitfall is grounded in v1/v2 codebase idioms, project memory, CONCERNS.md cuML reference-behavior anti-patterns, and the hdbscan/umap-learn source and validation literature. The cuML UMAP vertex-parallel nondeterminism bug and the cuML HDBSCAN epsilon-path incompleteness are HIGH-confidence failure modes to avoid. |
+| Stack | HIGH | Zero new Rust compute deps confirmed from multiple independent angles; Python oracle versions verified against PyPI; hard pins (pyo3 0.28, cubecl 0.10.0) grounded in shipped decisions D-09 and D-07 |
+| Features | HIGH | cuML reference source is in-tree; oracle/gate per feature grounded in prior milestone decisions (D-12, RandomProjection, exact-label vs property vs 1e-5); one confirmed PROJECT.md slip: ARIMA oracle is `statsmodels`, not `sklearn` |
+| Architecture | HIGH (crate placement + build order); MEDIUM-HIGH (GPU-tree feasibility framing — analogous to Phase-13 pattern but tree-specific kernel shapes are unproven until the spike runs) |
+| Pitfalls | HIGH | cpu-MLIR pitfalls grounded in shipped project memory and spike-findings-mlrs (002-A/002-B documented panics/miscompiles); stochastic-gate pitfall grounded in D-12 and UMAP/RandomProjection precedent; accel pitfall grounded in cuML's own UnsupportedOnGPU/ProxyBase design |
 
-**Overall confidence:** HIGH for the approach; MEDIUM for two specific execution spikes that must precede Phase 14 and Phase 15 planning.
+**Overall confidence: HIGH**
 
 ### Gaps to Address
 
-- **UMAP layout-step cpu-MLIR feasibility (spike before Phase 14):** Run a minimal umap_layout_step kernel (one thread per vertex, scan neighbors, write embedding row) under --features cpu before committing to the phase plan. If it panics, the ARCHITECTURE.md host-loop fallback for the inner step is the immediate mitigation. Resolution: spike takes < 1 day.
-- **Host MST tie-breaking exactness (spike before Phase 15):** Run Prim's MST + condensed-tree on a small fixture with deliberate tied mutual-reachability edges against hdbscan Python reference. Lock the tie-breaking convention (stable-sort on weight, lowest-index tiebreak for equal weights) before the phase plan commits to the exact-label gate. Resolution: spike takes < 1 day.
-- **UMAP property-gate thresholds (measure during Phase 14 fixture generation):** The trustworthiness and kNN-overlap floors are relative-to-umap-learn (not hard absolute values) and must be calibrated on the first oracle fixture run. Design the gate as mlrs_trustworthiness >= umap_learn_trustworthiness - delta and measure delta empirically.
+- **RF GATHER histogram tractability (A3 abort signal):** Correctness of the GATHER inversion is well-grounded; the O(samples x bins) performance per (node, feature) is unknown until the spike benchmarks on a representative fixture. If A3 fires: fewer bins (64 default), shallower max-depth, frontier-only histogramming, or — last resort — drop RF/FIL/TreeSHAP from v4.0 and re-scope.
+- **Batched L-BFGS vs host-batched for ARIMA:** ARCHITECTURE.md recommends host-batched (loop over the existing prim) as the starting point. The decision between host-batched and device-batched should be made early in Phase 22 planning based on representative series-count workloads.
+- **ARIMA PROJECT.md slip — oracle assignment:** PROJECT.md lists "sklearn for ARIMA" (no ARIMA exists in sklearn). Must be corrected to `statsmodels.tsa` when REQUIREMENTS.md is written. `pmdarima` is NOT the oracle (absent from cuML test deps). AutoARIMA order-search reference = cuML's internal implementation tested against `statsmodels`; gate the selected (p,d,q) on synthetic series with known structure.
+- **MT19937 host-match for model_selection:** Whether to implement an MT19937-compatible permutation in host Rust (so `train_test_split`/`KFold(shuffle=True)` indices match sklearn bit-for-bit) vs property-gate-only should be recorded as a decision in Phase 24 planning. Both are viable; the MT19937 match is higher-fidelity.
+- **cuml.accel proxy coverage:** The `_overrides` table maps module-qualified names to mlrs classes. The exact set of proxied estimators and the supported-param space per capability gate should be drafted in Phase 26 planning against the then-complete estimator surface.
+
+---
 
 ## Sources
 
 ### Primary (HIGH confidence)
-- mlrs codebase (shipped, direct reads): crates/mlrs-algos/src/{traits,error}.rs, crates/mlrs-algos/src/{naive_bayes,linear,cluster}/*, crates/mlrs-backend/src/prims/{topk,distance,eig,laplacian,sgd}.rs, crates/mlrs-py/src/{dispatch,lib}.rs, crates/mlrs-py/python/mlrs/base.py — confirm builder/shim partial existence, top_k GATHER idiom, any_estimator! structure, BuildError, MlrsBase
-- .planning/PROJECT.md (v3 scope, gate regime, primitive-first discipline, phase numbering, deferred items)
-- .planning/milestones/v2.0-research/{STACK,FEATURES,ARCHITECTURE,PITFALLS,SUMMARY}.md (GATHER idiom validation, RandomProjection D-12 property-gate precedent, exact-label D-08 rule, pyo3 0.28/arrow-59 ABI pin)
-- Project memory: cubecl-cpu-no-shared-memory.md, rocm-is-runnable-gpu-gate.md, oracle-fixture-regen-needs-venv.md, cubecl-algo-crates-moved-to-cubek.md
-- cuML v26.08 source (local, read-only): cuml-main/python/cuml/cuml/manifold/umap/umap.pyx, cuml-main/python/cuml/cuml/cluster/hdbscan/hdbscan.pyx — algorithm param surfaces and defaults; CONCERNS.md — vertex-parallel nondeterminism bug, epsilon-path incompleteness warnings
-- PyPI JSON API (2026-06-22): umap-learn 0.5.12, hdbscan 0.8.44, scikit-learn 1.9.0 version/dep metadata
-- crates.io API (2026-06-22): bon 3.9.3, typed-builder 0.23.2, derive_builder 0.20.2 — rationale for rejection
-- scikit-learn estimator development guide: check_estimator invariants, get_params/set_params/clone contract, trailing-_ fitted-attr convention
-- hdbscan reference source (scikit-learn-contrib/hdbscan/hdbscan_.py): stable-sort MST edge ordering, noise -1, probabilities_ formula, min_samples semantics
+- `.planning/research/STACK.md` — stack analysis, Python oracle versions, cuml.accel mechanism, hard dep pins
+- `.planning/research/FEATURES.md` — oracle/gate per feature, API surface (constructor params/attrs), feature dependencies
+- `.planning/research/ARCHITECTURE.md` — crate placement, build order, component responsibilities, data flow, anti-patterns
+- `.planning/research/PITFALLS.md` — A1-A5 abort signals, two-tier stochastic gate, ARIMA numerical pitfalls, accel silent-wrong-results pitfall, memory blow-up patterns
+- `.planning/PROJECT.md` — milestone scope, constraints, key decisions (D-07, D-09, D-12), Core Value
+- `cuml-main/python/cuml/cuml/{accel,ensemble,fil,tsa,explainer,metrics,preprocessing,model_selection,feature_extraction,genetic}/` — RAPIDS cuML v26.08 reference behavior (read-only, in-tree)
+- `cuml-main/cpp/src/decisiontree/batched-levelalgo/builder_kernels_impl.cuh` — atomic+SharedMemory histogram (confirms GATHER inversion need)
+- `cuml-main/cpp/include/cuml/tree/flatnode.h` — SparseTreeNode format, right=left+1 convention
+- `crates/*/Cargo.toml` + workspace `Cargo.toml` — confirmed zero new deps, pyo3 0.28, cubecl 0.10.0 pins
+- `.planning/milestones/v3.0-phases/13-knn-graph-primitive-feasibility-keystone/` — Phase 13 spike model
+- `Skill("spike-findings-mlrs")` + `references/cpu-mlir-kernel-authoring.md` — proven cpu-MLIR GATHER op-set; 002-A/002-B landmines
 
 ### Secondary (MEDIUM confidence)
-- UMAP validation practice literature: trustworthiness/continuity/kNN-preservation as structure-preservation gate; 5-15% coordinate variation across implementations confirms value-matching is infeasible
-- GitHub lmcinnes/umap: numpy > 2.0 / numba compatibility discussion — corroborates the oracle-venv watch-item
-- cubecl 0.10 cpu-MLIR lowering behavior: SharedMemory/atomic failure modes documented in project memory (empirical from v1/v2 codebase)
+- PyPI (2026-06-26): `gplearn 0.4.3`, `shap 0.52.0`, `statsmodels 0.14.4` — versions verified
+- Project MEMORY.md — cpu-MLIR no-SharedMemory/atomics, rocm f64-unsupported, oracle-venv, disk/suite-slowness landmines
+- Jones (1980) PACF stationarity transform; Lundberg et al. TreeSHAP algorithm — established domain knowledge
+- `.planning/notes/v3-hard-algorithm-backlog.md`, `notes/cuml-mlrs-gap-inventory.md` — dependency ordering, tree feasibility flags
 
 ---
-*Research completed: 2026-06-22*
+*Research completed: 2026-06-26*
 *Ready for roadmap: yes*

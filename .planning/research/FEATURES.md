@@ -1,270 +1,274 @@
 # Feature Research
 
-**Domain:** Manifold learning (UMAP) + density clustering (HDBSCAN) + shared KNN-graph primitive + a Rust-native builder/typestate API + a pure-Python sklearn shim — added to a Rust/CubeCL rewrite of RAPIDS cuML.
-**Researched:** 2026-06-22
-**Confidence:** HIGH for sklearn/umap-learn/hdbscan algorithm semantics, parameter surfaces, and Rust builder/typestate idioms (stable, documented, cross-checked against the local cuML v26.08 `manifold/umap/umap.pyx` + `cluster/hdbscan/hdbscan.pyx` source). MEDIUM for the exact correctness-gate band magnitudes (must be measured on hardware) and for the precise MST/condensed-tree tie-breaking that drives HDBSCAN label exactness.
+**Domain:** ML algorithm library (Rust rewrite of RAPIDS cuML) — v4.0 final-surface completion
+**Researched:** 2026-06-26
+**Confidence:** HIGH (cuML reference source + sklearn/gplearn/shap API are read-only and in-tree; stochastic-gate precedent already set in v2/v3)
 
-> **Framing.** v3 adds two *stochastic / structural* algorithms whose oracle relationship differs from v1/v2. UMAP's layout is SGD with negative sampling → **no element-wise 1e-5**; oracle is `umap-learn` (CPU) and the gate is a **property/structural** one (à la v2 RandomProjection D-12). HDBSCAN is deterministic given a fixed KNN graph → oracle is `hdbscan` / `sklearn.cluster.HDBSCAN` and the gate is **exact labels up to permutation + noise label** (à la v2 classifiers). Both consume the same new **KNN-graph primitive**, which is the feasibility-critical, primitive-first deliverable (land + validate standalone before either estimator). The Rust builder API and Python shim are *surface* features (no new kernels), retrofitted across the existing 30 estimators.
+> Scope note: this file covers ONLY the v4.0 NEW features. The existing 32 estimators, KNN-graph
+> prim, PyO3 wheels, builder/typestate API and sklearn shim are settled and not re-researched.
+> Per-feature **oracle + gate** is the load-bearing output (downstream = REQ-IDs grouped by
+> category + roadmap ordering). The recurring theme: **RandomForest, all sampling-SHAP, and
+> symbolic regression are stochastic and will NOT match element-wise** — each needs a structural/
+> property contract, exactly as RandomProjection (D-12) and UMAP-03 established.
+
+---
+
+## Oracle & Gate Summary (the headline table)
+
+| Feature group | Oracle | Gate type | Why this gate |
+|---|---|---|---|
+| RandomForest (clf/reg) | `sklearn.ensemble.RandomForest*` | **Property/predictive-quality + structural** | mlrs SplitMix64 ≠ NumPy RNG → bootstrap rows & feature subsets differ → trees differ → no element-wise match. Contract = test accuracy/R² within margin of sklearn + structural tree invariants + a fully-deterministic single-tree config checked vs `DecisionTree`. |
+| FIL (forest inference) | host reference traversal of the **same** mlrs trees | **Exact (≤1e-5 / bit-exact labels)** | Inference is deterministic given fixed trees → device traversal must equal a CPU reference walk of the identical node arrays. This is the one tree-stack gate that is exact. |
+| TreeSHAP | `shap.TreeExplainer` on the same forest | **Exact ≤1e-5 + additive-efficiency invariant** | Lundberg path-dependent TreeSHAP is a deterministic exact algorithm → matches `shap` to ≤1e-5 AND `sum(shap)+base == model_output`. |
+| ARIMA / AutoARIMA | `statsmodels.tsa` (SARIMAX) / `pmdarima` (auto) | **Value-band on params + tighter band on forecasts** (NOT 1e-5) | ML estimate via L-BFGS → params agree to an optimizer band; log-likelihood & forecasts agree tighter. AutoARIMA = exact selected order on clean synthetic series. |
+| Kernel SHAP | `shap.KernelExplainer` | **Additive-efficiency invariant (exact) + sampling band vs shap** | Weighted-lstsq over sampled coalitions → stochastic value, but `sum(shap)+base == f(x)` holds exactly. |
+| Permutation SHAP | `shap.PermutationExplainer` | **Additive-efficiency invariant + band** | Permutation sampling is stochastic; efficiency property is exact. |
+| cuml.accel | direct mlrs estimator + sklearn fallback | **Behavioral/equivalence** (no numeric oracle of its own) | Proxy must (a) reproduce the wrapped mlrs estimator's output and (b) fall back to sklearn on unsupported params. |
+| metrics | `sklearn.metrics` | **≤1e-5 (float scores) / exact (integer/label scores)** | Deterministic functions. `confusion_matrix`, `accuracy` exact; `r2`, `roc_auc`, `log_loss` ≤1e-5. |
+| preprocessing | `sklearn.preprocessing` | **≤1e-5 (transform output)** | Deterministic transforms; fitted stats (mean/var/min/max/categories) match exactly → transformed matrix ≤1e-5. |
+| model_selection | `sklearn.model_selection` | **Structural (split proportions exact, reproducible) — NOT index-identical** | Shuffle RNG differs from NumPy → can't reproduce exact indices; gate = correct sizes, no leakage, strat proportions exact, same-seed reproducibility within mlrs. |
+| feature_extraction (tfidf) | `sklearn.feature_extraction.text` | **≤1e-5 on the tfidf matrix (vocabulary exact)** | Deterministic given a fixed tokenizer/vocab. |
+| Symbolic regression | `gplearn.SymbolicRegressor` | **Property/predictive-quality + structural** | GP is heavily stochastic; gate = test fitness ≥ gplearn − margin, valid program trees, seed-reproducibility within mlrs, parsimony respected. |
 
 ---
 
 ## Feature Landscape
 
-### Table Stakes (Users Expect These)
+### Table Stakes (users expect these in a "complete cuML-parity" library)
 
 | Feature | Why Expected | Complexity | Notes |
-|---------|--------------|------------|-------|
-| **KNN-graph primitive**: k-NN indices `(n, k)` + distances `(n, k)` over the existing distance prim | Both UMAP and HDBSCAN are *defined on* a k-NN graph; it is the shared substrate and the v3 feasibility keystone | MEDIUM | Built on v1 `NearestNeighbors` (brute-force top-k). cpu-MLIR GATHER idiom (no SharedMemory/atomics). Must expose **self-inclusion control** (UMAP excludes self; HDBSCAN's `min_samples` core-distance needs self-or-not handled consistently) and **directed (raw) output** (symmetrization is the consumer's job). |
-| **UMAP**: `fit` / `transform` / `fit_transform` → `embedding_` `(n, n_components)` | The canonical nonlinear dim-reduction / visualization estimator; the headline v3 feature | HIGH | Stages: KNN graph → fuzzy simplicial set (smooth-kNN `ρ`/`σ` per point) → fuzzy set union (symmetrize via `set_op_mix_ratio`) → spectral init → SGD layout with negative sampling. `transform` on new data uses the *fitted* graph/embedding. Stochastic → property gate. |
-| UMAP table-stakes hyperparameters | umap-learn users expect exact param names/defaults | — | `n_neighbors=15`, `n_components=2`, `metric='euclidean'`, `min_dist=0.1`, `n_epochs=None`(→200 large / 500 small N), `init='spectral'`, `random_state=None`. These are the "everyone touches them" knobs. |
-| **HDBSCAN**: `fit` / `fit_predict` → `labels_`, `probabilities_` | The canonical density clusterer that handles variable-density clusters + noise without `eps`; headline v3 feature | HIGH | Stages: core distances (`min_samples`-th NN) → mutual-reachability distance → MST (over MR-distance) → single-linkage hierarchy → condensed tree (`min_cluster_size`) → stability-based cluster extraction. Deterministic given the KNN graph. `labels_` uses **-1 for noise**. |
-| HDBSCAN table-stakes hyperparameters | hdbscan / sklearn.cluster.HDBSCAN users expect exact names/defaults | — | `min_cluster_size=5`, `min_samples=None`(→`min_cluster_size`), `cluster_selection_epsilon=0.0`, `cluster_selection_method='eom'`, `metric='euclidean'`, `alpha=1.0`. |
-| HDBSCAN `probabilities_` (∈[0,1], 0 for noise) | Soft membership strength is a defining HDBSCAN output; users index/plot on it | MEDIUM | Per-point = scaled position within its cluster's λ (death) range; exact formula must match the reference. |
-| **sklearn-named constructor params + trailing-underscore fitted attrs + `n_features_in_`** | Every mlrs estimator already honors this; v3 must not regress the convention | LOW | UMAP: `embedding_`, `n_features_in_`. HDBSCAN: `labels_`, `probabilities_`, `n_features_in_`. |
-| **f32 + f64 generic device path** for both new algorithms | Project core value; v1/v2 set the precedent | — | Gate = cpu(f64) + rocm(f32); f64-on-rocm SKIPS-with-log (cubecl-cpp 0.10 F64 unregistered for HIP). Per-file skip-guard line as in v2. |
-| **Rust-native builder + `.fit()`** for the two new estimators *and* a uniform convention retrofit across the 30 existing | "today's surface is sklearn-mirror, consumed mainly via PyO3"; v3's stated goal is an idiomatic Rust caller surface | MEDIUM (convention) / MEDIUM-HIGH (30-estimator retrofit churn) | `Umap::builder().n_neighbors(15).min_dist(0.1).build()?` → `.fit(&x)?`. `build()` returns `Result` (validates params). `fit` returns `Result` (validates data). |
-| **Pure-Python sklearn shim**: `get_params` / `set_params` / passes `check_estimator` | Carried-forward v2 debt; required for the estimators to be drop-in sklearn objects (pipelines, grid-search) | MEDIUM | `get_params(deep=True)` returns the constructor kwargs verbatim; `set_params(**kw)` mutates + revalidates; clone-ability (no fitted state copied) and the `__init__`-stores-args-unchanged rule are the load-bearing `check_estimator` requirements. |
+|---|---|---|---|
+| RandomForestClassifier / Regressor | The single highest-demand missing estimator; "no RF" = library feels incomplete | **HIGH** (spike-gated) | GPU histogram/split under cpu-MLIR no-SharedMemory/no-atomics is the make-or-break; quantile binning (`n_bins`), per-tree bootstrap, feature subsampling. Keystone — unblocks FIL→TreeSHAP. |
+| FIL — batched tree inference | A forest you can't predict from fast is useless; predict path must traverse trees in bulk | **MEDIUM** | Deterministic; pure GATHER traversal over node arrays. Defines the canonical tree format the rest of the stack reads. |
+| ARIMA(p,d,q) + forecast | Table-stakes for any time-series story | **HIGH** | Batched Kalman-filter log-likelihood + **batched** L-BFGS (mlrs has L-BFGS but not batched). Differencing (d), intercept (mu/k), exog. |
+| metrics: accuracy / r2 / confusion_matrix / mse / mae | Every classifier/regressor user calls `.score`-adjacent metrics | **LOW** | Reductions only; deterministic; ≤1e-5 / exact. Highest-value first. |
+| preprocessing: StandardScaler / MinMaxScaler / MaxAbsScaler / RobustScaler / Normalizer | Universal pipeline front-ends; expected before any estimator | **LOW–MEDIUM** | Fit = column stats (mean/var/min/max/median/IQR); transform = elementwise. Deterministic ≤1e-5. PartialFit precedent exists (v2 IncrementalPCA). |
+| preprocessing encoders: OneHotEncoder / OrdinalEncoder / LabelEncoder / LabelBinarizer | Categorical handling expected for real datasets | **MEDIUM** | Host-heavy (category discovery); device-light. Exact category mapping. |
+| model_selection: train_test_split / KFold / StratifiedKFold | First call in nearly every ML script | **LOW** | Mostly host/indexing. Structural gate (see oracle table). cuML delegates `train_test_split` semantics to sklearn — mlrs can mirror. |
+| Kernel SHAP | The default model-agnostic explainer users reach for | **MEDIUM–HIGH** | Background dataset + coalition sampling + weighted lstsq. Reuses GEMM/lstsq prims. |
 
-### Differentiators (Competitive Advantage)
+### Differentiators (align with Core Value: correctness + single generic backend)
 
 | Feature | Value Proposition | Complexity | Notes |
-|---------|-------------------|------------|-------|
-| **Single shared KNN-graph prim** feeding both UMAP and HDBSCAN (+ reusable by future SpectralEmbedding `nearest_neighbors` affinity) | One validated, memory-efficient device prim instead of two ad-hoc graphs; embodies the project's primitive-first discipline | MEDIUM | Lands + gated standalone before consumers; mirrors v2's kernel-matrix/Laplacian/SGD prim pattern. |
-| **f64 device UMAP/HDBSCAN** | umap-learn / hdbscan are CPU-f64; cuML is GPU-**f32-only** for both. mlrs offers GPU **and** f64. | — | f64 makes the HDBSCAN MST/MR-distance ties and UMAP smooth-kNN root-find numerically comfortable; differentiator vs both references. |
-| **Typestate fit/unfit Rust API** (`Umap<Unfit>` → `Umap<Fitted>`; `predict`/`transform` only exist on `Fitted`) | Compile-time prevention of "predict before fit" — a class of bug sklearn/cuML catch only at runtime (`NotFittedError`) | MEDIUM | Idiomatic Rust; the PyO3 layer collapses the typestate behind the existing `Unfit/F32/F64` enum. Nice differentiator over a naive port. |
-| **`outlier_scores_` (GLOSH)** on HDBSCAN | The `hdbscan` library exposes per-point outlier scores; valued for anomaly detection | MEDIUM-HIGH | Differentiator *only vs sklearn.cluster.HDBSCAN* (which omits it). Optional — can ship as a v3.x follow-on. |
-| **Builder param-validation at `build()`** with typed errors (`thiserror`) | Caller gets a structured error (`InvalidNNeighbors`, `MinDistGtSpread`) before any device work | LOW | Matches the existing error convention (thiserror in libs, anyhow at boundaries). |
+|---|---|---|---|
+| TreeSHAP (exact) | Exact, fast tree explanations matching `shap` to ≤1e-5 — the rare stochastic-domain feature with an EXACT gate | **HIGH** | Path-dependent Lundberg algorithm over FIL trees. Strongest correctness story of the milestone. Depends on FIL/tree format. |
+| AutoARIMA order search | "Just fit my series" — automatic (p,d,q)(P,D,Q,s) via IC + stationarity/seasonality tests | **HIGH** | KPSS (d) + seasonal test (D) + grid/stepwise over orders, scored by aic/aicc/bic. Built on ARIMA. |
+| cuml.accel transparent drop-in | Zero-code-change acceleration of existing sklearn/umap/hdbscan scripts → proxies to the 32 mlrs estimators | **MEDIUM** (mostly Python plumbing) | Import-hook/module-swap + per-estimator overrides + CPU fallback. No new algorithm; high adoption value. Reverses the prior Out-of-Scope decision. |
+| Permutation SHAP | Cheaper model-agnostic explainer; complements Kernel SHAP | **MEDIUM** | Forward/reverse permutation passes; shares SHAPBase plumbing with Kernel SHAP. |
+| Symbolic / genetic regression | Interpretable closed-form models; a capability sklearn itself lacks (parity with cuML's `genetic`) | **HIGH** | Population of program trees, tournament selection, crossover/mutation. Heavily stochastic. Oracle = `gplearn`. |
+| feature_extraction: TfidfVectorizer / CountVectorizer | Enables text pipelines end-to-end | **MEDIUM** | Host tokenization + sparse counts; device-light. Lower priority than numeric preprocessing. |
+| RF OOB score, feature_importances_ | Expected RF attributes that add diagnostic value | **MEDIUM** | `oob_score_`, `feature_importances_` — structural-gated (within band vs sklearn). |
 
-### Anti-Features (Commonly Requested, Often Problematic)
+### Anti-Features (commonly requested, deliberately avoid or bound tightly)
 
 | Feature | Why Requested | Why Problematic | Alternative |
-|---------|---------------|-----------------|-------------|
-| **Element-wise 1e-5 match of UMAP `embedding_` vs umap-learn** | "match the oracle like every other estimator" | UMAP layout is SGD + negative sampling + per-PRNG shuffle; even umap-learn isn't reproducible across BLAS/threads. mlrs SplitMix64 ≠ NumPy MT → coordinates can't match | **Property/structural gate** (D-12 style): kNN-recall / trustworthiness of the embedding, local-neighborhood preservation, cluster separability (silhouette/ARI of a downstream KMeans on the embedding vs on umap-learn's), seed-reproducibility within mlrs. NOT coordinate value-match. |
-| **`tree`/`ball_tree` / NN-Descent / approximate-KNN graph build** | cuML uses `nn_descent`; umap/hdbscan support trees for speed | Tree/NN-descent builds fight cpu-MLIR (no SharedMemory) and add an approximation that breaks the exact-label HDBSCAN gate | **Brute-force exact KNN** (v1 top-k). Exact graph → deterministic HDBSCAN labels → clean gate. Document the O(n²) size ceiling. |
-| **Custom/callable metrics** (UMAP & HDBSCAN) | Both references accept arbitrary callables/`metric_params` | No numba on CubeCL; unbounded surface, no oracle | **Fixed string metrics** reusing the v1 distance prim: `euclidean` (+`manhattan`/`cosine` if cheap). Raise on unsupported. |
-| **UMAP supervised / `target_metric` / semi-supervised** (`fit(X, y)` to steer layout) | umap-learn & cuML support it | Doubles the fuzzy-graph machinery (target graph blend) for a niche use; no clean property gate | Unsupervised `fit(X)` only for v3; raise/ignore `y`. Defer supervised UMAP. |
-| **UMAP `inverse_transform`** (embedding → original space) | cuML/umap-learn expose it (Delaunay-based in cuML) | Needs Qhull/Delaunay (cuML does it on host via scipy) — large surface, host-only, no device value | Omit; `transform` (new data → embedding) is the table-stakes direction. |
-| **HDBSCAN `approximate_predict` / `membership_vector` / soft clustering** | hdbscan library prediction API for new points | Needs the persisted prediction-data structures (condensed-tree internals); large surface | Ship `fit_predict` (the 95% use). Defer new-point prediction to v3.x. |
-| **HDBSCAN `cluster_selection_method='leaf'` + the full `gen_min_span_tree`/dendrogram plotting attrs** | hdbscan library exposes `condensed_tree_`, `single_linkage_tree_`, `minimum_spanning_tree_` plot objects | Plotting/inspection objects are pure-Python surface with no algorithmic value and no oracle | Support both `'eom'` (default) and `'leaf'` selection (cheap, same condensed tree); skip the plot wrapper objects (or expose raw arrays only). |
-| **Builder retrofit that rewrites estimator internals** | "make it idiomatic everywhere at once" | Touching 30 estimator bodies risks regressing the shipped 1e-5 gates | **Additive builder layer**: builder constructs the *existing* config struct; `fit` path unchanged. Retrofit = new front door, not surgery. |
-| **`check_estimator` via live FFI `estimator_checks`** | "prove sklearn compliance end-to-end" | Needs maturin+pyarrow host this env lacks (explicitly deferred in PROJECT) | **Pure-Python shim** implementing get_params/set_params/clone semantics; live `estimator_checks` re-triage stays deferred. |
+|---|---|---|---|
+| Element-wise 1e-5 match of RF predictions/trees vs sklearn | "Match sklearn like everything else" | Different RNG → different bootstrap/feature subsets → fundamentally different forests; chasing it is impossible | Predictive-quality band + deterministic single-tree exact check + structural invariants |
+| Bit-exact match of Kernel/Permutation SHAP vs `shap` | "SHAP values should be identical" | Sampling-based → stochastic; only the additive-efficiency property is exact | Efficiency invariant (exact) + band vs `shap` library |
+| cuml.accel that silently produces wrong results on unsupported params | Maximize "it just works" coverage | Silent divergence destroys trust; cuML's own design fights this with `UnsupportedOnGPU`→CPU fallback | Explicit unsupported-config detection → transparent sklearn CPU fallback, never silent approximation |
+| Treelite/XGBoost/LightGBM model ingestion into FIL | "Load my existing boosted models" | Pulls in Treelite + a foreign serialization format; huge surface, no oracle in mlrs's sklearn-only world | FIL consumes ONLY mlrs's own forest format in v4.0; external-model import is a later milestone |
+| GridSearchCV / RandomizedSearchCV as native device code | "Full model_selection parity" | Search is orchestration, not compute; cuML itself just `__getattr__`-delegates to sklearn | Delegate to sklearn (passthrough); ship only the data-splitters natively |
+| Interventional/feature-perturbation TreeSHAP with background data | "Match shap's newer default" | Needs background-dataset marginalization; doubles the algorithm | Ship path-dependent (tree-stats) TreeSHAP first; interventional is a follow-up |
+| ARIMA via sklearn oracle | PROJECT.md lists "sklearn for ARIMA" | **sklearn has no ARIMA** — this is a documentation slip | Use `statsmodels.tsa` (SARIMAX) / `pmdarima` as the ARIMA oracle; flag the PROJECT.md line for correction |
+| Seasonal ARIMA + exog + missing-data in the first cut | "Full SARIMAX parity" | Each multiplies the Kalman state-space surface | Non-seasonal ARIMA(p,d,q) first; add seasonal (P,D,Q,s) and exog as graded sub-requirements |
 
 ---
 
-## Per-Feature Detail
+## Concrete API Surface (constructor params → fit/predict → fitted attrs)
 
-### Feature 1 — KNN-graph primitive (the shared substrate; build FIRST)
+### (a) RandomForest
 
-**New prim.** `prims/knn_graph.rs` over the v1 brute-force distance + top-k. Feature-free, GATHER idiom, standalone PoolStats-gated.
+**RandomForestClassifier** (cuML defaults): `n_estimators=100`, `split_criterion='gini'` (`gini`|`entropy`),
+`bootstrap=True`, `max_samples=1.0`, `max_depth=None`, `max_leaves=-1`, `max_features='sqrt'`
+(`'sqrt'`|`'log2'`|`None`|int|float), `n_bins=128`, `n_streams=4`, `min_samples_leaf=1`,
+`min_samples_split=2`, `min_impurity_decrease=0.0`, `max_batch_size=4096`, `random_state`.
+**RandomForestRegressor**: same, but `split_criterion='mse'` (`mse`|`mae`|`poisson`).
+- Criterion enum in cuML: `GINI, ENTROPY, MSE, MAE, POISSON`.
+- API: `fit(X, y)` → `predict(X)`, `predict_proba(X)` (clf), `score(X,y)`; attrs `feature_importances_`,
+  `oob_score_` (if `bootstrap=True`), `n_features_in_`, `classes_` (clf).
+- **What FIL needs from the tree format:** a per-tree node table — for each node: `feature_index`
+  (or LEAF sentinel), `threshold` (float, split `x[f] <= threshold` → left), `left_child`,
+  `right_child` indices, and `leaf_value` (regression: scalar; classification: class-probability
+  vector or class id). Dense (complete-array) or sparse (CSR-of-nodes) layout. cuML routes this via
+  Treelite; **mlrs should define its own flat node-array format** (cpu-MLIR-safe GATHER traversal),
+  NOT adopt Treelite. Quantile bin edges (`n_bins`) are the candidate split thresholds.
+- **Note:** `n_bins` quantile binning means even a "deterministic" mlrs tree won't equal sklearn's
+  exhaustive-threshold tree exactly; the deterministic-single-tree exact check should be against a
+  *binned* reference, or accept a documented split-threshold band.
 
-- **Contract (what consumers need):** for each of `n` rows, the `k` nearest neighbor **indices** `(n, k)` and **distances** `(n, k)`, in ascending-distance order.
-- **Self-inclusion:** must be a parameter.
-  - **UMAP** wants the `k` nearest *excluding self* (umap-learn computes `n_neighbors` neighbors; the smooth-kNN `ρ` is the distance to the nearest *non-zero* neighbor). Practically: request `k+1`, drop the self column (distance 0), keep `k`.
-  - **HDBSCAN** core distance is the distance to the `min_samples`-th neighbor; the reference convention **includes the point itself** as the 0th neighbor (so `core_dist = dist to the min_samples-th neighbor counting self`). Pin this counting convention against the oracle — off-by-one here shifts every core distance and breaks the exact-label gate.
-- **Directed vs symmetric:** the prim returns the **directed/raw** k-NN (row i's neighbors). Symmetrization is consumer-specific:
-  - UMAP: fuzzy-set **union** with `set_op_mix_ratio` (a *weighted* symmetrization, `A + Aᵀ − mix·A∘Aᵀ`), not a plain `max`/`0.5(W+Wᵀ)`.
-  - HDBSCAN: builds an MST over mutual-reachability distance, which is symmetric by construction (`mreach(a,b)=max(core_a, core_b, d(a,b))`); it does **not** need the kNN graph symmetrized, only the core distances + pairwise (or kNN-restricted) MR distances.
-- **Complexity:** O(n²·d) brute-force distance + O(n·k) top-k (reuses v1). Size-ceiling documented (same as v2 dense-Gram ceiling).
-- **Gate:** exact vs a NumPy/sklearn `NearestNeighbors` oracle (indices set-equal up to tie-ordering; distances 1e-5). This is a *value* gate — the prim itself is deterministic.
-- **cpu-MLIR:** one-thread-per-(row) GATHER scan for top-k; no SharedMemory, no atomics (proven idiom from v1 top-k).
+### (b) ARIMA / AutoARIMA
 
-### Feature 2 — UMAP
+**ARIMA**: `order=(p,d,q)` default `(1,1,1)`, `seasonal_order=(P,D,Q,s)` default `(0,0,0,0)`,
+`fit_intercept`/`k` (mu term), `exog` (n_exog regressors), `simple_differencing=True`,
+`handle`, `convert_dtype`. Internals: `ARIMAOrder{p,d,q,P,D,Q,s,k,n_exog}`,
+`ARIMAParams{mu,beta,ar,ma,sar,sma,sigma2}`.
+- API: `fit()` (ML via batched L-BFGS over Kalman-filter log-likelihood) → `forecast(nsteps)`,
+  `predict(start,end)`; attrs `aic`, `aicc`, `bic`, fitted `mu_/ar_/ma_/sar_/sma_`.
+- Batched over many series simultaneously — cuML's whole value prop. mlrs has L-BFGS but **batched
+  L-BFGS is new work**; the batched Kalman-filter likelihood is the new device kernel.
 
-**Oracle:** `umap-learn` (CPU, f64). cuML's `umap.pyx` is API-shape reference (confirmed: it exposes exactly the umap-learn param surface). **Gate:** property/structural, NOT 1e-5.
+**AutoARIMA**: `search(s, d, D, max_p, max_q, max_P, max_Q, start_p, start_q, ic='aicc'`
+(`aic`|`aicc`|`bic`)`, test='kpss'` (d-selection)`, seasonal_test='seas'` (D-selection)`, ...)`.
+- Picks `d` via stationarity test (KPSS), `D` via seasonal test, then grid/stepwise over remaining
+  orders scored by the information criterion. Built directly on ARIMA.
 
-**Algorithm stages (each is a discrete, testable sub-step):**
-1. **KNN graph** (Feature 1) — `n_neighbors` nearest, self-excluded.
-2. **Fuzzy simplicial set** — per point find `ρ_i` (distance to nearest neighbor, modulo `local_connectivity`) and solve for `σ_i` by **binary search** so that `Σ_j exp(−max(0, d_ij − ρ_i)/σ_i) = log2(n_neighbors)`. This is the "smooth kNN distance". Edge weight `w_ij = exp(−max(0,d_ij−ρ_i)/σ_i)`.
-3. **Fuzzy set union (symmetrize)** — `B = A + Aᵀ − set_op_mix_ratio · (A∘Aᵀ)` (probabilistic t-conorm; `set_op_mix_ratio=1.0` → pure union, `0.0` → intersection).
-4. **Spectral init** (`init='spectral'`) — eigenvectors of the normalized Laplacian of `B` (reuse the v2 graph-Laplacian prim + v1 eig — smallest nontrivial, exactly the v2 SpectralEmbedding machinery). `init='random'` is the fallback. **This is a major prim-reuse win.**
-5. **SGD layout optimization** — `n_epochs` of edge-sampling SGD with **negative sampling**: attract along graph edges, repel `negative_sample_rate` random non-edges, using the `a`/`b` curve from `find_ab_params(spread, min_dist)`. PRNG-driven → the stochastic core.
+### (c) Kernel SHAP vs Permutation SHAP
 
-**Table-stakes hyperparameters (umap-learn defaults; confirmed against cuML source):**
-| Param | Default | Role |
-|-------|---------|------|
-| `n_neighbors` | 15 | local vs global structure; KNN graph size |
-| `n_components` | 2 | embedding dimensionality |
-| `metric` | `'euclidean'` | distance for KNN graph |
-| `min_dist` | 0.1 | min spacing in embedding (drives `a`,`b`); **must be ≤ `spread`** |
-| `n_epochs` | None → 500 (n<10k) / 200 (n≥10k) | SGD iterations |
-| `init` | `'spectral'` | `'spectral'` or `'random'` |
-| `random_state` | None | seed; when set, forces deterministic single-thread path |
-| `learning_rate` | 1.0 | SGD initial α |
+**KernelExplainer**: `__init__(model, data` (background)`, nsamples='auto'` =`2*n_features+2048`,
+`link='identity'` (`identity`|`logit`)`, ...)` → `shap_values(X)`.
+Semantics: sample coalitions of present/absent features, evaluate model on masked rows (absent →
+background values), solve a **weighted least-squares** (SHAP kernel weights) per row → local linear
+attributions. Model-agnostic, expensive (many model calls), stochastic in sampling.
 
-**Differentiator/advanced hyperparameters (expose, sensible defaults, lower-priority to tune):** `spread=1.0`, `set_op_mix_ratio=1.0`, `local_connectivity=1.0`, `repulsion_strength=1.0`, `negative_sample_rate=5`, `a=None`/`b=None` (override the curve fit), `transform_queue_size=4.0`.
+**PermutationExplainer**: `__init__(model, data, link='identity', ...)` → `shap_values(X)`.
+Semantics: iterate feature **permutations**, do forward+reverse masking passes, accumulate marginal
+contributions. Cheaper, fewer model evals, also stochastic.
+- Both share `SHAPBase` (background data, link function, masking machinery). Both satisfy
+  **efficiency exactly**: `base_value + sum(shap_values) == link(model(x))`.
 
-**Outputs:** `fit(X)` → sets `embedding_` `(n, n_components)`; `fit_transform(X)` returns it; `transform(X_new)` embeds new points against the fitted fuzzy graph (umap-learn does a per-new-point kNN against training data + a short SGD). MVP may ship `fit`/`fit_transform` first and add `transform` as a fast-follow (transform reuses the same SGD but is fiddlier to gate).
+### (d) Highest-value utility surface
 
-**Gate (property/structural — the D-12 analog):**
-- **kNN preservation / trustworthiness**: fraction of each point's k embedding-neighbors that were k input-neighbors ≥ threshold, compared *against umap-learn's own* trustworthiness (mlrs ≥ umap-learn − margin), not against absolute coordinates.
-- **Downstream separability**: on a labeled synthetic blob/cluster dataset, KMeans/ARI on mlrs embedding ≈ ARI on umap-learn embedding (within band).
-- **Seed-reproducibility**: same `random_state` → bit-identical mlrs embedding across runs.
-- **Determinism of stages 1–4** (graph, fuzzy set, spectral init) — these *are* value-gateable at 1e-5 vs umap-learn's intermediate arrays; gate them directly. Only stage 5 (SGD) is property-only.
+| Module | Ship these (highest value) | Defer / passthrough |
+|---|---|---|
+| **metrics** | `accuracy_score`, `confusion_matrix`, `r2_score`, `mean_squared_error`, `mean_absolute_error`, `log_loss`, `roc_auc_score`, `precision_recall_curve` | `kl_divergence`, `hinge_loss`, cluster metrics (`adjusted_rand_score` already an internal helper), `mean_squared_log_error`, `median_absolute_error` |
+| **preprocessing** | `StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`, `Normalizer`, `Binarizer`, `OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder`, `LabelBinarizer`, `SimpleImputer` | `PolynomialFeatures`, `PowerTransformer`, `QuantileTransformer`, `KBinsDiscretizer`, `FunctionTransformer`, `KernelCenterer`, `TargetEncoder` |
+| **model_selection** | `train_test_split`, `KFold`, `StratifiedKFold` | `GridSearchCV`/`RandomizedSearchCV` → delegate to sklearn (cuML does exactly this via `__getattr__`) |
+| **feature_extraction** | `CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer` (lower priority; text/host-heavy) | — |
 
-### Feature 3 — HDBSCAN
+### (e) Symbolic / genetic regression (gplearn oracle)
 
-**Oracle:** `hdbscan` library and/or `sklearn.cluster.HDBSCAN` (CPU). **Gate:** exact `labels_` up to permutation + noise (`-1`), `probabilities_` within band. Deterministic given the KNN graph → a *real* exact gate (unlike UMAP).
-
-**Algorithm stages:**
-1. **Core distances** — `core_dist_i = ` distance to the `min_samples`-th neighbor (counting convention pinned in Feature 1).
-2. **Mutual-reachability distance** — `mreach(a,b) = max(core_a, core_b, alpha·d(a,b))` (`alpha=1.0`).
-3. **MST** — minimum spanning tree over MR distance (Prim's/Borůvka). cpu-MLIR-safe: Prim's with a GATHER per-iteration min-scan, no atomics. Tie-breaking must match the oracle for exact labels (document the rule).
-4. **Single-linkage hierarchy** — sort MST edges ascending; union-find to build the dendrogram.
-5. **Condensed tree** — walk the hierarchy top-down; a split is a "real" split only if **both** sides have ≥ `min_cluster_size` points; otherwise the smaller side "falls out of" the parent (points become noise at that λ). Tracks birth/death λ = 1/distance.
-6. **Cluster extraction** — `cluster_selection_method='eom'` (Excess of Mass): select clusters maximizing total stability `Σ (λ_p − λ_birth)` subject to no ancestor/descendant both selected; `'leaf'` selects all leaf clusters. `cluster_selection_epsilon>0` merges clusters below a distance threshold (DBSCAN-like floor).
-
-**Table-stakes hyperparameters (defaults — note sklearn vs hdbscan-library differences):**
-| Param | hdbscan lib default | sklearn.cluster.HDBSCAN default | Role |
-|-------|--------------------|-------------------------------|------|
-| `min_cluster_size` | 5 | 5 | smallest accepted cluster |
-| `min_samples` | None→`min_cluster_size` | None→`min_cluster_size` | core-distance k; conservatism/noise |
-| `cluster_selection_epsilon` | 0.0 | 0.0 | distance floor to merge micro-clusters |
-| `cluster_selection_method` | `'eom'` | `'eom'` | `'eom'` or `'leaf'` |
-| `metric` | `'euclidean'` | `'euclidean'` | distance |
-| `alpha` | 1.0 | 1.0 | MR-distance scaling (robust-single-linkage) |
-| `max_cluster_size` | 0 (off) | 0 (off) | upper cap (eom only) |
-
-**sklearn vs hdbscan-library API differences (pick a target, note both):**
-- **Namespace/import:** `sklearn.cluster.HDBSCAN` vs `import hdbscan; hdbscan.HDBSCAN`.
-- **`store_centers`:** sklearn-only param (`'centroid'`/`'medoid'`) → `centroids_`/`medoids_` attrs; not in hdbscan lib.
-- **`outlier_scores_` (GLOSH):** hdbscan lib **has it**; sklearn **omits it**. (mlrs differentiator if shipped.)
-- **Prediction/inspection attrs:** hdbscan lib exposes `condensed_tree_`, `single_linkage_tree_`, `minimum_spanning_tree_`, `approximate_predict`; sklearn exposes none of these.
-- **`metric='precomputed'`:** both accept a precomputed distance matrix (useful for a clean oracle harness — feed identical distances to both, isolating the clustering logic from KNN ties).
-- **Recommendation:** target **sklearn.cluster.HDBSCAN's surface** as the table-stakes contract (`labels_`, `probabilities_`, the 7 params above), and gate against **both** oracles with `metric='precomputed'` to neutralize KNN tie ambiguity; add `outlier_scores_` as an opt-in differentiator.
-
-**Outputs:** `labels_` `(n,)` int (`-1`=noise), `probabilities_` `(n,)` ∈[0,1] (0 for noise). Optional: `outlier_scores_` `(n,)`. `fit_predict(X)` returns `labels_`.
-
-**Gate:** `labels_` exact up to permutation + noise (v2 label-perm helper handles permutation; add noise-label alignment). `probabilities_` within a documented band (the λ-scaling can differ slightly in f32). With `metric='precomputed'` the gate should be *exact* on f64.
-
-### Feature 4 — Rust-native builder + typestate API
-
-**No new kernels.** A caller-surface convention + a 30-estimator retrofit. Idiomatic target:
-
-```rust
-let umap = Umap::builder()           // -> UmapBuilder (all params Optional, defaulted)
-    .n_neighbors(15)
-    .min_dist(0.1)
-    .n_components(2)
-    .random_state(42)
-    .build()?;                       // -> Result<Umap<Unfit>, BuildError>  (validates params)
-
-let fitted = umap.fit(&x)?;          // -> Result<Umap<Fitted>, FitError>   (validates data)
-let emb = fitted.embedding();        // accessor only exists on Fitted
-let y    = fitted.transform(&x2)?;   // transform/predict only on Fitted typestate
-```
-
-- **Table-stakes ergonomics:**
-  - **Owned builder, chained setters** returning `Self` (move-based; the dominant Rust builder style, no lifetime friction).
-  - **`build()` returns `Result`** and validates params (e.g. `min_dist ≤ spread`, `n_neighbors ≥ 1`) with `thiserror` variants.
-  - **`fit` returns `Result`**; on success yields the fitted estimator (or `&mut self` set-state — pick one and apply uniformly across all 30).
-  - **Sensible defaults** = sklearn defaults, so `Umap::builder().build()?` reproduces sklearn-default behavior.
-  - **Doc-comments on every setter** stating the sklearn param it mirrors.
-- **Nice-to-haves (differentiators):**
-  - **Typestate `Unfit`/`Fitted`** so `transform`/`predict`/accessors are compile-time-gated (can't call before fit). The PyO3 layer hides this behind the existing `any_estimator!` `Unfit/F32/F64` enum.
-  - **Derive-macro builder** (e.g. `derive_builder` / `bon` / `typed-builder`) vs hand-rolled — evaluate in STACK research; hand-rolled keeps zero new deps and full control over `Result`-returning `build()`.
-  - **`From`/`TryFrom` between builder and the existing config struct** so the retrofit is *additive* (builder → existing config → existing fit path) — protects the shipped 1e-5 gates.
-- **Anti-feature:** rewriting estimator fit bodies for the retrofit. Keep `fit` logic untouched; the builder is a new front door.
-
-### Feature 5 — Pure-Python sklearn shim
-
-**No new kernels.** Carried-forward v2 debt. What `check_estimator` / `get_params` / `set_params` actually require:
-
-- **`__init__` stores every constructor arg unchanged** as a same-named attribute, with **no validation and no computation in `__init__`** (sklearn rule: `__init__` must not mutate args). Validation happens in `fit`. The existing PyO3 estimators must surface their params this way at the Python layer.
-- **`get_params(deep=True)`** returns `{param: value}` for every `__init__` arg (discovered via the signature). For nested estimators, `deep=True` recurses with `param__subparam` keys (not needed for UMAP/HDBSCAN — flat params).
-- **`set_params(**params)`** sets the corresponding attrs, supports `param__subparam`, **revalidates nothing** (just stores), and returns `self`.
-- **`clone()` compatibility**: `clone(est)` calls `get_params` then `__init__(**params)` and asserts the new estimator's `get_params` equals the original's — so params must round-trip exactly (no coercion in `__init__`).
-- **Tags / mixin surface** that `check_estimator` exercises: `fit` returns `self`; fitted attrs end in `_` and only appear after `fit`; `NotFittedError` (or analog) before fit; `n_features_in_` set in `fit`; consistent `n_features_in_` enforced at `predict`/`transform`. For clusterers (HDBSCAN): `fit_predict` present, `labels_` set. For transformers (UMAP): `transform`/`fit_transform`, output shape `(n, n_components)`.
-- **Scope note:** the *pure-Python* shim implements get_params/set_params/clone semantics over the existing `MlrsBase`; the **live `estimator_checks` run is explicitly deferred** (needs maturin+pyarrow host). The shim is verified by Rust-side unit tests + a static Python check, not a live sklearn `check_estimator` invocation, in this environment.
+**SymbolicRegressor** (gplearn defaults): `population_size=1000`, `generations=20`,
+`tournament_size=20`, `function_set=('add','sub','mul','div')` (+ optional `sqrt,log,abs,neg,inv,
+max,min,sin,cos,tan`), `metric='mean absolute error'`, `parsimony_coefficient=0.001`,
+`p_crossover=0.9`, `p_subtree_mutation=0.01`, `p_hoist_mutation=0.01`, `p_point_mutation=0.01`,
+`init_depth=(2,6)`, `init_method='half and half'`, `const_range=(-1,1)`, `stopping_criteria=0.0`,
+`max_samples=1.0`, `random_state`.
+- API: `fit(X,y)` → `predict(X)`; attr `_program` (best program), `program` repr.
+- Also `SymbolicClassifier`, `SymbolicTransformer` in gplearn (defer; differentiator/later).
+- Heavily stochastic → property gate (fitness band + valid trees + seed-reproducibility).
 
 ---
 
 ## Feature Dependencies
 
 ```
-[KNN-graph prim (Feature 1)]                       <- build & gate FIRST (primitive-first)
-    ├──required──> [UMAP (Feature 2)]   (self-excluded k-NN)
-    └──required──> [HDBSCAN (Feature 3)] (self-inclusive core distances)
+[RF feasibility spike]  (gating, FIRST — make-or-break under cpu-MLIR)
+        └──gates──> [RandomForestClassifier + RandomForestRegressor]
+                          └──defines tree format──> [FIL (forest inference)]
+                                                          └──requires trees──> [TreeSHAP]
 
-[v2 graph-Laplacian prim] ──required──> [UMAP spectral init]   (REUSE, not new)
-[v1 symmetric eig]        ──required──> [UMAP spectral init]   (REUSE — smallest nontrivial)
-[v1 distance prim + top-k]──required──> [KNN-graph prim]       (REUSE)
-[host SplitMix64 RNG (v2 prims/rng.rs)] ──required──> [UMAP SGD negative sampling]  (REUSE)
-[v2 SGD/edge-sampling idiom] ──informs──> [UMAP SGD layout]    (pattern reuse, not the solver)
+[Kernel SHAP] ──shares SHAPBase──> [Permutation SHAP]    (model-agnostic; need any fitted estimator)
+[ARIMA] ──requires batched L-BFGS + batched Kalman prim──> [AutoARIMA order search]
+[Symbolic regression]   (independent; new GP engine, no device-prim dependency on others)
 
-[union-find + MST] ──new, internal to──> [HDBSCAN]             (host-side or GATHER min-scan)
+[metrics] ─┐
+[preprocessing] ─┼──independent, light/host; enable everything else's testing & pipelines
+[model_selection] ─┘
 
-[Rust builder/typestate convention (Feature 4)]
-    ├──wraps──> [UMAP], [HDBSCAN], and all 30 existing estimators
-    └──underlies──> [PyO3 surface]  (typestate collapses into any_estimator! enum)
-
-[Pure-Python sklearn shim (Feature 5)]
-    └──depends on──> [PyO3 estimators exposing get_params-able args]  (UMAP/HDBSCAN PyO3-wrapped)
+[cuml.accel] ──proxies to──> ALL 32 existing estimators + the new v4.0 estimators
+                              (depends on everything accelerable; build LAST)
 ```
 
 ### Dependency Notes
-- **KNN-graph prim before BOTH estimators (mandatory, primitive-first):** it is the feasibility-critical shared substrate; land + gate it standalone (exact vs NearestNeighbors oracle) before UMAP or HDBSCAN consume it — exactly the v1/v2 "land the prim, then assemble" discipline.
-- **UMAP reuses the v2 Spectral stack:** spectral init *is* SpectralEmbedding (graph-Laplacian + smallest-eig). This is the single biggest UMAP cost-saver and de-risks the deterministic stages.
-- **HDBSCAN's MST/union-find is the one genuinely new piece** with no v1/v2 analog; the MR-distance and condensed-tree are pure host/GATHER logic over the KNN graph + distances.
-- **UMAP and HDBSCAN are otherwise independent** — buildable in parallel once the KNN prim lands (file-disjoint, like v2 families).
-- **Builder retrofit is independent of the algorithms** but touches every estimator file → schedule as its own phase to contain churn; make it additive (builder→existing config) to protect shipped gates.
-- **Python shim depends on the PyO3 wrap of UMAP/HDBSCAN** existing first.
 
-## MVP Definition
+- **RF spike gates the whole tree stack:** if GPU histogram/split can't be made cpu-MLIR-safe
+  (no SharedMemory, no cross-unit atomics — see project memory + spike-findings-mlrs), RF→FIL→
+  TreeSHAP scope is renegotiated before any of it is committed. Mirrors Phase 13's KNN-graph
+  keystone spike. **Run first.**
+- **FIL depends on RF's tree format, TreeSHAP depends on FIL:** strict linear order. FIL's node-array
+  layout is the contract both RF (writer) and TreeSHAP (reader) bind to — design it once, in the RF
+  phase, validated by FIL.
+- **TreeSHAP needs only the tree format, not the trainer:** once the format is frozen, TreeSHAP can
+  be validated against `shap.TreeExplainer` on any forest (even a hand-built one) — exact gate.
+- **AutoARIMA requires ARIMA:** order search calls ARIMA fit repeatedly; batched L-BFGS + batched
+  Kalman likelihood are new prims that ARIMA introduces.
+- **Kernel/Permutation SHAP need a fitted model + GEMM/lstsq prims (already exist):** independent of
+  the tree stack; can land in parallel. Most compelling demoed on RF, but not blocked by it.
+- **cuml.accel proxies to the full estimator surface:** pure Python orchestration (import-hook,
+  module-swap, per-estimator override, CPU fallback) and should land **last**, after the estimators
+  it accelerates exist, so its proxy table is complete.
+- **Utility surface (metrics/preprocessing/model_selection) is independent and foundational:** mostly
+  host/reduction work; landing `accuracy/r2/confusion_matrix` + the scalers early also strengthens
+  every other feature's test harness.
 
-### Launch With (v3.0)
-- [ ] **KNN-graph prim** — shared, standalone-gated (exact vs NearestNeighbors); self-inclusion param; directed output. *Essential: both algorithms depend on it.*
-- [ ] **UMAP** `fit`/`fit_transform` → `embedding_`; table-stakes params; stages 1–4 value-gated, stage-5 property-gated. *Essential: headline feature.*
-- [ ] **HDBSCAN** `fit`/`fit_predict` → `labels_`, `probabilities_`; table-stakes params (`'eom'`+`'leaf'`); exact-label gate via `metric='precomputed'`. *Essential: headline feature.*
-- [ ] **Rust builder + typestate convention** + retrofit across the 30 existing estimators + the 2 new. *Essential: stated milestone goal.*
-- [ ] **Pure-Python sklearn shim** (get_params/set_params/clone) + PyO3-wrap UMAP/HDBSCAN. *Essential: carried-forward debt + makes new estimators drop-in.*
+---
 
-### Add After Validation (v3.x)
-- [ ] **UMAP `transform`** (new-data embedding) — fast-follow once `fit` property gate is stable.
-- [ ] **HDBSCAN `outlier_scores_` (GLOSH)** — differentiator vs sklearn; opt-in.
-- [ ] **HDBSCAN `store_centers` → `centroids_`/`medoids_`** — sklearn parity nicety.
+## MVP Definition (per v4.0 — "minimum to claim the surface is complete")
 
-### Future Consideration (v3+ / later milestone)
-- [ ] Supervised/semi-supervised UMAP (`target_metric`), UMAP `inverse_transform` — large surface, niche, no clean gate.
-- [ ] HDBSCAN `approximate_predict`/`membership_vector` (new-point prediction), condensed-tree plot objects.
-- [ ] Approximate/NN-Descent KNN graph build — only if O(n²) ceiling becomes the bottleneck and a cpu-MLIR-safe formulation exists; would force re-gating HDBSCAN to approximate-label agreement.
-- [ ] Native sparse KNN-graph path (densified at ingress for v3).
+### Launch With (the spine)
+
+- [ ] **RF feasibility spike** — make-or-break, gates the tree stack; FIRST phase.
+- [ ] **RandomForestClassifier + RandomForestRegressor** — keystone; property/predictive gate.
+- [ ] **FIL** — exact inference over the mlrs tree format (the one exact tree-stack gate).
+- [ ] **ARIMA(p,d,q)** non-seasonal + forecast — `statsmodels` band gate.
+- [ ] **metrics core** — accuracy, confusion_matrix, r2, mse, mae (exact/≤1e-5).
+- [ ] **preprocessing scalers** — Standard/MinMax/MaxAbs/Robust/Normalizer (≤1e-5).
+- [ ] **model_selection** — train_test_split, KFold, StratifiedKFold (structural gate).
+
+### Add After the Spine (same milestone, contingent)
+
+- [ ] **TreeSHAP** — exact ≤1e-5 vs `shap`; after FIL.
+- [ ] **Kernel SHAP + Permutation SHAP** — efficiency-invariant + band vs `shap`.
+- [ ] **AutoARIMA** — order search on top of ARIMA; seasonal (P,D,Q,s) + exog graded.
+- [ ] **preprocessing encoders** — OneHot/Ordinal/Label/LabelBinarizer/SimpleImputer.
+- [ ] **roc_auc_score / log_loss / precision_recall_curve** — remaining high-value metrics.
+- [ ] **Symbolic regression** — gplearn property gate.
+
+### Land Last / Lower Priority
+
+- [ ] **cuml.accel** — pure-Python drop-in; build last when the proxy target set is complete.
+- [ ] **feature_extraction (Tfidf/Count)** — text pipelines; host-heavy, lower demand.
+- [ ] **GridSearchCV/RandomizedSearchCV** — delegate to sklearn (no native build).
+
+---
 
 ## Feature Prioritization Matrix
 
-| Feature | User Value | Implementation Cost | Priority | Correctness gate |
-|---------|------------|---------------------|----------|------------------|
-| KNN-graph prim | HIGH (substrate) | MEDIUM | P1 | **Value** 1e-5 vs NearestNeighbors (exact, deterministic) |
-| HDBSCAN | HIGH | HIGH (MST/condensed tree new) | P1 | **Exact labels** up to perm+noise; probs band; exact on `precomputed`+f64 |
-| UMAP | HIGH | HIGH (SGD + 5 stages) | P1 | **Property/structural** (D-12 style) for SGD; 1e-5 for stages 1–4 |
-| Rust builder + typestate | MEDIUM (DX) | MEDIUM-HIGH (30-est retrofit churn) | P1 | Compile + behavior-preserving (existing gates unchanged) |
-| Pure-Python sklearn shim | MEDIUM | MEDIUM | P1 | get_params/set_params/clone round-trip; static check (live deferred) |
-| UMAP `transform` | MEDIUM | MEDIUM | P2 | Property gate on new points |
-| HDBSCAN `outlier_scores_` | MEDIUM | MEDIUM-HIGH | P2/P3 | Band vs hdbscan lib |
+| Feature | User Value | Implementation Cost | Priority |
+|---|---|---|---|
+| RandomForest clf/reg (+ spike) | HIGH | HIGH | P1 |
+| FIL | HIGH | MEDIUM | P1 |
+| metrics core (accuracy/r2/confusion/mse/mae) | HIGH | LOW | P1 |
+| preprocessing scalers | HIGH | LOW–MEDIUM | P1 |
+| model_selection splitters | HIGH | LOW | P1 |
+| ARIMA(p,d,q) | HIGH | HIGH | P1 |
+| TreeSHAP | MEDIUM–HIGH | HIGH | P2 |
+| Kernel SHAP | MEDIUM | MEDIUM–HIGH | P2 |
+| AutoARIMA | MEDIUM | HIGH | P2 |
+| preprocessing encoders | MEDIUM | MEDIUM | P2 |
+| roc_auc/log_loss/PR-curve | MEDIUM | LOW | P2 |
+| Permutation SHAP | MEDIUM | MEDIUM | P2 |
+| cuml.accel | MEDIUM–HIGH | MEDIUM (Python) | P2 (build last) |
+| Symbolic regression | MEDIUM | HIGH | P3 |
+| feature_extraction (tfidf) | LOW–MEDIUM | MEDIUM | P3 |
+| GridSearchCV (passthrough) | LOW | LOW | P3 |
 
-**Priority key:** P1 = must have for v3.0 launch; P2 = fast-follow; P3 = future.
+---
 
-## Competitor / Reference Feature Analysis
+## Reference Feature Analysis (cuML → mlrs mapping)
 
-| Feature | umap-learn / hdbscan (CPU) | cuML (GPU) | sklearn.cluster.HDBSCAN | mlrs (our approach) |
-|---------|---------------------------|------------|-------------------------|---------------------|
-| Precision | f64 | **f32-only** | f64 | **f32 + f64** (differentiator) |
-| KNN build | tree / NN-descent / brute | nn_descent | tree/brute | **brute-force exact** (cpu-MLIR-safe, clean gate) |
-| UMAP supervised / inverse_transform | yes | yes | n/a | **omit** (anti-feature for v3) |
-| HDBSCAN outlier_scores_ (GLOSH) | yes (hdbscan lib) | yes | **no** | **opt-in differentiator** |
-| HDBSCAN new-point predict | yes | yes | no | **defer** to v3.x |
-| Custom callable metrics | yes | partial | yes | **fixed string metrics** (no numba on CubeCL) |
-| Caller surface | Python sklearn API | Python sklearn API | sklearn API | **Rust builder/typestate + PyO3 sklearn shim** (differentiator) |
+| Feature | cuML reference | mlrs approach |
+|---|---|---|
+| RandomForest | `ensemble/randomforest{classifier,regressor}.py` + `randomforest_common.pyx` (GINI/ENTROPY/MSE/MAE/POISSON, `n_bins` quantile splits, Treelite export) | Own flat node-array tree format (cpu-MLIR-safe GATHER); sklearn property gate; NO Treelite |
+| FIL | `fil/` (Treelite-backed batched traversal) | Native batched GATHER traversal over mlrs node arrays; exact vs host reference |
+| TreeSHAP | `explainer/tree_shap.pyx` (Treelite path-info + GPUTreeShap) | Path-dependent Lundberg over mlrs trees; exact vs `shap.TreeExplainer` |
+| ARIMA/AutoARIMA | `tsa/arima.pyx`, `auto_arima.pyx`, `batched_lbfgs.py`, `stationarity.pyx`, `seasonality.py` | Batched Kalman likelihood + batched L-BFGS; `statsmodels`/`pmdarima` band gate |
+| Kernel/Perm SHAP | `explainer/kernel_shap.pyx`, `permutation_shap.pyx` (`SHAPBase`) | GEMM/lstsq prims; `shap` efficiency-invariant + band |
+| cuml.accel | `accel/` (`accelerator.py`, `estimator_proxy.py`, `_overrides/{sklearn,umap,hdbscan}`) | Import-hook/module-swap proxying to the 32 mlrs estimators + CPU fallback |
+| metrics | `metrics/` (`_classification`, `regression`, `confusion_matrix`, `_ranking`, …) | Reduction kernels; sklearn ≤1e-5/exact |
+| preprocessing | `preprocessing/` + `_thirdparty/sklearn/preprocessing` (scalers, encoders) | Column-stat fit + elementwise transform; sklearn ≤1e-5 |
+| model_selection | `model_selection/_split.py` (train_test_split, KFold, StratifiedKFold; GridSearchCV via `__getattr__`→sklearn) | Native splitters (structural gate); search delegated to sklearn |
+| feature_extraction | `feature_extraction/text.py` (CountVectorizer, Tfidf{Transformer,Vectorizer}) | Host tokenize + sparse counts; sklearn ≤1e-5 |
+| Symbolic regression | cuML `genetic` (gplearn-compatible SymbolicRegressor) | GP engine; `gplearn` property gate |
 
 ## Sources
 
-- **cuML v26.08 source (read-only reference, local):** `cuml-main/python/cuml/cuml/manifold/umap/umap.pyx` — confirmed UMAP param surface/defaults (`n_neighbors`, `min_dist`, `spread`, `set_op_mix_ratio`, `local_connectivity`, `repulsion_strength`, `negative_sample_rate`, `target_*`), `find_ab_params(spread, min_dist)`, `min_dist ≤ spread` validation, `init`/`random_state` deterministic-path handling. `cuml-main/python/cuml/cuml/cluster/hdbscan/hdbscan.pyx` — HDBSCAN surface. [HIGH]
-- **umap-learn algorithm semantics** (smooth-kNN ρ/σ binary search to `log2(n_neighbors)`, fuzzy set union via `set_op_mix_ratio` t-conorm, spectral init, negative-sampling SGD, `a`/`b` from min_dist/spread): stable documented algorithm, knowledge cutoff Jan 2026. [HIGH]
-- **hdbscan library + sklearn.cluster.HDBSCAN** semantics (core distance via min_samples-th NN, mutual-reachability `max(core_a,core_b,d)`, MST→single-linkage→condensed tree with min_cluster_size, EoM stability extraction, `probabilities_`, GLOSH `outlier_scores_`, sklearn `store_centers`/no-outlier-scores difference, `metric='precomputed'`): stable documented APIs. [HIGH]
-- **scikit-learn estimator contract** (`__init__` stores args unmodified, get_params/set_params/clone round-trip, fitted-attr `_` convention, `n_features_in_`, `check_estimator` requirements): stable, documented. [HIGH]
-- **Rust builder/typestate idioms** (owned chained builder returning Self, `build()->Result`, typestate phantom markers, `derive_builder`/`bon`/`typed-builder`): established community patterns. [HIGH]
-- **Project context:** `.planning/PROJECT.md` (v3 scope, gate=cpu f64+rocm f32, property-gate precedent D-12, primitive-first), `.planning/notes/v3-hard-algorithm-backlog.md`, `.planning/milestones/v2.0-research/{FEATURES,SUMMARY}.md` (GATHER idiom, label-perm helper, RandomProjection property gate, graph-Laplacian + eig prims to reuse). [HIGH]
-- **Project memory:** cpu-MLIR no-SharedMemory/no-atomics (GATHER idiom); f64-on-rocm skip-with-log; oracle-fixture /tmp-venv regen; Python wheel untestable in env (live estimator_checks deferred). [HIGH]
+- `cuml-main/python/cuml/cuml/{ensemble,fil,tsa,explainer,accel,metrics,preprocessing,model_selection,feature_extraction}/` — RAPIDS cuML v26.08 reference API/behavior (read-only, in-tree) — **HIGH**
+- `.planning/PROJECT.md`, `.planning/notes/v3-hard-algorithm-backlog.md`, `.planning/notes/cuml-mlrs-gap-inventory.md` — milestone scope, dependency ordering, Tier-3 rationale — **HIGH**
+- `.planning/milestones/v3.0-REQUIREMENTS.md` — REQ-ID / oracle / gate structuring precedent (value vs property vs exact-label gates; D-12) — **HIGH**
+- Project memory: cpu-MLIR no-SharedMemory/no-atomics constraint, f64-on-rocm skip, stochastic-gate precedent (RandomProjection, UMAP layout) — **HIGH**
+- gplearn / shap / statsmodels public API (constructor defaults) — well-established, version-stable — **MEDIUM** (verify exact defaults at implementation time via `find-docs`)
 
 ---
-*Feature research for: UMAP + HDBSCAN + KNN-graph prim + Rust builder API + Python sklearn shim (mlrs v3.0)*
-*Researched: 2026-06-22*
+*Feature research for: mlrs v4.0 — Tree Ensembles, Time-Series & Full-Surface Completion*
+*Researched: 2026-06-26*
