@@ -84,9 +84,51 @@ A ground-up Rust rewrite of cuML's scikit-learn-core surface: 12 sklearn-compati
 - Sessions: multi-session over ~3 active build days.
 - Notable: the five-prim primitive-first structure again front-loaded risk (SGD solver in Phase 10) so the closing Naive-Bayes phase was wide-but-shallow and fast.
 
+## Milestone: v3.0 — Manifold Algorithms & Rust-Native API
+
+**Shipped:** 2026-06-26
+**Phases:** 5 (12–16) | **Plans:** 34 | **Tasks:** 63 | **Commits:** 248 | **Timeline:** built 2026-06-23 → 2026-06-26 (~4 days)
+
+### What Was Built
+
+The UMAP + HDBSCAN manifold/clustering pair on a single shared, multi-metric KNN-graph primitive (euclidean/manhattan/cosine/chebyshev/minkowski-p, cpu-MLIR-safe), plus a Rust-native builder + compile-time fit/unfit typestate API additively retrofitted across all 32 estimators, a pure-Python sklearn shim (verbatim `__init__` + get/set_params/clone, AST-purity gated), and PyO3-wrapped UMAP/HDBSCAN. Oracle broadened to umap-learn 0.5.12 (property gate for the stochastic SGD layout, ≤1e-5 for deterministic stages); HDBSCAN keeps an exact-label hard gate. Zero new compute dependencies.
+
+### What Worked
+
+- **Primitive-first keystone, spike-validated first.** The KNN-graph prim (the milestone's feasibility risk) was spiked (the new Manhattan/Chebyshev/Minkowski-p direct kernels + the in-kernel `F::powf` cpu-MLIR unknown) BEFORE planning, then landed + standalone-gated per metric before UMAP/HDBSCAN touched it. Both consumers were then "mostly assembly" on a proven substrate.
+- **Convention-before-retrofit sequencing.** Establishing the builder/typestate *convention* in Phase 12 (so the new estimators were born idiomatic) and isolating the broad, parallel-unsafe 30-estimator *retrofit sweep* to the last phase (16) protected file-disjoint discipline and every shipped 1e-5/exact gate — the additive "builder fronts the existing config, fit body byte-identical" rule meant zero numeric regressions.
+- **Gate-type honesty for stochastic output.** UMAP's SplitMix64 ≠ NumPy MT means coordinates can't match; the property gate (trustworthiness/kNN-overlap within margin of umap-learn, byte-identical per seed) was the right contract, reusing the v2 RandomProjection D-12 precedent rather than forcing a doomed value match.
+- **File-disjoint parallel estimator phases.** UMAP (14) and HDBSCAN (15) were feature-disjoint and built in parallel after the shared prim landed.
+
+### What Was Inefficient
+
+- **Auto-extracted milestone accomplishments were noisy.** `milestone.complete` scraped stray SUMMARY lines (`[Rule 1 - Bug]`, `Verified GREEN`, `Task 1 — Guard`) into MILESTONES.md; the entry had to be hand-curated. SUMMARY one-liners aren't reliably machine-delimited.
+- **A pre-close gate was deferred on a stale environment assumption.** Phase 12's live-PyO3-FFI UAT/verification item sat `human_needed` on the "no maturin/pyarrow host" assumption — but PyPI was reachable, so it was genuinely resolved at close (venv + `maturin develop` + a live UMAP/HDBSCAN script, 22/22 f32+f64). The assumption should have been re-checked at phase time, not carried to milestone close.
+- **`min_dist > spread` and `n_components < n` guards surfaced as verification gaps.** UMAP needed CR-01/CR-02/CR-03 gap-closure plans (cross-cube write race, force double-count, n_components guard) after the first verification — the owner-only `move_other=0` fix landed in 14-07.
+
+### Patterns Established
+
+- Spike-before-planning for a feasibility-keystone primitive, then primitive-first land + per-metric standalone gate before any consumer.
+- Convention-first / retrofit-last for cross-cutting API changes (born-idiomatic new code; additive, gate-preserving sweep isolated to one parallel-unsafe phase).
+- Compile-time typestate (`T<Unfit>`→`T<Fitted>`) with a trybuild compile-fail gate as the predict-before-fit guard, collapsing behind the unchanged PyO3 `any_estimator!` enum.
+- Live FFI is runnable here when PyPI is reachable (venv + maturin + pyarrow) — verify, don't auto-defer SHIM-03-class gates.
+
+### Key Lessons
+
+1. Re-check environment-limitation assumptions at the moment a gate is written — "untestable here" can silently become false (a reachable PyPI made the whole live-FFI path runnable in ~15 min).
+2. For a feasibility-critical shared primitive, the spike + per-metric standalone gate BEFORE consumers is what makes the downstream estimators low-risk assembly — the v1/v2 primitive-first lesson held a third time.
+3. Curate milestone accomplishments by hand — auto-extraction from SUMMARY files captures intra-document scaffolding noise, not the headline deliverable.
+
+### Cost Observations
+
+- Model mix: planner + executor both opus (model_profile=quality); mix not finely instrumented.
+- Sessions: multi-session over ~4 active build days; the close itself resolved a carried gate inline rather than deferring it.
+- Notable: the largest milestone by diff (426 files, +45k) yet zero numeric regressions, because the broad edit (builder retrofit) was constrained to be additive and gate-preserving.
+
 ## Cross-Milestone Trends
 
 | Milestone | Phases | Plans | Days | Estimators |
 |-----------|--------|-------|------|------------|
 | v1.0 | 6 | 38 | 3 | 12 |
 | v2.0 | 5 | 27 | 3 | 18 (30 total) |
+| v3.0 | 5 | 34 | 4 | 2 + KNN-graph prim (32 total) |
