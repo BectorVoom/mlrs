@@ -1,33 +1,36 @@
 ---
 phase: 12-builder-typestate-convention-foundation
 verified: 2026-06-23T02:10:44Z
-status: human_needed
+status: passed
 score: 4/4
 overrides_applied: 0
-human_verification:
-  - test: "Live PyO3 estimator checks for PyUMAP and PyHDBSCAN"
-    expected: |
-      - UMAP().fit(X, rows, cols) via the real PyO3 boundary (capsule + pyarrow) stores
-        AnyUmap::F32/F64; embedding_f32()/embedding_f64() returns a Vec of length rows*2 (zeros shell).
-      - HDBSCAN().fit(X, rows, cols) stores AnyHdbscan::F32/F64; labels_() returns Vec<i32> of length
-        rows with all -1.
-      - Both raise PyValueError (matching NotFittedError) when accessed before fit.
-      - build_err_to_py correctly surfaces BuildError::InvalidMinDist / InvalidMinClusterSize as
-        Python ValueError.
-    why_human: |
-      No maturin or pyarrow in this environment (project MEMORY "Python wheel untestable in env" /
-      SHIM-03). The live Python interpreter + capsule FFI path cannot be exercised without building
-      the wheel. All Rust-side gates (consuming fit, build()/guard_f64() chain, not_fitted analog)
-      are verified by cargo tests without an interpreter. The concrete PyValueError class assertion
-      and the real capsule ingress path require UAT.
+human_verification_resolved:
+  resolved: 2026-06-26
+  test: "Live PyO3 estimator checks for PyUMAP and PyHDBSCAN"
+  how: |
+    The "no maturin/pyarrow host" assumption no longer held in this run — PyPI was reachable,
+    so a venv was provisioned (maturin 1.14, pyarrow 24, numpy 2.5, sklearn 1.9), the cpu wheel
+    was built (`maturin develop -m crates/mlrs-py/Cargo.toml --features cpu,extension-module`,
+    exit 0, mlrs-cpu-0.1.0 installed editable), and the live UAT script
+    (scratchpad/uat_12_live_ffi.py) exercised the real interpreter + pyarrow capsule path.
+  result: |
+    ALL 22 assertions PASS for BOTH dtype arms (f32 + f64). UMAP fit → embedding_ (75, 2) finite,
+    fit_transform, transform(X_new) (10, 2), same-random_state reproducibility; HDBSCAN fit →
+    labels_ (75,) int32 in {-1..k}, probabilities_ ∈ [0,1]; unfit accessors raise NotFittedError;
+    BuildError::InvalidMinDist (UMAP min_dist>spread) and InvalidMinClusterSize (HDBSCAN
+    min_cluster_size<2) surface as Python ValueError with the expected messages. The concrete
+    PyValueError class and real capsule ingress are now verified end-to-end. See 12-UAT.md (passed).
+    NOTE: the original "zeros shell / all -1" expectation reflected the pre-algorithm Phase-12
+    shells; UMAP (Phase 14) and HDBSCAN (Phase 15) now do real work, so the live test asserts
+    real embeddings/labels — strictly stronger than the shell gate.
 ---
 
 # Phase 12: Builder + Typestate Convention Foundation — Verification Report
 
 **Phase Goal:** Establish the idiomatic Rust-native estimator-construction convention — a shared owned-builder + fit/unfit typestate + typed validation error surface — so the v3 estimators (UMAP/HDBSCAN) are born builder-fronted and the later retrofit has a single target shape. Pure API foundation; no algorithm, no device work.
-**Verified:** 2026-06-23T02:10:44Z
-**Status:** human_needed
-**Re-verification:** No — initial verification
+**Verified:** 2026-06-23T02:10:44Z (live-FFI item resolved 2026-06-26)
+**Status:** passed
+**Re-verification:** No — initial verification; the single `human_needed` item (live PyO3 FFI) was resolved 2026-06-26 via a maturin+pyarrow wheel build + live UAT (all 22 assertions pass, both dtype arms — see frontmatter `human_verification_resolved` and 12-UAT.md)
 
 ## Goal Achievement
 
@@ -152,7 +155,9 @@ except Exception as e:
     assert "min_dist" in str(e).lower()
 ```
 **Expected:** All assertions pass; the concrete Python exception is `PyValueError` (the `not_fitted`/`build_err_to_py` mapper produces a Python ValueError type the shim re-raises as NotFittedError).
-**Why human:** No maturin or pyarrow in this environment (MEMORY "Python wheel untestable in env" / SHIM-03). The Rust-side gates — consuming fit, build()/guard_f64() chain, not_fitted runtime analog — are all verified by cargo tests without an interpreter. The live capsule FFI path and concrete Python exception class assertion require UAT.
+**Why human (original):** No maturin or pyarrow in this environment (MEMORY "Python wheel untestable in env" / SHIM-03). The Rust-side gates — consuming fit, build()/guard_f64() chain, not_fitted runtime analog — are all verified by cargo tests without an interpreter. The live capsule FFI path and concrete Python exception class assertion require UAT.
+
+**RESOLVED 2026-06-26:** The host assumption no longer held — PyPI was reachable, so maturin+pyarrow were installed in a venv, the cpu wheel was built (`maturin develop`, exit 0), and the live UAT script ran the real interpreter + pyarrow capsule path: all 22 assertions pass for both dtype arms (UMAP embedding_/fit_transform/transform/reproducibility; HDBSCAN labels_/probabilities_; unfit→NotFittedError; BuildError→ValueError with expected messages). See frontmatter `human_verification_resolved` and 12-UAT.md (status: complete, result: passed).
 
 ---
 
