@@ -15,11 +15,14 @@ install` the package for their backend and use familiar `fit`/`predict`/`transfo
 CubeCL backend from a single generic codebase.** If everything else fails, the numerical results
 must be right and the backend abstraction must hold.
 
-## Current Milestone: v3.0 Manifold Algorithms & Rust-Native API
+## Latest Milestone: v3.0 Manifold Algorithms & Rust-Native API — ✅ SHIPPED 2026-06-26
 
-**Goal:** Add the UMAP + HDBSCAN manifold/clustering pair on a shared KNN-graph primitive, and establish a Rust-native builder-pattern API retrofitted across the whole estimator surface.
+**Status:** Shipped (Phases 12–16, 34 plans, 16/16 requirements complete). Archive: [milestones/v3.0-ROADMAP.md](milestones/v3.0-ROADMAP.md) + [milestones/v3.0-REQUIREMENTS.md](milestones/v3.0-REQUIREMENTS.md).
+**Next:** v4.0 to be defined via `/gsd-new-milestone` (candidate scope: Tier-3 backlog — RandomForest→FIL→TreeSHAP, ARIMA, kernel-SVM/SMO — see `notes/v3-hard-algorithm-backlog.md`).
 
-**Target features:**
+**Goal (delivered):** Added the UMAP + HDBSCAN manifold/clustering pair on a shared multi-metric KNN-graph primitive, and established a Rust-native builder/typestate API additively retrofitted across the whole 32-estimator surface plus a pure-Python sklearn shim.
+
+**Delivered features:**
 - **KNN-graph primitive** — the shared, feasibility-critical, **multi-metric** prim (built on the v1 distance + top-k path, plus new direct pairwise distance kernels) returning directed `(indices, distances)`; metrics: euclidean, manhattan (L1), cosine, chebyshev (L∞), minkowski-p; under the cpu-MLIR no-SharedMemory/no-atomics constraint; consumed by both UMAP and HDBSCAN
 - **UMAP** — fuzzy simplicial set → SGD-based low-dim layout (oracle: `umap-learn`; stochastic layout → structural/property gate à la RandomProjection D-12, not element-wise 1e-5)
 - **HDBSCAN** — mutual-reachability → MST → condensed cluster tree → stability extraction (oracle: `hdbscan` / `sklearn.cluster.HDBSCAN`; exact labels up to permutation as the hard gate)
@@ -92,6 +95,12 @@ _v3.0 milestone fully shipped (Phases 12–16). Next scope to be detailed via `/
 - **Oracle:** scikit-learn on CPU produces reference outputs from identical random inputs — runs in CI without a GPU.
 - **Build protocol (AGENTS.md):** Source and test code strictly separated (no `mod tests` in source files; use `tests/` or `*_test.rs`). On any CubeCL build error, consult the CubeCL error guideline before attempting fixes.
 
+### Current State (after v3.0)
+
+- **Shipped v3.0** (2026-06-26): UMAP + HDBSCAN added on a shared multi-metric KNN-graph primitive, plus a Rust-native builder/typestate API retrofitted across all 32 estimators and a pure-Python sklearn shim. 34 plans over Phases 12–16, 248 commits, built 2026-06-23 → 2026-06-26 (426 files, +45,450 / −4,160). All 16 v3 requirements complete. Total estimator surface now 32 (+ the shared KNN-graph prim).
+- **New in v3.0:** the multi-metric KNN-graph primitive (euclidean/manhattan/cosine/chebyshev/minkowski-p, cpu-MLIR-safe); UMAP (umap-learn property gate for the stochastic layout, ≤1e-5 for deterministic stages, 35/35 oracle); HDBSCAN (exact-label gate + GLOSH `outlier_scores_` + `store_centers`); the builder + compile-time fit/unfit typestate convention (predict-before-fit is a compile error; `traits.rs` deleted); the 32-estimator pure-Python shim with an AST-purity gate; PyO3-wrapped UMAP/HDBSCAN.
+- **Resolved at close:** the carried live-Python-boundary gate (live FFI `estimator_checks`/capsule path) — verified end-to-end this session by building the cpu wheel (`maturin develop`) and exercising UMAP/HDBSCAN through a real interpreter + pyarrow capsule (22/22 assertions, f32+f64). The live FFI is runnable here whenever PyPI is reachable; it is no longer an automatic deferral.
+
 ### Current State (after v2.0)
 
 - **Shipped v2.0** (2026-06-22): 18 sklearn-compatible estimators added across five families (covariance/projection, kernel, spectral, SGD/linear-SVM, Naive Bayes), 27 plans over Phases 7–11, ~192 commits, built 2026-06-20 → 2026-06-22. All 24 v2 requirements complete. Total estimator surface now 30.
@@ -152,4 +161,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-26 after Phase 16 (final v3.0 phase) — builder/typestate retrofit + Python-shim coverage verified (UMAP oracle 35/35), security gate SECURED (threats_open: 0). v3.0 milestone fully shipped; ready for `/gsd-complete-milestone`.*
+*Last updated: 2026-06-26 after v3.0 milestone close — UMAP + HDBSCAN on the shared KNN-graph prim, builder/typestate retrofit across all 32 estimators, pure-Python shim, live PyO3 FFI sign-off (22/22). v3.0 archived + tagged; next milestone via `/gsd-new-milestone`.*

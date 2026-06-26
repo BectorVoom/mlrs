@@ -2,12 +2,12 @@
 gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Manifold Algorithms & Rust-Native API
-current_phase: 16
-status: verifying
+current_phase: 0
+status: Awaiting next milestone
 stopped_at: Phase 16 context gathered
-last_updated: "2026-06-26T06:06:51.882Z"
+last_updated: "2026-06-26T06:37:44.393Z"
 last_activity: 2026-06-26
-last_activity_desc: Phase 16 complete
+last_activity_desc: Milestone v3.0 completed and archived
 progress:
   total_phases: 5
   completed_phases: 5
@@ -28,14 +28,10 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 
 ## Current Position
 
-Phase: 16
-Plan: Not started
-Status: Phase complete — ready for verification
-Last activity: 2026-06-26 — Phase 16 complete
-Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
-Last quick task: 2026-06-24 — Completed quick task 260625-8ri: implement IN-04 (PrimError::InternalNone + 6 panic→typed-error conversions)
-
-Progress: [██████░░░░] 60% (v3.0)
+Phase: Milestone v3.0 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-06-26 — Milestone v3.0 completed and archived
 
 ## Open Follow-ups (Phase 05)
 

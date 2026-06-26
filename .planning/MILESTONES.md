@@ -2,6 +2,25 @@
 
 Historical record of shipped versions.
 
+## v3.0 Manifold Algorithms & Rust-Native API (Shipped: 2026-06-26)
+
+**Phases:** 5 (12–16) | **Plans:** 34 | **Tasks:** 63 | **Commits:** 248 | **Timeline:** built 2026-06-23 → 2026-06-26 | **Diff:** 426 files, +45,450 / −4,160
+
+**Delivered:** Added the UMAP + HDBSCAN manifold/clustering pair on a single shared, multi-metric KNN-graph primitive (built primitive-first and standalone-gated before either consumer), and established + additively retrofitted a Rust-native builder/typestate API across the full 32-estimator surface plus a pure-Python sklearn shim and PyO3-wrapped UMAP/HDBSCAN. Zero new compute dependencies. The oracle broadened to umap-learn 0.5.12 (a property/structural gate for UMAP's stochastic SGD layout, value gates ≤1e-5 for the deterministic stages); HDBSCAN keeps an exact-label hard gate. Same backend gate as v1/v2 (cpu f64 + rocm f32, f64-on-rocm skips-with-log).
+
+**Requirements:** 16/16 v3 requirements complete (PRIM-11, UMAP-01..04, HDBS-01..04, BLDR-01..04, SHIM-01..03).
+
+**Known deferred items at close:** 0 — the carried live-Python-boundary gate was RESOLVED this session (live PyO3 FFI for UMAP/HDBSCAN verified end-to-end, 22/22 assertions, f32+f64).
+
+**Key accomplishments:**
+
+- **KNN-graph primitive (PRIM-11, Phase 13)** — a shared, cpu-MLIR-safe, multi-metric (Euclidean/Manhattan/Cosine/Chebyshev/Minkowski-p) `knn_graph<F>` prim composed from `distance → top_k` (query-axis tiled) + a single index-identity `self_drop_gather`, emitting the directed `(indices, distances)` `(n,k)` graph. Four genuinely-new direct pairwise distance kernels (Manhattan/Chebyshev/Minkowski-p with in-kernel STATIC `F::powf`) PROVEN to launch under cpu-MLIR. Standalone-gated per metric: indices set-equal to sklearn, distances ≤1e-5 (f64), duplicate-point value gate, sub-quadratic memory gate — on cpu(f64) + rocm(f32).
+- **UMAP (Phase 14)** — full KNN → fuzzy simplicial set (smooth-kNN ρ/σ + t-conorm union) → host LM a/b curve fit → spectral/random init → new `umap_layout_step<F>` vertex-owner GATHER SGD kernel, plus `transform(X_new)` via the frozen-subset path. Deterministic stages value-match umap-learn ≤1e-5 (f64) across all 5 metrics; the stochastic layout passes a property gate (within +0.0007 trustworthiness of umap-learn 0.5.12) and is byte-identical per `random_state`. Full oracle 35/35 GREEN.
+- **HDBSCAN (Phase 15)** — device front-end (core distances + mutual-reachability GATHER) + host tree back-end (MST → UnionFind single-linkage → condensed tree → EoM/leaf/ε/max stability extraction), deliberately dodging the GPU-tree-atomics wall. `labels_` exact up-to-permutation vs sklearn (precomputed f64, `-1` pinned), `probabilities_` ≤1e-5, plus the GLOSH `outlier_scores_` differentiator and `store_centers` centroid/medoid.
+- **Rust-native builder + typestate convention (Phases 12, 16)** — owned-builder + compile-time fit/unfit typestate (predict/transform-before-fit is a compile error, trybuild-gated) with typed `thiserror` validation. Additively retrofitted across all 32 estimators (builder fronts the existing config; fit bodies byte-identical) onto a single `typestate` trait surface; the transitional `traits.rs` deleted (grep-gated). Every shipped 1e-5 / exact-label gate preserved.
+- **Pure-Python sklearn shim + PyO3 wraps (Phase 16)** — verbatim-`__init__` shim with `get_params`/`set_params`/`clone` round-trip across the full 32-estimator matrix, guarded by an AST purity gate; UMAP and HDBSCAN PyO3-wrapped (`#[pyclass]` on `any_estimator!`, GIL release, `guard_f64` before F64). Live `estimator_checks` stays static-gated per environment scope.
+- **Live PyO3 FFI sign-off (this session)** — built the cpu wheel (`maturin develop`) and verified UMAP/HDBSCAN end-to-end through a real interpreter + pyarrow capsule: 22/22 assertions across f32+f64 (fit/embedding_/transform/labels_/probabilities_ + NotFittedError + BuildError→ValueError), resolving the last carried Python-boundary gate.
+
 ## v2.0 Breadth Sweep (Shipped: 2026-06-22)
 
 **Phases:** 5 (7–11) | **Plans:** 27 | **Tasks:** 52 | **Commits:** ~192 (45 feat) | **Timeline:** planned 2026-06-14, built 2026-06-20 → 2026-06-22
