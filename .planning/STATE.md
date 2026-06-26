@@ -31,7 +31,7 @@ See: .planning/PROJECT.md (updated 2026-06-11)
 Phase: 16 (builder-retrofit-sweep-shim-coverage) — EXECUTING
 Plan: 13 of 13
 Status: Phase complete — ready for verification
-Last activity: 2026-06-24 — Completed 16-04 (PCA + TruncatedSVD + IncrementalPCA typestate retrofit; decomposition module fully migrated, PartialFit multi-transition + inverse_transform override proven)
+Last activity: 2026-06-26 — Completed quick task 260626-ktm: fix Phase-16 security gap T-16-GUARDF64 (lock_pool half) — covariance.rs migrated to poison-recovering lock_pool()
 Resume: /gsd-execute-phase 16 — continue the bulk retrofit sweep (Plans 16-05..16-12); do not mark phase complete until verification passes
 Last quick task: 2026-06-24 — Completed quick task 260625-8ri: implement IN-04 (PrimError::InternalNone + 6 panic→typed-error conversions)
 
@@ -329,6 +329,7 @@ None yet.
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260625-8ri | implement IN-04 — add PrimError::InternalNone variant + replace 6 Shared-path column_reduce expect() panics with typed-error propagation | 2026-06-24 | 2a0fcd4 | [260625-8ri-implement-in-04-add-a-primerror-variant-](./quick/260625-8ri-implement-in-04-add-a-primerror-variant-/) |
+| 260626-ktm | fix Phase-16 security gap T-16-GUARDF64 (lock_pool half) — migrate covariance.rs 12 legacy global_pool().lock().expect() sites to poison-recovering lock_pool(); refresh stale lib.rs doc comment | 2026-06-26 | e391eed | [260626-ktm-fix-phase-16-security-gap-t-16-guardf64-](./quick/260626-ktm-fix-phase-16-security-gap-t-16-guardf64-/) |
 
 ## Deferred Items
 
