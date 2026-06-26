@@ -58,16 +58,18 @@ must be right and the backend abstraction must hold.
 - ✓ Naive Bayes: GaussianNB, MultinomialNB, BernoulliNB, ComplementNB, CategoricalNB (reductions-only; exact-label hard gate) — v2.0
 - ✓ PY-06: all v2 estimators `#[pyclass]`-backed with sklearn-named hyperparameters, f32/f64 dispatch, GIL release, shipped in the four per-backend wheels — v2.0
 
+**v3.0 Manifold Algorithms & Rust-Native API — v3.0**
+- ✓ KNN-graph primitive (shared, cpu-MLIR-safe, multi-metric: euclidean/manhattan/cosine/chebyshev/minkowski-p; built on v1 distance + top-k + new direct distance kernels) — Phase 13
+- ✓ UMAP (fuzzy simplicial set → SGD layout; `umap-learn` oracle; property gate) — Phase 14; full umap_test oracle 35/35 GREEN confirmed Phase 16 UAT
+- ✓ HDBSCAN (mutual-reach → MST → condensed tree → stability; exact-label gate) — Phase 15
+- ✓ Rust-native builder-pattern API convention + additive retrofit across all 32 estimators (single `typestate` trait surface; `traits.rs` deleted; predict-before-fit is a compile error) — Phases 12, 16 (BLDR-03)
+- ✓ Pure-Python sklearn shim (verbatim `__init__`, get_params/set_params/clone, AST-purity gate, 32-shim matrix) + PyO3-wrapped UMAP/HDBSCAN — Phase 16 (SHIM-01/02/03)
+
 ### Active
 
 <!-- Current scope. Building toward these. All are hypotheses until shipped and validated. -->
 
-**v3.0 Manifold Algorithms & Rust-Native API** (scope being detailed in REQUIREMENTS.md)
-- [ ] KNN-graph primitive (shared, cpu-MLIR-safe, multi-metric: euclidean/manhattan/cosine/chebyshev/minkowski-p; built on v1 distance + top-k + new direct distance kernels)
-- [ ] UMAP (fuzzy simplicial set → SGD layout; `umap-learn` oracle; property gate)
-- [ ] HDBSCAN (mutual-reach → MST → condensed tree → stability; exact-label gate)
-- [ ] Rust-native builder-pattern API convention + retrofit across all 30 existing estimators
-- [ ] Pure-Python sklearn shim (get_params/set_params/check_estimator); PyO3-wrap UMAP/HDBSCAN
+_v3.0 milestone fully shipped (Phases 12–16). Next scope to be detailed via `/gsd-new-milestone`._
 
 ### Out of Scope
 
@@ -129,6 +131,8 @@ must be right and the backend abstraction must hold.
 | Property-gate (not 1e-5 value match) for RandomProjection (D-12) | mlrs SplitMix64 ≠ NumPy MT19937, so the projection matrix can't match element-wise; JL distortion + distribution stats + seed-reproducibility are the meaningful contract | ✓ Good — `johnson_lindenstrauss_min_dim` value-matched exactly; JL ratio concentration gated via 50-trial averaging |
 | Exact predicted labels as the hard correctness gate for classifiers (SGD/SVM/NB) | Iterative/host-order solvers agree with sklearn only to a band on coefficients, but argmax/label decisions are integer-exact | ✓ Good — every v2 classifier passes exact-label gate on cpu f32+f64; coef bands documented |
 | cpu-MLIR-safe GATHER idiom for all new kernels (no SharedMemory, no cross-unit atomics) | cubecl-cpu MLIR lowering panics on SharedMemory + mutable-bool/INFINITY/shift-loops; single-owner GATHER launches first try | ✓ Good — all five v2 prims (incl. the highest-risk SGD solver) launched on cpu-MLIR without rework |
+| Additive builder/typestate retrofit (builder constructs existing config; fit path untouched) with single `typestate` trait surface | Lets all 32 estimators adopt one idiomatic convention + a compile-time predict-before-fit guard without perturbing any shipped 1e-5/exact-label numeric path | ✓ Good — Phase 16: `traits.rs` deleted, 13/13 plans, 12 oracle suites + UMAP 35/35 all GREEN; byte-identical fit bodies confirmed |
+| `lock_pool()` (poison-recovering) as the single sanctioned pool-lock path for the PyO3 layer (WR-02/WR-04) | One surviving `global_pool().lock().expect()` re-panics on a poisoned mutex, turning a recoverable device fault into a process-wide brick | ✓ Good — Phase 16 secure-phase audit caught covariance.rs as the last legacy holder; remediated (quick 260626-ktm); zero estimator modules now use the panicking lock |
 
 ## Evolution
 
@@ -148,4 +152,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-06-22 after starting v3.0 Manifold Algorithms & Rust-Native API milestone (UMAP + HDBSCAN + builder-pattern retrofit; phases continue from 12)*
+*Last updated: 2026-06-26 after Phase 16 (final v3.0 phase) — builder/typestate retrofit + Python-shim coverage verified (UMAP oracle 35/35), security gate SECURED (threats_open: 0). v3.0 milestone fully shipped; ready for `/gsd-complete-milestone`.*
