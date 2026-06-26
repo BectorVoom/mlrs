@@ -82,7 +82,7 @@ impl PyEmpiricalCovariance {
             _ => (false, true),
         };
         let fitted = py.detach(|| -> PyResult<AnyEmpiricalCovariance> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -114,42 +114,42 @@ impl PyEmpiricalCovariance {
     }
 
     fn covariance_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyEmpiricalCovariance::F32(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "covariance_ (f32)")),
         }
     }
     fn covariance_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyEmpiricalCovariance::F64(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "covariance_ (f64)")),
         }
     }
     fn location_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyEmpiricalCovariance::F32(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "location_ (f32)")),
         }
     }
     fn location_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyEmpiricalCovariance::F64(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("empirical_covariance", "location_ (f64)")),
         }
     }
     fn precision_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyEmpiricalCovariance::F32(e) => e.precision_(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("empirical_covariance", "precision_ (f32)")),
         }
     }
     fn precision_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyEmpiricalCovariance::F64(e) => e.precision_(&pool).map_err(algo_err_to_py),
             _ => Err(not_fitted("empirical_covariance", "precision_ (f64)")),
@@ -219,7 +219,7 @@ impl PyLedoitWolf {
             _ => false,
         };
         let fitted = py.detach(|| -> PyResult<AnyLedoitWolf> {
-            let mut pool = crate::global_pool().lock().expect("pool mutex");
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
@@ -249,28 +249,28 @@ impl PyLedoitWolf {
     }
 
     fn covariance_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLedoitWolf::F32(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "covariance_ (f32)")),
         }
     }
     fn covariance_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLedoitWolf::F64(e) => Ok(e.covariance_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "covariance_ (f64)")),
         }
     }
     fn location_f32(&self) -> PyResult<Vec<f32>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLedoitWolf::F32(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "location_ (f32)")),
         }
     }
     fn location_f64(&self) -> PyResult<Vec<f64>> {
-        let pool = crate::global_pool().lock().expect("pool mutex");
+        let pool = crate::lock_pool();
         match &self.inner {
             AnyLedoitWolf::F64(e) => Ok(e.location_(&pool)),
             _ => Err(not_fitted("ledoit_wolf", "location_ (f64)")),
