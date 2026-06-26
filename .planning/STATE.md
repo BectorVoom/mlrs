@@ -6,7 +6,7 @@ status: planning
 last_updated: "2026-06-26T07:19:59.179Z"
 last_activity: 2026-06-26
 progress:
-  total_phases: 0
+  total_phases: 10
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
@@ -17,17 +17,19 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-06-11)
+See: .planning/PROJECT.md (updated 2026-06-26)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 16 — builder-retrofit-sweep-shim-coverage
+**Current focus:** Phase 17 — RandomForest GPU Histogram/Split Feasibility Spike (GATING)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-06-26 — Milestone v4.0 started
+Phase: 17 of 26 (RandomForest GPU Histogram/Split Feasibility Spike — GATING) — first v4.0 phase
+Plan: — (roadmap created; ready to plan Phase 17)
+Status: Ready to plan
+Last activity: 2026-06-26 — v4.0 roadmap created (Phases 17-26, 25/25 requirements mapped)
+
+**v4.0 dependency shape:** Phase 17 (spike) GATES the serial tree chain 17->18->19->20->21. Phases 22-25 are spike-independent / parallel-eligible. Phase 26 (cuml.accel) is last. Research-phase needed for Phase 17 (RF spike) and Phase 22 (ARIMA); all others standard-pattern.
 
 ## Open Follow-ups (Phase 05)
 

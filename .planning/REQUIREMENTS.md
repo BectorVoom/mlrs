@@ -103,37 +103,41 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TREE-01 | TBD | Pending |
-| TREE-02 | TBD | Pending |
-| RF-01 | TBD | Pending |
-| RF-02 | TBD | Pending |
-| RF-03 | TBD | Pending |
-| FIL-01 | TBD | Pending |
-| SHAP-01 | TBD | Pending |
-| SHAP-02 | TBD | Pending |
-| SHAP-03 | TBD | Pending |
-| ARIMA-01 | TBD | Pending |
-| ARIMA-02 | TBD | Pending |
-| ARIMA-03 | TBD | Pending |
-| METR-01 | TBD | Pending |
-| METR-02 | TBD | Pending |
-| METR-03 | TBD | Pending |
-| PREP-01 | TBD | Pending |
-| PREP-02 | TBD | Pending |
-| FEAT-01 | TBD | Pending |
-| MODSEL-01 | TBD | Pending |
-| MODSEL-02 | TBD | Pending |
-| GEN-01 | TBD | Pending |
-| GEN-02 | TBD | Pending |
-| GEN-03 | TBD | Pending |
-| ACCEL-01 | TBD | Pending |
-| ACCEL-02 | TBD | Pending |
+| TREE-01 | Phase 17 | Pending |
+| TREE-02 | Phase 18 | Pending |
+| RF-01 | Phase 19 | Pending |
+| RF-02 | Phase 19 | Pending |
+| RF-03 | Phase 19 | Pending |
+| FIL-01 | Phase 20 | Pending |
+| SHAP-01 | Phase 21 | Pending |
+| SHAP-02 | Phase 23 | Pending |
+| SHAP-03 | Phase 23 | Pending |
+| ARIMA-01 | Phase 22 | Pending |
+| ARIMA-02 | Phase 22 | Pending |
+| ARIMA-03 | Phase 22 | Pending |
+| METR-01 | Phase 24 | Pending |
+| METR-02 | Phase 24 | Pending |
+| METR-03 | Phase 24 | Pending |
+| PREP-01 | Phase 24 | Pending |
+| PREP-02 | Phase 24 | Pending |
+| FEAT-01 | Phase 24 | Pending |
+| MODSEL-01 | Phase 24 | Pending |
+| MODSEL-02 | Phase 24 | Pending |
+| GEN-01 | Phase 25 | Pending |
+| GEN-02 | Phase 25 | Pending |
+| GEN-03 | Phase 25 | Pending |
+| ACCEL-01 | Phase 26 | Pending |
+| ACCEL-02 | Phase 26 | Pending |
 
 **Coverage:**
 - v4.0 requirements: 25 total
-- Mapped to phases: 0 (roadmap pending)
-- Unmapped: 25 ⚠️ (filled by roadmapper)
+- Mapped to phases: 25 ✓ (all v1 requirements mapped to exactly one phase; no orphans, no duplicates)
+- Unmapped: 0 ✓
+
+**Phase → requirement rollup:**
+- Phase 17: TREE-01 · Phase 18: TREE-02 · Phase 19: RF-01/02/03 · Phase 20: FIL-01 · Phase 21: SHAP-01
+- Phase 22: ARIMA-01/02/03 · Phase 23: SHAP-02/03 · Phase 24: METR-01/02/03 + PREP-01/02 + FEAT-01 + MODSEL-01/02 · Phase 25: GEN-01/02/03 · Phase 26: ACCEL-01/02
 
 ---
 *Requirements defined: 2026-06-26 for milestone v4.0*
-*Last updated: 2026-06-26 at milestone open*
+*Last updated: 2026-06-26 — traceability filled by roadmapper (Phases 17–26, 25/25 mapped)*
