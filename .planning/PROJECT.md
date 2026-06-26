@@ -30,7 +30,7 @@ must be right and the backend abstraction must hold.
 - **sklearn-utility surface** — metrics / preprocessing / feature_extraction / model_selection
 - **genetic / symbolic regression** — evolutionary search (oracle: `gplearn`)
 
-**Key context:** One large milestone; phase numbering continues from v3.0 (last was Phase 16 → v4.0 starts at Phase 17). RandomForest is spike-gated — the tree family (RF→FIL→TreeSHAP) is contingent on the feasibility spike passing under cpu-MLIR; if it fails, scope adjusts before committing. Same backend gate as v1–v3 (cpu f64 + rocm f32, f64-on-rocm skips-with-log). Oracles broaden: sklearn for RF/ARIMA/utility/preprocessing; the `shap` library for explainers; `gplearn` for symbolic regression. Kept primitive-first. `cuml.accel` moves Out of Scope → Active; kernel SVM/SMO stays deferred.
+**Key context:** One large milestone; phase numbering continues from v3.0 (last was Phase 16 → v4.0 starts at Phase 17). RandomForest is spike-gated — the tree family (RF→FIL→TreeSHAP) is contingent on the feasibility spike passing under cpu-MLIR; if it fails, scope adjusts before committing. Same backend gate as v1–v3 (cpu f64 + rocm f32, f64-on-rocm skips-with-log). Oracles broaden: sklearn for RF/metrics/preprocessing/model_selection; **`statsmodels` for ARIMA** (sklearn has no ARIMA); the `shap` library for explainers; `gplearn` for symbolic regression. Only new deps are test-only oracles (`shap`/`statsmodels`/`gplearn`); pyo3 stays 0.28, cubecl 0.10.0; zero new Rust compute deps. Kept primitive-first. `cuml.accel` moves Out of Scope → Active; kernel SVM/SMO stays deferred.
 
 ## Latest Milestone: v3.0 Manifold Algorithms & Rust-Native API — ✅ SHIPPED 2026-06-26
 
