@@ -110,12 +110,13 @@ pub(crate) fn global_pool() -> &'static Mutex<BufferPool<ActiveRuntime>> {
 /// poison recovery only delivers its benefit if EVERY lock site uses it: one
 /// surviving `global_pool().lock().expect("pool mutex")` re-panics on a poisoned
 /// mutex and re-bricks the interpreter, making the brick-prevention only partial.
-/// The spectral wrappers ([`crate::estimators::spectral`]) and the kernel wrappers
-/// ([`crate::estimators::kernel`]) use `lock_pool` exclusively; new estimators MUST
-/// do the same. (The remaining `linear`/`cluster`/`decomposition`/`covariance`/
-/// `neighbors`/`projection` wrappers still carry the legacy panicking form — a
-/// pre-existing, tracked migration; mixing the two helpers defeats the recovery on
-/// those estimators until they are converted.)
+/// EVERY estimator wrapper now uses `lock_pool` exclusively — there are zero
+/// legacy panicking pool-lock holders left in the binding layer. `covariance`
+/// ([`crate::estimators::covariance`]) was the last remaining legacy holder and
+/// was migrated under T-16-GUARDF64; the spectral wrappers
+/// ([`crate::estimators::spectral`]) and the kernel wrappers
+/// ([`crate::estimators::kernel`]) were already on `lock_pool`. New estimators
+/// MUST continue to use `lock_pool` and MUST NOT reintroduce the legacy form.
 ///
 /// ## ACCOUNTING RE-BASELINE after a recovered poison (WR-01 / WR-06)
 /// "Not left torn" is a **memory-safety** statement, NOT an accounting one. The
