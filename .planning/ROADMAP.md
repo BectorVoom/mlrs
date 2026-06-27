@@ -283,7 +283,7 @@ Tree chain is serial: 17 → 18 → 19 → 20 → 21. Phases 22–25 are paralle
 | 14. UMAP | v3.0 | 7/7 | Complete | 2026-06-24 |
 | 15. HDBSCAN | v3.0 | 7/7 | Complete | 2026-06-24 |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 13/13 | Complete | 2026-06-24 |
-| 17. RandomForest GPU Histogram/Split Feasibility Spike (GATING) | v4.0 | 5/5 | Complete   | 2026-06-27 |
+| 17. RandomForest GPU Histogram/Split Feasibility Spike (GATING) | v4.0 | 5/5 | Complete    | 2026-06-27 |
 | 18. Tree Primitives + DecisionTree Core | v4.0 | 0/TBD | Not started | - |
 | 19. RandomForestClassifier + RandomForestRegressor | v4.0 | 0/TBD | Not started | - |
 | 20. FIL — Batched Forest Inference | v4.0 | 0/TBD | Not started | - |

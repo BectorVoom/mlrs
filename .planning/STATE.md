@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v4.0
 milestone_name: Tree Ensembles, Time-Series & Full-Surface Completion
-current_phase: 17
-current_phase_name: randomforest-gpu-histogram-split-feasibility-spike-gating
+current_phase: 18
+current_phase_name: Tree Primitives + DecisionTree Core
 status: verifying
 stopped_at: Completed 17-04-PLAN.md
-last_updated: "2026-06-27T04:21:32.539Z"
+last_updated: "2026-06-27T04:35:19.190Z"
 last_activity: 2026-06-27
-last_activity_desc: Phase 17 execution started
+last_activity_desc: Phase 17 complete, transitioned to Phase 18
 progress:
   total_phases: 10
   completed_phases: 1
@@ -28,10 +28,10 @@ See: .planning/PROJECT.md (updated 2026-06-26)
 
 ## Current Position
 
-Phase: 17 (randomforest-gpu-histogram-split-feasibility-spike-gating) — EXECUTING
-Plan: 5 of 5
+Phase: 18 — Tree Primitives + DecisionTree Core
+Plan: Not started
 Status: Phase complete — ready for verification
-Last activity: 2026-06-27 — Phase 17 execution started
+Last activity: 2026-06-27 — Phase 17 complete, transitioned to Phase 18
 
 **v4.0 dependency shape:** Phase 17 (spike) GATES the serial tree chain 17->18->19->20->21. Phases 22-25 are spike-independent / parallel-eligible. Phase 26 (cuml.accel) is last. Research-phase needed for Phase 17 (RF spike) and Phase 22 (ARIMA); all others standard-pattern.
 
@@ -45,7 +45,7 @@ Last activity: 2026-06-27 — Phase 17 execution started
 
 **Velocity:**
 
-- Total plans completed: 81
+- Total plans completed: 86
 - Average duration: — min
 - Total execution time: 0.0 hours
 
@@ -64,6 +64,7 @@ Last activity: 2026-06-27 — Phase 17 execution started
 | 14 | 7 | - | - |
 | 15 | 7 | - | - |
 | 16 | 13 | - | - |
+| 17 | 5 | - | - |
 
 **Recent Trend:**
 
