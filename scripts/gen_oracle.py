@@ -2965,6 +2965,256 @@ def gen_linear_svr(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# ---- Phase-17 DecisionTree oracle fixtures (TREE-01, D-07/D-09) ----
+# The Tier-1 correctness witness (Plan 03) value-asserts the spike's
+# histogram/gain/partition MATH against these committed sklearn reference trees.
+# Determinism recipe (RESEARCH §Tier-1, D-07): inject FIXED bootstrap-row and
+# feature-column index arrays (plain integers, NEVER RNG-drawn) and fit sklearn
+# on exactly X[bootstrap_idx][:, feature_idx]. With max_features=None over that
+# fixed column subset, sklearn considers precisely the injected columns and no
+# RNG enters the split selection, so a single tree reproduces element-wise.
+#
+# Standard fixtures fit on a ~60x8 synthetic set restricted to a 5-column subset;
+# the emitted sklearn ``tree_`` attributes (children_left/right, feature,
+# threshold, value) let Plan 03 compare split STRUCTURE (exact) and leaf VALUES
+# (<=1e-5 f64). Note ``feature`` indexes the INJECTED feature_idx subset (the
+# columns actually handed to sklearn), NOT the original X columns; Plan 03 maps
+# back through feature_idx when needed.
+#
+# Adversarial fixtures (the 002-B silent-miscompile backstop, T-17-01) are the
+# histogram analogue of Phase 13's duplicate-point row: two IDENTICAL feature
+# columns force an exact gain TIE, and a perfectly-separable target forces both
+# children to become PURE leaves (zero impurity / zero variance). The generator
+# INDEPENDENTLY verifies the tie exists (pure-numpy impurity over each tied
+# column) and documents sklearn's canonical resolution — lowest feature index,
+# then lowest threshold — WITHOUT ever hand-patching the blob to match any mlrs
+# kernel pick (Phase-13 CR-01/CR-02; committed blobs stay reproducible from this
+# generator alone). Because the tied columns are identical, the resulting
+# partition/children/leaf-values are invariant to which tied column is recorded.
+DT_N_SAMPLES = 60
+DT_N_FEATURES = 8
+DT_MAX_DEPTH = 4
+# FIXED injected indices (D-07) — plain integer arrays, never RNG-drawn. The
+# bootstrap sample draws WITH replacement (repeats present, as a real RF bag
+# would) and the feature subset selects 5 of the 8 columns.
+DT_BOOTSTRAP_IDX = np.array(
+    [
+        0, 3, 3, 7, 11, 14, 14, 18, 21, 22, 25, 29, 31, 33, 36, 38,
+        41, 41, 44, 47, 49, 50, 52, 55, 57, 59, 2, 6, 9, 13, 16, 19,
+        23, 26, 28, 30, 34, 37, 39, 42, 45, 48, 51, 54, 56, 58, 1, 5,
+    ],
+    dtype=np.int64,
+)
+DT_FEATURE_IDX = np.array([0, 2, 3, 5, 6], dtype=np.int64)
+
+
+def _dt_gini_best_impurity(col, y):
+    """Independent (pure-numpy) best weighted-Gini child impurity for one column.
+
+    Scans midpoint thresholds between sorted-unique values and returns the
+    minimum n-weighted child Gini impurity achievable on ``col`` (lower is a
+    better split). Used to PROVE the adversarial gain tie is genuine WITHOUT
+    consulting sklearn's choice — the tie-break verification stays independent
+    of the reference estimator (Phase-13 CR-01/CR-02).
+    """
+    n = len(y)
+    classes = np.unique(y)
+    uniq = np.unique(col)
+    best = np.inf
+    for a, b in zip(uniq[:-1], uniq[1:]):
+        thr = (a + b) / 2.0
+        left = col <= thr
+        right = ~left
+        nl, nr = int(left.sum()), int(right.sum())
+        if nl == 0 or nr == 0:
+            continue
+
+        def gini(mask):
+            m = int(mask.sum())
+            if m == 0:
+                return 0.0
+            p = np.array([(y[mask] == c).sum() / m for c in classes])
+            return 1.0 - float((p * p).sum())
+
+        weighted = (nl * gini(left) + nr * gini(right)) / n
+        best = min(best, weighted)
+    return best
+
+
+def _dt_var_best_impurity(col, y):
+    """Independent best n-weighted child VARIANCE for one column (regression tie)."""
+    n = len(y)
+    uniq = np.unique(col)
+    best = np.inf
+    for a, b in zip(uniq[:-1], uniq[1:]):
+        thr = (a + b) / 2.0
+        left = col <= thr
+        right = ~left
+        nl, nr = int(left.sum()), int(right.sum())
+        if nl == 0 or nr == 0:
+            continue
+        vl = float(np.var(y[left])) if nl else 0.0
+        vr = float(np.var(y[right])) if nr else 0.0
+        weighted = (nl * vl + nr * vr) / n
+        best = min(best, weighted)
+    return best
+
+
+def gen_decision_tree_clf(
+    seed: int = SEED, dtype=np.float32, structure: str = "standard"
+) -> str:
+    """Generate one DecisionTreeClassifier(gini) reference fixture (TREE-01, D-09).
+
+    ``structure="standard"`` fits on a ~60x8 synthetic binary-class set restricted
+    to the fixed ``DT_BOOTSTRAP_IDX`` rows and ``DT_FEATURE_IDX`` columns (D-07).
+    ``structure="adversarial"`` builds the forced-pure-leaf + gain-tie backstop
+    (two identical columns, perfectly separable target) and INDEPENDENTLY asserts
+    the tie is genuine. Emits ``X``, ``y``, ``bootstrap_idx``, ``feature_idx`` and
+    the sklearn ``tree_`` attributes (``children_left/right``, ``feature``,
+    ``threshold``, ``value``). Returns the path written.
+    """
+    from sklearn.tree import DecisionTreeClassifier
+
+    if structure == "adversarial":
+        # Two IDENTICAL columns => exact gain tie; perfectly-separable y => both
+        # children become PURE leaves. bootstrap/feature injection is the trivial
+        # identity here so the engineered tie/leaf survive verbatim.
+        base = np.array([0] * 8 + [1] * 8, dtype=np.float64)
+        x = np.column_stack([base, base])
+        y = base.astype(np.int64)
+        boot = np.arange(len(y), dtype=np.int64)
+        feat = np.arange(x.shape[1], dtype=np.int64)
+        x_fit = x[boot][:, feat]
+        # Independent tie proof: both tied columns achieve the SAME best child
+        # impurity (here 0.0 — pure split). Never read sklearn's pick to do this.
+        imp0 = _dt_gini_best_impurity(x_fit[:, 0], y[boot])
+        imp1 = _dt_gini_best_impurity(x_fit[:, 1], y[boot])
+        assert abs(imp0 - imp1) < 1e-12, (
+            f"adversarial clf tie not genuine: {imp0} vs {imp1}"
+        )
+        clf = DecisionTreeClassifier(criterion="gini", random_state=seed)
+        clf.fit(x_fit, y[boot])
+        # Canonical tie-break (documented, independent): lowest feature index then
+        # lowest threshold. The tied columns are identical so the partition/leaves
+        # are invariant regardless of which index sklearn recorded.
+        suffix = "clf_adv"
+    else:
+        rng = np.random.default_rng(seed)
+        x = rng.standard_normal((DT_N_SAMPLES, DT_N_FEATURES))
+        # Binary target with signal on a couple of the SELECTED columns so the
+        # injected feature subset is genuinely informative.
+        logits = 1.3 * x[:, 0] - 0.9 * x[:, 3] + 0.6 * x[:, 6]
+        y = (logits > np.median(logits)).astype(np.int64)
+        boot = DT_BOOTSTRAP_IDX
+        feat = DT_FEATURE_IDX
+        x_fit = x[boot][:, feat]
+        clf = DecisionTreeClassifier(
+            criterion="gini", max_depth=DT_MAX_DEPTH, random_state=seed
+        )
+        clf.fit(x_fit, y[boot])
+        suffix = "clf"
+
+    t = clf.tree_
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"tree_dt_{suffix}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        bootstrap_idx=c(boot),
+        feature_idx=c(feat),
+        children_left=c(t.children_left),
+        children_right=c(t.children_right),
+        feature=c(t.feature),
+        threshold=c(t.threshold),
+        value=c(t.value),
+    )
+    return out_path
+
+
+def gen_decision_tree_reg(
+    seed: int = SEED, dtype=np.float32, structure: str = "standard"
+) -> str:
+    """Generate one DecisionTreeRegressor(squared_error) reference fixture (D-09).
+
+    Mirror of ``gen_decision_tree_clf`` for the regression leaf path. Standard fits
+    a continuous target on the fixed injected rows/columns; ``adversarial`` forces
+    a zero-variance (pure) leaf plus an exact split-variance tie between two
+    identical columns, independently verified. Emits the same array set (``value``
+    here carries the regression-mean leaves). Returns the path written.
+    """
+    from sklearn.tree import DecisionTreeRegressor
+
+    if structure == "adversarial":
+        # Identical columns => variance-reduction tie; two-level constant target
+        # => each child has ZERO variance (pure regression leaf).
+        base = np.array([0] * 8 + [1] * 8, dtype=np.float64)
+        x = np.column_stack([base, base])
+        y = base * 4.0 + 1.0  # -> {1.0, 5.0}, each region constant
+        boot = np.arange(len(y), dtype=np.int64)
+        feat = np.arange(x.shape[1], dtype=np.int64)
+        x_fit = x[boot][:, feat]
+        v0 = _dt_var_best_impurity(x_fit[:, 0], y[boot])
+        v1 = _dt_var_best_impurity(x_fit[:, 1], y[boot])
+        assert abs(v0 - v1) < 1e-12, (
+            f"adversarial reg tie not genuine: {v0} vs {v1}"
+        )
+        reg = DecisionTreeRegressor(
+            criterion="squared_error", random_state=seed
+        )
+        reg.fit(x_fit, y[boot])
+        suffix = "reg_adv"
+    else:
+        rng = np.random.default_rng(seed)
+        x = rng.standard_normal((DT_N_SAMPLES, DT_N_FEATURES))
+        # Continuous target with signal on selected columns + mild noise.
+        y = (
+            2.0 * x[:, 0] - 1.5 * x[:, 3] + 0.8 * x[:, 6]
+            + 0.05 * rng.standard_normal(DT_N_SAMPLES)
+        )
+        boot = DT_BOOTSTRAP_IDX
+        feat = DT_FEATURE_IDX
+        x_fit = x[boot][:, feat]
+        reg = DecisionTreeRegressor(
+            criterion="squared_error",
+            max_depth=DT_MAX_DEPTH,
+            random_state=seed,
+        )
+        reg.fit(x_fit, y[boot])
+        suffix = "reg"
+
+    t = reg.tree_
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"tree_dt_{suffix}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        bootstrap_idx=c(boot),
+        feature_idx=c(feat),
+        children_left=c(t.children_left),
+        children_right=c(t.children_right),
+        feature=c(t.feature),
+        threshold=c(t.threshold),
+        value=c(t.value),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
