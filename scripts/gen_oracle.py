@@ -3094,7 +3094,16 @@ def gen_decision_tree_clf(
         assert abs(imp0 - imp1) < 1e-12, (
             f"adversarial clf data malformed (columns not tied): {imp0} vs {imp1}"
         )
-        clf = DecisionTreeClassifier(criterion="gini", random_state=seed)
+        # Pass max_depth=DT_MAX_DEPTH to match the standard branch AND the
+        # witness builder (tree_witness.rs MAX_DEPTH=4), so both sides share one
+        # depth cap (WR-03). The adversarial design is depth-1 by construction
+        # (two identical columns, perfectly-separable target → one split, two
+        # pure leaves), so the cap is never reached and the emitted tree is
+        # unchanged — but the cap is now explicit instead of an undocumented
+        # coupling to that data property.
+        clf = DecisionTreeClassifier(
+            criterion="gini", max_depth=DT_MAX_DEPTH, random_state=seed
+        )
         clf.fit(x_fit, y[boot])
         # Load-bearing guard (IN-03 / WR-01): pin sklearn's CANONICAL lowest-index
         # pick at the gain-tie root. The witness gates the adversarial clf as a
@@ -3178,8 +3187,15 @@ def gen_decision_tree_reg(
         assert abs(v0 - v1) < 1e-12, (
             f"adversarial reg data malformed (columns not tied): {v0} vs {v1}"
         )
+        # Pass max_depth=DT_MAX_DEPTH to match the standard branch AND the
+        # witness builder (tree_witness.rs MAX_DEPTH=4), so both sides share one
+        # depth cap (WR-03). The adversarial design is depth-1 by construction
+        # (identical columns, two-level constant target → one split, two
+        # zero-variance leaves), so the cap is never reached and the emitted tree
+        # is unchanged — but the cap is now explicit instead of an undocumented
+        # coupling to that data property.
         reg = DecisionTreeRegressor(
-            criterion="squared_error", random_state=seed
+            criterion="squared_error", max_depth=DT_MAX_DEPTH, random_state=seed
         )
         reg.fit(x_fit, y[boot])
         # Load-bearing guard (IN-03 / WR-01): pin sklearn's canonical lowest-index
