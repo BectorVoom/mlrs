@@ -250,8 +250,12 @@ fn launch_dims_rows(n: usize) -> (CubeCount, CubeDim) {
 fn launch_dims_2d(nx: usize, ny: usize) -> (CubeCount, CubeDim) {
     let bx = 16u32;
     let by = 16u32;
-    let cx = ((nx as u32) + bx - 1) / bx;
-    let cy = ((ny as u32) + by - 1) / by;
+    // Ceil-divide in `usize` to avoid the `nx as u32 + (bx-1)` intermediate
+    // wrapping when `nx` is within `bx-1` of `u32::MAX` (IN-03). `checked_mul`
+    // bounds the cell PRODUCT, but `nx = n_nodes*n_feat` alone is only bounded by
+    // `u32::MAX`, so the `+15` could overflow the u32 add.
+    let cx = nx.div_ceil(bx as usize) as u32;
+    let cy = ny.div_ceil(by as usize) as u32;
     (
         CubeCount::Static(cx.max(1), cy.max(1), 1),
         CubeDim { x: bx, y: by, z: 1 },
