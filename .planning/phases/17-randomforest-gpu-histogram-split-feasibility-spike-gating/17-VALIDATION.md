@@ -1,8 +1,8 @@
 ---
 phase: 17
 slug: randomforest-gpu-histogram-split-feasibility-spike-gating
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-06-27
 ---
@@ -37,14 +37,24 @@ created: 2026-06-27
 
 ## Per-Task Verification Map
 
-> Filled by the planner once PLAN tasks exist. Every kernel task carries a VALUE-asserting
-> live-launch test (never non-panic) — the 002-B silent-miscompile backstop.
+> Synced to the finalized plans (17-01..17-05). Every kernel/witness task carries a VALUE-asserting
+> live-launch test (never non-panic) — the 002-B silent-miscompile backstop. Threat refs from each
+> plan's `<threat_model>`; this is a local offline compute spike (no high web-app threats).
 
 | Task ID | Plan | Wave | Requirement | Threat Ref | Secure Behavior | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|------------|-----------------|-----------|-------------------|-------------|--------|
-| 17-01-01 | 01 | 1 | TREE-01 | — | N/A (local compute spike) | unit/live-launch | `cargo test -p mlrs-backend --features cpu <hist_test> -- --nocapture` | ❌ W0 | ⬜ pending |
+| 17-01-01 | 01 | 1 | TREE-01 | — | N/A (dev-controlled fixtures) | unit (python) | `python3 -c "import ast; ast.parse(open('scripts/gen_oracle.py').read())"` + grep `gen_decision_tree_clf`/`gen_decision_tree_reg` (≥2) | ❌ W0 | ⬜ pending |
+| 17-01-02 | 01 | 1 | TREE-01 | non-circular oracle | gen rule in generator, not hand-patched blob | unit (python) | regen → `ls tests/fixtures/ \| grep -E 'tree_dt_(clf\|reg)(_adv)?_(f32\|f64)_seed42\.npz'` (≥6) | ❌ W0 | ⬜ pending |
+| 17-02-01 | 02 | 1 | TREE-01 | 002-A / banned-set | no SharedMemory/Atomic/F::INFINITY/mutable-bool | build | `cargo build -p mlrs-backend --features cpu --tests` + grep 3 kernel fns | ❌ W0 | ⬜ pending |
+| 17-02-02 | 02 | 1 | TREE-01 | 002-A all-zeros | VALUE read-back ≠ zeros, per kernel | live-launch | `cargo test -p mlrs-backend --features cpu --test tree_spike_probes -- --nocapture` | ❌ W0 | ⬜ pending |
+| 17-03-01 | 03 | 2 | TREE-01 | A5 correctness | exact structure + ≤1e-5 leaf vs sklearn | live-launch | `cargo test -p mlrs-backend --features cpu --test tree_witness -- --nocapture` | ❌ W0 | ⬜ pending |
+| 17-03-02 | 03 | 2 | TREE-01 | 002-B silent miscompile | adversarial tie + pure-leaf VALUE-assert | live-launch | `cargo test -p mlrs-backend --features cpu --test tree_witness adversarial -- --nocapture` | ❌ W0 | ⬜ pending |
+| 17-04-01 | 04 | 2 | TREE-01 | A3 cost | benchmark prints 64/128-bin wall-clock + sweep | bench (Instant) | `cargo test -p mlrs-backend --features cpu --test tree_bench -- --nocapture` | ❌ W0 | ⬜ pending |
+| 17-05-01 | 05 | 3 | TREE-01 | T-17-09 decision integrity | A1–A5 evidence-cited verdict | file-assert | grep `A[1-5]`(≥5) + `GO\|ADJUST\|ABORT` + `colid` + `tier` in VERDICT.md | ❌ W0 | ⬜ pending |
+| 17-05-02 | 05 | 3 | TREE-01 | T-17-10 evidence tamper | verbatim copy, live tests authoritative | file-assert | spike dirs 003–006 exist + MANIFEST rows (≥4) | ❌ W0 | ⬜ pending |
+| 17-05-03 | 05 | 3 | TREE-01 | T-17-09 (human gate) | blocking human confirmation of verdict | manual (checkpoint) | human verify per Plan 05 Task 3 `<how-to-verify>` | ❌ W0 | ⬜ pending |
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky · File Exists ❌ W0 = produced during this phase's waves*
 
 ---
 
@@ -69,11 +79,11 @@ created: 2026-06-27
 
 ## Validation Sign-Off
 
-- [ ] All kernel tasks have a VALUE-asserting live-launch verify or Wave 0 fixture dependency
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers the oracle fixtures + adversarial/tie fixture
-- [ ] No watch-mode flags
-- [ ] Feedback latency acceptable (targeted runs; full suite backgrounded)
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All kernel tasks have a VALUE-asserting live-launch verify or Wave 0 fixture dependency
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify (Wave 1: 4/4 auto; Wave 2: 3/3 auto; Wave 3: 2 auto + 1 checkpoint)
+- [x] Wave 0 (Plan 01) covers the oracle fixtures + adversarial/tie fixture
+- [x] No watch-mode flags (all commands are targeted `--test <file>`; bench uses Instant, not Criterion)
+- [x] Feedback latency acceptable (targeted runs; full suite backgrounded)
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-06-27

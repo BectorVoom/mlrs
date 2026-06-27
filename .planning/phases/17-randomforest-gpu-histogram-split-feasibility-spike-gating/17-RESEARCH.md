@@ -390,17 +390,22 @@ All load-bearing examples are inlined in §Architecture Patterns (Patterns 1–3
 
 **If A1–A5 (the abort signals) are the spike's deliverable, these assumptions are resolved BY running the spike — that is the point of a feasibility phase.**
 
-## Open Questions
+## Open Questions (RESOLVED — answered by the plans / spike execution)
+
+> These are intentional EMPIRICAL unknowns that the spike itself answers, not ambiguities that block
+> planning. Each recommendation is incorporated into the relevant plan; the spike run closes them.
 
 1. **Threshold representation: binned cut vs sklearn's exact midpoint.**
    - What we know: D-10 bins on host quantile edges; sklearn splits on exact feature midpoints.
    - What's unclear: whether the witness should gate the raw `threshold` float or the resulting decision boundary when binning rounds it.
    - Recommendation: gate EXACT on structure (`colid`, `left_child`, leaf sentinel) and the chosen bin; gate the leaf VALUES ≤1e-5; for thresholds, assert the boundary classifies the same samples (decision-equivalence) rather than byte-equality. Document in the witness.
+   - **RESOLVED:** incorporated into Plan 17-03 Task 1 — the witness uses decision-equivalence threshold gating (exact structure + ≤1e-5 leaf values). Final disposition recorded in VERDICT.md (Phase-18 caveat).
 
 2. **Linearized cube indexing for the histogram (1D `ABSOLUTE_POS_X` over `n_cells` vs 2D).**
    - What we know: both the 2D `ABSOLUTE_POS_X/Y` (distance kernels) and the per-row `CUBE_POS_X` (topk/self_drop) shapes are proven.
    - What's unclear: which is cleanest for `(node,feature,bin)` cells.
    - Recommendation: a probe can try the 2D guarded shape first (proven in `manhattan_dist`); fall back to the `CUBE_POS_X` per-cell shape if the 2D guard mis-lowers. Either is in the op-set.
+   - **RESOLVED:** incorporated into Plan 17-02 Task 1 — a live probe selects the cleaner indexing shape (both are in the proven op-set; the probe picks, the 002-A all-zeros guard catches a mis-lower). Result recorded in 17-02-SUMMARY.md.
 
 ## Environment Availability
 

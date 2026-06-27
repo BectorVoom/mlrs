@@ -4,9 +4,9 @@ milestone: v4.0
 milestone_name: Tree Ensembles, Time-Series & Full-Surface Completion
 current_phase: 17
 current_phase_name: RandomForest GPU Histogram/Split Feasibility Spike — GATING
-status: planning
+status: executing
 stopped_at: Phase 17 context gathered
-last_updated: "2026-06-27T02:50:33.514Z"
+last_updated: "2026-06-27T03:23:18.528Z"
 last_activity: 2026-06-26
 last_activity_desc: v4.0 roadmap created (Phases 17-26, 25/25 requirements mapped)
 progress:
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-26)
 
 Phase: 17 of 26 (RandomForest GPU Histogram/Split Feasibility Spike — GATING) — first v4.0 phase
 Plan: — (roadmap created; ready to plan Phase 17)
-Status: Ready to plan
+Status: Ready to execute
 Last activity: 2026-06-26 — v4.0 roadmap created (Phases 17-26, 25/25 requirements mapped)
 
 **v4.0 dependency shape:** Phase 17 (spike) GATES the serial tree chain 17->18->19->20->21. Phases 22-25 are spike-independent / parallel-eligible. Phase 26 (cuml.accel) is last. Research-phase needed for Phase 17 (RF spike) and Phase 22 (ARIMA); all others standard-pattern.
