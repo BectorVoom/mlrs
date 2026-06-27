@@ -621,6 +621,11 @@ where
     let mut leaf_buffer: Vec<f64> = Vec::new();
     let mut node_id: Vec<u32> = vec![0u32; n_samples];
     let mut frontier: Vec<u32> = vec![0u32];
+    // (tot, sum_y) per current frontier node, carried from the level that CREATED
+    // those nodes so the max-depth cleanup never relaunches the histogram (WR-04).
+    // `None` until the first level runs (the degenerate `max_depth == 0` case, in
+    // which the root is still the frontier and its totals were never computed).
+    let mut frontier_totals: Option<Vec<(f64, f64)>> = None;
     let mut depth = 0usize;
 
     // (node, feature, bin) -> flat histogram cell index.
@@ -663,6 +668,9 @@ where
         let mut split_bin = vec![0u32; n_nodes_total];
         let mut left_child = vec![0u32; n_nodes_total];
         let mut next_frontier: Vec<u32> = Vec::new();
+        // (tot, sum_y) for each pushed child, derived from THIS level's histogram
+        // so the next level (or the max-depth cleanup) reuses it (WR-04).
+        let mut next_frontier_totals: Vec<(f64, f64)> = Vec::new();
 
         for &nid_u in &frontier {
             let nid = nid_u as usize;
@@ -677,6 +685,20 @@ where
             if can_split {
                 let f = best_col[nid] as usize;
                 let b = best_bin[nid] as usize;
+                // Left child gets bins 0..=b, right gets the rest — the SAME
+                // partition the relabel applies (`bv > thr=b → right`). Summing
+                // this level's histogram over those bin ranges yields each child's
+                // (tot, sum_y) without relaunching the histogram for the deepest
+                // level (WR-04). Identical to the relaunched values: the cells are
+                // this parent's per-bin counts, partitioned exactly as relabel routes.
+                let mut lc_tot = 0.0f64;
+                let mut lc_sum = 0.0f64;
+                for bb in 0..=b {
+                    lc_tot += host_to_f64(counts[cell(nid, f, bb)]);
+                    lc_sum += host_to_f64(vsums[cell(nid, f, bb)]);
+                }
+                let rc_tot = tot - lc_tot;
+                let rc_sum = sum_y - lc_sum;
                 let lc = nodes.len() as i32;
                 nodes[nid].colid = f as i32;
                 nodes[nid].threshold = from_f64::<F>(bin_edges[f][b]);
@@ -691,6 +713,8 @@ where
                 left_child[nid] = lc as u32;
                 next_frontier.push(lc as u32);
                 next_frontier.push((lc + 1) as u32);
+                next_frontier_totals.push((lc_tot, lc_sum));
+                next_frontier_totals.push((rc_tot, rc_sum));
             } else {
                 make_leaf(&mut nodes, &mut leaf_buffer, nid, sum_y, tot);
             }
@@ -709,23 +733,42 @@ where
         );
 
         frontier = next_frontier;
+        frontier_totals = Some(next_frontier_totals);
         depth += 1;
     }
 
-    // Remaining frontier nodes (hit max_depth) become leaves.
+    // Remaining frontier nodes (hit max_depth) become leaves. Reuse the (tot,
+    // sum_y) the splitting level already derived for these children — no extra
+    // histogram launch in the build's hot tail (WR-04). The only path without
+    // carried totals is the degenerate `max_depth == 0` (no level ran, the root
+    // is still the frontier); that one falls back to a single histogram.
     if !frontier.is_empty() {
-        let n_nodes_total = nodes.len();
-        let (counts, vsums) =
-            launch_histogram::<F>(&node_id, binned, y, n_samples, n_feat, n_nodes_total, n_bins);
-        for &nid_u in &frontier {
-            let nid = nid_u as usize;
-            let mut tot = 0.0f64;
-            let mut sum_y = 0.0f64;
-            for b in 0..n_bins {
-                tot += host_to_f64(counts[cell(nid, 0, b)]);
-                sum_y += host_to_f64(vsums[cell(nid, 0, b)]);
-            }
-            make_leaf(&mut nodes, &mut leaf_buffer, nid, sum_y, tot);
+        let totals = frontier_totals.unwrap_or_else(|| {
+            let n_nodes_total = nodes.len();
+            let (counts, vsums) = launch_histogram::<F>(
+                &node_id, binned, y, n_samples, n_feat, n_nodes_total, n_bins,
+            );
+            frontier
+                .iter()
+                .map(|&nid_u| {
+                    let nid = nid_u as usize;
+                    let mut tot = 0.0f64;
+                    let mut sum_y = 0.0f64;
+                    for b in 0..n_bins {
+                        tot += host_to_f64(counts[cell(nid, 0, b)]);
+                        sum_y += host_to_f64(vsums[cell(nid, 0, b)]);
+                    }
+                    (tot, sum_y)
+                })
+                .collect()
+        });
+        debug_assert_eq!(
+            totals.len(),
+            frontier.len(),
+            "carried frontier totals must parallel the frontier (WR-04)"
+        );
+        for (&nid_u, &(tot, sum_y)) in frontier.iter().zip(totals.iter()) {
+            make_leaf(&mut nodes, &mut leaf_buffer, nid_u as usize, sum_y, tot);
         }
     }
 
