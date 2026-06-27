@@ -6,14 +6,14 @@ current_phase: 17
 current_phase_name: randomforest-gpu-histogram-split-feasibility-spike-gating
 status: executing
 stopped_at: Phase 17 context gathered
-last_updated: "2026-06-27T03:31:23.002Z"
+last_updated: "2026-06-27T03:44:57.099Z"
 last_activity: 2026-06-27
 last_activity_desc: Phase 17 execution started
 progress:
   total_phases: 10
   completed_phases: 0
   total_plans: 5
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-26)
 ## Current Position
 
 Phase: 17 (randomforest-gpu-histogram-split-feasibility-spike-gating) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
 Last activity: 2026-06-27 — Phase 17 execution started
 
@@ -154,6 +154,7 @@ Last activity: 2026-06-27 — Phase 17 execution started
 | Phase 16 P12 | 47m | 2 tasks | 12 files |
 | Phase 17 P01 | 9 | 2 tasks | 9 files |
 | Phase 17 P01 | 9 | 2 tasks | 9 files |
+| Phase 17 P02 | 18 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -310,6 +311,8 @@ Recent decisions affecting current work:
 - [Phase ?]: BLDR-03 COMPLETE: all 29 estimators retrofitted to builder+typestate, legacy traits.rs deleted, phase-end gate green
 - [Phase ?]: Phase 17 P01: DecisionTree oracle fixtures inject the feature subset via X[boot][:, feat] (RNG-free, D-07); tree_.feature indexes the SUBSET, not original X columns
 - [Phase ?]: Phase 17 P01: adversarial tree fixtures force a gain tie with identical columns + pure leaves; sklearn records lowest-index feature 0 as canonical tie-break, independently verified (Phase-13 CR-01/CR-02)
+- [Phase ?]: Histogram 2D guarded ABSOLUTE_POS_X/Y lowered cleanly first try (Open Question 2 resolved)
+- [Phase ?]: tree_relabel_partition kept non-generic all-u32 with a split_active flag to stay in the proven cpu-MLIR op-set
 
 ### Pending Todos
 
@@ -348,7 +351,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-27T03:30:57.123Z
+Last session: 2026-06-27T03:44:49.928Z
 Stopped at: Phase 17 context gathered
 Resume file: .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-CONTEXT.md
 
