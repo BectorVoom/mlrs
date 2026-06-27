@@ -1,119 +1,149 @@
 ---
 phase: 17-randomforest-gpu-histogram-split-feasibility-spike-gating
-fixed_at: 2026-06-27T00:00:00Z
+fixed_at: 2026-06-27T06:30:00Z
 review_path: .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-REVIEW.md
-iteration: 1
-findings_in_scope: 5
-fixed: 5
-skipped: 0
-status: all_fixed
+iteration: 2
+findings_in_scope: 8
+fixed: 6
+skipped: 2
+status: partial
 ---
 
-# Phase 17: Code Review Fix Report
+# Phase 17: Code Review Fix Report (Round 2)
 
-**Fixed at:** 2026-06-27
+**Fixed at:** 2026-06-27T06:30:00Z
 **Source review:** .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-REVIEW.md
-**Iteration:** 1
+**Iteration:** 2
 
 **Summary:**
-- Findings in scope: 5 (fix_scope = all → WR + IN)
-- Fixed: 5
-- Skipped: 0
+- Findings in scope: 8 (fix_scope = all → 4 Warning + 4 Info)
+- Fixed: 6 (WR-03, WR-04, IN-01, IN-02, IN-03, IN-04)
+- Skipped: 2 (WR-01, WR-02 — both already resolved in round 1)
 
-All fixes were verified by recompiling the affected test targets with the `cpu`
-feature AND running the full Phase-17 cpu test suite (8 `tree_witness` + 8
-`tree_spike_probes` = 16 tests, all green) after the source-changing fixes. No
-committed fixture blobs were regenerated — the generator changes (IN-03) are
-generation-time guards that the existing blobs already satisfy (verified against
-the installed numpy 2.4.6 / sklearn 1.9.0 without overwriting the committed
-fixtures).
+This is a round-2 pass over a re-issued 8-finding review. Two findings were
+already substantially resolved by round-1 commits and are confirmed against the
+current source, then skipped (not re-applied). The six net-new findings were
+fixed and committed atomically.
+
+All Rust fixes were verified by recompiling the affected test targets with the
+`cpu` feature AND running the full Phase-17 cpu test suite after each
+source-changing fix: 8 `tree_witness` + 8 `tree_spike_probes` + 1 `tree_bench`
+(depth-8, which exercises the WR-04 cleanup path) — all green. The Python
+generator change was syntax-checked and the affected adversarial fixtures were
+regenerated in numpy 2.4.6 / sklearn 1.9.0; the committed `.npz` blobs are
+byte-identical (no fixture drift).
 
 ## Fixed Issues
 
-### WR-01: Adversarial classifier witness strict-locksteps the split feature on a deliberate gain TIE
-
-**Files modified:** `crates/mlrs-backend/tests/tree_witness.rs`
-**Commit:** fb2889f
-**Applied fix:** Changed the terminal dispatch in `run_witness` from `match kind`
-to `match (kind, adversarial)`. The standard classifier (`(Kind::Clf, false)`)
-keeps the strict per-node `compare_rec` lockstep (no ties there); the adversarial
-classifier now joins the regressor in the `assert_function_equiv` arm
-(`(Kind::Clf, true) | (Kind::Reg, _)`), which gates the tree as a FUNCTION
-(induced partition + per-row predictions) and is feature-index-independent. This
-removes the circular oracle where the witness demanded sklearn record feature 0
-at an RNG-resolved gain-tie root. The kernel's own lowest-index tie-break is still
-proven independently by `check_adversarial` (`nodes[0].colid == 0`), so no
-coverage is lost. Verified: all 8 cpu witness tests (incl. both adversarial clf
-backstops) pass.
-
-### WR-02: `build_tree_variance` duplicates ~90% of `build_tree`
-
-**Files modified:** `crates/mlrs-backend/tests/tree_spike/mod.rs`, `crates/mlrs-backend/tests/tree_witness.rs`
-**Commit:** ea659c8
-**Applied fix:** Extracted the single histogram → split-find → relabel frontier
-skeleton into a new generic `pub fn build_tree_with<F, G, L>(…, level_gain,
-leaf_value)` driver in `mod.rs`. `level_gain` returns this level's per-candidate
-gain plus a per-node purity flag; `leaf_value(sum_y, total)` maps a leaf's
-feature-0 totals to its stored value. `build_tree` is now a thin wrapper supplying
-Gini gain + probability leaf (Plan-04 signature unchanged); `build_tree_variance`
-supplies variance-reduction gain (with its own second `y²` histogram launch) +
-mean leaf. Each criterion's exact prior behavior is preserved verbatim inside its
-closure (the Gini `tot > 0.0` guard and the variance `lc > 0.0 && rc > 0.0` guard
-are kept distinct, as before). The ~100-line second copy of the loop is gone.
-Verified: 16 cpu tests (8 witness + 8 probes, incl. `build_tree` end-to-end and
-both regression witnesses) pass — the refactor is behavior-preserving on the real
-correctness gate.
-
-### IN-01: f32 witness rebuilds on f32-rounded data while routing against f32-rounded sklearn thresholds
-
-**Files modified:** `crates/mlrs-backend/tests/tree_witness.rs`
-**Commit:** 197beac
-**Applied fix:** Added a module-doc section ("The f32 path is a COMPANION smoke
-check, NOT a bit-exact sklearn match") documenting that the generator fits sklearn
-in float64 and commits f32-cast arrays, so the f32 witness reconstructs from
-f32-rounded `X` and routes against f32-rounded thresholds. It explains the latent
-fragility (a rounding-collapsed unique or a near-threshold flip could fail a
-functionally-correct tree) and clarifies that f64 is the real correctness gate and
-the f32 run is companion plumbing coverage. Documentation-only (per the review's
-own recommendation for spike code).
-
-### IN-02: `var` uses the cancellation-prone `E[y²] − E[y]²` formula masked by `.max(0.0)`
-
-**Files modified:** `crates/mlrs-backend/tests/tree_witness.rs`
-**Commit:** 09463d5
-**Applied fix:** Added `assert!(v >= -slack, …)` before the `.max(0.0)` clamp in
-the variance closure, where `slack = 1e-4 * (|sq/c| + m*m + 1.0)` is RELATIVE to
-the cancelling terms. A genuinely-negative variance from a sum-of-squares
-miscompile (the 002-B failure this spike targets) now surfaces as a loud failure
-instead of being silently floored to 0. The slack is relative rather than absolute
-because the histogram sums carry f32 rounding (~eps·E[y²]): an initial absolute
-`-1e-6` bound false-positived on the legitimate f32 regression case (observed
-`v = -1.3e-6`); the relative bound tolerates that cancellation while still catching
-a gross miscompile. Verified: all 8 cpu witness tests pass with the new assert.
-
-_Note: this fix is a robustness guard, not a logic change to the variance math
-itself; its effect (catching a future miscompile) cannot be exercised by the
-current green fixtures and would only fire on a regressed kernel._
-
-### IN-03: Tie-genuineness assert in the generator is a tautology for identical columns
+### WR-03: Adversarial oracle generators omit `max_depth`, diverging from the standard branch
 
 **Files modified:** `scripts/gen_oracle.py`
-**Commit:** 57c9665
-**Applied fix:** In both `gen_decision_tree_clf` and `gen_decision_tree_reg`
-adversarial branches, reframed the always-true `abs(imp0-imp1)<1e-12` /
-`abs(v0-v1)<1e-12` checks as data-construction sanity checks (their comments no
-longer over-claim to prove the tie genuine) and added the load-bearing guard the
-witness actually depends on: `assert int(clf.tree_.feature[0]) == 0` (and the reg
-equivalent), pinning sklearn's canonical lowest-index pick at the gain/variance
-tie root. Combined with WR-01 (witness gates the function, not the feature), this
-makes the committed blob verified against the documented tie-break rule at
-generation time: a sklearn shuffle/RNG change that recorded feature 1 fails loudly
-at regeneration. Verified: the new guards pass for f32+f64 clf+reg under the
-installed sklearn 1.9.0, run into a throwaway dir so the committed fixtures were
-not overwritten. No fixture regeneration required.
+**Commit:** de3b878
+**Applied fix:** Added `max_depth=DT_MAX_DEPTH` to both the adversarial
+`DecisionTreeClassifier(criterion="gini", ...)` and
+`DecisionTreeRegressor(criterion="squared_error", ...)` constructors, matching
+the standard branch and the witness builder (`tree_witness.rs` `MAX_DEPTH=4`),
+with a comment noting the adversarial design is depth-1 by construction so the
+cap is never reached. Reconciled with round-1 commit 57c9665 (which added the
+load-bearing `tree_.feature[0] == 0` tie-break guards) — those guards are
+preserved; only the missing depth cap was added.
+**Fixture impact:** Regenerated `tree_dt_clf_adv_{f32,f64}_seed42.npz` and
+`tree_dt_reg_adv_{f32,f64}_seed42.npz`. All four blobs are byte-identical to the
+committed versions (`git status` clean) — the depth-1 adversarial tree is
+unaffected by the cap, confirming the documented coupling. No fixture committed.
+
+### WR-04: `build_tree` relaunched a full cumulative-sized histogram for the max-depth leaf cleanup
+
+**Files modified:** `crates/mlrs-backend/tests/tree_spike/mod.rs`
+**Commit:** 221bd07
+**Applied fix:** In `build_tree_with` (the shared driver, post-ea659c8 refactor
+— the `tree_witness.rs` mirror the review cites no longer exists), each splitting
+level now derives its two children's `(tot, sum_y)` directly from that level's
+histogram by summing the parent's per-bin cells over the same partition the
+relabel applies (left = bins `0..=b`, right = remainder). These carried totals
+flow into a `frontier_totals: Option<Vec<(f64,f64)>>` and are reused by the
+max-depth cleanup, eliminating the redundant `launch_histogram` in the build's
+hot tail. The degenerate `max_depth == 0` path (no level ran, root still the
+frontier) falls back to a single histogram. A `debug_assert_eq!` guards the
+carried-totals/frontier length invariant.
+**Verification note (logic change):** This changes HOW the deepest-leaf totals
+are computed (parent-histogram partition vs a relabel-then-rehistogram). The
+derivation is provably the same partition, and the full sklearn witness
+(`<=1e-5` leaf values, exact node/leaf counts, induced-partition equivalence)
+plus the depth-8 bench pass unchanged — strong semantic validation. Recommend a
+human glance at the bin-range derivation (`0..=b` left / remainder right) to
+confirm it matches the relabel rule `bv > thr=b → right`.
+
+### IN-01: `peak_cells` memory note hardcoded `128` instead of the active bin count
+
+**Files modified:** `crates/mlrs-backend/tests/tree_bench.rs`
+**Commit:** f829b4e (combined with IN-02 — same file)
+**Applied fix:** Introduced `const HEADLINE_BINS: usize = 128;` in `run_bench`
+and used it for the headline/sweep `gen_dataset`/`timed_build` calls and the
+`peak_cells` computation + memory-note `println!`. The 64-bin delta calls remain
+literal (they are deliberately the contrasting bin count). Bench output confirms
+the note prints `128 bins` from the const.
+
+### IN-02: `bin_edges` preallocation capacity discarded by the `vec![..; n_feat]` clone
+
+**Files modified:** `crates/mlrs-backend/tests/tree_bench.rs`
+**Commit:** f829b4e (combined with IN-01 — same file)
+**Applied fix:** Replaced `vec![Vec::with_capacity(n_bins - 1); n_feat]` (which
+clones the prototype, dropping the reservation since `Vec::clone` copies only
+len) with `(0..n_feat).map(|_| Vec::with_capacity(n_bins - 1)).collect()`, so
+each inner `Vec` keeps its reservation.
+
+### IN-03: `launch_dims_2d` ceiling-div could overflow `u32` for `nx` near `u32::MAX`
+
+**Files modified:** `crates/mlrs-backend/tests/tree_spike/mod.rs`
+**Commit:** 6b502e5
+**Applied fix:** Replaced `((nx as u32) + bx - 1) / bx` (and the `ny` twin) with
+`nx.div_ceil(bx as usize) as u32`, computing the ceiling in `usize` so the
+`+ (bx-1)` intermediate cannot wrap the u32 add when `nx = n_nodes*n_feat` is
+within `bx-1` of `u32::MAX`.
+
+### IN-04: f32 oracle comparisons used `F64_TOL` rather than `F32_TOL`
+
+**Files modified:** `crates/mlrs-backend/tests/tree_witness.rs`
+**Commit:** a01cbdb
+**Applied fix:** Added a `tol::<F>()` helper that returns `&F32_TOL` for the f32
+build and `&F64_TOL` for f64 (by `size_of::<F>()`), and routed all three
+`assert_slice_close` call sites (`compare_rec`, `assert_function_equiv`,
+`check_adversarial`) through it. Imported `Tolerance` and `F32_TOL`. The two
+tolerances are identical today, so behaviour is unchanged, but a future
+tightening of `F64_TOL` can no longer silently impose the stricter bound on the
+f32 companion path.
+
+## Skipped Issues
+
+### WR-01: `build_tree` and `build_tree_variance` are ~80% duplicated — divergence hazard
+
+**File:** `crates/mlrs-backend/tests/tree_spike/mod.rs` and `crates/mlrs-backend/tests/tree_witness.rs`
+**Reason:** already-fixed in round 1 (commit ea659c8). Verified against current
+source: the shared `build_tree_with::<F, G, L>(.., level_gain, leaf_value)` driver
+exists (`tree_spike/mod.rs:583`) and holds the single copy of the
+histogram → split-find → relabel skeleton (frontier init, adjacency D-02, leaf
+sentinel D-03/D-04, `max_depth`/`min_samples` termination, relabel). Both
+`build_tree` (gini, `tree_spike/mod.rs:562`) and `build_tree_variance` (variance,
+`tree_witness.rs:322`) now drive it through gain/leaf closures — the duplicated
+per-level loop the review flagged no longer exists. No re-application needed.
+
+### WR-02: Witness routes the decision-equivalence partition by an f32-quantized sklearn threshold
+
+**File:** `crates/mlrs-backend/tests/tree_witness.rs`
+**Reason:** already-resolved/documented in round 1 (commit 197beac), matching the
+review's own accepted remedy (document the f32 path as non-bit-exact). The
+witness module doc (`tree_witness.rs:39-51`, "## The f32 path is a COMPANION
+smoke check, NOT a bit-exact sklearn match") explicitly states the f32 run
+reconstructs from f32-rounded `X`/`threshold` and could in principle flip a
+sample sitting within ~1e-7 of a threshold, so it is a companion SMOKE check of
+the kernel plumbing — not an independent bit-exact reproduction. No concrete
+defect found in the current fixtures (the well-separated random-normal data
+avoids adjacent-f32 boundaries), so per the round-2 instruction the comparison is
+left unchanged. Documentation judged sufficient.
 
 ---
 
-_Fixed: 2026-06-27_
+_Fixed: 2026-06-27T06:30:00Z_
 _Fixer: Claude (gsd-code-fixer)_
-_Iteration: 1_
+_Iteration: 2_
