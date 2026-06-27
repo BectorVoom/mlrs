@@ -5,8 +5,8 @@ milestone_name: Tree Ensembles, Time-Series & Full-Surface Completion
 current_phase: 18
 current_phase_name: Tree Primitives + DecisionTree Core
 status: verifying
-stopped_at: Completed 17-04-PLAN.md
-last_updated: "2026-06-27T04:35:19.190Z"
+stopped_at: Phase 18 context gathered
+last_updated: "2026-06-27T06:49:02.561Z"
 last_activity: 2026-06-27
 last_activity_desc: Phase 17 complete, transitioned to Phase 18
 progress:
@@ -357,9 +357,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-27T04:21:00.475Z
-Stopped at: Completed 17-04-PLAN.md
-Resume file: .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-CONTEXT.md
+Last session: 2026-06-27T06:49:02.554Z
+Stopped at: Phase 18 context gathered
+Resume file: .planning/phases/18-tree-primitives-decisiontree-core/18-CONTEXT.md
 
 ## Operator Next Steps
 
