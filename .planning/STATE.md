@@ -3,17 +3,17 @@ gsd_state_version: 1.0
 milestone: v4.0
 milestone_name: Tree Ensembles, Time-Series & Full-Surface Completion
 current_phase: 17
-current_phase_name: RandomForest GPU Histogram/Split Feasibility Spike — GATING
+current_phase_name: randomforest-gpu-histogram-split-feasibility-spike-gating
 status: executing
 stopped_at: Phase 17 context gathered
-last_updated: "2026-06-27T03:23:18.528Z"
-last_activity: 2026-06-26
-last_activity_desc: v4.0 roadmap created (Phases 17-26, 25/25 requirements mapped)
+last_updated: "2026-06-27T03:31:23.002Z"
+last_activity: 2026-06-27
+last_activity_desc: Phase 17 execution started
 progress:
   total_phases: 10
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 5
+  completed_plans: 1
   percent: 0
 ---
 
@@ -24,14 +24,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-06-26)
 
 **Core value:** Correct, memory-efficient ML algorithms that match scikit-learn within 1e-5, running on any CubeCL backend from a single generic codebase.
-**Current focus:** Phase 17 — RandomForest GPU Histogram/Split Feasibility Spike (GATING)
+**Current focus:** Phase 17 — randomforest-gpu-histogram-split-feasibility-spike-gating
 
 ## Current Position
 
-Phase: 17 of 26 (RandomForest GPU Histogram/Split Feasibility Spike — GATING) — first v4.0 phase
-Plan: — (roadmap created; ready to plan Phase 17)
+Phase: 17 (randomforest-gpu-histogram-split-feasibility-spike-gating) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
-Last activity: 2026-06-26 — v4.0 roadmap created (Phases 17-26, 25/25 requirements mapped)
+Last activity: 2026-06-27 — Phase 17 execution started
 
 **v4.0 dependency shape:** Phase 17 (spike) GATES the serial tree chain 17->18->19->20->21. Phases 22-25 are spike-independent / parallel-eligible. Phase 26 (cuml.accel) is last. Research-phase needed for Phase 17 (RF spike) and Phase 22 (ARIMA); all others standard-pattern.
 
@@ -152,6 +152,8 @@ Last activity: 2026-06-26 — v4.0 roadmap created (Phases 17-26, 25/25 requirem
 | Phase 16 P10 | 6min | 2 tasks | 2 files |
 | Phase 16 P11 | 28m | 3 tasks | 10 files |
 | Phase 16 P12 | 47m | 2 tasks | 12 files |
+| Phase 17 P01 | 9 | 2 tasks | 9 files |
+| Phase 17 P01 | 9 | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -306,6 +308,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 16-11: shim test matrix auto-derives from mlrs.__all__ (ALL_SHIMS, 32 shims) so it cannot drift; the 3 fit-free estimator_checks are guarded never-xfailed (A7)
 - [Phase ?]: Phase 16: traits.rs hard-deleted — mlrs_algos::typestate is the single trait surface (D-01)
 - [Phase ?]: BLDR-03 COMPLETE: all 29 estimators retrofitted to builder+typestate, legacy traits.rs deleted, phase-end gate green
+- [Phase ?]: Phase 17 P01: DecisionTree oracle fixtures inject the feature subset via X[boot][:, feat] (RNG-free, D-07); tree_.feature indexes the SUBSET, not original X columns
+- [Phase ?]: Phase 17 P01: adversarial tree fixtures force a gain tie with identical columns + pure leaves; sklearn records lowest-index feature 0 as canonical tie-break, independently verified (Phase-13 CR-01/CR-02)
 
 ### Pending Todos
 
@@ -344,7 +348,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-27T02:50:33.508Z
+Last session: 2026-06-27T03:30:57.123Z
 Stopped at: Phase 17 context gathered
 Resume file: .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-CONTEXT.md
 

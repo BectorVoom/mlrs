@@ -102,10 +102,10 @@ Full phase detail, plans, and per-plan notes: [milestones/v3.0-ROADMAP.md](miles
   4. A per-tree cost benchmark is recorded and abort signals A1–A5 are each evaluated
   5. An explicit GO / ADJUST / ABORT verdict is delivered and the two-tier stochastic-gate convention is documented as the milestone-wide standard
 
-**Plans**: 5 plans
+**Plans**: 1/5 plans executed
 **Wave 1**
 
-- [ ] 17-01-PLAN.md — Wave-0 oracle foundation: gen_decision_tree_clf(gini)/reg(squared_error) generators + committed sklearn .npz fixtures (standard + adversarial, f32+f64)
+- [x] 17-01-PLAN.md — Wave-0 oracle foundation: gen_decision_tree_clf(gini)/reg(squared_error) generators + committed sklearn .npz fixtures (standard + adversarial, f32+f64)
 - [ ] 17-02-PLAN.md — Three cpu-MLIR-safe kernels (GATHER histogram, seed-from-first split-find, relabel-partition) + SparseTreeNode + host build loop + standalone-launch VALUE probes (SC-1, A1, A4)
 
 **Wave 2** *(blocked on Wave 1 completion)*
@@ -283,7 +283,7 @@ Tree chain is serial: 17 → 18 → 19 → 20 → 21. Phases 22–25 are paralle
 | 14. UMAP | v3.0 | 7/7 | Complete | 2026-06-24 |
 | 15. HDBSCAN | v3.0 | 7/7 | Complete | 2026-06-24 |
 | 16. Builder Retrofit Sweep + Shim Coverage | v3.0 | 13/13 | Complete | 2026-06-24 |
-| 17. RandomForest GPU Histogram/Split Feasibility Spike (GATING) | v4.0 | 0/TBD | Not started | - |
+| 17. RandomForest GPU Histogram/Split Feasibility Spike (GATING) | v4.0 | 1/5 | In Progress|  |
 | 18. Tree Primitives + DecisionTree Core | v4.0 | 0/TBD | Not started | - |
 | 19. RandomForestClassifier + RandomForestRegressor | v4.0 | 0/TBD | Not started | - |
 | 20. FIL — Batched Forest Inference | v4.0 | 0/TBD | Not started | - |

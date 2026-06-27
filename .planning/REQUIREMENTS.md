@@ -17,7 +17,7 @@ Requirements for the v4.0 milestone. Each maps to a roadmap phase.
 
 ### Tree Feasibility & Primitives (build & gate FIRST — gates the tree chain)
 
-- [ ] **TREE-01**: A GPU tree-construction **feasibility spike** proves (or refutes) that a single-owner GATHER histogram/split lowers and is tractable under cpu-MLIR — no SharedMemory, no atomics, no `F::INFINITY` init. It delivers GATHER-histogram + relabel-partition + seed-from-first split-find kernels standalone-launching on cpu(f64)+rocm(f32), a VALUE-asserting correctness test vs `sklearn.tree.DecisionTree*` on **injected fixed bootstrap/feature indices**, a per-tree cost benchmark, a finalized `SparseTreeNode { colid, threshold, left_child, value }` (right = left+1) format contract, an established two-tier stochastic-gate convention, and an explicit **GO / ADJUST / ABORT** verdict with abort signals A1–A5 evaluated. *(gate: spike verdict + VALUE on fixed-index tree)*
+- [x] **TREE-01**: A GPU tree-construction **feasibility spike** proves (or refutes) that a single-owner GATHER histogram/split lowers and is tractable under cpu-MLIR — no SharedMemory, no atomics, no `F::INFINITY` init. It delivers GATHER-histogram + relabel-partition + seed-from-first split-find kernels standalone-launching on cpu(f64)+rocm(f32), a VALUE-asserting correctness test vs `sklearn.tree.DecisionTree*` on **injected fixed bootstrap/feature indices**, a per-tree cost benchmark, a finalized `SparseTreeNode { colid, threshold, left_child, value }` (right = left+1) format contract, an established two-tier stochastic-gate convention, and an explicit **GO / ADJUST / ABORT** verdict with abort signals A1–A5 evaluated. *(gate: spike verdict + VALUE on fixed-index tree)*
 - [ ] **TREE-02**: The tree primitives (`quantiles`, `tree_hist`, `best_split`, `node_partition`) are standalone-validated and a `DecisionTreeClassifier`/`DecisionTreeRegressor` core (level-wise host loop) is oracle-gated vs `sklearn.tree.DecisionTree*` on injected fixed indices, with a build-failing frontier-only-histogram PoolStats memory gate. *(gate: exact/structural on fixed-index tree; ≤1e-5 leaf values f64)*
 
 ### Random Forest (RF)
@@ -78,10 +78,12 @@ Requirements for the v4.0 milestone. Each maps to a roadmap phase.
 Deferred to a future milestone. Tracked but not in the v4.0 roadmap.
 
 ### Tree-stack extensions
+
 - **TREE-FUT-01**: Interventional / feature-perturbation TreeSHAP with background data (path-dependent TreeSHAP ships first in v4.0).
 - **FIL-FUT-01**: External tree-model ingestion (Treelite / XGBoost / LightGBM) into FIL — external-model import is its own milestone.
 
 ### Kernel SVM
+
 - **SVM-FUT-01**: Kernel `SVC` / `SVR` via the SMO solver — the hardest solver to make GPU-friendly; deferred past v4.0 (linear SVM shipped in v2).
 
 ## Out of Scope
@@ -103,7 +105,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TREE-01 | Phase 17 | Pending |
+| TREE-01 | Phase 17 | Complete |
 | TREE-02 | Phase 18 | Pending |
 | RF-01 | Phase 19 | Pending |
 | RF-02 | Phase 19 | Pending |
@@ -130,11 +132,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ACCEL-02 | Phase 26 | Pending |
 
 **Coverage:**
+
 - v4.0 requirements: 25 total
 - Mapped to phases: 25 ✓ (all v1 requirements mapped to exactly one phase; no orphans, no duplicates)
 - Unmapped: 0 ✓
 
 **Phase → requirement rollup:**
+
 - Phase 17: TREE-01 · Phase 18: TREE-02 · Phase 19: RF-01/02/03 · Phase 20: FIL-01 · Phase 21: SHAP-01
 - Phase 22: ARIMA-01/02/03 · Phase 23: SHAP-02/03 · Phase 24: METR-01/02/03 + PREP-01/02 + FEAT-01 + MODSEL-01/02 · Phase 25: GEN-01/02/03 · Phase 26: ACCEL-01/02
 
