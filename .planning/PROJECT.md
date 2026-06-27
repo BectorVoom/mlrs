@@ -120,6 +120,10 @@ _v4.0 scope (hypotheses until shipped — detailed REQ-IDs in REQUIREMENTS.md):_
 - **Oracle:** scikit-learn on CPU produces reference outputs from identical random inputs — runs in CI without a GPU.
 - **Build protocol (AGENTS.md):** Source and test code strictly separated (no `mod tests` in source files; use `tests/` or `*_test.rs`). On any CubeCL build error, consult the CubeCL error guideline before attempting fixes.
 
+### Current State (v4.0 in progress)
+
+- **Phase 17 complete** (2026-06-27): RandomForest GPU histogram/split **feasibility spike returned GO** — the gating verdict that unblocks the entire tree chain (Phases 18→21: tree prims + DecisionTree → RandomForest → FIL → TreeSHAP). All three GPU tree kernels (single-owner GATHER histogram, seed-from-first split-find, relabel-partition) lower and compute f64-correctly under cpu-MLIR with no SharedMemory/atomics/`F::INFINITY`; a single tree on injected fixed indices VALUE-matches `sklearn.tree.DecisionTree*` (≤1e-5); per-tree cost is tractable (sub-second, D-06 frontier-only headroom unrealized); abort signals A1–A5 all PASS. Finalized: the `SparseTreeNode { colid, threshold, left_child, value }` contract (leaf = `colid==-1`, a deliberate divergence from cuML's `left_child==-1`, binding for Phase 20) and the **two-tier stochastic-gate convention** (Tier-1 deterministic injected-fixed-index core + Tier-2 ensemble predictive band) as the milestone-wide standard for Phases 18–21. TREE-01 validated. Verdict human-approved; 5 plans, durable spike evidence in `.planning/spikes/003–006-*/`.
+
 ### Current State (after v3.0)
 
 - **Shipped v3.0** (2026-06-26): UMAP + HDBSCAN added on a shared multi-metric KNN-graph primitive, plus a Rust-native builder/typestate API retrofitted across all 32 estimators and a pure-Python sklearn shim. 34 plans over Phases 12–16, 248 commits, built 2026-06-23 → 2026-06-26 (426 files, +45,450 / −4,160). All 16 v3 requirements complete. Total estimator surface now 32 (+ the shared KNN-graph prim).
