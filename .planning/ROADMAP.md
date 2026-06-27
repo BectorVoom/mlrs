@@ -99,8 +99,13 @@ Full phase detail, plans, and per-plan notes: [milestones/v3.0-ROADMAP.md](miles
   3. The `SparseTreeNode { colid, threshold, left_child, value }` format contract is finalized (right child = `left_child + 1`)
   4. A per-tree cost benchmark is recorded and abort signals A1–A5 are each evaluated
   5. An explicit GO / ADJUST / ABORT verdict is delivered and the two-tier stochastic-gate convention is documented as the milestone-wide standard
-**Plans**: TBD
-**Research**: NEEDS `--research-phase` — consult `Skill("spike-findings-mlrs")` for the proven GATHER op-set and the 002-A (loud) / 002-B (silent) cpu-MLIR landmines
+**Plans**: 5 plans
+- [ ] 17-01-PLAN.md — Wave-0 oracle foundation: gen_decision_tree_clf(gini)/reg(squared_error) generators + committed sklearn .npz fixtures (standard + adversarial, f32+f64)
+- [ ] 17-02-PLAN.md — Three cpu-MLIR-safe kernels (GATHER histogram, seed-from-first split-find, relabel-partition) + SparseTreeNode + host build loop + standalone-launch VALUE probes (SC-1, A1, A4)
+- [ ] 17-03-PLAN.md — Tier-1 witness: single tree VALUE-matches sklearn DecisionTree clf+reg + adversarial; SparseTreeNode contract validated (SC-2, SC-3, A5)
+- [ ] 17-04-PLAN.md — Per-tree cost benchmark at 64 vs 128 bins + scaling sweep (SC-4, A3)
+- [ ] 17-05-PLAN.md — VERDICT.md (A1–A5 + GO/ADJUST/ABORT) + two-tier convention + spike wrap-up; blocking human gate (SC-4, SC-5)
+**Research**: COMPLETE — 17-RESEARCH.md + 17-PATTERNS.md; `Skill("spike-findings-mlrs")` carries the proven GATHER op-set and the 002-A (loud) / 002-B (silent) cpu-MLIR landmines
 
 ### Phase 18: Tree Primitives + DecisionTree Core
 **Goal**: Promote the spike's kernel probes to production primitives with full prim contracts and deliver an oracle-gated DecisionTree core (level-wise host loop) — primitive-first, before RandomForest assembles N of them.
