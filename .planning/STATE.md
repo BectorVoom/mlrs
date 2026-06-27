@@ -4,17 +4,17 @@ milestone: v4.0
 milestone_name: Tree Ensembles, Time-Series & Full-Surface Completion
 current_phase: 17
 current_phase_name: randomforest-gpu-histogram-split-feasibility-spike-gating
-status: executing
+status: verifying
 stopped_at: Completed 17-04-PLAN.md
-last_updated: "2026-06-27T04:09:56.402Z"
+last_updated: "2026-06-27T04:21:32.539Z"
 last_activity: 2026-06-27
 last_activity_desc: Phase 17 execution started
 progress:
   total_phases: 10
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 5
-  completed_plans: 4
-  percent: 0
+  completed_plans: 5
+  percent: 10
 ---
 
 # Project State
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-06-26)
 
 Phase: 17 (randomforest-gpu-histogram-split-feasibility-spike-gating) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-06-27 — Phase 17 execution started
 
 **v4.0 dependency shape:** Phase 17 (spike) GATES the serial tree chain 17->18->19->20->21. Phases 22-25 are spike-independent / parallel-eligible. Phase 26 (cuml.accel) is last. Research-phase needed for Phase 17 (RF spike) and Phase 22 (ARIMA); all others standard-pattern.
@@ -157,6 +157,7 @@ Last activity: 2026-06-27 — Phase 17 execution started
 | Phase 17 P02 | 18 | 2 tasks | 2 files |
 | Phase 17 P03 | 22 | 2 tasks | 1 files |
 | Phase 17 P04 | 14 | 1 tasks | 1 files |
+| Phase 17 P05 | 8 | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -316,6 +317,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Histogram 2D guarded ABSOLUTE_POS_X/Y lowered cleanly first try (Open Question 2 resolved)
 - [Phase ?]: tree_relabel_partition kept non-generic all-u32 with a split_active flag to stay in the proven cpu-MLIR op-set
 - [Phase ?]: A3 measured: per-tree depth-8 build on 1000x20 is sub-second on cpu-MLIR (f32 128bins=464ms/64bins=69ms; f64 128bins=195ms) — tractable with D-06 fewer-bins (6.68x f32) + frontier-only levers as headroom
+- [Phase 17]: Phase 17 spike verdict: GO (human-approved) — A1–A5 cleared; tree chain 18→19→20→21 proceeds; SparseTreeNode leaf=colid==-1 diverges from cuML; two-tier stochastic-gate convention adopted milestone-wide
 
 ### Pending Todos
 
@@ -354,7 +356,7 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-27T04:09:56.395Z
+Last session: 2026-06-27T04:21:00.475Z
 Stopped at: Completed 17-04-PLAN.md
 Resume file: .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-CONTEXT.md
 
