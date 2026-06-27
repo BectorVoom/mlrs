@@ -36,6 +36,20 @@
 //! witness gates the decision boundary (which samples go left/right), NOT the
 //! raw `threshold` float. This is the resolution of Open Question 1.
 //!
+//! ## The f32 path is a COMPANION smoke check, NOT a bit-exact sklearn match
+//!
+//! f64 is the real correctness gate (CLAUDE.md: abs/rel `<=1e-5`). The generator
+//! fits sklearn in float64 but commits `X` / `threshold` / `value` cast to the
+//! fixture dtype, so the f32 witness reconstructs `x_fit` from the f32-ROUNDED
+//! `X`, re-derives its unique values / bin layout, rebuilds the tree, and
+//! decision-routes against the f32-rounded `threshold`. If f32 rounding ever
+//! collapsed two previously-distinct feature values into one unique (changing
+//! the bin layout) or flipped a sample sitting within ~1e-7 of a threshold, the
+//! node-count or decision-equivalence assertions could fail on a tree that is
+//! functionally correct. It passes on this well-separated random-normal data,
+//! so the f32 run is a companion SMOKE check of the kernel plumbing — NOT an
+//! independent bit-exact reproduction of sklearn's float64 fit (IN-01).
+//!
 //! ## Regressor split-feature ties are RNG-determined — gate the FUNCTION, not
 //! the recorded feature (Pitfall 4 non-circularity)
 //!
