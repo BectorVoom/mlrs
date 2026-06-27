@@ -5,15 +5,15 @@ milestone_name: Tree Ensembles, Time-Series & Full-Surface Completion
 current_phase: 17
 current_phase_name: randomforest-gpu-histogram-split-feasibility-spike-gating
 status: executing
-stopped_at: Phase 17 context gathered
-last_updated: "2026-06-27T04:02:52.041Z"
+stopped_at: Completed 17-04-PLAN.md
+last_updated: "2026-06-27T04:09:56.402Z"
 last_activity: 2026-06-27
 last_activity_desc: Phase 17 execution started
 progress:
   total_phases: 10
   completed_phases: 0
   total_plans: 5
-  completed_plans: 3
+  completed_plans: 4
   percent: 0
 ---
 
@@ -29,7 +29,7 @@ See: .planning/PROJECT.md (updated 2026-06-26)
 ## Current Position
 
 Phase: 17 (randomforest-gpu-histogram-split-feasibility-spike-gating) — EXECUTING
-Plan: 4 of 5
+Plan: 5 of 5
 Status: Ready to execute
 Last activity: 2026-06-27 — Phase 17 execution started
 
@@ -156,6 +156,7 @@ Last activity: 2026-06-27 — Phase 17 execution started
 | Phase 17 P01 | 9 | 2 tasks | 9 files |
 | Phase 17 P02 | 18 | 2 tasks | 2 files |
 | Phase 17 P03 | 22 | 2 tasks | 1 files |
+| Phase 17 P04 | 14 | 1 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -314,6 +315,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Phase 17 P01: adversarial tree fixtures force a gain tie with identical columns + pure leaves; sklearn records lowest-index feature 0 as canonical tie-break, independently verified (Phase-13 CR-01/CR-02)
 - [Phase ?]: Histogram 2D guarded ABSOLUTE_POS_X/Y lowered cleanly first try (Open Question 2 resolved)
 - [Phase ?]: tree_relabel_partition kept non-generic all-u32 with a split_active flag to stay in the proven cpu-MLIR op-set
+- [Phase ?]: A3 measured: per-tree depth-8 build on 1000x20 is sub-second on cpu-MLIR (f32 128bins=464ms/64bins=69ms; f64 128bins=195ms) — tractable with D-06 fewer-bins (6.68x f32) + frontier-only levers as headroom
 
 ### Pending Todos
 
@@ -352,8 +354,8 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-27T04:02:41.659Z
-Stopped at: Phase 17 context gathered
+Last session: 2026-06-27T04:09:56.395Z
+Stopped at: Completed 17-04-PLAN.md
 Resume file: .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-CONTEXT.md
 
 ## Operator Next Steps
