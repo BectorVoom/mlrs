@@ -2,9 +2,13 @@
 gsd_state_version: 1.0
 milestone: v4.0
 milestone_name: Tree Ensembles, Time-Series & Full-Surface Completion
+current_phase: 17
+current_phase_name: RandomForest GPU Histogram/Split Feasibility Spike — GATING
 status: planning
-last_updated: "2026-06-26T07:19:59.179Z"
+stopped_at: Phase 17 context gathered
+last_updated: "2026-06-27T02:50:33.514Z"
 last_activity: 2026-06-26
+last_activity_desc: v4.0 roadmap created (Phases 17-26, 25/25 requirements mapped)
 progress:
   total_phases: 10
   completed_phases: 0
@@ -340,9 +344,9 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-06-24T14:41:37.818Z
-Stopped at: Phase 16 context gathered
-Resume file: .planning/phases/16-builder-retrofit-sweep-shim-coverage/16-CONTEXT.md
+Last session: 2026-06-27T02:50:33.508Z
+Stopped at: Phase 17 context gathered
+Resume file: .planning/phases/17-randomforest-gpu-histogram-split-feasibility-spike-gating/17-CONTEXT.md
 
 ## Operator Next Steps
 
