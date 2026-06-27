@@ -237,7 +237,22 @@ where
             0.0
         } else {
             let m = sm / c;
-            (sq / c - m * m).max(0.0)
+            let v = sq / c - m * m;
+            // IN-02: this one-pass E[y²]−E[y]² form is cancellation-prone, and a
+            // bare `.max(0.0)` would SILENTLY floor a genuinely-negative result —
+            // exactly the 002-B sum-of-squares miscompile this spike exists to
+            // catch. The histogram sums carry f32 rounding (~eps·E[y²]), so the
+            // legitimate cancellation slack is RELATIVE to the cancelling terms;
+            // a real miscompile drives `v` far more negative than that. Surface
+            // anything past the relative slack as a FAILURE, then clamp the
+            // residual fp noise to 0.
+            let slack = 1e-4 * ((sq / c).abs() + m * m + 1.0);
+            assert!(
+                v >= -slack,
+                "variance E[y²]−E[y]² is negative beyond fp slack ({v} < -{slack}): \
+                 sum-of-squares histogram is miscompiling (002-B), not fp rounding"
+            );
+            v.max(0.0)
         }
     };
 
