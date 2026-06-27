@@ -3430,6 +3430,21 @@ def main() -> None:
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_categorical_nb(dtype=dtype)}")
 
+    # ---- Phase-17 DecisionTree oracle fixtures (TREE-01, D-07/D-09) ----
+    # Injected fixed-index (bootstrap rows + feature subset) sklearn reference
+    # trees the Plan-03 Tier-1 witness value-asserts against. gini-classifier +
+    # squared-error-regressor, f32 (rocm gate) + f64 (cpu gate). The adversarial
+    # variant carries a forced-pure-leaf + exact gain TIE (the 002-B silent
+    # histogram/argmax-miscompile backstop, T-17-01).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_decision_tree_clf(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_decision_tree_reg(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_decision_tree_clf(dtype=dtype, structure='adversarial')}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_decision_tree_reg(dtype=dtype, structure='adversarial')}")
+
 
 if __name__ == "__main__":
     main()
