@@ -85,8 +85,12 @@ where
         y.push(from_f64::<F>(label));
     }
 
-    // Per-feature quantile bin edges (n_bins-1 thresholds each).
-    let mut bin_edges: Vec<Vec<f64>> = vec![Vec::with_capacity(n_bins - 1); n_feat];
+    // Per-feature quantile bin edges (n_bins-1 thresholds each). Build each inner
+    // Vec independently so the `with_capacity` reservation survives — `vec![proto;
+    // n]` would CLONE the prototype, and `Vec::clone` copies only len (0), dropping
+    // the reservation for every element (IN-02).
+    let mut bin_edges: Vec<Vec<f64>> =
+        (0..n_feat).map(|_| Vec::with_capacity(n_bins - 1)).collect();
     for f in 0..n_feat {
         let mut col: Vec<f64> = (0..n_samples).map(|s| raw[s * n_feat + f]).collect();
         col.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in host RNG output"));
@@ -162,13 +166,16 @@ where
     let n_feat = 20usize;
     let max_depth = 8usize;
     let min_samples = 2usize;
+    // The headline / sweep bin count, named once so the `peak_cells` memory note
+    // below can't silently misreport if the headline bin count ever changes (IN-01).
+    const HEADLINE_BINS: usize = 128;
 
     println!("\n=== A3 per-tree COST benchmark [{tag}] (feat={n_feat}, depth={max_depth}) ===");
 
     // Headline: the representative ≈1000×20×depth-8 load at 128 AND 64 bins.
-    let (b128, y128, e128) = gen_dataset::<F>(1000, n_feat, 128, 0xA3C0_u64);
+    let (b128, y128, e128) = gen_dataset::<F>(1000, n_feat, HEADLINE_BINS, 0xA3C0_u64);
     let (t128, nodes_128) = timed_build::<F>(
-        "headline", &b128, &y128, &e128, 1000, n_feat, 128, max_depth, min_samples,
+        "headline", &b128, &y128, &e128, 1000, n_feat, HEADLINE_BINS, max_depth, min_samples,
     );
 
     let (b64, y64, e64) = gen_dataset::<F>(1000, n_feat, 64, 0xA3C0_u64);
@@ -190,9 +197,9 @@ where
         println!("  -- sample-scaling sweep @ 128 bins (cost SHAPE, not a ceiling) --");
         let mut points: Vec<(usize, f64)> = Vec::new();
         for &n in &[250usize, 500usize] {
-            let (bn, yn, en) = gen_dataset::<F>(n, n_feat, 128, 0xA3C0_u64);
+            let (bn, yn, en) = gen_dataset::<F>(n, n_feat, HEADLINE_BINS, 0xA3C0_u64);
             let (dt, _) = timed_build::<F>(
-                "sweep-n", &bn, &yn, &en, n, n_feat, 128, max_depth, min_samples,
+                "sweep-n", &bn, &yn, &en, n, n_feat, HEADLINE_BINS, max_depth, min_samples,
             );
             points.push((n, dt.as_secs_f64()));
         }
@@ -229,10 +236,10 @@ where
     // spike's `build_tree` launches the histogram sized by `nodes.len()` (the
     // CUMULATIVE node count so far), not the active frontier — so the deepest
     // level's scratch is `final_nodes × n_feat × n_bins × 2` (count + vsum).
-    let peak_cells = nodes_128 * n_feat * 128;
+    let peak_cells = nodes_128 * n_feat * HEADLINE_BINS;
     println!(
         "  frontier-memory note: peak histogram scratch ≈ {peak_cells} cells × 2 buffers \
-         (count+vsum) = {nodes_128} nodes × {n_feat} feat × 128 bins."
+         (count+vsum) = {nodes_128} nodes × {n_feat} feat × {HEADLINE_BINS} bins."
     );
     println!(
         "    build_tree sizes the histogram by CUMULATIVE node count (nodes.len()), NOT the \
