@@ -685,11 +685,11 @@ where
         value: case.expect_f64("value"),
         kind,
     };
-    match kind {
-        // Classifier: no gain-ties → strict per-node lockstep (exact split
-        // FEATURE + decision-equivalence + leaf values), the "structure EXACT"
-        // gate the plan asks for.
-        Kind::Clf => {
+    match (kind, adversarial) {
+        // Standard classifier: no gain-ties → strict per-node lockstep (exact
+        // split FEATURE + decision-equivalence + leaf values), the "structure
+        // EXACT" gate the plan asks for.
+        (Kind::Clf, false) => {
             let all_rows: Vec<usize> = (0..n).collect();
             compare_rec(0, 0, &all_rows, &nodes, &leaf_buf, &sk_tree, &x_fit, nf);
             println!(
@@ -700,14 +700,24 @@ where
                 nodes.len()
             );
         }
-        // Regressor: split-feature ties at 2-sample nodes are sklearn-RNG —
-        // gate the tree as a FUNCTION (partition + predictions), non-circular.
-        Kind::Reg => {
+        // Regressor (all) + ADVERSARIAL classifier: the split FEATURE at a
+        // gain-tie node is sklearn-RNG-determined. The adversarial clf root is,
+        // by construction, an EXACT gain tie between two identical columns, so
+        // which column sklearn records there is an RNG outcome of its internal
+        // feature shuffle. Asserting `colid == sklearn.feature` at that node
+        // would be the CIRCULAR oracle the module doc forbids (WR-01). Gate the
+        // tree as a FUNCTION instead (induced partition + per-row predictions),
+        // which is feature-index-independent. The kernel's OWN lowest-index
+        // tie-break is proven separately by `check_adversarial`
+        // (`nodes[0].colid == 0`), so dropping the sklearn-feature equality at
+        // the tie node loses no real coverage.
+        (Kind::Clf, true) | (Kind::Reg, _) => {
             assert_function_equiv(&nodes, &leaf_buf, &sk_tree, &x_fit, n, nf);
             println!(
                 "{label} [{}]: {} nodes / {my_leaves} leaves, n_bins={n_bins} — \
-                 counts EXACT, induced partition identical, regression-mean leaf \
-                 predictions <=1e-5 vs sklearn (split-feature ties RNG-gated) ✓",
+                 counts EXACT, induced partition identical, leaf predictions \
+                 <=1e-5 vs sklearn (split-feature ties RNG-gated, \
+                 function-equivalence) ✓",
                 dtype_tag::<F>(),
                 nodes.len()
             );
