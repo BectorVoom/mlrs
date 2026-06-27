@@ -87,7 +87,7 @@ mod tree_spike;
 
 use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::capability;
-use mlrs_core::{assert_slice_close, load_npz, OracleCase, F64_TOL};
+use mlrs_core::{assert_slice_close, load_npz, OracleCase, Tolerance, F32_TOL, F64_TOL};
 use std::path::PathBuf;
 use tree_spike::{
     build_tree, build_tree_with, from_f64, host_to_f64, launch_histogram, SparseTreeNode,
@@ -144,6 +144,19 @@ fn dtype_tag<F>() -> &'static str {
         4 => "f32",
         8 => "f64",
         _ => unreachable!("tree witness is f32/f64 only"),
+    }
+}
+
+/// Dtype-appropriate comparison tolerance (IN-04): the f32 build uses `F32_TOL`,
+/// the f64 build `F64_TOL`. They are identical today, but `F64_TOL`'s doc states
+/// it is kept separate so the f64 path can be tightened independently — selecting
+/// by dtype keeps that future tightening from silently imposing the stricter
+/// (wrong) bound on the f32 companion path.
+fn tol<F>() -> &'static Tolerance {
+    if std::mem::size_of::<F>() == 4 {
+        &F32_TOL
+    } else {
+        &F64_TOL
     }
 }
 
@@ -376,7 +389,7 @@ fn compare_rec<F>(
         // (NOT a scalar) and compare THAT to sklearn's leaf output (<=1e-5).
         let mine = leaf_buf[node.value as usize];
         let theirs = sk_tree.leaf_value(sk);
-        assert_slice_close(&[mine], &[theirs], &F64_TOL);
+        assert_slice_close(&[mine], &[theirs], tol::<F>());
         return;
     }
 
@@ -527,7 +540,7 @@ fn assert_function_equiv<F>(
         .map(|&i| leaf_buf[nodes[i].value as usize])
         .collect();
     let theirs: Vec<f64> = sk_leaf_of.iter().map(|&i| sk_tree.leaf_value(i)).collect();
-    assert_slice_close(&mine, &theirs, &F64_TOL);
+    assert_slice_close(&mine, &theirs, tol::<F>());
 }
 
 /// Validate the SparseTreeNode contract over every node (D-02/D-03/D-04).
@@ -756,7 +769,7 @@ where
         Kind::Clf => (0.0, 1.0), // left region x=0 => class 0; right x=1 => class 1
         Kind::Reg => (1.0, 5.0), // left region y==1.0; right region y==5.0
     };
-    assert_slice_close(&[lv, rv], &[want_l, want_r], &F64_TOL);
+    assert_slice_close(&[lv, rv], &[want_l, want_r], tol::<F>());
 
     println!(
         "adversarial [{}/{}]: gain-TIE → feature 0 (independent rule), forced-pure \
