@@ -504,6 +504,99 @@ pub fn build_tree<F>(
 where
     F: Float + CubeElement + bytemuck::Pod,
 {
+    let n_cand = n_feat * (n_bins - 1);
+    let cell = move |nid: usize, f: usize, b: usize| (nid * n_feat + f) * n_bins + b;
+
+    // Criterion-specific level math: binary-Gini gain per (node, feature,
+    // split-after-bin) plus a per-node purity flag. The shared frontier /
+    // adjacency / relabel skeleton lives once in `build_tree_with` (WR-02).
+    let gini_gain = move |_node_id: &[u32],
+                          counts: &[F],
+                          vsums: &[F],
+                          frontier: &[u32],
+                          n_nodes_total: usize|
+          -> (Vec<f64>, Vec<bool>) {
+        let mut gain_h = vec![0.0f64; n_nodes_total * n_cand];
+        let mut pure = vec![false; n_nodes_total];
+        for &nid_u in frontier {
+            let nid = nid_u as usize;
+            // Purity from feature 0 (count/positive-count are feature-invariant):
+            // a single-class node (pos == 0 or pos == tot) cannot be split.
+            let mut tot0 = 0.0f64;
+            let mut pos0 = 0.0f64;
+            for b in 0..n_bins {
+                tot0 += host_to_f64(counts[cell(nid, 0, b)]);
+                pos0 += host_to_f64(vsums[cell(nid, 0, b)]);
+            }
+            pure[nid] = pos0 == 0.0 || pos0 == tot0;
+            for f in 0..n_feat {
+                let mut tot = 0.0f64;
+                let mut pos = 0.0f64;
+                for b in 0..n_bins {
+                    tot += host_to_f64(counts[cell(nid, f, b)]);
+                    pos += host_to_f64(vsums[cell(nid, f, b)]);
+                }
+                let parent = gini(pos, tot);
+                let mut lc = 0.0f64;
+                let mut lp = 0.0f64;
+                for b in 0..(n_bins - 1) {
+                    lc += host_to_f64(counts[cell(nid, f, b)]);
+                    lp += host_to_f64(vsums[cell(nid, f, b)]);
+                    let rc = tot - lc;
+                    let rp = pos - lp;
+                    let g = if tot > 0.0 {
+                        parent - (lc / tot) * gini(lp, lc) - (rc / tot) * gini(rp, rc)
+                    } else {
+                        0.0
+                    };
+                    gain_h[nid * n_cand + (f * (n_bins - 1) + b)] = g;
+                }
+            }
+        }
+        (gain_h, pure)
+    };
+
+    // Classifier leaf value = positive-class probability pos/tot (D-09).
+    let leaf_prob = |sum_y: f64, tot: f64| if tot > 0.0 { sum_y / tot } else { 0.0 };
+
+    build_tree_with::<F, _, _>(
+        binned, y, bin_edges, n_samples, n_feat, n_bins, max_depth, min_samples, gini_gain,
+        leaf_prob,
+    )
+}
+
+/// Shared per-level frontier DRIVER (D-01) — the single copy of the
+/// histogram → split-find → relabel skeleton, parameterized by a criterion so
+/// the classifier and regressor builders no longer duplicate it (WR-02).
+///
+/// `level_gain(node_id, counts, vsums, frontier, n_nodes_total)` returns this
+/// level's per-`(node, feature, split-after-bin)` gain (row-major
+/// `n_nodes_total * n_cand`) AND a per-node purity flag (`true` ⇒ the node
+/// cannot be split and must become a leaf). It receives the histogram on `y`
+/// (count + value-sum) and may launch its own auxiliary histograms (the
+/// regressor launches a second one on `y^2` for sum-of-squares).
+/// `leaf_value(sum_y, total)` maps a leaf node's feature-0 totals to its stored
+/// value (classifier ⇒ `pos/tot` probability; regressor ⇒ `sum_y/tot` mean).
+/// Adjacency (D-02), leaf sentinel (D-03/D-04), `max_depth`/`min_samples`
+/// termination, and relabel all live here exactly once.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tree_with<F, G, L>(
+    binned: &[u32],
+    y: &[F],
+    bin_edges: &[Vec<f64>],
+    n_samples: usize,
+    n_feat: usize,
+    n_bins: usize,
+    max_depth: usize,
+    min_samples: usize,
+    mut level_gain: G,
+    leaf_value: L,
+) -> (Vec<SparseTreeNode<F>>, Vec<f64>)
+where
+    F: Float + CubeElement + bytemuck::Pod,
+    G: FnMut(&[u32], &[F], &[F], &[u32], usize) -> (Vec<f64>, Vec<bool>),
+    L: Fn(f64, f64) -> f64,
+{
     assert!(n_bins >= 2, "build_tree needs n_bins >= 2");
     assert_eq!(binned.len(), n_samples * n_feat, "binned shape");
     assert_eq!(y.len(), n_samples, "y shape");
@@ -537,11 +630,11 @@ where
     let make_leaf = |nodes: &mut Vec<SparseTreeNode<F>>,
                      leaf_buffer: &mut Vec<f64>,
                      nid: usize,
-                     pos: f64,
+                     sum_y: f64,
                      tot: f64| {
-        let prob = if tot > 0.0 { pos / tot } else { 0.0 };
+        let v = leaf_value(sum_y, tot);
         let off = leaf_buffer.len() as i32;
-        leaf_buffer.push(prob);
+        leaf_buffer.push(v);
         nodes[nid].colid = -1;
         nodes[nid].left_child = -1;
         nodes[nid].value = off;
@@ -555,34 +648,9 @@ where
         let (counts, vsums) =
             launch_histogram::<F>(&node_id, binned, y, n_samples, n_feat, n_nodes_total, n_bins);
 
-        // 2) host Gini gain per (node, feature, split-after-bin).
-        let mut gain_h = vec![0.0f64; n_nodes_total * n_cand];
-        for &nid_u in &frontier {
-            let nid = nid_u as usize;
-            for f in 0..n_feat {
-                let mut tot = 0.0f64;
-                let mut pos = 0.0f64;
-                for b in 0..n_bins {
-                    tot += host_to_f64(counts[cell(nid, f, b)]);
-                    pos += host_to_f64(vsums[cell(nid, f, b)]);
-                }
-                let parent = gini(pos, tot);
-                let mut lc = 0.0f64;
-                let mut lp = 0.0f64;
-                for b in 0..(n_bins - 1) {
-                    lc += host_to_f64(counts[cell(nid, f, b)]);
-                    lp += host_to_f64(vsums[cell(nid, f, b)]);
-                    let rc = tot - lc;
-                    let rp = pos - lp;
-                    let g = if tot > 0.0 {
-                        parent - (lc / tot) * gini(lp, lc) - (rc / tot) * gini(rp, rc)
-                    } else {
-                        0.0
-                    };
-                    gain_h[nid * n_cand + (f * (n_bins - 1) + b)] = g;
-                }
-            }
-        }
+        // 2) criterion-specific gain + per-node purity for this level.
+        let (gain_h, pure) =
+            level_gain(&node_id, &counts, &vsums, &frontier, n_nodes_total);
 
         // 3) device split-find argmax per node.
         let gain_f: Vec<F> = gain_h.iter().map(|&g| from_f64::<F>(g)).collect();
@@ -599,14 +667,13 @@ where
         for &nid_u in &frontier {
             let nid = nid_u as usize;
             let mut tot = 0.0f64;
-            let mut pos = 0.0f64;
+            let mut sum_y = 0.0f64;
             for b in 0..n_bins {
                 tot += host_to_f64(counts[cell(nid, 0, b)]);
-                pos += host_to_f64(vsums[cell(nid, 0, b)]);
+                sum_y += host_to_f64(vsums[cell(nid, 0, b)]);
             }
-            let pure = pos == 0.0 || pos == tot;
             let g = host_to_f64(best_gain[nid]);
-            let can_split = g > 0.0 && !pure && (tot as usize) >= min_samples;
+            let can_split = g > 0.0 && !pure[nid] && (tot as usize) >= min_samples;
             if can_split {
                 let f = best_col[nid] as usize;
                 let b = best_bin[nid] as usize;
@@ -625,7 +692,7 @@ where
                 next_frontier.push(lc as u32);
                 next_frontier.push((lc + 1) as u32);
             } else {
-                make_leaf(&mut nodes, &mut leaf_buffer, nid, pos, tot);
+                make_leaf(&mut nodes, &mut leaf_buffer, nid, sum_y, tot);
             }
         }
 
@@ -653,12 +720,12 @@ where
         for &nid_u in &frontier {
             let nid = nid_u as usize;
             let mut tot = 0.0f64;
-            let mut pos = 0.0f64;
+            let mut sum_y = 0.0f64;
             for b in 0..n_bins {
                 tot += host_to_f64(counts[cell(nid, 0, b)]);
-                pos += host_to_f64(vsums[cell(nid, 0, b)]);
+                sum_y += host_to_f64(vsums[cell(nid, 0, b)]);
             }
-            make_leaf(&mut nodes, &mut leaf_buffer, nid, pos, tot);
+            make_leaf(&mut nodes, &mut leaf_buffer, nid, sum_y, tot);
         }
     }
 

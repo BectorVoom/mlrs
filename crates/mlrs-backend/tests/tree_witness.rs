@@ -90,7 +90,7 @@ use mlrs_backend::capability;
 use mlrs_core::{assert_slice_close, load_npz, OracleCase, F64_TOL};
 use std::path::PathBuf;
 use tree_spike::{
-    build_tree, from_f64, host_to_f64, launch_histogram, launch_split_find, SparseTreeNode,
+    build_tree, build_tree_with, from_f64, host_to_f64, launch_histogram, SparseTreeNode,
 };
 
 // sklearn hyperparameters baked into the Plan-01 generator (gen_oracle.py:
@@ -208,13 +208,14 @@ fn make_bins(x_fit: &[f64], n: usize, nf: usize) -> (Vec<u32>, Vec<Vec<f64>>, us
     (binned, bin_edges, n_bins)
 }
 
-/// Local REGRESSION builder: composes the SAME three public kernel wrappers as
-/// `build_tree` but with a VARIANCE-reduction gain (squared_error). It launches
-/// the histogram twice — once on `y` (per-cell sum) and once on `y^2` (per-cell
-/// sum of squares) — so the host can form `var = E[y^2] - E[y]^2` per child.
-/// Leaf `value` is the mean `sum(y)/count` (the regression-mean leaf shape).
-/// Mirrors `build_tree`'s per-level frontier loop, adjacency (D-02), and leaf
-/// sentinel (D-03) exactly.
+/// Local REGRESSION builder: drives the SAME shared `build_tree_with` frontier
+/// skeleton as the classifier (histogram → split-find → relabel, adjacency D-02,
+/// leaf sentinel D-03/D-04), supplying a VARIANCE-reduction gain (squared_error)
+/// and a regression-MEAN leaf. The gain closure launches the histogram a second
+/// time on `y^2` (per-cell sum of squares) so it can form `var = E[y^2] - E[y]^2`
+/// per child. Factoring the skeleton into `build_tree_with` removes the ~100-line
+/// near-verbatim copy of `build_tree`'s loop (WR-02) while leaving the Plan-04
+/// `build_tree` signature intact.
 fn build_tree_variance<F>(
     binned: &[u32],
     y: &[F],
@@ -229,35 +230,8 @@ where
     F: Float + CubeElement + bytemuck::Pod,
 {
     assert!(n_bins >= 2, "variance build needs n_bins >= 2");
-    let ysq: Vec<F> = y
-        .iter()
-        .map(|&v| {
-            let h = host_to_f64(v);
-            from_f64::<F>(h * h)
-        })
-        .collect();
-
     let n_cand = n_feat * (n_bins - 1);
-    let mut col_of = vec![0u32; n_cand];
-    let mut bin_of = vec![0u32; n_cand];
-    for c in 0..n_cand {
-        col_of[c] = (c / (n_bins - 1)) as u32;
-        bin_of[c] = (c % (n_bins - 1)) as u32;
-    }
-
-    let leaf_placeholder = SparseTreeNode::<F> {
-        colid: -1,
-        threshold: from_f64::<F>(0.0),
-        left_child: -1,
-        value: -1,
-    };
-    let mut nodes: Vec<SparseTreeNode<F>> = vec![leaf_placeholder];
-    let mut leaf_buffer: Vec<f64> = Vec::new();
-    let mut node_id: Vec<u32> = vec![0u32; n_samples];
-    let mut frontier: Vec<u32> = vec![0u32];
-    let mut depth = 0usize;
-
-    let cell = |nid: usize, f: usize, b: usize| (nid * n_feat + f) * n_bins + b;
+    let cell = move |nid: usize, f: usize, b: usize| (nid * n_feat + f) * n_bins + b;
     let var = |sq: f64, sm: f64, c: f64| -> f64 {
         if c <= 0.0 {
             0.0
@@ -266,32 +240,39 @@ where
             (sq / c - m * m).max(0.0)
         }
     };
-    // Leaf value = mean of y over the node (regression-mean leaf shape, D-09).
-    let make_leaf = |nodes: &mut Vec<SparseTreeNode<F>>,
-                     leaf_buffer: &mut Vec<f64>,
-                     nid: usize,
-                     sumy: f64,
-                     tot: f64| {
-        let mean = if tot > 0.0 { sumy / tot } else { 0.0 };
-        let off = leaf_buffer.len() as i32;
-        leaf_buffer.push(mean);
-        nodes[nid].colid = -1;
-        nodes[nid].left_child = -1;
-        nodes[nid].value = off;
-        nodes[nid].threshold = from_f64::<F>(0.0);
-    };
 
-    while !frontier.is_empty() && depth < max_depth {
-        let n_nodes_total = nodes.len();
-        let (counts, vsums) =
-            launch_histogram::<F>(&node_id, binned, y, n_samples, n_feat, n_nodes_total, n_bins);
+    // Criterion-specific level math: variance-reduction gain + per-node purity
+    // (a node is pure when its target variance is ~0). Needs the per-cell sum of
+    // SQUARES, so this closure launches the histogram a SECOND time on y^2 (the
+    // count + value-sum on y are provided by the shared driver).
+    let variance_gain = move |node_id: &[u32],
+                              counts: &[F],
+                              vsums: &[F],
+                              frontier: &[u32],
+                              n_nodes_total: usize|
+          -> (Vec<f64>, Vec<bool>) {
+        let ysq: Vec<F> = y
+            .iter()
+            .map(|&v| {
+                let h = host_to_f64(v);
+                from_f64::<F>(h * h)
+            })
+            .collect();
         let (_c2, vsqs) =
-            launch_histogram::<F>(&node_id, binned, &ysq, n_samples, n_feat, n_nodes_total, n_bins);
+            launch_histogram::<F>(node_id, binned, &ysq, n_samples, n_feat, n_nodes_total, n_bins);
 
-        // Host variance-reduction gain per (node, feature, split-after-bin).
         let mut gain_h = vec![0.0f64; n_nodes_total * n_cand];
-        for &nid_u in &frontier {
+        let mut pure = vec![false; n_nodes_total];
+        for &nid_u in frontier {
             let nid = nid_u as usize;
+            // Purity from feature 0: a zero-variance node cannot reduce variance.
+            let (mut t0, mut s0, mut q0) = (0.0f64, 0.0f64, 0.0f64);
+            for b in 0..n_bins {
+                t0 += host_to_f64(counts[cell(nid, 0, b)]);
+                s0 += host_to_f64(vsums[cell(nid, 0, b)]);
+                q0 += host_to_f64(vsqs[cell(nid, 0, b)]);
+            }
+            pure[nid] = var(q0, s0, t0) <= 1e-12;
             for f in 0..n_feat {
                 let (mut tot, mut sm, mut sq) = (0.0f64, 0.0f64, 0.0f64);
                 for b in 0..n_bins {
@@ -317,81 +298,16 @@ where
                 }
             }
         }
+        (gain_h, pure)
+    };
 
-        let gain_f: Vec<F> = gain_h.iter().map(|&g| from_f64::<F>(g)).collect();
-        let (best_gain, best_col, best_bin) =
-            launch_split_find::<F>(&gain_f, &col_of, &bin_of, n_nodes_total, n_cand);
+    // Regression leaf value = mean of y over the node (regression-mean leaf, D-09).
+    let leaf_mean = |sum_y: f64, tot: f64| if tot > 0.0 { sum_y / tot } else { 0.0 };
 
-        let mut split_active = vec![0u32; n_nodes_total];
-        let mut split_col = vec![0u32; n_nodes_total];
-        let mut split_bin = vec![0u32; n_nodes_total];
-        let mut left_child = vec![0u32; n_nodes_total];
-        let mut next_frontier: Vec<u32> = Vec::new();
-
-        for &nid_u in &frontier {
-            let nid = nid_u as usize;
-            let (mut tot, mut sm, mut sq) = (0.0f64, 0.0f64, 0.0f64);
-            for b in 0..n_bins {
-                tot += host_to_f64(counts[cell(nid, 0, b)]);
-                sm += host_to_f64(vsums[cell(nid, 0, b)]);
-                sq += host_to_f64(vsqs[cell(nid, 0, b)]);
-            }
-            let pure = var(sq, sm, tot) <= 1e-12;
-            let g = host_to_f64(best_gain[nid]);
-            let can_split = g > 0.0 && !pure && (tot as usize) >= min_samples;
-            if can_split {
-                let f = best_col[nid] as usize;
-                let b = best_bin[nid] as usize;
-                let lc = nodes.len() as i32;
-                nodes[nid].colid = f as i32;
-                nodes[nid].threshold = from_f64::<F>(bin_edges[f][b]);
-                nodes[nid].left_child = lc;
-                nodes[nid].value = -1;
-                nodes.push(leaf_placeholder); // left = lc
-                nodes.push(leaf_placeholder); // right = lc + 1 (D-02)
-                split_active[nid] = 1;
-                split_col[nid] = f as u32;
-                split_bin[nid] = b as u32;
-                left_child[nid] = lc as u32;
-                next_frontier.push(lc as u32);
-                next_frontier.push((lc + 1) as u32);
-            } else {
-                make_leaf(&mut nodes, &mut leaf_buffer, nid, sm, tot);
-            }
-        }
-
-        node_id = tree_spike::launch_relabel(
-            &node_id,
-            binned,
-            &split_active,
-            &split_col,
-            &split_bin,
-            &left_child,
-            n_samples,
-            n_feat,
-        );
-
-        frontier = next_frontier;
-        depth += 1;
-    }
-
-    // Remaining frontier (hit max_depth) → leaves.
-    if !frontier.is_empty() {
-        let n_nodes_total = nodes.len();
-        let (counts, vsums) =
-            launch_histogram::<F>(&node_id, binned, y, n_samples, n_feat, n_nodes_total, n_bins);
-        for &nid_u in &frontier {
-            let nid = nid_u as usize;
-            let (mut tot, mut sm) = (0.0f64, 0.0f64);
-            for b in 0..n_bins {
-                tot += host_to_f64(counts[cell(nid, 0, b)]);
-                sm += host_to_f64(vsums[cell(nid, 0, b)]);
-            }
-            make_leaf(&mut nodes, &mut leaf_buffer, nid, sm, tot);
-        }
-    }
-
-    (nodes, leaf_buffer)
+    build_tree_with::<F, _, _>(
+        binned, y, bin_edges, n_samples, n_feat, n_bins, max_depth, min_samples, variance_gain,
+        leaf_mean,
+    )
 }
 
 /// Bundle of the sklearn `tree_` reference arrays for the lockstep walk.
