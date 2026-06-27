@@ -1,184 +1,97 @@
 ---
 phase: 17-randomforest-gpu-histogram-split-feasibility-spike-gating
-reviewed: 2026-06-27T00:00:00Z
+reviewed: 2026-06-27T05:25:54Z
 depth: standard
 files_reviewed: 5
 files_reviewed_list:
-  - crates/mlrs-backend/tests/tree_bench.rs
+  - scripts/gen_oracle.py
   - crates/mlrs-backend/tests/tree_spike/mod.rs
   - crates/mlrs-backend/tests/tree_spike_probes.rs
   - crates/mlrs-backend/tests/tree_witness.rs
-  - scripts/gen_oracle.py
+  - crates/mlrs-backend/tests/tree_bench.rs
 findings:
   critical: 0
-  warning: 2
-  info: 3
-  total: 5
+  warning: 4
+  info: 4
+  total: 8
 status: issues_found
 ---
 
 # Phase 17: Code Review Report
 
-**Reviewed:** 2026-06-27
+**Reviewed:** 2026-06-27T05:25:54Z
 **Depth:** standard
-**Files Reviewed:** 5
+**Files Reviewed:** 5 (gen_oracle.py reviewed for the Phase-17 decision-tree additions only; the pre-existing fixture generators are out of phase scope)
 **Status:** issues_found
 
 ## Summary
 
-Reviewed the Phase-17 RandomForest GPU-tree feasibility spike: three cpu-MLIR-safe
-CubeCL kernels + host launch wrappers (`tree_spike/mod.rs`), the host per-level
-`build_tree` loop, the value-asserting kernel probes (`tree_spike_probes.rs`), the
-Tier-1 sklearn witness (`tree_witness.rs`), the wall-clock A3 cost benchmark
-(`tree_bench.rs`), and the sklearn fixture generator (`gen_oracle.py` Phase-17
-section).
+The phase delivers a self-contained RandomForest histogram/split feasibility spike: three cpu-MLIR-safe CubeCL kernels (`tree_gather_histogram`, `tree_split_find`, `tree_relabel_partition`), their host launch wrappers, a host per-level `build_tree` loop, value-asserting probes, a Tier-1 sklearn correctness witness, a wall-clock cost benchmark, and the matching numpy/sklearn oracle generators.
 
-Overall the math is sound. I traced the histogram → gain → split-find → relabel
-composition end-to-end and confirmed: every output cell is written (no
-uninitialized `client.empty` reads), empty-child splits resolve to exactly `0.0`
-gain via the algebra (`lc == tot` ⇒ `g = parent - parent - 0`), bin-rank routing
-(`bv > split_bin`) is equivalent to midpoint-threshold routing, the lowest-index
-tie-break is correctly seeded from candidate 0, and `u32` geometry is overflow-
-checked before every `unsafe` launch. No correctness BLOCKER found; the suite's
-24/24 green status is consistent with the logic as written.
+I traced the kernel math, the host build loop, the Gini/variance gain formulas, the tie-break logic, the launch-geometry guards, and the witness comparison logic end-to-end. **The core correctness path is sound** — the single-owner GATHER histogram writes every output cell exactly once (no uninitialized read-back), the seed-from-candidate-0 argmax implements the documented lowest-(feature,bin) tie-break correctly given the ascending candidate order, the relabel `bv > thr → right` is consistent with the host's `bins 0..=b → left` accumulation, every pushed node is finalized as either internal or leaf (no surviving placeholder), and empty-child splits collapse to zero gain so they are never chosen. The probes and witness use exact-value assertions (not bare non-panics) and correctly guard the documented 002-A all-zeros and 002-B silent-miscompile failure modes. No BLOCKER-class bug, security vulnerability, or data-loss path was found.
 
-The findings below concern a non-circularity gap in the **adversarial classifier**
-gate (it strict-locksteps the split FEATURE on a node that is, by construction, an
-RNG-resolved tie), a sizable duplicated build loop, and two precision/robustness
-notes appropriate to spike code.
+The findings below are maintainability and robustness concerns: a large duplicated build loop that creates a divergence hazard, an f32-quantized threshold used for exact partition routing in the witness, an undocumented hyperparameter inconsistency in the adversarial oracle generators, and a redundant histogram relaunch in the build tail.
 
 ## Warnings
 
-### WR-01: Adversarial classifier witness strict-locksteps the split feature on a deliberate gain TIE — couples the gate to sklearn's RNG tie-break
+### WR-01: `build_tree` and `build_tree_variance` are ~80% duplicated — divergence hazard
 
-**File:** `crates/mlrs-backend/tests/tree_witness.rs:688-694` (Clf branch → `compare_rec`), `crates/mlrs-backend/tests/tree_witness.rs:443-448` (`assert_eq!(node.colid, sk_feat)`); `scripts/gen_oracle.py:3078-3100` (adversarial clf generator)
-
-**Issue:** The module doc (lines 39-53) carefully argues that split-feature ties
-are sklearn-`random_state`-determined and therefore must be gated as a FUNCTION
-(partition + predictions), never by the recorded feature — and applies that
-non-circular treatment to the regressor (`assert_function_equiv`). But
-`run_witness` dispatches purely on `Kind`, so the **adversarial classifier**
-(`check_adversarial::<F>(Kind::Clf)`) still flows through the strict
-`compare_rec` path, which asserts `node.colid == sk_tree.feature[sk]` at every
-internal node — including the root, which is by construction an EXACT gain tie
-between two identical columns. sklearn's `BestSplitter` Fisher-Yates-shuffles the
-feature order (even with `max_features=None`) and keeps the first-evaluated
-feature on a strict-`>` tie, so which column it records at that tie root is an
-RNG outcome. The mlrs kernel deterministically picks feature 0; the witness then
-demands sklearn also recorded feature 0. This is exactly the circular oracle the
-design forbids for the regressor.
-
-It currently passes only because `random_state=42` happened to make sklearn
-record feature 0. The generator (`gen_decision_tree_clf` adversarial) verifies
-only that the tie is *genuine* (`abs(imp0 - imp1) < 1e-12`, trivially true for
-identical columns) — it never pins or asserts that sklearn recorded the lowest
-index. A sklearn version bump that alters the shuffle RNG could regenerate the
-committed blob with `feature == 1` at the tie root, which would make `compare_rec`
-fail (`split feature mismatch`) even though the tree is functionally identical.
-
-**Fix:** Gate the adversarial classifier the same non-circular way the regressor
-is gated. Either route `(Kind::Clf, adversarial=true)` through
-`assert_function_equiv` (partition + leaf-value equivalence, feature-index-
-independent), or, in the generator, independently assert sklearn recorded the
-canonical lowest-index feature and skip the strict per-node feature equality at
-known-tie nodes:
-
+**File:** `crates/mlrs-backend/tests/tree_spike/mod.rs:494-666` and `crates/mlrs-backend/tests/tree_witness.rs:204-381`
+**Issue:** The regression witness reimplements the entire per-level frontier loop (frontier init, candidate `col_of`/`bin_of` construction, leaf-placeholder seeding, per-node split/leaf decision, `next_frontier` adjacency push, the relabel call, and the post-loop "remaining frontier → leaves" cleanup) as a near-verbatim copy of `build_tree`, differing only in the gain formula (variance vs Gini) and a second histogram launch on `y^2`. This is intentional per the `build_tree_variance` doc comment (to avoid changing the shared signature Plan 04 depends on), but it is a real maintainability defect: any future correctness fix to the shared loop — adding `min_samples_leaf`, changing pure-node detection, or fixing the cumulative-vs-frontier histogram sizing flagged in `tree_bench.rs:228-241` — must be applied in two places or the classifier and regressor paths will silently diverge. The copies already differ in their pure-node test (`pos == 0.0 || pos == tot` vs `var(...) <= 1e-12`) and empty-child guard (`if tot > 0.0` vs `if lc > 0.0 && rc > 0.0`), so drift has already started.
+**Fix:** Extract the per-level orchestration into one generic function parameterized by a gain closure and a leaf-value closure:
 ```rust
-// in run_witness, branch on adversarial as well as kind:
-match (kind, adversarial) {
-    (Kind::Clf, false) => { /* strict per-node lockstep (no ties) */ }
-    // adversarial clf root is a deliberate tie -> gate the FUNCTION, not colid
-    (Kind::Clf, true) | (Kind::Reg, _) => {
-        assert_function_equiv(&nodes, &leaf_buf, &sk_tree, &x_fit, n, nf);
-    }
-}
+fn build_tree_generic<F, G, L>(/* shared args */, gain_fn: G, leaf_fn: L) -> (Vec<SparseTreeNode<F>>, Vec<f64>)
+// build_tree          = build_tree_generic(.., gini_gain,     prob_leaf)
+// build_tree_variance = build_tree_generic(.., variance_gain, mean_leaf)
 ```
+so the histogram → split-find → relabel composition exists once.
 
-(The explicit `nodes[0].colid == 0` check in `check_adversarial` already proves
-the kernel's own lowest-index tie-break independently, so dropping the
-sklearn-feature equality at the tie node loses no real coverage.)
+### WR-02: Witness routes the decision-equivalence partition by an f32-quantized sklearn threshold
 
-### WR-02: `build_tree_variance` duplicates ~90% of `build_tree` — divergence hazard across the two frontier loops
+**File:** `crates/mlrs-backend/tests/tree_witness.rs:455-478` (and `sk_leaf` at 524-535)
+**Issue:** For the f32 fixtures, `threshold` is stored in the `.npz` as f32 (`gen_decision_tree_clf`/`reg` cast every array through `c()` to the fixture dtype). The witness loads it via `case.expect_f64("threshold")` (an f32→f64 upcast that preserves the f32 quantization) and uses it for an EXACT partition comparison: `if v <= sk_thr { sk_l.push(r) }`, then `assert_eq!(my_l, sk_l)`. sklearn computes a threshold as the f64 midpoint of two adjacent feature values; quantizing that midpoint to f32 can round it onto one of the bracketing values, so a feature value `v` at such a collapsed boundary can flip `v <= sk_thr` relative to `v <= my_thr` (the f64 bin midpoint mlrs uses). That produces a spurious `decision-equivalence` failure that is an artifact of fixture quantization, not a kernel bug. The current fixtures happen to avoid adjacent-f32 boundaries so the test passes, but the gate is not robust by construction.
+**Fix:** Store `threshold` (and ideally `X`) at full f64 in every fixture regardless of compute dtype — the decision-equivalence routing is a host-side f64 comparison and gains nothing from f32 truncation. Alternatively route `sk_l`/`sk_r` through the same binned representation mlrs uses so both sides share one quantization.
 
-**File:** `crates/mlrs-backend/tests/tree_witness.rs:204-381` vs `crates/mlrs-backend/tests/tree_spike/mod.rs:494-666`
+### WR-03: Adversarial oracle generators omit `max_depth`, diverging from the standard branch
 
-**Issue:** `build_tree_variance` is a near-verbatim copy of `build_tree`: the
-candidate `(col_of, bin_of)` map construction, the `leaf_placeholder`, the
-per-level frontier `while` loop, the D-02 adjacency push, the `split_active/
-split_col/split_bin/left_child` frontier-array assembly, the relabel call, and
-the final max-depth leaf sweep are all duplicated, with only the host gain
-formula (Gini vs variance) and the leaf value (probability vs mean) differing.
-That is roughly 100 lines of structural logic kept in two places. The
-duplication is deliberate and documented (the doc explains the team did not want
-to mutate the shared `build_tree` signature that Plan 04 depends on), but it is a
-real maintenance hazard: a fix to the adjacency, leaf, or termination logic in
-one copy will silently not propagate to the other, and the two are already
-subtly different (the variance copy guards `lc > 0.0 && rc > 0.0` at line 297
-while the Gini copy at `mod.rs:577` relies on `tot > 0.0` + algebra to zero out
-empty-child gain).
+**File:** `scripts/gen_oracle.py:3095` and `scripts/gen_oracle.py:3169-3171`
+**Issue:** The `structure == "adversarial"` branches build `DecisionTreeClassifier(criterion="gini", random_state=seed)` and `DecisionTreeRegressor(criterion="squared_error", random_state=seed)` WITHOUT `max_depth=DT_MAX_DEPTH`, whereas the standard branch passes `max_depth=DT_MAX_DEPTH` (=4). The mlrs witness builds BOTH standard and adversarial trees with the same `MAX_DEPTH = 4` (`tree_witness.rs:84`, used for every `run_witness` call including `adversarial=true`). This works only because the adversarial design (two identical columns, perfectly separable target) yields a depth-1 tree that never reaches either cap — but the asymmetry is undocumented and silently couples the test's `assert_eq!(nodes.len(), sk_nodes)` gate to that data property. A deeper adversarial fixture would diverge (unbounded sklearn depth vs mlrs cap 4) for a reason unrelated to the kernels.
+**Fix:** Pass `max_depth=DT_MAX_DEPTH` in the adversarial branch too (matching the standard branch and the witness builder), or add an explicit comment asserting the adversarial tree is depth-1 by construction and therefore depth-cap-independent.
 
-**Fix:** Factor the shared skeleton into a single generic driver parameterized by
-a gain closure and a leaf-value closure, e.g.
-`build_tree_with(binned, y, edges, …, gain_fn, leaf_fn)`, and have both the Gini
-and variance builders call it. This keeps the Plan-04 `build_tree` signature
-intact (wrap it) while removing the second copy of the frontier loop.
+### WR-04: `build_tree` relaunches a full cumulative-sized histogram for the max-depth leaf cleanup
+
+**File:** `crates/mlrs-backend/tests/tree_spike/mod.rs:648-663` (mirrored at `tree_witness.rs:365-378`)
+**Issue:** When the loop exits on `depth == max_depth` with a non-empty frontier, the cleanup launches `launch_histogram` again sized by `nodes.len()` (cumulative node count) only to recompute `tot`/`pos` for the few remaining frontier nodes from feature 0. The final in-loop level already computed those values and discarded them. Beyond the wasted launch, this reuses the cumulative-sizing pattern the bench (`tree_bench.rs:228-241`) identifies as the dominant scratch cost, so the cleanup amplifies the worst-case allocation at exactly the deepest level. Correctness is unaffected (the recomputed `tot`/`pos` are identical), but it is an avoidable redundant device launch in the build's hot tail.
+**Fix:** Carry the final level's `counts`/`vsums` (or just per-frontier `tot`/`pos`) out of the loop and reuse them in the cleanup, or convert max-depth nodes to leaves inside the last loop iteration.
 
 ## Info
 
-### IN-01: f32 witness rebuilds on f32-rounded data while routing against f32-rounded sklearn thresholds — latent structural fragility
+### IN-01: `peak_cells` memory note hardcodes `128` instead of the active bin count
 
-**File:** `crates/mlrs-backend/tests/tree_witness.rs:139-195` (`reconstruct` + `make_bins`); `scripts/gen_oracle.py:3110,3119-3137`
+**File:** `crates/mlrs-backend/tests/tree_bench.rs:232-235`
+**Issue:** `let peak_cells = nodes_128 * n_feat * 128;` hardcodes the literal `128` in the printed frontier-memory diagnostic rather than a named constant. Correct today (the headline uses 128 bins) but brittle — if the headline bin count changes, the memory note silently misreports.
+**Fix:** Bind `const HEADLINE_BINS: usize = 128;` and use it for both the `gen_dataset`/`timed_build` calls and the `peak_cells` computation.
 
-**Issue:** The generator fits sklearn on `x_fit` in float64 (`rng.standard_normal`
-default dtype) but commits `X`, `threshold`, and `value` cast to the fixture dtype
-(f32 for the f32 fixtures). The f32 witness then reconstructs `x_fit` from the
-f32-rounded `X`, re-derives unique values / bin edges, rebuilds the tree, and
-decision-routes against the f32-rounded `sk_thr`. If f32 rounding ever (a)
-collapsed two previously distinct feature values into one unique (changing the
-bin layout) or (b) flipped a sample that sits within ~1e-7 of a threshold, the
-node-count assertion or `compare_rec` decision-equivalence would fail. It passes
-on this well-separated random-normal data, and f64 is the real correctness gate,
-so this is a robustness note rather than a defect.
+### IN-02: `bin_edges` preallocation capacity is discarded by the `vec![..; n_feat]` clone
 
-**Fix:** Document explicitly that the f32 path is a companion smoke check (not a
-bit-exact sklearn match) and/or generate f32 fixtures by fitting sklearn on the
-f32-cast data so the reference structure is derived from the same rounded inputs
-the witness sees.
+**File:** `crates/mlrs-backend/tests/tree_bench.rs:89`
+**Issue:** `vec![Vec::with_capacity(n_bins - 1); n_feat]` clones the prototype `Vec` `n_feat` times; `Vec::clone` allocates only `len` (0) capacity, so the intended reservation is lost for every element and the later `push` loop reallocates from zero. Harmless (bench-only) but the optimization does not do what it reads as.
+**Fix:** `let mut bin_edges: Vec<Vec<f64>> = (0..n_feat).map(|_| Vec::with_capacity(n_bins - 1)).collect();`
 
-### IN-02: `var` uses the cancellation-prone `E[y²] − E[y]²` formula masked by `.max(0.0)`
+### IN-03: `launch_dims_2d` ceiling-div can overflow `u32` for `nx` near `u32::MAX`
 
-**File:** `crates/mlrs-backend/tests/tree_witness.rs:247-254`
+**File:** `crates/mlrs-backend/tests/tree_spike/mod.rs:250-259`
+**Issue:** `((nx as u32) + bx - 1) / bx` adds `bx - 1 (=15)` before dividing. `checked_mul` guarantees the cell PRODUCT `≤ u32::MAX`, but `nx` itself (= `n_nodes*n_feat`) is only bounded by `u32::MAX`, so `nx as u32 + 15` wraps if `nx > u32::MAX - 15`. Purely theoretical at this spike's scale, but the ceiling-div is not overflow-safe the way the host `checked_mul` guard implies.
+**Fix:** Compute the ceiling in `usize` — `nx.div_ceil(bx as usize) as u32` — to avoid the u32 intermediate.
 
-**Issue:** `var(sq, sm, c) = (sq/c - m*m).max(0.0)` is the one-pass "computational"
-variance, which is subject to catastrophic cancellation, and the `.max(0.0)`
-clamp would silently hide a genuinely-negative result produced by a real bug in
-the sum-of-squares histogram (the very 002-B miscompile this spike is trying to
-catch). On the tiny spike fixtures this is numerically harmless, but the clamp
-weakens the kernel's own error-detection.
+### IN-04: f32 oracle comparisons use `F64_TOL` rather than `F32_TOL`
 
-**Fix:** Either compute variance two-pass on the host (`E[(y−mean)²]`) for the
-oracle path, or assert `sq/c - m*m >= -tol` before clamping so a negative result
-surfaces as a failure instead of being silently floored to 0.
-
-### IN-03: Tie-genuineness assert in the generator is a tautology for identical columns
-
-**File:** `scripts/gen_oracle.py:3090-3094` and `3164-3168`
-
-**Issue:** `imp0 = _dt_gini_best_impurity(x_fit[:, 0], …)` / `imp1 = …(x_fit[:, 1], …)`
-followed by `assert abs(imp0 - imp1) < 1e-12` operates on two columns that were
-constructed identically (`x = np.column_stack([base, base])`), so the assert can
-never fail — it does not actually prove anything about sklearn's tie behavior or
-the canonical pick. The comment claims it proves "the adversarial gain tie is
-genuine," but a tie between byte-identical columns is genuine by construction.
-
-**Fix:** If the intent is to guard the adversarial design, assert the stronger,
-non-trivial property the witness actually depends on — e.g. that sklearn's
-recorded root `feature == 0` (the canonical lowest-index pick) — so the committed
-blob is verified against the documented tie-break rule rather than against an
-identity that is always true. (See WR-01.)
+**File:** `crates/mlrs-backend/tests/tree_witness.rs:434, 585, 804`
+**Issue:** The witness compares both f32 and f64 builds against `&F64_TOL`. The two constants are identical today (`abs = rel = 1e-5`, `tolerance.rs:26-38`), so this is benign, but `F64_TOL`'s own doc comment states it is "kept as a separate constant so an f64 path can be tightened independently later." Tightening `F64_TOL` would silently impose the stricter (wrong) bound on the f32 path.
+**Fix:** Select the tolerance by dtype (`if size_of::<F>() == 4 { &F32_TOL } else { &F64_TOL }`), matching the dtype tagging the file already does.
 
 ---
 
-_Reviewed: 2026-06-27_
+_Reviewed: 2026-06-27T05:25:54Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: standard_
