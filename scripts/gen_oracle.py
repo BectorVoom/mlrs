@@ -3085,18 +3085,28 @@ def gen_decision_tree_clf(
         boot = np.arange(len(y), dtype=np.int64)
         feat = np.arange(x.shape[1], dtype=np.int64)
         x_fit = x[boot][:, feat]
-        # Independent tie proof: both tied columns achieve the SAME best child
-        # impurity (here 0.0 — pure split). Never read sklearn's pick to do this.
+        # Data-construction sanity check (NOT a tie-break proof): the two
+        # byte-identical columns trivially achieve the same best child impurity.
+        # On identical columns this can never fail, so it proves nothing about
+        # sklearn's pick (IN-03) — it only confirms the fixture was built tied.
         imp0 = _dt_gini_best_impurity(x_fit[:, 0], y[boot])
         imp1 = _dt_gini_best_impurity(x_fit[:, 1], y[boot])
         assert abs(imp0 - imp1) < 1e-12, (
-            f"adversarial clf tie not genuine: {imp0} vs {imp1}"
+            f"adversarial clf data malformed (columns not tied): {imp0} vs {imp1}"
         )
         clf = DecisionTreeClassifier(criterion="gini", random_state=seed)
         clf.fit(x_fit, y[boot])
-        # Canonical tie-break (documented, independent): lowest feature index then
-        # lowest threshold. The tied columns are identical so the partition/leaves
-        # are invariant regardless of which index sklearn recorded.
+        # Load-bearing guard (IN-03 / WR-01): pin sklearn's CANONICAL lowest-index
+        # pick at the gain-tie root. The witness gates the adversarial clf as a
+        # FUNCTION (feature-index-independent), so THIS generator-side assert is
+        # what verifies the committed blob against the documented tie-break rule
+        # (lowest feature index). A sklearn shuffle/RNG change that recorded
+        # feature 1 here fails LOUDLY at regeneration instead of silently shipping
+        # a blob whose recorded root feature no longer matches the documented rule.
+        assert int(clf.tree_.feature[0]) == 0, (
+            "adversarial clf: sklearn recorded root split feature "
+            f"{int(clf.tree_.feature[0])}, expected canonical lowest index 0"
+        )
         suffix = "clf_adv"
     else:
         rng = np.random.default_rng(seed)
@@ -3161,15 +3171,24 @@ def gen_decision_tree_reg(
         boot = np.arange(len(y), dtype=np.int64)
         feat = np.arange(x.shape[1], dtype=np.int64)
         x_fit = x[boot][:, feat]
+        # Data-construction sanity check (NOT a tie-break proof, IN-03): identical
+        # columns trivially achieve the same best child variance — always true.
         v0 = _dt_var_best_impurity(x_fit[:, 0], y[boot])
         v1 = _dt_var_best_impurity(x_fit[:, 1], y[boot])
         assert abs(v0 - v1) < 1e-12, (
-            f"adversarial reg tie not genuine: {v0} vs {v1}"
+            f"adversarial reg data malformed (columns not tied): {v0} vs {v1}"
         )
         reg = DecisionTreeRegressor(
             criterion="squared_error", random_state=seed
         )
         reg.fit(x_fit, y[boot])
+        # Load-bearing guard (IN-03 / WR-01): pin sklearn's canonical lowest-index
+        # pick at the variance-tie root so the committed blob is verified against
+        # the documented rule, not an always-true identity.
+        assert int(reg.tree_.feature[0]) == 0, (
+            "adversarial reg: sklearn recorded root split feature "
+            f"{int(reg.tree_.feature[0])}, expected canonical lowest index 0"
+        )
         suffix = "reg_adv"
     else:
         rng = np.random.default_rng(seed)
