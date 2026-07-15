@@ -24,11 +24,11 @@ use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::sgd::{
-    dloss, optimal_t0, schedule_eta, sgd_solve, SgdLoss, SgdParams, SgdSchedule,
+    dloss, loss_id, optimal_t0, schedule_eta, sgd_solve, SgdLoss, SgdParams, SgdSchedule,
 };
 use mlrs_backend::runtime::{self, ActiveRuntime};
 
-use mlrs_kernels::sgd::{sgd_margin, sgd_weight_update};
+use mlrs_kernels::sgd::{sgd_grad, sgd_l1_shrink, sgd_margin, sgd_weight_update};
 
 // ===========================================================================
 // Host references (the byte-exact f64 truth the device kernels must match).
@@ -103,6 +103,8 @@ fn launch_margin<F: Float + CubeElement + bytemuck::Pod>(
     let w_f: Vec<F> = w.iter().map(|&v| to_f::<F>(v)).collect();
     let x_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &x_f);
     let w_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &w_f);
+    // The intercept is device-resident (length-1 array) in the reworked kernel.
+    let bias_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &[to_f::<F>(bias)]);
     let p_handle = pool.acquire(b * std::mem::size_of::<F>());
 
     let client = pool.client().clone();
@@ -116,6 +118,7 @@ fn launch_margin<F: Float + CubeElement + bytemuck::Pod>(
     };
     let x_arg = unsafe { ArrayArg::from_raw_parts(x_dev.handle().clone(), b * d) };
     let w_arg = unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) };
+    let bias_arg = unsafe { ArrayArg::from_raw_parts(bias_dev.handle().clone(), 1) };
     let p_arg = unsafe { ArrayArg::from_raw_parts(p_handle.clone(), b) };
     sgd_margin::launch::<F, ActiveRuntime>(
         &client,
@@ -123,8 +126,9 @@ fn launch_margin<F: Float + CubeElement + bytemuck::Pod>(
         dim,
         x_arg,
         w_arg,
-        to_f::<F>(bias),
+        bias_arg,
         p_arg,
+        0u32, // row_offset = 0: the uploaded x IS the batch.
         b as u32,
         d as u32,
     );
@@ -133,6 +137,7 @@ fn launch_margin<F: Float + CubeElement + bytemuck::Pod>(
     let host: Vec<f64> = p_dev.to_host(pool).iter().map(|&v| from_f::<F>(v)).collect();
     x_dev.release_into(pool);
     w_dev.release_into(pool);
+    bias_dev.release_into(pool);
     pool.release(p_handle, b * std::mem::size_of::<F>());
     host
 }
@@ -176,6 +181,8 @@ fn launch_weight_update<F: Float + CubeElement + bytemuck::Pod>(
         w_arg,
         to_f::<F>(eta),
         to_f::<F>(inv_b),
+        to_f::<F>(1.0), // l2_factor = 1.0: the pure gradient step (host ref has no shrink).
+        0u32,           // row_offset = 0: the uploaded x IS the batch.
         d as u32,
         b as u32,
     );
@@ -453,4 +460,290 @@ fn sgd_convex_objective() {
         return;
     }
     run_convex_objective::<f64>("f64", 1e-5);
+}
+
+// ===========================================================================
+// Device dloss (sgd_grad) — kernel-vs-host gate for every loss family.
+// ===========================================================================
+
+/// Launch `sgd_grad` over a `(p, y)` batch for one loss family and read `g[]`.
+fn launch_grad<F: Float + CubeElement + bytemuck::Pod>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    p: &[f64],
+    y: &[f64],
+    loss: SgdLoss,
+    epsilon: f64,
+) -> Vec<f64> {
+    let b = p.len();
+    let p_f: Vec<F> = p.iter().map(|&v| to_f::<F>(v)).collect();
+    let y_f: Vec<F> = y.iter().map(|&v| to_f::<F>(v)).collect();
+    let p_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &p_f);
+    let y_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &y_f);
+    let g_handle = pool.acquire(b * std::mem::size_of::<F>());
+
+    let client = pool.client().clone();
+    let block = 256u32;
+    let count = CubeCount::Static(((b as u32) + block - 1) / block, 1, 1);
+    let dim = CubeDim {
+        x: block,
+        y: 1,
+        z: 1,
+    };
+    sgd_grad::launch::<F, ActiveRuntime>(
+        &client,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(p_dev.handle().clone(), b) },
+        unsafe { ArrayArg::from_raw_parts(y_dev.handle().clone(), b) },
+        unsafe { ArrayArg::from_raw_parts(g_handle.clone(), b) },
+        0u32,
+        b as u32,
+        loss_id(loss),
+        to_f::<F>(epsilon),
+    );
+
+    let g_dev = DeviceArray::<ActiveRuntime, F>::from_raw(g_handle.clone(), b);
+    let host: Vec<f64> = g_dev.to_host(pool).iter().map(|&v| from_f::<F>(v)).collect();
+    p_dev.release_into(pool);
+    y_dev.release_into(pool);
+    pool.release(g_handle, b * std::mem::size_of::<F>());
+    host
+}
+
+fn run_grad_match<F: Float + CubeElement + bytemuck::Pod>(label: &str) {
+    // A grid that exercises every branch of every loss: inside/outside the
+    // hinge margin, both epsilon-tube sides, a boundary point (p·y == 1, the
+    // duplicate-style degenerate case R-9 warns about), and both label signs.
+    let p = [0.5f64, 2.0, -1.5, 1.0, 1.05, 0.0, -0.3, 3.0];
+    let y = [1.0f64, 1.0, -1.0, 1.0, 1.0, -1.0, 0.4, 1.2];
+    let eps = 0.1f64;
+
+    let losses = [
+        SgdLoss::Hinge,
+        SgdLoss::Log,
+        SgdLoss::SquaredHinge,
+        SgdLoss::SquaredError,
+        SgdLoss::EpsilonInsensitive,
+        SgdLoss::SquaredEpsilonInsensitive,
+    ];
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let tol = if std::mem::size_of::<F>() == 8 {
+        1e-12
+    } else {
+        1e-5
+    };
+    for loss in losses {
+        let dev = launch_grad::<F>(&mut pool, &p, &y, loss, eps);
+        for i in 0..p.len() {
+            let host = dloss(loss, p[i], y[i], eps).clamp(-1e12, 1e12);
+            assert!(
+                (dev[i] - host).abs() <= tol,
+                "[{label}] sgd_grad {loss:?} g[{i}]={} != host dloss {} (p={}, y={}, tol {tol})",
+                dev[i],
+                host,
+                p[i],
+                y[i]
+            );
+        }
+    }
+}
+
+/// The device `sgd_grad` dloss table matches the host [`dloss`] reference for
+/// EVERY loss family and branch (VALUES asserted, not just non-panic — the
+/// silent-miscompile discipline). f64 strict; f32 a round-off band.
+#[test]
+fn sgd_grad_matches_host_dloss() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    run_grad_match::<f32>("f32");
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    run_grad_match::<f64>("f64");
+}
+
+// ===========================================================================
+// Device cumulative-L1 (sgd_l1_shrink) — kernel-vs-host gate.
+// ===========================================================================
+
+/// Host reference: the EXACT per-sample cumulative-L1 loop the previous host
+/// implementation ran (samples outer, coordinates inner).
+#[allow(clippy::too_many_arguments)]
+fn host_l1_shrink(
+    w: &mut [f64],
+    q: &mut [f64],
+    u_start: f64,
+    du: f64,
+    b: usize,
+) -> f64 {
+    let mut u = u_start;
+    for _ in 0..b {
+        u += du;
+        for j in 0..w.len() {
+            let z = w[j];
+            if w[j] > 0.0 {
+                w[j] = (w[j] - (u + q[j])).max(0.0);
+            } else if w[j] < 0.0 {
+                w[j] = (w[j] + (u - q[j])).min(0.0);
+            }
+            q[j] += w[j] - z;
+        }
+    }
+    u
+}
+
+fn run_l1_shrink_match<F: Float + CubeElement + bytemuck::Pod>(label: &str) {
+    // Mixed-sign weights incl. an exact zero (which the shrink must not move)
+    // and small magnitudes that clip to zero under the budget.
+    let w0 = [0.9f64, -0.6, 0.0, 0.004, -0.003, 1.4];
+    let q0 = [0.01f64, -0.02, 0.0, 0.001, -0.001, 0.05];
+    let (u_start, du, b) = (0.02f64, 0.005f64, 3usize);
+    let d = w0.len();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let w_f: Vec<F> = w0.iter().map(|&v| to_f::<F>(v)).collect();
+    let q_f: Vec<F> = q0.iter().map(|&v| to_f::<F>(v)).collect();
+    let w_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, &w_f);
+    let q_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, &q_f);
+
+    let cl = pool.client().clone();
+    // One cube per coordinate, single unit (002-A selecting-unit shape).
+    let count = CubeCount::Static(d as u32, 1, 1);
+    let dim = CubeDim { x: 1, y: 1, z: 1 };
+    sgd_l1_shrink::launch::<F, ActiveRuntime>(
+        &cl,
+        count,
+        dim,
+        unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) },
+        unsafe { ArrayArg::from_raw_parts(q_dev.handle().clone(), d) },
+        to_f::<F>(u_start),
+        to_f::<F>(du),
+        d as u32,
+        b as u32,
+    );
+
+    let mut w_ref = w0;
+    let mut q_ref = q0;
+    host_l1_shrink(&mut w_ref, &mut q_ref, u_start, du, b);
+
+    let w_got: Vec<f64> = w_dev.to_host(&pool).iter().map(|&v| from_f::<F>(v)).collect();
+    let q_got: Vec<f64> = q_dev.to_host(&pool).iter().map(|&v| from_f::<F>(v)).collect();
+
+    let tol = if std::mem::size_of::<F>() == 8 {
+        1e-12
+    } else {
+        1e-6
+    };
+    for j in 0..d {
+        assert!(
+            (w_got[j] - w_ref[j]).abs() <= tol,
+            "[{label}] sgd_l1_shrink w[{j}]={} != host {} (tol {tol})",
+            w_got[j],
+            w_ref[j]
+        );
+        assert!(
+            (q_got[j] - q_ref[j]).abs() <= tol,
+            "[{label}] sgd_l1_shrink q[{j}]={} != host {} (tol {tol})",
+            q_got[j],
+            q_ref[j]
+        );
+    }
+
+    w_dev.release_into(&mut pool);
+    q_dev.release_into(&mut pool);
+}
+
+/// The device cumulative-L1 soft-shrink replays the exact host per-sample
+/// sequence (w AND q asserted — the q correction is the part a re-ordering bug
+/// silently corrupts). f64 strict; f32 a round-off band.
+#[test]
+fn sgd_l1_shrink_matches_host() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    run_l1_shrink_match::<f32>("f32");
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    run_l1_shrink_match::<f64>("f64");
+}
+
+// ===========================================================================
+// tol > 0 early stop — the device-tracked convergence gate.
+// ===========================================================================
+
+/// With `tol > 0` on the convex system, the device-tracked stopping gate
+/// (`sgd_copy` snapshot + `sgd_delta_max` epoch fold + one per-epoch readback)
+/// must fire and still land near the optimum — the early-stop path is
+/// exercised end-to-end (it has no other coverage; the oracle fixtures pin
+/// `tol = 0`).
+#[test]
+fn sgd_tol_early_stop_converges() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (n, d) = (40usize, 3usize);
+    let mut x = vec![0.0f64; n * d];
+    for i in 0..n {
+        for j in 0..d {
+            x[i * d + j] = (((i * d + j) % 7) as f64) * 0.3 - 0.9;
+        }
+    }
+    let w_star = [1.3f64, -0.7, 0.5];
+    let b_star = 0.4f64;
+    let y: Vec<f64> = (0..n)
+        .map(|i| {
+            let mut acc = b_star;
+            for j in 0..d {
+                acc += x[i * d + j] * w_star[j];
+            }
+            acc
+        })
+        .collect();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_f: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+    let y_f: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+    let x_dev = DeviceArray::<ActiveRuntime, f32>::from_host(&mut pool, &x_f);
+    let y_dev = DeviceArray::<ActiveRuntime, f32>::from_host(&mut pool, &y_f);
+
+    let params = SgdParams {
+        loss: SgdLoss::SquaredError,
+        schedule: SgdSchedule::Constant,
+        alpha: 1e-9,
+        l1_ratio: 0.0,
+        apply_l1: false,
+        fit_intercept: true,
+        eta0: 0.05,
+        power_t: 0.5,
+        epsilon: 0.1,
+        batch_size: n,
+        max_iter: 4000,
+        tol: 1e-7, // small but > 0: the early stop fires near the fixed point.
+    };
+
+    let (coef, intercept) =
+        sgd_solve::<f32>(&mut pool, &x_dev, &y_dev, (n, d), &params).expect("sgd_solve runs");
+
+    let coef_h: Vec<f64> = coef.to_host(&pool).iter().map(|&v| v as f64).collect();
+    let b_h = intercept.to_host(&pool)[0] as f64;
+    for j in 0..d {
+        assert!(
+            (coef_h[j] - w_star[j]).abs() <= 1e-2,
+            "early-stop coef[{j}]={} != w*={} (band 1e-2)",
+            coef_h[j],
+            w_star[j]
+        );
+    }
+    assert!(
+        (b_h - b_star).abs() <= 1e-2,
+        "early-stop intercept={b_h} != b*={b_star} (band 1e-2)"
+    );
+
+    coef.release_into(&mut pool);
+    intercept.release_into(&mut pool);
+    x_dev.release_into(&mut pool);
+    y_dev.release_into(&mut pool);
 }

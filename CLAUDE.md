@@ -1,5 +1,3 @@
-<!-- GSD:project-start source:PROJECT.md -->
-
 ## Project
 
 **mlrs — cuML in Rust**
@@ -28,13 +26,7 @@ must be right and the backend abstraction must hold.
 - **Memory**: efficiency is first-class — zero-copy, buffer reuse, minimal copies, custom allocator — verified per phase, not deferred
 - **Code structure**: tests separated from source files (project AGENTS.md rule)
 
-### Spike findings
 
-- **Spike findings for mlrs** (KNN-graph prim recipe, cpu-MLIR-safe kernel authoring, landmines) → `Skill("spike-findings-mlrs")`
-
-<!-- GSD:project-end -->
-
-<!-- GSD:stack-start source:codebase/STACK.md -->
 
 ## Technology Stack
 
@@ -192,9 +184,6 @@ must be right and the backend abstraction must hold.
 - Wheel size limit: 15 MiB compressed (enforced by `pydistcheck`)
 - Minimum Python: 3.11
 
-<!-- GSD:stack-end -->
-
-<!-- GSD:conventions-start source:CONVENTIONS.md -->
 
 ## Conventions
 
@@ -320,10 +309,6 @@ must be right and the backend abstraction must hold.
 - Excludes `thirdparty/` paths.
 - Format config pulled from `rapids-cmake` branch at CI time.
 
-<!-- GSD:conventions-end -->
-
-<!-- GSD:architecture-start source:ARCHITECTURE.md -->
-
 ## Architecture
 
 ## System Overview
@@ -437,47 +422,8 @@ must be right and the backend abstraction must hold.
 - **Global state:** Thread-local handle in `_THREAD_STATE` (`python/cuml/cuml/internals/base.py:19`); global output type in `cuml.internals.global_settings` (`python/cuml/cuml/internals/global_settings.py`).
 - **Circular imports:** `cuml.internals.interop` uses local imports inside functions to avoid circular dependencies with `cuml.internals.base`.
 
-## Anti-Patterns
-
-### Direct sklearn import inside cuml.accel scope
-
-### Raw device pointer without CumlArray
 
 ## Error Handling
 
 - `UnsupportedOnGPU` / `UnsupportedOnCPU` (`python/cuml/cuml/internals/interop.py:44`) signal unsupported configurations in `cuml.accel` — triggers CPU fallback in `ProxyBase`
 - Logging via `cuml.internals.logger` (wraps spdlog) for C++-level verbosity; separate `cuml.accel.core.Logger` for accel-layer messages
-
-## Cross-Cutting Concerns
-
-<!-- GSD:architecture-end -->
-
-<!-- GSD:skills-start source:skills/ -->
-
-## Project Skills
-
-No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
-<!-- GSD:skills-end -->
-
-<!-- GSD:workflow-start source:GSD defaults -->
-
-## GSD Workflow Enforcement
-
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
-
-Use these entry points:
-
-- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd-debug` for investigation and bug fixing
-- `/gsd-execute-phase` for planned phase work
-
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
-
-<!-- GSD:profile-start -->
-
-## Developer Profile
-
-> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->
