@@ -76,6 +76,14 @@ apply to ANY new mlrs kernel, not just KNN.
   ```
 - **Banned entirely (panic at launch, project memory):** `SharedMemory`, `Atomic`, `F::INFINITY`,
   mutable-`bool` scans, descending-shift loops.
+- **Three chained loop-carried `F` accumulators** — a `while` whose body updates THREE mutable
+  `F` locals where one feeds another (e.g. `u += du; wj = wj - u; qj += wj - z;`) → loud
+  `failed to run pass` at kernel compile (module.rs:94), launch no-ops and the output reads back
+  UNCHANGED (which a happy-path check misses — assert VALUES). TWO coupled accumulators
+  (`wj`/`qj`) are the proven ceiling; independent pairs (running max/max) are also fine.
+  **FINDING 003 (phase 19, `sgd_l1_shrink`).** Derive the third value from the loop counter
+  instead (`let u = u_start + F::cast_from(s + 1u32) * du;` — `F::cast_from(u32)` is
+  jacobi/lbfgs-proven), equal to the repeated-add form up to one rounding per iteration.
 
 ## Constraints
 

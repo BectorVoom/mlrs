@@ -28,10 +28,6 @@ must be right and the backend abstraction must hold.
 
 
 
-## Technology Stack
-
-## Version
-
 ## Languages
 
 - C++20 - Core algorithm implementations in `cuml-main/cpp/src/` and `cuml-main/cpp/include/`
@@ -185,11 +181,6 @@ must be right and the backend abstraction must hold.
 - Minimum Python: 3.11
 
 
-## Conventions
-
-## License Headers
-
-## C++ / CUDA Conventions
 
 ### Tooling
 
@@ -239,10 +230,6 @@ must be right and the backend abstraction must hold.
 | `RAFT_FAIL(msg)` | Unconditional failure |
 | `RAFT_CUDA_TRY(call)` | Checks CUDA API return code |
 
-### Logging
-
-## Python / Cython Conventions
-
 ### Tooling
 
 | Tool | Config | Invocation |
@@ -262,12 +249,6 @@ must be right and the backend abstraction must hold.
 | Line length (Cython `.pyx`/`.pxd`) | 95 characters (`[tool.cython-lint]`) |
 | Target Python | 3.11+ (`requires-python = ">=3.11"`) |
 | isort profile | `black` |
-
-### Import Organisation
-
-### Docstrings
-
-### Type Hints
 
 ### Warning Policy
 
@@ -309,13 +290,6 @@ must be right and the backend abstraction must hold.
 - Excludes `thirdparty/` paths.
 - Format config pulled from `rapids-cmake` branch at CI time.
 
-## Architecture
-
-## System Overview
-
-```text
-
-```
 
 ## Component Responsibilities
 
@@ -371,12 +345,6 @@ must be right and the backend abstraction must hold.
 - Location: `python/cuml/cuml/dask/`
 - Contains: Mirrors single-GPU structure (`cluster/`, `linear_model/`, `decomposition/`, etc.)
 - Depends on: Single-GPU cuml estimators, Dask, `*_mg.pyx` Cython MG bindings, UCX
-
-## Data Flow
-
-### Primary Single-GPU Training Path
-
-### cuml.accel Transparent Acceleration Path
 
 ### Multi-GPU Dask Path
 
