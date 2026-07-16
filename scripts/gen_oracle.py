@@ -3250,6 +3250,343 @@ def gen_decision_tree_reg(
     return out_path
 
 
+# Phase-19 RandomForest FOREST-level oracle fixtures (ENSEMBLE-01). Unlike the
+# Phase-17 single-tree injected-index witness fixtures (tree_dt_*), these gate
+# the full mlrs forest ESTIMATOR surface. Two tiers per task:
+#   - DETERMINISTIC tier (bootstrap=False, max_features=None): all sklearn
+#     trees are identical and RNG-free; with grid-valued features (every
+#     feature has << n_bins distinct values) the mlrs binned candidate set
+#     equals sklearn's exact midpoint set, and both growers reach PURE leaves,
+#     so TRAIN-set predictions/probas match sklearn EXACTLY (asserted here at
+#     generation: sklearn train accuracy / R² == 1, probas one-hot).
+#     Held-out predictions are NOT exact-gated (equal-quality splits may pick
+#     different-but-decision-equivalent thresholds — the Phase-17 witness Open
+#     Question 1 resolution); they are gated statistically instead.
+#   - STATISTICAL tier (sklearn defaults: bootstrap + sqrt features): the
+#     held-out sklearn accuracy / R² is stored and the mlrs forest must land
+#     within a small margin.
+RF_N_TRAIN = 96
+RF_N_TEST = 48
+RF_N_FEATURES = 5
+RF_GRID = 16  # distinct values per feature (<< n_bins-1 = 31 candidates)
+RF_DET_MAX_DEPTH = 12
+RF_STAT_N_ESTIMATORS = 64
+RF_STAT_MAX_DEPTH = 8
+
+
+def _rf_grid_data(rng, n_rows: int):
+    """Grid-valued features in [0, 1]: RF_GRID distinct values per feature."""
+    raw = rng.integers(0, RF_GRID, size=(n_rows, RF_N_FEATURES))
+    return raw.astype(np.float64) / (RF_GRID - 1)
+
+
+def gen_random_forest_classifier(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one RandomForest CLASSIFIER fixture (ENSEMBLE-01).
+
+    Stores ``X``/``y`` (train), ``Xq``/``yq`` (held-out), the deterministic
+    tier's train-set ``det_pred_train``/``det_proba_train`` (asserted == y /
+    one-hot at generation), and the statistical tier's held-out sklearn
+    accuracy ``stat_acc_test``. Returns the path written.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+
+    rng = np.random.default_rng(seed)
+    x = _rf_grid_data(rng, RF_N_TRAIN)
+    xq = _rf_grid_data(rng, RF_N_TEST)
+    # No duplicate train rows: a duplicated row with a noise-flipped label
+    # would make pure leaves impossible and break the exact tier.
+    assert np.unique(x, axis=0).shape[0] == RF_N_TRAIN, "duplicate train rows"
+
+    def rule(a):
+        return np.where(a[:, 0] < 0.5, 0, np.where(a[:, 1] < 0.5, 1, 2))
+
+    y = rule(x)
+    yq = rule(xq)
+    # ~10% label noise so trees must genuinely isolate noisy points.
+    flip = rng.random(RF_N_TRAIN) < 0.10
+    y = np.where(flip, (y + rng.integers(1, 3, size=RF_N_TRAIN)) % 3, y)
+
+    det = RandomForestClassifier(
+        n_estimators=2,
+        bootstrap=False,
+        max_features=None,
+        max_depth=RF_DET_MAX_DEPTH,
+        random_state=0,
+    ).fit(x, y)
+    det_pred_train = det.predict(x)
+    det_proba_train = det.predict_proba(x)
+    # Load-bearing generation-time guards: the deterministic tier only gates
+    # EXACT parity if sklearn itself reaches purity on the train set.
+    assert (det_pred_train == y).all(), "det clf tier: sklearn not pure on train"
+    assert np.allclose(det_proba_train.max(axis=1), 1.0), "det clf tier: proba not one-hot"
+
+    stat = RandomForestClassifier(
+        n_estimators=RF_STAT_N_ESTIMATORS,
+        max_depth=RF_STAT_MAX_DEPTH,
+        random_state=0,
+    ).fit(x, y)
+    stat_acc_test = float((stat.predict(xq) == yq).mean())
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"rf_cls_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        Xq=c(xq),
+        yq=c(yq),
+        det_pred_train=c(det_pred_train),
+        det_proba_train=c(det_proba_train),
+        stat_acc_test=c([stat_acc_test]),
+    )
+    return out_path
+
+
+def gen_random_forest_regressor(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one RandomForest REGRESSOR fixture (ENSEMBLE-01).
+
+    The deterministic tier uses a PIECEWISE-CONSTANT target (finite level set)
+    so both growers reach zero-variance leaves and train predictions match
+    ``y`` exactly (asserted at generation). The statistical tier stores the
+    held-out sklearn R² for the margin gate. Returns the path written.
+    """
+    from sklearn.ensemble import RandomForestRegressor
+
+    rng = np.random.default_rng(seed + 1)
+    x = _rf_grid_data(rng, RF_N_TRAIN)
+    xq = _rf_grid_data(rng, RF_N_TEST)
+    assert np.unique(x, axis=0).shape[0] == RF_N_TRAIN, "duplicate train rows"
+
+    def levels(a):
+        # Piecewise-constant on a 2-feature grid of cells → finite level set.
+        return (
+            1.0 * (a[:, 0] >= 0.5)
+            + 2.5 * (a[:, 1] >= 0.5)
+            + 0.75 * (a[:, 2] >= 0.25)
+        )
+
+    y = levels(x)
+    yq = levels(xq)
+
+    det = RandomForestRegressor(
+        n_estimators=2,
+        bootstrap=False,
+        max_features=1.0,
+        max_depth=RF_DET_MAX_DEPTH,
+        random_state=0,
+    ).fit(x, y)
+    det_pred_train = det.predict(x)
+    assert np.allclose(det_pred_train, y, atol=1e-12), "det reg tier: sklearn not pure on train"
+
+    stat = RandomForestRegressor(
+        n_estimators=RF_STAT_N_ESTIMATORS,
+        max_depth=RF_STAT_MAX_DEPTH,
+        random_state=0,
+    ).fit(x, y)
+    pred_q = stat.predict(xq)
+    ss_res = float(((yq - pred_q) ** 2).sum())
+    ss_tot = float(((yq - yq.mean()) ** 2).sum())
+    stat_r2_test = 1.0 - ss_res / ss_tot
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"rf_reg_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        Xq=c(xq),
+        yq=c(yq),
+        det_pred_train=c(det_pred_train),
+        stat_r2_test=c([stat_r2_test]),
+    )
+    return out_path
+
+
+# HistGradientBoosting oracle fixtures (GBT-01). The mlrs grower is
+# LEVEL-WISE with a depth bound; sklearn's grower is leaf-wise (best-first)
+# with a leaf budget. With ``max_leaf_nodes=None`` and ``max_depth=D`` the
+# leaf budget is gone, growth ORDER is irrelevant (each node's split is
+# independent), and sklearn's tree equals the mlrs level-wise tree — so the
+# deterministic tier pins EXACT train parity without needing purity:
+#   - grid-valued features (16 distinct values << max_bins) make sklearn's
+#     ``_BinMapper`` midpoints identical to the mlrs candidate edges;
+#   - HGB has NO RNG (no bootstrap, no feature subsampling), so identical
+#     candidate sets + identical gain rule => identical trees + identical
+#     shrunk leaf values => train predictions match to float error.
+#   Held-out predictions stay margin-gated (near-tie gains may resolve to
+#   decision-equivalent-on-train but different thresholds — the RF lesson).
+#   - the STATISTICAL tier uses sklearn DEFAULTS (leaf-wise, 31 leaves,
+#     max_iter=100, early_stopping off) vs mlrs defaults (depth 6) and gates
+#     the held-out accuracy/R² within a margin.
+HGB_N_TRAIN = 96
+HGB_N_TEST = 48
+HGB_N_FEATURES = 5
+HGB_DET_MAX_ITER = 20
+HGB_DET_MAX_DEPTH = 6
+HGB_DET_MIN_SAMPLES_LEAF = 5
+HGB_DET_LEARNING_RATE = 0.1
+
+
+def _hgb_det_kwargs():
+    """The deterministic-tier sklearn kwargs shared by both HGB generators."""
+    return dict(
+        max_iter=HGB_DET_MAX_ITER,
+        learning_rate=HGB_DET_LEARNING_RATE,
+        max_depth=HGB_DET_MAX_DEPTH,
+        max_leaf_nodes=None,
+        min_samples_leaf=HGB_DET_MIN_SAMPLES_LEAF,
+        l2_regularization=0.0,
+        max_bins=255,
+        early_stopping=False,
+        random_state=0,
+    )
+
+
+def gen_hgb_regressor(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one HistGradientBoosting REGRESSOR fixture (GBT-01).
+
+    Stores ``X``/``y`` (train), ``Xq``/``yq`` (held-out), the deterministic
+    tier's train predictions ``det_pred_train`` (exact-gated) and held-out
+    R² ``det_r2_test``, plus the sklearn-DEFAULTS statistical tier's held-out
+    R² ``stat_r2_test``. Returns the path written.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    rng = np.random.default_rng(seed + 3)
+    x = _rf_grid_data(rng, HGB_N_TRAIN)
+    xq = _rf_grid_data(rng, HGB_N_TEST)
+    assert np.unique(x, axis=0).shape[0] == HGB_N_TRAIN, "duplicate train rows"
+
+    def levels(a):
+        # Piecewise-constant target (well-separated split gains).
+        return (
+            1.0 * (a[:, 0] >= 0.5)
+            + 2.5 * (a[:, 1] >= 0.5)
+            + 0.75 * (a[:, 2] >= 0.25)
+        )
+
+    y = levels(x)
+    yq = levels(xq)
+
+    det = HistGradientBoostingRegressor(**_hgb_det_kwargs()).fit(x, y)
+    det_pred_train = det.predict(x)
+    det_pred_test = det.predict(xq)
+    ss_res = float(((yq - det_pred_test) ** 2).sum())
+    ss_tot = float(((yq - yq.mean()) ** 2).sum())
+    det_r2_test = 1.0 - ss_res / ss_tot
+    # Generation-time sanity: 20 boosted iterations must fit this clean
+    # target well, or the fixture gates nothing.
+    train_r2 = det.score(x, y)
+    assert train_r2 > 0.95, f"det hgb reg tier: sklearn train R² {train_r2} too low"
+
+    stat = HistGradientBoostingRegressor(early_stopping=False, random_state=0).fit(x, y)
+    pred_q = stat.predict(xq)
+    ss_res = float(((yq - pred_q) ** 2).sum())
+    stat_r2_test = 1.0 - ss_res / ss_tot
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"hgb_reg_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        Xq=c(xq),
+        yq=c(yq),
+        det_pred_train=c(det_pred_train),
+        det_r2_test=c([det_r2_test]),
+        stat_r2_test=c([stat_r2_test]),
+    )
+    return out_path
+
+
+def gen_hgb_classifier(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one HistGradientBoosting CLASSIFIER fixture (GBT-01).
+
+    Carries BOTH class-count paths in one file: the 3-class rule target
+    (softmax, K = 3 trees/iteration) and its binarized sibling ``y == 0``
+    (sigmoid, K = 1). Stores the deterministic tier's train
+    probabilities/labels for each (exact-gated) and a NOISY-label statistical
+    tier's held-out accuracy (margin-gated).
+
+    CRITICAL (deterministic-tier design): the det-tier labels are the CLEAN
+    rule — no noise. Noisy labels create EXACT-TIE split gains whose float
+    resolution differs between sklearn (sibling histograms by SUBTRACTION)
+    and mlrs (direct sums); a tie that resolves into a different row
+    partition diverges the ensembles from that iteration on. On the clean
+    target every informative split's gain is well-separated (remaining ties
+    occur only inside PURE nodes, where all candidate children share one
+    value, so predictions are unaffected) — verified at generation by the
+    train-accuracy assertion. Label noise is exercised by the statistical
+    tier instead.
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    rng = np.random.default_rng(seed + 4)
+    x = _rf_grid_data(rng, HGB_N_TRAIN)
+    xq = _rf_grid_data(rng, HGB_N_TEST)
+    assert np.unique(x, axis=0).shape[0] == HGB_N_TRAIN, "duplicate train rows"
+
+    def rule(a):
+        return np.where(a[:, 0] < 0.5, 0, np.where(a[:, 1] < 0.5, 1, 2))
+
+    y = rule(x)
+    yq = rule(xq)
+    y_bin = (y == 0).astype(np.int64)
+    # Noisy sibling for the statistical tier (~10% flips).
+    flip = rng.random(HGB_N_TRAIN) < 0.10
+    y_noisy = np.where(flip, (y + rng.integers(1, 3, size=HGB_N_TRAIN)) % 3, y)
+
+    det = HistGradientBoostingClassifier(**_hgb_det_kwargs()).fit(x, y)
+    det_pred_train = det.predict(x)
+    det_proba_train = det.predict_proba(x)
+    acc = float((det_pred_train == y).mean())
+    assert acc == 1.0, f"det hgb clf tier: sklearn train accuracy {acc} != 1 on clean rule"
+
+    det_bin = HistGradientBoostingClassifier(**_hgb_det_kwargs()).fit(x, y_bin)
+    det_pred_bin_train = det_bin.predict(x)
+    det_proba_bin_train = det_bin.predict_proba(x)
+    assert det_bin.n_iter_ == HGB_DET_MAX_ITER
+
+    stat = HistGradientBoostingClassifier(early_stopping=False, random_state=0).fit(
+        x, y_noisy
+    )
+    stat_acc_test = float((stat.predict(xq) == yq).mean())
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"hgb_cls_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        y_noisy=c(y_noisy),
+        Xq=c(xq),
+        yq=c(yq),
+        y_bin=c(y_bin),
+        det_pred_train=c(det_pred_train),
+        det_proba_train=c(det_proba_train),
+        det_pred_bin_train=c(det_pred_bin_train),
+        det_proba_bin_train=c(det_proba_bin_train),
+        stat_acc_test=c([stat_acc_test]),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -3479,6 +3816,24 @@ def main() -> None:
         print(f"wrote {gen_decision_tree_clf(dtype=dtype, structure='adversarial')}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_decision_tree_reg(dtype=dtype, structure='adversarial')}")
+
+    # ---- Phase-19 RandomForest forest-level fixtures (ENSEMBLE-01) ----
+    # Deterministic (bootstrap=False, exact train parity, asserted pure) +
+    # statistical (sklearn-defaults held-out accuracy/R² margin) tiers.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_random_forest_classifier(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_random_forest_regressor(dtype=dtype)}")
+
+    # ---- HistGradientBoosting fixtures (GBT-01) ----
+    # Deterministic (max_leaf_nodes=None + depth bound => level-wise
+    # equivalence, exact train parity) + statistical (sklearn defaults,
+    # held-out margin) tiers; the classifier fixture carries the 3-class
+    # softmax AND binarized sigmoid paths.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_hgb_regressor(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_hgb_classifier(dtype=dtype)}")
 
 
 if __name__ == "__main__":

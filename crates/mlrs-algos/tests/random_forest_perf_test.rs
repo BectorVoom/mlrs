@@ -1,0 +1,125 @@
+//! RandomForest (ENSEMBLE-01) wall-clock performance probe.
+//!
+//! A plain `std::time::Instant` probe (the `tree_bench.rs` precedent — NOT a
+//! Criterion micro-benchmark). `#[ignore]` by default so the ordinary suite
+//! stays fast; run TARGETED in release mode:
+//!
+//! ```text
+//! cargo test -p mlrs-algos --release --features wgpu \
+//!   --test random_forest_perf_test -- --ignored --nocapture
+//! ```
+//!
+//! Compare against `scripts/bench_rf.py` (sklearn, and cuML on a CUDA host)
+//! on the SAME geometry. The fit loop is launch-only (one host sync for the
+//! quantile edges), so the number the probe prints is dominated by kernel
+//! time, not synchronization — the property that made earlier mlrs fits lose
+//! to cuML (see the sgd_solve perf memory).
+//!
+//! Per AGENTS.md §2 tests live here, never in-source.
+
+use std::time::Instant;
+
+use mlrs_algos::ensemble::random_forest_classifier::RandomForestClassifier;
+use mlrs_algos::typestate::{Fit, PredictLabels};
+use mlrs_backend::device_array::DeviceArray;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::runtime::{self, ActiveRuntime};
+
+/// Deterministic host data: splitmix64-derived uniform features + a 3-class
+/// rule with noise (no `rand` dependency — the tree_bench precedent).
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn uniform01(state: &mut u64) -> f64 {
+    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn make_data(n: usize, d: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+    let mut s = seed;
+    let mut x = Vec::with_capacity(n * d);
+    let mut y = Vec::with_capacity(n);
+    for _ in 0..n {
+        let row_start = x.len();
+        for _ in 0..d {
+            x.push(uniform01(&mut s) as f32);
+        }
+        let a = x[row_start] as f64;
+        let b = x[row_start + 1] as f64;
+        let noise = uniform01(&mut s) < 0.05;
+        let mut label = if a < 0.5 { 0 } else if b < 0.5 { 1 } else { 2 };
+        if noise {
+            label = (label + 1) % 3;
+        }
+        y.push(label as f32);
+    }
+    (x, y)
+}
+
+fn run_config(n: usize, d: usize, n_trees: usize, max_depth: usize) -> (f64, f64) {
+    let (x, y) = make_data(n, d, 42);
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+
+    let t0 = Instant::now();
+    let clf = RandomForestClassifier::<f32>::builder()
+        .n_estimators(n_trees)
+        .max_depth(max_depth)
+        .build::<f32>()
+        .expect("build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (n, d))
+        .expect("fit");
+    // predict_labels forces a device sync (host readback), so the fit timing
+    // below includes all queued fit kernels — time both phases together first,
+    // then predict separately (already-synced queue).
+    let labels = clf
+        .predict_labels(&mut pool, &x_dev, (n, d))
+        .expect("predict")
+        .to_host(&pool);
+    let fit_predict_s = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    let labels2 = clf
+        .predict_labels(&mut pool, &x_dev, (n, d))
+        .expect("predict 2")
+        .to_host(&pool);
+    let predict_s = t1.elapsed().as_secs_f64();
+    assert_eq!(labels, labels2, "predict must be deterministic");
+
+    // Sanity: the forest must actually have learned the rule (not just timed
+    // garbage) — train accuracy well above chance on the 5%-noise data.
+    let correct = labels
+        .iter()
+        .zip(y.iter())
+        .filter(|&(&l, &t)| l == t as i32)
+        .count();
+    let acc = correct as f64 / n as f64;
+    assert!(acc > 0.9, "train accuracy {acc} too low — perf run is broken");
+
+    (fit_predict_s - predict_s, predict_s)
+}
+
+#[test]
+#[ignore = "wall-clock perf probe — run targeted in release with --ignored --nocapture"]
+fn rf_fit_predict_wall_clock() {
+    // (n, d, trees, depth) — the cuML-comparison geometry ladder.
+    let configs = [
+        (10_000, 16, 32, 8),
+        (50_000, 16, 32, 8),
+        (100_000, 16, 32, 8),
+        (50_000, 16, 100, 8),
+        (50_000, 16, 32, 12),
+    ];
+    println!("backend-config: {}", std::env::var("CARGO_CFG_FEATURE").unwrap_or_default());
+    println!("{:>8} {:>4} {:>6} {:>6} | {:>10} {:>10}", "n", "d", "trees", "depth", "fit (s)", "pred (s)");
+    for &(n, d, t, dep) in &configs {
+        let (fit_s, pred_s) = run_config(n, d, t, dep);
+        println!("{n:>8} {d:>4} {t:>6} {dep:>6} | {fit_s:>10.3} {pred_s:>10.3}");
+    }
+}

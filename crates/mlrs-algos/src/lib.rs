@@ -50,6 +50,10 @@ pub mod cluster;
 pub mod covariance;
 pub mod decomposition;
 pub mod density;
+// Random Forest estimators (ENSEMBLE-01): `RandomForestClassifier` /
+// `RandomForestRegressor` over the launch-only batched forest primitive
+// (`mlrs_backend::prims::random_forest`).
+pub mod ensemble;
 pub mod error;
 pub mod kernel_ridge;
 pub mod linear;

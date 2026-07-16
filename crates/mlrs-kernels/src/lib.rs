@@ -19,6 +19,11 @@ pub mod distance;
 pub mod coordinate;
 pub mod dbscan;
 pub mod elementwise;
+// HistGradientBoosting kernels (GBT-01): sequential boosting over batched
+// level-wise gradient/hessian histogram trees (row-blocked gather + reduce),
+// driven by `prims/hist_gradient_boosting.rs`. Reuses `tree.rs` binning,
+// cumulative-histogram and forest-traversal kernels.
+pub mod gbt;
 pub mod jacobi_eig;
 pub mod jacobi_svd;
 pub mod kmeans;
@@ -37,6 +42,10 @@ pub mod reduce;
 pub mod sgd;
 pub mod smoke;
 pub mod topk;
+// Random Forest level-wise tree-building + forest-inference kernels
+// (ENSEMBLE-01): batched all-trees histogram builder (cuML-style row
+// partitioning, gather-only, atomic-free) driven by `prims/random_forest.rs`.
+pub mod tree;
 // Phase-14 UMAP layout (UMAP-03): the ONE new device kernel of the phase —
 // `umap_layout_step` is a vertex-owner GATHER SGD step (cpu-MLIR-safe, frozen-
 // subset-capable, host-drawn negative samples). This file owns its `pub mod` +
@@ -53,6 +62,15 @@ pub use elementwise::{
     kde_epanechnikov_map, kde_exponential_map, kde_gaussian_map, kde_linear_map, kde_tophat_map,
     laplacian_map, poly_map, rbf_map, scale, sigmoid_map, sqrt_elem, zero_diag_copy,
 };
+// HistGradientBoosting kernels (GBT-01): loss gradients (squared error /
+// binary log-loss / multiclass log-loss with staged softmax), row-blocked
+// 3-slot histogram gather + block reduce, sklearn-gain split pipeline, row
+// partition with a stage offset, and raw-prediction update/inference.
+pub use gbt::{
+    gbt_best_split, gbt_count_left, gbt_grad_binary, gbt_grad_multi, gbt_grad_reg, gbt_hist,
+    gbt_hist_reduce, gbt_init_partition, gbt_init_raw, gbt_partition, gbt_proba_binary,
+    gbt_proba_multi, gbt_row_max, gbt_row_sumexp, gbt_split_scores, gbt_sum_raw, gbt_update_raw,
+};
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
 // Phase-15 HDBSCAN mutual-reachability GATHER (HDBS-01, plan 15-05): launched by
@@ -68,6 +86,14 @@ pub use reduce::{
     reduce_min_shared, reduce_sum_plane, reduce_sum_shared, reduce_sumsq_plane, reduce_sumsq_shared,
 };
 pub use smoke::saxpy_kernel;
+// Random Forest kernels (ENSEMBLE-01): binning, level-wise histogram/split
+// pipeline, row partition, and forest traversal/vote. Launched by the backend
+// host orchestrator in `prims/random_forest.rs`.
+pub use tree::{
+    rf_best_split, rf_bin_features, rf_count_left, rf_hist_class, rf_hist_cum, rf_hist_reg,
+    rf_mean_reg, rf_node_max, rf_node_total, rf_partition, rf_predict_leaf,
+    rf_split_scores_class, rf_split_scores_reg, rf_vote_class, RF_NO_FEATURE,
+};
 // Phase-14 UMAP layout SGD step (UMAP-03): the per-owner GATHER kernel the host
 // epoch driver in `manifold/umap.rs` launches each epoch (Plan 04) and the
 // `transform` frozen-subset path reuses (Plan 05).

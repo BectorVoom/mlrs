@@ -47,6 +47,15 @@ pub mod mutual_reachability;
 pub mod coordinate_descent;
 pub mod dbscan;
 pub mod distance;
+// Random Forest prim (ENSEMBLE-01): the launch-only batched level-wise forest
+// builder + forest inference over the `mlrs-kernels::tree` kernels. Owns the
+// host quantile binning, seeded bootstrap/feature-subsample RNG (SplitMix64),
+// and the validate-before-launch guards.
+pub mod random_forest;
+// HistGradientBoosting (GBT-01): launch-only sequential boosting over the
+// batched level-wise histogram tree pipeline (`mlrs-kernels::gbt` +
+// `tree.rs` binning/traversal reuse).
+pub mod hist_gradient_boosting;
 pub mod eig;
 pub mod gemm;
 pub mod kmeans;

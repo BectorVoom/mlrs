@@ -624,6 +624,119 @@ pub enum BuildError {
         n_neighbors: usize,
     },
 
+    /// A Random Forest estimator was given `n_estimators == 0` (ENSEMBLE-01).
+    /// A forest must contain at least one tree. Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split).
+    #[error("estimator '{estimator}': n_estimators = {n_estimators} is invalid (must be >= 1)")]
+    InvalidNEstimators {
+        /// Which estimator's builder rejected the value
+        /// (`"random_forest_classifier"` / `"random_forest_regressor"`).
+        estimator: &'static str,
+        /// The offending tree count (0).
+        n_estimators: usize,
+    },
+
+    /// A Random Forest estimator was given a `max_depth` outside
+    /// `1 ..= 16` (ENSEMBLE-01). mlrs grows COMPLETE-layout trees whose node
+    /// arrays scale as `2^(max_depth+1)`, so the depth is bounded (the cuML
+    /// default cap) — a documented deviation from sklearn's unbounded
+    /// `max_depth=None`. Rejected at `build()`.
+    #[error(
+        "estimator '{estimator}': max_depth = {max_depth} is invalid (must be in 1..=16; \
+         mlrs trees are depth-bounded, unlike sklearn's max_depth=None)"
+    )]
+    InvalidMaxDepth {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending depth.
+        max_depth: usize,
+    },
+
+    /// A Random Forest estimator was given an `n_bins` outside `2 ..= 256`
+    /// (ENSEMBLE-01). Splits are histogram-binned (cuML-style); at least two
+    /// bins are needed for one candidate threshold, and the per-level
+    /// histogram memory scales linearly with bins. Rejected at `build()`.
+    #[error("estimator '{estimator}': n_bins = {n_bins} is invalid (must be in 2..=256)")]
+    InvalidNBins {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending bin count.
+        n_bins: usize,
+    },
+
+    /// A Random Forest estimator was given `max_features = Value(0)`
+    /// (ENSEMBLE-01). At least one feature must be sampled per node; the
+    /// data-DEPENDENT `value <= n_features` half is validated at `fit`.
+    /// Rejected at `build()`.
+    #[error("estimator '{estimator}': max_features = {max_features} is invalid (must be >= 1)")]
+    InvalidMaxFeatures {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending per-node feature count (0).
+        max_features: usize,
+    },
+
+    /// A Random Forest estimator was given a non-finite or out-of-range
+    /// `min_samples_split` / `min_samples_leaf` (ENSEMBLE-01): the split
+    /// minimum must be `>= 2` and the leaf minimum `>= 1` (the sklearn
+    /// integer-form contract). Rejected at `build()`.
+    #[error(
+        "estimator '{estimator}': {which} = {value} is invalid \
+         (min_samples_split must be >= 2, min_samples_leaf >= 1, both finite)"
+    )]
+    InvalidMinSamplesForest {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// Which hyperparameter failed (`"min_samples_split"` /
+        /// `"min_samples_leaf"`).
+        which: &'static str,
+        /// The offending value.
+        value: f64,
+    },
+
+    /// A HistGradientBoosting estimator was given `max_iter == 0` (GBT-01).
+    /// At least one boosting iteration is required. Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split).
+    #[error("estimator '{estimator}': max_iter = {max_iter} is invalid (must be >= 1)")]
+    InvalidMaxIter {
+        /// Which estimator's builder rejected the value
+        /// (`"hist_gradient_boosting_classifier"` /
+        /// `"hist_gradient_boosting_regressor"`).
+        estimator: &'static str,
+        /// The offending iteration count (0).
+        max_iter: usize,
+    },
+
+    /// A HistGradientBoosting estimator was given a non-positive or non-finite
+    /// `learning_rate` (GBT-01). The shrinkage multiplies every leaf value, so
+    /// it must be a finite positive number (the sklearn contract). Rejected at
+    /// `build()`.
+    #[error(
+        "estimator '{estimator}': learning_rate = {learning_rate} is invalid \
+         (must be finite and > 0)"
+    )]
+    InvalidLearningRate {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending shrinkage.
+        learning_rate: f64,
+    },
+
+    /// A HistGradientBoosting estimator was given a negative or non-finite
+    /// `l2_regularization` (GBT-01). The penalty enters every leaf-value
+    /// denominator `H + λ`, so it must be finite and `>= 0` (`0` disables it —
+    /// the sklearn default). Rejected at `build()`.
+    #[error(
+        "estimator '{estimator}': l2_regularization = {l2_regularization} is invalid \
+         (must be finite and >= 0)"
+    )]
+    InvalidL2Regularization {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending penalty.
+        l2_regularization: f64,
+    },
+
     /// `HDBSCAN` was given a `min_cluster_size` below 2 (Phase 12, HDBS-01,
     /// T-12-02). The minimum number of samples in a cluster must be `>= 2`; a
     /// smaller value is undefined. Rejected at `build()` (data-INDEPENDENT, the
