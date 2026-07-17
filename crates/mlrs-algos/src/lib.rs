@@ -58,6 +58,11 @@ pub mod error;
 pub mod kernel_ridge;
 pub mod linear;
 pub mod manifold;
+// The host-only sklearn metrics surface (Phase 24 METR-01/02/03): shared
+// bookkeeping in `metrics/mod.rs` (edited exactly once, TASK-01) plus
+// `metrics::classification` / `metrics::regression` free functions
+// (TASK-03..14).
+pub mod metrics;
 pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;

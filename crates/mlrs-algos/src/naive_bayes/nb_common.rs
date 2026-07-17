@@ -157,27 +157,18 @@ fn decode(joint_ll: &[f64], classes_: &[i64], take_max: bool) -> Vec<i32> {
 /// D-07). `[1,1,0]` vs `[1,0,0]` → `2/3`. Returns `f64::NAN` for an empty input
 /// (accuracy is undefined with no samples — sklearn raises; WR-07). Panics on a
 /// length mismatch (a real caller passes equal-length vectors).
+///
+/// TASK-03 (METR-CLS-01): a thin delegate to
+/// [`crate::metrics::classification::accuracy_score`] — ONE source of truth
+/// for the accuracy computation. This function's own signature/argument
+/// order (`pred` first, `y_true` second — opposite sklearn's own
+/// `accuracy_score(y_true, y_pred)` convention) and doc-comment are
+/// UNCHANGED; only the body changed, so this crate's one caller needs no
+/// edit. The empty-input `NaN` contract above is preserved for free by the
+/// new implementation's `0.0/0.0 = NaN` division (no special-cased branch;
+/// regression-locked by `nb_common_test.rs::nb_common_accuracy_score_empty_input_is_nan`).
 pub fn accuracy_score(pred: &[i32], y_true: &[i32]) -> f64 {
-    assert_eq!(
-        pred.len(),
-        y_true.len(),
-        "accuracy_score: length mismatch pred={} y_true={}",
-        pred.len(),
-        y_true.len()
-    );
-    // WR-07: an empty prediction vector has an UNDEFINED accuracy — return NaN
-    // (sklearn raises on empty input) rather than `0.0`, which is indistinguishable
-    // from "0% correct". The geometry guard upstream already rejects an empty
-    // predict, but this `pub` fn is independently callable.
-    if pred.is_empty() {
-        return f64::NAN;
-    }
-    let correct = pred
-        .iter()
-        .zip(y_true.iter())
-        .filter(|(p, t)| p == t)
-        .count();
-    correct as f64 / pred.len() as f64
+    crate::metrics::classification::accuracy_score(y_true, pred, None, true)
 }
 
 /// The one-owner-per-`(class, feature)` GATHER (Pitfall 1/2, ROADMAP #1):

@@ -58,6 +58,9 @@ pub mod dispatch;
 pub mod egress;
 pub mod errors;
 pub mod ingress;
+// The host-only sklearn metrics surface PyO3 free functions (METR-BIND-01,
+// TASK-15): thin wrappers over `mlrs_algos::metrics::{classification,regression}`.
+pub mod metrics;
 
 // The 12 estimator `#[pyclass]` wrappers (Plan 03). Registered on `_mlrs` below.
 pub mod estimators;
@@ -265,5 +268,26 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `any_estimator_typestate!`).
     m.add_class::<PyUMAP>()?;
     m.add_class::<PyHDBSCAN>()?;
+
+    // The host-only sklearn metrics surface (METR-BIND-01, TASK-15): 11
+    // metrics + 3 `_per_class` variants (precision/recall/f1's
+    // `average=None`) = 14 registrations. The pure-Python `mlrs.metrics`
+    // shim (TASK-16) delegates to these.
+    m.add_function(wrap_pyfunction!(metrics::accuracy_score, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::confusion_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::precision_score, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::precision_score_per_class, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::recall_score, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::recall_score_per_class, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::f1_score, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::f1_score_per_class, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::log_loss, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::roc_auc_score_binary, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::roc_auc_score_multiclass, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::precision_recall_curve, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::r2_score, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::mean_squared_error, m)?)?;
+    m.add_function(wrap_pyfunction!(metrics::mean_absolute_error, m)?)?;
+
     Ok(())
 }

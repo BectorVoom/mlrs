@@ -26,6 +26,7 @@
 //! more specific class.
 
 use mlrs_algos::error::{AlgoError, BuildError};
+use mlrs_algos::metrics::MetricError;
 use mlrs_core::error::BridgeError;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::PyErr;
@@ -54,6 +55,21 @@ pub fn bridge_err_to_py(err: BridgeError) -> PyErr {
 /// the Rust boundary surfaces it as a clear `ValueError` and the shim can refine
 /// it — Plan 03/04.)
 pub fn algo_err_to_py(err: AlgoError) -> PyErr {
+    PyValueError::new_err(err.to_string())
+}
+
+/// Map a [`MetricError`] (`crates/mlrs-algos/src/metrics/mod.rs`, TASK-01) to
+/// a `PyErr` (TASK-15, METR-BIND-01).
+///
+/// `MetricError` is a DISTINCT type from [`AlgoError`] (SPEC §4 explicit
+/// correction) — this is a NEW sibling of `algo_err_to_py`, not a reuse of
+/// it, since `algo_err_to_py` only accepts `AlgoError`. Every `MetricError`
+/// variant is a caller-supplied-value/usage problem (a length mismatch, an
+/// invalid weight, an undefined single-class `roc_auc_score`, an
+/// OvO+`sample_weight` combination the pinned sklearn itself rejects), so
+/// all map to `PyValueError` with the typed error's `Display` text
+/// preserved — the same class convention as `algo_err_to_py`/`build_err_to_py`.
+pub fn metric_err_to_py(err: MetricError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 

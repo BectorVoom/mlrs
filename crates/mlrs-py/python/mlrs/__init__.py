@@ -60,6 +60,12 @@ from .random_projection import (
     johnson_lindenstrauss_min_dim,
 )
 
+# The host-only sklearn metrics surface (METR-SHIM-01): a SUBMODULE import,
+# NOT top-level `__all__` names (SPEC §5 explicit instruction — avoids e.g.
+# `mlrs.accuracy_score` colliding with the estimator namespace). Access via
+# `mlrs.metrics.accuracy_score(...)` etc.
+from . import metrics  # noqa: F401
+
 __all__ = [
     "LinearRegression",
     "Ridge",

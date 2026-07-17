@@ -3587,6 +3587,487 @@ def gen_hgb_classifier(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# ---- Metrics surface fixtures (METR-01/02/03, .planning/plans/metrics-surface) ----
+#
+# All four generators below require ``scikit-learn==1.9.0`` (the version this
+# fixture was pinned against — TASK-02 Q6 resolution, PLAN.md, confirmed by
+# `/tmp/oracle-venv/bin/python -c "import sklearn; print(sklearn.__version__)"`
+# printing `1.9.0` at fixture-generation time).
+#
+# OvO + `sample_weight` probe (Q10, Plan-Check Issue 2), run BEFORE writing
+# `gen_metrics_classification_multiclass`'s weighted-OvO branch, against this
+# module's own `y_true`/`y_proba`/`sample_weight`:
+#
+#     roc_auc_score(y_true, y_proba, multi_class="ovo", average="macro", sample_weight=w)
+#
+# Outcome under scikit-learn==1.9.0: RAISES
+#     ValueError("sample_weight is not supported for multiclass one-vs-one
+#     ROC AUC score, 'sample_weight' must be None in this case.")
+# => Branch A. No `ref_roc_auc_ovo_{macro,weighted}_sw` array is generated;
+# TASK-10/TASK-21 implement/test the `MetricError::WeightedOvoUnsupported` /
+# `ValueError` gate instead of a value.
+_METRICS_FIXTURE_SEED = SEED
+
+
+def _c_metrics(arr, dtype):
+    """Float-cast helper for the metrics fixtures (Plan-Check Issue 5): EVERY
+    array saved into a `metrics_*.npz` file — including label arrays,
+    `labels*` arrays, and `ref_confusion*` count matrices — MUST go through
+    this cast. `mlrs_core::oracle::load_npz` only decodes 4-/8-byte float
+    dtypes and fails the WHOLE file on any int32/int64 array.
+    """
+    return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+
+def gen_metrics_classification_binary(seed: int = _METRICS_FIXTURE_SEED, dtype=np.float32) -> str:
+    """Generate the binary classification metrics oracle fixture (METR-CLS-01
+    ..07, METR-CLS-09). Requires ``scikit-learn==1.9.0`` (the version this
+    fixture was pinned against — see the Q6 resolution in
+    `.planning/plans/metrics-surface/PLAN.md`).
+
+    Builds a small binary `y_true`/`y_pred` set, a tie-heavy `y_score`
+    (quantized to 5 distinct levels so `roc_auc_score`/`precision_recall_curve`
+    exercise average-rank tie handling), a non-uniform `sample_weight`, and a
+    2-column row-major `y_prob_binary` proba array (Plan-Check Issue 7,
+    explicit binary `log_loss` reference). Every `ref_*` value is computed via
+    the corresponding `sklearn.metrics` function, INCLUDING the weighted
+    `precision_recall_curve` triple (Plan-Check Issue 1, always generated).
+    """
+    from sklearn.metrics import (
+        accuracy_score,
+        confusion_matrix,
+        f1_score,
+        log_loss,
+        precision_recall_curve,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+    )
+
+    rng = np.random.default_rng(seed + 101)
+    n = 40
+    y_true = rng.integers(0, 2, size=n)
+    flip = rng.random(n) < 0.2
+    y_pred = np.where(flip, 1 - y_true, y_true).astype(np.int64)
+    # Tie-heavy score: quantize to 5 distinct levels so several samples share
+    # an exact score (average-rank tie handling, SPEC METR-CLS-07/09).
+    y_score = np.round(rng.random(n) * 4) / 4.0
+    sample_weight = rng.uniform(0.5, 2.5, size=n)
+    proba_pos = np.clip(y_score, 0.0, 1.0)
+    y_prob_binary = np.column_stack([1.0 - proba_pos, proba_pos])
+
+    ref_accuracy = accuracy_score(y_true, y_pred)
+    ref_accuracy_sw = accuracy_score(y_true, y_pred, sample_weight=sample_weight)
+    ref_confusion = confusion_matrix(y_true, y_pred)
+    ref_confusion_sw = confusion_matrix(y_true, y_pred, sample_weight=sample_weight)
+    ref_precision_binary = precision_score(y_true, y_pred, pos_label=1, average="binary")
+    ref_recall_binary = recall_score(y_true, y_pred, pos_label=1, average="binary")
+    ref_f1_binary = f1_score(y_true, y_pred, pos_label=1, average="binary")
+    ref_precision_binary_sw = precision_score(
+        y_true, y_pred, pos_label=1, average="binary", sample_weight=sample_weight
+    )
+    ref_recall_binary_sw = recall_score(
+        y_true, y_pred, pos_label=1, average="binary", sample_weight=sample_weight
+    )
+    ref_f1_binary_sw = f1_score(
+        y_true, y_pred, pos_label=1, average="binary", sample_weight=sample_weight
+    )
+    ref_roc_auc = roc_auc_score(y_true, y_score)
+    ref_roc_auc_sw = roc_auc_score(y_true, y_score, sample_weight=sample_weight)
+    pr_precision, pr_recall, pr_thresholds = precision_recall_curve(y_true, y_score)
+    pr_precision_sw, pr_recall_sw, pr_thresholds_sw = precision_recall_curve(
+        y_true, y_score, sample_weight=sample_weight
+    )
+    ref_log_loss_binary = log_loss(y_true, y_prob_binary)
+
+    def c(arr):
+        return _c_metrics(arr, dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"metrics_cls_binary_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        y_true=c(y_true),
+        y_pred=c(y_pred),
+        y_score=c(y_score),
+        sample_weight=c(sample_weight),
+        y_prob_binary=c(y_prob_binary),
+        ref_accuracy=c([ref_accuracy]),
+        ref_accuracy_sw=c([ref_accuracy_sw]),
+        ref_confusion=c(ref_confusion),
+        ref_confusion_sw=c(ref_confusion_sw),
+        ref_precision_binary=c([ref_precision_binary]),
+        ref_recall_binary=c([ref_recall_binary]),
+        ref_f1_binary=c([ref_f1_binary]),
+        ref_precision_binary_sw=c([ref_precision_binary_sw]),
+        ref_recall_binary_sw=c([ref_recall_binary_sw]),
+        ref_f1_binary_sw=c([ref_f1_binary_sw]),
+        ref_roc_auc=c([ref_roc_auc]),
+        ref_roc_auc_sw=c([ref_roc_auc_sw]),
+        ref_pr_precision=c(pr_precision),
+        ref_pr_recall=c(pr_recall),
+        ref_pr_thresholds=c(pr_thresholds),
+        ref_pr_precision_sw=c(pr_precision_sw),
+        ref_pr_recall_sw=c(pr_recall_sw),
+        ref_pr_thresholds_sw=c(pr_thresholds_sw),
+        ref_log_loss_binary=c([ref_log_loss_binary]),
+    )
+    return out_path
+
+
+def gen_metrics_classification_multiclass(seed: int = _METRICS_FIXTURE_SEED, dtype=np.float32) -> str:
+    """Generate the 3-class classification metrics oracle fixture
+    (METR-CLS-01..08). Requires ``scikit-learn==1.9.0`` (Q6 resolution).
+
+    OvO+`sample_weight` probed under scikit-learn==1.9.0: RAISES
+    (`ValueError: sample_weight is not supported for multiclass one-vs-one
+    ROC AUC score, ...`) — Branch A (Plan-Check Issue 2, Q10). No
+    `ref_roc_auc_ovo_{macro,weighted}_sw` array is generated here; the
+    weighted OvR pair (`ref_roc_auc_ovr_{macro,weighted}_sw`) IS always
+    generated (Plan-Check Issue 1 — OvR carries no carve-out).
+
+    Also carries a `labels`-reorder triple (`y_true_labelreorder`/
+    `y_pred_labelreorder`/`labels_reorder=[2,0,1]`, Plan-Check Issue 6) with
+    `ref_{precision,recall,f1}_labelreorder` computed via
+    `average='macro'` — proves `labels` is ACCEPTED in a non-lexicographic
+    order without erroring (macro's mean-over-classes is order-invariant when
+    `labels` is a full permutation of the observed class set, so this is a
+    "labels order is accepted, value stays correct" acceptance test rather
+    than a "column semantics change" test; see the `average=None` per-class
+    tests for order-sensitive coverage).
+    """
+    from sklearn.metrics import (
+        accuracy_score,
+        confusion_matrix,
+        f1_score,
+        log_loss,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+    )
+
+    rng = np.random.default_rng(seed + 202)
+    n = 60
+    y_true = rng.integers(0, 3, size=n)
+    y_true[:3] = [0, 1, 2]  # ensure every class present at least once
+    flip = rng.random(n) < 0.25
+    y_pred = np.where(flip, (y_true + rng.integers(1, 3, size=n)) % 3, y_true).astype(np.int64)
+    y_true = y_true.astype(np.int64)
+    raw_proba = rng.random((n, 3))
+    y_proba = raw_proba / raw_proba.sum(axis=1, keepdims=True)
+    sample_weight = rng.uniform(0.5, 2.5, size=n)
+
+    ref_accuracy = accuracy_score(y_true, y_pred)
+    ref_accuracy_sw = accuracy_score(y_true, y_pred, sample_weight=sample_weight)
+    ref_confusion = confusion_matrix(y_true, y_pred)
+
+    averages = {"macro": "macro", "micro": "micro", "weighted": "weighted", "none": None}
+    ref_precision = {
+        k: precision_score(y_true, y_pred, average=v) for k, v in averages.items()
+    }
+    ref_recall = {k: recall_score(y_true, y_pred, average=v) for k, v in averages.items()}
+    ref_f1 = {k: f1_score(y_true, y_pred, average=v) for k, v in averages.items()}
+
+    ref_precision_macro_sw = precision_score(
+        y_true, y_pred, average="macro", sample_weight=sample_weight
+    )
+    ref_recall_macro_sw = recall_score(
+        y_true, y_pred, average="macro", sample_weight=sample_weight
+    )
+    ref_f1_macro_sw = f1_score(y_true, y_pred, average="macro", sample_weight=sample_weight)
+
+    ref_log_loss = log_loss(y_true, y_proba)
+    ref_log_loss_sw = log_loss(y_true, y_proba, sample_weight=sample_weight)
+
+    ref_roc_auc_ovr_macro = roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")
+    ref_roc_auc_ovr_weighted = roc_auc_score(
+        y_true, y_proba, multi_class="ovr", average="weighted"
+    )
+    ref_roc_auc_ovo_macro = roc_auc_score(y_true, y_proba, multi_class="ovo", average="macro")
+    ref_roc_auc_ovo_weighted = roc_auc_score(
+        y_true, y_proba, multi_class="ovo", average="weighted"
+    )
+    ref_roc_auc_ovr_macro_sw = roc_auc_score(
+        y_true, y_proba, multi_class="ovr", average="macro", sample_weight=sample_weight
+    )
+    ref_roc_auc_ovr_weighted_sw = roc_auc_score(
+        y_true, y_proba, multi_class="ovr", average="weighted", sample_weight=sample_weight
+    )
+    # Branch A (see module docstring above): OvO + sample_weight RAISES under
+    # scikit-learn==1.9.0 — no ref_roc_auc_ovo_*_sw is computed/saved.
+
+    labels_reorder = np.array([2, 0, 1], dtype=np.int64)
+    y_true_labelreorder = y_true.copy()
+    y_pred_labelreorder = y_pred.copy()
+    ref_precision_labelreorder = precision_score(
+        y_true_labelreorder, y_pred_labelreorder, labels=labels_reorder, average="macro"
+    )
+    ref_recall_labelreorder = recall_score(
+        y_true_labelreorder, y_pred_labelreorder, labels=labels_reorder, average="macro"
+    )
+    ref_f1_labelreorder = f1_score(
+        y_true_labelreorder, y_pred_labelreorder, labels=labels_reorder, average="macro"
+    )
+
+    def c(arr):
+        return _c_metrics(arr, dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"metrics_cls_multiclass_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        y_true=c(y_true),
+        y_pred=c(y_pred),
+        y_proba=c(y_proba),
+        sample_weight=c(sample_weight),
+        ref_accuracy=c([ref_accuracy]),
+        ref_accuracy_sw=c([ref_accuracy_sw]),
+        ref_confusion=c(ref_confusion),
+        ref_precision_macro=c([ref_precision["macro"]]),
+        ref_precision_micro=c([ref_precision["micro"]]),
+        ref_precision_weighted=c([ref_precision["weighted"]]),
+        ref_precision_none=c(ref_precision["none"]),
+        ref_recall_macro=c([ref_recall["macro"]]),
+        ref_recall_micro=c([ref_recall["micro"]]),
+        ref_recall_weighted=c([ref_recall["weighted"]]),
+        ref_recall_none=c(ref_recall["none"]),
+        ref_f1_macro=c([ref_f1["macro"]]),
+        ref_f1_micro=c([ref_f1["micro"]]),
+        ref_f1_weighted=c([ref_f1["weighted"]]),
+        ref_f1_none=c(ref_f1["none"]),
+        ref_precision_macro_sw=c([ref_precision_macro_sw]),
+        ref_recall_macro_sw=c([ref_recall_macro_sw]),
+        ref_f1_macro_sw=c([ref_f1_macro_sw]),
+        ref_log_loss=c([ref_log_loss]),
+        ref_log_loss_sw=c([ref_log_loss_sw]),
+        ref_roc_auc_ovr_macro=c([ref_roc_auc_ovr_macro]),
+        ref_roc_auc_ovr_weighted=c([ref_roc_auc_ovr_weighted]),
+        ref_roc_auc_ovo_macro=c([ref_roc_auc_ovo_macro]),
+        ref_roc_auc_ovo_weighted=c([ref_roc_auc_ovo_weighted]),
+        ref_roc_auc_ovr_macro_sw=c([ref_roc_auc_ovr_macro_sw]),
+        ref_roc_auc_ovr_weighted_sw=c([ref_roc_auc_ovr_weighted_sw]),
+        y_true_labelreorder=c(y_true_labelreorder),
+        y_pred_labelreorder=c(y_pred_labelreorder),
+        labels_reorder=c(labels_reorder),
+        ref_precision_labelreorder=c([ref_precision_labelreorder]),
+        ref_recall_labelreorder=c([ref_recall_labelreorder]),
+        ref_f1_labelreorder=c([ref_f1_labelreorder]),
+    )
+    return out_path
+
+
+def gen_metrics_classification_degenerate(seed: int = _METRICS_FIXTURE_SEED) -> str:
+    """Generate the hand-built classification-metrics degenerate fixture
+    (empty-class confusion, all-one-class confusion, zero-division P/R/F1,
+    single-sample accuracy, single-class roc_auc error-gate inputs, log_loss
+    0/1-probability clipping, log_loss `labels`-reorder). f64 only (SPEC §6:
+    exact/integer-valued tier, hand-built tiny arrays — no f32 variant
+    needed). Requires ``scikit-learn==1.9.0`` (Q6 resolution).
+
+    `log_loss` clip-vs-renormalize probed under scikit-learn==1.9.0 against a
+    row that does NOT sum to 1 (`[0.3, 0.3]`, sum 0.6): sklearn's value
+    (`0.857399...`) matches the CLIP-ONLY formula `-mean(log(p[true]))`
+    exactly, NOT the row-renormalized value (`0.490414...`) — sklearn clips
+    (and warns) but does not renormalize. `log_loss`'s Rust implementation
+    (TASK-08) must match clip-only.
+
+    `log_loss`'s `labels` parameter probed for reorder semantics: passing
+    `labels=[1, 0]` (non-lexicographic) produces the IDENTICAL value to
+    `labels=[0, 1]` (sorted) and to omitting `labels` entirely — sklearn
+    warns ("assumes labels are ordered lexicographically") but does NOT
+    remap which probability COLUMN is treated as which class; column `j`
+    is always the `j`-th smallest label in the resolved class set,
+    regardless of the order `labels` is passed in. TASK-08's `log_loss`
+    must mirror this: `labels` (when given) defines the accepted class SET
+    (sorted internally for column indexing), not a column permutation.
+    """
+    from sklearn.metrics import (
+        accuracy_score,
+        confusion_matrix,
+        f1_score,
+        log_loss,
+        precision_score,
+        recall_score,
+    )
+
+    y_true_empty = np.array([0, 1, 0, 1], dtype=np.int64)
+    y_pred_empty = np.array([0, 0, 1, 1], dtype=np.int64)
+    labels_empty = np.array([0, 1, 2], dtype=np.int64)
+    ref_confusion_empty = confusion_matrix(y_true_empty, y_pred_empty, labels=labels_empty)
+
+    y_true_one = np.array([3, 3, 3], dtype=np.int64)
+    y_pred_one = np.array([3, 3, 3], dtype=np.int64)
+    ref_confusion_one = confusion_matrix(y_true_one, y_pred_one)
+
+    # precision zero-division: positive class (1) never predicted.
+    y_true_zp = np.array([1, 1, 0, 0], dtype=np.int64)
+    y_pred_zp = np.array([0, 0, 0, 0], dtype=np.int64)
+    ref_precision_zerodiv = precision_score(y_true_zp, y_pred_zp, pos_label=1, zero_division=0)
+
+    # recall zero-division: positive class (1) never appears in y_true (no
+    # true positives are even possible).
+    y_true_zr = np.array([0, 0, 0, 0], dtype=np.int64)
+    y_pred_zr = np.array([1, 0, 1, 0], dtype=np.int64)
+    ref_recall_zerodiv = recall_score(y_true_zr, y_pred_zr, pos_label=1, zero_division=0)
+
+    # f1 zero-division: positive class (1) absent from both y_true and y_pred
+    # (both precision's and recall's denominators are zero).
+    y_true_zf = np.array([0, 0], dtype=np.int64)
+    y_pred_zf = np.array([0, 0], dtype=np.int64)
+    ref_f1_zerodiv = f1_score(y_true_zf, y_pred_zf, pos_label=1, zero_division=0)
+
+    y_true_single_match = np.array([1], dtype=np.int64)
+    y_pred_single_match = np.array([1], dtype=np.int64)
+    ref_acc_single_match = accuracy_score(y_true_single_match, y_pred_single_match)
+    y_true_single_mismatch = np.array([1], dtype=np.int64)
+    y_pred_single_mismatch = np.array([0], dtype=np.int64)
+    ref_acc_single_mismatch = accuracy_score(y_true_single_mismatch, y_pred_single_mismatch)
+
+    # Single-class roc_auc input: NO ref value is stored (an error gate, SPEC
+    # §6). Empirically (scikit-learn==1.9.0), roc_auc_score on this input
+    # does NOT raise — it emits UndefinedMetricWarning and returns `nan`.
+    # mlrs intentionally diverges here: `roc_auc_score_binary` returns
+    # `Err(MetricError::SingleClassRocAuc)` (mapped to `PyValueError` at the
+    # PyO3 boundary) rather than a silent NaN, matching the plan's explicit
+    # "gate the error, not a value" design intent (SPEC §9 risk 6) and the
+    # project's broader fail-closed philosophy. This is a DOCUMENTED,
+    # deliberate deviation from raw sklearn's own (NaN + warning) behavior on
+    # this specific degenerate input, not an oracle-fidelity violation (no
+    # numeric value is being compared either way).
+    y_true_singleclass = np.array([1, 1, 1, 1], dtype=np.int64)
+    y_score_singleclass = np.array([0.1, 0.4, 0.6, 0.9])
+
+    # log_loss 0.0/1.0-probability clipping degenerate.
+    y_true_clip = np.array([0, 1, 0, 1], dtype=np.int64)
+    y_prob_clip = np.array(
+        [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+    )
+    ref_log_loss_clip = log_loss(y_true_clip, y_prob_clip, labels=[0, 1])
+
+    # log_loss `labels`-reorder acceptance (Plan-Check Issue 6): non-sorted
+    # `labels=[1, 0]` must be ACCEPTED (no error) and produce the SAME value
+    # as the sorted/no-labels case (see the probe note in this docstring).
+    y_true_logloss_labelreorder = np.array([0, 1, 0, 1], dtype=np.int64)
+    y_prob_logloss_labelreorder = np.array(
+        [[0.3, 0.7], [0.6, 0.4], [0.2, 0.8], [0.9, 0.1]]
+    )
+    labels_logloss_reorder = np.array([1, 0], dtype=np.int64)
+    ref_log_loss_labelreorder = log_loss(
+        y_true_logloss_labelreorder,
+        y_prob_logloss_labelreorder,
+        labels=labels_logloss_reorder,
+    )
+
+    def c(arr):
+        return _c_metrics(arr, np.float64)
+
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"metrics_cls_degenerate_seed{seed}.npz")
+    np.savez(
+        out_path,
+        y_true_empty=c(y_true_empty),
+        y_pred_empty=c(y_pred_empty),
+        labels_empty=c(labels_empty),
+        ref_confusion_empty=c(ref_confusion_empty),
+        y_true_one=c(y_true_one),
+        y_pred_one=c(y_pred_one),
+        ref_confusion_one=c(ref_confusion_one),
+        y_true_zp=c(y_true_zp),
+        y_pred_zp=c(y_pred_zp),
+        ref_precision_zerodiv=c([ref_precision_zerodiv]),
+        y_true_zr=c(y_true_zr),
+        y_pred_zr=c(y_pred_zr),
+        ref_recall_zerodiv=c([ref_recall_zerodiv]),
+        y_true_zf=c(y_true_zf),
+        y_pred_zf=c(y_pred_zf),
+        ref_f1_zerodiv=c([ref_f1_zerodiv]),
+        y_true_single_match=c(y_true_single_match),
+        y_pred_single_match=c(y_pred_single_match),
+        ref_acc_single_match=c([ref_acc_single_match]),
+        y_true_single_mismatch=c(y_true_single_mismatch),
+        y_pred_single_mismatch=c(y_pred_single_mismatch),
+        ref_acc_single_mismatch=c([ref_acc_single_mismatch]),
+        y_true_singleclass=c(y_true_singleclass),
+        y_score_singleclass=c(y_score_singleclass),
+        y_true_clip=c(y_true_clip),
+        y_prob_clip=c(y_prob_clip),
+        ref_log_loss_clip=c([ref_log_loss_clip]),
+        y_true_logloss_labelreorder=c(y_true_logloss_labelreorder),
+        y_prob_logloss_labelreorder=c(y_prob_logloss_labelreorder),
+        labels_logloss_reorder=c(labels_logloss_reorder),
+        ref_log_loss_labelreorder=c([ref_log_loss_labelreorder]),
+    )
+    return out_path
+
+
+def gen_metrics_regression(seed: int = _METRICS_FIXTURE_SEED, dtype=np.float32) -> str:
+    """Generate the regression metrics oracle fixture (METR-REG-01..03).
+    Requires ``scikit-learn==1.9.0`` (Q6 resolution). Single-output only (1-D
+    `y_true`/`y_pred`) — no 2-D array anywhere in this generator, per SPEC §2's
+    multioutput non-goal.
+
+    `ref_r2_const` is read off the ACTUAL sklearn-computed value (SPEC §5 REG
+    note, SPEC §9 risk 5), not hand-derived: constant `y_true_const` with a
+    NON-exact-matching `y_pred_const` yields sklearn's documented `0.0`
+    (verified against the installed scikit-learn==1.9.0, not assumed).
+    """
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+    rng = np.random.default_rng(seed + 303)
+    n = 30
+    y_true = rng.uniform(-5.0, 5.0, size=n)
+    y_pred = y_true + rng.normal(0.0, 0.5, size=n)
+    sample_weight = rng.uniform(0.5, 2.5, size=n)
+
+    ref_r2 = r2_score(y_true, y_pred)
+    ref_r2_sw = r2_score(y_true, y_pred, sample_weight=sample_weight)
+    ref_mse = mean_squared_error(y_true, y_pred)
+    ref_mse_sw = mean_squared_error(y_true, y_pred, sample_weight=sample_weight)
+    ref_mae = mean_absolute_error(y_true, y_pred)
+    ref_mae_sw = mean_absolute_error(y_true, y_pred, sample_weight=sample_weight)
+
+    # Constant-target degenerate: y_true_const is all-equal (ss_tot == 0);
+    # y_pred_const does NOT exactly match it.
+    y_true_const = np.array([5.0, 5.0, 5.0, 5.0, 5.0])
+    y_pred_const = np.array([5.0, 5.1, 4.9, 5.0, 5.2])
+    ref_r2_const = r2_score(y_true_const, y_pred_const)
+
+    # Perfect-prediction degenerate.
+    y_perfect = rng.uniform(-3.0, 3.0, size=10)
+    ref_r2_perfect = r2_score(y_perfect, y_perfect)
+    ref_mse_perfect = mean_squared_error(y_perfect, y_perfect)
+    ref_mae_perfect = mean_absolute_error(y_perfect, y_perfect)
+
+    def c(arr):
+        return _c_metrics(arr, dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"metrics_reg_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        y_true=c(y_true),
+        y_pred=c(y_pred),
+        sample_weight=c(sample_weight),
+        ref_r2=c([ref_r2]),
+        ref_r2_sw=c([ref_r2_sw]),
+        ref_mse=c([ref_mse]),
+        ref_mse_sw=c([ref_mse_sw]),
+        ref_mae=c([ref_mae]),
+        ref_mae_sw=c([ref_mae_sw]),
+        y_true_const=c(y_true_const),
+        y_pred_const=c(y_pred_const),
+        ref_r2_const=c([ref_r2_const]),
+        y_perfect=c(y_perfect),
+        ref_r2_perfect=c([ref_r2_perfect]),
+        ref_mse_perfect=c([ref_mse_perfect]),
+        ref_mae_perfect=c([ref_mae_perfect]),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -3834,6 +4315,15 @@ def main() -> None:
         print(f"wrote {gen_hgb_regressor(dtype=dtype)}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_hgb_classifier(dtype=dtype)}")
+
+    # ---- Metrics surface fixtures (METR-01/02/03) ----
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_metrics_classification_binary(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_metrics_classification_multiclass(dtype=dtype)}")
+    print(f"wrote {gen_metrics_classification_degenerate()}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_metrics_regression(dtype=dtype)}")
 
 
 if __name__ == "__main__":

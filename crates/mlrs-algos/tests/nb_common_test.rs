@@ -105,6 +105,18 @@ fn accuracy_score_fraction() {
     assert!(accuracy_score(&[1, 2], &[3, 4]).abs() < 1e-12);
 }
 
+/// TASK-03 (Plan-Check Issue 8): `nb_common::accuracy_score`'s delegation to
+/// `metrics::classification::accuracy_score` computes empty input as
+/// `weighted_correct/weighted_total = 0.0/0.0`, which is IEEE-754 `NaN` —
+/// the SAME documented empty-input contract as before the delegation
+/// (`nb_common.rs`'s doc-comment), now locked in by a dedicated regression
+/// assertion so a future refactor of the shared `accuracy_score` cannot
+/// silently change empty-input behavior to `0.0` or a panic.
+#[test]
+fn nb_common_accuracy_score_empty_input_is_nan() {
+    assert!(accuracy_score(&[], &[]).is_nan());
+}
+
 /// LAUNCH WITNESS: `class_grouped_sum` GATHER on a 4×2 host example with 2
 /// classes, validated against a host reference. Runs under `--features cpu` (the
 /// reduce-prim launch is the ROADMAP cpu-launch gate; NO new `#[cube]` kernel).
