@@ -27,7 +27,7 @@ use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::random_forest::{
-    rf_fit_class, rf_fit_reg, rf_predict_proba, rf_predict_reg, RfParams,
+    rf_fit_class, rf_fit_reg, rf_predict_proba, rf_predict_reg, RfFitOutcome, RfParams,
 };
 use mlrs_backend::runtime::{self, ActiveRuntime};
 
@@ -76,6 +76,7 @@ fn params_single_tree() -> RfParams {
         min_samples_leaf: 1.0,
         bootstrap: false,
         seed: 42,
+        oob_score: false,
     }
 }
 
@@ -96,8 +97,9 @@ where
     let x_dev = upload::<F>(&mut pool, &xdata());
     let y_idx: Vec<u32> = vec![0, 0, 0, 0, 1, 1, 2, 2];
 
-    let model = rf_fit_class::<F>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params_single_tree())
-        .expect("fit hand-oracle classifier");
+    let RfFitOutcome { model, .. } =
+        rf_fit_class::<F>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params_single_tree())
+            .expect("fit hand-oracle classifier");
 
     // Root split: feature 0, threshold 0.5 (the (0.4+0.6)/2 midpoint edge).
     let feats = model.split_feature_host(&pool);
@@ -157,8 +159,9 @@ where
     let y = vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
     let y_dev = upload::<F>(&mut pool, &y);
 
-    let model = rf_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &params_single_tree())
-        .expect("fit hand-oracle regressor");
+    let RfFitOutcome { model, .. } =
+        rf_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &params_single_tree())
+            .expect("fit hand-oracle regressor");
 
     // Root: feature 0 @ 0.5. Right child: feature 0 @ 0.75 (flat-k tie-break
     // over the equal-proxy f1@0.35 split).
@@ -227,15 +230,18 @@ fn bootstrap_fit_is_seed_deterministic_f32() {
         min_samples_leaf: 1.0,
         bootstrap: true,
         seed: 1234,
+        oob_score: false,
     };
     let xq = vec![0.2, 0.5, 0.85, 0.2, 0.65, 0.95, 0.45, 0.45];
     let xq_dev = upload::<f32>(&mut pool, &xq);
 
-    let m1 = rf_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params).expect("fit 1");
+    let RfFitOutcome { model: m1, .. } =
+        rf_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params).expect("fit 1");
     let p1 = rf_predict_proba::<f32>(&mut pool, &m1, &xq_dev, (4, 2))
         .expect("proba 1")
         .to_host(&pool);
-    let m2 = rf_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params).expect("fit 2");
+    let RfFitOutcome { model: m2, .. } =
+        rf_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params).expect("fit 2");
     let p2 = rf_predict_proba::<f32>(&mut pool, &m2, &xq_dev, (4, 2))
         .expect("proba 2")
         .to_host(&pool);
@@ -270,7 +276,7 @@ fn invalid_geometry_is_typed_error_f32() {
     params.max_depth = 2;
 
     // Predict-side: feature-count mismatch vs the fitted model.
-    let model =
+    let RfFitOutcome { model, .. } =
         rf_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params).expect("valid fit");
     let xq_bad = upload::<f32>(&mut pool, &[0.1, 0.2, 0.3]);
     assert!(rf_predict_proba::<f32>(&mut pool, &model, &xq_bad, (1, 3)).is_err());

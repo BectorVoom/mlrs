@@ -200,11 +200,44 @@ def test_nearest_neighbors_has_no_predict_but_has_kneighbors():
         ("HDBSCAN", "labels_"),
         ("HDBSCAN", "probabilities_"),
         ("UMAP", "embedding_"),
+        # --- TASK-16 (PY-ENS-05, RF): always-present fitted attribute. ----- #
+        ("RandomForestClassifier", "feature_importances_"),
+        ("RandomForestRegressor", "feature_importances_"),
     ],
 )
 def test_fitted_attr_raises_before_fit(name, attr):
     with pytest.raises(NotFittedError):
         getattr(_ctor(name), attr)
+
+
+# --- TASK-16 (PY-ENS-05, RF-OOB-02): `oob_score_` conditional attribute. --- #
+#
+# `oob_score_` is the FIRST mlrs fitted attribute whose presence depends on a
+# constructor arg (RF-OOB-02's own unresolved-question resolution, PLAN.md
+# "Q-conditional-attribute test machinery"): `test_fitted_attr_raises_before_fit`
+# only proves "raises NotFittedError before fit" for an ALWAYS-eventually-present
+# attribute — it has no support for the THIRD state this attribute has
+# ("AttributeError even AFTER fit, when a constructor flag is False"). This gets
+# its own dedicated test rather than an entry in that generic parametrize list.
+def test_random_forest_oob_score_conditional_attribute():
+    """`oob_score_` (RF-OOB-02): NotFittedError before fit; AttributeError
+    after fit when `oob_score=False` (sklearn parity — NOT a silent `None`)."""
+    # (a) oob_score=True, before fit -> standard NotFittedError.
+    with pytest.raises(NotFittedError):
+        mlrs.RandomForestClassifier(oob_score=True).oob_score_
+
+    # (b) oob_score=False (the default), AFTER fit -> AttributeError. This half
+    # needs a real `.fit()` through the compiled `_mlrs` extension, so it is
+    # skipped (not failed) on a not-yet-built tree, keeping this file's
+    # pure-Python collection contract intact for part (a) above.
+    pytest.importorskip("mlrs._mlrs")
+    X = [[0.0, 0.0], [1.0, 1.0], [2.0, 0.5], [0.5, 2.0], [1.5, 1.5], [3.0, 3.0]]
+    y = [0.0, 1.0, 2.0, 0.5, 1.5, 3.0]
+    est = mlrs.RandomForestRegressor(
+        n_estimators=2, max_depth=2, oob_score=False
+    ).fit(X, y)
+    with pytest.raises(AttributeError):
+        est.oob_score_
 
 
 @pytest.mark.parametrize("name", ALL_SHIMS)

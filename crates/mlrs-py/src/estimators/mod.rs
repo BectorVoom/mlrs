@@ -31,6 +31,7 @@
 pub mod cluster;
 pub mod covariance;
 pub mod decomposition;
+pub mod ensemble;
 pub mod kernel;
 pub mod linear;
 pub mod manifold;

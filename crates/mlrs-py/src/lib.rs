@@ -62,7 +62,10 @@ pub mod ingress;
 // TASK-15): thin wrappers over `mlrs_algos::metrics::{classification,regression}`.
 pub mod metrics;
 
-// The 12 estimator `#[pyclass]` wrappers (Plan 03). Registered on `_mlrs` below.
+// The estimator `#[pyclass]` wrappers (Plan 03 onward, across every estimator
+// family landed since — linear/cluster/decomposition/neighbors/covariance/
+// projection/kernel/spectral/SGD-SVM/naive_bayes/manifold+HDBSCAN/ensemble).
+// Registered on `_mlrs` below.
 pub mod estimators;
 
 /// Boundary errors use `anyhow` (D-10); this alias documents the boundary error
@@ -175,7 +178,8 @@ fn backend_supports_f64() -> bool {
 /// pure-Python `mlrs` package (`module-name = "mlrs._mlrs"`).
 ///
 /// At import it runs the D-08 driver probe and, on success, registers the
-/// low-level surface. Plan 03 registers the 12 estimator `#[pyclass]`es here.
+/// low-level surface. Plan 03 registers the estimator `#[pyclass]`es here;
+/// every subsequent estimator-family phase adds its own `add_class` block.
 #[pymodule]
 fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // D-08 / T-06-05: probe the driver ONCE at import. cubecl's `client()`
@@ -198,11 +202,15 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The driver is present: register the low-level surface.
     m.add_function(wrap_pyfunction!(backend_supports_f64, m)?)?;
 
-    // Register all 12 estimator `#[pyclass]` wrappers (PY-01). The pure-Python
+    // Register all estimator `#[pyclass]` wrappers (PY-01). The pure-Python
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.
     use estimators::cluster::{PyDBSCAN, PyHDBSCAN, PyKMeans};
     use estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
     use estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
+    use estimators::ensemble::{
+        PyHistGradientBoostingClassifier, PyHistGradientBoostingRegressor,
+        PyRandomForestClassifier, PyRandomForestRegressor,
+    };
     use estimators::kernel::{PyKernelDensity, PyKernelRidge};
     use estimators::linear::{
         PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
@@ -268,6 +276,21 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `any_estimator_typestate!`).
     m.add_class::<PyUMAP>()?;
     m.add_class::<PyHDBSCAN>()?;
+
+    // Phase-13 ensemble wrappers (PY-ENS-01/02, RF-IMP-02, RF-OOB-02 —
+    // TASK-10, Wave 4a): RandomForestClassifier/Regressor, registration
+    // 32 -> 34.
+    m.add_class::<PyRandomForestClassifier>()?;
+    m.add_class::<PyRandomForestRegressor>()?;
+
+    // Phase-14 ensemble wrappers (PY-ENS-03/04, PY-ENS-05 —
+    // TASK-20, Wave 10a): HistGradientBoostingClassifier/Regressor,
+    // registration 34 -> 36. Structural-only (no `feature_importances_`/
+    // `oob_score_`, SPEC §2 non-goal — see `estimators::ensemble`'s module
+    // doc). This is the FINAL registration correction in this plan's scope:
+    // no further estimator additions follow.
+    m.add_class::<PyHistGradientBoostingClassifier>()?;
+    m.add_class::<PyHistGradientBoostingRegressor>()?;
 
     // The host-only sklearn metrics surface (METR-BIND-01, TASK-15): 11
     // metrics + 3 `_per_class` variants (precision/recall/f1's

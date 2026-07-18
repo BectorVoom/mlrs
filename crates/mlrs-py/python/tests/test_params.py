@@ -243,6 +243,50 @@ EXPECTED_PARAMS = {
         "max_cluster_size": 0,
         "output_type": "input",
     },
+    # --- TASK-16 (PY-ENS-05, RF): RandomForestClassifier/Regressor. ------- #
+    "RandomForestClassifier": {
+        "n_estimators": 100,
+        "max_depth": 10,
+        "n_bins": 32,
+        "max_features": "sqrt",
+        "min_samples_split": 2.0,
+        "min_samples_leaf": 1.0,
+        "bootstrap": True,
+        "oob_score": False,
+        "seed": 42,
+        "output_type": "input",
+    },
+    "RandomForestRegressor": {
+        "n_estimators": 100,
+        "max_depth": 10,
+        "n_bins": 32,
+        "max_features": 1.0,
+        "min_samples_split": 2.0,
+        "min_samples_leaf": 1.0,
+        "bootstrap": True,
+        "oob_score": False,
+        "seed": 42,
+        "output_type": "input",
+    },
+    # --- TASK-25 (PY-ENS-05, HGB): HistGradientBoostingClassifier/Regressor.
+    "HistGradientBoostingClassifier": {
+        "max_iter": 100,
+        "learning_rate": 0.1,
+        "max_depth": 6,
+        "n_bins": 64,
+        "l2_regularization": 0.0,
+        "min_samples_leaf": 20,
+        "output_type": "input",
+    },
+    "HistGradientBoostingRegressor": {
+        "max_iter": 100,
+        "learning_rate": 0.1,
+        "max_depth": 6,
+        "n_bins": 64,
+        "l2_regularization": 0.0,
+        "min_samples_leaf": 20,
+        "output_type": "input",
+    },
 }
 
 # The first non-output_type param to round-trip via set_params, with a new value.
@@ -281,6 +325,12 @@ SET_PARAM = {
     "SpectralEmbedding": ("n_components", 3),
     "UMAP": ("n_neighbors", 10),
     "HDBSCAN": ("min_cluster_size", 10),
+    # --- TASK-16 (PY-ENS-05, RF): RandomForestClassifier/Regressor. ------- #
+    "RandomForestClassifier": ("n_estimators", 10),
+    "RandomForestRegressor": ("n_estimators", 10),
+    # --- TASK-25 (PY-ENS-05, HGB): HistGradientBoostingClassifier/Regressor.
+    "HistGradientBoostingClassifier": ("max_iter", 10),
+    "HistGradientBoostingRegressor": ("max_iter", 10),
 }
 
 # The full estimator-shim matrix, derived from EXPECTED_PARAMS so it cannot drift

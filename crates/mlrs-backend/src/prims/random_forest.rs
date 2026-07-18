@@ -33,7 +33,7 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use mlrs_kernels::tree::{
     rf_best_split, rf_bin_features, rf_count_left, rf_hist_class, rf_hist_cum, rf_hist_reg,
-    rf_mean_reg, rf_node_max, rf_node_total, rf_partition, rf_predict_leaf,
+    rf_mean_reg, rf_node_max, rf_node_sqsum, rf_node_total, rf_partition, rf_predict_leaf,
     rf_split_scores_class, rf_split_scores_reg, rf_vote_class,
 };
 
@@ -80,6 +80,15 @@ pub struct RfParams {
     /// Seed for the single host RNG stream (bootstrap draws, then per-level
     /// feature subsamples, in a fixed consumption order — reproducible).
     pub seed: u64,
+    /// RF-OOB-01: compute `RfFitOutcome::oob_score` at fit time. `false`
+    /// (default) performs ZERO extra device/host work beyond the ordinary
+    /// fit. `true` re-derives the bootstrap weight mask (a second,
+    /// identically-seeded `SplitMix64` + [`bootstrap_weights`] pass) and
+    /// scores each training row using ONLY the trees for which it was
+    /// out-of-bag (never drawn): accuracy for a classifier, R² for a
+    /// regressor. Rows with zero out-of-bag trees are excluded from the
+    /// aggregate (sklearn parity) and reported once via `log::warn!`.
+    pub oob_score: bool,
 }
 
 /// A fitted, device-resident forest (complete-tree layout, `n_trees ×
@@ -94,6 +103,13 @@ where
     threshold: DeviceArray<ActiveRuntime, F>,
     is_leaf: DeviceArray<ActiveRuntime, u32>,
     leaf_dist: DeviceArray<ActiveRuntime, F>,
+    /// Per-node weighted impurity decrease (RF-IMP-01), `0` on leaves.
+    /// Device-resident for parity with the other model arrays; the
+    /// Python/algos-facing `feature_importances_` accessor reads the
+    /// already-reduced, already-normalized host `Vec<F>` on
+    /// [`RfFitOutcome`] instead (computed once at fit time), not a lazy
+    /// re-reduction of this field.
+    node_decrease: DeviceArray<ActiveRuntime, F>,
     n_trees: usize,
     max_depth: usize,
     total_nodes: usize,
@@ -145,6 +161,28 @@ where
     pub fn leaf_dist_host(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.leaf_dist.to_host(pool)
     }
+
+    /// Host copy of the per-node weighted impurity decrease (RF-IMP-01,
+    /// debug/tests; `0` on leaves). The normalized `feature_importances_`
+    /// vector is computed ONCE at fit time and returned on
+    /// [`RfFitOutcome::feature_importances`], not re-derived from this field.
+    pub fn node_decrease_host(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.node_decrease.to_host(pool)
+    }
+}
+
+/// The full output of a Random Forest fit (RF-IMP-01 / RF-OOB-01): the
+/// fitted forest, the normalized (sums to `1.0`, all-zero in the degenerate
+/// all-leaf-forest case) length-`n_features` `feature_importances_` vector,
+/// and the out-of-bag score (`None` unless `params.oob_score == true` —
+/// always `None` as of RF-IMP-01; RF-OOB-01/TASK-04 populates `Some`).
+pub struct RfFitOutcome<F>
+where
+    F: Float + CubeElement + Pod,
+{
+    pub model: RfModel<F>,
+    pub feature_importances: Vec<F>,
+    pub oob_score: Option<F>,
 }
 
 /// Fit a Random Forest CLASSIFIER. `y_idx` are DENSE class indices
@@ -156,7 +194,7 @@ pub fn rf_fit_class<F>(
     y_idx: &[u32],
     n_classes: usize,
     params: &RfParams,
-) -> Result<RfModel<F>, PrimError>
+) -> Result<RfFitOutcome<F>, PrimError>
 where
     F: Float + CubeElement + Pod,
 {
@@ -198,7 +236,7 @@ pub fn rf_fit_reg<F>(
     shape: (usize, usize),
     y: &DeviceArray<ActiveRuntime, F>,
     params: &RfParams,
-) -> Result<RfModel<F>, PrimError>
+) -> Result<RfFitOutcome<F>, PrimError>
 where
     F: Float + CubeElement + Pod,
 {
@@ -433,7 +471,7 @@ fn rf_fit_impl<F>(
     shape: (usize, usize),
     target: RfTarget<'_, F>,
     params: &RfParams,
-) -> Result<RfModel<F>, PrimError>
+) -> Result<RfFitOutcome<F>, PrimError>
 where
     F: Float + CubeElement + Pod,
 {
@@ -513,12 +551,15 @@ where
     let threshold_h = pool.acquire(t * total_nodes * size_of::<F>());
     let is_leaf_h = pool.acquire(t * total_nodes * size_of::<u32>());
     let leaf_dist_h = pool.acquire(t * total_nodes * nc_out * size_of::<F>());
+    let node_decrease_h = pool.acquire(t * total_nodes * size_of::<F>());
     let split_feature = DeviceArray::<ActiveRuntime, u32>::from_raw(split_feature_h, t * total_nodes);
     let split_bin = DeviceArray::<ActiveRuntime, u32>::from_raw(split_bin_h, t * total_nodes);
     let threshold = DeviceArray::<ActiveRuntime, F>::from_raw(threshold_h, t * total_nodes);
     let is_leaf = DeviceArray::<ActiveRuntime, u32>::from_raw(is_leaf_h, t * total_nodes);
     let leaf_dist =
         DeviceArray::<ActiveRuntime, F>::from_raw(leaf_dist_h, t * total_nodes * nc_out);
+    let node_decrease =
+        DeviceArray::<ActiveRuntime, F>::from_raw(node_decrease_h, t * total_nodes);
 
     let min_split_f = f64_to_host::<F>(params.min_samples_split);
     let min_leaf_f = f64_to_host::<F>(params.min_samples_leaf);
@@ -536,10 +577,11 @@ where
         let feat_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(pool, &feat_host);
         drop(feat_host);
 
-        // Tree chunking to the transient-buffer byte budget.
+        // Tree chunking to the transient-buffer byte budget (3 stats-shaped
+        // buffers now: node_total, node_max, node_sq).
         let per_tree_bytes = nodes * mf * nb * ncs * size_of::<F>()
             + nodes * mf * (nb - 1) * size_of::<F>()
-            + 2 * nodes * size_of::<F>();
+            + 3 * nodes * size_of::<F>();
         let chunk_t = (RF_HIST_BUDGET_BYTES / per_tree_bytes.max(1)).clamp(1, t);
 
         let mut tree_base = 0usize;
@@ -553,6 +595,7 @@ where
             let scores_h = pool.acquire(scores_len * size_of::<F>());
             let ntot_h = pool.acquire(stats_len * size_of::<F>());
             let nmax_h = pool.acquire(stats_len * size_of::<F>());
+            let nsq_h = pool.acquire(stats_len * size_of::<F>());
 
             // K1: histogram gather.
             {
@@ -667,6 +710,28 @@ where
                 );
             }
 
+            // K4.5: per-node classifier sum-of-squares (RF-IMP-01 impurity-
+            // decrease staging). Launched unconditionally for BOTH targets
+            // (mirrors K4's own "reuse the same shape on both modes"
+            // precedent) — the regressor's resulting `n² + (Σy)²` value is
+            // never read (rf_best_split gates every node_sq read behind
+            // mode_class == 1u32).
+            {
+                let (count, dim) = launch_dims_1d(stats_len);
+                rf_node_sqsum::launch::<F, ActiveRuntime>(
+                    &client,
+                    count,
+                    dim,
+                    unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                    unsafe { ArrayArg::from_raw_parts(nsq_h.clone(), stats_len) },
+                    mf as u32,
+                    nb as u32,
+                    ncs as u32,
+                    nodes as u32,
+                    tc as u32,
+                );
+            }
+
             // K5: split scores.
             {
                 let (count, dim) = launch_dims_1d(scores_len);
@@ -714,6 +779,7 @@ where
                     unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
                     unsafe { ArrayArg::from_raw_parts(ntot_h.clone(), stats_len) },
                     unsafe { ArrayArg::from_raw_parts(nmax_h.clone(), stats_len) },
+                    unsafe { ArrayArg::from_raw_parts(nsq_h.clone(), stats_len) },
                     unsafe { ArrayArg::from_raw_parts(scores_h.clone(), scores_len) },
                     unsafe { ArrayArg::from_raw_parts(feat_dev.handle().clone(), t * nodes * mf) },
                     unsafe {
@@ -735,6 +801,9 @@ where
                             t * total_nodes * nc_out,
                         )
                     },
+                    unsafe {
+                        ArrayArg::from_raw_parts(node_decrease.handle().clone(), t * total_nodes)
+                    },
                     min_split_f,
                     mf as u32,
                     nb as u32,
@@ -755,6 +824,7 @@ where
             pool.release(scores_h, scores_len * size_of::<F>());
             pool.release(ntot_h, stats_len * size_of::<F>());
             pool.release(nmax_h, stats_len * size_of::<F>());
+            pool.release(nsq_h, stats_len * size_of::<F>());
 
             tree_base += tc;
         }
@@ -823,16 +893,198 @@ where
     w_dev.release_into(pool);
     split_bin.release_into(pool);
 
-    Ok(RfModel {
+    // The fitted forest, assembled now (not deferred to the final `Ok(...)`)
+    // so both the RF-IMP-01 reduction below and the RF-OOB-01 block can read
+    // it through the same `RfModel` accessors `rf_predict_leaf`'s existing
+    // callers already use (`predict_leaves`, `rf_predict_proba`,
+    // `rf_predict_reg`) — reusing the predict-path traversal, not
+    // reimplementing it.
+    let model = RfModel {
         split_feature,
         threshold,
         is_leaf,
         leaf_dist,
+        node_decrease,
         n_trees: t,
         max_depth: depth,
         total_nodes,
         n_features: d,
         n_values: nc_out,
+    };
+
+    // RF-IMP-01: ONE host reduction to feature_importances_, after the
+    // level loop completes (the same "readback after launch-only compute"
+    // pattern already used above for the quantile bin edges — not a
+    // per-iteration host-sync regression).
+    //
+    // sklearn's `RandomForest.feature_importances_` (sklearn.ensemble
+    // `_forest.py`) normalizes EACH tree's weighted-impurity-decrease vector
+    // to sum 1 individually, then averages those per-tree vectors over the
+    // trees that actually split, then renormalizes the mean to sum 1:
+    //   mean_t( d_{t,f} / S_t )  (over trees with S_t > 0), then / its own sum.
+    // This is NOT the same as one global normalization `Σ_t d_{t,f} / Σ_t S_t`
+    // whenever the per-tree totals `S_t` differ — which they do under
+    // `bootstrap=true` (the DEFAULT), where each tree sees a different
+    // resample. We replicate sklearn's per-tree scheme exactly so the default
+    // config matches within the oracle band, not only the deterministic tier
+    // (where all trees are bit-identical and the two schemes coincide).
+    let split_feature_host_imp = model.split_feature_host(pool);
+    let is_leaf_host_imp = model.is_leaf_host(pool);
+    let node_decrease_host_imp = model.node_decrease_host(pool);
+    let mut imp = vec![0f64; d];
+    let mut n_contributing = 0usize;
+    for tr in 0..t {
+        let base = tr * total_nodes;
+        let mut imp_t = vec![0f64; d];
+        for node in 0..total_nodes {
+            let i = base + node;
+            if is_leaf_host_imp[i] == 0 {
+                let f = split_feature_host_imp[i] as usize;
+                imp_t[f] += host_to_f64(node_decrease_host_imp[i]);
+            }
+        }
+        let s_t: f64 = imp_t.iter().sum();
+        if s_t > 0.0 {
+            for (acc, v) in imp.iter_mut().zip(imp_t.iter()) {
+                *acc += *v / s_t;
+            }
+            n_contributing += 1;
+        }
+    }
+    if n_contributing > 0 {
+        // Mean over the split-bearing trees, then renormalize. The mean of
+        // unit-sum vectors already sums to 1; the trailing divide mirrors
+        // sklearn's own `all_importances / np.sum(all_importances)` for
+        // exactness under float rounding.
+        for v in imp.iter_mut() {
+            *v /= n_contributing as f64;
+        }
+        let imp_sum: f64 = imp.iter().sum();
+        if imp_sum > 0.0 {
+            for v in imp.iter_mut() {
+                *v /= imp_sum;
+            }
+        }
+    }
+    // else: every tree is a single leaf (degenerate) — leave the all-zero
+    // vector, matching sklearn's zeros return, never a divide-by-zero.
+    let feature_importances: Vec<F> = imp.into_iter().map(f64_to_host::<F>).collect();
+
+    // RF-OOB-01: gated OOB aggregation. `false` (default) is a no-op — zero
+    // extra device/host work beyond the ordinary fit.
+    let oob_score: Option<F> = if params.oob_score {
+        // Rederive the bootstrap mask on a FRESH, identically-seeded stream
+        // (not persisted from the level loop): `bootstrap_weights` is
+        // documented as the FIRST draw on the seeded stream, so this
+        // reproduces `w_host` byte-for-byte at the cost of one cheap,
+        // host-only, no-device-sync pass — cheaper than retaining an extra
+        // `t·n·sizeof(F)` device buffer for the common `oob_score=false`
+        // case.
+        let mut oob_rng = SplitMix64::new(params.seed);
+        let w_host2 = bootstrap_weights::<F>(&mut oob_rng, t, n, params.bootstrap);
+
+        // Reuse the existing predict-path leaf-traversal kernel against the
+        // just-built model and the TRAINING `x` (still in scope — only
+        // `x_host` was dropped above).
+        let leaf_dev = predict_leaves(pool, &model, x, n);
+        let leaf_host = leaf_dev.to_host(pool);
+        leaf_dev.release_into(pool);
+        let leaf_dist_host = model.leaf_dist_host(pool);
+        let nc = model.n_values;
+
+        let mut zero_oob_count = 0usize;
+        let score: f64 = match &target {
+            RfTarget::Class(y_dev, _n_classes) => {
+                let y_host = y_dev.to_host(pool);
+                let mut correct = 0usize;
+                let mut total = 0usize;
+                for i in 0..n {
+                    let mut acc = vec![0f64; nc];
+                    let mut cnt = 0usize;
+                    for tt in 0..t {
+                        if host_to_f64(w_host2[tt * n + i]) == 0.0 {
+                            let lf = leaf_host[tt * n + i] as usize;
+                            for (c, slot) in acc.iter_mut().enumerate() {
+                                *slot += host_to_f64(leaf_dist_host[(tt * total_nodes + lf) * nc + c]);
+                            }
+                            cnt += 1;
+                        }
+                    }
+                    if cnt == 0 {
+                        zero_oob_count += 1;
+                        continue;
+                    }
+                    let mut best_c = 0usize;
+                    let mut best_v = acc[0];
+                    for (c, &v) in acc.iter().enumerate().skip(1) {
+                        if v > best_v {
+                            best_v = v;
+                            best_c = c;
+                        }
+                    }
+                    total += 1;
+                    if best_c as u32 == y_host[i] {
+                        correct += 1;
+                    }
+                }
+                if total == 0 {
+                    0.0
+                } else {
+                    correct as f64 / total as f64
+                }
+            }
+            RfTarget::Reg(y_dev) => {
+                let y_host = y_dev.to_host(pool);
+                let mut preds: Vec<f64> = Vec::with_capacity(n);
+                let mut truths: Vec<f64> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let mut acc = 0f64;
+                    let mut cnt = 0usize;
+                    for tt in 0..t {
+                        if host_to_f64(w_host2[tt * n + i]) == 0.0 {
+                            let lf = leaf_host[tt * n + i] as usize;
+                            acc += host_to_f64(leaf_dist_host[tt * total_nodes + lf]);
+                            cnt += 1;
+                        }
+                    }
+                    if cnt == 0 {
+                        zero_oob_count += 1;
+                        continue;
+                    }
+                    preds.push(acc / cnt as f64);
+                    truths.push(host_to_f64(y_host[i]));
+                }
+                if truths.is_empty() {
+                    0.0
+                } else {
+                    let mean_t: f64 = truths.iter().sum::<f64>() / truths.len() as f64;
+                    let ss_res: f64 =
+                        preds.iter().zip(truths.iter()).map(|(p, tv)| (tv - p).powi(2)).sum();
+                    let ss_tot: f64 = truths.iter().map(|tv| (tv - mean_t).powi(2)).sum();
+                    if ss_tot > 0.0 {
+                        1.0 - ss_res / ss_tot
+                    } else {
+                        0.0
+                    }
+                }
+            }
+        };
+
+        if zero_oob_count > 0 {
+            log::warn!(
+                "random_forest: {zero_oob_count} training row(s) had zero out-of-bag trees \
+                 and were excluded from oob_score_ (increase n_estimators or bootstrap variance)"
+            );
+        }
+        Some(f64_to_host::<F>(score))
+    } else {
+        None
+    };
+
+    Ok(RfFitOutcome {
+        model,
+        feature_importances,
+        oob_score,
     })
 }
 

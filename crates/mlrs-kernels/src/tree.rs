@@ -52,7 +52,9 @@
 //!   `split_feature` (`u32`, raw id; `u32::MAX` sentinel on leaves),
 //!   `split_bin` (`u32`), `threshold` (`F`), `is_leaf` (`u32` 0/1),
 //!   `leaf_dist` (`× nc`: normalized class distribution, or the leaf mean for
-//!   regression with `nc = 1`).
+//!   regression with `nc = 1`), `node_decrease` (`F`, RF-IMP-01: the
+//!   sklearn-equivalent weighted impurity decrease at the node, `0` on
+//!   leaves — reduced host-side into `feature_importances_`).
 //!
 //! Tests live in `crates/mlrs-backend/tests/random_forest_test.rs` (this crate
 //! is feature-free and cannot launch; AGENTS.md §2 — no in-source tests).
@@ -285,6 +287,39 @@ pub fn rf_node_max<F: Float + CubeElement>(
     }
 }
 
+/// Per-node SUM-OF-SQUARES of class counts `Σ_c cum_hist[f=0, last_bin, c]²`
+/// → `node_sq` (RF-IMP-01 impurity-decrease staging, classifier only; for the
+/// regressor target this kernel is still launched — reusing the SAME `hist`
+/// `ncs = 2` layout as [`rf_node_max`] already does unconditionally — but the
+/// resulting `n² + (Σy)²` value is nonsensical and MUST NOT be read by
+/// [`rf_best_split`]'s regressor arm, which gates every `node_sq` read behind
+/// `mode_class == 1u32`). Mirrors [`rf_node_max`]'s exact index arithmetic,
+/// replacing the running-max with a running sum-of-squares.
+#[cube(launch)]
+pub fn rf_node_sqsum<F: Float + CubeElement>(
+    hist: &Array<F>,
+    node_sq: &mut Array<F>,
+    mf: u32,
+    nb: u32,
+    nc: u32,
+    nodes: u32,
+    t_chunk: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    let total = t_chunk * nodes;
+    if tid < total as usize {
+        let base = ((tid as u32) * mf * nb + (nb - 1u32)) * nc;
+        let mut sq = F::new(0.0);
+        let mut c = 0u32;
+        while c < nc {
+            let v = hist[(base + c) as usize];
+            sq += v * v;
+            c += 1u32;
+        }
+        node_sq[tid] = sq;
+    }
+}
+
 /// Classifier split scores: one unit per `(tree_in_chunk, node, feature slot,
 /// split bin s)` writes the gini PROXY score `Σ_c l_c²/n_l + Σ_c r_c²/n_r`
 /// (maximizing it minimizes the weighted children gini) or `−1` when the split
@@ -398,12 +433,21 @@ pub fn rf_split_scores_reg<F: Float + CubeElement>(
 /// `leaf_dist` is ALWAYS written (normalized class distribution, or the mean
 /// target with `nc = 1` for regression via `sy_slot = 1`): interior-node
 /// distributions are simply never read by the traversal.
+///
+/// `node_decrease` (RF-IMP-01) is ALWAYS written too: `0` on leaf nodes, else
+/// the sklearn-equivalent weighted impurity decrease `best − parent_sumsq /
+/// tot` — classifier: `parent_sumsq = node_sq[tid]` (the new `rf_node_sqsum`
+/// input, read ONLY here, gated behind `mode_class == 1u32`); regressor:
+/// `parent_sumsq = syt²` where `syt = hist[hbase+1]` is the node's own total
+/// weighted `Σy` (already read by the leaf-mean branch below, no new input
+/// needed).
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn rf_best_split<F: Float + CubeElement>(
     hist: &Array<F>,
     node_total: &Array<F>,
     node_max: &Array<F>,
+    node_sq: &Array<F>,
     scores: &Array<F>,
     feat_ids: &Array<u32>,
     edges: &Array<F>,
@@ -412,6 +456,7 @@ pub fn rf_best_split<F: Float + CubeElement>(
     threshold: &mut Array<F>,
     is_leaf: &mut Array<u32>,
     leaf_dist: &mut Array<F>,
+    node_decrease: &mut Array<F>,
     min_split: F,
     mf: u32,
     nb: u32,
@@ -494,6 +539,23 @@ pub fn rf_best_split<F: Float + CubeElement>(
                 mean = sy / tot;
             }
             leaf_dist[midx as usize] = mean;
+        }
+
+        // RF-IMP-01: weighted impurity decrease `best − parent_sumsq/tot`,
+        // `0` on leaf nodes. Classifier reads the new `node_sq` staging
+        // input (gated behind `mode_class == 1u32`, mirroring the purity
+        // check above); regressor reuses `sy = hist[hbase+1]`, already read
+        // above for the leaf-mean branch (`syt² / tot`).
+        if leaf == 1u32 {
+            node_decrease[midx as usize] = F::new(0.0);
+        } else {
+            if mode_class == 1u32 {
+                let sq = node_sq[tid];
+                node_decrease[midx as usize] = best - sq / tot;
+            } else {
+                let sy = hist[(hbase + 1u32) as usize];
+                node_decrease[midx as usize] = best - (sy * sy) / tot;
+            }
         }
 
         if leaf == 0u32 {

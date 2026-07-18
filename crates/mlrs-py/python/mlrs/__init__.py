@@ -29,6 +29,12 @@ from .cluster import (
 from .covariance import EmpiricalCovariance, LedoitWolf
 from .decomposition import PCA, IncrementalPCA, TruncatedSVD
 from .density import KernelDensity
+from .ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from .kernel_ridge import KernelRidge
 from .linear import (
     ElasticNet,
@@ -83,6 +89,10 @@ __all__ = [
     "CategoricalNB",
     "KernelRidge",
     "KernelDensity",
+    "RandomForestClassifier",
+    "RandomForestRegressor",
+    "HistGradientBoostingClassifier",
+    "HistGradientBoostingRegressor",
     "KMeans",
     "DBSCAN",
     "HDBSCAN",

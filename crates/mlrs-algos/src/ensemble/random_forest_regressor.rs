@@ -23,7 +23,9 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::random_forest::{rf_fit_reg, rf_predict_reg, RfModel, RfParams};
+use mlrs_backend::prims::random_forest::{
+    rf_fit_reg, rf_predict_reg, RfFitOutcome, RfModel, RfParams,
+};
 use mlrs_backend::runtime::ActiveRuntime;
 
 use mlrs_core::PrimError;
@@ -57,9 +59,19 @@ where
     min_samples_split: f64,
     min_samples_leaf: f64,
     bootstrap: bool,
+    /// RF-OOB-01: compute `oob_score_` at fit time (requires `bootstrap`,
+    /// enforced at `build()`). Default `false` — the common case pays no
+    /// extra fit-time cost.
+    oob_score: bool,
     seed: u64,
     /// The fitted device-resident forest, `None` until `fit`.
     model_: Option<RfModel<F>>,
+    /// RF-IMP-01: normalized (sums to 1) length-`n_features` mean-decrease-in-
+    /// impurity vector, empty until `fit`.
+    feature_importances_: Vec<F>,
+    /// RF-OOB-01: `Some(score)` once fitted with `oob_score=true`; `None`
+    /// otherwise (including always on the `Unfit` state, before `fit`).
+    oob_score_: Option<F>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -79,8 +91,11 @@ where
             min_samples_split: RF_REG_DEFAULT_MIN_SAMPLES_SPLIT,
             min_samples_leaf: RF_REG_DEFAULT_MIN_SAMPLES_LEAF,
             bootstrap: true,
+            oob_score: false,
             seed: RF_REG_DEFAULT_SEED,
             model_: None,
+            feature_importances_: Vec::new(),
+            oob_score_: None,
             _state: PhantomData,
         }
     }
@@ -100,6 +115,7 @@ where
             min_samples_split: self.min_samples_split,
             min_samples_leaf: self.min_samples_leaf,
             bootstrap: self.bootstrap,
+            oob_score: self.oob_score,
             seed: self.seed,
         }
     }
@@ -132,6 +148,22 @@ where
             .as_ref()
             .expect("model_ is Some by construction on the Fitted state")
     }
+
+    /// RF-IMP-01: the sklearn-equivalent normalized (sums to 1) mean-decrease-
+    /// in-impurity `feature_importances_`, length `n_features()`. Always
+    /// populated on any `Fitted` instance (no `oob_score`/`bootstrap`
+    /// precondition, matching sklearn).
+    pub fn feature_importances(&self) -> &[F] {
+        &self.feature_importances_
+    }
+
+    /// RF-OOB-01: the out-of-bag score computed at fit time — R² of the
+    /// OOB-tree-averaged prediction vs. training `y`. `Some(..)` iff the
+    /// builder's `oob_score` flag was `true`; `None` otherwise (matches
+    /// `RfFitOutcome::oob_score`'s own contract).
+    pub fn oob_score(&self) -> Option<F> {
+        self.oob_score_
+    }
 }
 
 /// Builder for [`RandomForestRegressor`] (D-01). `Default` re-derives the
@@ -145,6 +177,7 @@ pub struct RandomForestRegressorBuilder {
     min_samples_split: f64,
     min_samples_leaf: f64,
     bootstrap: bool,
+    oob_score: bool,
     seed: u64,
 }
 
@@ -198,6 +231,14 @@ impl RandomForestRegressorBuilder {
         self
     }
 
+    /// RF-OOB-01: enable/disable `oob_score_` computation at fit time
+    /// (sklearn `oob_score`, default `false`). Requires `bootstrap = true`
+    /// (enforced at `build()`, mirrors sklearn's `ValueError`).
+    pub fn oob_score(mut self, v: bool) -> Self {
+        self.oob_score = v;
+        self
+    }
+
     /// Set the host RNG seed (fully deterministic across runs and backends).
     pub fn seed(mut self, v: u64) -> Self {
         self.seed = v;
@@ -219,6 +260,11 @@ impl RandomForestRegressorBuilder {
             self.min_samples_split,
             self.min_samples_leaf,
         )?;
+        if self.oob_score && !self.bootstrap {
+            return Err(BuildError::OobRequiresBootstrap {
+                estimator: "random_forest_regressor",
+            });
+        }
         Ok(RandomForestRegressor {
             n_estimators: self.n_estimators,
             max_depth: self.max_depth,
@@ -227,8 +273,11 @@ impl RandomForestRegressorBuilder {
             min_samples_split: self.min_samples_split,
             min_samples_leaf: self.min_samples_leaf,
             bootstrap: self.bootstrap,
+            oob_score: self.oob_score,
             seed: self.seed,
             model_: None,
+            feature_importances_: Vec::new(),
+            oob_score_: None,
             _state: PhantomData,
         })
     }
@@ -272,8 +321,17 @@ where
             min_samples_leaf: self.min_samples_leaf,
             bootstrap: self.bootstrap,
             seed: self.seed,
+            oob_score: self.oob_score,
         };
-        let model = rf_fit_reg::<F>(pool, x, shape, y, &params)?;
+        // RF-IMP-01 (TASK-03) / RF-OOB-01 (TASK-07): `rf_fit_reg` returns
+        // `RfFitOutcome<F>` (TASK-01); destructure `feature_importances`
+        // AND `oob_score` alongside `model`, mirroring the classifier's
+        // `fit()` (TASK-02/TASK-06).
+        let RfFitOutcome {
+            model,
+            feature_importances,
+            oob_score: oob_score_,
+        } = rf_fit_reg::<F>(pool, x, shape, y, &params)?;
 
         Ok(RandomForestRegressor {
             n_estimators: self.n_estimators,
@@ -283,8 +341,11 @@ where
             min_samples_split: self.min_samples_split,
             min_samples_leaf: self.min_samples_leaf,
             bootstrap: self.bootstrap,
+            oob_score: self.oob_score,
             seed: self.seed,
             model_: Some(model),
+            feature_importances_: feature_importances,
+            oob_score_,
             _state: PhantomData,
         })
     }

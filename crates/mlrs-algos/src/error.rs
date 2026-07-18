@@ -694,6 +694,24 @@ pub enum BuildError {
         value: f64,
     },
 
+    /// A Random Forest estimator was given `oob_score = true` together with
+    /// `bootstrap = false` (RF-OOB-01). Out-of-bag estimation requires each
+    /// tree to be grown on a bootstrap resample so some training rows are
+    /// held out per tree; with `bootstrap = false` every row is in-bag for
+    /// every tree, so no OOB signal exists — mirrors sklearn's
+    /// `ValueError("Out of bag estimation only available if
+    /// bootstrap=True")`. Rejected at `build()` (data-INDEPENDENT, the D-08
+    /// split).
+    #[error(
+        "estimator '{estimator}': oob_score = true requires bootstrap = true \
+         (out-of-bag estimation only available if bootstrap=True)"
+    )]
+    OobRequiresBootstrap {
+        /// Which estimator's builder rejected the value
+        /// (`"random_forest_classifier"` / `"random_forest_regressor"`).
+        estimator: &'static str,
+    },
+
     /// A HistGradientBoosting estimator was given `max_iter == 0` (GBT-01).
     /// At least one boosting iteration is required. Rejected at `build()`
     /// (data-INDEPENDENT, the D-08 split).

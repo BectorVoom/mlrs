@@ -69,6 +69,14 @@ def _estimators():
         mlrs.SpectralEmbedding(n_components=2),
         mlrs.UMAP(n_components=2),
         mlrs.HDBSCAN(),
+        # --- TASK-16 (PY-ENS-05, RF): small, cheap hyperparameters for the
+        # check-sweep's tiny fixtures (not the class defaults). ------------ #
+        mlrs.RandomForestClassifier(n_estimators=5, max_depth=3),
+        mlrs.RandomForestRegressor(n_estimators=5, max_depth=3),
+        # --- TASK-25 (PY-ENS-05, HGB): small max_iter for the check-sweep's
+        # tiny fixtures (not the class default). --------------------------- #
+        mlrs.HistGradientBoostingClassifier(max_iter=10),
+        mlrs.HistGradientBoostingRegressor(max_iter=10),
     ]
 
 
@@ -205,6 +213,38 @@ _EXPECTED = {
     "HDBSCAN": _merge(_COMMON),
     "SpectralEmbedding": _merge(_COMMON),
     "UMAP": _merge(_COMMON),
+    # --- TASK-16 (PY-ENS-05, RF): empirically triaged against a real sweep
+    # run (Green-time, not assumed) — see this file's own module docstring
+    # ("Criterion 1 says 'relevant', NOT 'all checks pass'"). RandomForest*
+    # is a supervised, dense-float-only, non-picklable-fitted-state estimator
+    # like every other supervised shim above, so the same _COMMON/_SUPERVISED
+    # carve-outs apply; the classifier additionally needs _CLASSIFIER (v1
+    # contiguous-int-label contract) and _FIT2D_1SAMPLE (a 1-sample fit is not
+    # special-cased with sklearn's exact '1 sample' message — same failure
+    # LogisticRegression/PCA/TruncatedSVD already carry). Neither needs
+    # _N_ITER: RF's tree-growth loop has no iterative-solver `n_iter_`
+    # convergence concept, and check_non_transformer_estimators_n_iter did
+    # NOT fail in the Green-time sweep for either estimator.
+    "RandomForestClassifier": _merge(
+        _COMMON, _SUPERVISED, _CLASSIFIER, _FIT2D_1SAMPLE
+    ),
+    "RandomForestRegressor": _merge(_COMMON, _SUPERVISED),
+    # --- TASK-25 (PY-ENS-05, HGB): empirically triaged against a real sweep
+    # run (Green-time, not assumed). HistGradientBoosting* is a supervised,
+    # dense-float-only, non-picklable-fitted-state estimator like the other
+    # supervised shims, so the same _COMMON/_SUPERVISED carve-outs apply; the
+    # classifier additionally needs _CLASSIFIER (v1 contiguous-int-label
+    # contract) and _FIT2D_1SAMPLE (mirrors RandomForestClassifier/
+    # LogisticRegression/PCA/TruncatedSVD's own "1-sample fit is not
+    # special-cased with sklearn's exact message" failure). UNLIKE RandomForest
+    # (whose tree-growth loop has no iterative-solver convergence concept),
+    # BOTH HGB estimators DO fail check_non_transformer_estimators_n_iter in
+    # the Green-time sweep (the boosting-round loop has no surfaced `n_iter_`
+    # attribute in v1) — so _N_ITER is included for both here, unlike RF.
+    "HistGradientBoostingClassifier": _merge(
+        _COMMON, _SUPERVISED, _CLASSIFIER, _N_ITER, _FIT2D_1SAMPLE
+    ),
+    "HistGradientBoostingRegressor": _merge(_COMMON, _SUPERVISED, _N_ITER),
 }
 
 

@@ -3319,6 +3319,10 @@ def gen_random_forest_classifier(seed: int = SEED, dtype=np.float32) -> str:
     # EXACT parity if sklearn itself reaches purity on the train set.
     assert (det_pred_train == y).all(), "det clf tier: sklearn not pure on train"
     assert np.allclose(det_proba_train.max(axis=1), 1.0), "det clf tier: proba not one-hot"
+    # RF-IMP-01: feature_importances_ on the SAME deterministic-tier fitted
+    # forest, where mlrs and sklearn trees are proven structurally identical
+    # (exact-tier oracle assertion, TASK-02).
+    ref_feature_importances = det.feature_importances_
 
     stat = RandomForestClassifier(
         n_estimators=RF_STAT_N_ESTIMATORS,
@@ -3326,6 +3330,21 @@ def gen_random_forest_classifier(seed: int = SEED, dtype=np.float32) -> str:
         random_state=0,
     ).fit(x, y)
     stat_acc_test = float((stat.predict(xq) == yq).mean())
+
+    # RF-OOB-01 (TASK-06): a SECOND sklearn construction, same seed/data/
+    # statistical-tier hyperparameters as `stat` above, plus
+    # `oob_score=True, bootstrap=True` (bootstrap is already sklearn's
+    # default, made explicit here since `oob_score=True` requires it).
+    # `oob_score_` is a fixed, non-dtype-dependent sklearn float, computed
+    # ONCE and cast into both the f32 and f64 fixture files below.
+    stat_oob = RandomForestClassifier(
+        n_estimators=RF_STAT_N_ESTIMATORS,
+        max_depth=RF_STAT_MAX_DEPTH,
+        bootstrap=True,
+        oob_score=True,
+        random_state=0,
+    ).fit(x, y)
+    ref_oob_score = float(stat_oob.oob_score_)
 
     def c(arr):
         return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
@@ -3342,6 +3361,8 @@ def gen_random_forest_classifier(seed: int = SEED, dtype=np.float32) -> str:
         det_pred_train=c(det_pred_train),
         det_proba_train=c(det_proba_train),
         stat_acc_test=c([stat_acc_test]),
+        ref_feature_importances=c(ref_feature_importances),
+        ref_oob_score=c([ref_oob_score]),
     )
     return out_path
 
@@ -3381,6 +3402,10 @@ def gen_random_forest_regressor(seed: int = SEED, dtype=np.float32) -> str:
     ).fit(x, y)
     det_pred_train = det.predict(x)
     assert np.allclose(det_pred_train, y, atol=1e-12), "det reg tier: sklearn not pure on train"
+    # RF-IMP-01: feature_importances_ on the SAME deterministic-tier fitted
+    # forest, where mlrs and sklearn trees are proven structurally identical
+    # (exact-tier oracle assertion, TASK-03, mirrors the classifier's TASK-02).
+    ref_feature_importances = det.feature_importances_
 
     stat = RandomForestRegressor(
         n_estimators=RF_STAT_N_ESTIMATORS,
@@ -3391,6 +3416,22 @@ def gen_random_forest_regressor(seed: int = SEED, dtype=np.float32) -> str:
     ss_res = float(((yq - pred_q) ** 2).sum())
     ss_tot = float(((yq - yq.mean()) ** 2).sum())
     stat_r2_test = 1.0 - ss_res / ss_tot
+
+    # RF-OOB-01 (TASK-07): a SECOND sklearn construction, same seed/data/
+    # statistical-tier hyperparameters as `stat` above, plus
+    # `oob_score=True, bootstrap=True` (bootstrap is already sklearn's
+    # default, made explicit here since `oob_score=True` requires it).
+    # `oob_score_` (R²-based for RandomForestRegressor) is a fixed,
+    # non-dtype-dependent sklearn float, computed ONCE and cast into both
+    # the f32 and f64 fixture files below (mirrors the classifier's TASK-06).
+    stat_oob = RandomForestRegressor(
+        n_estimators=RF_STAT_N_ESTIMATORS,
+        max_depth=RF_STAT_MAX_DEPTH,
+        bootstrap=True,
+        oob_score=True,
+        random_state=0,
+    ).fit(x, y)
+    ref_oob_score = float(stat_oob.oob_score_)
 
     def c(arr):
         return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
@@ -3406,6 +3447,8 @@ def gen_random_forest_regressor(seed: int = SEED, dtype=np.float32) -> str:
         yq=c(yq),
         det_pred_train=c(det_pred_train),
         stat_r2_test=c([stat_r2_test]),
+        ref_feature_importances=c(ref_feature_importances),
+        ref_oob_score=c([ref_oob_score]),
     )
     return out_path
 
