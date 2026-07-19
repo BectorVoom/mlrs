@@ -50,6 +50,10 @@ pub mod tree;
 // `umap_layout_step` is a vertex-owner GATHER SGD step (cpu-MLIR-safe, frozen-
 // subset-capable, host-drawn negative samples). This file owns its `pub mod` +
 // `pub use` (file-disjoint, single-owner — the sgd/topk re-export precedent).
+// TSNE-01: the exact-method t-SNE per-iteration pair (Student-t affinity +
+// KL-gradient GATHER). This file owns its `pub mod` + `pub use` (file-disjoint,
+// single-owner — the umap_layout precedent).
+pub mod tsne;
 pub mod umap_layout;
 
 pub use cholesky::cholesky_solve;
@@ -97,4 +101,5 @@ pub use tree::{
 // Phase-14 UMAP layout SGD step (UMAP-03): the per-owner GATHER kernel the host
 // epoch driver in `manifold/umap.rs` launches each epoch (Plan 04) and the
 // `transform` frozen-subset path reuses (Plan 05).
+pub use tsne::{tsne_grad, tsne_qnum, tsne_rowsum, tsne_sqdist};
 pub use umap_layout::umap_layout_step;

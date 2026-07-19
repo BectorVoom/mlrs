@@ -101,6 +101,73 @@ class DBSCAN(ClusterMixin, MlrsBase):
         )
 
 
+class AgglomerativeClustering(ClusterMixin, MlrsBase):
+    """Single-linkage hierarchical clustering (AGGLO-01).
+
+    cuML-parity scope: ``linkage='single'`` only (any other linkage raises).
+    ``metric`` accepts the sklearn/cuML set ``{'euclidean', 'l2', 'manhattan',
+    'l1', 'cityblock', 'cosine'}``. Labels/children are EXACT sklearn matches
+    (line-for-line port of the unstructured single-linkage path). No standalone
+    ``predict`` — ``fit`` + ``labels_``/``children_`` (sklearn parity).
+    Defaults mirror ``PyAgglomerativeClustering`` ``#[new]``.
+    """
+
+    def __init__(
+        self,
+        n_clusters=2,
+        metric="euclidean",
+        linkage="single",
+        output_type="input",
+    ):
+        self.n_clusters = n_clusters
+        self.metric = metric
+        self.linkage = linkage
+        self.output_type = output_type
+
+    def fit(self, X, y=None):
+        # sklearn exposes ward/complete/average/single; the cuML/mlrs scope is
+        # single-linkage only — reject the rest loudly, never silently degrade.
+        if self.linkage != "single":
+            raise ValueError(
+                f"AgglomerativeClustering: unsupported linkage {self.linkage!r};"
+                " mlrs supports linkage='single' only (the cuML scope)"
+            )
+        xa, rows, cols = self._normalize(X)
+        obj = self._ext().AgglomerativeClustering(int(self.n_clusters), self.metric)
+        obj.fit(xa, rows, cols)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        return self
+
+    @property
+    def labels_(self):
+        self._check_fitted()
+        return self._to_output(self._mlrs_obj.labels_(), (-1,), None, np.int32)
+
+    @property
+    def children_(self):
+        self._check_fitted()
+        # The FFI returns children flattened row-major; reshape to (n-1, 2).
+        return self._to_output(
+            self._mlrs_obj.children_(), (-1, 2), None, np.int64
+        )
+
+    @property
+    def n_leaves_(self):
+        self._check_fitted()
+        return self._mlrs_obj.n_leaves_()
+
+    @property
+    def n_connected_components_(self):
+        self._check_fitted()
+        return self._mlrs_obj.n_connected_components_()
+
+    @property
+    def n_clusters_(self):
+        self._check_fitted()
+        return int(self.n_clusters)
+
+
 class SpectralClustering(ClusterMixin, MlrsBase):
     """Spectral clustering (SPECTRAL-02).
 

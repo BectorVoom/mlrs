@@ -18,6 +18,10 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+// AGGLO-01 — single-linkage AgglomerativeClustering (cuML-parity scope:
+// linkage='single' only). Reuses the HDBSCAN fresh-label union-find
+// (`hdbscan::single_linkage`) for the sklearn fast-path labelling.
+pub mod agglomerative;
 pub mod dbscan;
 // Phase-12 convention-foundation HDBSCAN shell (HDBS-01, plan 12-02). Born
 // builder-fronted + typestate (`Hdbscan<F, S = Unfit>`) with a NON-algorithmic
@@ -43,6 +47,7 @@ pub(crate) mod spectral;
 pub mod spectral_clustering;
 pub mod spectral_embedding;
 
+pub use agglomerative::AgglomerativeClustering;
 pub use hdbscan::Hdbscan;
 pub use spectral_clustering::SpectralClustering;
 pub use spectral_embedding::SpectralEmbedding;

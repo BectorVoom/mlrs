@@ -12,6 +12,9 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — never an in-source
 //! `#[cfg(test)] mod tests`).
 
+// TSNE-01 — exact-method t-SNE (device Q/gradient prim + sklearn-exact host
+// P-matrix / gradient-descent ports).
+pub mod tsne;
 pub mod umap;
 
 // Plan-02/03 homes, pre-declared EMPTY in Plan 14-01 so the two Wave-2 plans
@@ -25,4 +28,5 @@ pub mod umap;
 pub mod umap_init;
 pub mod umap_internals;
 
+pub use tsne::Tsne;
 pub use umap::Umap;

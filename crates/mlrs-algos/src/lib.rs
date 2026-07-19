@@ -66,6 +66,12 @@ pub mod metrics;
 pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;
+// Time-series estimators (TSA-01, Phase 22): ARIMA / AutoARIMA. HOST-side
+// (a Kalman filter over a tiny per-step state has no useful device
+// parallelism at v1 batch-size 1 — see `timeseries::arima` module docs for
+// the full scope statement, incl. what's deliberately NOT covered: seasonal
+// SARIMAX and multi-series batched fitting).
+pub mod timeseries;
 // The SINGLE estimator trait surface (D-01). The legacy `&mut self` `traits`
 // module was hard-deleted in Phase 16 once every estimator migrated; consumers
 // reach the lifecycle/accessor traits via the explicit `mlrs_algos::typestate::`

@@ -515,6 +515,54 @@ impl PyRandomForestClassifier {
         }
     }
 
+    /// SHAP-01: path-dependent TreeSHAP values (self-consistency-gated —
+    /// see the Rust `tree_shap` module docs). `x_train`/`query` are Arrow
+    /// capsules of the estimator's fitted dtype; `phi` is returned flattened
+    /// `n_query × n_features × n_classes` (f64, the algos host domain), the
+    /// per-class `expected_value` length `n_classes`.
+    #[allow(clippy::too_many_arguments)]
+    fn shap_values(
+        &self,
+        py: Python<'_>,
+        x_train: &Bound<'_, PyAny>,
+        train_rows: usize,
+        train_cols: usize,
+        query: &Bound<'_, PyAny>,
+        query_rows: usize,
+        query_cols: usize,
+    ) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        let xt = capsule_to_array(x_train)?;
+        let q = capsule_to_array(query)?;
+        py.detach(|| {
+            let pool = crate::lock_pool();
+            match &self.inner {
+                AnyRandomForestClassifier::F32(est) => {
+                    let xt_host: Vec<f64> = as_f32(&xt)?.values().iter().map(|&v| v as f64).collect();
+                    let q_host: Vec<f64> = as_f32(&q)?.values().iter().map(|&v| v as f64).collect();
+                    if train_cols != est.n_features() || query_cols != est.n_features() {
+                        return Err(PyValueError::new_err(
+                            "shap_values: x_train/query column count must match n_features_in_",
+                        ));
+                    }
+                    Ok(est.shap_values(&pool, &xt_host, train_rows, &q_host, query_rows))
+                }
+                AnyRandomForestClassifier::F64(est) => {
+                    let xt_host: Vec<f64> = as_f64(&xt)?.values().to_vec();
+                    let q_host: Vec<f64> = as_f64(&q)?.values().to_vec();
+                    if train_cols != est.n_features() || query_cols != est.n_features() {
+                        return Err(PyValueError::new_err(
+                            "shap_values: x_train/query column count must match n_features_in_",
+                        ));
+                    }
+                    Ok(est.shap_values(&pool, &xt_host, train_rows, &q_host, query_rows))
+                }
+                AnyRandomForestClassifier::Unfit { .. } => {
+                    Err(not_fitted("random_forest_classifier", "shap_values"))
+                }
+            }
+        })
+    }
+
     fn is_fitted(&self) -> bool {
         !matches!(self.inner, AnyRandomForestClassifier::Unfit { .. })
     }
@@ -840,6 +888,52 @@ impl PyRandomForestRegressor {
                 "oob_score_ (f64 path)",
             )),
         }
+    }
+
+    /// SHAP-01: path-dependent TreeSHAP values (self-consistency-gated).
+    /// `phi` is flattened `n_query × n_features × 1` (f64); `expected_value`
+    /// is length `1`.
+    #[allow(clippy::too_many_arguments)]
+    fn shap_values(
+        &self,
+        py: Python<'_>,
+        x_train: &Bound<'_, PyAny>,
+        train_rows: usize,
+        train_cols: usize,
+        query: &Bound<'_, PyAny>,
+        query_rows: usize,
+        query_cols: usize,
+    ) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        let xt = capsule_to_array(x_train)?;
+        let q = capsule_to_array(query)?;
+        py.detach(|| {
+            let pool = crate::lock_pool();
+            match &self.inner {
+                AnyRandomForestRegressor::F32(est) => {
+                    let xt_host: Vec<f64> = as_f32(&xt)?.values().iter().map(|&v| v as f64).collect();
+                    let q_host: Vec<f64> = as_f32(&q)?.values().iter().map(|&v| v as f64).collect();
+                    if train_cols != est.n_features() || query_cols != est.n_features() {
+                        return Err(PyValueError::new_err(
+                            "shap_values: x_train/query column count must match n_features_in_",
+                        ));
+                    }
+                    Ok(est.shap_values(&pool, &xt_host, train_rows, &q_host, query_rows))
+                }
+                AnyRandomForestRegressor::F64(est) => {
+                    let xt_host: Vec<f64> = as_f64(&xt)?.values().to_vec();
+                    let q_host: Vec<f64> = as_f64(&q)?.values().to_vec();
+                    if train_cols != est.n_features() || query_cols != est.n_features() {
+                        return Err(PyValueError::new_err(
+                            "shap_values: x_train/query column count must match n_features_in_",
+                        ));
+                    }
+                    Ok(est.shap_values(&pool, &xt_host, train_rows, &q_host, query_rows))
+                }
+                AnyRandomForestRegressor::Unfit { .. } => {
+                    Err(not_fitted("random_forest_regressor", "shap_values"))
+                }
+            }
+        })
     }
 
     fn is_fitted(&self) -> bool {
@@ -1372,5 +1466,324 @@ impl PyHistGradientBoostingRegressor {
             AnyHistGradientBoostingRegressor::F32(_) => Some("f32"),
             AnyHistGradientBoostingRegressor::F64(_) => Some("f64"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForestInference (FIL-01, Phase 20) — batched device inference over an
+// IMPORTED sklearn-layout forest (the cuML FIL parity surface). NOT a
+// typestate estimator: the model arrives fitted via `load_from_arrays`.
+// ---------------------------------------------------------------------------
+
+/// Dtype-dispatched imported forest.
+enum AnyFil {
+    F32(mlrs_algos::ensemble::forest_inference::ForestInference<f32>),
+    F64(mlrs_algos::ensemble::forest_inference::ForestInference<f64>),
+}
+
+/// cuML-parity `ForestInference`: load an externally-trained (sklearn-layout)
+/// forest and serve batched device inference. Constructed via
+/// `load_from_arrays` (the Python shim's `load_from_sklearn` extracts the
+/// arrays); `predict`/`predict_proba` mirror the native forest wrappers.
+#[pyclass(name = "ForestInference")]
+pub struct PyForestInference {
+    inner: AnyFil,
+    n_features: usize,
+}
+
+#[pymethods]
+impl PyForestInference {
+    /// Import a forest from FLATTENED per-tree sklearn arrays.
+    ///
+    /// `node_counts[t]` gives tree `t`'s node count; the five per-node arrays
+    /// are the per-tree arrays concatenated in tree order (`value` is
+    /// additionally `n_values` per node, row-major). `kind` is
+    /// `"classifier"` (with `n_values = n_classes`) or `"regressor"`
+    /// (`n_values = 1`). `dtype` picks the device arm (`"f32"`/`"f64"`).
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    fn load_from_arrays(
+        py: Python<'_>,
+        children_left: Vec<i64>,
+        children_right: Vec<i64>,
+        feature: Vec<i64>,
+        threshold: Vec<f64>,
+        value: Vec<f64>,
+        node_sample_weight: Vec<f64>,
+        node_counts: Vec<usize>,
+        n_values: usize,
+        kind: String,
+        n_features: usize,
+        dtype: String,
+    ) -> PyResult<Self> {
+        use mlrs_algos::ensemble::forest_inference::{ForestInference, ForestKind, TreeSpec};
+
+        let kind = match kind.as_str() {
+            "classifier" => ForestKind::Classifier { n_classes: n_values },
+            "regressor" => {
+                if n_values != 1 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "forest_inference: a regressor import requires n_values == 1",
+                    ));
+                }
+                ForestKind::Regressor
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "forest_inference: unknown kind {other:?}; expected \"classifier\"/\"regressor\""
+                )))
+            }
+        };
+        // Slice the flat arrays back into per-tree specs (validated lengths).
+        let total: usize = node_counts.iter().sum();
+        for (operand, len, expect) in [
+            ("children_left", children_left.len(), total),
+            ("children_right", children_right.len(), total),
+            ("feature", feature.len(), total),
+            ("threshold", threshold.len(), total),
+            ("value", value.len(), total * n_values),
+        ] {
+            if len != expect {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "forest_inference: {operand} has {len} entries, expected {expect}"
+                )));
+            }
+        }
+        // node_sample_weight (SHAP-01 cover) is OPTIONAL: empty means "no
+        // cover for any tree"; otherwise it must cover every node exactly.
+        if !node_sample_weight.is_empty() && node_sample_weight.len() != total {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "forest_inference: node_sample_weight has {} entries, expected 0 or {total}",
+                node_sample_weight.len()
+            )));
+        }
+        let mut trees = Vec::with_capacity(node_counts.len());
+        let mut off = 0usize;
+        for &nc in &node_counts {
+            trees.push(TreeSpec {
+                children_left: children_left[off..off + nc].to_vec(),
+                children_right: children_right[off..off + nc].to_vec(),
+                feature: feature[off..off + nc].to_vec(),
+                threshold: threshold[off..off + nc].to_vec(),
+                value: value[off * n_values..(off + nc) * n_values].to_vec(),
+                node_sample_weight: if node_sample_weight.is_empty() {
+                    Vec::new()
+                } else {
+                    node_sample_weight[off..off + nc].to_vec()
+                },
+            });
+            off += nc;
+        }
+
+        let inner = py.detach(|| -> PyResult<AnyFil> {
+            let mut pool = crate::lock_pool();
+            match dtype.as_str() {
+                "f32" => Ok(AnyFil::F32(
+                    ForestInference::<f32>::from_trees(&mut pool, &trees, kind, n_features)
+                        .map_err(algo_err_to_py)?,
+                )),
+                "f64" => {
+                    crate::capability::guard_f64()?;
+                    Ok(AnyFil::F64(
+                        ForestInference::<f64>::from_trees(&mut pool, &trees, kind, n_features)
+                            .map_err(algo_err_to_py)?,
+                    ))
+                }
+                other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "forest_inference: unknown dtype {other:?}; expected \"f32\"/\"f64\""
+                ))),
+            }
+        })?;
+        Ok(Self { inner, n_features })
+    }
+
+    /// Trees in the imported forest.
+    fn n_trees(&self) -> usize {
+        match &self.inner {
+            AnyFil::F32(f) => f.n_trees(),
+            AnyFil::F64(f) => f.n_trees(),
+        }
+    }
+
+    /// The declared feature count.
+    fn n_features(&self) -> usize {
+        self.n_features
+    }
+
+    /// Classifier: argmax class indices (u32; the shim maps them onto the
+    /// source model's `classes_`).
+    fn predict_class_indices(
+        &self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Vec<u32>> {
+        let xa = capsule_to_array(x)?;
+        let dt = float_dtype(&xa)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match (&self.inner, dt) {
+                (AnyFil::F32(f), FloatDtype::F32) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    f.predict_class_indices(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)
+                }
+                (AnyFil::F64(f), FloatDtype::F64) => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    f.predict_class_indices(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)
+                }
+                _ => Err(pyo3::exceptions::PyValueError::new_err(
+                    "forest_inference: query dtype must match the imported dtype",
+                )),
+            }
+        })
+    }
+
+    /// Classifier probabilities, f32 arm (`rows × n_classes`, flattened).
+    fn predict_proba_f32(
+        &self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Vec<f32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyFil::F32(f) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let out = f.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
+                    let host = out.to_host(&pool);
+                    out.release_into(&mut pool);
+                    Ok(host)
+                }
+                _ => Err(pyo3::exceptions::PyValueError::new_err(
+                    "forest_inference: predict_proba_f32 requires an f32 import",
+                )),
+            }
+        })
+    }
+
+    /// Classifier probabilities, f64 arm.
+    fn predict_proba_f64(
+        &self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Vec<f64>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyFil::F64(f) => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let out = f.predict_proba(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
+                    let host = out.to_host(&pool);
+                    out.release_into(&mut pool);
+                    Ok(host)
+                }
+                _ => Err(pyo3::exceptions::PyValueError::new_err(
+                    "forest_inference: predict_proba_f64 requires an f64 import",
+                )),
+            }
+        })
+    }
+
+    /// Regressor predictions, f32 arm.
+    fn predict_f32(
+        &self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Vec<f32>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyFil::F32(f) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let out = f.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
+                    let host = out.to_host(&pool);
+                    out.release_into(&mut pool);
+                    Ok(host)
+                }
+                _ => Err(pyo3::exceptions::PyValueError::new_err(
+                    "forest_inference: predict_f32 requires an f32 import",
+                )),
+            }
+        })
+    }
+
+    /// Regressor predictions, f64 arm.
+    fn predict_f64(
+        &self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Vec<f64>> {
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyFil::F64(f) => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let out = f.predict(&mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
+                    let host = out.to_host(&pool);
+                    out.release_into(&mut pool);
+                    Ok(host)
+                }
+                _ => Err(pyo3::exceptions::PyValueError::new_err(
+                    "forest_inference: predict_f64 requires an f64 import",
+                )),
+            }
+        })
+    }
+
+    /// SHAP-01: path-dependent TreeSHAP values using the import's OWN cover
+    /// (`tree_.weighted_n_node_samples` from the source model) — the
+    /// ≤1e-5-vs-`shap.TreeExplainer`-gated path. `query` is an Arrow
+    /// capsule of the import's dtype. `phi` is flattened `n_query ×
+    /// n_features × n_values` (f64); `expected_value` is length `n_values`.
+    ///
+    /// Errors if the import carried no `node_sample_weight`.
+    fn shap_values(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        let qa = capsule_to_array(query)?;
+        py.detach(|| {
+            let pool = crate::lock_pool();
+            match &self.inner {
+                AnyFil::F32(f) => {
+                    if cols != self.n_features {
+                        return Err(PyValueError::new_err(
+                            "shap_values: query column count must match n_features()",
+                        ));
+                    }
+                    let q_host: Vec<f64> = as_f32(&qa)?.values().iter().map(|&v| v as f64).collect();
+                    f.shap_values(&pool, &q_host, rows).map_err(algo_err_to_py)
+                }
+                AnyFil::F64(f) => {
+                    crate::capability::guard_f64()?;
+                    if cols != self.n_features {
+                        return Err(PyValueError::new_err(
+                            "shap_values: query column count must match n_features()",
+                        ));
+                    }
+                    let q_host: Vec<f64> = as_f64(&qa)?.values().to_vec();
+                    f.shap_values(&pool, &q_host, rows).map_err(algo_err_to_py)
+                }
+            }
+        })
     }
 }

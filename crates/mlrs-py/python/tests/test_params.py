@@ -243,6 +243,26 @@ EXPECTED_PARAMS = {
         "max_cluster_size": 0,
         "output_type": "input",
     },
+    # --- AGGLO-01: AgglomerativeClustering (single-linkage). -------------- #
+    "AgglomerativeClustering": {
+        "n_clusters": 2,
+        "metric": "euclidean",
+        "linkage": "single",
+        "output_type": "input",
+    },
+    # --- TSNE-01: TSNE (exact method). ------------------------------------ #
+    "TSNE": {
+        "n_components": 2,
+        "perplexity": 30.0,
+        "early_exaggeration": 12.0,
+        "learning_rate": "auto",
+        "max_iter": 1000,
+        "init": "pca",
+        "random_state": None,
+        "method": "exact",
+        "metric": "euclidean",
+        "output_type": "input",
+    },
     # --- TASK-16 (PY-ENS-05, RF): RandomForestClassifier/Regressor. ------- #
     "RandomForestClassifier": {
         "n_estimators": 100,
@@ -325,6 +345,9 @@ SET_PARAM = {
     "SpectralEmbedding": ("n_components", 3),
     "UMAP": ("n_neighbors", 10),
     "HDBSCAN": ("min_cluster_size", 10),
+    # --- AGGLO-01 / TSNE-01. ---------------------------------------------- #
+    "AgglomerativeClustering": ("n_clusters", 4),
+    "TSNE": ("perplexity", 15.0),
     # --- TASK-16 (PY-ENS-05, RF): RandomForestClassifier/Regressor. ------- #
     "RandomForestClassifier": ("n_estimators", 10),
     "RandomForestRegressor": ("n_estimators", 10),

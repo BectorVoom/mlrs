@@ -164,6 +164,29 @@ where
     pub fn oob_score(&self) -> Option<F> {
         self.oob_score_
     }
+
+    /// SHAP-01: path-dependent TreeSHAP values, self-consistency-gated (see
+    /// `tree_shap` module docs). `x_train_host`/`query_host` are host
+    /// row-major `f64` buffers. Returns `(phi, expected_value)`: `phi` is
+    /// `n_query × n_features × 1`; `expected_value` is length `1`. `Σ_f
+    /// phi[q, f, 0] + expected_value[0] == predict(query)[q]` exactly.
+    pub fn shap_values(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        x_train_host: &[f64],
+        n_train: usize,
+        query_host: &[f64],
+        n_query: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        crate::ensemble::tree_shap::native_forest_shap_values(
+            pool,
+            self.model(),
+            x_train_host,
+            n_train,
+            query_host,
+            n_query,
+        )
+    }
 }
 
 /// Builder for [`RandomForestRegressor`] (D-01). `Default` re-derives the

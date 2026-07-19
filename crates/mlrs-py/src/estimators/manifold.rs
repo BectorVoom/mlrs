@@ -438,3 +438,219 @@ impl PyUMAP {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// TSNE (TSNE-01) — Fit + embedding_/kl_divergence_/n_iter_ (fit/fit_transform
+// only, sklearn parity: TSNE has no out-of-sample transform).
+// ---------------------------------------------------------------------------
+
+crate::any_estimator_typestate! {
+    any:   AnyTsne,
+    algo:  mlrs_algos::manifold::tsne::Tsne,
+    unfit: {
+        n_components: usize, perplexity: f64, early_exaggeration: f64,
+        learning_rate: Option<f64>, max_iter: usize, init: String,
+        random_state: Option<u64>, method: String, metric: String,
+    },
+}
+
+/// Parse the sklearn-named `init` string (`"pca"` / `"random"`).
+fn parse_tsne_init(s: &str) -> PyResult<mlrs_algos::manifold::tsne::TsneInit> {
+    use mlrs_algos::manifold::tsne::TsneInit;
+    match s {
+        "pca" => Ok(TsneInit::Pca),
+        "random" => Ok(TsneInit::Random),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "tsne: unsupported init {other:?}; expected \"pca\" or \"random\""
+        ))),
+    }
+}
+
+/// sklearn-compatible `TSNE` (exact method only — the mlrs scope; cuML's
+/// barnes_hut/fft approximations are out of scope). `fit` + `embedding_`,
+/// NO out-of-sample `transform` (sklearn parity).
+#[pyclass(name = "TSNE")]
+pub struct PyTSNE {
+    inner: AnyTsne,
+}
+
+impl PyTSNE {
+    /// Rust-callable default constructor for the smoke test.
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyTsne::Unfit {
+                n_components: 2,
+                perplexity: 30.0,
+                early_exaggeration: 12.0,
+                learning_rate: None,
+                max_iter: 1000,
+                init: "pca".to_string(),
+                random_state: None,
+                method: "exact".to_string(),
+                metric: "euclidean".to_string(),
+            },
+        }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyTsne::Unfit { .. })
+    }
+}
+
+#[pymethods]
+impl PyTSNE {
+    /// `TSNE(n_components=2, perplexity=30.0, early_exaggeration=12.0,
+    /// learning_rate=None ('auto'), max_iter=1000, init="pca",
+    /// random_state=None, method="exact", metric="euclidean")`.
+    #[new]
+    #[pyo3(signature = (
+        n_components = 2, perplexity = 30.0, early_exaggeration = 12.0,
+        learning_rate = None, max_iter = 1000, init = String::from("pca"),
+        random_state = None, method = String::from("exact"),
+        metric = String::from("euclidean"),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        n_components: usize,
+        perplexity: f64,
+        early_exaggeration: f64,
+        learning_rate: Option<f64>,
+        max_iter: usize,
+        init: String,
+        random_state: Option<u64>,
+        method: String,
+        metric: String,
+    ) -> PyResult<Self> {
+        // Data-independent string surface validated AT CONSTRUCTION.
+        parse_tsne_init(&init)?;
+        if method != "exact" {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "tsne: unsupported method {method:?}; mlrs supports \"exact\" only"
+            )));
+        }
+        if metric != "euclidean" {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "tsne: unsupported metric {metric:?}; expected \"euclidean\""
+            )));
+        }
+        Ok(Self {
+            inner: AnyTsne::Unfit {
+                n_components,
+                perplexity,
+                early_exaggeration,
+                learning_rate,
+                max_iter,
+                init,
+                random_state,
+                method,
+                metric,
+            },
+        })
+    }
+
+    fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
+        use mlrs_algos::manifold::tsne::{LearningRate, Tsne};
+
+        let xa = capsule_to_array(x)?;
+        let dt = float_dtype(&xa)?;
+        let (n_components, perplexity, early_exaggeration, learning_rate, max_iter, init_s, random_state) =
+            match &self.inner {
+                AnyTsne::Unfit {
+                    n_components, perplexity, early_exaggeration, learning_rate,
+                    max_iter, init, random_state, ..
+                } => (
+                    *n_components, *perplexity, *early_exaggeration, *learning_rate,
+                    *max_iter, init.clone(), *random_state,
+                ),
+                _ => return Err(not_fitted("tsne", "re-fit")),
+            };
+        let init = parse_tsne_init(&init_s)?;
+        let lr = match learning_rate {
+            None => LearningRate::Auto,
+            Some(v) => LearningRate::Value(v),
+        };
+        let seed = random_state.unwrap_or(0);
+        let fitted = py.detach(|| -> PyResult<AnyTsne> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let est = Tsne::<f32>::builder()
+                        .n_components(n_components)
+                        .perplexity(perplexity)
+                        .early_exaggeration(early_exaggeration)
+                        .learning_rate(lr)
+                        .max_iter(max_iter)
+                        .init(init)
+                        .seed(seed)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyTsne::F32(fitted))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let est = Tsne::<f64>::builder()
+                        .n_components(n_components)
+                        .perplexity(perplexity)
+                        .early_exaggeration(early_exaggeration)
+                        .learning_rate(lr)
+                        .max_iter(max_iter)
+                        .init(init)
+                        .seed(seed)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
+                    Ok(AnyTsne::F64(fitted))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        Ok(())
+    }
+
+    /// Fitted `embedding_` (f32 arm), flattened row-major.
+    fn embedding_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyTsne::F32(e) => Ok(e.embedding(&pool)),
+            _ => Err(not_fitted("tsne", "embedding_ (f32)")),
+        }
+    }
+    /// Fitted `embedding_` (f64 arm), flattened row-major.
+    fn embedding_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyTsne::F64(e) => Ok(e.embedding(&pool)),
+            _ => Err(not_fitted("tsne", "embedding_ (f64)")),
+        }
+    }
+    /// Final `kl_divergence_`, either dtype arm.
+    fn kl_divergence_(&self) -> PyResult<f64> {
+        match &self.inner {
+            AnyTsne::F32(e) => Ok(e.kl_divergence()),
+            AnyTsne::F64(e) => Ok(e.kl_divergence()),
+            _ => Err(not_fitted("tsne", "kl_divergence_")),
+        }
+    }
+    /// Iterations run (`n_iter_`), either dtype arm.
+    fn n_iter_(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnyTsne::F32(e) => Ok(e.n_iter()),
+            AnyTsne::F64(e) => Ok(e.n_iter()),
+            _ => Err(not_fitted("tsne", "n_iter_")),
+        }
+    }
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyTsne::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyTsne::Unfit { .. } => None,
+            AnyTsne::F32(_) => Some("f32"),
+            AnyTsne::F64(_) => Some("f64"),
+        }
+    }
+}

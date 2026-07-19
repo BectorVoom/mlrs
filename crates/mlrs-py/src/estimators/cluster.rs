@@ -570,3 +570,164 @@ impl PyHDBSCAN {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// AgglomerativeClustering (AGGLO-01) — Fit + labels_/children_ ONLY (no
+// standalone predict; sklearn's AgglomerativeClustering is likewise
+// fit/fit_predict-only). Mirrors PyDBSCAN over the v3 typestate estimator.
+// ---------------------------------------------------------------------------
+
+crate::any_estimator_typestate! {
+    any:   AnyAgglomerative,
+    algo:  mlrs_algos::cluster::agglomerative::AgglomerativeClustering,
+    unfit: { n_clusters: usize, metric: String },
+}
+
+/// Parse the sklearn-named `metric` string into the algos agglomerative
+/// [`Metric`](mlrs_algos::cluster::agglomerative::Metric) enum. The sklearn/cuML
+/// aliases collapse: `'l2'` → Euclidean, `'l1'` → Manhattan.
+fn parse_agglomerative_metric(
+    s: &str,
+) -> PyResult<mlrs_algos::cluster::agglomerative::Metric> {
+    use mlrs_algos::cluster::agglomerative::Metric as AggloMetric;
+    match s {
+        "euclidean" | "l2" => Ok(AggloMetric::Euclidean),
+        "manhattan" | "l1" | "cityblock" => Ok(AggloMetric::Manhattan),
+        "cosine" => Ok(AggloMetric::Cosine),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "agglomerative_clustering: unsupported metric {other:?}; expected one of \
+             \"euclidean\"/\"l2\", \"manhattan\"/\"l1\"/\"cityblock\", \"cosine\""
+        ))),
+    }
+}
+
+/// sklearn-compatible `AgglomerativeClustering` (single-linkage only — the cuML
+/// scope). `fit` + `labels_`/`children_`, NO standalone `predict`.
+#[pyclass(name = "AgglomerativeClustering")]
+pub struct PyAgglomerativeClustering {
+    inner: AnyAgglomerative,
+}
+
+impl PyAgglomerativeClustering {
+    /// Rust-callable default constructor for the smoke test.
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyAgglomerative::Unfit {
+                n_clusters: 2,
+                metric: "euclidean".to_string(),
+            },
+        }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyAgglomerative::Unfit { .. })
+    }
+}
+
+#[pymethods]
+impl PyAgglomerativeClustering {
+    /// `AgglomerativeClustering(n_clusters=2, metric="euclidean")`.
+    #[new]
+    #[pyo3(signature = (n_clusters = 2, metric = String::from("euclidean")))]
+    fn new(n_clusters: usize, metric: String) -> PyResult<Self> {
+        // Reject an unknown metric AT CONSTRUCTION (sklearn parity: the string
+        // is data-independent), not first at fit.
+        parse_agglomerative_metric(&metric)?;
+        Ok(Self {
+            inner: AnyAgglomerative::Unfit { n_clusters, metric },
+        })
+    }
+
+    fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
+        use mlrs_algos::cluster::agglomerative::AgglomerativeClustering;
+
+        let xa = capsule_to_array(x)?;
+        let dt = float_dtype(&xa)?;
+        let (n_clusters, metric_s) = match &self.inner {
+            AnyAgglomerative::Unfit { n_clusters, metric } => (*n_clusters, metric.clone()),
+            _ => (2, "euclidean".to_string()),
+        };
+        let metric = parse_agglomerative_metric(&metric_s)?;
+        let fitted = py.detach(|| -> PyResult<AnyAgglomerative> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let est = AgglomerativeClustering::<f32>::builder()
+                        .n_clusters(n_clusters)
+                        .metric(metric)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyAgglomerative::F32(fitted))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let est = AgglomerativeClustering::<f64>::builder()
+                        .n_clusters(n_clusters)
+                        .metric(metric)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    Ok(AnyAgglomerative::F64(fitted))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        Ok(())
+    }
+
+    /// Fitted `labels_` (i32), either dtype arm; the runtime [`not_fitted`]
+    /// analog on the `Unfit` arm (D-13).
+    fn labels_(&self) -> PyResult<Vec<i32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyAgglomerative::F32(e) => Ok(e.labels(&pool)),
+            AnyAgglomerative::F64(e) => Ok(e.labels(&pool)),
+            _ => Err(not_fitted("agglomerative_clustering", "labels_")),
+        }
+    }
+
+    /// Fitted `children_` FLATTENED row-major (`2·(n-1)` i64 — the Python shim
+    /// reshapes to `(n-1, 2)`).
+    fn children_(&self) -> PyResult<Vec<i64>> {
+        match &self.inner {
+            AnyAgglomerative::F32(e) => Ok(e.children().iter().flatten().copied().collect()),
+            AnyAgglomerative::F64(e) => Ok(e.children().iter().flatten().copied().collect()),
+            _ => Err(not_fitted("agglomerative_clustering", "children_")),
+        }
+    }
+
+    /// Fitted `n_leaves_` (== n_samples).
+    fn n_leaves_(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnyAgglomerative::F32(e) => Ok(e.n_leaves()),
+            AnyAgglomerative::F64(e) => Ok(e.n_leaves()),
+            _ => Err(not_fitted("agglomerative_clustering", "n_leaves_")),
+        }
+    }
+
+    /// Fitted `n_connected_components_` (always 1 — unstructured fit).
+    fn n_connected_components_(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnyAgglomerative::F32(e) => Ok(e.n_connected_components()),
+            AnyAgglomerative::F64(e) => Ok(e.n_connected_components()),
+            _ => Err(not_fitted("agglomerative_clustering", "n_connected_components_")),
+        }
+    }
+
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyAgglomerative::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyAgglomerative::Unfit { .. } => None,
+            AnyAgglomerative::F32(_) => Some("f32"),
+            AnyAgglomerative::F64(_) => Some("f64"),
+        }
+    }
+}

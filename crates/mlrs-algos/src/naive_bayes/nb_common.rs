@@ -77,7 +77,10 @@ pub fn log_sum_exp_normalize(joint_ll: &[f64], n_classes: usize) -> (Vec<f64>, V
         joint_ll.len(),
         n_classes
     );
-    assert!(n_classes > 0, "log_sum_exp_normalize: n_classes must be > 0");
+    assert!(
+        n_classes > 0,
+        "log_sum_exp_normalize: n_classes must be > 0"
+    );
 
     let m = joint_ll.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     // m is finite for any finite joint_ll (n_classes > 0); the shifted sum's
@@ -169,6 +172,7 @@ fn decode(joint_ll: &[f64], classes_: &[i64], take_max: bool) -> Vec<i32> {
 /// regression-locked by `nb_common_test.rs::nb_common_accuracy_score_empty_input_is_nan`).
 pub fn accuracy_score(pred: &[i32], y_true: &[i32]) -> f64 {
     crate::metrics::classification::accuracy_score(y_true, pred, None, true)
+        .expect("accuracy_score: pred/y_true length mismatch")
 }
 
 /// The one-owner-per-`(class, feature)` GATHER (Pitfall 1/2, ROADMAP #1):
@@ -276,19 +280,18 @@ where
         // WR-02: release `block_dev` on EVERY exit (Ok / None / Err) before the `?`
         // propagation so a `column_reduce` failure does not leak the scratch buffer
         // (WR-07 "conserve live_bytes" contract).
-        let reduced = match column_reduce::<F>(
-            pool, &block_dev, n_c, n_features, op, ReducePath::Shared,
-        ) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                block_dev.release_into(pool);
-                unreachable!("shared-path column_reduce is always available");
-            }
-            Err(e) => {
-                block_dev.release_into(pool);
-                return Err(e);
-            }
-        };
+        let reduced =
+            match column_reduce::<F>(pool, &block_dev, n_c, n_features, op, ReducePath::Shared) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    block_dev.release_into(pool);
+                    unreachable!("shared-path column_reduce is always available");
+                }
+                Err(e) => {
+                    block_dev.release_into(pool);
+                    return Err(e);
+                }
+            };
         let reduced_host = reduced.to_host(pool);
         for (j, &v) in reduced_host.iter().enumerate() {
             out[c][j] = host_to_f64(v);

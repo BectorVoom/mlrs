@@ -64,7 +64,7 @@ fn accuracy_score_matches_sklearn_oracle_binary_f64() {
     let case = load("metrics_cls_binary_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
-    let got = accuracy_score(&y_true, &y_pred, None, true);
+    let got = accuracy_score(&y_true, &y_pred, None, true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_accuracy"),
@@ -78,7 +78,7 @@ fn accuracy_score_matches_sklearn_oracle_binary_f32() {
     let case = load("metrics_cls_binary_f32_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
-    let got = accuracy_score(&y_true, &y_pred, None, true);
+    let got = accuracy_score(&y_true, &y_pred, None, true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_accuracy"),
@@ -101,7 +101,7 @@ fn accuracy_score_weighted_matches_sklearn_oracle() {
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
     let sw = f64_vec(&case, "sample_weight");
-    let got = accuracy_score(&y_true, &y_pred, Some(&sw), true);
+    let got = accuracy_score(&y_true, &y_pred, Some(&sw), true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_accuracy_sw"),
@@ -116,7 +116,7 @@ fn accuracy_score_single_sample_degenerate() {
     let y_true_m = labels_i32(&case, "y_true_single_match");
     let y_pred_m = labels_i32(&case, "y_pred_single_match");
     assert_close(
-        accuracy_score(&y_true_m, &y_pred_m, None, true),
+        accuracy_score(&y_true_m, &y_pred_m, None, true).unwrap(),
         scalar(&case, "ref_acc_single_match"),
         EXACT_TOL,
         "single match",
@@ -124,7 +124,7 @@ fn accuracy_score_single_sample_degenerate() {
     let y_true_mm = labels_i32(&case, "y_true_single_mismatch");
     let y_pred_mm = labels_i32(&case, "y_pred_single_mismatch");
     assert_close(
-        accuracy_score(&y_true_mm, &y_pred_mm, None, true),
+        accuracy_score(&y_true_mm, &y_pred_mm, None, true).unwrap(),
         scalar(&case, "ref_acc_single_mismatch"),
         EXACT_TOL,
         "single mismatch",
@@ -136,7 +136,7 @@ fn accuracy_score_matches_sklearn_oracle_multiclass_f64() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
-    let got = accuracy_score(&y_true, &y_pred, None, true);
+    let got = accuracy_score(&y_true, &y_pred, None, true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_accuracy"),
@@ -170,7 +170,7 @@ fn confusion_matrix_empty_class_via_explicit_labels() {
     let y_true = labels_i32(&case, "y_true_empty");
     let y_pred = labels_i32(&case, "y_pred_empty");
     let labels = labels_i32(&case, "labels_empty");
-    let got = confusion_matrix(&y_true, &y_pred, Some(&labels), None);
+    let got = confusion_matrix(&y_true, &y_pred, Some(&labels), None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion_empty"),
@@ -185,7 +185,7 @@ fn confusion_matrix_all_one_class() {
     let case = load("metrics_cls_degenerate_seed42.npz");
     let y_true = labels_i32(&case, "y_true_one");
     let y_pred = labels_i32(&case, "y_pred_one");
-    let got = confusion_matrix(&y_true, &y_pred, None, None);
+    let got = confusion_matrix(&y_true, &y_pred, None, None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion_one"),
@@ -200,7 +200,7 @@ fn confusion_matrix_matches_sklearn_oracle_binary() {
     let case = load("metrics_cls_binary_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
-    let got = confusion_matrix(&y_true, &y_pred, None, None);
+    let got = confusion_matrix(&y_true, &y_pred, None, None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion"),
@@ -216,7 +216,7 @@ fn confusion_matrix_weighted_matches_sklearn_oracle_binary() {
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
     let sw = f64_vec(&case, "sample_weight");
-    let got = confusion_matrix(&y_true, &y_pred, None, Some(&sw));
+    let got = confusion_matrix(&y_true, &y_pred, None, Some(&sw)).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion_sw"),
@@ -231,7 +231,7 @@ fn confusion_matrix_matches_sklearn_oracle_multiclass() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
-    let got = confusion_matrix(&y_true, &y_pred, None, None);
+    let got = confusion_matrix(&y_true, &y_pred, None, None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion"),
@@ -270,7 +270,8 @@ fn precision_score_zero_division_no_predicted_positives() {
         Average::Binary,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_precision_zerodiv"),
@@ -292,7 +293,8 @@ fn precision_score_binary_matches_sklearn_oracle() {
         Average::Binary,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_precision_binary"),
@@ -315,7 +317,8 @@ fn precision_score_binary_weighted_matches_sklearn_oracle() {
         Average::Binary,
         Some(&sw),
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_precision_binary_sw"),
@@ -348,7 +351,8 @@ fn precision_score_averages_matches_sklearn_oracle_multiclass() {
             multiclass_avg(avg),
             None,
             ZeroDivision::Zero,
-        );
+        )
+        .unwrap();
         assert_close(
             prf_scalar(got),
             scalar(&case, &format!("ref_precision_{avg}")),
@@ -364,7 +368,8 @@ fn precision_score_averages_matches_sklearn_oracle_multiclass() {
         Average::None_,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     let want = f64_vec(&case, "ref_precision_none");
     let got_vec = prf_per_class(got_none);
     assert_eq!(got_vec.len(), want.len(), "precision none length");
@@ -387,7 +392,8 @@ fn precision_score_macro_weighted_matches_sklearn_oracle() {
         Average::Macro,
         Some(&sw),
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_precision_macro_sw"),
@@ -410,7 +416,8 @@ fn precision_score_labels_reorder_matches_sklearn_oracle() {
         Average::Macro,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_precision_labelreorder"),
@@ -432,7 +439,8 @@ fn recall_score_zero_division_no_true_positives() {
         Average::Binary,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_recall_zerodiv"),
@@ -454,7 +462,8 @@ fn recall_score_binary_matches_sklearn_oracle() {
         Average::Binary,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_recall_binary"),
@@ -477,7 +486,8 @@ fn recall_score_binary_weighted_matches_sklearn_oracle() {
         Average::Binary,
         Some(&sw),
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_recall_binary_sw"),
@@ -500,7 +510,8 @@ fn recall_score_averages_matches_sklearn_oracle_multiclass() {
             multiclass_avg(avg),
             None,
             ZeroDivision::Zero,
-        );
+        )
+        .unwrap();
         assert_close(
             prf_scalar(got),
             scalar(&case, &format!("ref_recall_{avg}")),
@@ -516,7 +527,8 @@ fn recall_score_averages_matches_sklearn_oracle_multiclass() {
         Average::None_,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     let want = f64_vec(&case, "ref_recall_none");
     let got_vec = prf_per_class(got_none);
     for i in 0..want.len() {
@@ -538,7 +550,8 @@ fn recall_score_macro_weighted_matches_sklearn_oracle() {
         Average::Macro,
         Some(&sw),
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_recall_macro_sw"),
@@ -561,7 +574,8 @@ fn recall_score_labels_reorder_matches_sklearn_oracle() {
         Average::Macro,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_recall_labelreorder"),
@@ -590,7 +604,8 @@ fn f1_score_computed_from_tp_fp_fn_not_precision_times_recall() {
         Average::Binary,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(prf_scalar(got), 0.5, 1e-7, "f1 direct-formula");
 }
 
@@ -607,7 +622,8 @@ fn f1_score_zero_division_degenerate() {
         Average::Binary,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_f1_zerodiv"),
@@ -629,7 +645,8 @@ fn f1_score_binary_matches_sklearn_oracle() {
         Average::Binary,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_f1_binary"),
@@ -652,7 +669,8 @@ fn f1_score_binary_weighted_matches_sklearn_oracle() {
         Average::Binary,
         Some(&sw),
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_f1_binary_sw"),
@@ -675,7 +693,8 @@ fn f1_score_averages_matches_sklearn_oracle_multiclass() {
             multiclass_avg(avg),
             None,
             ZeroDivision::Zero,
-        );
+        )
+        .unwrap();
         assert_close(
             prf_scalar(got),
             scalar(&case, &format!("ref_f1_{avg}")),
@@ -691,7 +710,8 @@ fn f1_score_averages_matches_sklearn_oracle_multiclass() {
         Average::None_,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     let want = f64_vec(&case, "ref_f1_none");
     let got_vec = prf_per_class(got_none);
     for i in 0..want.len() {
@@ -713,7 +733,8 @@ fn f1_score_macro_weighted_matches_sklearn_oracle() {
         Average::Macro,
         Some(&sw),
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_f1_macro_sw"),
@@ -736,7 +757,8 @@ fn f1_score_labels_reorder_matches_sklearn_oracle() {
         Average::Macro,
         None,
         ZeroDivision::Zero,
-    );
+    )
+    .unwrap();
     assert_close(
         prf_scalar(got),
         scalar(&case, "ref_f1_labelreorder"),
@@ -763,7 +785,7 @@ fn log_loss_clips_zero_and_one_probabilities_to_finite_value() {
     let case = load("metrics_cls_degenerate_seed42.npz");
     let y_true = labels_i32(&case, "y_true_clip");
     let y_prob = f64_vec(&case, "y_prob_clip");
-    let got = log_loss(&y_true, &y_prob, 2, None, None, f64::EPSILON, true);
+    let got = log_loss(&y_true, &y_prob, 2, None, None, f64::EPSILON, true).unwrap();
     assert!(got.is_finite(), "log_loss clip must be finite, got {got}");
     assert_close(
         got,
@@ -778,7 +800,7 @@ fn log_loss_matches_sklearn_oracle_multiclass() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_prob = f64_vec(&case, "y_proba");
-    let got = log_loss(&y_true, &y_prob, 3, None, None, f64::EPSILON, true);
+    let got = log_loss(&y_true, &y_prob, 3, None, None, f64::EPSILON, true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_log_loss"),
@@ -793,7 +815,7 @@ fn log_loss_weighted_matches_sklearn_oracle() {
     let y_true = labels_i32(&case, "y_true");
     let y_prob = f64_vec(&case, "y_proba");
     let sw = f64_vec(&case, "sample_weight");
-    let got = log_loss(&y_true, &y_prob, 3, None, Some(&sw), f64::EPSILON, true);
+    let got = log_loss(&y_true, &y_prob, 3, None, Some(&sw), f64::EPSILON, true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_log_loss_sw"),
@@ -807,7 +829,7 @@ fn log_loss_matches_sklearn_oracle_binary() {
     let case = load("metrics_cls_binary_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_prob = f64_vec(&case, "y_prob_binary");
-    let got = log_loss(&y_true, &y_prob, 2, None, None, f64::EPSILON, true);
+    let got = log_loss(&y_true, &y_prob, 2, None, None, f64::EPSILON, true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_log_loss_binary"),
@@ -822,7 +844,7 @@ fn log_loss_labels_reorder_matches_sklearn_oracle() {
     let y_true = labels_i32(&case, "y_true_logloss_labelreorder");
     let y_prob = f64_vec(&case, "y_prob_logloss_labelreorder");
     let labels = labels_i32(&case, "labels_logloss_reorder");
-    let got = log_loss(&y_true, &y_prob, 2, Some(&labels), None, f64::EPSILON, true);
+    let got = log_loss(&y_true, &y_prob, 2, Some(&labels), None, f64::EPSILON, true).unwrap();
     assert_close(
         got,
         scalar(&case, "ref_log_loss_labelreorder"),
@@ -1015,7 +1037,8 @@ fn precision_recall_curve_sentinel_and_length_invariants() {
     let case = load("metrics_cls_binary_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_score = f64_vec(&case, "y_score");
-    let (precision, recall, thresholds) = precision_recall_curve(&y_true, &y_score, 1, None);
+    let (precision, recall, thresholds) =
+        precision_recall_curve(&y_true, &y_score, 1, None).unwrap();
     assert_eq!(precision.len(), thresholds.len() + 1, "precision length");
     assert_eq!(recall.len(), thresholds.len() + 1, "recall length");
     assert_eq!(precision.last(), Some(&1.0), "precision sentinel");
@@ -1030,7 +1053,8 @@ fn precision_recall_curve_matches_sklearn_oracle_tie_heavy() {
     let case = load("metrics_cls_binary_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_score = f64_vec(&case, "y_score");
-    let (precision, recall, thresholds) = precision_recall_curve(&y_true, &y_score, 1, None);
+    let (precision, recall, thresholds) =
+        precision_recall_curve(&y_true, &y_score, 1, None).unwrap();
     let want_p = f64_vec(&case, "ref_pr_precision");
     let want_r = f64_vec(&case, "ref_pr_recall");
     let want_t = f64_vec(&case, "ref_pr_thresholds");
@@ -1061,7 +1085,8 @@ fn precision_recall_curve_weighted_matches_sklearn_oracle() {
     let y_true = labels_i32(&case, "y_true");
     let y_score = f64_vec(&case, "y_score");
     let sw = f64_vec(&case, "sample_weight");
-    let (precision, recall, thresholds) = precision_recall_curve(&y_true, &y_score, 1, Some(&sw));
+    let (precision, recall, thresholds) =
+        precision_recall_curve(&y_true, &y_score, 1, Some(&sw)).unwrap();
     let want_p = f64_vec(&case, "ref_pr_precision_sw");
     let want_r = f64_vec(&case, "ref_pr_recall_sw");
     let want_t = f64_vec(&case, "ref_pr_thresholds_sw");
@@ -1093,4 +1118,112 @@ fn precision_recall_curve_weighted_matches_sklearn_oracle() {
             &format!("pr_thresholds_sw[{i}]"),
         );
     }
+}
+
+// ==================== code-review fix: sample_weight validation, no panic ====================
+//
+// Every function below previously indexed `sample_weight[i]` with no length
+// check, and precision/recall/f1 discarded `class_bookkeeping`'s Err via
+// `.expect(...)`. These regression tests lock in the fixed contract: a
+// mismatched-length or invalid (negative/NaN) `sample_weight` returns a typed
+// `Err`, never a panic, and never a silently-truncated/out-of-bounds result.
+
+#[test]
+fn accuracy_score_bad_sample_weight_returns_err_not_panic() {
+    let y_true = [1i32, 0, 1];
+    let y_pred = [1i32, 0, 0];
+    let too_short = [1.0f64];
+    assert!(matches!(
+        accuracy_score(&y_true, &y_pred, Some(&too_short), true),
+        Err(MetricError::LengthMismatch)
+    ));
+    let negative = [1.0f64, -1.0, 1.0];
+    assert!(matches!(
+        accuracy_score(&y_true, &y_pred, Some(&negative), true),
+        Err(MetricError::InvalidWeight)
+    ));
+}
+
+#[test]
+fn confusion_matrix_bad_sample_weight_returns_err_not_panic() {
+    let y_true = [1i32, 0, 1];
+    let y_pred = [1i32, 0, 0];
+    let too_short = [1.0f64];
+    assert!(matches!(
+        confusion_matrix(&y_true, &y_pred, None, Some(&too_short)),
+        Err(MetricError::LengthMismatch)
+    ));
+}
+
+#[test]
+fn prf_bad_sample_weight_returns_err_not_panic() {
+    let y_true = [1i32, 0, 1];
+    let y_pred = [1i32, 0, 0];
+    let too_short = [1.0f64];
+    assert!(matches!(
+        precision_score(
+            &y_true,
+            &y_pred,
+            None,
+            1,
+            Average::Binary,
+            Some(&too_short),
+            ZeroDivision::Zero
+        ),
+        Err(MetricError::LengthMismatch)
+    ));
+    assert!(matches!(
+        recall_score(
+            &y_true,
+            &y_pred,
+            None,
+            1,
+            Average::Binary,
+            Some(&too_short),
+            ZeroDivision::Zero
+        ),
+        Err(MetricError::LengthMismatch)
+    ));
+    assert!(matches!(
+        f1_score(
+            &y_true,
+            &y_pred,
+            None,
+            1,
+            Average::Binary,
+            Some(&too_short),
+            ZeroDivision::Zero
+        ),
+        Err(MetricError::LengthMismatch)
+    ));
+}
+
+#[test]
+fn log_loss_bad_sample_weight_returns_err_not_panic() {
+    let y_true = [1i32, 0, 1];
+    let y_prob = [0.2, 0.8, 0.7, 0.3, 0.1, 0.9];
+    let too_short = [1.0f64];
+    assert!(matches!(
+        log_loss(
+            &y_true,
+            &y_prob,
+            2,
+            None,
+            Some(&too_short),
+            f64::EPSILON,
+            true
+        ),
+        Err(MetricError::LengthMismatch)
+    ));
+}
+
+#[test]
+fn precision_recall_curve_bad_sample_weight_returns_err_not_panic() {
+    let y_true = [1i32, 0, 1];
+    let y_score = [0.9, 0.2, 0.6];
+    let too_short = [1.0f64];
+    assert!(matches!(
+        precision_recall_curve(&y_true, &y_score, 1, Some(&too_short)),
+        Err(MetricError::LengthMismatch)
+    ));
 }

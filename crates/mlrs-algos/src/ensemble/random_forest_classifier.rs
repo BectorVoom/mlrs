@@ -187,6 +187,31 @@ where
     pub fn oob_score(&self) -> Option<F> {
         self.oob_score_
     }
+
+    /// SHAP-01: path-dependent TreeSHAP values, self-consistency-gated (see
+    /// `tree_shap` module docs — a native mlrs forest has no external
+    /// oracle). `x_train_host`/`query_host` are host row-major `f64` buffers
+    /// (`n_train`/`n_query` × `n_features()`). Returns `(phi, expected_value)`:
+    /// `phi` is `n_query × n_features × n_classes`; `expected_value` is
+    /// length `n_classes`. `Σ_f phi[q, f, :] + expected_value ==
+    /// predict_proba(query)[q]` exactly for every row.
+    pub fn shap_values(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        x_train_host: &[f64],
+        n_train: usize,
+        query_host: &[f64],
+        n_query: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        crate::ensemble::tree_shap::native_forest_shap_values(
+            pool,
+            self.model(),
+            x_train_host,
+            n_train,
+            query_host,
+            n_query,
+        )
+    }
 }
 
 /// Builder for [`RandomForestClassifier`] (D-01). `Default` re-derives the

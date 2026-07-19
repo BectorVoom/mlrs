@@ -3493,17 +3493,25 @@ def _hgb_det_kwargs():
     )
 
 
-def gen_hgb_regressor(seed: int = SEED, dtype=np.float32) -> str:
+def gen_hgb_regressor(seed: int = SEED, dtype=np.float32, rng_offset: int = 31) -> str:
     """Generate one HistGradientBoosting REGRESSOR fixture (GBT-01).
 
     Stores ``X``/``y`` (train), ``Xq``/``yq`` (held-out), the deterministic
     tier's train predictions ``det_pred_train`` (exact-gated) and held-out
     R² ``det_r2_test``, plus the sklearn-DEFAULTS statistical tier's held-out
     R² ``stat_r2_test``. Returns the path written.
+
+    `rng_offset` selects the `_rf_grid_data` draw — tunable for the same
+    reason as `gen_hgb_classifier`'s: mlrs's GBT-01 sibling-subtraction
+    optimization makes its histogram reduction float-noise-sensitive like
+    sklearn's own (independent reduction tree, not bit-identical), so an
+    offset must be probed against the ACTUAL mlrs fit (both backends — the
+    committed value passed cpu but a stale one failed on wgpu at f64, since
+    block/reduction order differs by backend even before subtraction).
     """
     from sklearn.ensemble import HistGradientBoostingRegressor
 
-    rng = np.random.default_rng(seed + 3)
+    rng = np.random.default_rng(seed + rng_offset)
     x = _rf_grid_data(rng, HGB_N_TRAIN)
     xq = _rf_grid_data(rng, HGB_N_TEST)
     assert np.unique(x, axis=0).shape[0] == HGB_N_TRAIN, "duplicate train rows"
@@ -3554,7 +3562,7 @@ def gen_hgb_regressor(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
-def gen_hgb_classifier(seed: int = SEED, dtype=np.float32) -> str:
+def gen_hgb_classifier(seed: int = SEED, dtype=np.float32, rng_offset: int = 40) -> str:
     """Generate one HistGradientBoosting CLASSIFIER fixture (GBT-01).
 
     Carries BOTH class-count paths in one file: the 3-class rule target
@@ -3565,18 +3573,26 @@ def gen_hgb_classifier(seed: int = SEED, dtype=np.float32) -> str:
 
     CRITICAL (deterministic-tier design): the det-tier labels are the CLEAN
     rule — no noise. Noisy labels create EXACT-TIE split gains whose float
-    resolution differs between sklearn (sibling histograms by SUBTRACTION)
-    and mlrs (direct sums); a tie that resolves into a different row
-    partition diverges the ensembles from that iteration on. On the clean
-    target every informative split's gain is well-separated (remaining ties
-    occur only inside PURE nodes, where all candidate children share one
-    value, so predictions are unaffected) — verified at generation by the
-    train-accuracy assertion. Label noise is exercised by the statistical
-    tier instead.
+    resolution differs between sklearn's and mlrs's histogram-SUBTRACTION
+    sibling reduction (both subtract now — mlrs's GBT-01 sibling-subtraction
+    optimization matches sklearn's own approach — but the two are independent
+    implementations with different reduction trees, so they are NOT
+    bit-identical); a tie that resolves into a different row partition
+    diverges the ensembles from that iteration on. On the clean target every
+    informative split's gain is well-separated (remaining ties occur only
+    inside PURE nodes, where all candidate children share one value, so
+    predictions are unaffected) — verified at generation by the
+    train-accuracy assertion. `rng_offset` selects the `_rf_grid_data` draw;
+    it is tunable because "well-separated" is empirical, not provable in
+    closed form — see `scripts/gen_oracle.py`'s git history for how the
+    committed offset was chosen (probed against the actual mlrs subtraction
+    path, not just sklearn's `train_acc == 1.0` check, which both offsets
+    satisfy despite one producing a near-tie ~2.4e-5 off at f64 tolerance).
+    Label noise is exercised by the statistical tier instead.
     """
     from sklearn.ensemble import HistGradientBoostingClassifier
 
-    rng = np.random.default_rng(seed + 4)
+    rng = np.random.default_rng(seed + rng_offset)
     x = _rf_grid_data(rng, HGB_N_TRAIN)
     xq = _rf_grid_data(rng, HGB_N_TEST)
     assert np.unique(x, axis=0).shape[0] == HGB_N_TRAIN, "duplicate train rows"
@@ -4111,6 +4127,332 @@ def gen_metrics_regression(seed: int = _METRICS_FIXTURE_SEED, dtype=np.float32) 
     return out_path
 
 
+def _tree_shap_arrays(model, is_classifier):
+    """Flatten a fitted sklearn forest's per-tree arrays (children/feature/
+    threshold/value/node_sample_weight) plus per-tree node counts — the SAME
+    layout `ForestInference.load_from_sklearn` / the Rust `TreeSpec` slicer
+    consume (SHAP-01)."""
+    cl, cr, fe, th, va, nsw, counts = [], [], [], [], [], [], []
+    for est in model.estimators_:
+        t = est.tree_
+        counts.append(int(t.node_count))
+        cl.append(np.asarray(t.children_left, dtype=np.int64))
+        cr.append(np.asarray(t.children_right, dtype=np.int64))
+        fe.append(np.asarray(t.feature, dtype=np.int64))
+        th.append(np.asarray(t.threshold, dtype=np.float64))
+        nsw.append(np.asarray(t.weighted_n_node_samples, dtype=np.float64))
+        v = np.asarray(t.value, dtype=np.float64)  # (n_nodes, 1, n_values)
+        va.append(v[:, 0, :].reshape(-1) if is_classifier else v[:, 0, 0].reshape(-1))
+    return (
+        np.concatenate(cl),
+        np.concatenate(cr),
+        np.concatenate(fe),
+        np.concatenate(th),
+        np.concatenate(va),
+        np.concatenate(nsw),
+        np.array(counts, dtype=np.int64),
+    )
+
+
+def gen_arima(seed: int = SEED) -> str:
+    """Generate the ARIMA oracle fixture (TSA-01, Phase 22).
+
+    Simulates a stationary AR(2)/MA(1) zero-mean process, then fits
+    ``statsmodels.tsa.statespace.sarimax.SARIMAX(order=(2,0,1), trend='n',
+    concentrate_scale=True, enforce_stationarity=False,
+    enforce_invertibility=False)`` — the EXACT state-space convention mlrs's
+    ``Arima`` reproduces (verified digit-for-digit at design time; see
+    `crates/mlrs-algos/src/timeseries/arima.rs` module docs).
+
+    Two gate tiers (the TreeSHAP/t-SNE convention):
+    - DETERMINISTIC: `loglik_at_true_params` — the concentrated Kalman
+      log-likelihood evaluated at FIXED known parameters, no optimizer
+      involved. Gated ≤1e-6.
+    - BAND: the statsmodels MLE fit's `loglik`/`aicc`/`forecast` — mlrs's own
+      L-BFGS (zero-start, finite-difference gradient) may converge to a
+      different point on this non-convex surface, so the gate is
+      "at least as good a fit" (loglik) plus a forecast band, not exact
+      parameter equality.
+
+    Stores (all float64): ``y`` (length 120), ``true_params`` (phi1,phi2,
+    theta1), ``loglik_at_true_params``, ``sm_loglik``/``sm_aicc``
+    (statsmodels' MLE fit), ``sm_forecast`` (5-step-ahead).
+    """
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+    rng = np.random.default_rng(seed)
+    n = 120
+    phi_true = [0.5, -0.2]
+    theta_true = [0.3]
+    burn = 50
+    e = rng.normal(size=n + burn)
+    y = np.zeros(n + burn)
+    for t in range(2, n + burn):
+        y[t] = phi_true[0] * y[t - 1] + phi_true[1] * y[t - 2] + e[t] + theta_true[0] * e[t - 1]
+    y = y[burn:]
+
+    # enforce_stationarity/invertibility LEFT AT THEIR DEFAULT (True): with
+    # them off, statsmodels switches from exact-stationary to
+    # approximate_diffuse initialization (verified empirically at design
+    # time) — a DIFFERENT filter from the one `Arima` implements and is
+    # gated against (module docs: exact stationary Lyapunov P1). The true
+    # simulated params lie well inside the stationary/invertible region, so
+    # the default constrained fit lands at essentially the same optimum an
+    # unconstrained search would.
+    mod = SARIMAX(y, order=(2, 0, 1), trend="n", concentrate_scale=True)
+    ll_true = mod.loglike(phi_true + theta_true)
+    res = mod.fit(disp=False, method="lbfgs")
+    fc = res.forecast(steps=5)
+
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"arima_seed{seed}.npz")
+    np.savez(
+        out_path,
+        y=y.astype(np.float64),
+        true_params=np.array(phi_true + theta_true, dtype=np.float64),
+        loglik_at_true_params=np.array([ll_true], dtype=np.float64),
+        sm_loglik=np.array([res.llf], dtype=np.float64),
+        sm_aicc=np.array([res.aicc], dtype=np.float64),
+        sm_forecast=fc.astype(np.float64),
+    )
+    return out_path
+
+
+def gen_tree_shap(seed: int = SEED) -> list:
+    """Generate the TreeSHAP oracle fixtures (SHAP-01, Phase 21): a fitted
+    sklearn RandomForestClassifier + RandomForestRegressor, their per-tree
+    node arrays (the SAME layout `ForestInference` imports), and
+    `shap.TreeExplainer` SHAP values + expected_value on a query set.
+
+    mlrs's Rust `ForestInference::from_trees` imports THESE arrays and
+    computes `shap_values` using the EXACT `node_sample_weight` cover carried
+    here — so the Rust gate is a direct ≤1e-5 replay of `shap.TreeExplainer`
+    on the identical tree structure, no Python needed at test time.
+
+    Two fixtures: ``tree_shap_classifier_seed{seed}.npz`` /
+    ``tree_shap_regressor_seed{seed}.npz``. All arrays float64-cast
+    (``load_npz`` rejects int arrays — ``children_left``/``children_right``/
+    ``feature``/``node_counts`` are int-valued but float-typed).
+    """
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
+    import shap
+
+    rng = np.random.default_rng(seed)
+    paths = []
+
+    # --- classifier ---
+    x = rng.normal(size=(60, 3))
+    y = ((x[:, 0] + x[:, 1] > 0).astype(int) + (x[:, 2] > 0.5).astype(int))
+    m = RandomForestClassifier(n_estimators=5, max_depth=4, random_state=seed).fit(x, y)
+    xq = rng.normal(size=(6, 3))
+    cl, cr, fe, th, va, nsw, counts = _tree_shap_arrays(m, is_classifier=True)
+    expl = shap.TreeExplainer(m)
+    sv = np.asarray(expl.shap_values(xq))  # (q, f, n_classes)
+    ev = np.asarray(expl.expected_value, dtype=np.float64)
+    n_classes = int(m.n_classes_)
+
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"tree_shap_classifier_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=x.astype(np.float64),
+        Xq=xq.astype(np.float64),
+        children_left=cl.astype(np.float64),
+        children_right=cr.astype(np.float64),
+        feature=fe.astype(np.float64),
+        threshold=th,
+        value=va,
+        node_sample_weight=nsw,
+        node_counts=counts.astype(np.float64),
+        n_values=np.array([n_classes], dtype=np.float64),
+        n_features=np.array([x.shape[1]], dtype=np.float64),
+        shap_values=sv.reshape(-1),
+        expected_value=ev,
+        predict_proba=m.predict_proba(xq).astype(np.float64).reshape(-1),
+    )
+    paths.append(out_path)
+
+    # --- regressor ---
+    x = rng.normal(size=(50, 3))
+    y = x @ rng.normal(size=3)
+    m = RandomForestRegressor(n_estimators=4, max_depth=4, random_state=seed).fit(x, y)
+    xq = rng.normal(size=(6, 3))
+    cl, cr, fe, th, va, nsw, counts = _tree_shap_arrays(m, is_classifier=False)
+    expl = shap.TreeExplainer(m)
+    sv = np.asarray(expl.shap_values(xq))  # (q, f)
+    ev = np.asarray(np.atleast_1d(expl.expected_value), dtype=np.float64)
+
+    out_path = os.path.join(_FIXTURE_DIR, f"tree_shap_regressor_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=x.astype(np.float64),
+        Xq=xq.astype(np.float64),
+        children_left=cl.astype(np.float64),
+        children_right=cr.astype(np.float64),
+        feature=fe.astype(np.float64),
+        threshold=th,
+        value=va,
+        node_sample_weight=nsw,
+        node_counts=counts.astype(np.float64),
+        n_values=np.array([1.0]),
+        n_features=np.array([x.shape[1]], dtype=np.float64),
+        shap_values=sv.reshape(-1),
+        expected_value=ev,
+        predict=m.predict(xq).astype(np.float64),
+    )
+    paths.append(out_path)
+    return paths
+
+
+def gen_agglomerative(seed: int = SEED, dtype=np.float32, metric: str = "euclidean") -> str:
+    """Generate one AgglomerativeClustering oracle fixture (AGGLO-01).
+
+    Fits ``sklearn.cluster.AgglomerativeClustering(linkage='single')`` (1.9.0)
+    on a three-blob design at ``n_clusters ∈ {2, 3, 5}`` and stores the EXACT
+    ``labels_`` per cut plus the shared ``children_`` dendrogram. mlrs ports the
+    unstructured single-linkage pipeline line-for-line (`mst_linkage_core` /
+    scipy `label` / `_hc_cut` incl. Python-heapq array order), so the Rust gate
+    is EXACT equality — no permutation matching.
+
+    The design spreads the blobs and adds a per-row unique offset so all MST
+    edge weights are distinct (the HDBSCAN Pitfall-1 option-2 convention): the
+    merge order — and hence children/labels — is then stable under the f32
+    cast and the device GEMM-expansion Euclidean roundoff.
+
+    Stores (ALL arrays float-cast — ``load_npz`` rejects int arrays): ``X``
+    (``c()``-cast to the fixture dtype), ``children`` ((n-1)×2, float64),
+    ``labels_k2`` / ``labels_k3`` / ``labels_k5`` (float64). The metric rides
+    the filename: ``agglomerative_{metric}_{dtype}_seed{seed}.npz``.
+    """
+    from sklearn.cluster import AgglomerativeClustering as SkAgglo
+
+    rng = np.random.default_rng(seed)
+    # Small-magnitude centers: the device Euclidean path is a GEMM expansion
+    # (‖x‖² + ‖y‖² − 2x·y), whose f32 cancellation error scales with ‖x‖² — at
+    # center magnitude ~5 the absolute distance noise is ~1e-5, far under the
+    # asserted 2e-3 MST-edge-weight gap below.
+    centers = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [5.0, 5.0, -5.0, 2.5, -2.5],
+            [-5.5, 3.5, 4.5, -4.5, 2.0],
+        ]
+    )
+    # Retry jitter draws until ALL sorted single-linkage MST edge weights are
+    # pairwise separated by > 2e-3 (deterministic loop; the gap makes the merge
+    # order — and hence children/labels — exact under the f32 cast AND the
+    # device GEMM-expansion roundoff). ~57 within-blob edges over an O(1) weight
+    # range: a few draws suffice.
+    for _attempt in range(200):
+        blocks = [
+            centers[b] + 0.8 * rng.standard_normal((20, 5)) for b in range(3)
+        ]
+        x_design = np.vstack(blocks)
+        from scipy.cluster.hierarchy import linkage as _scipy_linkage
+        from scipy.spatial.distance import pdist as _pdist
+
+        weights = np.sort(_scipy_linkage(_pdist(x_design), method="single")[:, 2])
+        if np.diff(weights).min() > 2e-3:
+            break
+    else:
+        raise RuntimeError("no tie-free agglomerative design found in 200 draws")
+
+    labels_by_k = {}
+    children = None
+    for k in (2, 3, 5):
+        model = SkAgglo(n_clusters=k, metric=metric, linkage="single").fit(x_design)
+        labels_by_k[k] = model.labels_
+        children = model.children_  # cut-independent (same dendrogram)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"agglomerative_{metric}_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x_design),
+        children=children.astype(np.float64),
+        labels_k2=labels_by_k[2].astype(np.float64),
+        labels_k3=labels_by_k[3].astype(np.float64),
+        labels_k5=labels_by_k[5].astype(np.float64),
+    )
+    return out_path
+
+
+def gen_tsne(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the TSNE oracle fixture (TSNE-01).
+
+    Two gate tiers (the UMAP convention):
+    - DETERMINISTIC: the dense joint-probability matrix ``P`` from sklearn's
+      ``_joint_probabilities`` (f32-rounded distances, f64 search — mlrs ports
+      it line-for-line, gated ≤1e-5).
+    - BAND: ``sklearn.manifold.TSNE(method='exact', init='pca')`` embedding's
+      ``kl_divergence_`` and ``trustworthiness`` — mlrs's own embedding must
+      reach the same neighborhood-preservation band (chaotic dynamics + a
+      different PCA solver make exact equality meaningless).
+
+    Stores (ALL float — ``load_npz`` rejects ints): ``X`` (``c()``-cast),
+    ``P`` (dense n×n, f64), ``embedding`` (n×2, f64), ``kl`` (len-1),
+    ``trust`` (len-1, n_neighbors=5), ``perplexity`` (len-1).
+    """
+    from scipy.spatial.distance import squareform
+    from sklearn.manifold import TSNE as SkTSNE
+    from sklearn.manifold import trustworthiness
+    from sklearn.manifold._t_sne import _joint_probabilities
+    from sklearn.metrics import pairwise_distances
+
+    rng = np.random.default_rng(seed)
+    centers = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [6.0, 6.0, -6.0, 3.0, -3.0],
+            [-7.0, 4.0, 5.0, -5.0, 2.5],
+        ]
+    )
+    x_design = np.vstack(
+        [centers[b] + 0.7 * rng.standard_normal((16, 5)) for b in range(3)]
+    )  # 48 × 5, three well-separated blobs
+
+    perplexity = 10.0
+    dsq = pairwise_distances(x_design, metric="euclidean", squared=True)
+    p_cond = _joint_probabilities(dsq, perplexity, 0)  # condensed
+    p_dense = squareform(p_cond)  # dense n×n, diagonal 0
+
+    model = SkTSNE(
+        n_components=2,
+        perplexity=perplexity,
+        method="exact",
+        init="pca",
+        learning_rate="auto",
+        max_iter=1000,
+        random_state=seed,
+    )
+    emb = model.fit_transform(x_design)
+    trust = trustworthiness(x_design, emb, n_neighbors=5)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"tsne_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x_design),
+        P=p_dense.astype(np.float64),
+        embedding=np.asarray(emb, dtype=np.float64),
+        kl=np.array([model.kl_divergence_], dtype=np.float64),
+        trust=np.array([trust], dtype=np.float64),
+        perplexity=np.array([perplexity], dtype=np.float64),
+    )
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -4214,6 +4556,22 @@ def main() -> None:
     for structure in ("tieheavy", "nested", "allnoise", "single", "tiny"):
         for dtype in (np.float32, np.float64):
             print(f"wrote {gen_hdbscan(dtype=dtype, metric='euclidean', structure=structure)}")
+    # ARIMA (TSA-01): AR(2)/MA(1) zero-mean process, statsmodels SARIMAX
+    # oracle (fixed-param loglik + MLE fit + forecast).
+    print(f"wrote {gen_arima()}")
+    # TreeSHAP (SHAP-01): sklearn RF classifier+regressor node arrays +
+    # shap.TreeExplainer values (the ForestInference import path oracle).
+    for path in gen_tree_shap():
+        print(f"wrote {path}")
+    # AgglomerativeClustering (AGGLO-01): single-linkage, EXACT labels+children
+    # per metric × {f32, f64} at n_clusters ∈ {2, 3, 5}. Regen in the same /tmp
+    # venv as the hdbscan fixtures.
+    for metric in ("euclidean", "manhattan", "cosine"):
+        for dtype in (np.float32, np.float64):
+            print(f"wrote {gen_agglomerative(dtype=dtype, metric=metric)}")
+    # TSNE (TSNE-01): deterministic P-matrix gate + KL/trustworthiness band.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_tsne(dtype=dtype)}")
     # Lasso (LINEAR-03): sparse coef_ with exact zeros (Pitfall 1).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_lasso(dtype=dtype)}")

@@ -31,6 +31,24 @@
 //! `n_blocks` partial histograms per (tree, node, feature) — each unit owns
 //! one block slice exclusively — and [`gbt_hist_reduce`] sums the block axis.
 //!
+//! ## Sibling histogram SUBTRACTION (perf: ~15-20% faster fit)
+//! [`gbt_hist`]'s `node_stride` parameter lets the host gather only the LEFT
+//! child of every split directly (`node_stride = 2`, every EVEN real node
+//! id); [`gbt_hist_subtract`] then derives the RIGHT sibling by subtracting
+//! from the retained PARENT-level histogram (`right = parent − left`, valid
+//! on CUMULATIVE histograms since cumsum is linear and a non-leaf parent's
+//! rows partition exactly into its two children — see that kernel's doc for
+//! the leaf-phantom-node correctness argument). This roughly halves the
+//! total row-scan work per level without shrinking `gbt_hist`'s launch grid
+//! (an earlier attempt that shrank the grid to cut redundant reads was
+//! REVERTED — this machine's histogram gather is occupancy-bound, not
+//! bandwidth-bound; fewer/fatter threads regressed fit by ~30% despite
+//! moving fewer bytes). The host orchestration
+//! (`hist_gradient_boosting.rs::hgb_fit_impl`) only uses subtraction while a
+//! level's histogram fits in ONE unchunked buffer (a `subtract_cap` derived
+//! from the existing `HGB_HIST_BUDGET_BYTES` chunking discipline); deep/wide
+//! trees that need chunking fall back to the original direct-gather path.
+//!
 //! ## cpu-MLIR safety (the primary correctness gate)
 //! Every kernel stays inside the proven op-set (spike findings 001/002/003,
 //! see `tree.rs`): bare-`ABSOLUTE_POS` 1D launches with `if tid < total`
@@ -222,7 +240,12 @@ pub fn gbt_init_partition(order: &mut Array<u32>, ranges: &mut Array<u32>, n: u3
 ///
 /// `nodes_total` is the FULL level width (ranges indexing); `node_base` +
 /// `nodes_chunk` select the node chunk this launch covers (deep-level memory
-/// chunking, the `RF_HIST_BUDGET_BYTES` discipline).
+/// chunking, the `RF_HIST_BUDGET_BYTES` discipline). `node_stride` scales the
+/// per-thread `node` offset ONLY for the `ranges` lookup (`1` for a normal
+/// dense gather; `2` selects every EVEN real node id — the sibling
+/// histogram-SUBTRACTION "gather the left child only" pass, see
+/// `gbt_hist_subtract`); the OUTPUT stays densely packed by `node` either
+/// way, so [`gbt_hist_reduce`] is unaffected.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn gbt_hist<F: Float + CubeElement>(
@@ -240,6 +263,7 @@ pub fn gbt_hist<F: Float + CubeElement>(
     node_base: u32,
     nodes_chunk: u32,
     n_blocks: u32,
+    node_stride: u32,
 ) {
     let tid = ABSOLUTE_POS;
     let total = k * nodes_chunk * d * n_blocks;
@@ -259,7 +283,7 @@ pub fn gbt_hist<F: Float + CubeElement>(
             z += 1u32;
         }
 
-        let rbase = (tt * nodes_total + node_base + node) * 2u32;
+        let rbase = (tt * nodes_total + node_base + node * node_stride) * 2u32;
         let s = ranges[rbase as usize];
         let e = ranges[(rbase + 1u32) as usize];
         let len = e - s;
@@ -301,6 +325,59 @@ pub fn gbt_hist_reduce<F: Float + CubeElement>(
             b += 1u32;
         }
         hist[tid] = acc;
+    }
+}
+
+/// Derive the RIGHT sibling's histogram via SUBTRACTION from a directly
+/// GATHERED left-child histogram (`left`, produced by [`gbt_hist`] with
+/// `node_stride = 2`) and a RETAINED parent-level histogram (`parent_hist`)
+/// — valid on CUMULATIVE histograms too, since cumsum is linear:
+/// `parent_cum − left_cum = right_cum` exactly, because a non-leaf parent's
+/// row range partitions EXACTLY into its two children (`gbt_count_left` /
+/// `gbt_partition` never drop or duplicate a row). `left` is copied straight
+/// into the EVEN (left-child) slot of `hist_full`; the derived value lands in
+/// the ODD (right-child) slot — EXCEPT when the parent is a LEAF, where both
+/// children are phantom complete-tree slots with an EMPTY row range: naive
+/// subtraction would hand the phantom right slot the whole (nonzero) parent
+/// histogram back, so it is forced to zero instead (the phantom left slot is
+/// already correctly zero — `gbt_hist` scans its empty range and stays at its
+/// zeroed initial value). One unit per `(tree, parent, d·nb·3 element)` — no
+/// loops, straight-line reads (the `gbt_split_scores` shape).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn gbt_hist_subtract<F: Float + CubeElement>(
+    left: &Array<F>,
+    parent_hist: &Array<F>,
+    is_leaf: &Array<u32>,
+    hist_full: &mut Array<F>,
+    elem: u32,
+    k: u32,
+    left_children: u32,
+    tree_base: u32,
+    parent_level_base: u32,
+    total_nodes: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    let total = k * left_children * elem;
+    if tid < total as usize {
+        let col = (tid as u32) / elem;
+        let e = (tid as u32) % elem;
+        let tt = col / left_children;
+        let p = col % left_children;
+
+        let lv = left[tid];
+        let pv = parent_hist[tid];
+
+        let nodes_cur = left_children * 2u32;
+        let even_col = tt * nodes_cur + p * 2u32;
+        hist_full[(even_col * elem + e) as usize] = lv;
+
+        let midx = (tree_base + tt) * total_nodes + parent_level_base + p;
+        let mut rv = pv - lv;
+        if is_leaf[midx as usize] == 1u32 {
+            rv = F::new(0.0);
+        }
+        hist_full[((even_col + 1u32) * elem + e) as usize] = rv;
     }
 }
 

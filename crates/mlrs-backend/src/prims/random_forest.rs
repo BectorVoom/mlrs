@@ -121,9 +121,75 @@ impl<F> RfModel<F>
 where
     F: Float + CubeElement + Pod,
 {
+    /// Assemble a device-resident forest from HOST complete-layout arrays
+    /// (FIL-01 — the ForestInference import path; the fit path never uses
+    /// this). Each array is `n_trees × total_nodes` (× `n_values` for
+    /// `leaf_dist`) with `total_nodes = 2^(max_depth+1) − 1`; the traversal
+    /// contract is the fitted-forest one (`x < threshold → 2i+1`, bounded
+    /// `max_depth` walk, `is_leaf != 0` stops advancement — see
+    /// [`mlrs_kernels::rf_predict_leaf`]). `node_decrease` is zero-filled
+    /// (impurity decrease is a FIT product; an imported forest has none).
+    ///
+    /// Geometry is validated host-side: `total_nodes` must equal
+    /// `2^(max_depth+1) − 1` and every array length must match. Violations
+    /// return [`PrimError::ShapeMismatch`] BEFORE any upload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        pool: &mut BufferPool<ActiveRuntime>,
+        split_feature: &[u32],
+        threshold: &[F],
+        is_leaf: &[u32],
+        leaf_dist: &[F],
+        n_trees: usize,
+        max_depth: usize,
+        n_features: usize,
+        n_values: usize,
+    ) -> Result<Self, PrimError> {
+        let total_nodes = (1usize << (max_depth + 1)) - 1;
+        let tn = n_trees.checked_mul(total_nodes).ok_or(PrimError::Overflow {
+            operand: "total_nodes",
+            lhs: n_trees,
+            rhs: total_nodes,
+        })?;
+        for (operand, len, expect) in [
+            ("split_feature", split_feature.len(), tn),
+            ("threshold", threshold.len(), tn),
+            ("is_leaf", is_leaf.len(), tn),
+            ("leaf_dist", leaf_dist.len(), tn * n_values),
+        ] {
+            if len != expect {
+                return Err(PrimError::ShapeMismatch {
+                    operand,
+                    rows: n_trees,
+                    cols: total_nodes,
+                    len,
+                });
+            }
+        }
+        fits_u32(tn, "total_nodes")?;
+        let zeros: Vec<F> = vec![F::new(0.0); tn];
+        Ok(Self {
+            split_feature: DeviceArray::from_host(pool, split_feature),
+            threshold: DeviceArray::from_host(pool, threshold),
+            is_leaf: DeviceArray::from_host(pool, is_leaf),
+            leaf_dist: DeviceArray::from_host(pool, leaf_dist),
+            node_decrease: DeviceArray::from_host(pool, &zeros),
+            n_trees,
+            max_depth,
+            total_nodes,
+            n_features,
+            n_values,
+        })
+    }
+
     /// Number of trees in the forest.
     pub fn n_trees(&self) -> usize {
         self.n_trees
+    }
+
+    /// The bounded traversal depth (complete-layout `max_depth`).
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
     }
 
     /// Fitted feature count (predict geometry is validated against it).

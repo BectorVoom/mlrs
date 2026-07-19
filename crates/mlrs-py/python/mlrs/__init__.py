@@ -22,6 +22,7 @@ This file:
 from .cluster import (
     DBSCAN,
     HDBSCAN,
+    AgglomerativeClustering,
     KMeans,
     SpectralClustering,
     SpectralEmbedding,
@@ -30,6 +31,7 @@ from .covariance import EmpiricalCovariance, LedoitWolf
 from .decomposition import PCA, IncrementalPCA, TruncatedSVD
 from .density import KernelDensity
 from .ensemble import (
+    ForestInference,
     HistGradientBoostingClassifier,
     HistGradientBoostingRegressor,
     RandomForestClassifier,
@@ -47,7 +49,7 @@ from .linear import (
     MBSGDRegressor,
     Ridge,
 )
-from .manifold import UMAP
+from .manifold import TSNE, UMAP
 from .naive_bayes import (
     BernoulliNB,
     CategoricalNB,
@@ -65,6 +67,7 @@ from .random_projection import (
     SparseRandomProjection,
     johnson_lindenstrauss_min_dim,
 )
+from .timeseries import ARIMA, AutoARIMA
 
 # The host-only sklearn metrics surface (METR-SHIM-01): a SUBMODULE import,
 # NOT top-level `__all__` names (SPEC §5 explicit instruction — avoids e.g.
@@ -93,10 +96,13 @@ __all__ = [
     "RandomForestRegressor",
     "HistGradientBoostingClassifier",
     "HistGradientBoostingRegressor",
+    "ForestInference",
     "KMeans",
     "DBSCAN",
     "HDBSCAN",
+    "AgglomerativeClustering",
     "SpectralClustering",
+    "TSNE",
     "SpectralEmbedding",
     "UMAP",
     "PCA",
@@ -110,6 +116,8 @@ __all__ = [
     "GaussianRandomProjection",
     "SparseRandomProjection",
     "johnson_lindenstrauss_min_dim",
+    "ARIMA",
+    "AutoARIMA",
     "backend_supports_f64",
 ]
 

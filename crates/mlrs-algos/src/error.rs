@@ -370,6 +370,34 @@ pub enum AlgoError {
         reason: String,
     },
 
+    /// TSNE was fitted with a `perplexity >= n_samples` (TSNE-01). sklearn
+    /// raises `"perplexity must be less than n_samples"` — the conditional-
+    /// Gaussian entropy target is unreachable otherwise. Data-DEPENDENT, so
+    /// rejected at `fit` (the data-INDEPENDENT `perplexity > 0` bound is
+    /// [`BuildError::InvalidPerplexity`]).
+    #[error(
+        "estimator '{estimator}': perplexity = {perplexity} must be less than \
+         n_samples = {n_samples}"
+    )]
+    InvalidPerplexity {
+        /// Which estimator rejected the value.
+        estimator: &'static str,
+        /// The offending perplexity.
+        perplexity: f64,
+        /// The training sample count the perplexity must stay under.
+        n_samples: usize,
+    },
+
+    /// A construction-class hyperparameter violation raised by a NON-builder
+    /// entry point (FIL-01: `ForestInference::from_trees` validates an
+    /// imported forest — empty forest / depth over the complete-layout cap —
+    /// with the SAME typed vocabulary the builders use, but surfaces it from
+    /// a fallible constructor that also raises `Prim` geometry errors, so
+    /// the two classes share one `Result` error type here). Transparent
+    /// `#[from]`.
+    #[error("estimator build error: {0}")]
+    Build(#[from] BuildError),
+
     /// A primitive-layer failure (geometry / squareness / convergence /
     /// non-SPD pivot) surfaced from a `mlrs-backend` prim call the estimator
     /// composed. Transparent `#[from]` so estimator methods can `?` a prim
@@ -624,6 +652,18 @@ pub enum BuildError {
         n_neighbors: usize,
     },
 
+    /// AgglomerativeClustering was given `n_clusters == 0` (AGGLO-01). sklearn
+    /// raises on `n_clusters <= 0`; the data-DEPENDENT `n_clusters <= n_samples`
+    /// bound is a fit-body check ([`AlgoError::InvalidK`]). Rejected at
+    /// `build()` (data-INDEPENDENT, the D-08 split).
+    #[error("estimator '{estimator}': n_clusters = {n_clusters} is invalid (must be >= 1)")]
+    InvalidNClusters {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending cluster count (0).
+        n_clusters: usize,
+    },
+
     /// A Random Forest estimator was given `n_estimators == 0` (ENSEMBLE-01).
     /// A forest must contain at least one tree. Rejected at `build()`
     /// (data-INDEPENDENT, the D-08 split).
@@ -710,6 +750,36 @@ pub enum BuildError {
         /// Which estimator's builder rejected the value
         /// (`"random_forest_classifier"` / `"random_forest_regressor"`).
         estimator: &'static str,
+    },
+
+    /// TSNE was given a non-positive / non-finite `perplexity` (TSNE-01). The
+    /// perplexity is the (soft) effective neighbor count of the conditional
+    /// Gaussians and must be a finite positive number; the data-DEPENDENT
+    /// `perplexity < n_samples` bound is a fit-body check
+    /// ([`AlgoError::InvalidPerplexity`]). Rejected at `build()`.
+    #[error(
+        "estimator '{estimator}': perplexity = {perplexity} is invalid \
+         (must be finite and > 0)"
+    )]
+    InvalidPerplexity {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending perplexity.
+        perplexity: f64,
+    },
+
+    /// TSNE was given an `early_exaggeration < 1` or non-finite (TSNE-01).
+    /// sklearn raises on `early_exaggeration < 1.0` (the P scale-up must not
+    /// shrink the attractive forces). Rejected at `build()`.
+    #[error(
+        "estimator '{estimator}': early_exaggeration = {early_exaggeration} is \
+         invalid (must be finite and >= 1)"
+    )]
+    InvalidEarlyExaggeration {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending exaggeration factor.
+        early_exaggeration: f64,
     },
 
     /// A HistGradientBoosting estimator was given `max_iter == 0` (GBT-01).
@@ -831,5 +901,29 @@ pub enum BuildError {
         estimator: &'static str,
         /// The offending Minkowski exponent.
         p: f64,
+    },
+
+    /// An ARIMA order `(p, d, q)` component exceeded the bound `mlrs` enforces
+    /// to keep the Kalman-filter state dimension `r = max(p, q+1)` and the
+    /// differencing pass tractable (TSA-01). sklearn/statsmodels place no such
+    /// cap; mlrs's is a documented v1 scope bound. Rejected at `build()`
+    /// (data-INDEPENDENT).
+    #[error(
+        "estimator '{estimator}': order ({p}, {d}, {q}) has a component over the \
+         mlrs bound (p, q <= {max_pq}, d <= {max_d})"
+    )]
+    InvalidArimaOrder {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending AR order.
+        p: usize,
+        /// The offending differencing order.
+        d: usize,
+        /// The offending MA order.
+        q: usize,
+        /// The `p`/`q` bound.
+        max_pq: usize,
+        /// The `d` bound.
+        max_d: usize,
     },
 }

@@ -70,3 +70,6 @@ pub mod reduce;
 pub mod sgd;
 pub mod svd;
 pub mod topk;
+// TSNE-01: the exact-method t-SNE per-iteration gradient prim (Student-t
+// affinity + KL-gradient GATHER over the Phase-2 distance prim).
+pub mod tsne;

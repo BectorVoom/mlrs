@@ -38,8 +38,13 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+// FIL-01 — ForestInference: batched device inference over an IMPORTED
+// (sklearn-layout) forest, the cuML FIL parity surface.
+pub mod forest_inference;
 pub mod hist_gradient_boosting_classifier;
 pub mod hist_gradient_boosting_regressor;
+// SHAP-01 — path-dependent TreeSHAP over a fitted mlrs/imported forest.
+pub mod tree_shap;
 pub mod random_forest_classifier;
 pub mod random_forest_regressor;
 

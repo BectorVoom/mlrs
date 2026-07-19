@@ -98,3 +98,63 @@ def test_r2_mse_mae_callable():
     assert isinstance(_mlrs.mean_absolute_error(y_true, y_pred, None), float)
     assert _mlrs.mean_squared_error(y_true, y_true, None) == 0.0
     assert _mlrs.mean_absolute_error(y_true, y_true, None) == 0.0
+
+
+# ==================== code-review fix: bad sample_weight raises ValueError, no panic ====================
+#
+# A mismatched-length `sample_weight` previously indexed out of bounds inside
+# Rust and crashed the process with an unhandled `pyo3_runtime.PanicException`
+# instead of a catchable `ValueError`; precision/recall/f1 additionally
+# discarded a valid `class_bookkeeping` `Err` via `.expect(...)`. These lock
+# in the fixed, catchable-`ValueError` contract at the actual PyO3 boundary
+# users hit.
+
+
+def test_accuracy_score_bad_sample_weight_raises_value_error_not_panic():
+    with pytest.raises(ValueError):
+        _mlrs.accuracy_score([1, 0, 1], [1, 0, 0], [1.0], True)
+
+
+def test_confusion_matrix_bad_sample_weight_raises_value_error_not_panic():
+    with pytest.raises(ValueError):
+        _mlrs.confusion_matrix([1, 0, 1], [1, 0, 0], None, [1.0])
+
+
+def test_prf_bad_sample_weight_raises_value_error_not_panic():
+    y_true = [0, 1, 2, 0, 1, 2]
+    y_pred = [0, 1, 1, 0, 2, 2]
+    too_short = [1.0]
+    with pytest.raises(ValueError):
+        _mlrs.precision_score(y_true, y_pred, None, 1, "macro", too_short, 0.0)
+    with pytest.raises(ValueError):
+        _mlrs.recall_score(y_true, y_pred, None, 1, "macro", too_short, 0.0)
+    with pytest.raises(ValueError):
+        _mlrs.f1_score(y_true, y_pred, None, 1, "macro", too_short, 0.0)
+    with pytest.raises(ValueError):
+        _mlrs.precision_score_per_class(y_true, y_pred, None, too_short, 0.0)
+
+
+def test_log_loss_bad_sample_weight_raises_value_error_not_panic():
+    y_true = [0, 1, 0, 1]
+    y_prob = [0.9, 0.1, 0.1, 0.9, 0.8, 0.2, 0.2, 0.8]
+    with pytest.raises(ValueError):
+        _mlrs.log_loss(y_true, y_prob, 2, None, [1.0], 1e-15, True)
+
+
+def test_precision_recall_curve_bad_sample_weight_raises_value_error_not_panic():
+    y_true = [0, 1, 0, 1]
+    y_score = [0.1, 0.9, 0.4, 0.6]
+    with pytest.raises(ValueError):
+        _mlrs.precision_recall_curve(y_true, y_score, 1, [1.0])
+
+
+def test_regression_metrics_bad_sample_weight_raises_value_error_not_panic():
+    y_true = [1.0, 2.0, 3.0]
+    y_pred = [1.1, 1.9, 3.2]
+    too_short = [1.0]
+    with pytest.raises(ValueError):
+        _mlrs.r2_score(y_true, y_pred, too_short)
+    with pytest.raises(ValueError):
+        _mlrs.mean_squared_error(y_true, y_pred, too_short)
+    with pytest.raises(ValueError):
+        _mlrs.mean_absolute_error(y_true, y_pred, too_short)

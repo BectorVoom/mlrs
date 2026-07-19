@@ -21,6 +21,12 @@ use super::{
 /// `nb_common::accuracy_score`'s documented empty-input contract without a
 /// special-cased branch.
 ///
+/// Returns `Err(MetricError::LengthMismatch)` if `y_true`/`y_pred`/
+/// `sample_weight` lengths disagree, and `Err(MetricError::InvalidWeight)` on
+/// a negative/NaN weight entry — no panic (code-review fix: a too-short
+/// `sample_weight` previously indexed out of bounds and panicked, and a
+/// too-long one was silently truncated with no error).
+///
 /// NOTE: `nb_common::accuracy_score(pred, y_true)` (existing, opposite arg
 /// order) is now a thin delegate to this function (TASK-03, SPEC §5
 /// CLS-01) — ONE source of truth.
@@ -29,14 +35,12 @@ pub fn accuracy_score(
     y_pred: &[i32],
     sample_weight: Option<&[f64]>,
     normalize: bool,
-) -> f64 {
-    assert_eq!(
-        y_true.len(),
-        y_pred.len(),
-        "accuracy_score: length mismatch y_true={} y_pred={}",
-        y_true.len(),
-        y_pred.len()
-    );
+) -> Result<f64, MetricError> {
+    if y_true.len() != y_pred.len() {
+        return Err(MetricError::LengthMismatch);
+    }
+    validate_weight(y_true.len(), sample_weight)?;
+
     let mut correct = 0.0f64;
     let mut total = 0.0f64;
     for i in 0..y_true.len() {
@@ -46,11 +50,7 @@ pub fn accuracy_score(
             correct += w;
         }
     }
-    if normalize {
-        correct / total
-    } else {
-        correct
-    }
+    Ok(if normalize { correct / total } else { correct })
 }
 
 // ==================== TASK-04 — METR-CLS-02: confusion_matrix ====================
@@ -60,17 +60,21 @@ pub fn accuracy_score(
 /// `classes[j]`, in the resolved class order (sorted unique of `y_true ∪
 /// y_pred` when `labels=None`, else `labels` verbatim — including a class
 /// absent from the data, which gets a full zero row/column).
+///
+/// Returns `Err(MetricError::LengthMismatch)`/`Err(MetricError::InvalidWeight)`
+/// on a bad `sample_weight` — no panic (code-review fix, same class of bug
+/// as `accuracy_score`).
 pub fn confusion_matrix(
     y_true: &[i32],
     y_pred: &[i32],
     labels: Option<&[i32]>,
     sample_weight: Option<&[f64]>,
-) -> Vec<Vec<f64>> {
-    assert_eq!(
-        y_true.len(),
-        y_pred.len(),
-        "confusion_matrix: length mismatch"
-    );
+) -> Result<Vec<Vec<f64>>, MetricError> {
+    if y_true.len() != y_pred.len() {
+        return Err(MetricError::LengthMismatch);
+    }
+    validate_weight(y_true.len(), sample_weight)?;
+
     let classes: Vec<i32> = match labels {
         Some(ls) => ls.to_vec(),
         None => {
@@ -89,7 +93,7 @@ pub fn confusion_matrix(
             matrix[ti][pi] += w;
         }
     }
-    matrix
+    Ok(matrix)
 }
 
 // ==================== TASK-05/06/07 — precision/recall/f1 ====================
@@ -165,6 +169,10 @@ fn average_ratio(
 
 /// `precision = tp / (tp + fp)` per class, dispatched over `average` (SPEC
 /// §5 CLS-03).
+///
+/// Propagates [`class_bookkeeping`]'s `Result` (code-review fix: this
+/// previously `.expect()`-ed the Result, turning a documented graceful
+/// length-mismatch/invalid-weight `Err` into a Rust panic).
 pub fn precision_score(
     y_true: &[i32],
     y_pred: &[i32],
@@ -173,9 +181,8 @@ pub fn precision_score(
     average: Average,
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
-) -> PrfOut {
-    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)
-        .expect("precision_score: invalid input");
+) -> Result<PrfOut, MetricError> {
+    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
     let denom: Vec<f64> = bk
         .tp
         .iter()
@@ -188,7 +195,7 @@ pub fn precision_score(
         .zip(bk.fnn.iter())
         .map(|(&tp, &fnv)| tp + fnv)
         .collect();
-    average_ratio(
+    Ok(average_ratio(
         &bk.classes,
         &bk.tp,
         &denom,
@@ -196,11 +203,14 @@ pub fn precision_score(
         pos_label,
         average,
         zero_division,
-    )
+    ))
 }
 
 /// `recall = tp / (tp + fn)` per class, dispatched over `average` (SPEC §5
 /// CLS-04).
+///
+/// Propagates [`class_bookkeeping`]'s `Result` (code-review fix, same class
+/// of bug as `precision_score`).
 pub fn recall_score(
     y_true: &[i32],
     y_pred: &[i32],
@@ -209,9 +219,8 @@ pub fn recall_score(
     average: Average,
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
-) -> PrfOut {
-    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)
-        .expect("recall_score: invalid input");
+) -> Result<PrfOut, MetricError> {
+    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
     let denom: Vec<f64> = bk
         .tp
         .iter()
@@ -219,7 +228,7 @@ pub fn recall_score(
         .map(|(&tp, &fnv)| tp + fnv)
         .collect();
     let support = denom.clone();
-    average_ratio(
+    Ok(average_ratio(
         &bk.classes,
         &bk.tp,
         &denom,
@@ -227,13 +236,16 @@ pub fn recall_score(
         pos_label,
         average,
         zero_division,
-    )
+    ))
 }
 
 /// `f1 = 2*tp / (2*tp + fp + fn)` per class, computed DIRECTLY from the
 /// shared weighted TP/FP/FN (harmonic mean) — NOT from
 /// `precision_score(...) × recall_score(...)` floats, to avoid
 /// double-rounding (SPEC §5 CLS-05 note, TASK-07).
+///
+/// Propagates [`class_bookkeeping`]'s `Result` (code-review fix, same class
+/// of bug as `precision_score`).
 pub fn f1_score(
     y_true: &[i32],
     y_pred: &[i32],
@@ -242,9 +254,8 @@ pub fn f1_score(
     average: Average,
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
-) -> PrfOut {
-    let bk =
-        class_bookkeeping(y_true, y_pred, sample_weight, labels).expect("f1_score: invalid input");
+) -> Result<PrfOut, MetricError> {
+    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
     let numer: Vec<f64> = bk.tp.iter().map(|&tp| 2.0 * tp).collect();
     let denom: Vec<f64> = (0..bk.classes.len())
         .map(|i| 2.0 * bk.tp[i] + bk.fp[i] + bk.fnn[i])
@@ -255,7 +266,7 @@ pub fn f1_score(
         .zip(bk.fnn.iter())
         .map(|(&tp, &fnv)| tp + fnv)
         .collect();
-    average_ratio(
+    Ok(average_ratio(
         &bk.classes,
         &numer,
         &denom,
@@ -263,7 +274,7 @@ pub fn f1_score(
         pos_label,
         average,
         zero_division,
-    )
+    ))
 }
 
 // ==================== TASK-08 — METR-CLS-06: log_loss ====================
@@ -281,6 +292,12 @@ pub fn f1_score(
 /// sorted order (sklearn warns but does not remap columns). `y_prob` is
 /// row-major `n_rows × n_classes`, column `j` corresponding to the `j`-th
 /// smallest class in the resolved set.
+///
+/// Returns `Err(MetricError::BadShape)` if `y_prob`'s length isn't
+/// `y_true.len() * n_classes`, and `Err(MetricError::LengthMismatch)`/
+/// `Err(MetricError::InvalidWeight)` on a bad `sample_weight` — no panic
+/// (code-review fix: a too-short `sample_weight` previously indexed out of
+/// bounds and panicked).
 pub fn log_loss(
     y_true: &[i32],
     y_prob: &[f64],
@@ -289,12 +306,12 @@ pub fn log_loss(
     sample_weight: Option<&[f64]>,
     eps: f64,
     normalize: bool,
-) -> f64 {
-    assert_eq!(
-        y_prob.len(),
-        y_true.len() * n_classes,
-        "log_loss: y_prob shape mismatch"
-    );
+) -> Result<f64, MetricError> {
+    if y_prob.len() != y_true.len() * n_classes {
+        return Err(MetricError::BadShape);
+    }
+    validate_weight(y_true.len(), sample_weight)?;
+
     let classes: Vec<i32> = match labels {
         Some(ls) => {
             let mut v = ls.to_vec();
@@ -324,11 +341,7 @@ pub fn log_loss(
         sum += -w * p.ln();
         weight_total += w;
     }
-    if normalize {
-        sum / weight_total
-    } else {
-        sum
-    }
+    Ok(if normalize { sum / weight_total } else { sum })
 }
 
 // ==================== Shared rank-based sweep (TASK-09/10/11) ====================
@@ -559,17 +572,23 @@ pub fn roc_auc_score_multiclass(
 /// `thresholds.len()+1` with a trailing `(1.0, 0.0)` sentinel (the
 /// "threshold = +infinity, predict nothing positive" point), `thresholds`
 /// strictly ascending (the distinct score values, ascending).
+///
+/// Returns `Err(MetricError::LengthMismatch)`/`Err(MetricError::InvalidWeight)`
+/// on a bad `sample_weight` — no panic (code-review fix: unlike
+/// `roc_auc_score_binary`/`_multiclass`, this function called [`sweep`]
+/// without first validating `sample_weight`, so a too-short weight vector
+/// indexed out of bounds).
 pub fn precision_recall_curve(
     y_true: &[i32],
     probas_pred: &[f64],
     pos_label: i32,
     sample_weight: Option<&[f64]>,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    assert_eq!(
-        y_true.len(),
-        probas_pred.len(),
-        "precision_recall_curve: length mismatch"
-    );
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), MetricError> {
+    if y_true.len() != probas_pred.len() {
+        return Err(MetricError::LengthMismatch);
+    }
+    validate_weight(y_true.len(), sample_weight)?;
+
     let sw = sweep(y_true, probas_pred, pos_label, sample_weight);
     let k = sw.scores_desc.len();
     let mut thresholds = Vec::with_capacity(k);
@@ -588,5 +607,5 @@ pub fn precision_recall_curve(
     }
     precision.push(1.0);
     recall.push(0.0);
-    (precision, recall, thresholds)
+    Ok((precision, recall, thresholds))
 }

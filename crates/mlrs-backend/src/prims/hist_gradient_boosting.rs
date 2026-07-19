@@ -40,8 +40,9 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use mlrs_kernels::gbt::{
     gbt_best_split, gbt_count_left, gbt_grad_binary, gbt_grad_multi, gbt_grad_reg, gbt_hist,
-    gbt_hist_reduce, gbt_init_partition, gbt_init_raw, gbt_partition, gbt_proba_binary,
-    gbt_proba_multi, gbt_row_max, gbt_row_sumexp, gbt_split_scores, gbt_sum_raw, gbt_update_raw,
+    gbt_hist_reduce, gbt_hist_subtract, gbt_init_partition, gbt_init_raw, gbt_partition,
+    gbt_proba_binary, gbt_proba_multi, gbt_row_max, gbt_row_sumexp, gbt_split_scores, gbt_sum_raw,
+    gbt_update_raw,
 };
 use mlrs_kernels::tree::{rf_bin_features, rf_hist_cum, rf_predict_leaf};
 
@@ -368,6 +369,118 @@ fn validate_fit(x_len: usize, n: usize, d: usize, params: &HgbParams) -> Result<
     Ok(())
 }
 
+/// Gather + block-reduce + bin-cumsum a histogram for `nc` nodes starting at
+/// `node_base` within a `nodes_total`-wide level (row-blocked per
+/// [`gbt_hist`]'s `HGB_HIST_TARGET_UNITS` discipline). `node_stride` is `1`
+/// for a normal dense gather, `2` for the sibling-subtraction "gather the
+/// LEFT child only" pass (see [`hgb_fit_impl`]'s level loop and
+/// [`gbt_hist_subtract`]). Returns the freshly-acquired `(hist_handle,
+/// hist_len)` — the caller owns release.
+#[allow(clippy::too_many_arguments)]
+fn gather_hist<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    client: &cubecl::client::ComputeClient<ActiveRuntime>,
+    binned: &DeviceArray<ActiveRuntime, u32>,
+    g_dev: &DeviceArray<ActiveRuntime, F>,
+    h_dev: &DeviceArray<ActiveRuntime, F>,
+    order_a: &DeviceArray<ActiveRuntime, u32>,
+    ranges_a: &DeviceArray<ActiveRuntime, u32>,
+    ranges_len: usize,
+    n: usize,
+    d: usize,
+    nb: usize,
+    k: usize,
+    nodes_total: usize,
+    node_base: usize,
+    nc: usize,
+    node_stride: usize,
+) -> (cubecl::server::Handle, usize)
+where
+    F: Float + CubeElement + Pod,
+{
+    // Row blocks: aim for HGB_HIST_TARGET_UNITS units, bounded by the block
+    // cap and the byte budget.
+    let mut blocks = (HGB_HIST_TARGET_UNITS / (k * nc * d).max(1)).clamp(1, HGB_MAX_BLOCKS);
+    while blocks > 1 && k * nc * d * blocks * nb * 3 * size_of::<F>() > HGB_HIST_BUDGET_BYTES {
+        blocks /= 2;
+    }
+
+    let part_len = k * nc * d * blocks * nb * 3;
+    let hist_len = k * nc * d * nb * 3;
+    // With a single block the "partial" histogram IS the final histogram —
+    // gather straight into it and skip the reduce.
+    let part_h = if blocks > 1 {
+        Some(pool.acquire(part_len * size_of::<F>()))
+    } else {
+        None
+    };
+    let hist_h = pool.acquire(hist_len * size_of::<F>());
+
+    // K1: row-blocked histogram gather (count, Σg, Σh).
+    {
+        let gather_h = part_h.as_ref().unwrap_or(&hist_h);
+        let gather_len = if blocks > 1 { part_len } else { hist_len };
+        let (count, dim) = launch_dims_1d(k * nc * d * blocks);
+        gbt_hist::launch::<F, ActiveRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
+            unsafe { ArrayArg::from_raw_parts(g_dev.handle().clone(), n * k) },
+            unsafe { ArrayArg::from_raw_parts(h_dev.handle().clone(), n * k) },
+            unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), k * n) },
+            unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
+            unsafe { ArrayArg::from_raw_parts(gather_h.clone(), gather_len) },
+            n as u32,
+            d as u32,
+            nb as u32,
+            k as u32,
+            nodes_total as u32,
+            node_base as u32,
+            nc as u32,
+            blocks as u32,
+            node_stride as u32,
+        );
+    }
+
+    // K2: reduce the block axis (skipped when blocks == 1).
+    if let Some(part) = &part_h {
+        let (count, dim) = launch_dims_1d(hist_len);
+        gbt_hist_reduce::launch::<F, ActiveRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(part.clone(), part_len) },
+            unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+            nb as u32,
+            (k * nc * d) as u32,
+            blocks as u32,
+        );
+    }
+
+    // K3: cumulative histogram over bins (tree.rs kernel, ncs=3).
+    {
+        let (count, dim) = launch_dims_1d(k * nc * d * 3);
+        rf_hist_cum::launch::<F, ActiveRuntime>(
+            client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+            d as u32,
+            nb as u32,
+            3u32,
+            nc as u32,
+            k as u32,
+        );
+    }
+
+    if let Some(part) = part_h {
+        pool.release(part, part_len * size_of::<F>());
+    }
+
+    (hist_h, hist_len)
+}
+
 /// The shared launch-only fit driver. `baseline` has `K` entries.
 fn hgb_fit_impl<F>(
     pool: &mut BufferPool<ActiveRuntime>,
@@ -581,6 +694,20 @@ where
             );
         }
 
+        // Sibling histogram-SUBTRACTION eligibility cap: `per_node_bytes` is
+        // LEVEL-INDEPENDENT (only k/d/nb), so `node_chunk = min(cap, nodes)`
+        // crosses from "whole level fits in ONE unchunked buffer" to "must
+        // chunk" at MOST once, monotonically, as `nodes` doubles each level
+        // — there is a single threshold level after which every deeper level
+        // always chunks. `retained_hist` therefore only ever needs to
+        // survive between ADJACENT eligible levels; once ineligible, the
+        // ORIGINAL per-chunk gather path below runs unmodified forever after
+        // (graceful degradation for deep/wide trees, never a regression).
+        let per_node_bytes =
+            k * d * nb * 3 * size_of::<F>() * 2 + k * d * (nb - 1) * size_of::<F>();
+        let subtract_cap = HGB_HIST_BUDGET_BYTES / per_node_bytes.max(1);
+        let mut retained_hist: Option<(cubecl::server::Handle, usize)> = None;
+
         // Level loop — the batched histogram/split pipeline over K trees.
         for level in 0..=depth {
             let nodes = 1usize << level;
@@ -588,124 +715,82 @@ where
             let force_leaf = if level == depth { 1u32 } else { 0u32 };
             let root_level = if level == 0 { 1u32 } else { 0u32 };
 
-            // Node chunking to the transient byte budget (hist + one block
-            // set + scores per node; blocks only shrink the chunk further).
-            let per_node_bytes =
-                k * d * nb * 3 * size_of::<F>() * 2 + k * d * (nb - 1) * size_of::<F>();
-            let node_chunk = (HGB_HIST_BUDGET_BYTES / per_node_bytes.max(1)).clamp(1, nodes);
-
-            let mut node_base = 0usize;
-            while node_base < nodes {
-                let nc_now = node_chunk.min(nodes - node_base);
-
-                // Row blocks: aim for HGB_HIST_TARGET_UNITS units, bounded by
-                // the block cap and the byte budget.
-                let mut blocks =
-                    (HGB_HIST_TARGET_UNITS / (k * nc_now * d).max(1)).clamp(1, HGB_MAX_BLOCKS);
-                while blocks > 1
-                    && k * nc_now * d * blocks * nb * 3 * size_of::<F>() > HGB_HIST_BUDGET_BYTES
-                {
-                    blocks /= 2;
-                }
-
-                let part_len = k * nc_now * d * blocks * nb * 3;
-                let hist_len = k * nc_now * d * nb * 3;
-                let scores_len = k * nc_now * d * (nb - 1);
-                // With a single block the "partial" histogram IS the final
-                // histogram — gather straight into it and skip the reduce.
-                let part_h = if blocks > 1 {
-                    Some(pool.acquire(part_len * size_of::<F>()))
+            if nodes <= subtract_cap {
+                // --- Single-shot path: the whole level in ONE unchunked
+                // histogram buffer — either gathered directly (level 0, no
+                // parent) or derived via sibling SUBTRACTION from the
+                // retained parent level ([`gbt_hist_subtract`]'s doc has the
+                // leaf-phantom-node correctness argument) — then K4/K5 ONCE
+                // over the whole level.
+                let hist_len = k * nodes * d * nb * 3;
+                let hist_cur_h = if let Some((parent_h, parent_len)) = retained_hist.take() {
+                    let left_children = nodes / 2;
+                    let (left_h, left_len) = gather_hist::<F>(
+                        pool, &client, &binned, &g_dev, &h_dev, &order_a, &ranges_a, ranges_len,
+                        n, d, nb, k, nodes, 0, left_children, 2,
+                    );
+                    let hist_full_h = pool.acquire(hist_len * size_of::<F>());
+                    {
+                        let (count, dim) = launch_dims_1d(k * left_children * d * nb * 3);
+                        gbt_hist_subtract::launch::<F, ActiveRuntime>(
+                            &client,
+                            count,
+                            dim,
+                            unsafe { ArrayArg::from_raw_parts(left_h.clone(), left_len) },
+                            unsafe { ArrayArg::from_raw_parts(parent_h.clone(), parent_len) },
+                            unsafe {
+                                ArrayArg::from_raw_parts(
+                                    is_leaf.handle().clone(),
+                                    n_trees * total_nodes,
+                                )
+                            },
+                            unsafe { ArrayArg::from_raw_parts(hist_full_h.clone(), hist_len) },
+                            (d * nb * 3) as u32,
+                            k as u32,
+                            left_children as u32,
+                            tree_base,
+                            (left_children - 1) as u32,
+                            total_nodes as u32,
+                        );
+                    }
+                    pool.release(left_h, left_len * size_of::<F>());
+                    pool.release(parent_h, parent_len * size_of::<F>());
+                    hist_full_h
                 } else {
-                    None
+                    let (h, _) = gather_hist::<F>(
+                        pool, &client, &binned, &g_dev, &h_dev, &order_a, &ranges_a, ranges_len,
+                        n, d, nb, k, nodes, 0, nodes, 1,
+                    );
+                    h
                 };
-                let hist_h = pool.acquire(hist_len * size_of::<F>());
+
+                let scores_len = k * nodes * d * (nb - 1);
                 let scores_h = pool.acquire(scores_len * size_of::<F>());
-
-                // K1: row-blocked histogram gather (count, Σg, Σh).
-                {
-                    let gather_h = part_h.as_ref().unwrap_or(&hist_h);
-                    let gather_len = if blocks > 1 { part_len } else { hist_len };
-                    let (count, dim) = launch_dims_1d(k * nc_now * d * blocks);
-                    gbt_hist::launch::<F, ActiveRuntime>(
-                        &client,
-                        count,
-                        dim,
-                        unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
-                        unsafe { ArrayArg::from_raw_parts(g_dev.handle().clone(), n * k) },
-                        unsafe { ArrayArg::from_raw_parts(h_dev.handle().clone(), n * k) },
-                        unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), k * n) },
-                        unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
-                        unsafe { ArrayArg::from_raw_parts(gather_h.clone(), gather_len) },
-                        n as u32,
-                        d as u32,
-                        nb as u32,
-                        k as u32,
-                        nodes as u32,
-                        node_base as u32,
-                        nc_now as u32,
-                        blocks as u32,
-                    );
-                }
-
-                // K2: reduce the block axis (skipped when blocks == 1).
-                if let Some(part) = &part_h {
-                    let (count, dim) = launch_dims_1d(hist_len);
-                    gbt_hist_reduce::launch::<F, ActiveRuntime>(
-                        &client,
-                        count,
-                        dim,
-                        unsafe { ArrayArg::from_raw_parts(part.clone(), part_len) },
-                        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
-                        nb as u32,
-                        (k * nc_now * d) as u32,
-                        blocks as u32,
-                    );
-                }
-
-                // K3: cumulative histogram over bins (tree.rs kernel, ncs=3).
-                {
-                    let (count, dim) = launch_dims_1d(k * nc_now * d * 3);
-                    rf_hist_cum::launch::<F, ActiveRuntime>(
-                        &client,
-                        count,
-                        dim,
-                        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
-                        d as u32,
-                        nb as u32,
-                        3u32,
-                        nc_now as u32,
-                        k as u32,
-                    );
-                }
-
-                // K4: split gains (sklearn XGBoost-form, validity-gated).
                 {
                     let (count, dim) = launch_dims_1d(scores_len);
                     gbt_split_scores::launch::<F, ActiveRuntime>(
                         &client,
                         count,
                         dim,
-                        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                        unsafe { ArrayArg::from_raw_parts(hist_cur_h.clone(), hist_len) },
                         unsafe { ArrayArg::from_raw_parts(scores_h.clone(), scores_len) },
                         min_leaf_f,
                         min_hessian_f,
                         l2_f,
                         d as u32,
                         nb as u32,
-                        nc_now as u32,
+                        nodes as u32,
                         k as u32,
                         root_level,
                     );
                 }
-
-                // K5: per-node best split + leaf finalize (model writes).
                 {
-                    let (count, dim) = launch_dims_1d(k * nc_now);
+                    let (count, dim) = launch_dims_1d(k * nodes);
                     gbt_best_split::launch::<F, ActiveRuntime>(
                         &client,
                         count,
                         dim,
-                        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                        unsafe { ArrayArg::from_raw_parts(hist_cur_h.clone(), hist_len) },
                         unsafe { ArrayArg::from_raw_parts(scores_h.clone(), scores_len) },
                         unsafe {
                             ArrayArg::from_raw_parts(edges_dev.handle().clone(), edges_host.len())
@@ -744,22 +829,113 @@ where
                         l2_f,
                         d as u32,
                         nb as u32,
-                        nc_now as u32,
+                        nodes as u32,
                         k as u32,
                         tree_base,
-                        level_base + node_base as u32,
+                        level_base,
                         total_nodes as u32,
                         force_leaf,
                     );
                 }
-
-                if let Some(part) = part_h {
-                    pool.release(part, part_len * size_of::<F>());
-                }
-                pool.release(hist_h, hist_len * size_of::<F>());
                 pool.release(scores_h, scores_len * size_of::<F>());
 
-                node_base += nc_now;
+                if level < depth && (nodes * 2) <= subtract_cap {
+                    retained_hist = Some((hist_cur_h, hist_len));
+                } else {
+                    pool.release(hist_cur_h, hist_len * size_of::<F>());
+                }
+            } else {
+                // --- Deep-level fallback: the ORIGINAL per-node-chunk gather
+                // (subtraction never applies once a level needs chunking —
+                // see the monotonic-cap note above; `retained_hist` is
+                // already `None` by the time any level reaches this branch).
+                let node_chunk = (HGB_HIST_BUDGET_BYTES / per_node_bytes.max(1)).clamp(1, nodes);
+                let mut node_base = 0usize;
+                while node_base < nodes {
+                    let nc_now = node_chunk.min(nodes - node_base);
+                    let (hist_h, hist_len) = gather_hist::<F>(
+                        pool, &client, &binned, &g_dev, &h_dev, &order_a, &ranges_a, ranges_len,
+                        n, d, nb, k, nodes, node_base, nc_now, 1,
+                    );
+
+                    let scores_len = k * nc_now * d * (nb - 1);
+                    let scores_h = pool.acquire(scores_len * size_of::<F>());
+                    {
+                        let (count, dim) = launch_dims_1d(scores_len);
+                        gbt_split_scores::launch::<F, ActiveRuntime>(
+                            &client,
+                            count,
+                            dim,
+                            unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                            unsafe { ArrayArg::from_raw_parts(scores_h.clone(), scores_len) },
+                            min_leaf_f,
+                            min_hessian_f,
+                            l2_f,
+                            d as u32,
+                            nb as u32,
+                            nc_now as u32,
+                            k as u32,
+                            root_level,
+                        );
+                    }
+                    {
+                        let (count, dim) = launch_dims_1d(k * nc_now);
+                        gbt_best_split::launch::<F, ActiveRuntime>(
+                            &client,
+                            count,
+                            dim,
+                            unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                            unsafe { ArrayArg::from_raw_parts(scores_h.clone(), scores_len) },
+                            unsafe {
+                                ArrayArg::from_raw_parts(edges_dev.handle().clone(), edges_host.len())
+                            },
+                            unsafe {
+                                ArrayArg::from_raw_parts(
+                                    split_feature.handle().clone(),
+                                    n_trees * total_nodes,
+                                )
+                            },
+                            unsafe {
+                                ArrayArg::from_raw_parts(
+                                    split_bin.handle().clone(),
+                                    n_trees * total_nodes,
+                                )
+                            },
+                            unsafe {
+                                ArrayArg::from_raw_parts(
+                                    threshold.handle().clone(),
+                                    n_trees * total_nodes,
+                                )
+                            },
+                            unsafe {
+                                ArrayArg::from_raw_parts(
+                                    is_leaf.handle().clone(),
+                                    n_trees * total_nodes,
+                                )
+                            },
+                            unsafe {
+                                ArrayArg::from_raw_parts(
+                                    leaf_value.handle().clone(),
+                                    n_trees * total_nodes,
+                                )
+                            },
+                            lr_f,
+                            l2_f,
+                            d as u32,
+                            nb as u32,
+                            nc_now as u32,
+                            k as u32,
+                            tree_base,
+                            level_base + node_base as u32,
+                            total_nodes as u32,
+                            force_leaf,
+                        );
+                    }
+
+                    pool.release(hist_h, hist_len * size_of::<F>());
+                    pool.release(scores_h, scores_len * size_of::<F>());
+                    node_base += nc_now;
+                }
             }
 
             // K6 + K7: child ranges + stable partition (full-level launches).

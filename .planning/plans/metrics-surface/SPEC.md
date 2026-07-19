@@ -3,8 +3,8 @@ title: mlrs sklearn Metrics Surface (classification + regression free functions)
 status: draft
 format: markdown
 spec_version: 1
-spec_revision: 2
-updated_at: 2026-07-16T13:01:15Z
+spec_revision: 3
+updated_at: 2026-07-17T00:00:00Z
 source_requirements:
   - "User request: implement features in cuML/sklearn not yet in mlrs (coverage-gap fill)"
   - "Roadmap Phase 24 metrics success criterion (METR-01, METR-02, METR-03) — .planning/ROADMAP.md:216-231"
@@ -77,20 +77,20 @@ pub enum MultiClass { Ovr, Ovo }
 // sample_weight is Option<&[f64]> on every fn; None => unit weights.
 
 // metrics/classification.rs
-pub fn accuracy_score(y_true: &[i32], y_pred: &[i32], sw: Option<&[f64]>, normalize: bool) -> f64;
-pub fn confusion_matrix(y_true: &[i32], y_pred: &[i32], labels: Option<&[i32]>, sw: Option<&[f64]>) -> Vec<Vec<f64>>; // counts; f64 to carry weights, integral when sw=None
-pub fn precision_score(y_true: &[i32], y_pred: &[i32], labels: Option<&[i32]>, pos_label: i32, average: Average, sw: Option<&[f64]>, zero_division: ZeroDivision) -> PrfOut; // scalar or per-class
-pub fn recall_score(/* same shape */) -> PrfOut;
-pub fn f1_score(/* same shape */) -> PrfOut;
-pub fn log_loss(y_true: &[i32], y_prob: &[f64], n_classes: usize, labels: Option<&[i32]>, sw: Option<&[f64]>, eps: f64, normalize: bool) -> f64; // y_prob row-major n×n_classes
+pub fn accuracy_score(y_true: &[i32], y_pred: &[i32], sw: Option<&[f64]>, normalize: bool) -> Result<f64, MetricError>;
+pub fn confusion_matrix(y_true: &[i32], y_pred: &[i32], labels: Option<&[i32]>, sw: Option<&[f64]>) -> Result<Vec<Vec<f64>>, MetricError>; // counts; f64 to carry weights, integral when sw=None
+pub fn precision_score(y_true: &[i32], y_pred: &[i32], labels: Option<&[i32]>, pos_label: i32, average: Average, sw: Option<&[f64]>, zero_division: ZeroDivision) -> Result<PrfOut, MetricError>; // scalar or per-class
+pub fn recall_score(/* same shape */) -> Result<PrfOut, MetricError>;
+pub fn f1_score(/* same shape */) -> Result<PrfOut, MetricError>;
+pub fn log_loss(y_true: &[i32], y_prob: &[f64], n_classes: usize, labels: Option<&[i32]>, sw: Option<&[f64]>, eps: f64, normalize: bool) -> Result<f64, MetricError>; // y_prob row-major n×n_classes; BadShape if y_prob.len() != y_true.len()*n_classes
 pub fn roc_auc_score_binary(y_true: &[i32], y_score: &[f64], pos_label: i32, sw: Option<&[f64]>) -> Result<f64, MetricError>; // Err on single class
 pub fn roc_auc_score_multiclass(y_true: &[i32], y_score: &[f64], n_classes: usize, multi_class: MultiClass, average: Average, sw: Option<&[f64]>) -> Result<f64, MetricError>;
-pub fn precision_recall_curve(y_true: &[i32], probas_pred: &[f64], pos_label: i32, sw: Option<&[f64]>) -> (Vec<f64>, Vec<f64>, Vec<f64>); // (precision, recall, thresholds)
+pub fn precision_recall_curve(y_true: &[i32], probas_pred: &[f64], pos_label: i32, sw: Option<&[f64]>) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), MetricError>; // (precision, recall, thresholds)
 
 // metrics/regression.rs — generic over input float, accumulate f64
-pub fn r2_score<F: Float>(y_true: &[F], y_pred: &[F], sw: Option<&[f64]>) -> f64;
-pub fn mean_squared_error<F: Float>(y_true: &[F], y_pred: &[F], sw: Option<&[f64]>) -> f64;
-pub fn mean_absolute_error<F: Float>(y_true: &[F], y_pred: &[F], sw: Option<&[f64]>) -> f64;
+pub fn r2_score<F: Float>(y_true: &[F], y_pred: &[F], sw: Option<&[f64]>) -> Result<f64, MetricError>;
+pub fn mean_squared_error<F: Float>(y_true: &[F], y_pred: &[F], sw: Option<&[f64]>) -> Result<f64, MetricError>;
+pub fn mean_absolute_error<F: Float>(y_true: &[F], y_pred: &[F], sw: Option<&[f64]>) -> Result<f64, MetricError>;
 
 pub enum MetricError { LengthMismatch, EmptyInput, SingleClassRocAuc, BadShape, InvalidWeight, WeightedOvoUnsupported } // -> NEW metric_err_to_py -> PyValueError (a sibling of algo_err_to_py, which only takes AlgoError)
 pub enum PrfOut { Scalar(f64), PerClass(Vec<f64>) }
@@ -251,6 +251,8 @@ Open questions (owner-tagged; resolve at/before planning):
 - **Q10 OvO + sample_weight** — probe the pinned sklearn's `roc_auc_score(multi_class='ovo', sample_weight=...)` at TASK-02; if it raises, apply the §2 carve-out (Rust OvO rejects `sw!=None`). Owner: Planner. [Plan-Check Issue 2]
 
 **Revision note (Plan-Check pass 1 → SPEC v1 revised):** multioutput downgraded to non-goal (Issue 3); OvO+sample_weight carve-out documented (Issue 2); `MetricError`→`metric_err_to_py` corrected (Issue found in §4); regression metrics constrained to 1-D. Plan-level fixes (load_npz float-cast, mod.rs stub pre-creation, weighted pr_curve/roc_auc fixtures, labels-reorder tests, empty-NaN assertion) are delegated to PLAN.md revision.
+
+**Revision note (post-implementation code review → SPEC v3 revised):** an independent code review of the landed implementation (commit `0788e17`) found that `accuracy_score`, `confusion_matrix`, `precision_score`/`recall_score`/`f1_score`, `log_loss`, `precision_recall_curve`, `r2_score`, `mean_squared_error`, and `mean_absolute_error` all indexed `sample_weight[i]` with NO length/validity check — a too-short weight vector panicked (surfacing as an unhandled PyO3 `PanicException` instead of `ValueError`), and a too-long one was silently truncated with no error at all. `precision_score`/`recall_score`/`f1_score` additionally discarded `class_bookkeeping`'s own graceful `Err` via `.expect(...)`. **Fix:** every function in §4's typed contract now returns `Result<_, MetricError>` and validates via the existing `validate_weight` helper (the pattern `class_bookkeeping`/`roc_auc_score_binary`/`roc_auc_score_multiclass` already used) — no panic, no silent truncation, on any metric. The PyO3 layer propagates via `metric_err_to_py` uniformly. A separate cleanup fix consolidated the regression module's weighted-mean helper (previously duplicated three ways despite a doc-comment claiming it was shared) into one generic `weighted_mean` reused by `r2_score`/`mean_squared_error`/`mean_absolute_error`. New regression tests lock in the fixed contract at both the Rust and PyO3/Python boundaries. Verified: 83 Rust tests + 68 Python tests green.
 
 ## 10. Traceability and Sources
 

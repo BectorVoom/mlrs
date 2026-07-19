@@ -79,3 +79,42 @@ def test_dbscan_oracle(fixture):
     core = np.sort(np.asarray(est.core_sample_indices_).astype(np.int64).ravel())
     ref_core = np.sort(d["core_sample_indices"].astype(np.int64).ravel())
     assert np.array_equal(core, ref_core)
+
+
+AGGLOMERATIVE_FIXTURES = [
+    "agglomerative_euclidean_f32_seed42",
+    "agglomerative_euclidean_f64_seed42",
+    "agglomerative_manhattan_f32_seed42",
+    "agglomerative_manhattan_f64_seed42",
+    "agglomerative_cosine_f32_seed42",
+    "agglomerative_cosine_f64_seed42",
+]
+
+
+@pytest.mark.parametrize("fixture", AGGLOMERATIVE_FIXTURES)
+@requires_f64
+def test_agglomerative_oracle(fixture):
+    """AGGLO-01: labels_ and children_ EXACTLY match sklearn (no permutation —
+    mlrs ports the unstructured single-linkage pipeline line-for-line)."""
+    d = np.load(fixture_path(fixture))
+    metric = fixture.split("_")[1]
+    for k, key in ((2, "labels_k2"), (3, "labels_k3"), (5, "labels_k5")):
+        est = mlrs.AgglomerativeClustering(n_clusters=k, metric=metric).fit(d["X"])
+        labels = np.asarray(est.labels_).astype(np.int64).ravel()
+        ref = d[key].astype(np.int64).ravel()
+        assert np.array_equal(labels, ref), f"{fixture} k={k}: labels mismatch"
+        children = np.asarray(est.children_).astype(np.int64)
+        ref_children = d["children"].astype(np.int64)
+        assert np.array_equal(children, ref_children), f"{fixture} k={k}: children"
+        assert est.n_leaves_ == d["X"].shape[0]
+        assert est.n_connected_components_ == 1
+        assert est.n_clusters_ == k
+
+
+def test_agglomerative_rejects_unsupported():
+    """Unsupported linkage / metric raise loudly (never silently degrade)."""
+    X = np.random.default_rng(0).normal(size=(8, 3))
+    with pytest.raises(ValueError, match="linkage"):
+        mlrs.AgglomerativeClustering(linkage="ward").fit(X)
+    with pytest.raises(ValueError, match="metric"):
+        mlrs.AgglomerativeClustering(metric="chebyshev").fit(X)

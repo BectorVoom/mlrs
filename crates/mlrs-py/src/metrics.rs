@@ -95,12 +95,8 @@ pub fn accuracy_score(
     normalize: bool,
 ) -> PyResult<f64> {
     check_same_len(y_true.len(), y_pred.len(), "accuracy_score")?;
-    Ok(cls::accuracy_score(
-        &y_true,
-        &y_pred,
-        sample_weight.as_deref(),
-        normalize,
-    ))
+    cls::accuracy_score(&y_true, &y_pred, sample_weight.as_deref(), normalize)
+        .map_err(metric_err_to_py)
 }
 
 // ==================== confusion_matrix (METR-CLS-02) ====================
@@ -114,12 +110,8 @@ pub fn confusion_matrix(
     sample_weight: Option<Vec<f64>>,
 ) -> PyResult<Vec<Vec<f64>>> {
     check_same_len(y_true.len(), y_pred.len(), "confusion_matrix")?;
-    Ok(cls::confusion_matrix(
-        &y_true,
-        &y_pred,
-        labels.as_deref(),
-        sample_weight.as_deref(),
-    ))
+    cls::confusion_matrix(&y_true, &y_pred, labels.as_deref(), sample_weight.as_deref())
+        .map_err(metric_err_to_py)
 }
 
 // ==================== precision/recall/f1 (METR-CLS-03/04/05) ====================
@@ -140,7 +132,9 @@ macro_rules! prf_pyfunctions {
             check_same_len(y_true.len(), y_pred.len(), stringify!($scalar_fn))?;
             let avg = average_from_str(average)?;
             let zd = zero_division_from_f64(zero_division);
-            match $algos_fn(&y_true, &y_pred, labels.as_deref(), pos_label, avg, sample_weight.as_deref(), zd) {
+            match $algos_fn(&y_true, &y_pred, labels.as_deref(), pos_label, avg, sample_weight.as_deref(), zd)
+                .map_err(metric_err_to_py)?
+            {
                 mlrs_algos::metrics::PrfOut::Scalar(v) => Ok(v),
                 mlrs_algos::metrics::PrfOut::PerClass(_) => unreachable!(
                     "average_from_str rejects 'none'; PerClass cannot be produced here"
@@ -159,7 +153,9 @@ macro_rules! prf_pyfunctions {
         ) -> PyResult<Vec<f64>> {
             check_same_len(y_true.len(), y_pred.len(), stringify!($per_class_fn))?;
             let zd = zero_division_from_f64(zero_division);
-            match $algos_fn(&y_true, &y_pred, labels.as_deref(), 1, Average::None_, sample_weight.as_deref(), zd) {
+            match $algos_fn(&y_true, &y_pred, labels.as_deref(), 1, Average::None_, sample_weight.as_deref(), zd)
+                .map_err(metric_err_to_py)?
+            {
                 mlrs_algos::metrics::PrfOut::PerClass(v) => Ok(v),
                 mlrs_algos::metrics::PrfOut::Scalar(_) => {
                     unreachable!("Average::None_ always produces PerClass")
@@ -199,7 +195,7 @@ pub fn log_loss(
             n_classes
         )));
     }
-    Ok(cls::log_loss(
+    cls::log_loss(
         &y_true,
         &y_prob,
         n_classes,
@@ -207,7 +203,8 @@ pub fn log_loss(
         sample_weight.as_deref(),
         eps,
         normalize,
-    ))
+    )
+    .map_err(metric_err_to_py)
 }
 
 // ==================== roc_auc_score (METR-CLS-07/08) ====================
@@ -259,12 +256,8 @@ pub fn precision_recall_curve(
     sample_weight: Option<Vec<f64>>,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<f64>)> {
     check_same_len(y_true.len(), probas_pred.len(), "precision_recall_curve")?;
-    Ok(cls::precision_recall_curve(
-        &y_true,
-        &probas_pred,
-        pos_label,
-        sample_weight.as_deref(),
-    ))
+    cls::precision_recall_curve(&y_true, &probas_pred, pos_label, sample_weight.as_deref())
+        .map_err(metric_err_to_py)
 }
 
 // ==================== r2_score / mean_squared_error / mean_absolute_error (METR-REG-01/02/03) ====================
@@ -277,11 +270,7 @@ pub fn r2_score(
     sample_weight: Option<Vec<f64>>,
 ) -> PyResult<f64> {
     check_same_len(y_true.len(), y_pred.len(), "r2_score")?;
-    Ok(reg::r2_score::<f64>(
-        &y_true,
-        &y_pred,
-        sample_weight.as_deref(),
-    ))
+    reg::r2_score::<f64>(&y_true, &y_pred, sample_weight.as_deref()).map_err(metric_err_to_py)
 }
 
 #[pyfunction]
@@ -292,11 +281,8 @@ pub fn mean_squared_error(
     sample_weight: Option<Vec<f64>>,
 ) -> PyResult<f64> {
     check_same_len(y_true.len(), y_pred.len(), "mean_squared_error")?;
-    Ok(reg::mean_squared_error::<f64>(
-        &y_true,
-        &y_pred,
-        sample_weight.as_deref(),
-    ))
+    reg::mean_squared_error::<f64>(&y_true, &y_pred, sample_weight.as_deref())
+        .map_err(metric_err_to_py)
 }
 
 #[pyfunction]
@@ -307,9 +293,6 @@ pub fn mean_absolute_error(
     sample_weight: Option<Vec<f64>>,
 ) -> PyResult<f64> {
     check_same_len(y_true.len(), y_pred.len(), "mean_absolute_error")?;
-    Ok(reg::mean_absolute_error::<f64>(
-        &y_true,
-        &y_pred,
-        sample_weight.as_deref(),
-    ))
+    reg::mean_absolute_error::<f64>(&y_true, &y_pred, sample_weight.as_deref())
+        .map_err(metric_err_to_py)
 }

@@ -204,19 +204,21 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register all estimator `#[pyclass]` wrappers (PY-01). The pure-Python
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.
-    use estimators::cluster::{PyDBSCAN, PyHDBSCAN, PyKMeans};
+    use estimators::cluster::{PyAgglomerativeClustering, PyDBSCAN, PyHDBSCAN, PyKMeans};
     use estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
     use estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
     use estimators::ensemble::{
-        PyHistGradientBoostingClassifier, PyHistGradientBoostingRegressor,
-        PyRandomForestClassifier, PyRandomForestRegressor,
+        PyForestInference, PyHistGradientBoostingClassifier,
+        PyHistGradientBoostingRegressor, PyRandomForestClassifier,
+        PyRandomForestRegressor,
     };
     use estimators::kernel::{PyKernelDensity, PyKernelRidge};
+    use estimators::timeseries::{PyAutoArima, PyArima};
     use estimators::linear::{
         PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
         PyLogisticRegression, PyMBSGDClassifier, PyMBSGDRegressor, PyRidge,
     };
-    use estimators::manifold::PyUMAP;
+    use estimators::manifold::{PyTSNE, PyUMAP};
     use estimators::naive_bayes::{
         PyBernoulliNB, PyCategoricalNB, PyComplementNB, PyGaussianNB, PyMultinomialNB,
     };
@@ -275,12 +277,17 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // consuming-`fit` typestate estimators (collapsed behind the additive
     // `any_estimator_typestate!`).
     m.add_class::<PyUMAP>()?;
+    m.add_class::<PyTSNE>()?;
     m.add_class::<PyHDBSCAN>()?;
+    m.add_class::<PyAgglomerativeClustering>()?;
 
     // Phase-13 ensemble wrappers (PY-ENS-01/02, RF-IMP-02, RF-OOB-02 —
     // TASK-10, Wave 4a): RandomForestClassifier/Regressor, registration
     // 32 -> 34.
     m.add_class::<PyRandomForestClassifier>()?;
+    m.add_class::<PyForestInference>()?;
+    m.add_class::<PyArima>()?;
+    m.add_class::<PyAutoArima>()?;
     m.add_class::<PyRandomForestRegressor>()?;
 
     // Phase-14 ensemble wrappers (PY-ENS-03/04, PY-ENS-05 —

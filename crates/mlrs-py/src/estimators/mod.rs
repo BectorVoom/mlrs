@@ -39,3 +39,4 @@ pub mod naive_bayes;
 pub mod neighbors;
 pub mod projection;
 pub mod spectral;
+pub mod timeseries;
