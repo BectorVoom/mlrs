@@ -184,7 +184,7 @@ pub fn sgd_grad<F: Float + CubeElement>(
             }
         }
         // Clip ±1e12 (the host dloss clamp, on device — statement-form ifs).
-        let cap = F::new(1e12);
+        let cap = F::new(1e12_f32);
         if gi > cap {
             gi = cap;
         }

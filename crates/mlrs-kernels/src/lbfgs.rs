@@ -79,7 +79,7 @@ pub fn softmax_loss_grad<F: Float + CubeElement>(
     if UNIT_POS == 0 {
         let zero = F::from_int(0i64);
         let one = F::from_int(1i64);
-        let half = F::new(0.5);
+        let half = F::new(0.5_f32);
         let inv_n = one / F::cast_from(n);
 
         // --- Zero the gradient accumulators (grad_w is K×d, grad_b is K). ---

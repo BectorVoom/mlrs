@@ -35,7 +35,7 @@ use mlrs_algos::linear::linear_svr::LinearSVR;
 use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
 use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
-use mlrs_algos::traits::{Fit, Predict, PredictLabels, PredictProba};
+use mlrs_algos::typestate::{Fit, Predict, PredictLabels, PredictProba};
 
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -179,7 +179,7 @@ where
 
     // Builder chain identical to the PyMBSGDClassifier::fit body (log loss so
     // predict_proba is exercised, constant schedule for a deterministic smoke).
-    let mut est = MBSGDClassifier::<F>::builder()
+    let est = MBSGDClassifier::<F>::builder()
         .loss(Loss::try_from("log_loss").unwrap())
         .penalty(Penalty::try_from("l2").unwrap())
         .alpha(1e-4)
@@ -189,7 +189,9 @@ where
         .seed(0)
         .build::<F>()
         .expect("MBSGDClassifier builder");
-    est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("classifier fit");
+    // `Fit::fit` CONSUMES the `Unfit` estimator and returns the `Fitted` sibling
+    // (typestate lifecycle, D-05), so rebind rather than mutate in place.
+    let est = est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("classifier fit");
 
     let labels = est
         .predict_labels(&mut pool, &xd, (N, D))
@@ -225,7 +227,7 @@ where
     let xd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host::<F>());
     let yd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_regression::<F>());
 
-    let mut est = MBSGDRegressor::<F>::builder()
+    let est = MBSGDRegressor::<F>::builder()
         .loss(Loss::try_from("squared_error").unwrap())
         .penalty(Penalty::try_from("l2").unwrap())
         .alpha(1e-4)
@@ -235,7 +237,7 @@ where
         .seed(0)
         .build::<F>()
         .expect("MBSGDRegressor builder");
-    est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("regressor fit");
+    let est = est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("regressor fit");
 
     let pred = est.predict(&mut pool, &xd, (N, D)).expect("predict").to_host(&mut pool);
     assert_eq!(pred.len(), N, "predict length N");
@@ -256,13 +258,13 @@ where
     let xd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host::<F>());
     let yd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_labels::<F>());
 
-    let mut est = LinearSVC::<F>::builder()
+    let est = LinearSVC::<F>::builder()
         .loss(Loss::try_from("squared_hinge").unwrap())
         .penalty(Penalty::try_from("l2").unwrap())
         .c(1.0)
         .build::<F>()
         .expect("LinearSVC builder");
-    est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("svc fit");
+    let est = est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("svc fit");
 
     let labels = est
         .predict_labels(&mut pool, &xd, (N, D))
@@ -284,14 +286,14 @@ where
     let xd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host::<F>());
     let yd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_regression::<F>());
 
-    let mut est = LinearSVR::<F>::builder()
+    let est = LinearSVR::<F>::builder()
         .loss(Loss::try_from("squared_epsilon_insensitive").unwrap())
         .penalty(Penalty::try_from("l2").unwrap())
         .c(1.0)
         .epsilon(0.0)
         .build::<F>()
         .expect("LinearSVR builder");
-    est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("svr fit");
+    let est = est.fit(&mut pool, &xd, Some(&yd), (N, D)).expect("svr fit");
 
     let pred = est.predict(&mut pool, &xd, (N, D)).expect("predict").to_host(&mut pool);
     assert_eq!(pred.len(), N, "predict length N");

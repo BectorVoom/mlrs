@@ -32,8 +32,10 @@ use cubecl::prelude::*;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use mlrs_kernels::tree::{
-    rf_best_split, rf_bin_features, rf_count_left, rf_hist_class, rf_hist_cum, rf_hist_reg,
-    rf_mean_reg, rf_node_max, rf_node_sqsum, rf_node_total, rf_partition, rf_predict_leaf,
+    rf_best_split, rf_bin_features_t, rf_bin_features_t_packed, rf_child_ranges,
+    rf_count_left_blocks, rf_hist_class_atomic, rf_hist_class_part, rf_hist_cum,
+    rf_hist_cum_u32, rf_hist_reduce, rf_hist_reg_part, rf_hist_zero_u32, rf_mean_reg,
+    rf_node_stats, rf_order_iota, rf_partition_blocks, rf_predict_leaf, rf_root_ranges,
     rf_split_scores_class, rf_split_scores_reg, rf_vote_class,
 };
 
@@ -47,6 +49,101 @@ use crate::runtime::ActiveRuntime;
 /// tree chunks (extra launches, still zero readbacks). 64 MiB keeps single
 /// allocations comfortably under wgpu's default max-buffer-size.
 const RF_HIST_BUDGET_BYTES: usize = 64 << 20;
+
+/// Target parallel-unit count for the row-blocked kernels. Shallow levels
+/// have far fewer `tree × node × feature` columns than a GPU has resident
+/// threads (level 0 of the cuML-comparison ladder is ~128 — a big GPU sits
+/// >99% idle), so the row scans are split into up to [`RF_MAX_ROW_BLOCKS`]
+/// per-column blocks until the launch reaches this many units. 64Ki covers a
+/// T4-class device (40 SMs × 1024 resident threads) with headroom.
+const RF_TARGET_UNITS: usize = 128 * 1024;
+
+/// Cap on row blocks per histogram/partition column (bounds the partial-
+/// histogram memory multiplier and the per-node prefix loop length).
+const RF_MAX_ROW_BLOCKS: usize = 512;
+
+/// Histogram row-block count for one level chunk (see [`RF_TARGET_UNITS`] /
+/// [`RF_MAX_ROW_BLOCKS`]): reach the launch target, but never blow the
+/// partial-buffer budget and never drop below ~one `nb·ncs` slice of row work
+/// per block (the zero+reduce overhead ceiling).
+fn hist_blocks(cols: usize, hist_bytes: usize, n: usize, nodes: usize, slice: usize) -> usize {
+    RF_TARGET_UNITS
+        .div_ceil(cols.max(1))
+        .min(RF_HIST_BUDGET_BYTES / hist_bytes.max(1))
+        .min((n / nodes.max(1) / slice.max(1)).max(1))
+        .clamp(1, RF_MAX_ROW_BLOCKS)
+}
+
+/// The cpu backend's MLIR path miscompiles SharedMemory/atomic kernels
+/// (spike findings 001–003), so the shared-atomic classifier histogram is a
+/// GPU-backend path; cpu keeps the row-blocked gather. Integer atomics make
+/// both paths produce bitwise-identical histograms, and each backend's oracle
+/// suite runs its own path.
+#[cfg(feature = "cpu")]
+const RF_ATOMIC_HIST: bool = false;
+#[cfg(not(feature = "cpu"))]
+const RF_ATOMIC_HIST: bool = true;
+
+/// Shared-memory histogram slot budget of [`rf_hist_class_atomic`] (fixed
+/// comptime allocation of 4096 × u32 = 16 KiB per cube).
+const RF_ATOMIC_SHARED_SLOTS: usize = 4096;
+
+/// Workgroup (row-block) count per level for the atomic histogram: enough
+/// 256-thread cubes to saturate a T4-class device, split over the level's
+/// `(tree, node)` columns.
+fn atomic_hist_blocks(cols: usize) -> usize {
+    512usize.div_ceil(cols.max(1)).clamp(1, 64)
+}
+
+/// Partition row-block count for one level (same launch target; the floor is
+/// ~16 rows of scan work per block). Shared with
+/// `prims::hist_gradient_boosting` (the blocked GBT partition).
+pub(crate) fn partition_blocks(units: usize, n: usize, nodes: usize) -> usize {
+    RF_TARGET_UNITS
+        .div_ceil(units.max(1))
+        .min((n / nodes.max(1) / 16).max(1))
+        .clamp(1, RF_MAX_ROW_BLOCKS)
+}
+
+/// `RF_PROFILE=1` phase profiler: device-syncs at each `lap` and records the
+/// wall time since the previous one, dumping a table at the end of the fit.
+/// With the env var unset every call is a no-op (ZERO added syncs — the
+/// launch-only fit loop stays launch-only; profiling totals are inflated by
+/// the per-phase pipeline drains and are for ATTRIBUTION, not headlines).
+struct RfProf {
+    on: bool,
+    t: std::time::Instant,
+    rows: Vec<(String, f64)>,
+}
+
+impl RfProf {
+    fn new() -> Self {
+        Self {
+            on: std::env::var_os("RF_PROFILE").is_some(),
+            t: std::time::Instant::now(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, client: &crate::runtime::Client, label: impl Into<String>) {
+        if self.on {
+            let _ = cubecl::future::block_on(client.sync());
+            self.rows.push((label.into(), self.t.elapsed().as_secs_f64()));
+            self.t = std::time::Instant::now();
+        }
+    }
+
+    fn dump(&self) {
+        if self.on {
+            eprintln!("=== RF_PROFILE (sync per phase; totals inflated by the syncs) ===");
+            for (l, s) in &self.rows {
+                eprintln!("{l:>22}: {:9.3} ms", s * 1e3);
+            }
+            let tot: f64 = self.rows.iter().map(|r| r.1).sum();
+            eprintln!("{:>22}: {:9.3} ms", "TOTAL", tot * 1e3);
+        }
+    }
+}
 
 /// Hard cap on `max_depth` (complete-tree layout: node arrays grow as
 /// `2^(max_depth+1)`; 16 gives 131 071 nodes/tree — the cuML default depth).
@@ -348,6 +445,20 @@ pub(crate) fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
     )
 }
 
+/// 256-thread workgroup grid for a CUBE-addressed kernel (folds past the
+/// per-dimension dispatch limit like [`launch_dims_1d`]; slack cubes are
+/// guarded in-kernel).
+pub(crate) fn launch_cubes_256(cubes: usize) -> (CubeCount, CubeDim) {
+    const MAX_DIM: u32 = 65_535;
+    let c = (cubes as u32).max(1);
+    let y = c.div_ceil(MAX_DIM);
+    let x = c.div_ceil(y);
+    (
+        CubeCount::Static(x, y, 1),
+        CubeDim { x: 256, y: 1, z: 1 },
+    )
+}
+
 /// WR-03: reject a kernel-index product that does not fit `u32` BEFORE any
 /// launch (a truncated index would read/write out of bounds on device).
 /// Shared with `prims::hist_gradient_boosting`.
@@ -434,70 +545,315 @@ where
 {
     let n_edges = n_bins - 1;
     let mut edges = vec![0f64; d * n_edges];
-    let mut col = vec![0f64; n];
-    for j in 0..d {
-        for i in 0..n {
-            col[i] = host_to_f64(x_host[i * d + j]);
-        }
-        col.sort_unstable_by(|a, b| a.total_cmp(b));
-        let vmax = col[n - 1];
-        let pad = if vmax.is_finite() { vmax.abs() + vmax.abs() * 1e-6 + 1.0 } else { 1.0 };
-
-        // Distinct consecutive values (the sklearn candidate midpoints).
-        let mut distinct: Vec<f64> = Vec::with_capacity(n.min(n_bins * 4));
-        for &v in col.iter() {
-            if distinct.last().is_none_or(|&last| v > last) {
-                distinct.push(v);
-            }
-        }
-
-        let mut cand: Vec<f64> = Vec::with_capacity(n_edges);
-        if distinct.len().saturating_sub(1) <= n_edges {
-            for w in distinct.windows(2) {
-                cand.push(0.5 * (w[0] + w[1]));
-            }
-        } else {
-            // Quantile midpoints: only strictly-increasing adjacent pairs so
-            // every edge falls strictly between two data values.
-            for k in 1..n_bins {
-                let i = (k * n) / n_bins;
-                if i >= 1 && col[i - 1] < col[i] {
-                    let m = 0.5 * (col[i - 1] + col[i]);
-                    if cand.last().is_none_or(|&last| m > last) {
-                        cand.push(m);
+    // `F` is `Pod`, so the host slice reinterprets as the concrete float via
+    // bytemuck — the workers then borrow a plain `&[f32]`/`&[f64]` (Send +
+    // Sync) and each extracts + sorts its OWN feature columns (no serial
+    // transpose pass, and the f32 path radix-sorts 4×u8 passes on 32-bit
+    // keys). Sorted order and every candidate float op are bit-identical to
+    // the previous convert-then-sort (f32→f64 is exact and monotone).
+    let bytes: &[u8] = bytemuck::cast_slice(x_host);
+    let workers = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .clamp(1, d);
+    let per = d.div_ceil(workers);
+    if size_of::<F>() == 4 {
+        let xf: &[f32] = bytemuck::cast_slice(bytes);
+        std::thread::scope(|scope| {
+            for (g, edge_group) in edges.chunks_mut(n_edges * per).enumerate() {
+                scope.spawn(move || {
+                    let mut col32: Vec<f32> = vec![0f32; n];
+                    let mut col: Vec<f64> = vec![0f64; n];
+                    let mut keys: Vec<u32> = Vec::with_capacity(n);
+                    let mut tmp: Vec<u32> = Vec::with_capacity(n);
+                    for (jj, out) in edge_group.chunks_mut(n_edges).enumerate() {
+                        let j = g * per + jj;
+                        for (i, dst) in col32.iter_mut().enumerate() {
+                            *dst = xf[i * d + j];
+                        }
+                        radix_sort_total_f32(&mut col32, &mut keys, &mut tmp);
+                        for (dst, &v) in col.iter_mut().zip(col32.iter()) {
+                            *dst = v as f64;
+                        }
+                        edges_from_sorted(&col, n_bins, out);
                     }
-                }
+                });
             }
-        }
-        cand.resize(n_edges, vmax + pad);
-        for (k, &e) in cand.iter().enumerate() {
-            edges[j * n_edges + k] = e;
-        }
+        });
+    } else {
+        let xd: &[f64] = bytemuck::cast_slice(bytes);
+        std::thread::scope(|scope| {
+            for (g, edge_group) in edges.chunks_mut(n_edges * per).enumerate() {
+                scope.spawn(move || {
+                    let mut col: Vec<f64> = vec![0f64; n];
+                    let mut keys: Vec<u64> = Vec::with_capacity(n);
+                    let mut tmp: Vec<u64> = Vec::with_capacity(n);
+                    for (jj, out) in edge_group.chunks_mut(n_edges).enumerate() {
+                        let j = g * per + jj;
+                        for (i, dst) in col.iter_mut().enumerate() {
+                            *dst = xd[i * d + j];
+                        }
+                        radix_sort_total(&mut col, &mut keys, &mut tmp);
+                        edges_from_sorted(&col, n_bins, out);
+                    }
+                });
+            }
+        });
     }
     edges.into_iter().map(f64_to_host::<F>).collect()
 }
 
-/// Host bootstrap weights (`n_trees × n` with-replacement counts as `F`), or
-/// all-ones when `bootstrap = false`. Consumes the RNG stream FIRST (fixed
-/// order for reproducibility).
-fn bootstrap_weights<F>(rng: &mut SplitMix64, n_trees: usize, n: usize, bootstrap: bool) -> Vec<F>
-where
-    F: Float + CubeElement + Pod,
-{
-    if !bootstrap {
-        return vec![f64_to_host::<F>(1.0); n_trees * n];
+/// IEEE-754 totalOrder key for `f32` (the 32-bit analogue of
+/// [`f64_total_key`]).
+#[inline]
+fn f32_total_key(v: f32) -> u32 {
+    let b = v.to_bits();
+    if b >> 31 == 1 { !b } else { b | (1u32 << 31) }
+}
+
+/// Inverse of [`f32_total_key`].
+#[inline]
+fn f32_from_total_key(k: u32) -> f32 {
+    let b = if k >> 31 == 1 { k & !(1u32 << 31) } else { !k };
+    f32::from_bits(b)
+}
+
+/// 4×8-bit LSB counting radix sort over f32 totalOrder keys (even pass count
+/// ⇒ result lands back in `keys`).
+fn radix_sort_total_f32(col: &mut [f32], keys: &mut Vec<u32>, tmp: &mut Vec<u32>) {
+    let n = col.len();
+    keys.clear();
+    keys.extend(col.iter().map(|&v| f32_total_key(v)));
+    tmp.resize(n, 0);
+    for pass in 0..4u32 {
+        let shift = pass * 8;
+        let mut cnt = [0usize; 256];
+        for &k in keys.iter() {
+            cnt[((k >> shift) & 255) as usize] += 1;
+        }
+        if cnt.iter().any(|&c| c == n) {
+            continue;
+        }
+        let mut pos = [0usize; 256];
+        let mut acc = 0usize;
+        for b in 0..256 {
+            pos[b] = acc;
+            acc += cnt[b];
+        }
+        for &k in keys.iter() {
+            let b = ((k >> shift) & 255) as usize;
+            tmp[pos[b]] = k;
+            pos[b] += 1;
+        }
+        std::mem::swap(keys, tmp);
     }
-    let mut counts = vec![0u32; n_trees * n];
-    for t in 0..n_trees {
-        for _ in 0..n {
-            let i = rng.next_below(n as u64) as usize;
-            counts[t * n + i] += 1;
+    for (dst, &k) in col.iter_mut().zip(keys.iter()) {
+        *dst = f32_from_total_key(k);
+    }
+}
+
+/// IEEE-754 totalOrder key for `f64`: a monotone `u64` whose unsigned order
+/// equals `f64::total_cmp` order (sign-magnitude flip). Bijective, so the
+/// radix-sorted array is BIT-IDENTICAL to a `sort_unstable_by(total_cmp)`
+/// result (equal values have equal bits under totalOrder — the sort output
+/// is unique regardless of stability).
+#[inline]
+fn f64_total_key(v: f64) -> u64 {
+    let b = v.to_bits();
+    if b >> 63 == 1 { !b } else { b | (1u64 << 63) }
+}
+
+/// Inverse of [`f64_total_key`].
+#[inline]
+fn f64_from_total_key(k: u64) -> f64 {
+    let b = if k >> 63 == 1 { k & !(1u64 << 63) } else { !k };
+    f64::from_bits(b)
+}
+
+/// LSB-first 8×8-bit counting radix sort over totalOrder keys — a linear-time
+/// replacement for the per-feature comparison sort (the quantile-edge sorts
+/// were the single biggest host cost of the fit on the Kaggle T4 profile).
+/// Even pass count ⇒ result lands back in `keys`.
+fn radix_sort_total(col: &mut [f64], keys: &mut Vec<u64>, tmp: &mut Vec<u64>) {
+    let n = col.len();
+    keys.clear();
+    keys.extend(col.iter().map(|&v| f64_total_key(v)));
+    tmp.resize(n, 0);
+    for pass in 0..8u32 {
+        let shift = pass * 8;
+        let mut cnt = [0usize; 256];
+        for &k in keys.iter() {
+            cnt[((k >> shift) & 255) as usize] += 1;
+        }
+        // Early-out: all keys share this byte — pass is the identity.
+        if cnt.iter().any(|&c| c == n) {
+            continue;
+        }
+        let mut pos = [0usize; 256];
+        let mut acc = 0usize;
+        for b in 0..256 {
+            pos[b] = acc;
+            acc += cnt[b];
+        }
+        for &k in keys.iter() {
+            let b = ((k >> shift) & 255) as usize;
+            tmp[pos[b]] = k;
+            pos[b] += 1;
+        }
+        std::mem::swap(keys, tmp);
+    }
+    for (dst, &k) in col.iter_mut().zip(keys.iter()) {
+        *dst = f64_from_total_key(k);
+    }
+}
+
+/// One feature's edge computation over its (unsorted) f64 column: sorts in
+/// place (linear-time radix, totalOrder — bit-identical to the old
+/// comparison sort), then emits the candidate midpoints — the exact
+/// per-feature logic (and float operations) `compute_edges` always used,
+/// factored out so the features can run on separate threads.
+fn edges_from_sorted(col: &[f64], n_bins: usize, out: &mut [f64]) {
+    let n = col.len();
+    let n_edges = n_bins - 1;
+    let vmax = col[n - 1];
+    let pad = if vmax.is_finite() { vmax.abs() + vmax.abs() * 1e-6 + 1.0 } else { 1.0 };
+
+    // Distinct consecutive values (the sklearn candidate midpoints).
+    let mut distinct: Vec<f64> = Vec::with_capacity(n.min(n_bins * 4));
+    for &v in col.iter() {
+        if distinct.last().is_none_or(|&last| v > last) {
+            distinct.push(v);
         }
     }
+
+    let mut cand: Vec<f64> = Vec::with_capacity(n_edges);
+    if distinct.len().saturating_sub(1) <= n_edges {
+        for w in distinct.windows(2) {
+            cand.push(0.5 * (w[0] + w[1]));
+        }
+    } else {
+        // Quantile midpoints: only strictly-increasing adjacent pairs so
+        // every edge falls strictly between two data values.
+        for k in 1..n_bins {
+            let i = (k * n) / n_bins;
+            if i >= 1 && col[i - 1] < col[i] {
+                let m = 0.5 * (col[i - 1] + col[i]);
+                if cand.last().is_none_or(|&last| m > last) {
+                    cand.push(m);
+                }
+            }
+        }
+    }
+    cand.resize(n_edges, vmax + pad);
+    out.copy_from_slice(&cand);
+}
+
+/// Per-tree bootstrap draw counts (`n_trees × n`; `n` with-replacement draws
+/// per tree). Each tree runs on its OWN SplitMix64 sub-stream whose seed was
+/// drawn SEQUENTIALLY from the master stream (so the whole scheme stays a
+/// pure function of the fit seed) — that independence is what lets the trees
+/// generate on parallel host threads (the profiled Kaggle T4 run spent 52 ms
+/// at 32 trees / 169 ms at 100 trees on the old single-threaded draw loop).
+/// `bootstrap = false` never calls this (and consumes NO RNG — the
+/// deterministic oracle tier is stream-independent).
+fn bootstrap_counts(sub_seeds: &[u64], n: usize) -> Vec<u32> {
+    let n_trees = sub_seeds.len();
+    let mut counts = vec![0u32; n_trees * n];
+    let workers = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .clamp(1, n_trees);
+    let per = n_trees.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (g, chunk) in counts.chunks_mut(per * n).enumerate() {
+            let seeds = &sub_seeds[g * per..];
+            scope.spawn(move || {
+                for (k, tree_counts) in chunk.chunks_mut(n).enumerate() {
+                    let mut r = SplitMix64::new(seeds[k]);
+                    for _ in 0..n {
+                        tree_counts[r.next_below(n as u64) as usize] += 1;
+                    }
+                }
+            });
+        }
+    });
     counts
-        .into_iter()
-        .map(|c| f64_to_host::<F>(c as f64))
-        .collect()
+}
+
+/// Expand per-tree draw counts into the per-tree ASCENDING row list the fit
+/// consumes as its level-0 `order` (row `i` appears `counts[i]` times;
+/// out-of-bag rows are simply absent). The histogram gather then adds `1` per
+/// visit — the resulting weighted counts are EXACTLY the old `Σ w` integers,
+/// with no weight array, no weight gather, and no dead `w = 0` row scans.
+fn expand_order(counts: &[u32], n_trees: usize, n: usize) -> Vec<u32> {
+    let mut order = vec![0u32; n_trees * n];
+    let workers = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .clamp(1, n_trees);
+    let per = n_trees.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for (g, chunk) in order.chunks_mut(per * n).enumerate() {
+            let counts = &counts[g * per * n..];
+            scope.spawn(move || {
+                for (k, tree_order) in chunk.chunks_mut(n).enumerate() {
+                    let mut w = 0usize;
+                    for (i, &c) in counts[k * n..(k + 1) * n].iter().enumerate() {
+                        for _ in 0..c {
+                            tree_order[w] = i as u32;
+                            w += 1;
+                        }
+                    }
+                    debug_assert_eq!(w, n, "bootstrap draws must total n");
+                }
+            });
+        }
+    });
+    order
+}
+
+/// All-level feature subsample table on per-level sub-streams (seeds drawn
+/// sequentially from the master stream by the caller), generated on parallel
+/// host threads. `mf == d` short-circuits to the identity per level and
+/// consumes NO sub-seed randomness (the deterministic oracle tier). Returns
+/// the concatenated table plus each level's element offset.
+fn sample_features_all(
+    level_seeds: &[u64],
+    n_trees: usize,
+    depth: usize,
+    mf: usize,
+    d: usize,
+) -> (Vec<u32>, Vec<usize>) {
+    let mut offs = Vec::with_capacity(depth + 1);
+    let mut total = 0usize;
+    for l in 0..=depth {
+        offs.push(total);
+        total += n_trees * (1usize << l) * mf;
+    }
+    let mut table = vec![0u32; total];
+    let workers = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .clamp(1, depth + 1);
+    std::thread::scope(|scope| {
+        let mut rest: &mut [u32] = &mut table;
+        let mut spawned = 0usize;
+        for l in 0..=depth {
+            let (head, tail) = rest.split_at_mut(n_trees * (1usize << l) * mf);
+            rest = tail;
+            let seed = level_seeds[l];
+            scope.spawn(move || {
+                let mut r = SplitMix64::new(seed);
+                let out = sample_features(&mut r, n_trees, 1usize << l, mf, d);
+                head.copy_from_slice(&out);
+            });
+            spawned += 1;
+            // Crude thread cap: join in waves by scope end; the level count is
+            // small (≤ 17) so oversubscription beyond `workers` is harmless.
+            let _ = (spawned, workers);
+        }
+    });
+    (table, offs)
 }
 
 /// Host per-node feature subsample (`n_trees × nodes × mf` raw ids, WITHOUT
@@ -561,55 +917,226 @@ where
     fits_u32(t * total_nodes * nc_out, "n_trees*total_nodes*n_values")?;
     fits_u32(t * max_nodes_level * mf * nb * ncs, "level_hist")?;
 
-    // --- ONE host readback: quantile bin edges (host-side, like kmeans++). ---
+    let mut prof = RfProf::new();
+    let client = pool.client().clone();
+
+    // --- Host RNG sub-seed derivation (sequential, cheap, a pure function of
+    // the fit seed): per-tree bootstrap sub-seeds first, then per-level
+    // feature sub-seeds. `bootstrap = false` and `mf == d` consume NOTHING,
+    // keeping the deterministic oracle tier stream-independent.
+    let mut rng = SplitMix64::new(params.seed);
+    let boot_seeds: Option<Vec<u64>> = if params.bootstrap {
+        Some((0..t).map(|_| rng.next_u64()).collect())
+    } else {
+        None
+    };
+    let feat_seeds: Option<Vec<u64>> = if mf < d {
+        Some((0..=depth).map(|_| rng.next_u64()).collect())
+    } else {
+        None
+    };
+    let total_feat_len: usize = (0..=depth).map(|l| t * (1usize << l) * mf).sum();
+    let pregen_feats = total_feat_len * size_of::<u32>() <= RF_HIST_BUDGET_BYTES;
+
+    // --- Worker thread: bootstrap draw expansion + the whole-forest feature
+    // table, OVERLAPPED with the main thread's quantile-edge sorts below. ---
+    let worker = std::thread::spawn({
+        let boot_seeds = boot_seeds.clone();
+        let feat_seeds = feat_seeds.clone();
+        move || {
+            let boot_order: Option<Vec<u32>> = boot_seeds.as_deref().map(|seeds| {
+                let counts = bootstrap_counts(seeds, n);
+                expand_order(&counts, t, n)
+            });
+            let feats: Option<(Vec<u32>, Vec<usize>)> = if !pregen_feats {
+                None
+            } else if let Some(seeds) = &feat_seeds {
+                Some(sample_features_all(seeds, t, depth, mf, d))
+            } else {
+                // mf == d: identity table (no RNG consumed).
+                let mut dummy = SplitMix64::new(0);
+                let mut offs = Vec::with_capacity(depth + 1);
+                let mut table: Vec<u32> = Vec::with_capacity(total_feat_len);
+                for l in 0..=depth {
+                    offs.push(table.len());
+                    table.extend(sample_features(&mut dummy, t, 1usize << l, mf, d));
+                }
+                Some((table, offs))
+            };
+            (boot_order, feats)
+        }
+    });
+
+    // --- ONE host readback: quantile bin edges (host-side, like kmeans++;
+    // per-feature sorts thread-parallel, overlapped with the worker). ---
     let x_host = x.to_host(pool);
     let edges_host = compute_edges::<F>(&x_host, n, d, nb);
     drop(x_host);
     let edges_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &edges_host);
+    prof.lap(&client, "edges(host)");
 
-    // --- Host RNG stream (fixed order: bootstrap, then levels). ---
-    let mut rng = SplitMix64::new(params.seed);
-    let w_host = bootstrap_weights::<F>(&mut rng, t, n, params.bootstrap);
-    let w_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &w_host);
-    drop(w_host);
+    let (boot_order, pregen_table) = worker.join().expect("rf host worker panicked");
+    prof.lap(&client, "boot+feat(host,overlap)");
 
-    let client = pool.client().clone();
-
-    // --- Bin the features once on device (n × d u32). ---
+    // --- Bin the features once on device, TRANSPOSED to d × n (feature-
+    // major) so the blocked row scans below read consecutive addresses. The
+    // classifier PACKS the row's class into the high bits (one load per
+    // histogram visit); the partition kernels mask bins with `% 65536`
+    // (a no-op on the regressor's unpacked layout). ---
     let binned_handle = pool.acquire(n * d * size_of::<u32>());
     {
         let (count, dim) = launch_dims_1d(n * d);
-        rf_bin_features::launch::<F, ActiveRuntime>(
-            &client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(x.handle().clone(), n * d) },
-            unsafe { ArrayArg::from_raw_parts(edges_dev.handle().clone(), edges_host.len()) },
-            unsafe { ArrayArg::from_raw_parts(binned_handle.clone(), n * d) },
-            n as u32,
-            d as u32,
-            (nb - 1) as u32,
-        );
+        match &target {
+            RfTarget::Class(y_dev, _) => {
+                rf_bin_features_t_packed::launch::<F, ActiveRuntime>(
+                    &client,
+                    count,
+                    dim,
+                    unsafe { ArrayArg::from_raw_parts(x.handle().clone(), n * d) },
+                    unsafe {
+                        ArrayArg::from_raw_parts(edges_dev.handle().clone(), edges_host.len())
+                    },
+                    unsafe { ArrayArg::from_raw_parts(y_dev.handle().clone(), n) },
+                    unsafe { ArrayArg::from_raw_parts(binned_handle.clone(), n * d) },
+                    n as u32,
+                    d as u32,
+                    (nb - 1) as u32,
+                );
+            }
+            RfTarget::Reg(_) => {
+                rf_bin_features_t::launch::<F, ActiveRuntime>(
+                    &client,
+                    count,
+                    dim,
+                    unsafe { ArrayArg::from_raw_parts(x.handle().clone(), n * d) },
+                    unsafe {
+                        ArrayArg::from_raw_parts(edges_dev.handle().clone(), edges_host.len())
+                    },
+                    unsafe { ArrayArg::from_raw_parts(binned_handle.clone(), n * d) },
+                    n as u32,
+                    d as u32,
+                    (nb - 1) as u32,
+                );
+            }
+        }
     }
-    let binned = DeviceArray::<ActiveRuntime, u32>::from_raw(binned_handle, n * d);
+    let binned_t = DeviceArray::<ActiveRuntime, u32>::from_raw(binned_handle, n * d);
 
-    // --- Row order (identity per tree) + level-0 ranges, ping-pong pairs. ---
-    let order_init: Vec<u32> = (0..t).flat_map(|_| 0..n as u32).collect();
-    let mut order_a: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(pool, &order_init);
-    drop(order_init);
+    // --- Row order (identity per tree) + level-0 ranges, ping-pong pairs —
+    // both filled ON DEVICE (zero uploads; the ranges buffer beyond the roots
+    // is written level-by-level by rf_child_ranges before it is ever read). ---
+    let mut order_a: DeviceArray<ActiveRuntime, u32> = match &boot_order {
+        // bootstrap: the expanded per-tree draw list (ONE upload).
+        Some(order_host) => DeviceArray::from_host(pool, order_host),
+        // no bootstrap: identity rows, filled on device (zero uploads).
+        None => {
+            let order_a_handle = pool.acquire(t * n * size_of::<u32>());
+            let (count, dim) = launch_dims_1d(t * n);
+            rf_order_iota::launch::<ActiveRuntime>(
+                &client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(order_a_handle.clone(), t * n) },
+                n as u32,
+                t as u32,
+            );
+            DeviceArray::from_raw(order_a_handle, t * n)
+        }
+    };
+    drop(boot_order);
     let order_b_handle = pool.acquire(t * n * size_of::<u32>());
     let mut order_b = DeviceArray::<ActiveRuntime, u32>::from_raw(order_b_handle, t * n);
 
     let ranges_len = t * max_nodes_level * 2;
-    let mut ranges_init = vec![0u32; ranges_len];
-    for tree in 0..t {
-        ranges_init[tree * 2] = 0;
-        ranges_init[tree * 2 + 1] = n as u32;
+    let ranges_a_handle = pool.acquire(ranges_len * size_of::<u32>());
+    {
+        let (count, dim) = launch_dims_1d(t);
+        rf_root_ranges::launch::<ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(ranges_a_handle.clone(), ranges_len) },
+            n as u32,
+            t as u32,
+        );
     }
-    let mut ranges_a: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(pool, &ranges_init);
-    drop(ranges_init);
+    let mut ranges_a = DeviceArray::<ActiveRuntime, u32>::from_raw(ranges_a_handle, ranges_len);
     let ranges_b_handle = pool.acquire(ranges_len * size_of::<u32>());
     let mut ranges_b = DeviceArray::<ActiveRuntime, u32>::from_raw(ranges_b_handle, ranges_len);
+
+    // --- Whole-forest feature table (worker-generated, ONE upload; the
+    // level loop performs no host→device transfers at all). Very deep trees
+    // exceed the budget guard and regenerate per level from their sub-seed
+    // instead. ---
+    let feat_all: Option<(DeviceArray<ActiveRuntime, u32>, Vec<usize>)> =
+        match pregen_table {
+            Some((host, offs)) => {
+                fits_u32(total_feat_len, "feat_ids_all")?;
+                Some((DeviceArray::from_host(pool, &host), offs))
+            }
+            None => None,
+        };
+
+    // Shared-atomic classifier histogram path (GPU backends): decided once —
+    // eligibility is level-independent (`mf·nb·ncs` is constant).
+    let use_atomic = RF_ATOMIC_HIST && mode_class == 1 && mf * nb * ncs <= RF_ATOMIC_SHARED_SLOTS;
+
+    // --- Transient level buffers: acquired ONCE at their maximum per-level
+    // sizes and reused across every level/chunk (per-level acquires would
+    // miss the exact-size free-list at every level on the first fit). ---
+    let mut max_hist = 0usize;
+    let mut max_part = 0usize;
+    let mut max_scores = 0usize;
+    let mut max_stats = 0usize;
+    let mut max_blk = 0usize;
+    for level in 0..=depth {
+        let nodes = 1usize << level;
+        let per_tree_bytes = nodes * mf * nb * ncs * size_of::<F>()
+            + nodes * mf * (nb - 1) * size_of::<F>()
+            + 3 * nodes * size_of::<F>();
+        let chunk_t = (RF_HIST_BUDGET_BYTES / per_tree_bytes.max(1)).clamp(1, t);
+        // Both chunk widths that can occur at this level (full + tail).
+        for tc in [chunk_t.min(t), t % chunk_t] {
+            if tc == 0 {
+                continue;
+            }
+            let hist_len = tc * nodes * mf * nb * ncs;
+            let bh = hist_blocks(tc * nodes * mf, hist_len * size_of::<F>(), n, nodes, nb * ncs);
+            max_hist = max_hist.max(hist_len);
+            if bh > 1 && !use_atomic {
+                max_part = max_part.max(hist_len * bh);
+            }
+            max_scores = max_scores.max(tc * nodes * mf * (nb - 1));
+            max_stats = max_stats.max(tc * nodes);
+        }
+        if level < depth {
+            let units = t * nodes;
+            max_blk = max_blk.max(units * partition_blocks(units, n, nodes));
+        }
+    }
+    fits_u32(max_part.max(max_hist), "level_hist_part")?;
+    fits_u32(max_blk, "partition_units")?;
+    let hist_h = pool.acquire(max_hist * size_of::<F>());
+    let scores_h = pool.acquire(max_scores * size_of::<F>());
+    let ntot_h = pool.acquire(max_stats * size_of::<F>());
+    let nmax_h = pool.acquire(max_stats * size_of::<F>());
+    let nsq_h = pool.acquire(max_stats * size_of::<F>());
+    let part_h = if max_part > 0 {
+        Some(pool.acquire(max_part * size_of::<F>()))
+    } else {
+        None
+    };
+    let histu_h = if use_atomic {
+        Some(pool.acquire(max_hist * size_of::<u32>()))
+    } else {
+        None
+    };
+    let blk_h = if max_blk > 0 {
+        Some(pool.acquire(max_blk * size_of::<u32>()))
+    } else {
+        None
+    };
+    prof.lap(&client, "init(bin+order+feat)");
 
     // --- Persistent model arrays (complete-tree layout). ---
     let split_feature_h = pool.acquire(t * total_nodes * size_of::<u32>());
@@ -638,10 +1165,24 @@ where
         let level_base = (nodes - 1) as u32;
         let force_leaf = if level == depth { 1u32 } else { 0u32 };
 
-        // Host-drawn per-node feature subsample (D-05), one upload.
-        let feat_host = sample_features(&mut rng, t, nodes, mf, d);
-        let feat_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(pool, &feat_host);
-        drop(feat_host);
+        // Per-node feature subsample: the pre-uploaded whole-forest table
+        // (offset per level, zero mid-loop uploads), or the per-level upload
+        // fallback for very deep trees.
+        let feat_tmp: Option<DeviceArray<ActiveRuntime, u32>> = if feat_all.is_none() {
+            let mut level_rng = match &feat_seeds {
+                Some(seeds) => SplitMix64::new(seeds[level]),
+                None => SplitMix64::new(0), // mf == d: identity, RNG unused
+            };
+            let feat_host = sample_features(&mut level_rng, t, nodes, mf, d);
+            Some(DeviceArray::from_host(pool, &feat_host))
+        } else {
+            None
+        };
+        let (feat_handle, feat_arr_len, feat_base) = match (&feat_all, &feat_tmp) {
+            (Some((arr, offs)), _) => (arr.handle().clone(), arr.len(), offs[level] as u32),
+            (_, Some(arr)) => (arr.handle().clone(), arr.len(), 0u32),
+            _ => unreachable!("feat_all xor feat_tmp always set"),
+        };
 
         // Tree chunking to the transient-buffer byte budget (3 stats-shaped
         // buffers now: node_total, node_max, node_sq).
@@ -657,142 +1198,188 @@ where
             let scores_len = tc * nodes * mf * (nb - 1);
             let stats_len = tc * nodes;
 
-            let hist_h = pool.acquire(hist_len * size_of::<F>());
-            let scores_h = pool.acquire(scores_len * size_of::<F>());
-            let ntot_h = pool.acquire(stats_len * size_of::<F>());
-            let nmax_h = pool.acquire(stats_len * size_of::<F>());
-            let nsq_h = pool.acquire(stats_len * size_of::<F>());
+            if use_atomic {
+                let histu = histu_h.as_ref().expect("u32 hist hoisted on atomic path");
+                // K1a: zero the u32 histogram (atomic flush accumulates).
+                {
+                    let (zc, zd) = launch_dims_1d(hist_len);
+                    rf_hist_zero_u32::launch::<ActiveRuntime>(
+                        &client,
+                        zc,
+                        zd,
+                        unsafe { ArrayArg::from_raw_parts(histu.clone(), hist_len) },
+                        hist_len as u32,
+                    );
+                }
+                // K1b: shared-memory atomic gather (one 256-thread cube per
+                // (tree, node, row block); integer atomics — bitwise-exact).
+                {
+                    let aw = atomic_hist_blocks(tc * nodes);
+                    let (ac, ad) = launch_cubes_256(tc * nodes * aw);
+                    rf_hist_class_atomic::launch::<ActiveRuntime>(
+                        &client,
+                        ac,
+                        ad,
+                        unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
+                        unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), t * n) },
+                        unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
+                        unsafe { ArrayArg::from_raw_parts(feat_handle.clone(), feat_arr_len) },
+                        unsafe { ArrayArg::from_raw_parts(histu.clone(), hist_len) },
+                        n as u32,
+                        mf as u32,
+                        nb as u32,
+                        ncs as u32,
+                        nodes as u32,
+                        tc as u32,
+                        tree_base as u32,
+                        feat_base,
+                        aw as u32,
+                    );
+                }
+                // K2′: u32 → F conversion + cumulative sum in one pass.
+                {
+                    let (cc, cd) = launch_dims_1d(tc * nodes * mf * ncs);
+                    rf_hist_cum_u32::launch::<F, ActiveRuntime>(
+                        &client,
+                        cc,
+                        cd,
+                        unsafe { ArrayArg::from_raw_parts(histu.clone(), hist_len) },
+                        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                        mf as u32,
+                        nb as u32,
+                        ncs as u32,
+                        nodes as u32,
+                        tc as u32,
+                    );
+                }
+            } else {
+                // Row-block count for the histogram gather (bounded by the
+                // hoisted partial buffer acquired before the loop).
+                let cols = tc * nodes * mf;
+                let slice = nb * ncs;
+                let mut bh = hist_blocks(cols, hist_len * size_of::<F>(), n, nodes, slice);
+                if bh > 1 {
+                    bh = bh.min((max_part / hist_len).max(1));
+                }
 
-            // K1: histogram gather.
-            {
-                let (count, dim) = launch_dims_1d(tc * nodes * mf);
-                match &target {
-                    RfTarget::Class(y_dev, _) => {
-                        rf_hist_class::launch::<F, ActiveRuntime>(
-                            &client,
-                            count,
-                            dim,
-                            unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
-                            unsafe { ArrayArg::from_raw_parts(y_dev.handle().clone(), n) },
-                            unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), t * n) },
-                            unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), t * n) },
-                            unsafe {
-                                ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len)
-                            },
-                            unsafe {
-                                ArrayArg::from_raw_parts(feat_dev.handle().clone(), t * nodes * mf)
-                            },
-                            unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
-                            n as u32,
-                            d as u32,
-                            mf as u32,
-                            nb as u32,
-                            ncs as u32,
-                            nodes as u32,
-                            tc as u32,
-                            tree_base as u32,
-                        );
+                // K1: row-blocked histogram gather (+ reduce when bh > 1; with
+                // bh == 1 the partial layout equals `hist`, so gather lands in
+                // `hist` directly and the reduce pass is skipped).
+                {
+                    let part_len = hist_len * bh;
+                    let gather_h = if bh > 1 {
+                        part_h
+                            .as_ref()
+                            .expect("partial buffer hoisted when any bh > 1")
+                            .clone()
+                    } else {
+                        hist_h.clone()
+                    };
+                    let (count, dim) = launch_dims_1d(cols * bh);
+                    match &target {
+                        RfTarget::Class(_, _) => {
+                            rf_hist_class_part::launch::<F, ActiveRuntime>(
+                                &client,
+                                count,
+                                dim,
+                                unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
+                                unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), t * n) },
+                                unsafe {
+                                    ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len)
+                                },
+                                unsafe {
+                                    ArrayArg::from_raw_parts(feat_handle.clone(), feat_arr_len)
+                                },
+                                unsafe { ArrayArg::from_raw_parts(gather_h.clone(), part_len) },
+                                n as u32,
+                                mf as u32,
+                                nb as u32,
+                                ncs as u32,
+                                nodes as u32,
+                                tc as u32,
+                                tree_base as u32,
+                                feat_base,
+                                bh as u32,
+                            );
+                        }
+                        RfTarget::Reg(y_dev) => {
+                            rf_hist_reg_part::launch::<F, ActiveRuntime>(
+                                &client,
+                                count,
+                                dim,
+                                unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
+                                unsafe { ArrayArg::from_raw_parts(y_dev.handle().clone(), n) },
+                                unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), t * n) },
+                                unsafe {
+                                    ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len)
+                                },
+                                unsafe {
+                                    ArrayArg::from_raw_parts(feat_handle.clone(), feat_arr_len)
+                                },
+                                unsafe { ArrayArg::from_raw_parts(gather_h.clone(), part_len) },
+                                n as u32,
+                                mf as u32,
+                                nb as u32,
+                                nodes as u32,
+                                tc as u32,
+                                tree_base as u32,
+                                feat_base,
+                                bh as u32,
+                            );
+                        }
                     }
-                    RfTarget::Reg(y_dev) => {
-                        rf_hist_reg::launch::<F, ActiveRuntime>(
+                    if bh > 1 {
+                        let (rcount, rdim) = launch_dims_1d(hist_len);
+                        rf_hist_reduce::launch::<F, ActiveRuntime>(
                             &client,
-                            count,
-                            dim,
-                            unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
-                            unsafe { ArrayArg::from_raw_parts(y_dev.handle().clone(), n) },
-                            unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), t * n) },
-                            unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), t * n) },
-                            unsafe {
-                                ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len)
-                            },
-                            unsafe {
-                                ArrayArg::from_raw_parts(feat_dev.handle().clone(), t * nodes * mf)
-                            },
+                            rcount,
+                            rdim,
+                            unsafe { ArrayArg::from_raw_parts(gather_h.clone(), part_len) },
                             unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
-                            n as u32,
-                            d as u32,
-                            mf as u32,
-                            nb as u32,
-                            nodes as u32,
-                            tc as u32,
-                            tree_base as u32,
+                            slice as u32,
+                            cols as u32,
+                            bh as u32,
                         );
                     }
                 }
+
+                // K2: cumulative histogram over bins.
+                {
+                    let (count, dim) = launch_dims_1d(tc * nodes * mf * ncs);
+                    rf_hist_cum::launch::<F, ActiveRuntime>(
+                        &client,
+                        count,
+                        dim,
+                        unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                        mf as u32,
+                        nb as u32,
+                        ncs as u32,
+                        nodes as u32,
+                        tc as u32,
+                    );
+                }
+
             }
 
-            // K2: cumulative histogram over bins.
-            {
-                let (count, dim) = launch_dims_1d(tc * nodes * mf * ncs);
-                rf_hist_cum::launch::<F, ActiveRuntime>(
-                    &client,
-                    count,
-                    dim,
-                    unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
-                    mf as u32,
-                    nb as u32,
-                    ncs as u32,
-                    nodes as u32,
-                    tc as u32,
-                );
-            }
 
-            // K3: per-node weighted total (classifier sums classes; regressor
-            // reads slot 0 only).
+            // K3 (fused): per-node weighted total + max slot + sum-of-squares
+            // in ONE launch. Classifier sums all classes (`nsum = ncs`);
+            // regressor reads slot 0 only (`nsum = 1`).
             let nsum = if mode_class == 1 { ncs as u32 } else { 1u32 };
             {
                 let (count, dim) = launch_dims_1d(stats_len);
-                rf_node_total::launch::<F, ActiveRuntime>(
+                rf_node_stats::launch::<F, ActiveRuntime>(
                     &client,
                     count,
                     dim,
                     unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
                     unsafe { ArrayArg::from_raw_parts(ntot_h.clone(), stats_len) },
-                    mf as u32,
-                    nb as u32,
-                    ncs as u32,
-                    nsum,
-                    nodes as u32,
-                    tc as u32,
-                );
-            }
-
-            // K4: per-node max class count (classifier purity staging; the
-            // regressor never reads it but the buffer must hold REAL data, so
-            // reuse the total kernel's shape via rf_node_max on both modes).
-            {
-                let (count, dim) = launch_dims_1d(stats_len);
-                rf_node_max::launch::<F, ActiveRuntime>(
-                    &client,
-                    count,
-                    dim,
-                    unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
                     unsafe { ArrayArg::from_raw_parts(nmax_h.clone(), stats_len) },
-                    mf as u32,
-                    nb as u32,
-                    ncs as u32,
-                    nodes as u32,
-                    tc as u32,
-                );
-            }
-
-            // K4.5: per-node classifier sum-of-squares (RF-IMP-01 impurity-
-            // decrease staging). Launched unconditionally for BOTH targets
-            // (mirrors K4's own "reuse the same shape on both modes"
-            // precedent) — the regressor's resulting `n² + (Σy)²` value is
-            // never read (rf_best_split gates every node_sq read behind
-            // mode_class == 1u32).
-            {
-                let (count, dim) = launch_dims_1d(stats_len);
-                rf_node_sqsum::launch::<F, ActiveRuntime>(
-                    &client,
-                    count,
-                    dim,
-                    unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
                     unsafe { ArrayArg::from_raw_parts(nsq_h.clone(), stats_len) },
                     mf as u32,
                     nb as u32,
                     ncs as u32,
+                    nsum,
                     nodes as u32,
                     tc as u32,
                 );
@@ -847,7 +1434,7 @@ where
                     unsafe { ArrayArg::from_raw_parts(nmax_h.clone(), stats_len) },
                     unsafe { ArrayArg::from_raw_parts(nsq_h.clone(), stats_len) },
                     unsafe { ArrayArg::from_raw_parts(scores_h.clone(), scores_len) },
-                    unsafe { ArrayArg::from_raw_parts(feat_dev.handle().clone(), t * nodes * mf) },
+                    unsafe { ArrayArg::from_raw_parts(feat_handle.clone(), feat_arr_len) },
                     unsafe {
                         ArrayArg::from_raw_parts(edges_dev.handle().clone(), edges_host.len())
                     },
@@ -878,6 +1465,7 @@ where
                     nodes as u32,
                     tc as u32,
                     tree_base as u32,
+                    feat_base,
                     level_base,
                     total_nodes as u32,
                     force_leaf,
@@ -885,26 +1473,31 @@ where
                 );
             }
 
-            // Transient buffers back to the free-list (reused next chunk/level).
-            pool.release(hist_h, hist_len * size_of::<F>());
-            pool.release(scores_h, scores_len * size_of::<F>());
-            pool.release(ntot_h, stats_len * size_of::<F>());
-            pool.release(nmax_h, stats_len * size_of::<F>());
-            pool.release(nsq_h, stats_len * size_of::<F>());
-
             tree_base += tc;
         }
+        prof.lap(&client, format!("L{level}/hist+split"));
 
-        // K7 + K8: child ranges + stable partition (full-forest launches; no
-        // per-level transient state needed).
+        // K7 + K8 + K9: blocked child-range count → per-node prefix + child
+        // ranges → blocked STABLE partition. The block count multiplies the
+        // former t×nodes unit count (32 at level 0 of the comparison ladder)
+        // up to the launch target; contiguous chunks + the per-block prefix
+        // keep the scatter bitwise-identical to the old single-unit-per-node
+        // partition.
         if level < depth {
             let units = t * nodes;
-            let (count, dim) = launch_dims_1d(units);
-            rf_count_left::launch::<ActiveRuntime>(
+            let bp = partition_blocks(units, n, nodes);
+            let blk_len = units * bp;
+            let blk_hh = blk_h
+                .as_ref()
+                .expect("blk buffer hoisted when depth > 0")
+                .clone();
+
+            let (count, dim) = launch_dims_1d(units * bp);
+            rf_count_left_blocks::launch::<ActiveRuntime>(
                 &client,
-                count.clone(),
+                count,
                 dim,
-                unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
+                unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
                 unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), t * n) },
                 unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
                 unsafe {
@@ -912,20 +1505,35 @@ where
                 },
                 unsafe { ArrayArg::from_raw_parts(split_bin.handle().clone(), t * total_nodes) },
                 unsafe { ArrayArg::from_raw_parts(is_leaf.handle().clone(), t * total_nodes) },
-                unsafe { ArrayArg::from_raw_parts(ranges_b.handle().clone(), ranges_len) },
+                unsafe { ArrayArg::from_raw_parts(blk_hh.clone(), blk_len) },
                 n as u32,
-                d as u32,
                 nodes as u32,
                 t as u32,
                 level_base,
                 total_nodes as u32,
+                bp as u32,
             );
             let (count2, dim2) = launch_dims_1d(units);
-            rf_partition::launch::<ActiveRuntime>(
+            rf_child_ranges::launch::<ActiveRuntime>(
                 &client,
                 count2,
                 dim2,
-                unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
+                unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
+                unsafe { ArrayArg::from_raw_parts(is_leaf.handle().clone(), t * total_nodes) },
+                unsafe { ArrayArg::from_raw_parts(blk_hh.clone(), blk_len) },
+                unsafe { ArrayArg::from_raw_parts(ranges_b.handle().clone(), ranges_len) },
+                nodes as u32,
+                t as u32,
+                level_base,
+                total_nodes as u32,
+                bp as u32,
+            );
+            let (count3, dim3) = launch_dims_1d(units * bp);
+            rf_partition_blocks::launch::<ActiveRuntime>(
+                &client,
+                count3,
+                dim3,
+                unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
                 unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), t * n) },
                 unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
                 unsafe { ArrayArg::from_raw_parts(ranges_b.handle().clone(), ranges_len) },
@@ -934,29 +1542,49 @@ where
                 },
                 unsafe { ArrayArg::from_raw_parts(split_bin.handle().clone(), t * total_nodes) },
                 unsafe { ArrayArg::from_raw_parts(is_leaf.handle().clone(), t * total_nodes) },
+                unsafe { ArrayArg::from_raw_parts(blk_hh.clone(), blk_len) },
                 unsafe { ArrayArg::from_raw_parts(order_b.handle().clone(), t * n) },
                 n as u32,
-                d as u32,
                 nodes as u32,
                 t as u32,
                 level_base,
                 total_nodes as u32,
+                bp as u32,
             );
             std::mem::swap(&mut order_a, &mut order_b);
             std::mem::swap(&mut ranges_a, &mut ranges_b);
+            prof.lap(&client, format!("L{level}/partition"));
         }
 
-        feat_dev.release_into(pool);
+        if let Some(arr) = feat_tmp {
+            arr.release_into(pool);
+        }
     }
 
-    // Fit-only scratch back to the pool.
-    binned.release_into(pool);
+    // Fit-only scratch back to the pool (hoisted transients first).
+    pool.release(hist_h, max_hist * size_of::<F>());
+    pool.release(scores_h, max_scores * size_of::<F>());
+    pool.release(ntot_h, max_stats * size_of::<F>());
+    pool.release(nmax_h, max_stats * size_of::<F>());
+    pool.release(nsq_h, max_stats * size_of::<F>());
+    if let Some(h) = part_h {
+        pool.release(h, max_part * size_of::<F>());
+    }
+    if let Some(h) = histu_h {
+        pool.release(h, max_hist * size_of::<u32>());
+    }
+    if let Some(h) = blk_h {
+        pool.release(h, max_blk * size_of::<u32>());
+    }
+    if let Some((arr, _)) = feat_all {
+        arr.release_into(pool);
+    }
+    binned_t.release_into(pool);
     order_a.release_into(pool);
     order_b.release_into(pool);
     ranges_a.release_into(pool);
     ranges_b.release_into(pool);
     edges_dev.release_into(pool);
-    w_dev.release_into(pool);
     split_bin.release_into(pool);
 
     // The fitted forest, assembled now (not deferred to the final `Ok(...)`)
@@ -1035,6 +1663,8 @@ where
     // else: every tree is a single leaf (degenerate) — leave the all-zero
     // vector, matching sklearn's zeros return, never a divide-by-zero.
     let feature_importances: Vec<F> = imp.into_iter().map(f64_to_host::<F>).collect();
+    prof.lap(&client, "importances(host)");
+    prof.dump();
 
     // RF-OOB-01: gated OOB aggregation. `false` (default) is a no-op — zero
     // extra device/host work beyond the ordinary fit.
@@ -1046,8 +1676,14 @@ where
         // host-only, no-device-sync pass — cheaper than retaining an extra
         // `t·n·sizeof(F)` device buffer for the common `oob_score=false`
         // case.
-        let mut oob_rng = SplitMix64::new(params.seed);
-        let w_host2 = bootstrap_weights::<F>(&mut oob_rng, t, n, params.bootstrap);
+        let counts2: Option<Vec<u32>> = if params.bootstrap {
+            let mut oob_rng = SplitMix64::new(params.seed);
+            let seeds: Vec<u64> = (0..t).map(|_| oob_rng.next_u64()).collect();
+            Some(bootstrap_counts(&seeds, n))
+        } else {
+            // bootstrap = false: no row is ever out-of-bag.
+            None
+        };
 
         // Reuse the existing predict-path leaf-traversal kernel against the
         // just-built model and the TRAINING `x` (still in scope — only
@@ -1068,7 +1704,7 @@ where
                     let mut acc = vec![0f64; nc];
                     let mut cnt = 0usize;
                     for tt in 0..t {
-                        if host_to_f64(w_host2[tt * n + i]) == 0.0 {
+                        if counts2.as_ref().is_some_and(|c| c[tt * n + i] == 0) {
                             let lf = leaf_host[tt * n + i] as usize;
                             for (c, slot) in acc.iter_mut().enumerate() {
                                 *slot += host_to_f64(leaf_dist_host[(tt * total_nodes + lf) * nc + c]);
@@ -1107,7 +1743,7 @@ where
                     let mut acc = 0f64;
                     let mut cnt = 0usize;
                     for tt in 0..t {
-                        if host_to_f64(w_host2[tt * n + i]) == 0.0 {
+                        if counts2.as_ref().is_some_and(|c| c[tt * n + i] == 0) {
                             let lf = leaf_host[tt * n + i] as usize;
                             acc += host_to_f64(leaf_dist_host[tt * total_nodes + lf]);
                             cnt += 1;

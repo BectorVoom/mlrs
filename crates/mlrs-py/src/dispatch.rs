@@ -167,6 +167,16 @@ macro_rules! any_estimator_typestate {
         enum $any {
             /// Constructed-but-unfit: the verbatim hyperparameters the matching
             /// `Estimator<F, Fitted>` arm is built from at `fit`.
+            //
+            // WR-02: typestate estimators persist their hyperparameters in the
+            // wrapper's `self.params` and rebuild from THAT at `fit` (so a second
+            // `fit` of the same object works), reading only the `Unfit` variant
+            // TAG here (`matches!(.., Unfit { .. })`) — never its payload. The
+            // fields are therefore write-only in this form; suppress the
+            // resulting `dead_code` without dropping them from the enum shape
+            // (which is kept byte-for-byte in sync with `any_estimator!`, whose
+            // `&mut self` fit DOES read them).
+            #[allow(dead_code)]
             Unfit { $( $field : $ty ),* },
             /// Fitted f32 monomorphization (`Fitted` state spelled explicitly).
             F32($algo $( :: $algo_rest )* <f32, mlrs_algos::typestate::Fitted>),

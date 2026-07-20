@@ -39,16 +39,19 @@ use cubecl::prelude::*;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use mlrs_kernels::gbt::{
-    gbt_best_split, gbt_count_left, gbt_grad_binary, gbt_grad_multi, gbt_grad_reg, gbt_hist,
-    gbt_hist_reduce, gbt_hist_subtract, gbt_init_partition, gbt_init_raw, gbt_partition,
-    gbt_proba_binary, gbt_proba_multi, gbt_row_max, gbt_row_sumexp, gbt_split_scores, gbt_sum_raw,
+    gbt_best_split, gbt_child_ranges, gbt_count_left_blocks, gbt_grad_binary, gbt_grad_multi,
+    gbt_grad_reg, gbt_hist, gbt_hist_atomic, gbt_hist_reduce, gbt_hist_subtract, gbt_hist_zero,
+    gbt_init_partition, gbt_init_raw, gbt_partition_blocks, gbt_predict_fused, gbt_proba_binary,
+    gbt_proba_multi, gbt_row_max, gbt_row_sumexp, gbt_split_scores, gbt_sum_partials,
     gbt_update_raw,
 };
-use mlrs_kernels::tree::{rf_bin_features, rf_hist_cum, rf_predict_leaf};
+use mlrs_kernels::tree::{rf_bin_features, rf_bin_features_t, rf_hist_cum};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
-use crate::prims::random_forest::{compute_edges, fits_u32, launch_dims_1d, RF_MAX_DEPTH_CAP};
+use crate::prims::random_forest::{
+    compute_edges, fits_u32, launch_cubes_256, launch_dims_1d, partition_blocks, RF_MAX_DEPTH_CAP,
+};
 use crate::runtime::ActiveRuntime;
 
 /// Byte budget for the transient per-level histogram (+ partials + scores)
@@ -72,6 +75,72 @@ const HGB_MAX_BLOCKS: usize = 64;
 /// sklearn `TreeGrower` internal `min_hessian_to_split` (not exposed on the
 /// estimator surface there either).
 const HGB_MIN_HESSIAN_TO_SPLIT: f64 = 1e-3;
+
+/// Shared-memory slot budget of [`gbt_hist_atomic`] (fixed comptime
+/// allocation of 4096 × `F`; 16 KiB at f32 / 32 KiB at f64 per cube).
+const GBT_ATOMIC_SHARED_SLOTS: usize = 4096;
+
+/// The shared-FLOAT-atomic histogram is CUDA/ROCm-only: `atomicAdd(float*)`
+/// is native there, WGSL has no `atomic<f32>`, and the cpu backend's MLIR
+/// path miscompiles SharedMemory/atomic kernels (spike findings 001–003).
+/// cpu and wgpu keep the deterministic row-blocked gather; each backend's
+/// oracle suite tests its own path. Float atomics reorder the accumulation
+/// (summation-order noise at last-ULP scale — inside the 1e-5 oracle gate),
+/// so CUDA/ROCm fits are tolerance-exact rather than bitwise-deterministic.
+const GBT_ATOMIC_HIST: bool = cfg!(any(feature = "cuda", feature = "rocm"));
+
+/// Target cube count for [`gbt_hist_atomic`] launches (the RF atomic-hist
+/// discipline: enough 256-thread cubes to keep a T4-class device busy, split
+/// over the level's `(tree, node, feature-chunk)` columns).
+const GBT_ATOMIC_TARGET_CUBES: usize = 512;
+
+/// `HGB_PROFILE=1` phase profiler (the `RfProf` shape, AGGREGATED by label —
+/// the boosting loop repeats each phase `iters × levels` times): device-syncs
+/// at each `lap` and folds the wall time since the previous one into the
+/// label's running total, dumping a table at the end of the fit. With the
+/// env var unset every call is a no-op (ZERO added syncs — the launch-only
+/// fit loop stays launch-only; totals are inflated by the per-phase pipeline
+/// drains and are for ATTRIBUTION, not headlines).
+struct HgbProf {
+    on: bool,
+    t: std::time::Instant,
+    rows: Vec<(&'static str, f64, usize)>,
+}
+
+impl HgbProf {
+    fn new() -> Self {
+        Self {
+            on: std::env::var_os("HGB_PROFILE").is_some(),
+            t: std::time::Instant::now(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, client: &crate::runtime::Client, label: &'static str) {
+        if self.on {
+            let _ = cubecl::future::block_on(client.sync());
+            let dt = self.t.elapsed().as_secs_f64();
+            if let Some(row) = self.rows.iter_mut().find(|r| r.0 == label) {
+                row.1 += dt;
+                row.2 += 1;
+            } else {
+                self.rows.push((label, dt, 1));
+            }
+            self.t = std::time::Instant::now();
+        }
+    }
+
+    fn dump(&self) {
+        if self.on {
+            eprintln!("=== HGB_PROFILE (sync per phase; totals inflated by the syncs) ===");
+            for (l, s, c) in &self.rows {
+                eprintln!("{l:>14}: {:9.3} ms  ({c:>5} laps)", s * 1e3);
+            }
+            let tot: f64 = self.rows.iter().map(|r| r.1).sum();
+            eprintln!("{:>14}: {:9.3} ms", "TOTAL", tot * 1e3);
+        }
+    }
+}
 
 /// HistGradientBoosting fit hyperparameters (prim-level, already resolved).
 #[derive(Debug, Clone, Copy)]
@@ -381,6 +450,7 @@ fn gather_hist<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     client: &cubecl::client::ComputeClient<ActiveRuntime>,
     binned: &DeviceArray<ActiveRuntime, u32>,
+    binned_t: &DeviceArray<ActiveRuntime, u32>,
     g_dev: &DeviceArray<ActiveRuntime, F>,
     h_dev: &DeviceArray<ActiveRuntime, F>,
     order_a: &DeviceArray<ActiveRuntime, u32>,
@@ -398,6 +468,80 @@ fn gather_hist<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    // CUDA/ROCm: shared-memory float-atomic gather (the RF campaign's
+    // cuML-class histogram lever — see [`GBT_ATOMIC_HIST`]). Feature-chunked
+    // so any `nb ≤ 256` fits the fixed shared lattice; falls through to the
+    // deterministic gather only when a single feature's `nb · 3` slots
+    // exceed the budget (impossible at `nb ≤ 256`: 768 ≤ 4096).
+    if GBT_ATOMIC_HIST && 3 * nb <= GBT_ATOMIC_SHARED_SLOTS {
+        let hist_len = k * nc * d * nb * 3;
+        let hist_h = pool.acquire(hist_len * size_of::<F>());
+        let f_chunk = (GBT_ATOMIC_SHARED_SLOTS / (3 * nb)).min(d.max(1));
+        let n_fchunks = d.div_ceil(f_chunk);
+
+        // K1a: zero the histogram (the atomic flush accumulates).
+        {
+            let (zc, zd) = launch_dims_1d(hist_len);
+            gbt_hist_zero::launch::<F, ActiveRuntime>(
+                client,
+                zc,
+                zd,
+                unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                hist_len as u32,
+            );
+        }
+        // K1b: shared-atomic gather — one 256-thread cube per (tree, node,
+        // feature chunk, row block). Row blocks reach the cube target but
+        // keep ≥ ~2 rows of scan work per thread (each extra cube re-pays
+        // the shared zero + global flush of the whole lattice).
+        {
+            let cols = k * nc * n_fchunks;
+            let aw = GBT_ATOMIC_TARGET_CUBES
+                .div_ceil(cols.max(1))
+                .min((n / nc.max(1) / 512).max(1))
+                .clamp(1, 256);
+            let (ac, ad) = launch_cubes_256(cols * aw);
+            gbt_hist_atomic::launch::<F, ActiveRuntime>(
+                client,
+                ac,
+                ad,
+                unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
+                unsafe { ArrayArg::from_raw_parts(g_dev.handle().clone(), n * k) },
+                unsafe { ArrayArg::from_raw_parts(h_dev.handle().clone(), n * k) },
+                unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), k * n) },
+                unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
+                unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                n as u32,
+                d as u32,
+                nb as u32,
+                k as u32,
+                nodes_total as u32,
+                node_base as u32,
+                nc as u32,
+                f_chunk as u32,
+                n_fchunks as u32,
+                aw as u32,
+                node_stride as u32,
+            );
+        }
+        // K3: cumulative histogram over bins (unchanged).
+        {
+            let (count, dim) = launch_dims_1d(k * nc * d * 3);
+            rf_hist_cum::launch::<F, ActiveRuntime>(
+                client,
+                count,
+                dim,
+                unsafe { ArrayArg::from_raw_parts(hist_h.clone(), hist_len) },
+                d as u32,
+                nb as u32,
+                3u32,
+                nc as u32,
+                k as u32,
+            );
+        }
+        return (hist_h, hist_len);
+    }
+
     // Row blocks: aim for HGB_HIST_TARGET_UNITS units, bounded by the block
     // cap and the byte budget.
     let mut blocks = (HGB_HIST_TARGET_UNITS / (k * nc * d).max(1)).clamp(1, HGB_MAX_BLOCKS);
@@ -511,6 +655,9 @@ where
     fits_u32(n * HGB_MAX_BLOCKS, "n*blocks")?;
     fits_u32(n_trees * total_nodes, "n_trees*total_nodes")?;
     fits_u32(k * max_nodes_level * d * nb * 3, "level_hist")?;
+    fits_u32(k * max_nodes_level * 512, "k*nodes*partition_blocks")?;
+
+    let mut prof = HgbProf::new();
 
     // --- ONE host readback: quantile bin edges (the forest concession). ---
     let x_host = x.to_host(pool);
@@ -537,6 +684,28 @@ where
         );
     }
     let binned = DeviceArray::<ActiveRuntime, u32>::from_raw(binned_handle, n * d);
+
+    // --- Transposed (feature-major) bins: coalesced reads for the blocked
+    // partition and the CUDA/ROCm atomic histogram (`binned` stays row-major
+    // for the per-row traversal in `gbt_update_raw`). One extra n × d u32
+    // buffer + one launch, once per fit.
+    let binned_t_handle = pool.acquire(n * d * size_of::<u32>());
+    {
+        let (count, dim) = launch_dims_1d(n * d);
+        rf_bin_features_t::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(x.handle().clone(), n * d) },
+            unsafe { ArrayArg::from_raw_parts(edges_dev.handle().clone(), edges_host.len()) },
+            unsafe { ArrayArg::from_raw_parts(binned_t_handle.clone(), n * d) },
+            n as u32,
+            d as u32,
+            (nb - 1) as u32,
+        );
+    }
+    let binned_t = DeviceArray::<ActiveRuntime, u32>::from_raw(binned_t_handle, n * d);
+    prof.lap(&client, "edges+bin");
 
     // --- Baseline + raw predictions (n × k), device-initialized. ---
     let baseline_f: Vec<F> = baseline.iter().map(|&b| f64_to_host::<F>(b)).collect();
@@ -679,6 +848,8 @@ where
             }
         }
 
+        prof.lap(&client, "grad");
+
         // G2: reset the per-iteration row partition (identity order, root
         // range [0, n) per tree) — a device kernel, zero uploads.
         {
@@ -693,6 +864,7 @@ where
                 k as u32,
             );
         }
+        prof.lap(&client, "init_part");
 
         // Sibling histogram-SUBTRACTION eligibility cap: `per_node_bytes` is
         // LEVEL-INDEPENDENT (only k/d/nb), so `node_chunk = min(cap, nodes)`
@@ -726,8 +898,8 @@ where
                 let hist_cur_h = if let Some((parent_h, parent_len)) = retained_hist.take() {
                     let left_children = nodes / 2;
                     let (left_h, left_len) = gather_hist::<F>(
-                        pool, &client, &binned, &g_dev, &h_dev, &order_a, &ranges_a, ranges_len,
-                        n, d, nb, k, nodes, 0, left_children, 2,
+                        pool, &client, &binned, &binned_t, &g_dev, &h_dev, &order_a, &ranges_a,
+                        ranges_len, n, d, nb, k, nodes, 0, left_children, 2,
                     );
                     let hist_full_h = pool.acquire(hist_len * size_of::<F>());
                     {
@@ -758,11 +930,12 @@ where
                     hist_full_h
                 } else {
                     let (h, _) = gather_hist::<F>(
-                        pool, &client, &binned, &g_dev, &h_dev, &order_a, &ranges_a, ranges_len,
-                        n, d, nb, k, nodes, 0, nodes, 1,
+                        pool, &client, &binned, &binned_t, &g_dev, &h_dev, &order_a, &ranges_a,
+                        ranges_len, n, d, nb, k, nodes, 0, nodes, 1,
                     );
                     h
                 };
+                prof.lap(&client, "hist");
 
                 let scores_len = k * nodes * d * (nb - 1);
                 let scores_h = pool.acquire(scores_len * size_of::<F>());
@@ -838,6 +1011,7 @@ where
                     );
                 }
                 pool.release(scores_h, scores_len * size_of::<F>());
+                prof.lap(&client, "scores+split");
 
                 if level < depth && (nodes * 2) <= subtract_cap {
                     retained_hist = Some((hist_cur_h, hist_len));
@@ -854,9 +1028,10 @@ where
                 while node_base < nodes {
                     let nc_now = node_chunk.min(nodes - node_base);
                     let (hist_h, hist_len) = gather_hist::<F>(
-                        pool, &client, &binned, &g_dev, &h_dev, &order_a, &ranges_a, ranges_len,
-                        n, d, nb, k, nodes, node_base, nc_now, 1,
+                        pool, &client, &binned, &binned_t, &g_dev, &h_dev, &order_a, &ranges_a,
+                        ranges_len, n, d, nb, k, nodes, node_base, nc_now, 1,
                     );
+                    prof.lap(&client, "hist");
 
                     let scores_len = k * nc_now * d * (nb - 1);
                     let scores_h = pool.acquire(scores_len * size_of::<F>());
@@ -934,72 +1109,113 @@ where
 
                     pool.release(hist_h, hist_len * size_of::<F>());
                     pool.release(scores_h, scores_len * size_of::<F>());
+                    prof.lap(&client, "scores+split");
                     node_base += nc_now;
                 }
             }
 
-            // K6 + K7: child ranges + stable partition (full-level launches).
+            // K6 + K7: blocked child ranges + STABLE blocked partition
+            // (bitwise-identical `order_next` to the old serial kernels; the
+            // serial per-(tree, node) scans left level 0 to K single threads
+            // scanning all n rows — the dominant serial cost once the
+            // histogram is fast).
             if level < depth {
                 let units = k * nodes;
-                let (count, dim) = launch_dims_1d(units);
-                gbt_count_left::launch::<ActiveRuntime>(
-                    &client,
-                    count,
-                    dim,
-                    unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
-                    unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), k * n) },
-                    unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
-                    unsafe {
-                        ArrayArg::from_raw_parts(
-                            split_feature.handle().clone(),
-                            n_trees * total_nodes,
-                        )
-                    },
-                    unsafe {
-                        ArrayArg::from_raw_parts(split_bin.handle().clone(), n_trees * total_nodes)
-                    },
-                    unsafe {
-                        ArrayArg::from_raw_parts(is_leaf.handle().clone(), n_trees * total_nodes)
-                    },
-                    unsafe { ArrayArg::from_raw_parts(ranges_b.handle().clone(), ranges_len) },
-                    n as u32,
-                    d as u32,
-                    nodes as u32,
-                    k as u32,
-                    tree_base,
-                    level_base,
-                    total_nodes as u32,
-                );
-                let (count2, dim2) = launch_dims_1d(units);
-                gbt_partition::launch::<ActiveRuntime>(
-                    &client,
-                    count2,
-                    dim2,
-                    unsafe { ArrayArg::from_raw_parts(binned.handle().clone(), n * d) },
-                    unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), k * n) },
-                    unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
-                    unsafe { ArrayArg::from_raw_parts(ranges_b.handle().clone(), ranges_len) },
-                    unsafe {
-                        ArrayArg::from_raw_parts(
-                            split_feature.handle().clone(),
-                            n_trees * total_nodes,
-                        )
-                    },
-                    unsafe {
-                        ArrayArg::from_raw_parts(split_bin.handle().clone(), n_trees * total_nodes)
-                    },
-                    unsafe {
-                        ArrayArg::from_raw_parts(is_leaf.handle().clone(), n_trees * total_nodes)
-                    },
-                    unsafe { ArrayArg::from_raw_parts(order_b.handle().clone(), k * n) },
-                    n as u32,
-                    d as u32,
-                    nodes as u32,
-                    k as u32,
-                    tree_base,
-                    level_base,
-                    total_nodes as u32,
-                );
+                let pb = partition_blocks(units, n, nodes);
+                let blk_len = units * pb;
+                let blk_h = pool.acquire(blk_len * size_of::<u32>());
+                {
+                    let (count, dim) = launch_dims_1d(blk_len);
+                    gbt_count_left_blocks::launch::<ActiveRuntime>(
+                        &client,
+                        count,
+                        dim,
+                        unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
+                        unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), k * n) },
+                        unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
+                        unsafe {
+                            ArrayArg::from_raw_parts(
+                                split_feature.handle().clone(),
+                                n_trees * total_nodes,
+                            )
+                        },
+                        unsafe {
+                            ArrayArg::from_raw_parts(
+                                split_bin.handle().clone(),
+                                n_trees * total_nodes,
+                            )
+                        },
+                        unsafe {
+                            ArrayArg::from_raw_parts(is_leaf.handle().clone(), n_trees * total_nodes)
+                        },
+                        unsafe { ArrayArg::from_raw_parts(blk_h.clone(), blk_len) },
+                        n as u32,
+                        nodes as u32,
+                        k as u32,
+                        tree_base,
+                        level_base,
+                        total_nodes as u32,
+                        pb as u32,
+                    );
+                }
+                {
+                    let (count, dim) = launch_dims_1d(units);
+                    gbt_child_ranges::launch::<ActiveRuntime>(
+                        &client,
+                        count,
+                        dim,
+                        unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
+                        unsafe {
+                            ArrayArg::from_raw_parts(is_leaf.handle().clone(), n_trees * total_nodes)
+                        },
+                        unsafe { ArrayArg::from_raw_parts(blk_h.clone(), blk_len) },
+                        unsafe { ArrayArg::from_raw_parts(ranges_b.handle().clone(), ranges_len) },
+                        nodes as u32,
+                        k as u32,
+                        tree_base,
+                        level_base,
+                        total_nodes as u32,
+                        pb as u32,
+                    );
+                }
+                {
+                    let (count, dim) = launch_dims_1d(blk_len);
+                    gbt_partition_blocks::launch::<ActiveRuntime>(
+                        &client,
+                        count,
+                        dim,
+                        unsafe { ArrayArg::from_raw_parts(binned_t.handle().clone(), n * d) },
+                        unsafe { ArrayArg::from_raw_parts(order_a.handle().clone(), k * n) },
+                        unsafe { ArrayArg::from_raw_parts(ranges_a.handle().clone(), ranges_len) },
+                        unsafe { ArrayArg::from_raw_parts(ranges_b.handle().clone(), ranges_len) },
+                        unsafe {
+                            ArrayArg::from_raw_parts(
+                                split_feature.handle().clone(),
+                                n_trees * total_nodes,
+                            )
+                        },
+                        unsafe {
+                            ArrayArg::from_raw_parts(
+                                split_bin.handle().clone(),
+                                n_trees * total_nodes,
+                            )
+                        },
+                        unsafe {
+                            ArrayArg::from_raw_parts(is_leaf.handle().clone(), n_trees * total_nodes)
+                        },
+                        unsafe { ArrayArg::from_raw_parts(blk_h.clone(), blk_len) },
+                        unsafe { ArrayArg::from_raw_parts(order_b.handle().clone(), k * n) },
+                        n as u32,
+                        nodes as u32,
+                        k as u32,
+                        tree_base,
+                        level_base,
+                        total_nodes as u32,
+                        pb as u32,
+                    );
+                }
+                pool.release(blk_h, blk_len * size_of::<u32>());
+                prof.lap(&client, "partition");
                 std::mem::swap(&mut order_a, &mut order_b);
                 std::mem::swap(&mut ranges_a, &mut ranges_b);
             }
@@ -1035,10 +1251,13 @@ where
                 total_nodes as u32,
             );
         }
+        prof.lap(&client, "update_raw");
     }
+    prof.dump();
 
     // Fit-only scratch back to the pool.
     binned.release_into(pool);
+    binned_t.release_into(pool);
     raw.release_into(pool);
     g_dev.release_into(pool);
     h_dev.release_into(pool);
@@ -1106,14 +1325,26 @@ where
 {
     let (q, d) = shape;
     validate_predict(model, xq.len(), q, d)?;
+    fits_u32(q * d, "q*d")?;
     let client = pool.client().clone();
     let n_trees = model.n_iters * model.k;
+    let qk = q * model.k;
 
-    // Traverse every stage tree (tree.rs kernel; complete-tree layout).
-    let leaf_h = pool.acquire(n_trees * q * size_of::<u32>());
+    // FUSED traverse-and-sum (no per-(tree, row) leaf-index intermediate —
+    // that n_trees × q u32 buffer's write + re-read dominated predict
+    // bandwidth at large n_trees · q). The iteration axis is blocked only as
+    // far as needed to keep the launch grid wide (~256k units) when q·k
+    // alone would under-occupy the device; `n_blocks` is recomputed from the
+    // ceil'd `iters_per_block` so no launched block owns an empty range.
+    const PREDICT_TARGET_UNITS: usize = 262_144;
+    let n_blocks = PREDICT_TARGET_UNITS.div_ceil(qk).clamp(1, model.n_iters);
+    let iters_per_block = model.n_iters.div_ceil(n_blocks);
+    let n_blocks = model.n_iters.div_ceil(iters_per_block);
+
+    let part_h = pool.acquire(qk * n_blocks * size_of::<F>());
     {
-        let (count, dim) = launch_dims_1d(n_trees * q);
-        rf_predict_leaf::launch::<F, ActiveRuntime>(
+        let (count, dim) = launch_dims_1d(qk * n_blocks);
+        gbt_predict_fused::launch::<F, ActiveRuntime>(
             &client,
             count,
             dim,
@@ -1136,24 +1367,6 @@ where
                     n_trees * model.total_nodes,
                 )
             },
-            unsafe { ArrayArg::from_raw_parts(leaf_h.clone(), n_trees * q) },
-            q as u32,
-            d as u32,
-            model.max_depth as u32,
-            n_trees as u32,
-            model.total_nodes as u32,
-        );
-    }
-    let leaf = DeviceArray::<ActiveRuntime, u32>::from_raw(leaf_h, n_trees * q);
-
-    let raw_h = pool.acquire(q * model.k * size_of::<F>());
-    {
-        let (count, dim) = launch_dims_1d(q * model.k);
-        gbt_sum_raw::launch::<F, ActiveRuntime>(
-            &client,
-            count,
-            dim,
-            unsafe { ArrayArg::from_raw_parts(leaf.handle().clone(), n_trees * q) },
             unsafe {
                 ArrayArg::from_raw_parts(
                     model.leaf_value.handle().clone(),
@@ -1161,15 +1374,37 @@ where
                 )
             },
             unsafe { ArrayArg::from_raw_parts(model.baseline.handle().clone(), model.k) },
-            unsafe { ArrayArg::from_raw_parts(raw_h.clone(), q * model.k) },
+            unsafe { ArrayArg::from_raw_parts(part_h.clone(), qk * n_blocks) },
             q as u32,
+            d as u32,
             model.k as u32,
+            model.max_depth as u32,
             model.n_iters as u32,
             model.total_nodes as u32,
+            iters_per_block as u32,
+            n_blocks as u32,
         );
     }
-    leaf.release_into(pool);
-    Ok(DeviceArray::from_raw(raw_h, q * model.k))
+    if n_blocks == 1 {
+        // Block 0 seeded the baseline; the partial buffer IS the raw output.
+        return Ok(DeviceArray::from_raw(part_h, qk));
+    }
+
+    let raw_h = pool.acquire(qk * size_of::<F>());
+    {
+        let (count, dim) = launch_dims_1d(qk);
+        gbt_sum_partials::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            unsafe { ArrayArg::from_raw_parts(part_h.clone(), qk * n_blocks) },
+            unsafe { ArrayArg::from_raw_parts(raw_h.clone(), qk) },
+            qk as u32,
+            n_blocks as u32,
+        );
+    }
+    pool.release(part_h, qk * n_blocks * size_of::<F>());
+    Ok(DeviceArray::from_raw(raw_h, qk))
 }
 
 /// Regressor inference: length-`q` device predictions (the raw scores —

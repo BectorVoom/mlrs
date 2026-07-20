@@ -144,7 +144,7 @@ pub fn enet_gap<F: Float + CubeElement>(
 ) {
     if UNIT_POS == 0 {
         let zero = F::from_int(0i64);
-        let half = F::new(0.5);
+        let half = F::new(0.5_f32);
         let one = F::from_int(1i64);
 
         // R_norm2 = R·R, Ry = R·y (forward dots, numpy left-to-right order).

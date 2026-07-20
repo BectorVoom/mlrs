@@ -137,9 +137,9 @@ pub fn umap_layout_step<F: Float + CubeElement>(
                     let mut grad_coeff = F::from_int(0i64);
                     if dist_sq > F::from_int(0i64) {
                         let pow_b = F::powf(dist_sq, b);
-                        let pow_bm1 = F::powf(dist_sq, b - F::new(1.0));
-                        let num = F::new(-2.0) * a * b * pow_bm1;
-                        let den = a * pow_b + F::new(1.0);
+                        let pow_bm1 = F::powf(dist_sq, b - F::new(1.0_f32));
+                        let num = F::new(-2.0_f32) * a * b * pow_bm1;
+                        let den = a * pow_b + F::new(1.0_f32);
                         grad_coeff = num / den;
                     }
 
@@ -151,11 +151,11 @@ pub fn umap_layout_step<F: Float + CubeElement>(
                         // grad_d = clip(grad·(cur_d − other_d), −4, 4) — finite
                         // literals + statement-`if` (NO F::INFINITY / max / min).
                         let mut grad_d = grad_coeff * (cur_d - other_d);
-                        if grad_d > F::new(4.0) {
-                            grad_d = F::new(4.0);
+                        if grad_d > F::new(4.0_f32) {
+                            grad_d = F::new(4.0_f32);
                         }
-                        if grad_d < F::new(-4.0) {
-                            grad_d = F::new(-4.0);
+                        if grad_d < F::new(-4.0_f32) {
+                            grad_d = F::new(-4.0_f32);
                         }
                         embedding[(cur_base + d1) as usize] = cur_d + grad_d * alpha;
                         // Two-sided push for the `fit` path (frozen on transform).
@@ -199,17 +199,17 @@ pub fn umap_layout_step<F: Float + CubeElement>(
                         let mut d3 = 0u32;
                         if dist_sq > F::from_int(0i64) {
                             let pow_b = F::powf(dist_sq, b);
-                            let den = (F::new(0.001) + dist_sq) * (a * pow_b + F::new(1.0));
-                            let grad_coeff = (F::new(2.0) * gamma * b) / den;
+                            let den = (F::new(0.001_f32) + dist_sq) * (a * pow_b + F::new(1.0_f32));
+                            let grad_coeff = (F::new(2.0_f32) * gamma * b) / den;
                             while d3 < dim {
                                 let cur_d = embedding[(cur_base + d3) as usize];
                                 let other_d = embedding[(other_base + d3) as usize];
                                 let mut grad_d = grad_coeff * (cur_d - other_d);
-                                if grad_d > F::new(4.0) {
-                                    grad_d = F::new(4.0);
+                                if grad_d > F::new(4.0_f32) {
+                                    grad_d = F::new(4.0_f32);
                                 }
-                                if grad_d < F::new(-4.0) {
-                                    grad_d = F::new(-4.0);
+                                if grad_d < F::new(-4.0_f32) {
+                                    grad_d = F::new(-4.0_f32);
                                 }
                                 embedding[(cur_base + d3) as usize] = cur_d + grad_d * alpha;
                                 d3 += 1u32;
@@ -219,7 +219,7 @@ pub fn umap_layout_step<F: Float + CubeElement>(
                             while d3 < dim {
                                 let cur_d = embedding[(cur_base + d3) as usize];
                                 embedding[(cur_base + d3) as usize] =
-                                    cur_d + F::new(4.0) * alpha;
+                                    cur_d + F::new(4.0_f32) * alpha;
                                 d3 += 1u32;
                             }
                         }

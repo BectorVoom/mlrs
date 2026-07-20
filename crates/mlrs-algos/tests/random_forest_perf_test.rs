@@ -105,6 +105,63 @@ fn run_config(n: usize, d: usize, n_trees: usize, max_depth: usize) -> (f64, f64
     (fit_predict_s - predict_s, predict_s)
 }
 
+/// Per-launch overhead probe: times enqueue-only and enqueue+sync costs of a
+/// trivially small kernel. Separates the cubecl per-launch host cost from
+/// real kernel work — the RF fit issues ~6 launches per tree level, so a
+/// large per-launch constant dominates shallow-work levels.
+#[test]
+#[ignore = "launch-overhead probe — run with --ignored --nocapture"]
+fn launch_overhead_probe() {
+    use cubecl::prelude::{ArrayArg, CubeCount, CubeDim};
+    use mlrs_kernels::tree::rf_order_iota;
+
+    let client = mlrs_backend::runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client.clone());
+    let len = 1024usize;
+    let h = pool.acquire(len * 4);
+    let count = CubeCount::Static(4, 1, 1);
+    let dim = CubeDim { x: 256, y: 1, z: 1 };
+    let launch = |c: &CubeCount, d: &CubeDim| {
+        rf_order_iota::launch::<ActiveRuntime>(
+            &client,
+            c.clone(),
+            *d,
+            unsafe { ArrayArg::from_raw_parts(h.clone(), len) },
+            len as u32,
+            1u32,
+        );
+    };
+    // Warm (JIT + first-touch).
+    for _ in 0..10 {
+        launch(&count, &dim);
+    }
+    let _ = cubecl::future::block_on(client.sync());
+
+    let iters = 200usize;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        launch(&count, &dim);
+    }
+    let enqueue_s = t0.elapsed().as_secs_f64();
+    let _ = cubecl::future::block_on(client.sync());
+    let complete_s = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    for _ in 0..50 {
+        launch(&count, &dim);
+        let _ = cubecl::future::block_on(client.sync());
+    }
+    let synced_s = t1.elapsed().as_secs_f64();
+
+    println!(
+        "launch overhead: enqueue {:.3} ms/launch | enqueue+complete {:.3} ms/launch | launch+sync {:.3} ms/round",
+        enqueue_s / iters as f64 * 1e3,
+        complete_s / iters as f64 * 1e3,
+        synced_s / 50.0 * 1e3,
+    );
+    pool.release(h, len * 4);
+}
+
 #[test]
 #[ignore = "wall-clock perf probe — run targeted in release with --ignored --nocapture"]
 fn rf_fit_predict_wall_clock() {

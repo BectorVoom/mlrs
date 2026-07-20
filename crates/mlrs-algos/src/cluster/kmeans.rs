@@ -10,24 +10,27 @@
 //! (up to a label permutation, compared with `best_match_accuracy`).
 //!
 //! ## The Lloyd loop reproduces sklearn's strict-OR-tol convergence (Pitfall 6)
-//! Each iteration:
-//!   1. ASSIGN every sample to its nearest center — `distance(X, centers,
-//!      sqrt=false)` (the Phase-2 prim, squared Euclidean, no boundary sqrt)
-//!      then [`argmin_rows`] (lowest-index tie-break, D-02).
-//!   2. UPDATE the centers as the per-label mean via [`lloyd_update`] (the
-//!      Phase-5 prim), passing the per-sample distance-to-assigned-center
-//!      ([`inertia_rows_host`]) so the prim can run sklearn's EXACT
-//!      `_relocate_empty_clusters_dense` (relocate an empty cluster to the
-//!      globally-farthest sample, decrementing its donor — never a
-//!      divide-by-zero NaN, CR-01 / T-05-03-02).
+//! The loop is fully DEVICE-resident (the "count synchronizations, not FLOPs"
+//! treatment): labels never leave the device inside the loop, and each
+//! iteration's host traffic is a few KB. Each iteration:
+//!   1. UPDATE the centers as the per-label mean via the row-blocked device
+//!      gather ([`centroid_sums_dev`]) — small k×d sums + k counts readback,
+//!      host f64 divide. An empty cluster (rare) triggers sklearn's EXACT
+//!      `_relocate_empty_clusters_dense` ([`relocate_empty_clusters`]) ranked
+//!      by the fused assign's per-row distance buffer (CR-01 / T-05-03-02).
+//!   2. ASSIGN every sample to its nearest center — the FUSED device
+//!      [`assign_min`] prim (direct per-row squared distance + argmin,
+//!      lowest-index tie-break D-02; no n×k distance matrix, no
+//!      `row_reduce(Shared)` norm term, no per-row argmin launches).
 //!   3. CONVERGENCE — first the STRICT `array_equal(labels, labels_old)` BREAK
-//!      (sklearn breaks the moment the labeling stops changing, BEFORE the tol
-//!      check — Pitfall 6); then `center_shift_tot <= tol_scaled` where
-//!      `tol_scaled = mean(var(X, axis=0)) · tol` (sklearn scales the raw `tol`
-//!      by the mean feature variance; `tol` default `1e-4`). `max_iter = 300`.
-//!   4. If the loop ends WITHOUT a strict label-equality break (it hit the tol
-//!      or `max_iter`), run ONE FINAL assignment pass so `labels_` reflects the
-//!      final centers (sklearn's post-loop `_labels_inertia` pass — Pitfall 6).
+//!      via the device [`labels_changed`] count (sklearn breaks the moment the
+//!      labeling stops changing, BEFORE the tol check — Pitfall 6); then
+//!      `center_shift_tot <= tol_scaled` where `tol_scaled =
+//!      mean(var(X, axis=0)) · tol` (computed on-device by
+//!      [`feature_mean_var`]; `tol` default `1e-4`). `max_iter = 300`.
+//!   4. No post-loop assignment pass is needed: every exit path leaves the
+//!      labels written against the final adopted centers, so a re-assign
+//!      (sklearn's post-loop `_labels_inertia`) would reproduce them exactly.
 //!
 //! ## Stored fitted state (device-resident, D-03)
 //! `cluster_centers_` (`k × d`, `F`) and `labels_` (`n`, `i32` — D-06 the
@@ -71,9 +74,10 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::distance::distance;
-use mlrs_backend::prims::kmeans::{inertia, inertia_rows_host, kmeanspp_sample, lloyd_update};
-use mlrs_backend::prims::reduce::argmin_rows;
+use mlrs_backend::prims::kmeans::{
+    assign_min, centroid_sums_dev, feature_mean_var, gather_rows_device, kmeanspp_sample,
+    inertia_rows_device, labels_changed, relocate_empty_clusters, row_sqnorms, sum_device,
+};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -326,23 +330,24 @@ where
     F: Float + CubeElement + Pod,
 {
     /// Assign each row of `x` (`n × d`) to its nearest center in `centers`
-    /// (`k × d`) via the Phase-2 `distance(sqrt=false)` + per-row `argmin`
-    /// (lowest-index tie-break, D-02). Shared by the Lloyd loop and
-    /// `predict_labels`. Returns length-`n` `u32` labels (each in `0..k`).
-    fn assign(
+    /// (`k × d`) via the FUSED device [`assign_min`] prim (direct per-row
+    /// argmin, lowest-index tie-break D-02) into caller-owned DEVICE buffers:
+    /// `labels` (`u32`, length `n`) and `dist` (the winning squared distance —
+    /// the per-row inertia term). No readback — the Lloyd loop stays
+    /// launch-only; `predict_labels` reads the labels back at its boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn assign_dev(
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         n: usize,
         d: usize,
         centers: &DeviceArray<ActiveRuntime, F>,
         k: usize,
-    ) -> Result<Vec<u32>, PrimError> {
-        // n × k squared-distance matrix (no boundary sqrt — nearest is
-        // sqrt-monotonic), then the lowest-index per-row argmin.
-        let dmat = distance::<F>(pool, x, (n, d), centers, (k, d), false, None)?;
-        let labels = argmin_rows::<F>(pool, &dmat, n, k)?;
-        dmat.release_into(pool);
-        Ok(labels)
+        labels: &DeviceArray<ActiveRuntime, u32>,
+        dist: &DeviceArray<ActiveRuntime, F>,
+        xnorm: Option<&DeviceArray<ActiveRuntime, F>>,
+    ) -> Result<(), PrimError> {
+        assign_min::<F>(pool, x, centers, labels, dist, xnorm, n, d, k)
     }
 }
 
@@ -376,28 +381,30 @@ where
         validate_geometry(x, shape)?;
 
         // --- Init centers: injected (D-09, the deterministic oracle) or the
-        //     k-means++ D²-weighted host sampler (D-09a, n_init=1 D-09b). ---
-        let mut centers: DeviceArray<ActiveRuntime, F> = if let Some(init) = &self.init {
-            if init.len() != k * n_features {
-                return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                    operand: "init",
-                    rows: k,
-                    cols: n_features,
-                    len: init.len(),
-                }));
-            }
-            DeviceArray::from_host(pool, init)
-        } else {
-            let idx = kmeanspp_sample::<F>(pool, x, n_samples, n_features, k, self.seed)?;
-            // Gather the chosen sample rows into a k × d init buffer.
-            let x_host = x.to_host(pool);
-            let mut init_host: Vec<F> = vec![F::from_int(0i64); k * n_features];
-            for (c, &i) in idx.iter().enumerate() {
-                init_host[c * n_features..(c + 1) * n_features]
-                    .copy_from_slice(&x_host[i * n_features..(i + 1) * n_features]);
-            }
-            DeviceArray::from_host(pool, &init_host)
-        };
+        //     k-means++ D²-weighted host sampler (D-09a, n_init=1 D-09b). The
+        //     `centers_host` f64 mirror feeds the per-iteration center-shift
+        //     check WITHOUT reading the centers back each iteration. ---
+        let (mut centers, mut centers_host): (DeviceArray<ActiveRuntime, F>, Vec<f64>) =
+            if let Some(init) = &self.init {
+                if init.len() != k * n_features {
+                    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                        operand: "init",
+                        rows: k,
+                        cols: n_features,
+                        len: init.len(),
+                    }));
+                }
+                let host = init.iter().map(|&v| host_to_f64(v)).collect();
+                (DeviceArray::from_host(pool, init), host)
+            } else {
+                let idx = kmeanspp_sample::<F>(pool, x, n_samples, n_features, k, self.seed)?;
+                // Gather the chosen sample rows into the k × d init buffer ON
+                // the device (no full `x` readback); mirror the small result.
+                let idx_u32: Vec<u32> = idx.iter().map(|&i| i as u32).collect();
+                let dev = gather_rows_device::<F>(pool, x, &idx_u32, n_samples, n_features)?;
+                let host = dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+                (dev, host)
+            };
 
         // --- WR-03: KMeans NON-CONVERGENCE CONTRACT. Unlike Lasso / LogReg (which
         //     surface AlgoError::NotConverged), KMeans matches sklearn's contract:
@@ -412,106 +419,195 @@ where
         //     covered by a regression test in `tests/kmeans_test.rs`.
         //
         // --- tol_scaled = tol · mean(var(X, axis=0)) (Pitfall 6). sklearn scales
-        //     the raw tol by the mean per-feature variance; computed host-side on
-        //     the tiny n-vectors (the heavy assign/update stay on-device). ---
-        let x_host: Vec<F> = x.to_host(pool);
-        let tol_scaled = {
-            let inv_n = 1.0_f64 / n_samples as f64;
-            let mut mean = vec![0.0f64; n_features];
-            for r in 0..n_samples {
-                for c in 0..n_features {
-                    mean[c] += host_to_f64(x_host[r * n_features + c]);
-                }
-            }
-            for m in mean.iter_mut() {
-                *m *= inv_n;
-            }
-            let mut var_sum = 0.0f64;
-            for r in 0..n_samples {
-                for c in 0..n_features {
-                    let diff = host_to_f64(x_host[r * n_features + c]) - mean[c];
-                    var_sum += diff * diff;
-                }
-            }
-            // mean over features of var(X, axis=0) (population variance, ddof=0 —
-            // sklearn uses np.mean(np.var(X, axis=0))).
-            let mean_var = (var_sum * inv_n) / n_features as f64;
-            self.tol * mean_var
-        };
+        //     the raw tol by the mean per-feature variance; computed by the
+        //     two-pass blocked DEVICE column reduction (only tiny partials are
+        //     read back — never the n × d sample matrix). ---
+        let tol_scaled = self.tol * feature_mean_var::<F>(pool, x, n_samples, n_features)?;
+
+        // --- Device work buffers for the launch-only Lloyd loop: u32 labels
+        //     (current + previous, swapped each iteration) and the per-row
+        //     squared distance to the assigned center (written by every fused
+        //     assign — it doubles as the relocation ranking AND the inertia
+        //     rows, so neither needs an extra pass). ---
+        let elem_u32 = size_of::<u32>();
+        let mut labels_dev = DeviceArray::<ActiveRuntime, u32>::from_raw(
+            pool.acquire(n_samples * elem_u32),
+            n_samples,
+        );
+        let mut labels_old_dev = DeviceArray::<ActiveRuntime, u32>::from_raw(
+            pool.acquire(n_samples * elem_u32),
+            n_samples,
+        );
+        let dist_dev = DeviceArray::<ActiveRuntime, F>::from_raw(
+            pool.acquire(n_samples * size_of::<F>()),
+            n_samples,
+        );
+
+        // ‖x_i‖², computed ONCE per fit for the GEMM assignment path (the prim
+        // ignores it on the direct path — a single tiny launch either way).
+        let xnorm = row_sqnorms::<F>(pool, x, n_samples, n_features)?;
 
         // --- Lloyd loop (Pitfall 6: strict label-equality break BEFORE the tol
-        //     check; one final assignment pass if it did NOT strict-converge). ---
-        let mut labels = Self::assign(pool, x, n_samples, n_features, &centers, k)?;
-        let mut strict_converged = false;
+        //     check), fully DEVICE-resident: per iteration the host sees only
+        //     the k × d centroid sums + k counts and the per-block
+        //     changed-label counts (a few KB) — never an O(n) buffer. ---
+        // KM_PROFILE=1: per-phase wall-clock attribution (laps are delimited by
+        // the loop's natural readback sync points, so kernel time lands in the
+        // phase whose readback drains it — attribution only, like RF_PROFILE).
+        let profile = std::env::var("KM_PROFILE").is_ok();
+        let mut t_sums = 0.0_f64;
+        let mut t_host = 0.0_f64;
+        let mut t_assign = 0.0_f64;
+        let mut iters_run = 0usize;
+
+        // Host `x` copy, materialized ONLY if some iteration hits the rare
+        // empty-cluster relocation, then reused across later relocations (`x`
+        // is immutable — measured 12ms/iteration of repeated O(n·d) readback
+        // on a relocation-heavy ladder config without the cache).
+        let mut x_host_cache: Option<Vec<F>> = None;
+
+        Self::assign_dev(
+            pool, x, n_samples, n_features, &centers, k, &labels_dev, &dist_dev, Some(&xnorm),
+        )?;
         for _iter in 0..self.max_iter {
-            // sklearn empty-cluster relocation (CR-01) needs the per-sample squared
-            // distance to the CURRENTLY-assigned center (the same quantity inertia
-            // sums) so an empty cluster can take the globally-farthest sample and
-            // decrement its donor. Compute it against the CURRENT centers + labels
-            // (the assignment that produced the sums lloyd_update is about to form).
-            let dist_to_assigned =
-                inertia_rows_host::<F>(pool, x, &centers, &labels, n_samples, n_features)?;
+            iters_run += 1;
+            let lap0 = std::time::Instant::now();
+            // UPDATE: per-centroid sums + counts via the row-blocked device
+            // gather (the only per-iteration readback of the update phase).
+            let (mut sums_f64, mut counts_i64) =
+                centroid_sums_dev::<F>(pool, x, &labels_dev, n_samples, n_features, k)?;
+            if profile {
+                t_sums += lap0.elapsed().as_secs_f64();
+            }
+            let lap1 = std::time::Instant::now();
 
-            // UPDATE: per-label mean with sklearn-exact empty-cluster relocation
-            // (CR-01: relocate to the farthest-from-assigned-center sample, fixing
-            // sums + counts + donor — lifted here where labels + centers exist).
-            let new_centers = lloyd_update::<F>(
-                pool,
-                x,
-                &labels,
-                &dist_to_assigned,
-                n_samples,
-                n_features,
-                k,
-            )?;
-
-            // ASSIGN to the new centers.
-            let new_labels =
-                Self::assign(pool, x, n_samples, n_features, &new_centers, k)?;
-
-            // STRICT array_equal break FIRST (Pitfall 6) — the labeling stopped
-            // changing, so sklearn breaks before measuring the center shift.
-            if new_labels == labels {
-                centers.release_into(pool);
-                centers = new_centers;
-                labels = new_labels;
-                strict_converged = true;
-                break;
+            // RARE path: an empty cluster triggers sklearn's exact relocation
+            // (CR-01 / T-05-03-02), which ranks samples by their squared
+            // distance to the assigned center — `dist_dev` holds exactly that
+            // (written by the assign that produced `labels_dev`). Only this
+            // branch ever reads an O(n) buffer back.
+            if counts_i64.iter().any(|&c| c == 0) {
+                if x_host_cache.is_none() {
+                    x_host_cache = Some(x.to_host(pool));
+                }
+                let labels_host: Vec<u32> = labels_dev.to_host(pool);
+                let dist_host: Vec<f64> = dist_dev
+                    .to_host(pool)
+                    .iter()
+                    .map(|&v| host_to_f64(v))
+                    .collect();
+                relocate_empty_clusters::<F>(
+                    &mut sums_f64,
+                    &mut counts_i64,
+                    x_host_cache.as_ref().expect("cached above"),
+                    &labels_host,
+                    &dist_host,
+                    n_samples,
+                    n_features,
+                    k,
+                )?;
             }
 
-            // center_shift_tot = Σ ‖new_center_c − old_center_c‖² (host pass over
-            // the tiny k × d centers). Break when it falls to/under tol_scaled.
-            let old_host = centers.to_host(pool);
-            let new_host = new_centers.to_host(pool);
-            let mut shift = 0.0f64;
+            // Mean divide (f64, matching lloyd_update's finalize) + the center
+            // shift against the f64 host mirror of the OLD centers.
+            let mut new_centers_host = vec![0.0_f64; k * n_features];
+            for c in 0..k {
+                // Post-relocation every cluster has count >= 1 (the relocation
+                // helper guarantees it or errors).
+                debug_assert!(
+                    counts_i64[c] > 0,
+                    "post-relocation cluster {c} has non-positive count {}",
+                    counts_i64[c]
+                );
+                if counts_i64[c] > 0 {
+                    let inv = 1.0_f64 / counts_i64[c] as f64;
+                    for j in 0..n_features {
+                        new_centers_host[c * n_features + j] = sums_f64[c * n_features + j] * inv;
+                    }
+                }
+            }
+            // center_shift_tot = Σ ‖new_center_c − old_center_c‖² (host pass
+            // over the tiny k × d mirrors). Consulted AFTER the strict check.
+            let mut shift = 0.0_f64;
             for i in 0..k * n_features {
-                let diff = host_to_f64(new_host[i]) - host_to_f64(old_host[i]);
+                let diff = new_centers_host[i] - centers_host[i];
                 shift += diff * diff;
             }
 
+            let new_f: Vec<F> = new_centers_host
+                .iter()
+                .map(|&v| f64_to_host::<F>(v))
+                .collect();
             centers.release_into(pool);
-            centers = new_centers;
-            labels = new_labels;
+            centers = DeviceArray::from_host(pool, &new_f);
+            centers_host = new_centers_host;
 
+            if profile {
+                t_host += lap1.elapsed().as_secs_f64();
+            }
+            let lap2 = std::time::Instant::now();
+
+            // ASSIGN to the new centers (previous labels kept in the swapped
+            // buffer for the strict check).
+            std::mem::swap(&mut labels_dev, &mut labels_old_dev);
+            Self::assign_dev(
+                pool, x, n_samples, n_features, &centers, k, &labels_dev, &dist_dev, Some(&xnorm),
+            )?;
+
+            // STRICT array_equal break FIRST (Pitfall 6) — the labeling stopped
+            // changing, so sklearn breaks before measuring the center shift.
+            let changed = labels_changed(pool, &labels_dev, &labels_old_dev, n_samples)?;
+            if profile {
+                t_assign += lap2.elapsed().as_secs_f64();
+            }
+            if changed == 0 {
+                break;
+            }
             if shift <= tol_scaled {
                 break;
             }
         }
 
-        // --- One FINAL assignment pass if we did NOT strict-converge (the loop
-        //     hit the tol threshold or max_iter): labels_ must reflect the final
-        //     centers (sklearn's post-loop _labels_inertia, Pitfall 6). ---
-        if !strict_converged {
-            labels = Self::assign(pool, x, n_samples, n_features, &centers, k)?;
+        if profile {
+            eprintln!(
+                "KM_PROFILE n={n_samples} d={n_features} k={k}: iters={iters_run} \
+                 sums+readback={t_sums:.4}s host+upload={t_host:.4}s \
+                 assign+changed={t_assign:.4}s"
+            );
         }
 
-        // --- inertia_ via the Phase-5 prim (Σ squared dist to assigned center). ---
-        let inertia_val = inertia::<F>(pool, x, &centers, &labels, n_samples, n_features)?;
+        // NOTE: no post-loop assignment pass is needed (the old code's Pitfall-6
+        // re-assign): EVERY exit path above — strict break, tol break, max_iter
+        // exhaustion, and the max_iter == 0 degenerate — leaves `labels_dev` /
+        // `dist_dev` written by an assign against the FINAL adopted `centers`,
+        // and assignment is deterministic, so re-assigning reproduces the same
+        // labels sklearn's post-loop `_labels_inertia` would.
+
+        // --- inertia_ = Σ per-row squared distance to the assigned center.
+        //     Recompute the rows with the DIRECT gather first (the GEMM staging
+        //     distances rank correctly but their f32 cancellation noise exceeds
+        //     the 1e-5 oracle tolerance when summed), then the blocked device
+        //     sum — still no O(n) readback. ---
+        inertia_rows_device::<F>(
+            pool, x, &centers, &labels_dev, &dist_dev, n_samples, n_features,
+        )?;
+        let inertia_val =
+            f64_to_host::<F>(sum_device::<F>(pool, &dist_dev, n_samples)?);
 
         // --- Store labels as i32 (D-06: the u32 prim labels widen to the i32
-        //     trait surface; KMeans labels are non-negative). ---
-        let labels_i32: Vec<i32> = labels.iter().map(|&l| l as i32).collect();
-        let labels_dev: DeviceArray<ActiveRuntime, i32> = DeviceArray::from_host(pool, &labels_i32);
+        //     trait surface; KMeans labels are non-negative). One boundary
+        //     readback at the end of fit — never inside the loop. ---
+        let labels_u32: Vec<u32> = labels_dev.to_host(pool);
+        let labels_i32: Vec<i32> = labels_u32.iter().map(|&l| l as i32).collect();
+        let labels_dev_i32: DeviceArray<ActiveRuntime, i32> =
+            DeviceArray::from_host(pool, &labels_i32);
+
+        // Return the transient loop buffers to the pool (FOUND-05).
+        labels_dev.release_into(pool);
+        labels_old_dev.release_into(pool);
+        dist_dev.release_into(pool);
+        xnorm.release_into(pool);
+        let labels_dev = labels_dev_i32;
 
         Ok(KMeans {
             n_clusters: self.n_clusters,
@@ -565,8 +661,32 @@ where
         }
 
         // Assign new points to the fitted centers (nearest-centroid → i32 label,
-        // D-08: KMeans.predict returns INTEGER labels, not an F target).
-        let labels = Self::assign(pool, x, n_samples, n_features, centers, self.n_clusters)?;
+        // D-08: KMeans.predict returns INTEGER labels, not an F target) via the
+        // fused device assign; one boundary readback for the u32 → i32 widening.
+        let labels_dev = DeviceArray::<ActiveRuntime, u32>::from_raw(
+            pool.acquire(n_samples * size_of::<u32>()),
+            n_samples,
+        );
+        let dist_dev = DeviceArray::<ActiveRuntime, F>::from_raw(
+            pool.acquire(n_samples * size_of::<F>()),
+            n_samples,
+        );
+        let xnorm = row_sqnorms::<F>(pool, x, n_samples, n_features)?;
+        Self::assign_dev(
+            pool,
+            x,
+            n_samples,
+            n_features,
+            centers,
+            self.n_clusters,
+            &labels_dev,
+            &dist_dev,
+            Some(&xnorm),
+        )?;
+        xnorm.release_into(pool);
+        let labels: Vec<u32> = labels_dev.to_host(pool);
+        labels_dev.release_into(pool);
+        dist_dev.release_into(pool);
         let labels_i32: Vec<i32> = labels.iter().map(|&l| l as i32).collect();
         Ok(DeviceArray::from_host(pool, &labels_i32))
     }

@@ -1,0 +1,36 @@
+tree:
+  builder: markdown_heading_v1
+  synthetic_group_paragraphs: 6
+  synthetic_group_max_words: 400
+  summary_max_words: 48
+  sync_index_max_bytes: 2097152
+search:
+  default_strategy: beam_tree_v1
+  allow_request_override: true
+  experimental_strategies_enabled: false
+  strategies:
+    beam_tree_v1:
+      beam_width: 8
+      max_depth: 8
+      max_nodes_visited: 200
+      expand_threshold: 0.12
+      weights:
+        title: 0.3
+        body: 0.25
+        summary: 0.2
+        path: 0.2
+        prior: 0.05
+        plugin: 0.0
+    exhaustive_tree_v1:
+      max_nodes_visited: 5000
+limits:
+  max_file_bytes: 10485760
+  max_patch_bytes: 2097152
+  max_query_chars: 2000
+  max_top_k: 50
+  max_nodes_visited: 10000
+  max_list_limit: 500
+security:
+  read_only: false
+  follow_symlinks: false
+  mcp_tool_allowlist: []

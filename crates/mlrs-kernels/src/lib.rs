@@ -71,9 +71,11 @@ pub use elementwise::{
 // 3-slot histogram gather + block reduce, sklearn-gain split pipeline, row
 // partition with a stage offset, and raw-prediction update/inference.
 pub use gbt::{
-    gbt_best_split, gbt_count_left, gbt_grad_binary, gbt_grad_multi, gbt_grad_reg, gbt_hist,
-    gbt_hist_reduce, gbt_init_partition, gbt_init_raw, gbt_partition, gbt_proba_binary,
-    gbt_proba_multi, gbt_row_max, gbt_row_sumexp, gbt_split_scores, gbt_sum_raw, gbt_update_raw,
+    gbt_best_split, gbt_child_ranges, gbt_count_left, gbt_count_left_blocks, gbt_grad_binary,
+    gbt_grad_multi, gbt_grad_reg, gbt_hist, gbt_hist_atomic, gbt_hist_reduce, gbt_hist_zero,
+    gbt_init_partition, gbt_init_raw, gbt_partition, gbt_partition_blocks, gbt_predict_fused,
+    gbt_proba_binary, gbt_proba_multi, gbt_row_max, gbt_row_sumexp, gbt_split_scores,
+    gbt_sum_partials, gbt_update_raw,
 };
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
@@ -94,9 +96,11 @@ pub use smoke::saxpy_kernel;
 // pipeline, row partition, and forest traversal/vote. Launched by the backend
 // host orchestrator in `prims/random_forest.rs`.
 pub use tree::{
-    rf_best_split, rf_bin_features, rf_count_left, rf_hist_class, rf_hist_cum, rf_hist_reg,
-    rf_mean_reg, rf_node_max, rf_node_total, rf_partition, rf_predict_leaf,
-    rf_split_scores_class, rf_split_scores_reg, rf_vote_class, RF_NO_FEATURE,
+    rf_best_split, rf_bin_features, rf_bin_features_t, rf_bin_features_t_packed,
+    rf_child_ranges, rf_count_left_blocks, rf_hist_class_atomic, rf_hist_class_part,
+    rf_hist_cum, rf_hist_cum_u32, rf_hist_reduce, rf_hist_reg_part, rf_hist_zero_u32,
+    rf_mean_reg, rf_node_stats, rf_order_iota, rf_partition_blocks, rf_predict_leaf,
+    rf_root_ranges, rf_split_scores_class, rf_split_scores_reg, rf_vote_class, RF_NO_FEATURE,
 };
 // Phase-14 UMAP layout SGD step (UMAP-03): the per-owner GATHER kernel the host
 // epoch driver in `manifold/umap.rs` launches each epoch (Plan 04) and the

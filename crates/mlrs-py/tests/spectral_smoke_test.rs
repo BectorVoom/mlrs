@@ -20,6 +20,7 @@
 //!     backend without f64, e.g. rocm; run on cpu).
 
 use mlrs_algos::cluster::{SpectralClustering, SpectralEmbedding};
+use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -111,9 +112,18 @@ where
     let xd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xh);
 
     let n_components = 2usize;
-    let mut se = SpectralEmbedding::<F>::new(n_components, "rbf".to_string(), None, 3);
-    se.fit(&mut pool, &xd, (N, D)).expect("SpectralEmbedding::fit smoke");
-    let emb = se.embedding(&pool).expect("embedding_ after fit");
+    let se = SpectralEmbedding::<F>::builder()
+        .n_components(n_components)
+        .affinity("rbf".to_string())
+        .n_neighbors(3)
+        .build::<F>()
+        .expect("SpectralEmbedding builder");
+    // `Fit::fit` CONSUMES the `Unfit` estimator and returns the `Fitted` sibling
+    // (typestate lifecycle, D-05); `y` is `None` for this unsupervised fit.
+    let se = se
+        .fit(&mut pool, &xd, None, (N, D))
+        .expect("SpectralEmbedding::fit smoke");
+    let emb = se.embedding(&pool);
     assert_eq!(emb.len(), N * n_components, "embedding_ is n × n_components");
     assert!(
         emb.iter().all(|v| {
@@ -139,14 +149,19 @@ where
     let xh = x_host::<F>();
     let xd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &xh);
 
-    let gamma: F = match std::mem::size_of::<F>() {
-        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&1.0f32)),
-        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&1.0f64)),
-        _ => unreachable!(),
-    };
-    let mut sc = SpectralClustering::<F>::new(2, None, "rbf".to_string(), gamma, 3, 7);
-    sc.fit(&mut pool, &xd, (N, D)).expect("SpectralClustering::fit smoke");
-    let labels = sc.labels(&pool).expect("labels_ after fit");
+    let sc = SpectralClustering::<F>::builder()
+        .n_clusters(2)
+        .n_components(None)
+        .affinity("rbf".to_string())
+        .gamma(1.0)
+        .n_neighbors(3)
+        .seed(7)
+        .build::<F>()
+        .expect("SpectralClustering builder");
+    let sc = sc
+        .fit(&mut pool, &xd, None, (N, D))
+        .expect("SpectralClustering::fit smoke");
+    let labels = sc.labels(&pool);
     assert_eq!(labels.len(), N, "labels_ is length n");
     assert!(
         labels.iter().all(|&l| l >= 0 && (l as usize) < 2),

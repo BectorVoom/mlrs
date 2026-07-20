@@ -57,8 +57,11 @@
 //! statement-form `if`, no `SharedMemory`/atomics/`F::INFINITY`. Each unit
 //! writes only memory it exclusively owns (its own histogram-block / score /
 //! node / raw slice) — race-free without atomics (the `lbfgs.rs` precedent).
+//! ONE exception: [`gbt_hist_atomic`] uses shared-memory FLOAT atomics and is
+//! host-gated to the CUDA/ROCm backends (never launched on cpu-MLIR or wgpu —
+//! see its doc); cpu and wgpu keep the deterministic gather path end to end.
 //!
-//! LANDMINE (wgpu): small constants MUST be `F::new(1e-15)`, never
+//! LANDMINE (wgpu): small constants MUST be `F::new(1e-15_f32)`, never
 //! `F::cast_from(1e-15)` — the f64-literal cast makes the WGSL shader fail to
 //! compile SILENTLY on wgpu (the kernel launches as a no-op and every score
 //! reads back 0). `F::new` takes an f32 literal and lowers cleanly.
@@ -97,7 +100,7 @@ pub fn gbt_grad_reg<F: Float + CubeElement>(
     let tid = ABSOLUTE_POS;
     if tid < n as usize {
         g[tid] = raw[tid] - y[tid];
-        h[tid] = F::new(1.0);
+        h[tid] = F::new(1.0_f32);
     }
 }
 
@@ -113,9 +116,9 @@ pub fn gbt_grad_binary<F: Float + CubeElement>(
 ) {
     let tid = ABSOLUTE_POS;
     if tid < n as usize {
-        let p = F::new(1.0) / (F::new(1.0) + F::exp(-raw[tid]));
+        let p = F::new(1.0_f32) / (F::new(1.0_f32) + F::exp(-raw[tid]));
         g[tid] = p - y[tid];
-        h[tid] = p * (F::new(1.0) - p);
+        h[tid] = p * (F::new(1.0_f32) - p);
     }
 }
 
@@ -159,7 +162,7 @@ pub fn gbt_row_sumexp<F: Float + CubeElement>(
     if tid < n as usize {
         let base = (tid as u32) * k;
         let mx = row_max[tid];
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0_f32);
         let mut c = 0u32;
         while c < k {
             acc += F::exp(raw[(base + c) as usize] - mx);
@@ -189,12 +192,12 @@ pub fn gbt_grad_multi<F: Float + CubeElement>(
         let i = (tid as u32) / k;
         let c = (tid as u32) % k;
         let p = F::exp(raw[tid] - row_max[i as usize]) / row_sumexp[i as usize];
-        let mut ind = F::new(0.0);
+        let mut ind = F::new(0.0_f32);
         if y_idx[i as usize] == c {
-            ind = F::new(1.0);
+            ind = F::new(1.0_f32);
         }
         g[tid] = p - ind;
-        h[tid] = p * (F::new(1.0) - p);
+        h[tid] = p * (F::new(1.0_f32) - p);
     }
 }
 
@@ -279,7 +282,7 @@ pub fn gbt_hist<F: Float + CubeElement>(
         // Zero the exclusively-owned slice (pool buffers arrive uninitialized).
         let mut z = 0u32;
         while z < nb * 3u32 {
-            hist_part[(base + z) as usize] = F::new(0.0);
+            hist_part[(base + z) as usize] = F::new(0.0_f32);
             z += 1u32;
         }
 
@@ -294,7 +297,7 @@ pub fn gbt_hist<F: Float + CubeElement>(
             let i = order[(tt * n + r) as usize];
             let b = binned[(i * d + f) as usize];
             let slot = base + b * 3u32;
-            hist_part[slot as usize] += F::new(1.0);
+            hist_part[slot as usize] += F::new(1.0_f32);
             hist_part[(slot + 1u32) as usize] += g[(i * k + tt) as usize];
             hist_part[(slot + 2u32) as usize] += h[(i * k + tt) as usize];
             r += 1u32;
@@ -318,7 +321,7 @@ pub fn gbt_hist_reduce<F: Float + CubeElement>(
     if tid < total as usize {
         let col = (tid as u32) / (nb * 3u32); // (tt, node, f) flat index
         let within = (tid as u32) % (nb * 3u32);
-        let mut acc = F::new(0.0);
+        let mut acc = F::new(0.0_f32);
         let mut b = 0u32;
         while b < n_blocks {
             acc += hist_part[((col * n_blocks + b) * (nb * 3u32) + within) as usize];
@@ -375,9 +378,127 @@ pub fn gbt_hist_subtract<F: Float + CubeElement>(
         let midx = (tree_base + tt) * total_nodes + parent_level_base + p;
         let mut rv = pv - lv;
         if is_leaf[midx as usize] == 1u32 {
-            rv = F::new(0.0);
+            rv = F::new(0.0_f32);
         }
         hist_full[((even_col + 1u32) * elem + e) as usize] = rv;
+    }
+}
+
+/// Zero an `F` histogram buffer (the atomic gather flushes with `fetch_add`,
+/// so the pool buffer must start at 0 — pool buffers arrive uninitialized).
+/// One unit per element.
+#[cube(launch)]
+pub fn gbt_hist_zero<F: Float + CubeElement>(hist: &mut Array<F>, len: u32) {
+    let tid = ABSOLUTE_POS;
+    if tid < len as usize {
+        hist[tid] = F::new(0.0_f32);
+    }
+}
+
+/// Shared-memory FLOAT-atomic histogram gather (the `rf_hist_class_atomic`
+/// shape adapted to the 3-slot `count/Σg/Σh` lattice): one 256-thread cube
+/// per `(tree, node_in_chunk, feature chunk, row block)` accumulates its row
+/// stripe into a fixed 4096-slot `SharedMemory<Atomic<F>>` with `fetch_add`,
+/// then atomically flushes the non-zero slots to the global histogram.
+///
+/// CUDA/ROCm ONLY (host-gated): float `atomicAdd` is native there; WGSL has
+/// no `atomic<f32>` and the cpu-MLIR path miscompiles shared/atomic kernels
+/// (spike findings 001–003) — both keep the deterministic [`gbt_hist`]
+/// gather. Unlike the forest's integer path, float atomics make the
+/// accumulation ORDER non-deterministic, so sums differ from the gather path
+/// by summation-order float noise (last-ULP scale — well inside the 1e-5
+/// oracle gate; fits on these backends are tolerance-exact, not bitwise).
+///
+/// The FEATURE CHUNK axis (`f_chunk` features per cube, `n_fchunks =
+/// ceil(d / f_chunk)`) keeps the shared lattice `f_chunk · nb · 3 ≤ 4096`
+/// slots for any `nb` (at the default `nb = 64` one chunk covers `d ≤ 21`;
+/// at `nb = 256` a chunk is 5 features). `order`/`g`/`h` row loads repeat
+/// per chunk, but each cube still owns MANY rows per thread — the grid-width
+/// occupancy lesson from the reverted gather restructure does not apply to
+/// the 256-wide cube shape. `node_stride` mirrors [`gbt_hist`]: it scales the
+/// `ranges` lookup only (`2` = gather EVEN/left real nodes for the sibling
+/// subtraction), the output stays densely packed by `node`.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn gbt_hist_atomic<F: Float + CubeElement>(
+    binned_t: &Array<u32>,
+    g: &Array<F>,
+    h: &Array<F>,
+    order: &Array<u32>,
+    ranges: &Array<u32>,
+    hist: &mut Array<Atomic<F>>,
+    n: u32,
+    d: u32,
+    nb: u32,
+    k: u32,
+    nodes_total: u32,
+    node_base: u32,
+    nodes_chunk: u32,
+    f_chunk: u32,
+    n_fchunks: u32,
+    bcount: u32,
+    node_stride: u32,
+) {
+    let shared = SharedMemory::<Atomic<F>>::new(4096usize);
+    let lid = UNIT_POS as u32;
+    let dim = CUBE_DIM_X;
+    // Explicit 2D cube linearization (the grid folds into Y past 65535).
+    let cube = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as u32;
+
+    let blk = cube % bcount;
+    let rest = cube / bcount;
+    let fci = rest % n_fchunks;
+    let col = rest / n_fchunks;
+    let node = col % nodes_chunk;
+    let tt = col / nodes_chunk;
+
+    // Slack-cube guard: UNIFORM per cube (derived from CUBE_POS only), so
+    // every unit of a cube takes the same branch and the barriers are safe.
+    if tt < k {
+        let f_base = fci * f_chunk;
+        let mut fc_now = f_chunk;
+        if f_base + fc_now > d {
+            fc_now = d - f_base;
+        }
+        let slots = fc_now * nb * 3u32;
+
+        let mut z = lid;
+        while z < slots {
+            shared[z as usize].store(F::new(0.0_f32));
+            z += dim;
+        }
+        sync_cube();
+
+        let rbase = (tt * nodes_total + node_base + node * node_stride) * 2u32;
+        let s = ranges[rbase as usize];
+        let e = ranges[(rbase + 1u32) as usize];
+        let mut r = s + blk * dim + lid;
+        while r < e {
+            let i = order[(tt * n + r) as usize];
+            let gv = g[(i * k + tt) as usize];
+            let hv = h[(i * k + tt) as usize];
+            let mut f = 0u32;
+            while f < fc_now {
+                let b = binned_t[((f_base + f) * n + i) as usize];
+                let sbase = (f * nb + b) * 3u32;
+                shared[sbase as usize].fetch_add(F::new(1.0_f32));
+                shared[(sbase + 1u32) as usize].fetch_add(gv);
+                shared[(sbase + 2u32) as usize].fetch_add(hv);
+                f += 1u32;
+            }
+            r += bcount * dim;
+        }
+        sync_cube();
+
+        let hbase = (col * d + f_base) * (nb * 3u32);
+        let mut z2 = lid;
+        while z2 < slots {
+            let v2 = shared[z2 as usize].load();
+            if v2 != F::new(0.0_f32) {
+                hist[(hbase + z2) as usize].fetch_add(v2);
+            }
+            z2 += dim;
+        }
     }
 }
 
@@ -412,7 +533,7 @@ pub fn gbt_split_scores<F: Float + CubeElement>(
         let fbase = col * (nb * 3u32);
         let tbase = (tn * d) * (nb * 3u32) + (nb - 1u32) * 3u32; // feature 0 totals
 
-        let eps = F::new(1e-15);
+        let eps = F::new(1e-15_f32);
         let nl = hist[(fbase + s * 3u32) as usize];
         let gl = hist[(fbase + s * 3u32 + 1u32) as usize];
         let hl = hist[(fbase + s * 3u32 + 2u32) as usize];
@@ -423,12 +544,12 @@ pub fn gbt_split_scores<F: Float + CubeElement>(
         let gr = gt - gl;
         let hr = ht - hl;
 
-        let mut loss_node = F::new(0.0);
+        let mut loss_node = F::new(0.0_f32);
         if root_level == 0u32 {
             loss_node = gt * gt / (ht + l2 + eps);
         }
 
-        let mut sc = F::new(-1.0);
+        let mut sc = F::new(-1.0_f32);
         if nl >= min_leaf {
             if nr >= min_leaf {
                 if hl >= min_hessian {
@@ -488,7 +609,7 @@ pub fn gbt_best_split<F: Float + CubeElement>(
         // lowest flat index on ties (the sklearn feature-then-bin scan order).
         let nsplit = nb - 1u32;
         let sbase = (tid as u32) * d * nsplit;
-        let mut best = F::new(-1.0);
+        let mut best = F::new(-1.0_f32);
         let mut bk = 0u32;
         let mut i = 0u32;
         while i < d * nsplit {
@@ -504,14 +625,14 @@ pub fn gbt_best_split<F: Float + CubeElement>(
         let tbase = ((tid as u32) * d) * (nb * 3u32) + (nb - 1u32) * 3u32;
         let gt = hist[(tbase + 1u32) as usize];
         let ht = hist[(tbase + 2u32) as usize];
-        let eps = F::new(1e-15);
+        let eps = F::new(1e-15_f32);
         leaf_value[midx as usize] = -lr * gt / (ht + l2 + eps);
 
         let mut leaf = 0u32;
         if force_leaf == 1u32 {
             leaf = 1u32;
         }
-        if best <= F::new(0.0) {
+        if best <= F::new(0.0_f32) {
             leaf = 1u32;
         }
         is_leaf[midx as usize] = leaf;
@@ -525,7 +646,7 @@ pub fn gbt_best_split<F: Float + CubeElement>(
         } else {
             split_feature[midx as usize] = 0xFFFF_FFFFu32;
             split_bin[midx as usize] = 0u32;
-            threshold[midx as usize] = F::new(0.0);
+            threshold[midx as usize] = F::new(0.0_f32);
         }
     }
 }
@@ -646,6 +767,195 @@ pub fn gbt_partition(
     }
 }
 
+/// Blocked left-count (the `rf_count_left_blocks` shape with a `tree_base`
+/// model offset and feature-major `binned_t` reads): one unit per `(tree,
+/// node, row block)` counts left-going rows in its contiguous chunk. The
+/// serial [`gbt_count_left`] left level 0 to `K` single threads scanning all
+/// `n` rows each — the dominant serial bottleneck once the histogram is
+/// fast; blocking restores the row-scan parallelism on every level.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn gbt_count_left_blocks(
+    binned_t: &Array<u32>,
+    order: &Array<u32>,
+    ranges: &Array<u32>,
+    split_feature: &Array<u32>,
+    split_bin: &Array<u32>,
+    is_leaf: &Array<u32>,
+    blk_cnt: &mut Array<u32>,
+    n: u32,
+    nodes: u32,
+    k: u32,
+    tree_base: u32,
+    level_base: u32,
+    total_nodes: u32,
+    bcount: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    let total = k * nodes * bcount;
+    if tid < total as usize {
+        let blk = (tid as u32) % bcount;
+        let tn = (tid as u32) / bcount;
+        let node = tn % nodes;
+        let tt = tn / nodes;
+        let gnode = level_base + node;
+        let midx = (tree_base + tt) * total_nodes + gnode;
+
+        let mut cnt = 0u32;
+        if is_leaf[midx as usize] == 0u32 {
+            let fr = split_feature[midx as usize];
+            let bs = split_bin[midx as usize];
+            let s = ranges[((tt * nodes + node) * 2u32) as usize];
+            let e = ranges[((tt * nodes + node) * 2u32 + 1u32) as usize];
+            let len = e - s;
+            let per = (len + bcount - 1u32) / bcount;
+            let lo = s + blk * per;
+            let mut hi = lo + per;
+            if hi > e {
+                hi = e;
+            }
+            let mut r = lo;
+            while r < hi {
+                let i = order[(tt * n + r) as usize];
+                if binned_t[(fr * n + i) as usize] <= bs {
+                    cnt += 1u32;
+                }
+                r += 1u32;
+            }
+        }
+        blk_cnt[tid] = cnt;
+    }
+}
+
+/// Per-node block-count PREFIX + child ranges (the `rf_child_ranges` shape
+/// with a `tree_base` model offset): one unit per `(tree, node)` converts its
+/// own `bcount` slice of `blk_cnt` to an EXCLUSIVE prefix sum in place and
+/// writes the two child `[start, end)` ranges for the next level; leaves emit
+/// two EMPTY child ranges (exactly the serial [`gbt_count_left`] behavior).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn gbt_child_ranges(
+    ranges: &Array<u32>,
+    is_leaf: &Array<u32>,
+    blk_cnt: &mut Array<u32>,
+    ranges_next: &mut Array<u32>,
+    nodes: u32,
+    k: u32,
+    tree_base: u32,
+    level_base: u32,
+    total_nodes: u32,
+    bcount: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    let total = k * nodes;
+    if tid < total as usize {
+        let tt = (tid as u32) / nodes;
+        let node = (tid as u32) % nodes;
+        let gnode = level_base + node;
+        let midx = (tree_base + tt) * total_nodes + gnode;
+        let next_nodes = nodes * 2u32;
+        let lbase = (tt * next_nodes + node * 2u32) * 2u32;
+
+        if is_leaf[midx as usize] == 1u32 {
+            ranges_next[lbase as usize] = 0u32;
+            ranges_next[(lbase + 1u32) as usize] = 0u32;
+            ranges_next[(lbase + 2u32) as usize] = 0u32;
+            ranges_next[(lbase + 3u32) as usize] = 0u32;
+        } else {
+            let cbase = (tid as u32) * bcount;
+            let mut run = 0u32;
+            let mut b = 0u32;
+            while b < bcount {
+                let c = blk_cnt[(cbase + b) as usize];
+                blk_cnt[(cbase + b) as usize] = run;
+                run += c;
+                b += 1u32;
+            }
+            let s = ranges[((tt * nodes + node) * 2u32) as usize];
+            let e = ranges[((tt * nodes + node) * 2u32 + 1u32) as usize];
+            ranges_next[lbase as usize] = s;
+            ranges_next[(lbase + 1u32) as usize] = s + run;
+            ranges_next[(lbase + 2u32) as usize] = s + run;
+            ranges_next[(lbase + 3u32) as usize] = e;
+        }
+    }
+}
+
+/// Blocked STABLE two-way partition (the `rf_partition_blocks` shape with a
+/// `tree_base` model offset): one unit per `(tree, node, row block)` re-scans
+/// its chunk and scatters to the child ranges; its left cursor starts at
+/// `s + prefix[blk]`, its right cursor at `mid + (blk·per − prefix[blk])`
+/// (`prefix` = the in-place exclusive prefix from [`gbt_child_ranges`], `mid`
+/// read from GLOBAL `ranges_next` — FINDING 002-B). Blocks write disjoint
+/// output sub-ranges in original row order — STABLE, bitwise-identical
+/// `order_next` to the serial [`gbt_partition`], race-free without atomics.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn gbt_partition_blocks(
+    binned_t: &Array<u32>,
+    order: &Array<u32>,
+    ranges: &Array<u32>,
+    ranges_next: &Array<u32>,
+    split_feature: &Array<u32>,
+    split_bin: &Array<u32>,
+    is_leaf: &Array<u32>,
+    blk_cnt: &Array<u32>,
+    order_next: &mut Array<u32>,
+    n: u32,
+    nodes: u32,
+    k: u32,
+    tree_base: u32,
+    level_base: u32,
+    total_nodes: u32,
+    bcount: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    let total = k * nodes * bcount;
+    if tid < total as usize {
+        let blk = (tid as u32) % bcount;
+        let tn = (tid as u32) / bcount;
+        let node = tn % nodes;
+        let tt = tn / nodes;
+        let gnode = level_base + node;
+        let midx = (tree_base + tt) * total_nodes + gnode;
+
+        if is_leaf[midx as usize] == 0u32 {
+            let fr = split_feature[midx as usize];
+            let bs = split_bin[midx as usize];
+            let s = ranges[((tt * nodes + node) * 2u32) as usize];
+            let e = ranges[((tt * nodes + node) * 2u32 + 1u32) as usize];
+            let len = e - s;
+            let per = (len + bcount - 1u32) / bcount;
+            let lo = s + blk * per;
+            let mut hi = lo + per;
+            if hi > e {
+                hi = e;
+            }
+            let next_nodes = nodes * 2u32;
+            let lbase = (tt * next_nodes + node * 2u32) * 2u32;
+            let pfx = blk_cnt[(tn * bcount + blk) as usize];
+            let mid = ranges_next[(lbase + 1u32) as usize];
+            // `blk·per ≥ pfx` always (the prefix counts a subset of the rows
+            // before the block), so the subtraction cannot wrap.
+            let rows_before = blk * per;
+            let mut li = s + pfx;
+            let mut ri = mid + (rows_before - pfx);
+            let mut r = lo;
+            while r < hi {
+                let i = order[(tt * n + r) as usize];
+                if binned_t[(fr * n + i) as usize] <= bs {
+                    order_next[(tt * n + li) as usize] = i;
+                    li += 1u32;
+                } else {
+                    order_next[(tt * n + ri) as usize] = i;
+                    ri += 1u32;
+                }
+                r += 1u32;
+            }
+        }
+    }
+}
+
 /// Fold this iteration's trees into the TRAIN raw predictions: one unit per
 /// `(row, class)` walks tree `tree_base + c` on the BINNED features (bounded
 /// `max_depth` descent, `bin ≤ split_bin → left` — exactly the training
@@ -690,33 +1000,100 @@ pub fn gbt_update_raw<F: Float + CubeElement>(
     }
 }
 
-/// Predict-time raw-score sum: one unit per `(query row, class)` accumulates
-/// `baseline[c] + Σ_iter leaf_value[iter·k + c]` over the leaves reached by
-/// [`rf_predict_leaf`](crate::tree::rf_predict_leaf) (`leaf` is `(n_iters·k) ×
-/// q`, the `rf_mean_reg` shape). Single `F` accumulator.
+/// Predict-time FUSED traverse-and-sum: one unit per `(iter block, query
+/// row, class)` walks its `iters_per_block` complete-layout trees and
+/// accumulates the reached leaf values directly into
+/// `out[blk·(q·k) + row·k + c]` — no per-`(tree, row)` leaf-index
+/// intermediate (the old `rf_predict_leaf` → `gbt_sum_raw` pair wrote and
+/// re-read an `n_trees × q` u32 buffer, which dominated predict bandwidth at
+/// large `n_trees × q`). Block 0 seeds `baseline[c]`; the host folds the
+/// (deterministically ordered) block axis with [`gbt_sum_partials`], or skips
+/// it entirely when one block suffices — the block split exists only to keep
+/// the launch grid wide when `q·k` alone would under-occupy the device.
+///
+/// Unit index order is `row`-fastest so a warp walks 32 consecutive rows of
+/// the SAME tree: the tree's node arrays stay hot in L1/L2 while `x` rows are
+/// read once per level. A reached leaf exits the level loop early
+/// (`l = max_depth` — `cur` would be a fixpoint anyway, the remaining
+/// `is_leaf` re-reads are pure waste).
 #[cube(launch)]
-pub fn gbt_sum_raw<F: Float + CubeElement>(
-    leaf: &Array<u32>,
+pub fn gbt_predict_fused<F: Float + CubeElement>(
+    x: &Array<F>,
+    split_feature: &Array<u32>,
+    threshold: &Array<F>,
+    is_leaf: &Array<u32>,
     leaf_value: &Array<F>,
     baseline: &Array<F>,
-    raw_out: &mut Array<F>,
+    out: &mut Array<F>,
     q: u32,
+    d: u32,
     k: u32,
+    max_depth: u32,
     n_iters: u32,
     total_nodes: u32,
+    iters_per_block: u32,
+    n_blocks: u32,
 ) {
     let tid = ABSOLUTE_POS;
-    let total = q * k;
+    let qk = q * k;
+    let total = qk * n_blocks;
     if tid < total as usize {
-        let row = (tid as u32) / k;
-        let c = (tid as u32) % k;
-        let mut acc = baseline[c as usize];
-        let mut it = 0u32;
-        while it < n_iters {
-            let t = it * k + c;
-            let lf = leaf[(t * q + row) as usize];
-            acc += leaf_value[(t * total_nodes + lf) as usize];
+        let blk = (tid as u32) / qk;
+        let rem = (tid as u32) % qk;
+        let c = rem / q;
+        let row = rem % q;
+        let it0 = blk * iters_per_block;
+        let mut it_end = it0 + iters_per_block;
+        if it_end > n_iters {
+            it_end = n_iters;
+        }
+        let mut acc = F::new(0.0_f32);
+        if blk == 0u32 {
+            acc = baseline[c as usize];
+        }
+        let mut it = it0;
+        while it < it_end {
+            let tbase = (it * k + c) * total_nodes;
+            let mut cur = 0u32;
+            let mut l = 0u32;
+            while l < max_depth {
+                if is_leaf[(tbase + cur) as usize] == 0u32 {
+                    let fr = split_feature[(tbase + cur) as usize];
+                    let thr = threshold[(tbase + cur) as usize];
+                    let mut nxt = 2u32 * cur + 2u32;
+                    if x[(row * d + fr) as usize] < thr {
+                        nxt = 2u32 * cur + 1u32;
+                    }
+                    cur = nxt;
+                    l += 1u32;
+                } else {
+                    l = max_depth;
+                }
+            }
+            acc += leaf_value[(tbase + cur) as usize];
             it += 1u32;
+        }
+        out[(blk * qk + row * k + c) as usize] = acc;
+    }
+}
+
+/// Fold [`gbt_predict_fused`]'s block axis: one unit per `(row, class)` slot
+/// sums the `n_blocks` partials in ascending block order (deterministic —
+/// same run, same grouping, same bits). Only launched when `n_blocks > 1`.
+#[cube(launch)]
+pub fn gbt_sum_partials<F: Float + CubeElement>(
+    partials: &Array<F>,
+    raw_out: &mut Array<F>,
+    qk: u32,
+    n_blocks: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < qk as usize {
+        let mut acc = F::new(0.0_f32);
+        let mut b = 0u32;
+        while b < n_blocks {
+            acc += partials[(b * qk + (tid as u32)) as usize];
+            b += 1u32;
         }
         raw_out[tid] = acc;
     }
@@ -728,8 +1105,8 @@ pub fn gbt_sum_raw<F: Float + CubeElement>(
 pub fn gbt_proba_binary<F: Float + CubeElement>(raw: &Array<F>, proba: &mut Array<F>, q: u32) {
     let tid = ABSOLUTE_POS;
     if tid < q as usize {
-        let p = F::new(1.0) / (F::new(1.0) + F::exp(-raw[tid]));
-        proba[(2u32 * (tid as u32)) as usize] = F::new(1.0) - p;
+        let p = F::new(1.0_f32) / (F::new(1.0_f32) + F::exp(-raw[tid]));
+        proba[(2u32 * (tid as u32)) as usize] = F::new(1.0_f32) - p;
         proba[(2u32 * (tid as u32) + 1u32) as usize] = p;
     }
 }

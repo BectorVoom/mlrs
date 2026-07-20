@@ -166,7 +166,7 @@ pub fn minkowski_dist<F: Float + CubeElement>(
                 acc += F::powf(diff, p);
                 kk += 1u32;
             }
-            let inv_p = F::new(1.0) / p;
+            let inv_p = F::new(1.0_f32) / p;
             out[(i * rows_y + j) as usize] = F::powf(acc, inv_p);
         }
     }

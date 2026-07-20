@@ -104,7 +104,7 @@ pub fn cholesky_solve<F: Float + CubeElement>(
     // can still produce a slightly-negative `A[i][i] − Σ L[i][k]²` under f32
     // cancellation (RESEARCH Pitfall 4); a pivot at/below this floor is treated as
     // non-SPD and flagged rather than fed to `√` (which would emit NaN).
-    let floor = F::new(1e-12);
+    let floor = F::new(1e-12_f32);
 
     // --- Initialise info to the "SPD / OK" sentinel before the acting unit runs
     //     (every unit writes the same constant so there is no race). ---
@@ -170,7 +170,7 @@ pub fn cholesky_solve<F: Float + CubeElement>(
                 // Non-SPD: write a safe non-zero placeholder so later divisions do
                 // not produce NaN/Inf; the host rejects the whole result via the
                 // info flag before reading x.
-                l_sh[(i * MAX_DIM + i) as usize] = F::new(1.0);
+                l_sh[(i * MAX_DIM + i) as usize] = F::new(1.0_f32);
                 l_out[(i * n + i) as usize] = zero;
             }
             i += 1u32;

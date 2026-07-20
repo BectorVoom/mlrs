@@ -175,8 +175,8 @@ pub fn sigmoid_map<F: Float + CubeElement>(
 pub fn kde_gaussian_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, h: F) {
     let tid = ABSOLUTE_POS;
     if tid < input.len() {
-        let inv_h2 = F::new(1.0) / (h * h);
-        output[tid] = F::exp(F::new(-0.5) * input[tid] * inv_h2);
+        let inv_h2 = F::new(1.0_f32) / (h * h);
+        output[tid] = F::exp(F::new(-0.5_f32) * input[tid] * inv_h2);
     }
 }
 
@@ -198,7 +198,7 @@ pub fn kde_epanechnikov_map<F: Float + CubeElement>(input: &Array<F>, output: &m
         let h2 = h * h;
         let sqdist = input[tid];
         let zero = F::from_int(0i64);
-        let mut val = F::new(1.0) - sqdist / h2;
+        let mut val = F::new(1.0_f32) - sqdist / h2;
         if sqdist >= h2 {
             val = zero;
         }
@@ -219,7 +219,7 @@ pub fn kde_tophat_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Arr
     if tid < input.len() {
         let dist = input[tid];
         let zero = F::from_int(0i64);
-        let mut val = F::new(1.0);
+        let mut val = F::new(1.0_f32);
         if dist >= h {
             val = zero;
         }
@@ -256,7 +256,7 @@ pub fn kde_linear_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Arr
     if tid < input.len() {
         let dist = input[tid];
         let zero = F::from_int(0i64);
-        let mut val = F::new(1.0) - dist / h;
+        let mut val = F::new(1.0_f32) - dist / h;
         if dist >= h {
             val = zero;
         }
@@ -279,7 +279,7 @@ pub fn kde_cosine_map<F: Float + CubeElement>(input: &Array<F>, output: &mut Arr
     if tid < input.len() {
         let dist = input[tid];
         let zero = F::from_int(0i64);
-        let half_pi = F::new(1.570_796_326_794_896_6);
+        let half_pi = F::new(1.570_796_326_794_896_6_f32);
         let mut val = F::cos(half_pi * dist / h);
         if dist >= h {
             val = zero;
@@ -360,7 +360,7 @@ pub fn degree_guard<F: Float + CubeElement>(w: &Array<F>, output: &mut Array<F>)
         let zero = F::from_int(0i64);
         let mut val = F::sqrt(deg);
         if deg == zero {
-            val = F::new(1.0);
+            val = F::new(1.0_f32);
         }
         output[tid] = val;
     }
@@ -408,7 +408,7 @@ pub fn laplacian_map<F: Float + CubeElement>(
         let off = -a[tid] / (dd[i] * dd[j]);
 
         // Diagonal value: 1 - isolated = (w[i] == 0 ? 0 : 1). STATEMENT-form.
-        let mut diag = F::new(1.0);
+        let mut diag = F::new(1.0_f32);
         if w[i] == zero {
             diag = zero;
         }
@@ -447,7 +447,7 @@ pub fn dist_combine_clamp<F: Float + CubeElement>(
     let j = ABSOLUTE_POS_Y;
     if i < rows && j < cols {
         let idx = (i * cols + j) as usize;
-        let mut d = xnorm[i as usize] + ynorm[j as usize] - F::new(2.0) * xy[idx];
+        let mut d = xnorm[i as usize] + ynorm[j as usize] - F::new(2.0_f32) * xy[idx];
         let zero = F::from_int(0i64);
         if d < zero {
             d = zero;
