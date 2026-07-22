@@ -209,3 +209,30 @@ fn regression_metrics_bad_sample_weight_returns_err_not_panic() {
         Err(MetricError::InvalidWeight)
     ));
 }
+
+// ==================== code-review fix: all-zero sample_weight ====================
+//
+// weighted_mean previously divided the weighted sum by a zero weight-total and
+// returned a silent NaN for an all-zero `sample_weight`. sklearn raises
+// `ValueError("Sample weights must contain at least one non-zero number.")`
+// (verified against scikit-learn==1.9.0); this locks in the matching typed
+// `Err(MetricError::ZeroWeightSum)` for all three regression metrics.
+
+#[test]
+fn regression_metrics_all_zero_sample_weight_returns_err_not_nan() {
+    let y_true = [1.0f64, 2.0, 3.0];
+    let y_pred = [1.1f64, 2.1, 2.9];
+    let all_zero = [0.0f64, 0.0, 0.0];
+    assert!(matches!(
+        r2_score::<f64>(&y_true, &y_pred, Some(&all_zero)),
+        Err(MetricError::ZeroWeightSum)
+    ));
+    assert!(matches!(
+        mean_squared_error::<f64>(&y_true, &y_pred, Some(&all_zero)),
+        Err(MetricError::ZeroWeightSum)
+    ));
+    assert!(matches!(
+        mean_absolute_error::<f64>(&y_true, &y_pred, Some(&all_zero)),
+        Err(MetricError::ZeroWeightSum)
+    ));
+}

@@ -20,7 +20,11 @@ use super::{validate_weight, MetricError};
 /// hand-rolled accumulation loops (the previous doc-comment claimed this
 /// sharing without the code actually doing it; `mean_squared_error`/
 /// `mean_absolute_error` each duplicated the same weight-total loop).
-fn weighted_mean(len: usize, sample_weight: Option<&[f64]>, term: impl Fn(usize) -> f64) -> f64 {
+fn weighted_mean(
+    len: usize,
+    sample_weight: Option<&[f64]>,
+    term: impl Fn(usize) -> f64,
+) -> Result<f64, MetricError> {
     let mut weight_total = 0.0f64;
     let mut weighted_sum = 0.0f64;
     for i in 0..len {
@@ -28,7 +32,17 @@ fn weighted_mean(len: usize, sample_weight: Option<&[f64]>, term: impl Fn(usize)
         weight_total += w;
         weighted_sum += w * term(i);
     }
-    weighted_sum / weight_total
+    // A zero weight-total (all-zero `sample_weight`, or empty input with unit
+    // weights) makes the weighted mean undefined. sklearn raises
+    // `ValueError("Sample weights must contain at least one non-zero
+    // number.")`; return a typed error rather than the silent `0.0/0.0 = NaN`
+    // the previous version produced (code-review fix). `validate_weight`
+    // already rejected negative/NaN weights, so a non-negative finite total
+    // is `0.0` iff every weight is `0.0`.
+    if weight_total == 0.0 {
+        return Err(MetricError::ZeroWeightSum);
+    }
+    Ok(weighted_sum / weight_total)
 }
 
 /// `r2 = 1 - ss_res/ss_tot` (`ss_res = Σ w_i*(y_true_i-y_pred_i)²`, `ss_tot =
@@ -55,7 +69,7 @@ pub fn r2_score<F: Pod>(
     }
     validate_weight(y_true.len(), sample_weight)?;
 
-    let mean_true = weighted_mean(y_true.len(), sample_weight, |i| host_to_f64(y_true[i]));
+    let mean_true = weighted_mean(y_true.len(), sample_weight, |i| host_to_f64(y_true[i]))?;
 
     let mut ss_res = 0.0f64;
     let mut ss_tot = 0.0f64;
@@ -99,11 +113,11 @@ pub fn mean_squared_error<F: Pod>(
     }
     validate_weight(y_true.len(), sample_weight)?;
 
-    Ok(weighted_mean(y_true.len(), sample_weight, |i| {
+    weighted_mean(y_true.len(), sample_weight, |i| {
         let t = host_to_f64(y_true[i]);
         let p = host_to_f64(y_pred[i]);
         (t - p) * (t - p)
-    }))
+    })
 }
 
 /// `mae = Σ w_i*|y_true_i-y_pred_i| / Σ w_i`.
@@ -121,9 +135,9 @@ pub fn mean_absolute_error<F: Pod>(
     }
     validate_weight(y_true.len(), sample_weight)?;
 
-    Ok(weighted_mean(y_true.len(), sample_weight, |i| {
+    weighted_mean(y_true.len(), sample_weight, |i| {
         let t = host_to_f64(y_true[i]);
         let p = host_to_f64(y_pred[i]);
         (t - p).abs()
-    }))
+    })
 }

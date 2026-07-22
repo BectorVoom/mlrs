@@ -1227,3 +1227,63 @@ fn precision_recall_curve_bad_sample_weight_returns_err_not_panic() {
         Err(MetricError::LengthMismatch)
     ));
 }
+
+// ==================== code-review fix: NaN scores + log_loss absent label ====================
+//
+// These three previously PANICKED (a Rust panic aborts the interpreter across
+// the PyO3 boundary) where scikit-learn==1.9.0 raises a catchable ValueError:
+//   - roc_auc_score / precision_recall_curve on a NaN score -> `.expect("scores
+//     must not be NaN")` in the descending-score sort (sklearn: "Input contains
+//     NaN.").
+//   - log_loss with an explicit `labels` list omitting a class present in
+//     y_true -> `.expect(...)` on the label->column lookup (sklearn: "y_true
+//     contains values ... not belonging to the passed labels ...").
+// Each now returns a typed `Err` (mapped to PyValueError at the binding), the
+// sklearn-matching behavior. Actual sklearn behavior verified empirically
+// against scikit-learn==1.9.0 before writing these.
+
+#[test]
+fn roc_auc_binary_nan_score_returns_err_not_panic() {
+    let y_true = [0i32, 1, 0, 1];
+    let y_score = [0.1, f64::NAN, 0.3, 0.9];
+    assert!(matches!(
+        roc_auc_score_binary(&y_true, &y_score, 1, None),
+        Err(MetricError::NaNScore)
+    ));
+}
+
+#[test]
+fn precision_recall_curve_nan_score_returns_err_not_panic() {
+    let y_true = [0i32, 1, 0, 1];
+    let probas = [0.1, f64::NAN, 0.3, 0.9];
+    assert!(matches!(
+        precision_recall_curve(&y_true, &probas, 1, None),
+        Err(MetricError::NaNScore)
+    ));
+}
+
+#[test]
+fn roc_auc_multiclass_nan_score_returns_err_not_panic() {
+    // The NaN flows through the per-class binary sweep; the OvR path must
+    // surface the typed error, not panic.
+    let y_true = [0i32, 1, 2, 0, 1, 2];
+    // 6 samples x 3 classes, one NaN entry.
+    let mut y_score = vec![0.2f64; 18];
+    y_score[4] = f64::NAN;
+    assert!(matches!(
+        roc_auc_score_multiclass(&y_true, &y_score, 3, MultiClass::Ovr, Average::Macro, None),
+        Err(MetricError::NaNScore)
+    ));
+}
+
+#[test]
+fn log_loss_label_absent_from_explicit_labels_returns_err_not_panic() {
+    // y_true contains class 2, but the explicit `labels` list omits it.
+    let y_true = [0i32, 1, 2];
+    let y_prob = [0.5, 0.5, 0.4, 0.6, 0.3, 0.7]; // 3 samples x 2 classes
+    let labels = [0i32, 1];
+    assert!(matches!(
+        log_loss(&y_true, &y_prob, 2, Some(&labels), None, f64::EPSILON, true),
+        Err(MetricError::LabelNotInLabels)
+    ));
+}

@@ -83,6 +83,24 @@ pub enum MetricError {
     /// wires the OvO branch, but present here so `mod.rs` is touched exactly
     /// once for the whole plan.
     WeightedOvoUnsupported,
+    /// A rank-based metric (`roc_auc_score` / `precision_recall_curve`) was
+    /// given a `y_score`/`probas_pred` containing a NaN. sklearn raises
+    /// `ValueError("Input contains NaN.")`; the previous code panicked in the
+    /// descending-score sort's `partial_cmp(...).expect(...)` (code-review fix:
+    /// a panic across the PyO3 boundary aborts the interpreter, whereas
+    /// sklearn's ValueError is catchable).
+    NaNScore,
+    /// `log_loss` was given an explicit `labels` list that omits a class
+    /// actually present in `y_true`. sklearn raises `ValueError("y_true
+    /// contains values ... not belonging to the passed labels ...")`; the
+    /// previous code panicked in `index_of(...).expect(...)` (code-review fix,
+    /// same panic-vs-catchable-error class as [`MetricError::NaNScore`]).
+    LabelNotInLabels,
+    /// A weighted metric was given a `sample_weight` that is all zeros (a
+    /// zero weight-total). sklearn raises `ValueError("Sample weights must
+    /// contain at least one non-zero number.")`; the previous code divided by
+    /// the zero weight-total and returned a silent NaN (code-review fix).
+    ZeroWeightSum,
 }
 
 impl std::fmt::Display for MetricError {
@@ -101,6 +119,13 @@ impl std::fmt::Display for MetricError {
             }
             MetricError::WeightedOvoUnsupported => {
                 "mlrs.metrics: roc_auc_score(multi_class='ovo', sample_weight=...) is not supported"
+            }
+            MetricError::NaNScore => "mlrs.metrics: input contains NaN",
+            MetricError::LabelNotInLabels => {
+                "mlrs.metrics: y_true contains a value not belonging to the passed labels"
+            }
+            MetricError::ZeroWeightSum => {
+                "mlrs.metrics: sample_weight must contain at least one non-zero number"
             }
         };
         f.write_str(msg)

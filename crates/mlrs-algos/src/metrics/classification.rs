@@ -325,18 +325,20 @@ pub fn log_loss(
             v
         }
     };
-    let index_of = |c: i32| {
-        classes
-            .iter()
-            .position(|&x| x == c)
-            .expect("log_loss: y_true label not in resolved class set")
-    };
+    // A y_true label absent from the resolved class set only happens when the
+    // caller passed an explicit `labels` omitting a class present in y_true
+    // (with `labels = None` the set is DERIVED from y_true, so every label is
+    // present). sklearn raises `ValueError("y_true contains values ... not
+    // belonging to the passed labels ...")`; return a typed error rather than
+    // panicking (code-review fix — a panic across the PyO3 boundary aborts the
+    // interpreter, whereas sklearn's ValueError is catchable).
+    let index_of = |c: i32| classes.iter().position(|&x| x == c);
 
     let mut sum = 0.0f64;
     let mut weight_total = 0.0f64;
     for i in 0..y_true.len() {
         let w = sample_weight.map_or(1.0, |sw| sw[i]);
-        let col = index_of(y_true[i]);
+        let col = index_of(y_true[i]).ok_or(MetricError::LabelNotInLabels)?;
         let p = y_prob[i * n_classes + col].clamp(eps, 1.0 - eps);
         sum += -w * p.ln();
         weight_total += w;
@@ -364,11 +366,16 @@ struct Sweep {
 fn sweep(y_true: &[i32], scores: &[f64], pos_label: i32, sample_weight: Option<&[f64]>) -> Sweep {
     let n = y_true.len();
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| {
-        scores[b]
-            .partial_cmp(&scores[a])
-            .expect("scores must not be NaN")
-    });
+    // `total_cmp` (a total order over ALL f64 incl. NaN) rather than
+    // `partial_cmp(...).expect(...)`: the public callers
+    // (`roc_auc_score_binary` / `precision_recall_curve`) reject NaN scores up
+    // front with `MetricError::NaNScore` (sklearn's own "Input contains NaN."
+    // ValueError), so no NaN reaches here; `total_cmp` makes the sort
+    // panic-proof regardless (code-review fix — the old `.expect` panicked the
+    // interpreter across the PyO3 boundary on any NaN that slipped through).
+    // For the finite, non-NaN scores that DO reach here, `total_cmp` orders
+    // identically to `partial_cmp`, so the sweep result is unchanged.
+    idx.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
 
     let mut scores_desc = Vec::new();
     let mut cum_tp = Vec::new();
@@ -451,6 +458,13 @@ pub fn roc_auc_score_binary(
         return Err(MetricError::LengthMismatch);
     }
     validate_weight(y_true.len(), sample_weight)?;
+    // sklearn raises `ValueError("Input contains NaN.")` on a NaN score;
+    // reject up front with a typed error rather than reaching the sort (which
+    // used to panic on NaN) — code-review fix. Covers the multiclass OvR/OvO
+    // paths too, since they funnel their per-class scores through here.
+    if y_score.iter().any(|v| v.is_nan()) {
+        return Err(MetricError::NaNScore);
+    }
 
     let mut distinct: Vec<i32> = y_true.to_vec();
     distinct.sort_unstable();
@@ -588,6 +602,12 @@ pub fn precision_recall_curve(
         return Err(MetricError::LengthMismatch);
     }
     validate_weight(y_true.len(), sample_weight)?;
+    // sklearn raises `ValueError("Input contains NaN.")` on a NaN score;
+    // reject up front rather than reaching the sort (which used to panic on
+    // NaN) — code-review fix, same as `roc_auc_score_binary`.
+    if probas_pred.iter().any(|v| v.is_nan()) {
+        return Err(MetricError::NaNScore);
+    }
 
     let sw = sweep(y_true, probas_pred, pos_label, sample_weight);
     let k = sw.scores_desc.len();
