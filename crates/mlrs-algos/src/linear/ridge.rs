@@ -11,12 +11,29 @@
 //! solvers MUST NOT be unified — RESEARCH Anti-Patterns / D-02).
 //!
 //! ## Raw Gram, NOT scaled covariance (RESEARCH Open Q1)
-//! The normal matrix is the **raw** Gram `XᵀX` formed by
-//! `gemm(transa=true)` over the centered design — NOT `prims::covariance`,
+//! The normal matrix is the **raw** Gram `XᵀX` formed by the row-blocked
+//! [`gram_xty`] prim over the centered design — NOT `prims::covariance`,
 //! which centers AND scales by `1/(n−ddof)`. sklearn's `_solve_cholesky` adds
 //! `alpha` to the raw `XᵀX` diagonal directly (no `n_samples` scaling), so the
 //! raw Gram is the sklearn-faithful normal matrix (verified against the
 //! committed fixture: `Xc·Xc + αI` reproduces sklearn's `coef_` exactly).
+//!
+//! ## Perf: device-resident centering + row-blocked Gram (LINEAR-02, shared
+//! ## with LinearRegression's `fit_gram_eig`)
+//! Centering and Gram/Xty formation both run entirely on-device via
+//! [`center_columns`] and [`gram_xty`] — the SAME primitives that fixed
+//! `LinearRegression`'s large-`n_samples` path (`linear_regression.rs` module
+//! docs): `center_columns` avoids an `O(n·d)` host round-trip of the full
+//! design matrix (the original Ridge implementation shipped X/y to host,
+//! recentered there, and re-uploaded — a PCIe-bound cost that scales with
+//! `n_samples` and dominates at any realistic dataset size), and `gram_xty`
+//! avoids the skinny-output/huge-K `gemm` pathology (`d×d` output over a
+//! `n_samples`-sized reduction starves the GPU of independent output tiles —
+//! see `mlrs_kernels::gram` module docs) by accumulating row-blocked partials
+//! in shared memory instead. Ridge has no `LinearRegression`-style feature
+//! cap: `gram_xty` itself falls back to the original two-`gemm` formation
+//! whenever `d² > 4096`, so arbitrarily wide `X` stays correct, just without
+//! the shared-memory speedup.
 //!
 //! ## alpha on the diagonal only; intercept never penalized (D-05)
 //! `alpha` is added to the Gram DIAGONAL only (`A[i·n+i] += alpha`). The
@@ -51,9 +68,10 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::center::center_columns;
 use mlrs_backend::prims::cholesky::cholesky_solve;
-use mlrs_backend::prims::gemm::gemm;
-use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
+use mlrs_backend::prims::gram::gram_xty;
+use mlrs_backend::prims::linear_predict::linear_predict;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -259,79 +277,62 @@ where
             }));
         }
 
-        // --- 1. Centering (D-05). When fit_intercept, remove the column means x̄
-        //        and ȳ; solve on the centered system. Mirrors the LinearRegression
-        //        host two-pass centering — done host-side because the diagonal-α
-        //        injection and the intercept recovery already need a host pass over
-        //        the tiny n-vectors; the heavy products (Gram, Xᵀy, solve) stay
-        //        on-device. ---
-        let x_host = x.to_host(pool);
-        let y_host = y.to_host(pool);
+        // RIDGE_PROFILE=1: per-phase wall-clock attribution (the LR_PROFILE
+        // precedent in `linear_regression.rs`'s `fit_gram_eig` — attribution
+        // only, since kernel launches are async and a lap only completes at the
+        // next readback that drains the queue; a tiny forced readback after
+        // `gram_xty`/`cholesky_solve` pins each phase's lap to ITS OWN kernels
+        // rather than bleeding into the next phase's).
+        let profile = std::env::var("RIDGE_PROFILE").is_ok();
+        let lap0 = std::time::Instant::now();
 
-        let mut x_mean = vec![0.0f64; n_features];
-        let mut y_mean = 0.0f64;
-        if self.fit_intercept {
-            for r in 0..n_samples {
-                for c in 0..n_features {
-                    x_mean[c] += host_to_f64(x_host[r * n_features + c]);
-                }
-                y_mean += host_to_f64(y_host[r]);
-            }
-            let inv = 1.0 / n_samples as f64;
-            for m in x_mean.iter_mut() {
-                *m *= inv;
-            }
-            y_mean *= inv;
+        // --- 1. Centering, DEVICE-resident (D-05 / perf): mirrors
+        //        LinearRegression's `fit_gram_eig` (`center_columns` composes
+        //        `column_reduce` + the center kernel with no host round-trip of
+        //        the full n×d design — the original host two-pass form here was
+        //        an O(n·d) PCIe-bound cost that dominates at scale). When
+        //        !fit_intercept there is nothing to remove — `x`/`y` are read
+        //        directly by `gram_xty` below with NO copy. ---
+        let (x_mean, y_mean, x_owned, y_owned) = if self.fit_intercept {
+            let (x_c, x_mean_dev) = center_columns::<F>(pool, x, (n_samples, n_features))?;
+            let (y_c, y_mean_dev) = center_columns::<F>(pool, y, (n_samples, 1))?;
+            let x_mean: Vec<f64> = x_mean_dev
+                .to_host(pool)
+                .iter()
+                .map(|&v| host_to_f64(v))
+                .collect();
+            let y_mean = host_to_f64(y_mean_dev.to_host(pool)[0]);
+            x_mean_dev.release_into(pool);
+            y_mean_dev.release_into(pool);
+            (x_mean, y_mean, Some(x_c), Some(y_c))
+        } else {
+            (vec![0.0f64; n_features], 0.0f64, None, None)
+        };
+        let x_ref = x_owned.as_ref().unwrap_or(x);
+        let y_ref = y_owned.as_ref().unwrap_or(y);
+        let t_center = if profile { lap0.elapsed().as_secs_f64() } else { 0.0 };
+
+        // --- 2. Raw Gram G = XᵀX (d×d) and c = Xᵀy (d×1) via the row-blocked
+        //        `gram_xty` prim (RESEARCH Open Q1 — NOT the scaled covariance;
+        //        LINEAR-01/02 perf lever shared with LinearRegression): replaces
+        //        the skinny-output/huge-K `gemm` pair that starved the GPU of
+        //        parallel work regardless of `n_samples` (see `mlrs_kernels::gram`
+        //        module docs) with a row-blocked shared-memory accumulation. ---
+        let lap1 = std::time::Instant::now();
+        let (raw_gram, xty) = gram_xty::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
+        if profile {
+            // Force a drain so this lap attributes ONLY gram_xty's kernels, not
+            // whatever runs next (the LR_PROFILE precedent's readback-boundary
+            // caveat) — a tiny d-element readback, not the n-heavy data.
+            let _ = xty.to_host(pool);
         }
-
-        let mut x_centered: Vec<F> = vec![F::from_int(0i64); n_samples * n_features];
-        for r in 0..n_samples {
-            for c in 0..n_features {
-                let v = host_to_f64(x_host[r * n_features + c]) - x_mean[c];
-                x_centered[r * n_features + c] = f64_to_host::<F>(v);
-            }
+        let t_gram = if profile { lap1.elapsed().as_secs_f64() } else { 0.0 };
+        if let Some(xc) = x_owned {
+            xc.release_into(pool);
         }
-        let mut y_centered: Vec<F> = vec![F::from_int(0i64); n_samples];
-        for r in 0..n_samples {
-            y_centered[r] = f64_to_host::<F>(host_to_f64(y_host[r]) - y_mean);
+        if let Some(yc) = y_owned {
+            yc.release_into(pool);
         }
-
-        let x_c_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_centered);
-        let y_c_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y_centered);
-
-        // Phase-2 column-mean reduction on the (zero-mean) centered X as the
-        // documented key-link `column_reduce(.., ScalarOp::Mean, ..)` site (shared
-        // with LinearRegression). The load-bearing means are the host two-pass
-        // form above; this confirms the centered columns are ~0-mean and exercises
-        // the prim path. The result is not load-bearing for the solve.
-        let _centered_means = column_reduce::<F>(
-            pool,
-            &x_c_dev,
-            n_samples,
-            n_features,
-            ScalarOp::Mean,
-            ReducePath::Shared,
-        )?
-        .ok_or(AlgoError::Prim(PrimError::InternalNone {
-            operand: "column_reduce",
-            context: "ReducePath::Shared",
-        }))?;
-        let _ = _centered_means.to_host(pool);
-        _centered_means.release_into(pool);
-
-        // --- 2. Raw Gram XᵀX via gemm(transa=true) (RESEARCH Open Q1 — NOT the
-        //        scaled covariance). x_c_dev is the centered design (m×n) row-major;
-        //        transa reads it as Xᵀ (n×m), so the product is the n×n Gram. ---
-        let raw_gram = gemm::<F>(
-            pool,
-            &x_c_dev,
-            (n_features, n_samples), // logical Xᵀ is (n × m)
-            &x_c_dev,
-            (n_samples, n_features),
-            true, // first operand buffer is X (m×n); transa reads it as Xᵀ.
-            false,
-            None,
-        )?;
 
         // --- 3. alpha on the Gram DIAGONAL only (D-05 / T-04-05-02). Add `alpha`
         //        to element [i·n+i]; NEVER to the intercept (the intercept is
@@ -350,33 +351,28 @@ where
         raw_gram.release_into(pool);
         let gram: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &gram_host);
 
-        // --- 4. Xᵀy via gemm(transa=true): the centered RHS (n×1). ---
-        let xty = gemm::<F>(
-            pool,
-            &x_c_dev,
-            (n_features, n_samples), // logical Xᵀ is (n × m)
-            &y_c_dev,
-            (n_samples, 1),
-            true, // first operand buffer is X (m×n); transa reads it as Xᵀ.
-            false,
-            None,
-        )?;
-
-        // --- 5. Solve (XᵀX + αI)·coef = Xᵀy with the Cholesky primitive (D-02).
-        //        Thread the regularized Gram buffer through `out` so the factor
-        //        reuses it in place — no parallel n² allocation (D-11 gate 2). The
-        //        kernel only READS `out` as its working input, so the threaded
-        //        buffer is consumed (released back to the pool) by the call; we
-        //        clone the handle for `out` and keep `gram` as the `a` operand. A
-        //        non-SPD pivot (near-singular Gram) surfaces NotPositiveDefinite →
-        //        AlgoError (Pitfall 4 / T-04-05-01), never NaN coef_. ---
+        // --- 4. Solve (XᵀX + αI)·coef = Xᵀy with the Cholesky primitive (D-02).
+        //        `xty` (n×1) was already formed above by `gram_xty` — no separate
+        //        gemm needed. Thread the regularized Gram buffer through `out` so
+        //        the factor reuses it in place — no parallel n² allocation (D-11
+        //        gate 2). The kernel only READS `out` as its working input, so the
+        //        threaded buffer is consumed (released back to the pool) by the
+        //        call; we clone the handle for `out` and keep `gram` as the `a`
+        //        operand. A non-SPD pivot (near-singular Gram) surfaces
+        //        NotPositiveDefinite → AlgoError (Pitfall 4 / T-04-05-01), never
+        //        NaN coef_. ---
+        let lap2 = std::time::Instant::now();
         let gram_out = DeviceArray::<ActiveRuntime, F>::from_raw(
             gram.handle().clone(),
             n_features * n_features,
         );
         let coef = cholesky_solve::<F>(pool, &gram, &xty, n_features, 1, Some(gram_out))?;
+        if profile {
+            let _ = coef.to_host(pool);
+        }
+        let t_solve = if profile { lap2.elapsed().as_secs_f64() } else { 0.0 };
 
-        // --- 6. intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 (D-05). α is
+        // --- 5. intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 (D-05). α is
         //        NOT applied here — the intercept is unpenalized. ---
         let coef_host = coef.to_host(pool);
         let intercept = if self.fit_intercept {
@@ -391,15 +387,19 @@ where
         let intercept_dev: DeviceArray<ActiveRuntime, F> =
             DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)]);
 
-        // --- 7. Release scratch; store device-resident fitted state (D-03). The
+        // --- 6. Release scratch; store device-resident fitted state (D-03). The
         //        Gram buffer was consumed (its cloned handle threaded through `out`
         //        and released by the Cholesky solve — so we do NOT release `gram`
         //        again here, avoiding a double-release of the shared allocation);
         //        release the remaining transients. ---
         drop(gram);
         xty.release_into(pool);
-        x_c_dev.release_into(pool);
-        y_c_dev.release_into(pool);
+
+        if profile {
+            eprintln!(
+                "RIDGE_PROFILE n={n_samples} d={n_features}: center={t_center:.4}s gram_xty={t_gram:.4}s solve={t_solve:.4}s"
+            );
+        }
 
         Ok(Ridge {
             alpha: self.alpha,
@@ -452,27 +452,19 @@ where
             }));
         }
 
-        // y_pred = X_test · coef  (m×1) via the Phase-2 GEMM, on-device (D-03).
-        let raw = gemm::<F>(
+        // y_pred = X_test · coef + intercept via ONE fused device launch
+        // (LINEAR-02 predict perf lever): the `linear_predict` prim's GATHER
+        // matvec+bias kernel replaces the prior gemm→`intercept.to_host()`→
+        // `raw.to_host()`→host bias-loop→`from_host` round-trips (the
+        // `center`/`gram` host-sync pathology, same class of fix). The result
+        // stays device-resident; the PyO3 boundary's terminal readback is the
+        // only host↔device crossing.
+        Ok(linear_predict::<F>(
             pool,
             x,
-            (n_samples, n_features),
             coef,
-            (n_features, 1),
-            false,
-            false,
-            None,
-        )?;
-
-        // Broadcast-add the scalar intercept (tiny length-m host pass; the fitted
-        // state itself stays device-resident, materialized only at this terminal).
-        let bias = host_to_f64(intercept.to_host(pool)[0]);
-        let raw_host = raw.to_host(pool);
-        let mut pred_host: Vec<F> = vec![F::from_int(0i64); n_samples];
-        for r in 0..n_samples {
-            pred_host[r] = f64_to_host::<F>(host_to_f64(raw_host[r]) + bias);
-        }
-        raw.release_into(pool);
-        Ok(DeviceArray::from_host(pool, &pred_host))
+            intercept,
+            (n_samples, n_features),
+        )?)
     }
 }

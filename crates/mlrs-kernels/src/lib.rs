@@ -6,6 +6,12 @@
 //! runtime is chosen in `mlrs-backend`.
 
 pub mod cholesky;
+// `prims::center::center_columns` perf lever (D-05): row-blocked shared-memory
+// column-sum accumulation replacing `column_reduce`'s per-column host-sync
+// round-trips (see this module's docs for the Kaggle-T4-profiling finding).
+// Owns its `pub mod` (single-owner, no root re-export — mirrors the `gram`
+// module-scoped-access precedent: callers use `mlrs_kernels::colmean::{…}`).
+pub mod colmean;
 // Phase-13 KNN-graph direct distance + self-drop kernels (PRIM-11). Wave-1
 // scaffold plan 13-01 owns this registration; plan 13-02 fills the file body
 // (the direct pairwise feature-loop distance kernels + the per-row self-drop
@@ -24,10 +30,22 @@ pub mod elementwise;
 // driven by `prims/hist_gradient_boosting.rs`. Reuses `tree.rs` binning,
 // cumulative-histogram and forest-traversal kernels.
 pub mod gbt;
+// LinearRegression Gram+eig path perf lever (LINEAR-01, D-02): row-blocked
+// shared-memory XᵀX/Xᵀy accumulation replacing the skinny-output/huge-K GEMM
+// formation (the `kmeans.rs` "GEMM sums" pathology, same fix applied). Owns
+// its `pub mod` (single-owner, no root re-export — mirrors the `kmeans`
+// module-scoped-access precedent: callers use `mlrs_kernels::gram::{…}`).
+pub mod gram;
 pub mod jacobi_eig;
 pub mod jacobi_svd;
 pub mod kmeans;
 pub mod lbfgs;
+// Dense linear-model inference perf lever (LINEAR-01/02): a fused GATHER
+// matvec+bias kernel replacing the shared `gemm→to_host→host bias-loop→
+// from_host` predict round-trips (the `center`/`gram` host-sync pathology,
+// same class of fix). Owns its `pub mod` + `pub use` (single-owner,
+// file-disjoint — the `colmean`/`gram` module-scoped-access precedent).
+pub mod linear_predict;
 // Phase-15 HDBSCAN mutual-reachability (HDBS-01, plan 15-05): the ONE new device
 // kernel of the phase — a SharedMemory-free per-element 2D GATHER computing
 // `out[i*n+j] = max(core_i, core_j, d_ij/alpha)` (the chebyshev_dist running-max
@@ -78,6 +96,7 @@ pub use gbt::{
     gbt_sum_partials, gbt_update_raw,
 };
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
+pub use linear_predict::linear_predict_bias;
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
 // Phase-15 HDBSCAN mutual-reachability GATHER (HDBS-01, plan 15-05): launched by
 // the feature-metric/dense-cosine device front-end via the backend host wrapper

@@ -40,7 +40,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::gemm::gemm;
+use mlrs_backend::prims::linear_predict::linear_predict;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -383,26 +383,18 @@ where
         }));
     }
 
-    // y_pred = X_test · coef  (m×1) via the Phase-2 GEMM, on-device (D-03).
-    let raw = gemm::<F>(
+    // y_pred = X_test · coef + intercept via ONE fused device launch (the
+    // LINEAR-01/02 predict perf lever, shared by ElasticNet + Lasso): the
+    // `linear_predict` prim's GATHER matvec+bias kernel replaces the prior
+    // gemm→`intercept.to_host()`→`raw.to_host()`→host bias-loop→`from_host`
+    // round-trips (the `center`/`gram` host-sync pathology, same class of fix).
+    // The result stays device-resident; the PyO3 boundary's terminal readback
+    // is the only host↔device crossing.
+    Ok(linear_predict::<F>(
         pool,
         x,
-        (n_samples, n_features),
         coef,
-        (n_features, 1),
-        false,
-        false,
-        None,
-    )?;
-
-    // Broadcast-add the scalar intercept (tiny length-m host pass; the fitted
-    // state itself stays device-resident, materialized only at this terminal).
-    let bias = host_to_f64(intercept.to_host(pool)[0]);
-    let raw_host = raw.to_host(pool);
-    let mut pred_host: Vec<F> = vec![F::from_int(0i64); n_samples];
-    for r in 0..n_samples {
-        pred_host[r] = f64_to_host::<F>(host_to_f64(raw_host[r]) + bias);
-    }
-    raw.release_into(pool);
-    Ok(DeviceArray::from_host(pool, &pred_host))
+        intercept,
+        (n_samples, n_features),
+    )?)
 }

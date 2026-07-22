@@ -9,8 +9,20 @@
 //! Tests live in `crates/mlrs-backend/tests/` (never an in-source
 //! `#[cfg(test)]` module — AGENTS.md §2).
 
+// LinearRegression's large-`n_samples` Gram+eig path (LINEAR-01) needs JUST
+// the device-resident centered matrix + mean (not the full Gram/scale that
+// `covariance.rs` produces) — extracted as its own composition of
+// `column_reduce` + `center_columns` so that path doesn't hand-roll the
+// unsafe kernel-launch dance in the algos layer.
+pub mod center;
 pub mod cholesky;
 pub mod covariance;
+// LinearRegression Gram+eig path perf lever (LINEAR-01, D-02): row-blocked
+// shared-memory XᵀX/Xᵀy formation replacing the skinny-output/huge-K `gemm`
+// pair (the `kmeans.rs` "GEMM sums" pathology, same fix applied) — falls back
+// to the original `gemm` formation on the cpu backend (SharedMemory-unsafe
+// there, the `use_shared_sums` precedent).
+pub mod gram;
 // Phase-7 prim stubs (Wave-0 scaffold owns these registrations; plans 07-02
 // (rng) / 07-03 (incremental_svd) fill their own file body — file-disjoint,
 // parallel-safe). Each is an empty compiling module until its plan adds the
@@ -59,6 +71,12 @@ pub mod hist_gradient_boosting;
 pub mod eig;
 pub mod gemm;
 pub mod kmeans;
+// Dense linear-model inference perf lever (LINEAR-01/02): a single fused
+// GATHER matvec+bias launch (`mlrs_kernels::linear_predict`) replacing the
+// shared `gemm→to_host→host bias-loop→from_host` predict round-trips (the
+// `center`/`gram` host-sync pathology, same fix). GATHER-only, so no cpu
+// fallback branch. Consumed by Ridge/LinearRegression/ElasticNet/Lasso predict.
+pub mod linear_predict;
 pub mod lbfgs;
 pub mod reduce;
 // Phase-10 SGD solver prim (PRIM-10). `sgd_solve` is fully implemented: a

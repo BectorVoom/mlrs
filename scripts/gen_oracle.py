@@ -402,6 +402,12 @@ CHOL_N, CHOL_RHS = 6, 2
 LIN_N_SAMPLES, LIN_N_FEATURES = 12, 4
 LIN_TEST_SAMPLES = 3
 
+# LINEAR-01 large-`n_samples` fixture (the `fit_gram_eig` Gram+eig path, above
+# the direct-SVD single-cube kernel's `MAX_ROWS = 256` row cap). Deliberately
+# `n_samples > 256` (crosses the cap) with `n_features` comfortably under the
+# eig path's `MAX_DIM = 64` (D-06).
+LIN_LARGE_N_SAMPLES, LIN_LARGE_N_FEATURES = 2000, 20
+
 # PCA/TruncatedSVD convention-fixture shapes (DECOMP-01/02). TALL (m>n) is the
 # standard case; WIDE (n_features>n_samples) exercises the k=min(m,n) truncation
 # and the wide SVD path. n_components < min(m,n) so truncation is real.
@@ -1948,6 +1954,66 @@ def gen_linear_regression(seed: int = SEED, dtype=np.float32) -> str:
     os.makedirs(_FIXTURE_DIR, exist_ok=True)
     out_path = os.path.join(
         _FIXTURE_DIR, f"linear_regression_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        y=c(y),
+        coef=c(reg.coef_),
+        intercept=c([reg.intercept_]),
+        X_test=c(x_test),
+        y_pred=c(y_pred),
+        X_coll=c(x_coll),
+        y_coll=c(y_coll),
+        coef_col=c(reg_coll.coef_),
+        intercept_col=c([reg_coll.intercept_]),
+    )
+    return out_path
+
+
+def gen_linear_regression_large(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the large-`n_samples` LinearRegression fixture (LINEAR-01),
+    exercising the `fit_gram_eig` Gram+eig path (`n_samples > 256`, the
+    direct-SVD single-cube kernel's row cap).
+
+    Same shape as [`gen_linear_regression`] (full-rank + near-collinear,
+    ``X``/``y``/``coef``/``intercept``/``X_test``/``y_pred``/``X_coll``/
+    ``y_coll``/``coef_col``/``intercept_col``) at
+    ``LIN_LARGE_N_SAMPLES × LIN_LARGE_N_FEATURES``, so the Rust test can reuse
+    the exact same fixture-consumption code as the small-fixture oracle test
+    with only the geometry constants swapped. sklearn's ``LinearRegression``
+    is still ``scipy.linalg.lstsq`` (gelsd / SVD) — the reference the
+    Gram+eig path must match to 1e-5 despite forming normal equations
+    internally (D-02 numerical tradeoff, see `linear_regression.rs`
+    `fit_gram_eig` docs). Returns the absolute path written.
+    """
+    from sklearn.linear_model import LinearRegression
+
+    rng = np.random.default_rng(seed)
+    n, p = LIN_LARGE_N_SAMPLES, LIN_LARGE_N_FEATURES
+    x = rng.standard_normal((n, p))
+    true_coef = rng.standard_normal(p)
+    y = x @ true_coef + 0.5 + 0.01 * rng.standard_normal(n)
+
+    reg = LinearRegression(fit_intercept=True).fit(x, y)
+    x_test = rng.standard_normal((LIN_TEST_SAMPLES, p))
+    y_pred = reg.predict(x_test)
+
+    # NEAR-COLLINEAR case: duplicate column 0 into column 2 with a tiny
+    # perturbation, mirroring `gen_linear_regression`'s small-fixture cutoff
+    # case, but at the large-N geometry this fixture targets.
+    x_coll = x.copy()
+    x_coll[:, 2] = x_coll[:, 0] + 1e-7 * rng.standard_normal(n)
+    y_coll = x_coll @ true_coef + 0.5 + 0.01 * rng.standard_normal(n)
+    reg_coll = LinearRegression(fit_intercept=True).fit(x_coll, y_coll)
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"linear_regression_large_{dtype_tag}_seed{seed}.npz"
     )
     np.savez(
         out_path,
@@ -4494,6 +4560,9 @@ def main() -> None:
     # LinearRegression (LINEAR-01): full-rank + near-collinear (small-σ cutoff).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_linear_regression(dtype=dtype)}")
+    # LinearRegression large-N (LINEAR-01 `fit_gram_eig` path, n_samples > 256).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_linear_regression_large(dtype=dtype)}")
     # Ridge (LINEAR-02): cholesky solver, alpha sweep incl. the strict 1.0 case.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_ridge(dtype=dtype)}")

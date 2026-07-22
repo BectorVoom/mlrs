@@ -303,3 +303,57 @@ fn eig_clustered_invariant() {
         w[0]
     );
 }
+
+/// Counter-based splitmix64 (byte-identical to the `linear_regression_perf_test.rs`
+/// / `kmeans_perf_test.rs` precedent).
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn uniform_pm1(state: &mut u64) -> f64 {
+    ((splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+}
+
+/// Deterministic symmetric `n × n` matrix `A = M + Mᵀ` for a random `M`
+/// (seeded splitmix64, uniform in `[-1, 1)`) — guarantees symmetry by
+/// construction (D-06 feeder contract) without depending on any particular
+/// spectrum shape.
+fn random_symmetric(n: usize, seed: u64) -> Vec<f64> {
+    let mut s = seed;
+    let m: Vec<f64> = (0..n * n).map(|_| uniform_pm1(&mut s)).collect();
+    let mut a = vec![0.0f64; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            a[r * n + c] = m[r * n + c] + m[c * n + r];
+        }
+    }
+    a
+}
+
+/// Residual invariant across a sweep of `n` sizes spanning BOTH parities and
+/// the round-robin ghost-padding boundary (odd `n` pads to `n+1` players,
+/// even `n` does not — CR-01), from tiny (`n=1`, no pairs at all) up to
+/// `MAX_DIM = 64` (the shared-memory cap `jacobi_eig_sweep` is sized for).
+/// This is the primary correctness gate for the round-robin two-phase
+/// parallel schedule (LINEAR-01 perf lever) — the pre-existing fixture tests
+/// above only ever exercised `n=4`. f32 only (always runs; f64 is validated
+/// by the existing fixture tests, gated by `skip_f64_with_log`).
+#[test]
+fn eig_various_n_residual_invariant() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
+
+    for &n in &[1usize, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64] {
+        let a64 = random_symmetric(n, 1000 + n as u64);
+        let a32: Vec<f32> = a64.iter().map(|&v| v as f32).collect();
+        let (w, v) = run_eig::<f32>(&a32, n);
+        assert_eig_residual::<f32>(&a32, n, &w, &v, 5e-3, &format!("random-n{n}-f32"));
+    }
+
+    println!("eig various-n residual invariant backend={backend}: n=1..64 (odd+even) pass");
+}

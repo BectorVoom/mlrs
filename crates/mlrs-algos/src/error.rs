@@ -287,6 +287,30 @@ pub enum AlgoError {
         max: usize,
     },
 
+    /// `LinearRegression::fit` was given more features than the large-`n_samples`
+    /// Gram+eig path's dense eigensolver cap (`n_features > 64`). Above the
+    /// direct-SVD size (`n_samples.max(n_features) > jacobi_svd::MAX_ROWS`), the
+    /// estimator forms the `n_features × n_features` Gram (unbounded in
+    /// `n_samples`, PRIM-01 GEMM) and eigendecomposes it (PRIM-05 `eig`, capped at
+    /// `MAX_DIM = 64` — mirrors the spectral-family cap, D-06). A wide design
+    /// that also exceeds the direct-SVD row cap falls in neither path's covered
+    /// geometry and is rejected here *before* any Gram/eig launch, naming the
+    /// LINEAR-01 cap rather than deferring to `eig`'s generic
+    /// [`mlrs_core::PrimError::NotSquare`].
+    #[error(
+        "estimator '{estimator}': n_features = {n_features} exceeds the large-\
+         n_samples Gram+eig cap (must be <= {max} = MAX_DIM); reduce n_features \
+         or keep n_samples.max(n_features) within the direct-SVD path"
+    )]
+    NFeaturesExceedsMaxDim {
+        /// Which estimator rejected the value (`"linear_regression"`).
+        estimator: &'static str,
+        /// The feature count the caller supplied.
+        n_features: usize,
+        /// The inclusive cap `MAX_DIM` (`64`) that was exceeded.
+        max: usize,
+    },
+
     /// A kernel estimator (KernelRidge / KernelDensity) was given an unrecognised
     /// `kernel` name. Only the supported kernel families are accepted
     /// (KernelRidge: `linear`/`rbf`/`poly`/`sigmoid`; KernelDensity:

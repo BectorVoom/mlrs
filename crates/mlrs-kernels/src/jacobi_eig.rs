@@ -30,25 +30,59 @@
 //! Unit `i` (`UNIT_POS_X`) owns index `i`. The `n×n` symmetric `A` and the
 //! `n×n` accumulator `V` are staged ROW-MAJOR in shared memory
 //! (`a_sh[r*MAX_DIM + c]`, `v_sh[r*MAX_DIM + c]`), `V` initialised to the
-//! identity. Per round-robin step a disjoint set of index pairs `(p, q)` rotate
-//! concurrently — each pair is handled by the lower-indexed unit, which reads
-//! the 2×2 block, computes the symmetric Jacobi rotation, and applies it to
-//! rows/cols `p, q` of `A` and to columns `p, q` of `V`; the `sync_cube()`
-//! between steps makes the writes visible before the next.
+//! identity.
 //!
-//! ## Cyclic (sequential-pair) sweep schedule — NOT the SVD's parallel schedule
-//! One sweep visits all `n(n-1)/2` upper-triangle index pairs `(p, q)` in cyclic
-//! row-major order, ONE pair at a time. Unlike the one-sided SVD kernel (which
-//! rotates index-disjoint COLUMN pairs concurrently because each rotation's
-//! write footprint is its two columns), the TWO-sided eig rotation of plane
-//! `(p, q)` touches the ENTIRE rows AND columns `p, q` — including cross entries
-//! that belong to another index-disjoint pair — so index-disjoint pairs are NOT
-//! footprint-disjoint and CANNOT rotate concurrently without racing. We instead
-//! parallelise only the `O(n)` row/column/`V` update ACROSS units within each
-//! pair (unit `k` updates index `k`'s entries), with a `sync_cube()` between the
-//! column pass and the row pass and after each pair. `continue` is NOT supported
-//! in `#[cube]`, so a below-threshold pair is if-wrapped
-//! (`if a_pq.abs() > skip_thr { ... }`).
+//! ## Round-robin (chess-tournament) pair schedule, TWO-PHASE per round (LINEAR-01 perf lever)
+//! Earlier revisions of this kernel visited the `n(n-1)/2` upper-triangle pairs
+//! ONE AT A TIME with a SINGLE acting unit (`if i == 0u32 { ...whole rotation... }`)
+//! doing the entire `O(n)` row+column+`V` update while the other `n-1` units
+//! idled — `O(n²)` pairs fully serialized, i.e. `O(n³)` work per sweep on ONE
+//! thread. Profiling `LinearRegression`'s Gram+eig path (`d=64`) showed `eig`
+//! alone costing ~0.13-0.14s regardless of `n_samples` (a pure function of `d`),
+//! ~17x more than at `d=16` — matching `C(64,2)/C(16,2) ≈ 16.8x`, i.e. the pair
+//! COUNT, not any per-pair cost, confirming the serial schedule as the
+//! bottleneck (`[[mlrs-linear-regression-optimization]]` memory).
+//!
+//! This revision reuses [`crate::jacobi_svd`]'s ALREADY-PROVEN ghost-padded
+//! round-robin (circle-method) tournament schedule ([`circle_player`], CR-01):
+//! each ROUND pairs up ALL `n` (real, padded to `players` with a ghost bye when
+//! `n` is odd) indices into `players/2` MUTUALLY INDEX-DISJOINT pairs, so
+//! `players - 1` rounds cover every one of the `n(n-1)/2` pairs exactly once.
+//! The one-sided SVD kernel can rotate a round's disjoint pairs fully
+//! concurrently because `A ← A·J` only ever touches COLUMNS, and disjoint
+//! COLUMN pairs have disjoint write footprints. The two-sided `A ← Jᵀ·A·J`
+//! does NOT have that property directly: rotating pair `(lo, hi)` writes rows
+//! `lo, hi` (ALL columns) AND columns `lo, hi` (ALL rows) — including entries
+//! like `A[lo, a]` for another pair `(a, b)`'s column `a`, so a naive
+//! concurrent two-sided update of a whole round WOULD race.
+//!
+//! The fix is to split each round into two barrier-separated phases,
+//! mirroring how `A ← Jᵀ·A·J` is mathematically `Jᵀ·(A·J)` — right-multiply,
+//! THEN left-multiply:
+//!   - **Phase 1 (right-multiply, `A ← A·J` + `V ← V·J`)**: the acting
+//!     (lower-indexed) unit of EACH pair in the round computes its rotation
+//!     from the OLD 2×2 block and updates ONLY columns `lo, hi` (all rows) of
+//!     `A` and `V` — structurally IDENTICAL to the SVD kernel's single-phase
+//!     update. Different pairs in a round own DISJOINT columns, so this phase
+//!     is race-free across the WHOLE round (no cross-pair write ever touches
+//!     another pair's columns, and no cross-pair READ depends on another
+//!     pair's not-yet-updated columns, since a pair's angle only depends on
+//!     its own 2×2 block).
+//!   - **Barrier** (`sync_cube()`), then:
+//!   - **Phase 2 (left-multiply, `A ← Jᵀ·A`)**: EACH pair's acting unit
+//!     updates ROWS `lo, hi` (all columns) of `A`, reusing the SAME `cs`/`sn`
+//!     computed in phase 1 (kept in per-unit registers across the barrier —
+//!     NOT re-derived: re-reading `a[lo,hi]` here would see phase 1's
+//!     already-near-zeroed value and wrongly skip the rotation). Different
+//!     pairs own DISJOINT rows, so this phase is also race-free across the
+//!     round; it correctly reads the FULLY phase-1-updated matrix (the
+//!     intended intermediate `A·J_round`).
+//!
+//! This turns `O(n²)` serialized pairs into `O(n)` rounds of `O(n)` work each,
+//! run by `players/2` CONCURRENT acting units per round instead of one — the
+//! same complexity class as the already-parallel SVD kernel. `continue` is NOT
+//! supported in `#[cube]`, so a below-threshold pair is if-wrapped
+//! (`if a_pq.abs() > skip_thr { ... }`, RESEARCH Pattern 6) exactly as before.
 //!
 //! ## Convergence (D-12 constants — RECORDED here)
 //! TWO distinct thresholds are passed by value (the key Pitfall-5 fix, mirroring
@@ -69,13 +103,18 @@
 //!     extra `sqrt(2)` only makes the break marginally STRICTER (more accurate),
 //!     which is safe. `ε_f32 ≈ 1.2e-7`, `ε_f64 ≈ 2.2e-16`.
 //! The loop also stops at `max_sweeps = 30` (generous; cyclic Jacobi converges
-//! quadratically). A cap hit without convergence surfaces `NotConverged` on the
-//! host (D-12).
+//! quadratically — the round-robin reordering does not change WHICH pairs are
+//! visited per sweep, only that they now run concurrently, so the sweep count
+//! to convergence is unaffected). A cap hit without convergence surfaces
+//! `NotConverged` on the host (D-12).
 //!
 //! ## CubeCL expression notes
 //! - `SharedMemory::<F>::new(N)` requires a COMPILE-TIME size — `a_sh` / `v_sh`
 //!   are sized to the comptime cap (`MAX_DIM` × `MAX_DIM`) and the active region
 //!   is bounded by the runtime `n` (mirrors `reduce.rs` sizing + `len` guard).
+//!   The round-robin schedule adds NO new shared memory (the per-pair `lo` /
+//!   `hi` / `cs` / `sn` / flags are per-unit REGISTERS, not shared arrays) —
+//!   the LDS budget is unchanged from the serial revision.
 //! - `continue` is NOT supported in `#[cube]` — the "skip below-threshold pair"
 //!   is `if a_pq.abs() > skip_thr { ...rotate... }` (RESEARCH Pattern 6).
 //! - generic constants via `F::from_int` / `F::new`; `Float` methods `.abs()` /
@@ -155,46 +194,73 @@ pub fn jacobi_eig_sweep<F: Float + CubeElement>(
     sync_cube();
 
     // --- Sweep loop (in-kernel; no host round-trip — D-11 gate 3). ---
-    //
-    // ## Why pairs are processed SEQUENTIALLY (not the SVD's disjoint-parallel
-    //    schedule)
-    // The one-sided SVD kernel rotates disjoint COLUMN pairs concurrently: a
-    // column-disjoint pair set has a disjoint write footprint (each rotation
-    // touches only its two columns). The TWO-sided eig rotation of plane (p, q)
-    // touches the ENTIRE rows AND columns p, q — including the cross entries
-    // a[p][a], a[q][b] that belong to ANOTHER index-disjoint pair (a, b). So
-    // index-disjoint pairs are NOT footprint-disjoint here, and rotating them
-    // concurrently would race on those cross entries. We therefore visit the
-    // n(n-1)/2 upper-triangle pairs (p, q) one at a time (cyclic row-major
-    // order), parallelising only the O(n) row/column/V update ACROSS units
-    // within each pair (unit k updates index k's entries). A sync_cube after the
-    // angle read and after the writes keeps the single-pair update race-free.
     let mut sweep = 0u32;
     let mut converged = false;
     while sweep < max_sweeps && !converged {
-        let mut p = 0u32;
-        while p < n {
-            let mut q = p + 1u32;
-            while q < n {
-                // A SINGLE unit (unit 0) performs the entire two-sided rotation
-                // for plane (p, q) — reading/writing the full rows AND columns
-                // p, q of A and the columns p, q of V — while all other units
-                // idle. This mirrors the SVD kernel's "the acting unit does the
-                // whole rotation" idiom (which is proven on the CPU backend) and
-                // sidesteps the cross-unit shared-memory aliasing that a
-                // distributed two-sided update would create (an index-disjoint
-                // unit's column write would alias this plane's row footprint). A
-                // sync_cube after the pair makes the result visible to all units
-                // before the next pair / the convergence reduction.
-                if i == 0u32 {
-                    // 2×2 symmetric block: a_pp, a_qq, a_pq (= a_qp).
-                    let a_pp = a_sh[(p * MAX_DIM + p) as usize];
-                    let a_qq = a_sh[(q * MAX_DIM + q) as usize];
-                    let a_pq = a_sh[(p * MAX_DIM + q) as usize];
+        // Ghost-padded round-robin (CR-01, the jacobi_svd_sweep precedent):
+        // pad to an EVEN player count so the circle method enumerates ALL
+        // n(n-1)/2 pairs for odd AND even `n`. `players = n` when n is even,
+        // else `n + 1` (the ghost player >= n supplies the bye). Run
+        // `players - 1` rounds of `players / 2` positions; SKIP any pairing
+        // touching the ghost index (`hi >= n`).
+        let mut players = n;
+        if n % 2u32 != 0u32 {
+            players = n + 1u32;
+        }
+        let mut n_steps = 0u32;
+        if players > 0u32 {
+            n_steps = players - 1u32;
+        }
 
-                    // --- Symmetric Jacobi rotation that zeroes a_pq (skip only
-                    //     when |a_pq| is below the TINY skip bound; `continue`
-                    //     unsupported → if-wrap). ---
+        let mut step = 0u32;
+        while step < n_steps {
+            // Per-unit pair identity for this round, found once and reused
+            // across BOTH phases below (phase 2 must NOT re-derive `a_pq`
+            // from the shared matrix — phase 1 already rotated it toward 0).
+            let mut lo = 0u32;
+            let mut hi = 0u32;
+            let mut is_lo = false;
+            let mut do_rot = false;
+            let mut cs = one;
+            let mut sn = zero;
+
+            if i < n {
+                let half = players / 2u32;
+                let mut pos = 0u32;
+                while pos < half {
+                    // Circle-method pairing for this round: position pos <->
+                    // position (players-1-pos), over the padded `players`.
+                    let col_a = circle_player(pos, step, players);
+                    let col_b = circle_player(players - 1u32 - pos, step, players);
+                    let plo = if col_a < col_b { col_a } else { col_b };
+                    let phi = if col_a < col_b { col_b } else { col_a };
+                    // Only the LOW-index unit performs this pair's rotation,
+                    // and only for REAL pairs (skip the self-pair and any
+                    // pairing touching the ghost index `>= n`).
+                    if i == plo && plo != phi && phi < n {
+                        lo = plo;
+                        hi = phi;
+                        is_lo = true;
+                    }
+                    pos += 1u32;
+                }
+
+                // --- Phase 1 (right-multiply, A ← A·J + V ← V·J): compute
+                //     the rotation from the OLD 2×2 block and update ONLY
+                //     columns lo, hi (all rows) of A and V. Every pair in
+                //     this round owns a DISJOINT column pair, so different
+                //     pairs' phase-1 updates never write-alias (module docs)
+                //     — this is what makes the whole round parallel, unlike
+                //     the old fully-serial single-acting-unit schedule. ---
+                if is_lo {
+                    // 2×2 symmetric block: a_pp, a_qq, a_pq (= a_qp).
+                    let a_pp = a_sh[(lo * MAX_DIM + lo) as usize];
+                    let a_qq = a_sh[(hi * MAX_DIM + hi) as usize];
+                    let a_pq = a_sh[(lo * MAX_DIM + hi) as usize];
+
+                    // --- Symmetric Jacobi rotation that zeroes a_pq (skip
+                    //     only when |a_pq| is below the TINY skip bound;
+                    //     `continue` unsupported → if-wrap). ---
                     if a_pq.abs() > skip_thr {
                         // θ = (a_qq − a_pp) / (2·a_pq);
                         // t = sign(θ) / (|θ| + sqrt(1 + θ²));
@@ -205,46 +271,55 @@ pub fn jacobi_eig_sweep<F: Float + CubeElement>(
                         if theta < zero {
                             t = -t;
                         }
-                        let cs = one / (one + t * t).sqrt();
-                        let sn = cs * t;
+                        cs = one / (one + t * t).sqrt();
+                        sn = cs * t;
+                        do_rot = true;
 
-                        // Apply A ← Jᵀ·A·J. First A·J (column pass over all rows
-                        // k: columns p, q), then Jᵀ·(A·J) (row pass over all
-                        // columns k: rows p, q). The single acting unit does both
-                        // passes in order, so no intra-pair barrier is needed.
+                        // A·J: column pass over all rows k, columns lo, hi.
                         let mut k = 0u32;
                         while k < n {
-                            let a_kp = a_sh[(k * MAX_DIM + p) as usize];
-                            let a_kq = a_sh[(k * MAX_DIM + q) as usize];
-                            a_sh[(k * MAX_DIM + p) as usize] = cs * a_kp - sn * a_kq;
-                            a_sh[(k * MAX_DIM + q) as usize] = sn * a_kp + cs * a_kq;
+                            let a_kp = a_sh[(k * MAX_DIM + lo) as usize];
+                            let a_kq = a_sh[(k * MAX_DIM + hi) as usize];
+                            a_sh[(k * MAX_DIM + lo) as usize] = cs * a_kp - sn * a_kq;
+                            a_sh[(k * MAX_DIM + hi) as usize] = sn * a_kp + cs * a_kq;
                             k += 1u32;
                         }
-                        let mut kk = 0u32;
-                        while kk < n {
-                            let a_pk = a_sh[(p * MAX_DIM + kk) as usize];
-                            let a_qk = a_sh[(q * MAX_DIM + kk) as usize];
-                            a_sh[(p * MAX_DIM + kk) as usize] = cs * a_pk - sn * a_qk;
-                            a_sh[(q * MAX_DIM + kk) as usize] = sn * a_pk + cs * a_qk;
-                            kk += 1u32;
-                        }
 
-                        // Accumulate the rotation into V columns p, q (V ← V·J;
-                        // eigenvectors are the columns of V).
+                        // V ← V·J: same column pass over V's rows.
                         let mut r = 0u32;
                         while r < n {
-                            let v_rp = v_sh[(r * MAX_DIM + p) as usize];
-                            let v_rq = v_sh[(r * MAX_DIM + q) as usize];
-                            v_sh[(r * MAX_DIM + p) as usize] = cs * v_rp - sn * v_rq;
-                            v_sh[(r * MAX_DIM + q) as usize] = sn * v_rp + cs * v_rq;
+                            let v_rp = v_sh[(r * MAX_DIM + lo) as usize];
+                            let v_rq = v_sh[(r * MAX_DIM + hi) as usize];
+                            v_sh[(r * MAX_DIM + lo) as usize] = cs * v_rp - sn * v_rq;
+                            v_sh[(r * MAX_DIM + hi) as usize] = sn * v_rp + cs * v_rq;
                             r += 1u32;
                         }
                     }
                 }
-                sync_cube();
-                q += 1u32;
             }
-            p += 1u32;
+            // Barrier: phase 2 needs the FULLY phase-1-updated matrix (every
+            // pair's column update in this round complete) before rotating
+            // rows — see the module docs for why this can't be one phase.
+            sync_cube();
+
+            // --- Phase 2 (left-multiply, A ← Jᵀ·A): update ONLY rows lo, hi
+            //     (all columns) of A, reusing the SAME cs/sn computed in
+            //     phase 1 above (kept in this unit's registers across the
+            //     barrier — NOT re-derived from a_pq, which phase 1 already
+            //     rotated toward 0). Different pairs own DISJOINT rows, so
+            //     this is race-free across the round exactly like phase 1. ---
+            if is_lo && do_rot {
+                let mut kk = 0u32;
+                while kk < n {
+                    let a_pk = a_sh[(lo * MAX_DIM + kk) as usize];
+                    let a_qk = a_sh[(hi * MAX_DIM + kk) as usize];
+                    a_sh[(lo * MAX_DIM + kk) as usize] = cs * a_pk - sn * a_qk;
+                    a_sh[(hi * MAX_DIM + kk) as usize] = sn * a_pk + cs * a_qk;
+                    kk += 1u32;
+                }
+            }
+            sync_cube();
+            step += 1u32;
         }
 
         // --- In-kernel off-diagonal-norm convergence test (no host round-trip).
@@ -305,6 +380,26 @@ pub fn jacobi_eig_sweep<F: Float + CubeElement>(
         info_out[0usize] = F::cast_from(sweep);
         info_out[1usize] = off_sh[0usize].sqrt();
     }
+}
+
+/// Circle-method player index for circle position `pos` at round `step`, over
+/// `players` positions (the EVEN-padded count — `n` or `n+1`, CR-01). Position
+/// 0 is the fixed pivot; positions `1..players` rotate:
+/// `player = ((pos - 1 + step) mod (players - 1)) + 1`. With an even `players`
+/// the standard round-robin tournament covers all `players·(players-1)/2`
+/// position pairs over `players - 1` rounds; the caller skips any pairing that
+/// touches a ghost position (`>= n`), leaving exactly the `n·(n-1)/2` real
+/// pairs. Byte-identical to `jacobi_svd_sweep`'s `circle_player` (kept as its
+/// own copy per this crate's per-kernel-file convention — no cross-file
+/// `#[cube]` fn imports).
+#[cube]
+fn circle_player(pos: u32, step: u32, players: u32) -> u32 {
+    let mut player = 0u32;
+    if pos > 0u32 {
+        let m = players - 1u32;
+        player = ((pos - 1u32 + step) % m) + 1u32;
+    }
+    player
 }
 
 /// Largest power of two strictly less than `n` (the starting stride for a
