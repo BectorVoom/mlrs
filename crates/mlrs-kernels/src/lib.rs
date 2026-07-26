@@ -37,6 +37,12 @@ pub mod gbt;
 // module-scoped-access precedent: callers use `mlrs_kernels::gram::{…}`).
 pub mod gram;
 pub mod jacobi_eig;
+// Brute-force KNN predict perf lever (KNN-01): a fused device-side neighbor-
+// target GATHER replacing the `top_k → to_host(idx) → host k-loop → from_host`
+// round-trip in `KNeighborsRegressor::predict` (the `linear_predict` host-sync
+// pathology, same class of fix). Owns its `pub mod` + `pub use` (single-owner,
+// file-disjoint — the `linear_predict`/`colmean` precedent).
+pub mod knn;
 pub mod jacobi_svd;
 pub mod kmeans;
 pub mod lbfgs;
@@ -78,11 +84,17 @@ pub use cholesky::cholesky_solve;
 // Phase-13 KNN-graph (PRIM-11): direct pairwise distance kernels + per-row
 // index-identity self-drop GATHER. Plan 13-02 owns this re-export (file-disjoint,
 // single-owner) alongside the kernel bodies in `distance.rs`.
-pub use distance::{chebyshev_dist, manhattan_dist, minkowski_dist, self_drop_gather};
+pub use distance::{
+    chebyshev_dist, euclidean_sq_dist, euclidean_sq_dist_rb, euclidean_sq_dist_rb4,
+    euclidean_sq_dist_tiled,
+    manhattan_dist,
+    minkowski_dist, self_drop_gather,
+};
 pub use elementwise::{
-    center_columns, clamp_nonneg, degree_guard, dist_combine_clamp, div_by_row, kde_cosine_map,
-    kde_epanechnikov_map, kde_exponential_map, kde_gaussian_map, kde_linear_map, kde_tophat_map,
-    laplacian_map, poly_map, rbf_map, scale, sigmoid_map, sqrt_elem, zero_diag_copy,
+    center_columns, clamp_nonneg, copy_elem, degree_guard, dist_combine_clamp, div_by_row,
+    kde_cosine_map, kde_epanechnikov_map, kde_exponential_map, kde_gaussian_map, kde_linear_map,
+    kde_tophat_map, laplacian_map, poly_map, rbf_map, scale, sigmoid_map, sqrt_elem,
+    zero_diag_copy,
 };
 // HistGradientBoosting kernels (GBT-01): loss gradients (squared error /
 // binary log-loss / multiclass log-loss with staged softmax), row-blocked
@@ -96,7 +108,10 @@ pub use gbt::{
     gbt_sum_partials, gbt_update_raw,
 };
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
-pub use linear_predict::linear_predict_bias;
+pub use linear_predict::{
+    linear_predict_bias, linear_predict_bias_shared, PREDICT_MAX_FEATURES,
+    PREDICT_ROWS_PER_BLOCK, PREDICT_SHARED_ELEMS, PREDICT_SHARED_MIN_FEATURES,
+};
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
 // Phase-15 HDBSCAN mutual-reachability GATHER (HDBS-01, plan 15-05): launched by
 // the feature-metric/dense-cosine device front-end via the backend host wrapper

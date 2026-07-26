@@ -39,6 +39,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::knn::device_copy;
 use mlrs_backend::prims::reduce::argmax_rows;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
@@ -302,8 +303,13 @@ where
             })
             .collect();
 
-        let x_host = x.to_host(pool);
-        let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_host);
+        // Take device-resident ownership of the training matrix with a
+        // DEVICE-TO-DEVICE copy rather than round-tripping it through the host
+        // (KNN-01) — see `nearest.rs::fit` for the full rationale and why a bare
+        // handle clone was NOT ownership. `y_class_` stays host-side here because
+        // the classifier's vote gather works on remapped i32 class indices, not on
+        // `F` targets.
+        let x_dev: DeviceArray<ActiveRuntime, F> = device_copy::<F>(pool, x);
         Ok(KNeighborsClassifier {
             n_neighbors: self.n_neighbors,
             x_train_: Some(x_dev),

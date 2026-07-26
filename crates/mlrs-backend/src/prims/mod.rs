@@ -40,6 +40,10 @@ pub mod kernel_matrix;
 // `mlrs-kernels::distance` direct + self-drop kernels (file-disjoint,
 // single-owner). Empty compiling shell until then; the oracle harness in
 // `tests/knn_graph_test.rs` (plan 13-01) is RED until `Metric`/`knn_graph` land.
+// Fused KNN neighbor-target gather (KNN-01 perf lever): keeps the brute-force
+// KNN predict pipeline device-resident by forming the neighbor mean on-device
+// instead of reading the indices back and looping on the host.
+pub mod knn;
 pub mod knn_graph;
 // Phase-9 prim stub (Wave-0 scaffold 09-01 owns this registration; the Wave-1
 // plan 09-02 fills the file body — file-disjoint, parallel-safe). The

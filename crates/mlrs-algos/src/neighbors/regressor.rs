@@ -4,19 +4,20 @@
 //!
 //! ## Predict = mean of the k neighbor targets (D-07)
 //! `predict` finds the `k` nearest neighbors of each query (reusing the validated
-//! `NearestNeighbors` core, [`neighbor_indices`]), gathers their continuous `F`
+//! `NearestNeighbors` core, [`neighbor_indices_device`]), gathers their continuous `F`
 //! targets, and returns the arithmetic MEAN (uniform weights — each of the `k`
 //! neighbors contributes `1/k`). `weights='distance'` is deferred per CONTEXT.
 //!
 //! ## Validate-before-launch (T-05-08-01 / ASVS V5)
 //! `predict` rejects `k` outside `1 ..= n_train` ([`AlgoError::InvalidK`]) and a
-//! mismatched query geometry BEFORE any prim launch (the shared `neighbor_indices`
+//! mismatched query geometry BEFORE any prim launch (the shared `neighbor_indices_device`
 //! core enforces this, 05-08 Task 1).
 //!
-//! ## Device residency (D-03)
-//! The fitted training matrix is device-resident; the small `n_train` target
-//! vector is kept host-side for the per-query gather, and the mean is staged back
-//! to a device-resident output.
+//! ## Device residency (D-03 / D-05)
+//! BOTH fitted operands are device-resident, and so is the whole predict
+//! pipeline: `distance` → `top_k` → the fused `knn_regress_mean` neighbor-target
+//! gather all run on the device, with no host round-trip between them (KNN-01).
+//! The single terminal read-back happens at the caller's API boundary.
 //!
 //! Tests live in `crates/mlrs-algos/tests/knn_regressor_test.rs` (AGENTS.md §2),
 //! never an in-source `#[cfg(test)] mod tests`.
@@ -29,10 +30,11 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+use mlrs_backend::prims::knn::{device_copy, knn_regress_mean_gather};
+use mlrs_core::PrimError;
 
 use crate::error::{AlgoError, BuildError};
-use crate::neighbors::nearest::neighbor_indices;
+use crate::neighbors::nearest::neighbor_indices_device;
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// sklearn `KNeighborsRegressor` default neighbor count.
@@ -55,9 +57,11 @@ pub struct KNeighborsRegressor<F, S = Unfit> {
     x_train_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted training geometry `(n_train, n_features)`, `None` until `fit`.
     train_shape_: Option<(usize, usize)>,
-    /// Host copy of the continuous regression targets (length `n_train`),
-    /// gathered per neighbor for the mean. `None` until `fit`.
-    y_reg_: Option<Vec<F>>,
+    /// DEVICE-RESIDENT continuous regression targets (length `n_train`),
+    /// gathered per neighbor for the mean by the fused `knn_regress_mean` kernel
+    /// (KNN-01 — previously a host `Vec<F>` driving a host gather loop). `None`
+    /// until `fit`.
+    y_reg_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -208,14 +212,31 @@ where
             }));
         }
 
-        let y_reg = y.to_host(pool);
-        let x_host = x.to_host(pool);
-        let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_host);
+        // KNN-01: keep BOTH fitted operands device-resident with a
+        // DEVICE-TO-DEVICE copy, never a host round-trip.
+        //
+        // The original `x.to_host(pool)` → `DeviceArray::from_host(...)` pair was a
+        // full device→host→device copy of the ENTIRE training matrix (at
+        // `n = 200_000`, `d = 32`, f32 that is 25 MB across the bus TWICE) whose
+        // only purpose was to obtain an OWNED array from a borrowed one. KNN-01
+        // replaced it with a HANDLE CLONE, which removed the traffic but left the
+        // fitted estimator aliasing buffers the caller still owns — and
+        // `DeviceArray::release_into` is the repo-wide way to return a buffer to
+        // the pool, so a caller that released its fit inputs afterwards would see
+        // the next `pool.acquire` hand that live training matrix straight back.
+        // `device_copy` keeps the win (no bus traffic, no host allocation) and
+        // makes the ownership real — see its docs.
+        //
+        // `y` likewise stays on the device: `predict` gathers the neighbor targets
+        // with a device kernel, so the fit-time `y.to_host(pool)` read-back — and
+        // the host `Vec<F>` it produced — are both gone.
+        let x_dev: DeviceArray<ActiveRuntime, F> = device_copy::<F>(pool, x);
+        let y_dev: DeviceArray<ActiveRuntime, F> = device_copy::<F>(pool, y);
         Ok(KNeighborsRegressor {
             n_neighbors: self.n_neighbors,
             x_train_: Some(x_dev),
             train_shape_: Some((n_train, n_features)),
-            y_reg_: Some(y_reg),
+            y_reg_: Some(y_dev),
             _state: PhantomData,
         })
     }
@@ -240,9 +261,11 @@ where
             .as_ref()
             .expect("y_reg_ is Some by construction on KNeighborsRegressor<F, Fitted>");
 
-        // Reuse the validated NearestNeighbors core: validates 1<=k<=n_train +
-        // query geometry before launch, returns the host u32 neighbor indices.
-        let (val_dev, idx_dev, idx_host) = neighbor_indices::<F>(
+        // Reuse the validated NearestNeighbors core in its DEVICE-RESIDENT form
+        // (KNN-01): same `1<=k<=n_train` + query-geometry validation and the same
+        // query-tiled `distance → top_k` pipeline, but the `u32` neighbor indices
+        // stay on the device instead of being read back.
+        let (val_dev, idx_dev) = neighbor_indices_device::<F>(
             pool,
             self.x_train_.as_ref(),
             self.train_shape_,
@@ -250,33 +273,33 @@ where
             shape,
             self.n_neighbors,
         )?;
+        // The regressor needs only the indices; the distances are scratch here.
         val_dev.release_into(pool);
+
+        // Mean of the k neighbor targets per query (uniform weights — 1/k each),
+        // formed ON the device by the fused gather kernel. This replaces the host
+        // `n_query × k` double loop that previously required reading the indices
+        // back and uploading the predictions again; the whole predict path is now
+        // device-resident end to end (D-05), with the single terminal read-back
+        // happening at the caller's API boundary.
+        //
+        // The kernel's `t < n_train` guard carries the WR-02 defence that the host
+        // loop expressed as a typed `ShapeMismatch`: a corrupted index from top_k
+        // contributes nothing rather than reading out of bounds.
+        let (n_train, _) = self
+            .train_shape_
+            .expect("train_shape_ is Some by construction on KNeighborsRegressor<F, Fitted>");
+        let pred = knn_regress_mean_gather::<F>(
+            pool,
+            y_reg,
+            &idx_dev,
+            n_query,
+            self.n_neighbors,
+            n_train,
+        )
+        .map_err(AlgoError::Prim)?;
         idx_dev.release_into(pool);
 
-        // Mean of the k neighbor targets per query (uniform weights — 1/k each).
-        let k = self.n_neighbors;
-        let inv_k = 1.0f64 / k as f64;
-        let mut pred: Vec<F> = vec![F::from_int(0i64); n_query];
-        for q in 0..n_query {
-            let mut acc = 0.0f64;
-            for j in 0..k {
-                let train_idx = idx_host[q * k + j] as usize;
-                // WR-02: a corrupted/oversized neighbor index from top_k must be a
-                // typed error at the gather site, not an unchecked panic (debug) or
-                // a silent wrong read (release).
-                if train_idx >= y_reg.len() {
-                    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                        operand: "knn.train_idx",
-                        rows: train_idx,
-                        cols: 1,
-                        len: y_reg.len(),
-                    }));
-                }
-                acc += host_to_f64(y_reg[train_idx]);
-            }
-            pred[q] = f64_to_host::<F>(acc * inv_k);
-        }
-
-        Ok(DeviceArray::from_host(pool, &pred))
+        Ok(pred)
     }
 }

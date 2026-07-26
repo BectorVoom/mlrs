@@ -1,0 +1,151 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The four backend templates in crates/mlrs-py/pyproject/ are FOUR SEPARATE PyPI
+# distributions (mlrs-cpu / mlrs-wgpu / mlrs-cuda / mlrs-rocm) built from one
+# Cargo workspace. Two consequences drive the shape of this file:
+#
+#  1. maturin's `-m/--manifest-path` takes a CARGO manifest, not a pyproject —
+#     `maturin build -m .../cpu.pyproject.toml` fails outright with "the
+#     manifest-path must be a path to a Cargo.toml file". maturin instead reads
+#     `[tool.maturin]` from the pyproject in the CURRENT DIRECTORY, and resolves
+#     that table's relative `manifest-path` / `python-source` against the
+#     pyproject's own directory. So each job STAGES its backend template as the
+#     repo-root pyproject.toml and builds from the root — the same dance
+#     `crates/mlrs-py/python/tests/_wheel_build.py` already documents and uses.
+#
+#  2. Trusted Publishing mints a token per PROJECT, so a single upload step
+#     covering all four distributions fails the moment one of them is not
+#     registered for this workflow — after some wheels are already live. The
+#     publish job is therefore a per-backend matrix: one OIDC exchange and one
+#     upload per distribution, independently re-runnable.
+
+jobs:
+  build-linux:
+    name: Build Linux Wheels (${{ matrix.backend }} - ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, wgpu, cuda, rocm]
+        target: [x86_64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Stage backend pyproject at the repo root
+        shell: bash
+        run: cp "crates/mlrs-py/pyproject/${{ matrix.backend }}.pyproject.toml" pyproject.toml
+
+      - name: Build Wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+
+      - name: Upload wheels as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.backend }}-${{ matrix.target }}
+          path: dist
+
+  build-macos:
+    name: Build macOS Wheels (${{ matrix.backend }} - ${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, wgpu]
+        target: [x86_64, aarch64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Stage backend pyproject at the repo root
+        shell: bash
+        run: cp "crates/mlrs-py/pyproject/${{ matrix.backend }}.pyproject.toml" pyproject.toml
+
+      - name: Build Wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+
+      - name: Upload wheels as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.backend }}-${{ matrix.target }}
+          path: dist
+
+  build-windows:
+    name: Build Windows Wheels (${{ matrix.backend }} - ${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, wgpu, cuda]
+        target: [x64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Stage backend pyproject at the repo root
+        shell: bash
+        run: cp "crates/mlrs-py/pyproject/${{ matrix.backend }}.pyproject.toml" pyproject.toml
+
+      - name: Build Wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+
+      - name: Upload wheels as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.backend }}-${{ matrix.target }}
+          path: dist
+
+  publish:
+    name: Publish mlrs-${{ matrix.backend }} to PyPI
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-macos, build-windows]
+    # One distribution per job: each gets its own Trusted Publishing exchange, so
+    # a project that is not yet registered for this workflow fails only its own
+    # backend and can be re-run once registered, instead of aborting a partially
+    # completed multi-project upload.
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, wgpu, cuda, rocm]
+    permissions:
+      id-token: write # Required for Trusted Publishing / OIDC authentication
+    steps:
+      - name: Download this backend's wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*-${{ matrix.backend }}-*
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

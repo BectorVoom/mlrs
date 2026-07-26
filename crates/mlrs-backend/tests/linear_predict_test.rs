@@ -137,6 +137,68 @@ fn linear_predict_zero_bias_is_plain_matvec_f32() {
     assert_slice_close(&got, &exp, &F32_TOL);
 }
 
+/// The shapes that exercise the shared-tile kernel BELOW its `n = 64` ceiling
+/// (`n = 32`, `n = 48`): the padded-tile stride math (`row·65 + c`, read only
+/// up to `c < n`) and the partial-tail block guard, at `n < PREDICT_MAX_FEATURES`
+/// — the regime the existing `(513, 64)` case (n exactly at the ceiling) does
+/// not cover. Row counts cross the 64-row block boundary with a non-zero
+/// remainder (`200 = 3·64 + 8`, `1000 = 15·64 + 40`, `130 = 2·64 + 2`) to hit
+/// the tail guard. A large bias (`7.5`) keeps every prediction clear of the
+/// zero-crossing, so the compare is not tripped by a near-cancellation
+/// relative-error blow-up (the prediction magnitude, not the kernel, would
+/// otherwise decide the tolerance).
+///
+/// Since the perf kernel is now dispatched ONLY on wgpu (`use_shared_predict`),
+/// the cpu primary gate can no longer witness it — so this wgpu-run coverage is
+/// the shared kernel's PRIMARY correctness oracle, and it must exercise BOTH
+/// float widths (the padded tile is `n·size_of::<F>()`-strided in bytes, and
+/// the f64 sub-ceiling path is otherwise unchecked). The two closures share the
+/// deterministic design/coef/bias so f32 and f64 validate the identical shapes.
+fn shared_band_case<F>(m: usize, n: usize) -> (Vec<f64>, Vec<f64>)
+where
+    F: Float + CubeElement + Pod,
+{
+    let x64 = design(m, n);
+    let coef64 = coefs(n);
+    let b = 7.5f64;
+    let cast = |v: &[f64]| -> Vec<F> {
+        v.iter()
+            .map(|&x| match std::mem::size_of::<F>() {
+                4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(x as f32))),
+                8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&x)),
+                _ => unreachable!("shared_band_case is f32/f64 only"),
+            })
+            .collect()
+    };
+    let bias_f = cast(&[b])[0];
+    let got = run_predict_case::<F>(&cast(&x64), &cast(&coef64), bias_f, m, n);
+    let exp = host_predict_ref(&x64, &coef64, b, m, n);
+    (got, exp)
+}
+
+const SHARED_BAND_SHAPES: &[(usize, usize)] = &[(200, 32), (1000, 32), (130, 48), (513, 32)];
+
+#[test]
+fn linear_predict_shared_band_multiblock_f32() {
+    for &(m, n) in SHARED_BAND_SHAPES {
+        let (got, exp) = shared_band_case::<f32>(m, n);
+        assert_slice_close(&got, &exp, &F32_TOL);
+    }
+}
+
+/// f64 twin of [`linear_predict_shared_band_multiblock_f32`] — the sub-ceiling
+/// f64 shared-tile path (`33 KiB` tile), skipped on adapters without f64.
+#[test]
+fn linear_predict_shared_band_multiblock_f64() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    for &(m, n) in SHARED_BAND_SHAPES {
+        let (got, exp) = shared_band_case::<f64>(m, n);
+        assert_slice_close(&got, &exp, &F64_TOL);
+    }
+}
+
 /// Geometry rejection (ASVS V5): zero-row / zero-col / mismatched-length x /
 /// wrong-length coef / empty bias are each rejected BEFORE any launch with a
 /// typed `PrimError`, never a panic or an OOB device read.

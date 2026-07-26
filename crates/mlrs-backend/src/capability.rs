@@ -53,6 +53,54 @@ pub fn feature_enabled(kind: FloatKind) -> bool {
     client.properties().supports_type(kind)
 }
 
+/// Units a **cpu** launch should spread over = the machine's usable core count.
+///
+/// `cubecl-cpu` maps ONE OS THREAD PER UNIT and runs the cube grid as a serial
+/// loop inside each of them (`cubecl_cpu::compute::runner::execute_data`), so a
+/// launch's `cube_dim` is literally its thread count. The GPU-idiomatic 256-unit
+/// block therefore spawns 256 threads and pays a 256-way join per kernel, which
+/// for a small GATHER pass can exceed the work itself. Barrier-free kernels
+/// indexed by `ABSOLUTE_POS_X` alone are free to take this instead: the split
+/// between cube and unit is a pure scheduling choice with no effect on results.
+///
+/// `std::thread::available_parallelism()` reads cgroup limits from `/proc` and
+/// costs hundreds of microseconds, so it is resolved ONCE per process — a
+/// per-launch call showed up on the KNN predict hot path. `MLRS_CPU_UNITS`
+/// overrides the value for on-target A/B and is re-read per call so a test can
+/// sweep it within one process.
+pub fn cpu_launch_units() -> u32 {
+    use std::sync::OnceLock;
+
+    if let Some(v) = std::env::var("MLRS_CPU_UNITS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v >= 1)
+    {
+        return v;
+    }
+    static DETECTED: OnceLock<u32> = OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|v| v.get() as u32)
+            .unwrap_or(8)
+            .max(1)
+    })
+}
+
+/// Unit width a 1D `ABSOLUTE_POS_X`-indexed launch should use on the active
+/// backend: [`cpu_launch_units`] on cpu, the 256-unit warp multiple elsewhere.
+///
+/// Only for kernels whose result is independent of the cube/unit split — i.e.
+/// no `SharedMemory`, no `sync_cube`, no `CUBE_DIM`-dependent indexing.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn gather_launch_width() -> u32 {
+    if active_backend_name() == "cpu" {
+        cpu_launch_units()
+    } else {
+        256
+    }
+}
+
 /// Query whether the given client's backend supports plane (subgroup) ops.
 ///
 /// Mirrors [`supports_type`] but for the plane/subgroup capability. cubecl 0.10
@@ -96,6 +144,24 @@ pub fn active_plane_width() -> u32 {
         .properties()
         .hardware
         .plane_size_max
+}
+
+/// Active runtime's maximum per-cube shared-memory budget, in bytes.
+///
+/// Reports `client.properties().hardware.max_shared_memory_size`. Unlike CUDA
+/// (a fixed 48 KiB+ budget) a wgpu adapter can advertise as little as the
+/// WebGPU downlevel default (`16384` = 16 KiB), so a `SharedMemory` kernel sized
+/// against the CUDA budget can exceed a wgpu adapter's limit and fail pipeline
+/// creation. Callers that dispatch a shared kernel ONLY on wgpu (e.g.
+/// `prims::linear_predict::use_shared_predict`) query this and fall back to
+/// their GATHER path when their tile would not fit — so `predict` never fails
+/// on a small-SLM adapter where the GATHER kernel would have worked.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn active_max_shared_memory() -> usize {
+    crate::runtime::active_client()
+        .properties()
+        .hardware
+        .max_shared_memory_size
 }
 
 /// Static name of the active backend, derived from the compiled-in Cargo

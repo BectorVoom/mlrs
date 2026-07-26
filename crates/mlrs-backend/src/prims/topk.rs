@@ -29,8 +29,9 @@ use cubecl::prelude::*;
 
 use mlrs_core::PrimError;
 use mlrs_kernels::sqrt_elem;
-use mlrs_kernels::topk::select_k;
+use mlrs_kernels::topk::{select_k, select_k_onepass, select_k_shared};
 
+use crate::capability;
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
 use crate::runtime::ActiveRuntime;
@@ -97,9 +98,6 @@ where
     };
 
     let client = pool.client().clone();
-    // One cube per query row (CUBE_POS_X = row); a 1-unit cube — only unit 0
-    // selects (small-k insertion-select, see the kernel docs).
-    let (count, dim) = launch_dims_rows(rows);
 
     // SAFETY: lengths are the carried/validated element counts (the kernel
     // bounds-checks `row < rows` and only writes `rows * k` slots), NEVER raw
@@ -108,18 +106,65 @@ where
     let val_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
     let idx_arg = unsafe { ArrayArg::from_raw_parts(idx_handle.clone(), out_len) };
 
-    select_k::launch::<F, ActiveRuntime>(
-        &client,
-        count,
-        dim,
-        dist_arg,
-        val_arg,
-        idx_arg,
-        // Scalar args by value in cubecl 0.10 (no ScalarArg — see distance.rs).
-        rows as u32,
-        cols as u32,
-        k as u32,
-    );
+    if serial_select_forced() || cpu_serial_select() {
+        // A/B escape hatch (`MLRS_TOPK_SERIAL=1`): the legacy one-unit-per-row
+        // kernel, retained so the parallel path can be measured against it on the
+        // actual target device rather than by extrapolation.
+        //
+        // It is ALSO the cpu default (`cpu_serial_select`) — see that function
+        // for why "parallel" and "serial" swap meanings on that backend.
+        let (count, dim) = launch_dims_rows(rows);
+        select_k::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            dist_arg,
+            val_arg,
+            idx_arg,
+            // Scalar args by value in cubecl 0.10 (no ScalarArg — see distance.rs).
+            rows as u32,
+            cols as u32,
+            k as u32,
+        );
+    } else if k <= ONEPASS_K_CAP && !multipass_select_forced() {
+        // SINGLE-PASS selection (the default for KNN-sized k): each unit keeps
+        // its strided slice's k smallest in a sorted local list, then k head
+        // -merge rounds through the shared pair-order tree emit the row's exact
+        // ascending top-k. Reads the matrix ONCE where the multi-pass kernel
+        // reads it k times — see the kernel docs for the traffic model.
+        let (count, dim) = launch_dims_rows_parallel(rows, cols);
+        select_k_onepass::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            dist_arg,
+            val_arg,
+            idx_arg,
+            rows as u32,
+            cols as u32,
+            k as u32,
+        );
+    } else {
+        // One cube per query row (CUBE_POS_X = row) with a POWER-OF-TWO unit
+        // width: every unit scans a strided slice of the row and the winners are
+        // folded through a shared-memory pair-order tree (bitwise-identical
+        // output, `cols / width` less serial work per rank — see the kernel docs
+        // for the 41×-of-distance measurement that motivated it). Reached when
+        // `k` exceeds the one-pass kernel's local-list capacity, or when forced
+        // for A/B via `MLRS_TOPK_MULTIPASS=1`.
+        let (count, dim) = launch_dims_rows_parallel(rows, cols);
+        select_k_shared::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            dist_arg,
+            val_arg,
+            idx_arg,
+            rows as u32,
+            cols as u32,
+            k as u32,
+        );
+    }
 
     // --- Optional Euclidean sqrt over ONLY the returned k values (D-08 / Pitfall
     //     8). Squared distance selects the same neighbors as Euclidean, so the
@@ -209,9 +254,81 @@ fn validate_geometry(
     Ok(())
 }
 
-/// Launch config for `select_k`: ONE cube per query row (`CUBE_POS_X` = row), a
-/// single-unit cube (only unit 0 selects). The kernel bounds-checks `row < rows`,
-/// so `rows.max(1)` cubes is exact.
+/// Local-list capacity of `select_k_onepass` (must match the kernel's comptime
+/// `Array::new(32)` allocations). Selections with `k` beyond this fall back to
+/// the multi-pass `select_k_shared`.
+const ONEPASS_K_CAP: usize = 32;
+
+/// Is the legacy serial `select_k` forced via `MLRS_TOPK_SERIAL=1`?
+///
+/// The parallel kernels are the default. This escape hatch exists ONLY so the
+/// paths can be A/B'd on the real target device (a perf kernel must never be
+/// gated onto a backend by extrapolating from a different backend's numbers).
+fn serial_select_forced() -> bool {
+    std::env::var("MLRS_TOPK_SERIAL").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Should the cpu backend take the one-unit-per-row `select_k` kernel?
+/// DEFAULT YES, and it is the FASTER choice there — the labels "serial" and
+/// "parallel" swap meaning on cpu.
+///
+/// `cubecl-cpu` maps ONE OS THREAD PER UNIT and runs the cube grid as a serial
+/// loop inside each thread, so parallelism is `cube_dim` and `sync_cube` is a
+/// SPIN barrier across every one of those threads
+/// (`cubecl_cpu::compute::compute_task::sync_cube`). Under that model the two
+/// shared-memory kernels are not merely slower, they are structurally wrong:
+/// `launch_dims_rows_parallel` asks for up to 256 units = 256 OS threads on a
+/// machine with a dozen cores, and each of `log₂(width) + 2` barriers per rank
+/// makes the runnable threads burn a whole scheduling quantum waiting on
+/// descheduled peers.
+///
+/// The one-unit-per-row kernel inverts that correctly: `CubeDim { x: 1 }` with
+/// one cube per row means ONE thread walking every row serially — which is
+/// exactly what a cpu wants, since the cube grid is that thread's loop. It uses
+/// no `SharedMemory` and no barriers at all (see its kernel docs, which already
+/// call out the cubecl-cpu MLIR constraints it was written against).
+///
+/// This is the same dispatch discipline `prims::knn::cpu_rows_applicable`
+/// applies to the fused KNN search, extended to the shared `top_k` prim that
+/// `spectral.rs`, `umap.rs` and `knn_graph.rs` also depend on.
+/// `MLRS_TOPK_MULTIPASS=1` / `MLRS_TOPK_SERIAL=1` still force their arms for
+/// on-target A/B.
+fn cpu_serial_select() -> bool {
+    capability::active_backend_name() == "cpu" && !multipass_select_forced()
+}
+
+/// Is the multi-pass `select_k_shared` forced via `MLRS_TOPK_MULTIPASS=1`?
+///
+/// The single-pass `select_k_onepass` is the default for `k <= ONEPASS_K_CAP`;
+/// this escape hatch selects the k-pass kernel so the two can be A/B'd on the
+/// real target device.
+fn multipass_select_forced() -> bool {
+    std::env::var("MLRS_TOPK_MULTIPASS").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Launch config for `select_k_shared`: ONE cube per query row (`CUBE_POS_X` =
+/// row) with a POWER-OF-TWO unit width.
+///
+/// The width is the largest power of two `<= min(256, cols)`: 256 caps it at the
+/// kernel's SharedMemory size (matching `reduce.rs`), and clamping to `cols`
+/// avoids launching units that would own an empty strided slice on narrow
+/// selections. The `log₂` tree reduce requires the power of two; `max(1)` keeps a
+/// `cols == 1` selection legal (the tree loop is then a no-op and unit 0 emits its
+/// own scan result).
+fn launch_dims_rows_parallel(rows: usize, cols: usize) -> (CubeCount, CubeDim) {
+    let capped = cols.min(256) as u32;
+    // Largest power of two <= capped (capped >= 1 — validate_geometry pinned
+    // `1 <= k <= cols`).
+    let width = 1u32 << (31 - capped.max(1).leading_zeros());
+    (
+        CubeCount::Static((rows as u32).max(1), 1, 1),
+        CubeDim { x: width, y: 1, z: 1 },
+    )
+}
+
+/// Launch config for the legacy serial `select_k`: ONE cube per query row
+/// (`CUBE_POS_X` = row), a single-unit cube (only unit 0 selects). The kernel
+/// bounds-checks `row < rows`, so `rows.max(1)` cubes is exact.
 fn launch_dims_rows(rows: usize) -> (CubeCount, CubeDim) {
     (
         CubeCount::Static((rows as u32).max(1), 1, 1),
@@ -221,8 +338,11 @@ fn launch_dims_rows(rows: usize) -> (CubeCount, CubeDim) {
 
 /// Standard ceiling-division 1D launch config for the in-place sqrt pass over the
 /// `rows × k` returned distances (matches `distance.rs::launch_dims_1d`).
+///
+/// `sqrt_elem` is a barrier-free `ABSOLUTE_POS_X` GATHER, so the block width is
+/// whatever the backend schedules best — see [`capability::gather_launch_width`].
 fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
+    let block = capability::gather_launch_width();
     let cubes = ((n as u32) + block - 1) / block;
     (
         CubeCount::Static(cubes.max(1), 1, 1),

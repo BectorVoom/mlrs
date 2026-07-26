@@ -60,9 +60,9 @@ EXPECTED_PARAMS = {
     },
     "DBSCAN": {"eps": 0.5, "min_samples": 5, "output_type": "input"},
     "TruncatedSVD": {"n_components": 2, "output_type": "input"},
-    "NearestNeighbors": {"n_neighbors": 5, "output_type": "input"},
-    "KNeighborsClassifier": {"n_neighbors": 5, "output_type": "input"},
-    "KNeighborsRegressor": {"n_neighbors": 5, "output_type": "input"},
+    "NearestNeighbors": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
+    "KNeighborsClassifier": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
+    "KNeighborsRegressor": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
     # PCA requires an explicit n_components — constructed with n_components=2.
     "PCA": {"n_components": 2, "output_type": "input"},
     # --- pre-existing shims that were not in the original ALL_12 matrix (now

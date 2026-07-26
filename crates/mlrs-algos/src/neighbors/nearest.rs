@@ -40,10 +40,15 @@ use std::marker::PhantomData;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
+use cubecl::server::Handle;
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::distance::distance;
+use mlrs_backend::prims::distance::{distance_direct, distance_with_ynorm};
+use mlrs_backend::prims::knn::{
+    cpu_rows_applicable, cpu_rows_topk, device_copy, fused_distance_topk, fused_topk_applicable,
+};
+use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
@@ -223,11 +228,25 @@ where
         let (n_train, n_features) = shape;
         validate_geometry(x, shape)?;
 
-        // Stage a device-resident copy of the training matrix (D-03). A fresh
-        // `from_host` round-trip clones the buffer so the estimator owns its
-        // training state independently of the caller's input handle.
-        let x_host = x.to_host(pool);
-        let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_host);
+        // Take device-resident ownership of the training matrix (D-03) with a
+        // DEVICE-TO-DEVICE copy (KNN-01, corrected).
+        //
+        // This used to be `x.to_host(pool)` → `DeviceArray::from_host(...)`: a
+        // full device→host→device copy of the entire training matrix, producing a
+        // bit-identical buffer, purely to turn a borrowed array into an owned one.
+        // KNN-01 replaced it with `DeviceArray::from_raw(x.handle().clone(), ..)`,
+        // which removed the bus traffic but made the fitted estimator ALIAS a
+        // buffer the caller still owns — and `DeviceArray::release_into` is the
+        // repo-wide way to return a buffer to the pool free list, so any caller
+        // that uploaded `x` as a temporary and released it after `fit` would have
+        // that exact allocation handed back by the next `pool.acquire` of the same
+        // size (the first one `predict` makes), silently overwriting the live
+        // training matrix. The invariant was prose; nothing enforced it.
+        //
+        // `device_copy` keeps the win that mattered — no host round-trip, no host
+        // allocation, one device pass — while making the fitted state genuinely
+        // owned, so releasing the fit input is safe again.
+        let x_dev: DeviceArray<ActiveRuntime, F> = device_copy::<F>(pool, x);
 
         Ok(NearestNeighbors {
             n_neighbors: self.n_neighbors,
@@ -296,6 +315,81 @@ pub(crate) fn neighbor_indices<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    // --- T-05-08-01 / ASVS V5: validate the untrusted k + query geometry BEFORE
+    //     any prim launch (shared with the device core so the two cannot drift). ---
+    let (x_train, (n_train, n_features)) =
+        validate_kneighbors::<F>(x_train, train_shape, xq, shape, k)?;
+    let (n_query, _) = shape;
+
+    // --- 1./2. QUERY-TILED distance → select-k, straight into the full output
+    //        buffers (see `neighbor_indices_device` for why tiling is required). ---
+    let (val_dev, idx_dev_u32) = tiled_distance_topk::<F>(
+        pool,
+        x_train,
+        (n_train, n_features),
+        xq,
+        (n_query, n_features),
+        k,
+    )?;
+
+    // --- 3. u32 → i32 neighbor indices (D-06). Host-cast the small n_query × k
+    //        index buffer; the values are training-column indices in
+    //        [0, n_train), so the cast is exact. Keep the host u32 copy so the
+    //        classifier gathers targets without a second round-trip. ---
+    let idx_host: Vec<u32> = idx_dev_u32.to_host(pool);
+    idx_dev_u32.release_into(pool);
+    let idx_i32: Vec<i32> = idx_host.iter().map(|&u| u as i32).collect();
+    let idx_dev_i32: DeviceArray<ActiveRuntime, i32> = DeviceArray::from_host(pool, &idx_i32);
+
+    Ok((val_dev, idx_dev_i32, idx_host))
+}
+
+/// Fully DEVICE-RESIDENT kneighbors core (KNN-01): same validation and same
+/// `distance → top_k` pipeline as [`neighbor_indices`], but it returns the raw
+/// `u32` indices ON the device and performs NO host round-trip at all.
+///
+/// [`neighbor_indices`] exists for the consumers that genuinely need host indices
+/// (`kneighbors`'s public `i32` surface, the classifier's label gather); the
+/// regressor pairs this one with the fused
+/// [`knn_regress_mean_gather`](mlrs_backend::prims::knn::knn_regress_mean_gather)
+/// so its predict never leaves the device.
+pub(crate) fn neighbor_indices_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: Option<&DeviceArray<ActiveRuntime, F>>,
+    train_shape: Option<(usize, usize)>,
+    xq: &DeviceArray<ActiveRuntime, F>,
+    shape: (usize, usize),
+    k: usize,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, u32>,
+    ),
+    AlgoError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x_train, (n_train, n_features)) = validate_kneighbors::<F>(x_train, train_shape, xq, shape, k)?;
+    tiled_distance_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k)
+}
+
+/// Validate the untrusted `k` + query geometry BEFORE any prim launch
+/// (T-05-08-01 / ASVS V5), returning the unwrapped fitted state.
+///
+/// `1 <= k <= n_train` (cannot request more neighbors than training points); the
+/// query feature count must match the fitted one. Factored out so the host and
+/// device cores cannot drift on validation.
+fn validate_kneighbors<'a, F>(
+    x_train: Option<&'a DeviceArray<ActiveRuntime, F>>,
+    train_shape: Option<(usize, usize)>,
+    xq: &DeviceArray<ActiveRuntime, F>,
+    shape: (usize, usize),
+    k: usize,
+) -> Result<(&'a DeviceArray<ActiveRuntime, F>, (usize, usize)), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
     let x_train = x_train.ok_or(AlgoError::NotFitted {
         estimator: "knn",
         operation: "kneighbors",
@@ -306,9 +400,6 @@ where
     })?;
     let (n_query, q_features) = shape;
 
-    // --- T-05-08-01 / ASVS V5: validate the untrusted k + query geometry BEFORE
-    //     any prim launch. 1 <= k <= n_train (cannot request more neighbors than
-    //     training points); the query feature count must match the fitted one. ---
     if k < 1 || k > n_train {
         return Err(AlgoError::InvalidK {
             estimator: "knn",
@@ -331,35 +422,332 @@ where
             rhs: n_features,
         }));
     }
+    Ok((x_train, (n_train, n_features)))
+}
 
-    // --- 1. Pairwise SQUARED Euclidean distance Xq × X = n_query × n_train (no
-    //        sqrt — top-k selects on the order-preserving squared form,
-    //        Pitfall 8). ---
-    let dist = distance::<F>(
+/// Peak bytes the intermediate `tile_rows × n_train` distance matrix may occupy.
+///
+/// The brute-force pipeline's memory is dominated by that matrix, NOT by the
+/// operands: at `n_query = 10_000` against `n_train = 100_000` in f32 it is 4 GB,
+/// which simply fails to allocate (the probe hit exactly that on wgpu). sklearn
+/// and cuML both chunk the query rows for this reason; 128 MiB keeps the working
+/// set comfortably inside any supported device while staying far above the size
+/// at which the GEMM stops saturating.
+const DIST_TILE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// Row granularity every tile boundary must respect (KNN-01).
+///
+/// Tiles are zero-copy byte-offset VIEWS of the parent buffers, and a device
+/// imposes a `min_storage_buffer_offset_alignment` on any such view — an
+/// unaligned binding is a hard validation failure, not a slow path (wgpu rejected
+/// a 13_420-byte offset against its 32-byte limit during bring-up). The three
+/// view offsets are `start * n_features * size_of::<F>()` and (twice)
+/// `start * k * size_of::<u32 | F>()`, so making `start` a multiple of 64 makes
+/// every one of them a multiple of `64 * 4 = 256` bytes for the smallest (4-byte)
+/// element in play — at or above the alignment any supported backend requests,
+/// for ANY `n_features` and `k`.
+const TILE_ALIGN_ROWS: usize = 64;
+
+/// Is the GEMM-expansion distance path forced via `MLRS_KNN_GEMM_DISTANCE=1`?
+///
+/// The direct per-element kernel is the default. This escape hatch exists so the
+/// two can be A/B'd on the real target device rather than gated by extrapolation
+/// from a different backend's numbers.
+fn gemm_distance_forced() -> bool {
+    std::env::var("MLRS_KNN_GEMM_DISTANCE").map(|v| v == "1").unwrap_or(false)
+}
+
+/// `distance → top_k` over the query rows in TILES, writing each tile's results
+/// directly into the full `n_query × k` output buffers (KNN-01).
+///
+/// Geometry is assumed already validated by [`validate_kneighbors`].
+///
+/// ## Why tiling, and why it is free
+/// See [`DIST_TILE_BUDGET_BYTES`]: materializing the whole `n_query × n_train`
+/// distance matrix is what bounds the problem size, and it is pure scratch — no
+/// result depends on two tiles at once, because top-k is computed independently
+/// per query ROW. Tiling therefore changes NOTHING numerically (each row sees the
+/// identical full `n_train` candidate set) while making peak memory independent of
+/// `n_query`. The per-tile scratch is released back to the [`BufferPool`] each
+/// iteration, so every tile after the first reuses the same device buffer (D-11).
+///
+/// ## Zero-copy tile views
+/// Both the query matrix and the two outputs are row-major and contiguous, so a
+/// tile is a byte-offset VIEW of the parent buffer (`Handle::offset_start`) rather
+/// than a copy — the tile loop introduces no extra device traffic, and `top_k`
+/// writes its tile at the correct global row offset through the offset output
+/// handles.
+fn tiled_distance_topk<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: &DeviceArray<ActiveRuntime, F>,
+    (n_train, n_features): (usize, usize),
+    xq: &DeviceArray<ActiveRuntime, F>,
+    (n_query, _): (usize, usize),
+    k: usize,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, u32>,
+    ),
+    AlgoError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    // CPU-SHAPED path (KNN-04), checked FIRST because on the cpu backend the
+    // shared-memory fused family below is structurally wrong, not merely
+    // slower: `cubecl-cpu` maps one OS THREAD per unit and implements
+    // `sync_cube` as a spin barrier across all of them, so the 256-unit fused
+    // kernels perform hundreds of thousands of 256-way spin rendezvous on a
+    // machine with a dozen cores. `cpu_rows_topk` is barrier-free and its
+    // parallelism is query TILES over core-count units, so it also has no
+    // minimum-`n_query` occupancy floor to clear — only the `cols`/`k` caps of
+    // its local caches. `MLRS_KNN_CPU_ROWS=0` forces the fused family back for
+    // on-target A/B.
+    if cpu_rows_applicable::<F>(n_query, n_train, n_features, k) {
+        return cpu_rows_topk::<F>(
+            pool,
+            xq,
+            (n_query, n_features),
+            x_train,
+            n_train,
+            k,
+            true,
+        )
+        .map_err(AlgoError::Prim);
+    }
+
+    // FUSED path (KNN-02): squared distance + selection in ONE kernel, no
+    // intermediate matrix, no query tiling. Applicable for KNN-sized k on
+    // adapters whose shared-memory limit covers the kernel's ~19 KB budget
+    // (a capability gate — wgpu's default 16 KiB limit takes the two-kernel
+    // path below); `MLRS_KNN_UNFUSED=1` forces the two-kernel path for A/B on
+    // the real target device.
+    if fused_topk_applicable::<F>(n_query, n_train, k) {
+        return fused_distance_topk::<F>(
+            pool,
+            xq,
+            (n_query, n_features),
+            x_train,
+            (n_train, n_features),
+            k,
+            true,
+        )
+        .map_err(AlgoError::Prim);
+    }
+
+    let row_bytes = n_train * size_of::<F>();
+    // Round the budget-derived tile DOWN to the alignment granularity, then clamp
+    // to `n_query`. This preserves the invariant the offset views need: either
+    // `tile_rows` is a multiple of `TILE_ALIGN_ROWS` (so every `start` is too), or
+    // the clamp made it `n_query`, in which case there is a SINGLE tile at
+    // `start = 0` — which is trivially aligned.
+    //
+    // `max(TILE_ALIGN_ROWS)` means a very large `n_train` can exceed the byte
+    // budget: 64 rows is the smallest tile that can be cut at all, so the budget
+    // is a target rather than a hard cap. It is only reachable past
+    // `n_train ≈ 512_000` in f32, where the brute-force method is impractical for
+    // other reasons anyway.
+    let tile_rows = ((DIST_TILE_BUDGET_BYTES / row_bytes.max(1)) / TILE_ALIGN_ROWS
+        * TILE_ALIGN_ROWS)
+        .max(TILE_ALIGN_ROWS)
+        .min(n_query);
+
+    let val_bytes = n_query * k * size_of::<F>();
+    let idx_bytes = n_query * k * size_of::<u32>();
+    let val_handle = pool.acquire(val_bytes);
+    let idx_handle = pool.acquire(idx_bytes);
+
+    // The tile loop is fallible (`distance_*` and `top_k` both propagate
+    // `PrimError`), and the two output buffers above are already charged to
+    // `BufferPool::live_bytes`. Run it through a helper so EVERY early return can
+    // be met with an explicit release here: dropping the handles instead would
+    // leave `live_bytes` permanently raised by `n_query * k * 8` bytes, and
+    // `pool.rs` documents that counter as the FOUND-05 conservation property the
+    // D-10 memory gate asserts on. A failed `kneighbors`/`predict` must leave the
+    // pool exactly as it found it.
+    if let Err(e) = tiled_distance_topk_tiles::<F>(
         pool,
-        xq,
-        (n_query, n_features),
         x_train,
         (n_train, n_features),
-        false,
-        None,
-    )?;
+        xq,
+        n_query,
+        k,
+        tile_rows,
+        &val_handle,
+        &idx_handle,
+    ) {
+        pool.release(val_handle, val_bytes);
+        pool.release(idx_handle, idx_bytes);
+        return Err(e);
+    }
 
-    // --- 2. Select the k nearest per query row, sqrt at the boundary so the
-    //        returned distances are true sqrt-Euclidean (lowest-index tie-break
-    //        inherited from the validated top_k prim, 05-02). ---
-    let (val_dev, idx_dev_u32) =
-        top_k::<F>(pool, &dist, n_query, n_train, k, true, None, None)?;
-    dist.release_into(pool);
+    Ok((
+        DeviceArray::from_raw(val_handle, n_query * k),
+        DeviceArray::from_raw(idx_handle, n_query * k),
+    ))
+}
 
-    // --- 3. u32 → i32 neighbor indices (D-06). Host-cast the small n_query × k
-    //        index buffer; the values are training-column indices in
-    //        [0, n_train), so the cast is exact. Keep the host u32 copy so the
-    //        classifier / regressor gather targets without a second round-trip. ---
-    let idx_host: Vec<u32> = idx_dev_u32.to_host(pool);
-    idx_dev_u32.release_into(pool);
-    let idx_i32: Vec<i32> = idx_host.iter().map(|&u| u as i32).collect();
-    let idx_dev_i32: DeviceArray<ActiveRuntime, i32> = DeviceArray::from_host(pool, &idx_i32);
+/// The fallible tile loop of [`tiled_distance_topk`], split out so its caller
+/// owns the two output buffers and can return them to the pool on ANY error
+/// path (see the call site). Writes each tile's results directly into
+/// `val_handle` / `idx_handle` through zero-copy byte-offset views; returns
+/// nothing on success.
+#[allow(clippy::too_many_arguments)]
+fn tiled_distance_topk_tiles<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: &DeviceArray<ActiveRuntime, F>,
+    (n_train, n_features): (usize, usize),
+    xq: &DeviceArray<ActiveRuntime, F>,
+    n_query: usize,
+    k: usize,
+    tile_rows: usize,
+    val_handle: &Handle,
+    idx_handle: &Handle,
+) -> Result<(), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    // Read the A/B switch ONCE (it cannot change mid-call) rather than on every
+    // tile iteration — a `std::env::var` is a locked environ scan plus a String
+    // allocation, and this loop is the predict hot path.
+    let gemm_distance = gemm_distance_forced();
 
-    Ok((val_dev, idx_dev_i32, idx_host))
+    // HOIST the training-set squared-norm term out of the tile loop (KNN-01).
+    // `distance` recomputes `‖x_train_j‖²` on every call, and that reduction is
+    // `O(n_train × n_features)` — INDEPENDENT of the tile height. Left inside the
+    // loop it is repeated once per tile over the whole training set, which is what
+    // made a tiled run cost MORE per tile than an untiled run of the same total
+    // work. Computed once here, every tile reuses it.
+    // Only the GEMM-expansion path consumes this term; the direct kernel needs
+    // no norms at all.
+    let ynorm = if gemm_distance {
+        Some(
+            row_reduce::<F>(
+                pool,
+                x_train,
+                n_train,
+                n_features,
+                ScalarOp::SumSq,
+                ReducePath::Shared,
+            )
+            .map_err(AlgoError::Prim)?
+            .expect("shared path is never plane-gated to None"),
+        )
+    } else {
+        None
+    };
+
+    let mut start = 0usize;
+    while start < n_query {
+        let rows = tile_rows.min(n_query - start);
+
+        // Zero-copy row-slice views of the query matrix and of both outputs.
+        let xq_tile: DeviceArray<ActiveRuntime, F> = DeviceArray::from_raw(
+            xq.handle()
+                .clone()
+                .offset_start((start * n_features * size_of::<F>()) as u64),
+            rows * n_features,
+        );
+        let out_val: DeviceArray<ActiveRuntime, F> = DeviceArray::from_raw(
+            val_handle
+                .clone()
+                .offset_start((start * k * size_of::<F>()) as u64),
+            rows * k,
+        );
+        let out_idx: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_raw(
+            idx_handle
+                .clone()
+                .offset_start((start * k * size_of::<u32>()) as u64),
+            rows * k,
+        );
+
+        // Pairwise SQUARED Euclidean distance for this tile (no sqrt — top-k
+        // selects on the order-preserving squared form, Pitfall 8).
+        // DIRECT per-element kernel by default (KNN-01): the GEMM-expansion's
+        // `cubek-matmul` call is pathologically slow at the tiny contraction
+        // dimension a pairwise-distance shape has (`k = n_features`), and after
+        // the selection kernel was fixed it was ~99% of KNN predict. Set
+        // `MLRS_KNN_GEMM_DISTANCE=1` to A/B against the expansion path on the
+        // target device.
+        let dist = {
+            let attempt = if gemm_distance {
+                distance_with_ynorm::<F>(
+                    pool,
+                    &xq_tile,
+                    (rows, n_features),
+                    x_train,
+                    (n_train, n_features),
+                    false,
+                    None,
+                    ynorm.as_ref(),
+                )
+            } else {
+                distance_direct::<F>(
+                    pool,
+                    &xq_tile,
+                    (rows, n_features),
+                    x_train,
+                    (n_train, n_features),
+                    None,
+                )
+            };
+            match attempt {
+                Ok(d) => d,
+                Err(e) => {
+                    // `ynorm` is scratch owned by THIS function — release it
+                    // before propagating so the pool's `live_bytes` is conserved
+                    // across the failure.
+                    if let Some(yn) = ynorm {
+                        yn.release_into(pool);
+                    }
+                    return Err(AlgoError::Prim(e));
+                }
+            }
+        };
+
+        // Select the k nearest per query row, sqrt at the boundary so the returned
+        // distances are true sqrt-Euclidean (lowest-index tie-break inherited from
+        // the validated top_k prim, 05-02). The `out_*` views mean the results land
+        // in the full buffers with no copy-back (D-11).
+        let (val_view, idx_view) = match top_k::<F>(
+            pool,
+            &dist,
+            rows,
+            n_train,
+            k,
+            true,
+            Some(out_val),
+            Some(out_idx),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                // Same conservation duty as the distance arm, plus this tile's
+                // distance scratch.
+                dist.release_into(pool);
+                if let Some(yn) = ynorm {
+                    yn.release_into(pool);
+                }
+                return Err(AlgoError::Prim(e));
+            }
+        };
+        // `val_view`/`idx_view` alias the caller-owned full buffers — drop the
+        // wrappers WITHOUT releasing, or the pool would hand the live output to a
+        // later acquire (WR-07).
+        drop(val_view);
+        drop(idx_view);
+
+        // Scratch only: return it so the next tile reuses the same buffer (D-11).
+        dist.release_into(pool);
+
+        start += rows;
+    }
+    // The hoisted norm term is scratch owned by THIS function (distance never
+    // releases a caller-supplied one) — return it to the pool now that the last
+    // tile has consumed it.
+    if let Some(yn) = ynorm {
+        yn.release_into(pool);
+    }
+
+    Ok(())
 }

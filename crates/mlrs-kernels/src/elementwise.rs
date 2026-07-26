@@ -55,6 +55,26 @@ pub fn clamp_nonneg<F: Float + CubeElement>(input: &Array<F>, output: &mut Array
     }
 }
 
+/// Element-wise copy `out[i] = in[i]` — a DEVICE-TO-DEVICE buffer duplication.
+///
+/// Exists so an estimator can take OWNERSHIP of a caller's device operand at
+/// `fit` time without the `to_host` → `from_host` round-trip that ownership
+/// used to require (KNN-01 removed that round-trip by aliasing the caller's
+/// handle instead, which is unsound the moment the caller returns its own array
+/// to the `BufferPool` — see `neighbors::nearest::Fit::fit`). One pass over the
+/// buffer on the device, no bus traffic, no host allocation.
+///
+/// Deliberately not `scale(input, out, 1.0)`: an identity multiply is only
+/// value-preserving, and this must be a BIT-exact duplicate of whatever the
+/// caller uploaded.
+#[cube(launch)]
+pub fn copy_elem<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        output[tid] = input[tid];
+    }
+}
+
 /// Element-wise square root `out[i] = sqrt(in[i])` (D-08, the optional Euclidean
 /// boundary for KNN). The distance host API clamps to `>= 0` BEFORE this, so the
 /// argument is always non-negative (no `sqrt`-of-negative NaN — T-0203-03).

@@ -78,3 +78,42 @@ def test_kneighbors_regressor_oracle(fixture):
         atol=_atol(fixture),
         rtol=0.0,
     )
+
+
+def test_invalid_algorithm():
+    """Verify that NearestNeighbors, KNeighborsClassifier, and KNeighborsRegressor raise ValueError on invalid algorithm.
+
+    float32 operands deliberately: the ``algorithm`` guard is dtype-independent
+    and lives in the Python shim, so keeping the fitted arrays off f64 lets this
+    run on an f64-incapable backend (rocm) instead of being skipped by
+    ``requires_f64`` like the fixture-replay tests above. With float64 the
+    accepted-algorithm ``fit`` calls would reach ``guard_f64`` and ERROR rather
+    than skip.
+    """
+    X = np.random.randn(10, 4).astype(np.float32)
+    y_class = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=np.int32)
+    y_reg = np.random.randn(10).astype(np.float32)
+
+    # NearestNeighbors
+    nn = mlrs.NearestNeighbors(algorithm="invalid")
+    with pytest.raises(ValueError, match="Algorithm is not supported"):
+        nn.fit(X)
+    # auto and brute are accepted
+    mlrs.NearestNeighbors(algorithm="auto").fit(X)
+    mlrs.NearestNeighbors(algorithm="brute").fit(X)
+
+    # KNeighborsClassifier
+    clf = mlrs.KNeighborsClassifier(algorithm="invalid")
+    with pytest.raises(ValueError, match="Algorithm is not supported"):
+        clf.fit(X, y_class)
+    # auto and brute are accepted
+    mlrs.KNeighborsClassifier(algorithm="auto").fit(X, y_class)
+    mlrs.KNeighborsClassifier(algorithm="brute").fit(X, y_class)
+
+    # KNeighborsRegressor
+    reg = mlrs.KNeighborsRegressor(algorithm="invalid")
+    with pytest.raises(ValueError, match="Algorithm is not supported"):
+        reg.fit(X, y_reg)
+    # auto and brute are accepted
+    mlrs.KNeighborsRegressor(algorithm="auto").fit(X, y_reg)
+    mlrs.KNeighborsRegressor(algorithm="brute").fit(X, y_reg)

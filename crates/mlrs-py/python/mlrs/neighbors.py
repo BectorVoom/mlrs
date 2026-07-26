@@ -17,11 +17,17 @@ from .base import MlrsBase
 class NearestNeighbors(MlrsBase):
     """Brute-force k-NN search (NEIGH-01). Exposes ``kneighbors`` — no predict."""
 
-    def __init__(self, n_neighbors=5, output_type="input"):
+    def __init__(self, n_neighbors=5, algorithm="auto", output_type="input"):
         self.n_neighbors = n_neighbors
+        self.algorithm = algorithm
         self.output_type = output_type
 
     def fit(self, X, y=None):
+        if self.algorithm not in ["auto", "brute"]:
+            raise ValueError(
+                f"Algorithm is not supported: {self.algorithm}. "
+                f"Supported algorithms are ['auto', 'brute']"
+            )
         xa, rows, cols = self._normalize(X)
         obj = self._ext().NearestNeighbors(self.n_neighbors)
         obj.fit(xa, rows, cols)
@@ -50,11 +56,17 @@ class NearestNeighbors(MlrsBase):
 class KNeighborsClassifier(ClassifierMixin, MlrsBase):
     """k-NN classification by majority vote (NEIGH-02)."""
 
-    def __init__(self, n_neighbors=5, output_type="input"):
+    def __init__(self, n_neighbors=5, algorithm="auto", output_type="input"):
         self.n_neighbors = n_neighbors
+        self.algorithm = algorithm
         self.output_type = output_type
 
     def fit(self, X, y):
+        if self.algorithm not in ["auto", "brute"]:
+            raise ValueError(
+                f"Algorithm is not supported: {self.algorithm}. "
+                f"Supported algorithms are ['auto', 'brute']"
+            )
         xa, rows, cols = self._normalize(X)
         ya = self._normalize_y(y, dtype=self._x_float(xa))
         obj = self._ext().KNeighborsClassifier(self.n_neighbors)
@@ -85,11 +97,17 @@ class KNeighborsClassifier(ClassifierMixin, MlrsBase):
 class KNeighborsRegressor(RegressorMixin, MlrsBase):
     """k-NN regression by neighbor mean (NEIGH-03)."""
 
-    def __init__(self, n_neighbors=5, output_type="input"):
+    def __init__(self, n_neighbors=5, algorithm="auto", output_type="input"):
         self.n_neighbors = n_neighbors
+        self.algorithm = algorithm
         self.output_type = output_type
 
     def fit(self, X, y):
+        if self.algorithm not in ["auto", "brute"]:
+            raise ValueError(
+                f"Algorithm is not supported: {self.algorithm}. "
+                f"Supported algorithms are ['auto', 'brute']"
+            )
         xa, rows, cols = self._normalize(X)
         ya = self._normalize_y(y, dtype=KNeighborsClassifier._x_float(xa))
         obj = self._ext().KNeighborsRegressor(self.n_neighbors)
