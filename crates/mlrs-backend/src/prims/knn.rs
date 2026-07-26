@@ -31,7 +31,7 @@ use mlrs_kernels::knn::{
     CPU_QUERY_TILE,
 };
 use mlrs_kernels::topk::select_k_onepass_indexed;
-use mlrs_kernels::{copy_elem, sqrt_elem};
+use mlrs_kernels::{copy_elem, copy_elem_cpu_chunked, sqrt_elem};
 
 use crate::capability;
 use crate::device_array::DeviceArray;
@@ -143,6 +143,24 @@ where
 /// This is NOT the `to_host` → `from_host` round-trip KNN-01 deleted: no bus
 /// traffic and no host allocation, just one device pass over the buffer. At the
 /// 200k × 32 f32 ladder rung `fit` still measures 0.0000 s.
+///
+/// KNN-FIT-01: on the **cpu** backend this dispatches
+/// [`copy_elem_cpu_chunked`] (one cube of `cpu_launch_units` threads, each
+/// copying a contiguous span) instead of [`copy_elem`]'s
+/// one-unit-per-element GATHER shape. `copy_elem`'s `ceil(len /
+/// cpu_launch_units)`-cube grid pays a per-cube thread-spawn/join cost on
+/// `cubecl-cpu` (one OS thread per unit) for every `cpu_launch_units`
+/// elements — at `KNeighborsClassifier::fit`'s 100k×32 f32 training-matrix
+/// size that measured ~1.9 GB/s, an order of magnitude below a plain memcpy,
+/// and made `fit` lose to sklearn on cpu. Other backends are GPU-shaped
+/// hardware (many cheap concurrent lanes), so they keep the original
+/// one-thread-per-element form.
+///
+/// Every `#[cube(launch)]` kernel's `Array` metadata is `u32`-indexed (a
+/// structural limit of the whole prims layer, e.g. `launch_dims_1d`'s
+/// `n as u32` below), so `len` is asserted to fit before either kernel is
+/// dispatched — a loud panic instead of the silent truncated-copy this guard
+/// replaces (code-review KNN-FIT-01).
 pub fn device_copy<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     src: &DeviceArray<ActiveRuntime, F>,
@@ -151,14 +169,25 @@ where
     F: Float + CubeElement + Pod,
 {
     let len = src.len();
+    assert!(
+        len <= u32::MAX as usize,
+        "device_copy: {len} elements exceeds the u32 index ceiling every CubeCL kernel launch is bound by"
+    );
     let handle = pool.acquire(len * size_of::<F>());
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(len);
     // SAFETY: both lengths are the same validated element count carried by the
-    // source array; the kernel bounds-checks `tid < input.len()`.
+    // source array; both kernels bounds-check the thread/tid against it.
     let in_arg = unsafe { ArrayArg::from_raw_parts(src.handle().clone(), len) };
     let out_arg = unsafe { ArrayArg::from_raw_parts(handle.clone(), len) };
-    copy_elem::launch::<F, ActiveRuntime>(&client, count, dim, in_arg, out_arg);
+    if capability::active_backend_name() == "cpu" {
+        let threads = capability::cpu_launch_units();
+        let count = CubeCount::Static(1, 1, 1);
+        let dim = CubeDim { x: threads, y: 1, z: 1 };
+        copy_elem_cpu_chunked::launch::<F, ActiveRuntime>(&client, count, dim, in_arg, out_arg);
+    } else {
+        let (count, dim) = launch_dims_1d(len);
+        copy_elem::launch::<F, ActiveRuntime>(&client, count, dim, in_arg, out_arg);
+    }
     DeviceArray::from_raw(handle, len)
 }
 

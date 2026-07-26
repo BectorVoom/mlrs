@@ -75,6 +75,55 @@ pub fn copy_elem<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>
     }
 }
 
+/// Barrier-free CHUNKED device-to-device copy for the **cpu** backend
+/// (KNN-FIT-01): `cubecl-cpu` maps one OS thread per unit and runs the cube
+/// grid as a serial loop inside each of them, so [`copy_elem`]'s
+/// one-unit-per-element GATHER shape needs `ceil(len / cpu_launch_units)`
+/// cubes — a per-cube thread-spawn/join cost paid for every `cpu_launch_units`
+/// elements copied, which is pathological once `len` reaches the low
+/// millions (a `KNeighborsClassifier::fit` device_copy of a 100k×32 f32
+/// training matrix measured ~1.9 GB/s this way, an order of magnitude below a
+/// plain memcpy, and made mlrs's `fit` slower than sklearn's on cpu). This
+/// kernel instead launches as ONE cube, each of its `CUBE_DIM_X` units copying
+/// its own CONTIGUOUS `ceil(len / CUBE_DIM_X)`-element span in a loop — the
+/// same row-tiling idea `euclidean_topk_rows_cpu` uses for query rows, applied
+/// here to a flat element range. No `SharedMemory`, no `sync_cube`: spans
+/// never overlap, so this is safe on cubecl-cpu at zero barrier cost.
+///
+/// SELF-VERIFYING like [`copy_elem`] (D-13 review fix, KNN-FIT-01): `len` and
+/// the thread count are read off `input.len()`/`CUBE_DIM_X` — the actual
+/// launch shape and array metadata — rather than trusted as separate scalar
+/// arguments a caller could pass out of sync with the real buffers. The write
+/// is additionally guarded by `i < output.len()`, so a mismatched output
+/// buffer degrades to a partial-but-in-bounds copy, never an OOB write. Bit-
+/// exact with `copy_elem` (still a bare assignment, D-07's "not an identity
+/// multiply" rationale still applies).
+#[cube(launch)]
+pub fn copy_elem_cpu_chunked<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>) {
+    let tid = UNIT_POS_X;
+    let threads = CUBE_DIM_X;
+    if tid < threads {
+        // `Array::len()` is `usize`-typed (it backs `ABSOLUTE_POS`-indexed
+        // comparisons like `copy_elem`'s), but every other quantity here is
+        // the `u32` cube/unit topology — cast once so the chunk arithmetic
+        // stays in one type.
+        let len = input.len() as u32;
+        let chunk = (len + threads - 1u32) / threads;
+        let start = tid * chunk;
+        let mut end = start + chunk;
+        if end > len {
+            end = len;
+        }
+        let mut i = start;
+        while i < end {
+            if (i as usize) < output.len() {
+                output[i as usize] = input[i as usize];
+            }
+            i += 1u32;
+        }
+    }
+}
+
 /// Element-wise square root `out[i] = sqrt(in[i])` (D-08, the optional Euclidean
 /// boundary for KNN). The distance host API clamps to `>= 0` BEFORE this, so the
 /// argument is always non-negative (no `sqrt`-of-negative NaN — T-0203-03).

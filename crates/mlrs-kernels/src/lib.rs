@@ -91,10 +91,10 @@ pub use distance::{
     minkowski_dist, self_drop_gather,
 };
 pub use elementwise::{
-    center_columns, clamp_nonneg, copy_elem, degree_guard, dist_combine_clamp, div_by_row,
-    kde_cosine_map, kde_epanechnikov_map, kde_exponential_map, kde_gaussian_map, kde_linear_map,
-    kde_tophat_map, laplacian_map, poly_map, rbf_map, scale, sigmoid_map, sqrt_elem,
-    zero_diag_copy,
+    center_columns, clamp_nonneg, copy_elem, copy_elem_cpu_chunked, degree_guard,
+    dist_combine_clamp, div_by_row, kde_cosine_map, kde_epanechnikov_map, kde_exponential_map,
+    kde_gaussian_map, kde_linear_map, kde_tophat_map, laplacian_map, poly_map, rbf_map, scale,
+    sigmoid_map, sqrt_elem, zero_diag_copy,
 };
 // HistGradientBoosting kernels (GBT-01): loss gradients (squared error /
 // binary log-loss / multiclass log-loss with staged softmax), row-blocked
