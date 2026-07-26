@@ -27,8 +27,8 @@ use mlrs_core::PrimError;
 use mlrs_kernels::knn::{
     euclidean_topk_fused, euclidean_topk_fused_dot, euclidean_topk_fused_dot_vec,
     euclidean_topk_fused_dot_vec8, euclidean_topk_rows_cpu, euclidean_topk_rows_cpu_direct,
-    euclidean_topk_rows_cpu_direct_w64, euclidean_topk_rows_cpu_vec, knn_regress_mean, row_sumsq,
-    CPU_K_CAP, CPU_MAX_COLS, CPU_QUERY_TILE, CPU_QUERY_TILE_WIDE, CPU_QUERY_TILE_WIDEST,
+    euclidean_topk_rows_cpu_vec, knn_regress_mean, row_sumsq, CPU_K_CAP, CPU_MAX_COLS,
+    CPU_QUERY_TILE, CPU_QUERY_TILE_WIDE,
 };
 use mlrs_kernels::topk::select_k_onepass_indexed;
 use mlrs_kernels::{copy_elem, copy_elem_cpu_chunked, sqrt_elem};
@@ -301,34 +301,6 @@ fn cpu_rows_launch_dims(n_query: usize, tile: u32) -> (CubeCount, CubeDim) {
     )
 }
 
-/// Query-tile width for the DIRECT arm: [`CPU_QUERY_TILE_WIDEST`] when there is
-/// enough work to keep every thread busy at that grain, else
-/// [`CPU_QUERY_TILE_WIDE`].
-///
-/// Width is a throughput/grain trade with an optimum that depends on `n_query`,
-/// so it cannot be one constant. The 64-lane kernel's dot loop measured ~1.36×
-/// the 32-lane one's (255 vs 187 GFMA/s on a 16-core Zen5 — the scalar `y[t, c]`
-/// load and splat that feed each vector FMA are paid per FMA whatever its width,
-/// so a wider vector amortizes them). But the width is ALSO the scheduling
-/// grain: the launch splits `ceil(n_query / tile)` tiles over
-/// `cpu_launch_units()` threads, so below `units * tile` query rows some threads
-/// get no tile at all and the wider kernel LOSES — at 16 threads that is 1024
-/// rows for the 64-lane form against 512 for the 32-lane one.
-///
-/// Requiring a full `units * WIDEST` before switching keeps the wide form on the
-/// only side of that line where it can win. Both kernels come from one macro
-/// body, so this is purely a speed choice — the emitted top-k is identical
-/// either way, which is what lets `cpu_rows_topk_matches_brute_force` gate both
-/// through the same reference by sweeping `MLRS_CPU_UNITS`.
-fn cpu_direct_tile(n_query: usize) -> u32 {
-    let units = capability::cpu_launch_units() as usize;
-    if n_query >= units * CPU_QUERY_TILE_WIDEST as usize {
-        CPU_QUERY_TILE_WIDEST
-    } else {
-        CPU_QUERY_TILE_WIDE
-    }
-}
-
 /// CPU-shaped fused k-nearest search (KNN-04): norms + one barrier-free
 /// row-scan kernel + the boundary sqrt.
 ///
@@ -408,43 +380,24 @@ where
     if direct_selected() {
         let val_handle = pool.acquire(out_len * size_of::<F>());
         let idx_handle = pool.acquire(out_len * size_of::<u32>());
-        let tile = cpu_direct_tile(n_query);
-        let (count, dim) = cpu_rows_launch_dims(n_query, tile);
+        let (count, dim) = cpu_rows_launch_dims(n_query, CPU_QUERY_TILE_WIDE);
         let x_arg = unsafe { ArrayArg::from_raw_parts(xq.handle().clone(), xq.len()) };
         let y_arg = unsafe { ArrayArg::from_raw_parts(x_train.handle().clone(), x_train.len()) };
         let val_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         let idx_arg = unsafe { ArrayArg::from_raw_parts(idx_handle.clone(), out_len) };
-        // The two widths differ ONLY in lane count (one macro body — see
-        // `impl_topk_rows_cpu_direct`), so this picks a speed, never a result.
-        if tile == CPU_QUERY_TILE_WIDEST {
-            euclidean_topk_rows_cpu_direct_w64::launch::<F, ActiveRuntime>(
-                &client,
-                count,
-                dim,
-                x_arg,
-                y_arg,
-                val_arg,
-                idx_arg,
-                n_query as u32,
-                n_train as u32,
-                n_features as u32,
-                k as u32,
-            );
-        } else {
-            euclidean_topk_rows_cpu_direct::launch::<F, ActiveRuntime>(
-                &client,
-                count,
-                dim,
-                x_arg,
-                y_arg,
-                val_arg,
-                idx_arg,
-                n_query as u32,
-                n_train as u32,
-                n_features as u32,
-                k as u32,
-            );
-        }
+        euclidean_topk_rows_cpu_direct::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            x_arg,
+            y_arg,
+            val_arg,
+            idx_arg,
+            n_query as u32,
+            n_train as u32,
+            n_features as u32,
+            k as u32,
+        );
         if sqrt {
             let (scount, sdim) = launch_dims_1d(out_len);
             let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };

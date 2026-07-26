@@ -836,18 +836,18 @@ fn host_rows_topk(
 /// the `CPU_MAX_COLS` cap, and more query rows than one cube's worth so the cube
 /// loop runs several times per unit.
 ///
-/// The `MLRS_CPU_UNITS` sweep is what reaches BOTH direct widths from one case
-/// list: `cpu_direct_tile` switches to the 64-row kernel at `n_query >= units *
-/// 64`, so a case at `units = 1` exercises the wide kernel and the same case at
-/// `units = 16` exercises the narrow one — and both must reproduce the identical
-/// reference, which is the claim that lets the dispatch be a pure speed choice.
+/// The `MLRS_CPU_UNITS` sweep makes the query-tile-to-thread mapping invisible in
+/// the results: the same case at `units = 1`, `3` and `16` distributes tiles
+/// differently (and leaves different numbers of dummy lanes in the tail tile),
+/// and all three must reproduce the identical reference.
 ///
-/// Note what this test does NOT pin: the direct kernels scan `t` in ascending
-/// order, so `insert_lane`'s `t < lworst_idx` tie-break is unreachable on this
-/// path and no input can distinguish it (verified by flipping the min-screen's
-/// `<=` to `<` — every case still passes). The tie-break is gated on the GPU
-/// family instead, by `fused_topk_matches_two_kernel_bitwise`, where the k-round
-/// strip merge really does present candidates out of index order.
+/// Note what this test does NOT pin: these kernels scan `t` in ascending order,
+/// so `insert_lane`'s `t < lworst_idx` tie-break is unreachable on this path and
+/// no input can distinguish it. The tie-break is gated on the GPU family
+/// instead, by `fused_topk_matches_two_kernel_bitwise`, where the k-round strip
+/// merge really does present candidates out of index order. Non-finite input is
+/// likewise not covered here — the host reference is undefined on NaN — so it
+/// gets its own invariant test, `cpu_rows_topk_survives_non_finite`.
 ///
 /// The whole test is a no-op off the cpu backend — the kernel's
 /// one-thread-per-unit shape is meaningless on a GPU, and `cpu_rows_applicable`
@@ -868,13 +868,19 @@ fn cpu_rows_topk_matches_brute_force() {
         (300, 100, 4, 10, Some(3)),
         // d at the cpu cap with the argmin-degenerate k = 1.
         (500, 70, 32, 1, None),
-        // Exactly one 64-row DIRECT tile (reached at `units = 1`), and one row
-        // past it so the wide kernel's over-provisioned-lane guard runs.
-        (300, 64, 8, 5, None),
-        (300, 65, 8, 5, None),
-        // Tie-saturated ACROSS the 64-row tile, so the wide kernel's min-screen
-        // is exercised on the inputs where almost every admission decision is a
-        // tie rather than a comparison.
+        // Exactly one 32-row DIRECT tile, and one row past it so the
+        // over-provisioned-lane guard (and the disabled dummy lanes) run.
+        (300, 32, 8, 5, None),
+        (300, 33, 8, 5, None),
+        // n_train NOT divisible by 4, so the LAST training block is partial and
+        // the rows the dot loop clamps to `rows_y - 1` are skipped rather than
+        // admitted as duplicates. Every other case here has `n_train % 4 == 0`,
+        // which left that path unexercised.
+        (301, 33, 8, 5, None),
+        (299, 70, 16, 10, None),
+        // Tie-saturated across several tiles, so the mask screen is exercised on
+        // inputs where almost every admission decision is a tie rather than a
+        // comparison.
         (400, 128, 4, 10, Some(3)),
         // More query rows than one cube covers, so the cube loop runs several
         // times per unit, and a tie-saturated tail.
@@ -996,4 +1002,115 @@ fn cpu_rows_topk_rejects_bad_geometry() {
         cpu_rows_topk::<f32>(&mut p, &wide_q, (1, wide), &wide_t, 2, 1, true),
         Err(PrimError::ShapeMismatch { .. })
     ));
+}
+
+/// KNN-REG-01 regression gate: NON-FINITE input must not corrupt the neighbor
+/// lists beyond the row that carries it.
+///
+/// Two distinct regressions were introduced by the sentinel-prefill rewrite and
+/// are pinned here. Neither is comparable against [`host_rows_topk`] — a host
+/// reference is just as undefined on NaN as the kernel is — so this asserts
+/// INVARIANTS instead of equality:
+///
+/// 1. **No sentinel escapes.** A query row whose distances are all NaN admits
+///    nothing (`v < w` and `v == w` are both false for NaN), so its slots still
+///    hold the `(+∞, u32::MAX)` prefill when the scan ends. Emitting `u32::MAX`
+///    put an OUT-OF-RANGE training index into every consumer: `knn_regress_mean`
+///    skipped it and silently predicted `0.0`, and `KNeighborsClassifier`
+///    rejected the whole batch with a shape error. `emit_lists` clamps it, so
+///    every emitted index must be `< n_train` — for EVERY row, whatever the
+///    input.
+/// 2. **A non-finite TRAINING row must not take its block-mates down with it.**
+///    An earlier screen bounded a whole 4-row training block with
+///    `min(min(d0,d1),min(d2,d3))`. `min` propagates NaN, so one NaN row made the
+///    bound NaN, the `<=` test false, and all four rows were skipped for every
+///    lane — silently dropping the NaN row's three FINITE neighbours from the
+///    candidate set. The per-row mask screen keeps the blast radius to the NaN
+///    row itself, so poisoning row `p` must leave every OTHER training index
+///    still selectable.
+///
+/// No-op off the cpu backend, like its sibling above.
+#[test]
+fn cpu_rows_topk_survives_non_finite() {
+    use mlrs_backend::prims::knn::{cpu_rows_applicable, cpu_rows_topk};
+
+    let (n_train, n_query, d, k) = (300usize, 70usize, 4usize, 5usize);
+    if !cpu_rows_applicable::<f32>(n_query, n_train, d, k) {
+        println!("SKIP non-finite case: not the cpu backend");
+        return;
+    }
+
+    let mut s = 0x51F7_C0DEu64;
+    let base_t: Vec<f32> = (0..n_train * d)
+        .map(|_| ((splitmix64(&mut s) >> 40) as f32 / 8_388_608.0) * 2.0 - 1.0)
+        .collect();
+    let base_q: Vec<f32> = (0..n_query * d)
+        .map(|_| ((splitmix64(&mut s) >> 40) as f32 / 8_388_608.0) * 2.0 - 1.0)
+        .collect();
+
+    // Every arm, and every unit count, since the tile-to-thread mapping decides
+    // which lanes are dummies and the screen runs per tile.
+    let arms = [("direct", "1", "0"), ("dot-simd", "1", "1"), ("dot-scalar", "0", "1")];
+    for (arm, vec_mode, dot_mode) in arms {
+        for units in ["1", "3", "16"] {
+            let run = |xq: &[f32], xt: &[f32]| -> Vec<u32> {
+                let mut p = pool();
+                let xqd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut p, xq);
+                let xtd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut p, xt);
+                std::env::set_var("MLRS_KNN_CPU_VEC", vec_mode);
+                std::env::set_var("MLRS_KNN_DOT", dot_mode);
+                std::env::set_var("MLRS_CPU_UNITS", units);
+                let (v, i) =
+                    cpu_rows_topk::<f32>(&mut p, &xqd, (n_query, d), &xtd, n_train, k, true)
+                        .expect("cpu rows");
+                let out = i.to_host(&p);
+                std::env::remove_var("MLRS_KNN_CPU_VEC");
+                std::env::remove_var("MLRS_KNN_DOT");
+                std::env::remove_var("MLRS_CPU_UNITS");
+                v.release_into(&mut p);
+                out
+            };
+            let tag = format!("arm={arm} units={units}");
+
+            // --- 1. a NaN QUERY row must still emit in-range indices ---
+            let mut xq = base_q.clone();
+            xq[3 * d + 2] = f32::NAN;
+            let got = run(&xq, &base_t);
+            for (n, &ix) in got.iter().enumerate() {
+                assert!(
+                    (ix as usize) < n_train,
+                    "out-of-range neighbor index {ix} at slot {n} (query row {}) with a NaN \
+                     query row at {tag} — a sentinel escaped to the caller",
+                    n / k
+                );
+            }
+
+            // --- 2. a NaN TRAINING row must not remove its finite block-mates ---
+            let poisoned_row = 8usize; // 4-row block 8..11
+            let mut xt = base_t.clone();
+            xt[poisoned_row * d + 1] = f32::NAN;
+            let after = run(&base_q, &xt);
+            for (n, &ix) in after.iter().enumerate() {
+                assert!(
+                    (ix as usize) < n_train,
+                    "out-of-range index {ix} at slot {n} with a NaN training row at {tag}"
+                );
+            }
+            // The poisoned row's block-mates are finite and must remain
+            // selectable: the baseline picks them for some query rows, and only
+            // the poisoned index itself may disappear.
+            let before = run(&base_q, &base_t);
+            for m in [poisoned_row + 1, poisoned_row + 2, poisoned_row + 3] {
+                let m = m as u32;
+                let was = before.contains(&m);
+                let is = after.contains(&m);
+                assert!(
+                    !was || is,
+                    "training row {m} is FINITE and was selected before row {poisoned_row} was \
+                     poisoned, but is gone afterwards at {tag} — a non-finite row took its \
+                     block-mates down with it"
+                );
+            }
+        }
+    }
 }
