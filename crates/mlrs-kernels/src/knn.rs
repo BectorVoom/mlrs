@@ -1968,6 +1968,37 @@ pub fn row_sumsq<F: Float + CubeElement>(
 /// training stream: every training row a unit loads feeds this many query rows.
 pub const CPU_QUERY_TILE: u32 = 16;
 
+/// Query rows one unit owns in [`euclidean_topk_rows_cpu_direct`] — the cpu
+/// DEFAULT kernel, which runs a WIDER tile than the expansion arms above.
+///
+/// ## Why wider (KNN-REG-01, measured — not a guess)
+/// The inner loop's per-feature cost is not the arithmetic, it is the ops
+/// SURROUNDING it: one scalar `y[t, c]` load plus one splat feed each vector
+/// FMA, and those two are paid per FMA regardless of how many query rows the
+/// vector covers. Doubling the lane count therefore halves the per-query-row
+/// overhead. A roofline probe of this exact loop shape on a 16-core Zen5
+/// (`vector<Nxf32>`, 4 independent training rows, one splat per FMA) measured:
+///
+/// | lanes | GFMA/s | vs 16 |
+/// |-------|--------|-------|
+/// | 16    | 147    | 1.00× |
+/// | 32    | 219    | 1.49× |
+/// | 64    | 258    | 1.75× |
+/// | 128   | 171    | 1.16× |
+///
+/// 64 is the throughput peak, but the width is also the SCHEDULING GRAIN: a
+/// launch splits `ceil(n_query / tile)` tiles over `cpu_launch_units()` threads,
+/// so a wide tile leaves threads idle until `n_query >= units * tile`. Both
+/// widths therefore exist — `prims::knn::cpu_direct_tile` picks between them on
+/// `n_query`. This is the NARROWER of the two (full occupancy from `n_query >=
+/// 512` at 16 threads). The `k`-list stride stays [`CPU_K_CAP`] either way.
+pub const CPU_QUERY_TILE_WIDE: u32 = 32;
+
+/// The WIDER query tile of [`euclidean_topk_rows_cpu_direct_w64`] — the
+/// throughput peak of the table in [`CPU_QUERY_TILE_WIDE`], used once `n_query`
+/// is large enough to fill every thread at this grain (`units * 64`).
+pub const CPU_QUERY_TILE_WIDEST: u32 = 64;
+
 /// Largest `n_features` the cpu row-scan kernels cache in their local
 /// transposed query tile (`CPU_QUERY_TILE * CPU_MAX_COLS` `F` of stack).
 pub const CPU_MAX_COLS: u32 = 32;
@@ -2210,8 +2241,19 @@ pub fn euclidean_topk_rows_cpu<F: Float + CubeElement>(
 /// the identical scalar sequence [`euclidean_topk_rows_cpu`] runs in its
 /// `acc[a]` slot, just issued a tile at a time; the expansion is likewise
 /// `(‖x‖² + ‖y‖²) − 2·x·y` with the same association. The clamp, admission
-/// rule and emit are copied verbatim. Results are therefore BITWISE identical
-/// to the scalar kernel's, which is what `knn_test.rs` asserts.
+/// rule and emit are the same too — this kernel keeps the plain `mul` + `add`
+/// accumulation and does NOT take the DIRECT kernel's `fma()`, precisely
+/// because `fma` rounds once where the scalar twin rounds twice. Results are
+/// therefore BITWISE identical to the scalar kernel's, which is what
+/// `knn_test.rs` asserts.
+///
+/// KNN-REG-01 did give this kernel the two changes that cost no accuracy: its
+/// accumulators and row bases are `let` bindings rather than an `Array` (stack
+/// memory at `-O0`), and its top-k lists arrive sentinel-prefilled from
+/// [`prefill_lists`] so admission's reject path drops the per-lane `lcnt` load
+/// and `cnt < k` branch. It keeps the PER-ROW [`admit_tile`] rather than the
+/// DIRECT kernel's min-screened block form, because its clamp has to be applied
+/// per lane before any comparison is valid.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
@@ -2235,9 +2277,10 @@ pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
         let mut xt = Array::<Vector<F, Const<16>>>::new(32usize);
         let mut lval = Array::<F>::new(256usize);
         let mut lidx = Array::<u32>::new(256usize);
-        let mut lcnt = Array::<u32>::new(16usize);
         let mut lworst_val = Array::<F>::new(16usize);
         let mut lworst_idx = Array::<u32>::new(16usize);
+
+        prefill_lists::<F>(&mut lval, &mut lidx, &mut lworst_val, &mut lworst_idx, 16u32, k);
 
         // The query norms live as a VECTOR so the expansion below is one
         // vector add/sub for the whole tile.
@@ -2250,9 +2293,6 @@ pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
                 nv = xnorm[r as usize];
             }
             xnv[a as usize] = nv;
-            lcnt[a as usize] = 0u32;
-            lworst_val[a as usize] = zero_f;
-            lworst_idx[a as usize] = 0u32;
         }
         let mut c = 0u32;
         while c < cols {
@@ -2284,20 +2324,26 @@ pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
             // Rows past the end are CLAMPED to the last row so the inner loop
             // stays branch-free — their results are discarded by the
             // `tt < rows_y` guard at admission.
-            let mut yb = Array::<u32>::new(4usize);
-            #[unroll]
-            for u in 0..4u32 {
-                let mut tt = t + u;
-                if tt >= rows_y {
-                    tt = rows_y - 1u32;
-                }
-                yb[u as usize] = tt * cols;
+            let mut t1 = t + 1u32;
+            if t1 >= rows_y {
+                t1 = rows_y - 1u32;
             }
-            let mut accs = Array::<Vector<F, Const<16>>>::new(4usize);
-            #[unroll]
-            for u in 0..4u32 {
-                accs[u as usize] = Vector::<F, Const<16>>::from_int(0i64);
+            let mut t2 = t + 2u32;
+            if t2 >= rows_y {
+                t2 = rows_y - 1u32;
             }
+            let mut t3 = t + 3u32;
+            if t3 >= rows_y {
+                t3 = rows_y - 1u32;
+            }
+            let b0 = t * cols;
+            let b1 = t1 * cols;
+            let b2 = t2 * cols;
+            let b3 = t3 * cols;
+            let mut a0 = Vector::<F, Const<16>>::from_int(0i64);
+            let mut a1 = Vector::<F, Const<16>>::from_int(0i64);
+            let mut a2 = Vector::<F, Const<16>>::from_int(0i64);
+            let mut a3 = Vector::<F, Const<16>>::from_int(0i64);
 
             // Comptime-unrolled 8-feature chunks, then the sub-8 tail — the
             // loop bookkeeping is what the unroll is buying, not the FMAs.
@@ -2308,45 +2354,70 @@ pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
                 for i in 0..8u32 {
                     let cc = cb + i;
                     let xv = xt[cc as usize];
-                    #[unroll]
-                    for u in 0..4u32 {
-                        accs[u as usize] +=
-                            xv * Vector::<F, Const<16>>::new(y[(yb[u as usize] + cc) as usize]);
-                    }
+                    a0 += xv * Vector::<F, Const<16>>::new(y[(b0 + cc) as usize]);
+                    a1 += xv * Vector::<F, Const<16>>::new(y[(b1 + cc) as usize]);
+                    a2 += xv * Vector::<F, Const<16>>::new(y[(b2 + cc) as usize]);
+                    a3 += xv * Vector::<F, Const<16>>::new(y[(b3 + cc) as usize]);
                 }
                 h += 1u32;
             }
             let mut ct = tail0;
             while ct < cols {
                 let xv = xt[ct as usize];
-                #[unroll]
-                for u in 0..4u32 {
-                    accs[u as usize] +=
-                        xv * Vector::<F, Const<16>>::new(y[(yb[u as usize] + ct) as usize]);
-                }
+                a0 += xv * Vector::<F, Const<16>>::new(y[(b0 + ct) as usize]);
+                a1 += xv * Vector::<F, Const<16>>::new(y[(b1 + ct) as usize]);
+                a2 += xv * Vector::<F, Const<16>>::new(y[(b2 + ct) as usize]);
+                a3 += xv * Vector::<F, Const<16>>::new(y[(b3 + ct) as usize]);
                 ct += 1u32;
             }
 
-            #[unroll]
-            for u in 0..4u32 {
-                let tt = t + u;
-                if tt < rows_y {
-                    // d² = (‖x‖² + ‖y‖²) − 2·x·y for the whole tile at once;
-                    // the same association the scalar kernel evaluates per
-                    // lane.
-                    let acc = accs[u as usize];
-                    let dv = (xnv + Vector::<F, Const<16>>::new(ynorm[tt as usize])) - (acc + acc);
-                    admit_tile::<F>(
-                        &mut lval,
-                        &mut lidx,
-                        &mut lcnt,
-                        &mut lworst_val,
-                        &mut lworst_idx,
-                        dv,
-                        tt,
-                        k,
-                    );
-                }
+            // d² = (‖x‖² + ‖y‖²) − 2·x·y for the whole tile at once; the same
+            // association the scalar kernel evaluates per lane.
+            let d0 = (xnv + Vector::<F, Const<16>>::new(ynorm[t as usize])) - (a0 + a0);
+            admit_tile::<F>(
+                &mut lval,
+                &mut lidx,
+                &mut lworst_val,
+                &mut lworst_idx,
+                d0,
+                t,
+                k,
+            );
+            if t + 1u32 < rows_y {
+                let d1 = (xnv + Vector::<F, Const<16>>::new(ynorm[t1 as usize])) - (a1 + a1);
+                admit_tile::<F>(
+                    &mut lval,
+                    &mut lidx,
+                    &mut lworst_val,
+                    &mut lworst_idx,
+                    d1,
+                    t1,
+                    k,
+                );
+            }
+            if t + 2u32 < rows_y {
+                let d2 = (xnv + Vector::<F, Const<16>>::new(ynorm[t2 as usize])) - (a2 + a2);
+                admit_tile::<F>(
+                    &mut lval,
+                    &mut lidx,
+                    &mut lworst_val,
+                    &mut lworst_idx,
+                    d2,
+                    t2,
+                    k,
+                );
+            }
+            if t + 3u32 < rows_y {
+                let d3 = (xnv + Vector::<F, Const<16>>::new(ynorm[t3 as usize])) - (a3 + a3);
+                admit_tile::<F>(
+                    &mut lval,
+                    &mut lidx,
+                    &mut lworst_val,
+                    &mut lworst_idx,
+                    d3,
+                    t3,
+                    k,
+                );
             }
 
             t += 4u32;
@@ -2372,74 +2443,253 @@ pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
 ///
 /// `dv` is the tile's squared distances against training row `t` — formed by
 /// the expansion in [`euclidean_topk_rows_cpu_vec`] and directly by
-/// [`euclidean_topk_rows_cpu_direct`]. This function clamps at 0 against
-/// cancellation and folds each lane into its sorted top-k list under the
-/// `(value, index)` order — BYTE-FOR-BYTE the admission rule of
+/// [`euclidean_topk_rows_cpu_direct`]. Each lane is folded into its sorted
+/// top-k list under the `(value, index)` order — the admission rule of
 /// [`euclidean_topk_fused_dot`].
+///
+/// ## Lists arrive SENTINEL-PREFILLED (KNN-REG-01)
+/// The caller must fill slots `0 .. k` of every lane's list with
+/// `(+∞, u32::MAX)` and set `lworst_val`/`lworst_idx` to that pair — see
+/// [`prefill_lists`]. That is a PERF invariant, not a style choice: with a
+/// partially-filled list the reject test has to load a per-lane `lcnt` and
+/// branch on `cnt < k` before it can even look at the candidate, and this test
+/// runs `n_train × lanes` times per unit while the insert body runs ~`k + k·ln`
+/// times. Prefilling makes the reject path a single compare against
+/// `lworst_val`, and `+∞`/`u32::MAX` sort strictly after every real candidate
+/// under the same `(value, index)` order, so the k slots are provably all real
+/// once the scan ends (`k <= n_train` is validated host-side) and the emitted
+/// list is IDENTICAL to the counted form's.
+///
+/// ## `$clamp`: whether the 0-clamp is live
+/// The expansion arms need `max(dv, 0)` because `‖x‖² + ‖y‖² − 2·x·y` is a
+/// difference of large numbers and can land just below zero. The DIRECT kernel
+/// accumulates `Σ (x−y)²` — a sum of squares, which no IEEE rounding can carry
+/// below zero — so for it the clamp is provably dead, and dead code is not free
+/// at LLVM `-O0`: it is a compare and a select per LANE per TRAINING ROW.
+///
+/// ## Why a macro over the lane count
+/// The cpu kernels do not all run the same query-tile width — the DIRECT
+/// default uses [`CPU_QUERY_TILE_WIDE`] because its inner loop is IR-op bound
+/// and a wider vector amortizes the per-FMA scalar load + splat (KNN-REG-01,
+/// measured), while the expansion arms stay at [`CPU_QUERY_TILE`]. A `Vector`'s
+/// width is part of its TYPE and a lane must be indexed at comptime to stay a
+/// register extract, so one function cannot serve both widths. Generating them
+/// from a single body is what keeps the admission rule — the part that decides
+/// RESULTS — impossible to drift between the two.
+/// THE admission rule, in one place: fold candidate `(v, t)` into lane `a`'s
+/// sorted top-k list, or reject it.
+///
+/// Every cpu row-scan kernel funnels through here, so the rule that decides
+/// RESULTS — the `(value, index)` order and its lowest-index tie-break — exists
+/// exactly once, however the callers differ in lane width, clamping or
+/// screening. `a` is a runtime lane index (the list is an `Array`, i.e. memory,
+/// so a dynamic index costs nothing extra); only the `Vector` LANE EXTRACT that
+/// produced `v` needs a comptime index, and that happens in the caller.
+///
+/// Rejecting is one compare against `lworst_val[a]` because the lists arrive
+/// sentinel-prefilled — see [`prefill_lists`].
 #[cube]
 #[allow(clippy::too_many_arguments)]
-fn admit_tile<F: Float + CubeElement>(
+fn insert_lane<F: Float + CubeElement>(
     lval: &mut Array<F>,
     lidx: &mut Array<u32>,
-    lcnt: &mut Array<u32>,
     lworst_val: &mut Array<F>,
     lworst_idx: &mut Array<u32>,
-    dv: Vector<F, Const<16>>,
+    a: u32,
+    v: F,
     t: u32,
     k: u32,
 ) {
-    let zero_f = F::from_int(0i64);
-    #[unroll]
-    for a in 0..16u32 {
-        let mut v = dv[a as usize];
-        if v < zero_f {
-            v = zero_f;
-        }
-        let cnt = lcnt[a as usize];
-        let mut admit: u32 = 0u32;
-        if cnt < k {
+    let w = lworst_val[a as usize];
+    let mut admit: u32 = 0u32;
+    if v < w {
+        admit = 1u32;
+    } else if v == w {
+        if t < lworst_idx[a as usize] {
             admit = 1u32;
-        } else if v < lworst_val[a as usize] {
-            admit = 1u32;
-        } else if v == lworst_val[a as usize] {
-            if t < lworst_idx[a as usize] {
-                admit = 1u32;
-            }
         }
+    }
 
-        if admit == 1u32 {
-            let mut cav = v;
-            let mut cai = t;
-            let mut fs = 0u32;
-            while fs < cnt {
-                let jv = lval[(a * 16u32 + fs) as usize];
-                let ji = lidx[(a * 16u32 + fs) as usize];
-                let mut swap: u32 = 0u32;
-                if cav < jv {
+    if admit == 1u32 {
+        let mut cav = v;
+        let mut cai = t;
+        let mut fs = 0u32;
+        while fs < k {
+            let jv = lval[(a * 16u32 + fs) as usize];
+            let ji = lidx[(a * 16u32 + fs) as usize];
+            let mut swap: u32 = 0u32;
+            if cav < jv {
+                swap = 1u32;
+            } else if cav == jv {
+                if cai < ji {
                     swap = 1u32;
-                } else if cav == jv {
-                    if cai < ji {
-                        swap = 1u32;
+                }
+            }
+            if swap == 1u32 {
+                lval[(a * 16u32 + fs) as usize] = cav;
+                lidx[(a * 16u32 + fs) as usize] = cai;
+                cav = jv;
+                cai = ji;
+            }
+            fs += 1u32;
+        }
+        // The pair that fell off the end is gone; slot `k - 1` is the new worst
+        // kept pair.
+        lworst_val[a as usize] = lval[(a * 16u32 + k - 1u32) as usize];
+        lworst_idx[a as usize] = lidx[(a * 16u32 + k - 1u32) as usize];
+    }
+}
+
+macro_rules! impl_admit_tile {
+    ($name:ident, $lanes:literal, $lanes_u32:literal, $clamp:literal) => {
+        #[cube]
+        #[allow(clippy::too_many_arguments)]
+        fn $name<F: Float + CubeElement>(
+            lval: &mut Array<F>,
+            lidx: &mut Array<u32>,
+            lworst_val: &mut Array<F>,
+            lworst_idx: &mut Array<u32>,
+            dv: Vector<F, Const<$lanes>>,
+            t: u32,
+            k: u32,
+        ) {
+            #[unroll]
+            for a in 0..$lanes_u32 {
+                let mut v = dv[a as usize];
+                if comptime!($clamp) {
+                    let zero_f = F::from_int(0i64);
+                    if v < zero_f {
+                        v = zero_f;
                     }
                 }
-                if swap == 1u32 {
-                    lval[(a * 16u32 + fs) as usize] = cav;
-                    lidx[(a * 16u32 + fs) as usize] = cai;
-                    cav = jv;
-                    cai = ji;
-                }
-                fs += 1u32;
+                insert_lane::<F>(lval, lidx, lworst_val, lworst_idx, a, v, t, k);
             }
-            let mut ncnt = cnt;
-            if cnt < k {
-                lval[(a * 16u32 + cnt) as usize] = cav;
-                lidx[(a * 16u32 + cnt) as usize] = cai;
-                ncnt = cnt + 1u32;
-                lcnt[a as usize] = ncnt;
-            }
-            lworst_val[a as usize] = lval[(a * 16u32 + ncnt - 1u32) as usize];
-            lworst_idx[a as usize] = lidx[(a * 16u32 + ncnt - 1u32) as usize];
         }
+    };
+}
+
+impl_admit_tile!(admit_tile, 16, 16u32, true);
+
+/// MIN-SCREENED admission of a whole 4-training-row block (KNN-REG-01) — the
+/// form [`euclidean_topk_rows_cpu_direct`] uses.
+///
+/// ## Why the screen is the point
+/// Per-lane admission is a REJECT in the overwhelming majority of cases: with
+/// `n_train = 100_000` and `k = 10` a query row admits ~10 + O(k·ln n_train)
+/// candidates out of 100_000, so ~99.9% of the work is proving a candidate is
+/// not good enough. Doing that per lane per training row costs a lane extract, a
+/// `lworst_val` load and a compare — measured at ~40% of this kernel's total
+/// wall-clock once the dot loop was fused (a `d`-sweep separates the two: the
+/// per-feature slope is the dot loop, the intercept is this).
+///
+/// `m = min(min(d0, d1), min(d2, d3))` is THREE vector ops and gives, per lane,
+/// a lower bound on all four of the block's candidates. If lane `a`'s bound
+/// cannot beat `lworst_val[a]`, none of its four candidates can, so all four are
+/// skipped together — the per-lane scan runs once per BLOCK instead of once per
+/// ROW.
+///
+/// Two facts make the screen exact rather than approximate. The four
+/// [`insert_lane`] calls below can only LOWER `lworst_val`, never raise it, so a
+/// bound computed before them can never hide a candidate that would have been
+/// admitted. And the test is `<=`, not `<`, so a candidate exactly EQUAL to the
+/// current worst kept value still reaches [`insert_lane`] and is decided by the
+/// real `(value, index)` rule rather than by the screen.
+///
+/// On the equal case, `<` would in fact behave identically HERE — these kernels
+/// scan `t` in ascending order, so every already-kept pair has a smaller index
+/// than the candidate and `insert_lane`'s `t < lworst_idx` tie-break cannot fire
+/// (unlike the GPU family, which merges strips out of order and needs it). `<=`
+/// is kept anyway because it costs nothing and keeps this screen correct under
+/// ANY scan order, rather than silently depending on the loop above staying
+/// monotonic.
+///
+/// `t1`/`t2`/`t3` are the block's later row indices ALREADY CLAMPED to the last
+/// valid row by the caller (which keeps its dot loop branch-free); `valid1..3`
+/// say whether each was a real row, so a clamped duplicate is screened but never
+/// admitted twice. No 0-clamp: this kernel accumulates `Σ (x−y)²`, a sum of
+/// squares that no IEEE rounding can carry below zero.
+macro_rules! impl_admit_block {
+    ($name:ident, $lanes:literal, $lanes_u32:literal) => {
+        #[cube]
+        #[allow(clippy::too_many_arguments)]
+        fn $name<F: Float + CubeElement>(
+            lval: &mut Array<F>,
+            lidx: &mut Array<u32>,
+            lworst_val: &mut Array<F>,
+            lworst_idx: &mut Array<u32>,
+            d0: Vector<F, Const<$lanes>>,
+            d1: Vector<F, Const<$lanes>>,
+            d2: Vector<F, Const<$lanes>>,
+            d3: Vector<F, Const<$lanes>>,
+            t0: u32,
+            t1: u32,
+            t2: u32,
+            t3: u32,
+            valid1: u32,
+            valid2: u32,
+            valid3: u32,
+            k: u32,
+        ) {
+            let m = min(min(d0, d1), min(d2, d3));
+            #[unroll]
+            for a in 0..$lanes_u32 {
+                if m[a as usize] <= lworst_val[a as usize] {
+                    insert_lane::<F>(lval, lidx, lworst_val, lworst_idx, a, d0[a as usize], t0, k);
+                    if valid1 == 1u32 {
+                        insert_lane::<F>(
+                            lval, lidx, lworst_val, lworst_idx, a, d1[a as usize], t1, k,
+                        );
+                    }
+                    if valid2 == 1u32 {
+                        insert_lane::<F>(
+                            lval, lidx, lworst_val, lworst_idx, a, d2[a as usize], t2, k,
+                        );
+                    }
+                    if valid3 == 1u32 {
+                        insert_lane::<F>(
+                            lval, lidx, lworst_val, lworst_idx, a, d3[a as usize], t3, k,
+                        );
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_admit_block!(admit_block_w32, 32, 32u32);
+impl_admit_block!(admit_block_w64, 64, 64u32);
+
+/// Sentinel-prefill one unit's `lanes` top-k lists so [`admit_tile`] /
+/// [`admit_tile_wide`] can skip the fill-phase bookkeeping — see their docs for
+/// why this is a correctness-preserving perf invariant.
+///
+/// Slots `0 .. k` of each lane get `(+∞, u32::MAX)`, the pair that sorts after
+/// every real candidate under the `(value, index)` order; slots `k .. CPU_K_CAP`
+/// are never read (both the insert loop and the emit loop bound by `k`). The
+/// `lanes` count is a runtime argument because the loop is not unrolled — it
+/// runs once per unit, not once per training row.
+#[cube]
+fn prefill_lists<F: Float + CubeElement>(
+    lval: &mut Array<F>,
+    lidx: &mut Array<u32>,
+    lworst_val: &mut Array<F>,
+    lworst_idx: &mut Array<u32>,
+    lanes: u32,
+    k: u32,
+) {
+    let inf = F::new(f32::INFINITY);
+    let sentinel_idx = u32::MAX;
+    let mut a = 0u32;
+    while a < lanes {
+        let mut j = 0u32;
+        while j < k {
+            lval[(a * 16u32 + j) as usize] = inf;
+            lidx[(a * 16u32 + j) as usize] = sentinel_idx;
+            j += 1u32;
+        }
+        lworst_val[a as usize] = inf;
+        lworst_idx[a as usize] = sentinel_idx;
+        a += 1u32;
     }
 }
 
@@ -2460,136 +2710,191 @@ fn admit_tile<F: Float + CubeElement>(
 /// sklearn's own `ArgKmin` share the hazard.
 ///
 /// This kernel spends one extra vector op per feature (subtract, then a squaring
-/// FMA) to remove it. Select it with `MLRS_KNN_DIRECT=1`, the same escape hatch
-/// the GPU dot path already honours.
+/// FMA) to remove it, and it is the cpu DEFAULT — `MLRS_KNN_DOT=1` forces the
+/// expansion arms back for A/B.
 ///
-/// Structure, blocking, admission, tie-break and output layout are exactly
-/// [`euclidean_topk_rows_cpu_vec`]'s; only the inner arithmetic differs, and it
-/// takes no norm operands.
-#[cube(launch)]
-#[allow(clippy::too_many_arguments)]
-pub fn euclidean_topk_rows_cpu_direct<F: Float + CubeElement>(
-    x: &Array<F>,
-    y: &Array<F>,
-    out_val: &mut Array<F>,
-    out_idx: &mut Array<u32>,
-    rows_x: u32,
-    rows_y: u32,
-    cols: u32,
-    k: u32,
-) {
-    let q0 = ABSOLUTE_POS_X * 16u32;
-    if q0 < rows_x {
-        let zero_f = F::from_int(0i64);
+/// ## Shape (KNN-REG-01 — where it now differs from the expansion arms)
+/// Same tie-break and output layout as [`euclidean_topk_rows_cpu_vec`], but the
+/// three things that set its speed are its own:
+///
+/// 1. **Wider query tile**, generated at two widths from ONE macro body
+///    ([`CPU_QUERY_TILE_WIDE`] / [`CPU_QUERY_TILE_WIDEST`], chosen by
+///    `prims::knn::cpu_direct_tile`). The per-feature `y[t, c]` scalar load and
+///    splat are paid per vector FMA whatever its width, so lane count is the
+///    lever on them.
+/// 2. **`fma()` instead of `mul` + `add`** — one IR op instead of two, and one
+///    rounding instead of two. At LLVM `-O0` (which is what `cubecl-cpu` JITs
+///    at) op count IS the cost. Being a `Σ` of squares, this is also strictly
+///    MORE accurate, so it moves toward sklearn, not away — but the host
+///    reference in `knn_test.rs` uses `f32::mul_add` to match it exactly rather
+///    than leaving the index assertion to near-tie luck.
+/// 3. **Accumulators as `let` bindings, not an `Array`** — an `Array` is
+///    `memref.alloca`, real stack memory with a load and a store per update.
+/// 4. **Min-screened block admission** ([`impl_admit_block`]) instead of a
+///    per-row per-lane scan.
+///
+/// Together these measured 2.5× on the `n_train = 100_000 / 200_000, d = 32,
+/// k = 10` rungs of `knn_regressor_perf_test`.
+macro_rules! impl_topk_rows_cpu_direct {
+    ($name:ident, $admit:ident, $lanes:literal, $lanes_u32:literal, $lanes_sz:literal, $list:literal) => {
+        #[cube(launch)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name<F: Float + CubeElement>(
+            x: &Array<F>,
+            y: &Array<F>,
+            out_val: &mut Array<F>,
+            out_idx: &mut Array<u32>,
+            rows_x: u32,
+            rows_y: u32,
+            cols: u32,
+            k: u32,
+        ) {
+            let q0 = ABSOLUTE_POS_X * $lanes_u32;
+            if q0 < rows_x {
+                let zero_f = F::from_int(0i64);
 
-        let mut xt = Array::<Vector<F, Const<16>>>::new(32usize);
-        let mut lval = Array::<F>::new(256usize);
-        let mut lidx = Array::<u32>::new(256usize);
-        let mut lcnt = Array::<u32>::new(16usize);
-        let mut lworst_val = Array::<F>::new(16usize);
-        let mut lworst_idx = Array::<u32>::new(16usize);
+                let mut xt = Array::<Vector<F, Const<$lanes>>>::new(32usize);
+                let mut lval = Array::<F>::new($list);
+                let mut lidx = Array::<u32>::new($list);
+                let mut lworst_val = Array::<F>::new($lanes_sz);
+                let mut lworst_idx = Array::<u32>::new($lanes_sz);
 
-        #[unroll]
-        for a in 0..16u32 {
-            lcnt[a as usize] = 0u32;
-            lworst_val[a as usize] = zero_f;
-            lworst_idx[a as usize] = 0u32;
-        }
-        let mut c = 0u32;
-        while c < cols {
-            let mut v = Vector::<F, Const<16>>::from_int(0i64);
-            #[unroll]
-            for a in 0..16u32 {
-                let r = q0 + a;
-                // An over-provisioned lane (`r >= rows_x`) stages zeros and
-                // never reaches the emit guard below.
-                let mut xv = zero_f;
-                if r < rows_x {
-                    xv = x[(r * cols + c) as usize];
-                }
-                v[a as usize] = xv;
-            }
-            xt[c as usize] = v;
-            c += 1u32;
-        }
-
-        let chunks = cols / 8u32;
-        let tail0 = chunks * 8u32;
-        let mut t = 0u32;
-        while t < rows_y {
-            let mut yb = Array::<u32>::new(4usize);
-            #[unroll]
-            for u in 0..4u32 {
-                let mut tt = t + u;
-                if tt >= rows_y {
-                    tt = rows_y - 1u32;
-                }
-                yb[u as usize] = tt * cols;
-            }
-            let mut accs = Array::<Vector<F, Const<16>>>::new(4usize);
-            #[unroll]
-            for u in 0..4u32 {
-                accs[u as usize] = Vector::<F, Const<16>>::from_int(0i64);
-            }
-
-            let mut h = 0u32;
-            while h < chunks {
-                let cb = h * 8u32;
-                #[unroll]
-                for i in 0..8u32 {
-                    let cc = cb + i;
-                    let xv = xt[cc as usize];
+                prefill_lists::<F>(
+                    &mut lval,
+                    &mut lidx,
+                    &mut lworst_val,
+                    &mut lworst_idx,
+                    $lanes_u32,
+                    k,
+                );
+                let mut c = 0u32;
+                while c < cols {
+                    let mut v = Vector::<F, Const<$lanes>>::from_int(0i64);
                     #[unroll]
-                    for u in 0..4u32 {
-                        let dif =
-                            xv - Vector::<F, Const<16>>::new(y[(yb[u as usize] + cc) as usize]);
-                        accs[u as usize] += dif * dif;
+                    for a in 0..$lanes_u32 {
+                        let r = q0 + a;
+                        // An over-provisioned lane (`r >= rows_x`) stages zeros
+                        // and never reaches the emit guard below.
+                        let mut xv = zero_f;
+                        if r < rows_x {
+                            xv = x[(r * cols + c) as usize];
+                        }
+                        v[a as usize] = xv;
                     }
+                    xt[c as usize] = v;
+                    c += 1u32;
                 }
-                h += 1u32;
-            }
-            let mut ct = tail0;
-            while ct < cols {
-                let xv = xt[ct as usize];
-                #[unroll]
-                for u in 0..4u32 {
-                    let dif = xv - Vector::<F, Const<16>>::new(y[(yb[u as usize] + ct) as usize]);
-                    accs[u as usize] += dif * dif;
-                }
-                ct += 1u32;
-            }
 
-            #[unroll]
-            for u in 0..4u32 {
-                let tt = t + u;
-                if tt < rows_y {
-                    admit_tile::<F>(
+                let mut t = 0u32;
+                while t < rows_y {
+                    // The four training-row bases and their four accumulators are
+                    // plain `let` bindings, NOT an `Array` — an `Array` is
+                    // `memref.alloca`, i.e. real stack memory that costs a load
+                    // and a store on every update, while a binding is an SSA
+                    // value MLIR's `mem2reg` keeps in a register.
+                    let mut t1 = t + 1u32;
+                    if t1 >= rows_y {
+                        t1 = rows_y - 1u32;
+                    }
+                    let mut t2 = t + 2u32;
+                    if t2 >= rows_y {
+                        t2 = rows_y - 1u32;
+                    }
+                    let mut t3 = t + 3u32;
+                    if t3 >= rows_y {
+                        t3 = rows_y - 1u32;
+                    }
+                    let b0 = t * cols;
+                    let b1 = t1 * cols;
+                    let b2 = t2 * cols;
+                    let b3 = t3 * cols;
+                    let mut a0 = Vector::<F, Const<$lanes>>::from_int(0i64);
+                    let mut a1 = Vector::<F, Const<$lanes>>::from_int(0i64);
+                    let mut a2 = Vector::<F, Const<$lanes>>::from_int(0i64);
+                    let mut a3 = Vector::<F, Const<$lanes>>::from_int(0i64);
+
+                    let mut cc = 0u32;
+                    while cc < cols {
+                        let xv = xt[cc as usize];
+                        let d0 = xv - Vector::<F, Const<$lanes>>::new(y[(b0 + cc) as usize]);
+                        let d1 = xv - Vector::<F, Const<$lanes>>::new(y[(b1 + cc) as usize]);
+                        let d2 = xv - Vector::<F, Const<$lanes>>::new(y[(b2 + cc) as usize]);
+                        let d3 = xv - Vector::<F, Const<$lanes>>::new(y[(b3 + cc) as usize]);
+                        a0 = fma(d0, d0, a0);
+                        a1 = fma(d1, d1, a1);
+                        a2 = fma(d2, d2, a2);
+                        a3 = fma(d3, d3, a3);
+                        cc += 1u32;
+                    }
+
+                    // One min-screened pass over the lanes covers the whole 4-row
+                    // block — see `impl_admit_block`. `valid*` mark the rows the
+                    // dot loop CLAMPED past the end so a duplicate is screened but
+                    // never admitted.
+                    let mut v1 = 0u32;
+                    if t + 1u32 < rows_y {
+                        v1 = 1u32;
+                    }
+                    let mut v2 = 0u32;
+                    if t + 2u32 < rows_y {
+                        v2 = 1u32;
+                    }
+                    let mut v3 = 0u32;
+                    if t + 3u32 < rows_y {
+                        v3 = 1u32;
+                    }
+                    $admit::<F>(
                         &mut lval,
                         &mut lidx,
-                        &mut lcnt,
                         &mut lworst_val,
                         &mut lworst_idx,
-                        accs[u as usize],
-                        tt,
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        t,
+                        t1,
+                        t2,
+                        t3,
+                        v1,
+                        v2,
+                        v3,
                         k,
                     );
+
+                    t += 4u32;
+                }
+
+                #[unroll]
+                for a in 0..$lanes_u32 {
+                    let r = q0 + a;
+                    if r < rows_x {
+                        let mut j = 0u32;
+                        while j < k {
+                            out_val[(r * k + j) as usize] = lval[(a * 16u32 + j) as usize];
+                            out_idx[(r * k + j) as usize] = lidx[(a * 16u32 + j) as usize];
+                            j += 1u32;
+                        }
+                    }
                 }
             }
-
-            t += 4u32;
         }
-
-        #[unroll]
-        for a in 0..16u32 {
-            let r = q0 + a;
-            if r < rows_x {
-                let mut j = 0u32;
-                while j < k {
-                    out_val[(r * k + j) as usize] = lval[(a * 16u32 + j) as usize];
-                    out_idx[(r * k + j) as usize] = lidx[(a * 16u32 + j) as usize];
-                    j += 1u32;
-                }
-            }
-        }
-    }
+    };
 }
+
+impl_topk_rows_cpu_direct!(
+    euclidean_topk_rows_cpu_direct,
+    admit_block_w32,
+    32,
+    32u32,
+    32usize,
+    512usize
+);
+impl_topk_rows_cpu_direct!(
+    euclidean_topk_rows_cpu_direct_w64,
+    admit_block_w64,
+    64,
+    64u32,
+    64usize,
+    1024usize
+);

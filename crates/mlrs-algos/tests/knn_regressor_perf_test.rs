@@ -17,6 +17,11 @@
 //! the two device stages (`distance` GEMM-expansion vs `top_k` selection) so the
 //! optimization target is measured, not guessed.
 //!
+//! `knn_cpu_shape_probe` is the **cpu** equivalent of that attribution, and the
+//! two GPU stage probes cannot substitute for it: on cpu, `predict` dispatches to
+//! `cpu_rows_topk`, whose single kernel fuses distance and selection, so there is
+//! no stage boundary to time. It separates them by SHAPE instead — see its docs.
+//!
 //! Per AGENTS.md §2 tests live here, never in-source.
 
 use std::time::Instant;
@@ -313,5 +318,75 @@ fn knn_stage_breakdown() {
         println!(
             "{n:>8} {d:>5} {k:>4} {nq:>8} {dist_s:>12.4} {par_s:>12.4} {ser_s:>12.4} {speedup:>8.1}x"
         );
+    }
+}
+
+/// Attribute the **cpu** predict wall-clock to the row-scan kernel's two halves
+/// by SHAPE, since they are fused into one kernel and cannot be timed apart.
+///
+/// On cpu, `predict` dispatches to `cpu_rows_topk`, whose kernel does two things
+/// per training row: the `d`-long dot loop, and admission of the result into each
+/// query lane's top-k list. Their costs separate cleanly because only one of them
+/// scales with `d`:
+///
+/// - sweep `d` at fixed `(n_train, k, n_query)` — the SLOPE is the dot loop's
+///   per-feature cost, the INTERCEPT is everything per-training-row that is not
+///   the dot loop (admission, the block screen, loop bookkeeping);
+/// - sweep `k` at fixed `d` — this moves only the insert body, so it bounds how
+///   much of that intercept is list maintenance rather than the reject test.
+///
+/// This is the measurement KNN-REG-01 was steered by, and it is what stops the
+/// next person optimizing the wrong half. At the time of writing, on a 16-core
+/// Zen5 at `n_train = 100_000, k = 10, n_query = 10_000`: per-feature 0.0048 s,
+/// intercept 0.033 s — so at `d = 32` the dot loop is ~82% of predict, and the
+/// `k = 1 → 16` sweep moves only ~0.011 s (~6%), i.e. list maintenance is now
+/// minor. Before the min-screened block admission landed the same sweep put the
+/// intercept at 0.105 s against a 0.161 s dot loop (a 60/40 split), which is why
+/// further work belongs in the dot loop — in practice in the query-tile width,
+/// since the per-feature cost is dominated by the `y[t, c]` load and splat that
+/// feed each vector FMA — and not in admission.
+///
+/// cpu-ONLY in practice: off cpu, `cpu_rows_applicable` is false and `predict`
+/// runs the fused GPU family instead, so the numbers would describe a kernel this
+/// probe is not reasoning about. Use `knn_fused_stage_probe` there.
+#[test]
+#[ignore = "wall-clock probe; run explicitly with --ignored --nocapture"]
+fn knn_cpu_shape_probe() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let n = 100_000usize.min(max_n());
+    let nq = 10_000usize;
+
+    // Warm the clocks / JIT at the shape the sweeps use, so the first row of the
+    // d-sweep is not the one paying for kernel compilation.
+    let _ = run_config(n, 32, 10, nq);
+
+    println!("# d-sweep (k=10): slope = dot loop per feature, intercept = the rest");
+    println!("{:>8} {:>5} {:>4} {:>8} {:>12}", "n_train", "d", "k", "n_query", "predict_s");
+    let mut pts: Vec<(f64, f64)> = Vec::new();
+    for &d in &[8usize, 16, 24, 32] {
+        let (_, pred_s) = run_config(n, d, 10, nq);
+        println!("{n:>8} {d:>5} {:>4} {nq:>8} {pred_s:>12.4}", 10);
+        pts.push((d as f64, pred_s));
+    }
+    // Least-squares slope/intercept over the sweep (4 points, exact arithmetic).
+    let m = pts.len() as f64;
+    let sx: f64 = pts.iter().map(|p| p.0).sum();
+    let sy: f64 = pts.iter().map(|p| p.1).sum();
+    let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+    let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+    let slope = (m * sxy - sx * sy) / (m * sxx - sx * sx);
+    let intercept = (sy - slope * sx) / m;
+    let at32 = slope * 32.0 + intercept;
+    println!(
+        "# per-feature = {slope:.6} s, intercept = {intercept:.6} s \
+         -> at d=32 the dot loop is {:.0}% of {at32:.4} s",
+        100.0 * (slope * 32.0) / at32
+    );
+
+    println!("# k-sweep (d=32): moves the insert body only");
+    println!("{:>8} {:>5} {:>4} {:>8} {:>12}", "n_train", "d", "k", "n_query", "predict_s");
+    for &k in &[1usize, 5, 10, 16] {
+        let (_, pred_s) = run_config(n, 32, k, nq);
+        println!("{n:>8} {:>5} {k:>4} {nq:>8} {pred_s:>12.4}", 32);
     }
 }

@@ -777,7 +777,15 @@ fn host_rows_topk(
                 let mut acc = 0.0f32;
                 for c in 0..d {
                     let dif = xq[q * d + c] - xt[t * d + c];
-                    acc += dif * dif;
+                    // `mul_add`, NOT `acc += dif * dif`: the DIRECT kernel
+                    // squares-and-accumulates with the `fma()` intrinsic (one
+                    // rounding instead of two — KNN-REG-01, it is a third of
+                    // that kernel's inner-loop op count), so this reference has
+                    // to run the SAME arithmetic. With a separate mul and add
+                    // the two differ by up to an ulp per feature, which leaves
+                    // the exact index assertion below to chance on any input
+                    // that happens to hold a near-tie.
+                    acc = dif.mul_add(dif, acc);
                 }
                 acc
             } else {
@@ -822,10 +830,24 @@ fn host_rows_topk(
 /// project's 1e-5 relative bar otherwise, the same rule the GPU dot-expansion
 /// gate above uses.
 ///
-/// Cases cover the boundaries the kernel blocks on: `n_query`/`n_train` on and
-/// off the 16-row query tile and the 4-row train block, `k` at 1 and at the
-/// cap, `d` at the `CPU_MAX_COLS` cap, and more query rows than one cube's
-/// worth so the cube loop runs several times per unit.
+/// Cases cover the boundaries the kernels block on: `n_query`/`n_train` on and
+/// off EACH query-tile width (16 for the expansion arms, 32 and 64 for the two
+/// DIRECT widths) and off the 4-row train block, `k` at 1 and at the cap, `d` at
+/// the `CPU_MAX_COLS` cap, and more query rows than one cube's worth so the cube
+/// loop runs several times per unit.
+///
+/// The `MLRS_CPU_UNITS` sweep is what reaches BOTH direct widths from one case
+/// list: `cpu_direct_tile` switches to the 64-row kernel at `n_query >= units *
+/// 64`, so a case at `units = 1` exercises the wide kernel and the same case at
+/// `units = 16` exercises the narrow one — and both must reproduce the identical
+/// reference, which is the claim that lets the dispatch be a pure speed choice.
+///
+/// Note what this test does NOT pin: the direct kernels scan `t` in ascending
+/// order, so `insert_lane`'s `t < lworst_idx` tie-break is unreachable on this
+/// path and no input can distinguish it (verified by flipping the min-screen's
+/// `<=` to `<` — every case still passes). The tie-break is gated on the GPU
+/// family instead, by `fused_topk_matches_two_kernel_bitwise`, where the k-round
+/// strip merge really does present candidates out of index order.
 ///
 /// The whole test is a no-op off the cpu backend — the kernel's
 /// one-thread-per-unit shape is meaningless on a GPU, and `cpu_rows_applicable`
@@ -846,6 +868,14 @@ fn cpu_rows_topk_matches_brute_force() {
         (300, 100, 4, 10, Some(3)),
         // d at the cpu cap with the argmin-degenerate k = 1.
         (500, 70, 32, 1, None),
+        // Exactly one 64-row DIRECT tile (reached at `units = 1`), and one row
+        // past it so the wide kernel's over-provisioned-lane guard runs.
+        (300, 64, 8, 5, None),
+        (300, 65, 8, 5, None),
+        // Tie-saturated ACROSS the 64-row tile, so the wide kernel's min-screen
+        // is exercised on the inputs where almost every admission decision is a
+        // tie rather than a comparison.
+        (400, 128, 4, 10, Some(3)),
         // More query rows than one cube covers, so the cube loop runs several
         // times per unit, and a tie-saturated tail.
         (1_000, 700, 16, 8, Some(7)),
