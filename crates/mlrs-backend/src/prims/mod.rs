@@ -95,3 +95,67 @@ pub mod topk;
 // TSNE-01: the exact-method t-SNE per-iteration gradient prim (Student-t
 // affinity + KL-gradient GATHER over the Phase-2 distance prim).
 pub mod tsne;
+
+// ---------------------------------------------------------------------------
+// Shared 1-D launch geometry
+// ---------------------------------------------------------------------------
+
+use cubecl::prelude::{CubeCount, CubeDim};
+use mlrs_kernels::colmean::MAX_GRID_DIM;
+
+/// Workgroup width for the prims whose launch geometry was tuned by a MEASURED
+/// GPU campaign (`kmeans`, `random_forest`), rather than being an arbitrary
+/// GPU-idiomatic default.
+///
+/// Those campaigns picked `256` against real hardware, and this repo's own rule
+/// is not to re-gate a perf kernel from a different backend's measurement — so
+/// they keep it explicitly instead of inheriting
+/// [`crate::capability::gather_launch_width`]. On the cpu backend a `cube_dim`
+/// IS a thread count, so `256` there spawns 256 OS threads per launch; moving
+/// these two prims onto the gather width is a real cpu win waiting to be
+/// measured on their own ladders, NOT a mechanical substitution.
+pub(crate) const PERF_TUNED_BLOCK: u32 = 256;
+
+/// Ceiling-division 1-D launch config: `ceil(n / block)` cubes of `block` units
+/// along X only.
+///
+/// For kernels that address their element through `ABSOLUTE_POS_X`, which does
+/// NOT linearize across a multi-axis grid — so this must stay single-axis. `n`
+/// above `MAX_GRID_DIM * block` needs [`launch_dims_1d_folded`] and a kernel
+/// that reads `ABSOLUTE_POS`.
+///
+/// `block` is passed explicitly at every call site rather than defaulted: it is
+/// the cpu thread count (see [`PERF_TUNED_BLOCK`]), so which width a prim uses
+/// is a decision worth reading at the launch, not inheriting silently. Prims
+/// whose kernels are split-independent (no `SharedMemory`, no `sync_cube`, no
+/// `CUBE_DIM`-dependent indexing) pass
+/// [`crate::capability::gather_launch_width`].
+///
+/// This is the ONE definition. Nine byte-identical private copies of it used to
+/// live across the prim modules, which is how three of them ended up fixed for
+/// the cpu thread-storm and the rest did not.
+pub(crate) fn launch_dims_1d(n: usize, block: u32) -> (CubeCount, CubeDim) {
+    let cubes = (n as u32).div_ceil(block).max(1);
+    (
+        CubeCount::Static(cubes, 1, 1),
+        CubeDim { x: block, y: 1, z: 1 },
+    )
+}
+
+/// [`launch_dims_1d`] with the cube count FOLDED across the X/Y grid axes, so it
+/// never exceeds `MAX_GRID_DIM` in a single dimension.
+///
+/// Only for kernels that address their element through the flattened
+/// `ABSOLUTE_POS` (which linearizes contiguously across the grid: cube `(x, y)`
+/// covers `[(y·CUBE_COUNT_X + x)·block, +block)`) and bounds-check it, so the
+/// second axis is transparent to them. A kernel reading `ABSOLUTE_POS_X` would
+/// silently process only the first grid column — use [`launch_dims_1d`] there.
+pub(crate) fn launch_dims_1d_folded(n: usize, block: u32) -> (CubeCount, CubeDim) {
+    let cubes = (n as u32).div_ceil(block).max(1);
+    let y = cubes.div_ceil(MAX_GRID_DIM).max(1);
+    let x = cubes.div_ceil(y).max(1);
+    (
+        CubeCount::Static(x, y, 1),
+        CubeDim { x: block, y: 1, z: 1 },
+    )
+}

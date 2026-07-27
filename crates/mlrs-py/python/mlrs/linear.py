@@ -17,6 +17,28 @@ from sklearn.base import ClassifierMixin, RegressorMixin
 from .base import MlrsBase
 
 
+def _dense_linear_predict(est, X):
+    """``predict`` for the four dense linear regressors (OLS/Ridge/Lasso/ENet).
+
+    ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the Rust
+    predict path reads every element of ``X`` anyway, so it reports the same
+    verdict from that pass and raises ``check_array``'s exact ``ValueError``
+    itself (``errors.rs::nonfinite_input_err``). ``check_array``'s own scan is a
+    second single-threaded trip over the whole matrix and was the single largest
+    remaining cost of ``predict`` on the cpu backend — larger than the prediction
+    itself. See ``prims/linear_predict.rs`` for the measurements, and
+    ``base.MlrsBase._check_predict_X`` for how the error ORDER is preserved.
+
+    All four estimators route here so the relocation lives in one place: a
+    sibling left on ``ensure_all_finite=True`` would silently pay the extra pass,
+    and one added later with the flag but WITHOUT the Rust-side scan would drop
+    the validation entirely.
+    """
+    xa, rows, cols = est._check_predict_X(X, ensure_all_finite=False)
+    out = est._suffixed("predict")(xa, rows, cols)
+    return est._to_output(out, (rows,), X, est._np_float())
+
+
 class LinearRegression(RegressorMixin, MlrsBase):
     """Ordinary least squares (LINEAR-01)."""
 
@@ -34,9 +56,7 @@ class LinearRegression(RegressorMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._check_predict_X(X)
-        out = self._suffixed("predict")(xa, rows, cols)
-        return self._to_output(out, (rows,), X, self._np_float())
+        return _dense_linear_predict(self, X)
 
     @property
     def coef_(self):
@@ -72,9 +92,7 @@ class Ridge(RegressorMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._check_predict_X(X)
-        out = self._suffixed("predict")(xa, rows, cols)
-        return self._to_output(out, (rows,), X, self._np_float())
+        return _dense_linear_predict(self, X)
 
     @property
     def coef_(self):
@@ -117,9 +135,7 @@ class Lasso(RegressorMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._check_predict_X(X)
-        out = self._suffixed("predict")(xa, rows, cols)
-        return self._to_output(out, (rows,), X, self._np_float())
+        return _dense_linear_predict(self, X)
 
     @property
     def coef_(self):
@@ -168,9 +184,7 @@ class ElasticNet(RegressorMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._check_predict_X(X)
-        out = self._suffixed("predict")(xa, rows, cols)
-        return self._to_output(out, (rows,), X, self._np_float())
+        return _dense_linear_predict(self, X)
 
     @property
     def coef_(self):

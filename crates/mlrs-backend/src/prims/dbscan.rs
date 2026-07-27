@@ -122,7 +122,7 @@ where
     let count_handle = pool.acquire(n * size_of::<u32>());
 
     let client = pool.client().clone();
-    let (cube_count, cube_dim) = launch_dims_1d(n);
+    let (cube_count, cube_dim) = super::launch_dims_1d(n, crate::capability::gather_launch_width());
 
     // eps2 = eps*eps in the kernel's float type (the comparison is on the squared
     // distance, so the squared eps is the threshold). Construct it from the f64
@@ -252,16 +252,4 @@ fn f64_to_f<F: Pod>(x: f64) -> F {
         8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&x)),
         _ => unreachable!("dbscan eps_core_mask is f32/f64 only"),
     }
-}
-
-/// 1D launch config for `eps_core_count`: ONE unit per point (`ABSOLUTE_POS_X` =
-/// `i`), ceiling-division over a 256-wide cube so over-provisioned threads are
-/// bounds-checked away in the kernel (matches `distance.rs::launch_dims_1d`).
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = ((n as u32) + block - 1) / block;
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
-    )
 }

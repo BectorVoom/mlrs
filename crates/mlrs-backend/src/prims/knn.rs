@@ -103,8 +103,9 @@ where
     }
 
     let out_handle = pool.acquire(n_query * size_of::<F>());
+    let oob_handle = pool.acquire(n_query * size_of::<u32>());
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(n_query);
+    let (count, dim) = super::launch_dims_1d(n_query, capability::gather_launch_width());
 
     // SAFETY: lengths are the validated element counts carried by the arrays (the
     // kernel additionally bounds-checks `q < n_query` and `t < n_train`), NEVER
@@ -112,6 +113,7 @@ where
     let y_arg = unsafe { ArrayArg::from_raw_parts(y_train.handle().clone(), y_train.len()) };
     let idx_arg = unsafe { ArrayArg::from_raw_parts(idx.handle().clone(), idx.len()) };
     let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n_query) };
+    let oob_arg = unsafe { ArrayArg::from_raw_parts(oob_handle.clone(), n_query) };
 
     knn_regress_mean::launch::<F, ActiveRuntime>(
         &client,
@@ -120,10 +122,35 @@ where
         y_arg,
         idx_arg,
         out_arg,
+        oob_arg,
         n_query as u32,
         k as u32,
         n_train as u32,
     );
+
+    // WR-02: a neighbor index outside `[0, n_train)` is a corruption in the
+    // producing selection kernel, and the pre-KNN-01 host gather loop stopped
+    // with a typed error when it saw one. The kernel cannot return an error, so
+    // it flags the offending ROW (`knn_regress_mean`'s `oob` docs) and the check
+    // happens here. Skipping the guard is not an option: the kernel still
+    // divides by the full `k`, so a silently-dropped neighbor produces a
+    // plausible-looking wrong mean.
+    //
+    // Cost is one `u32` per query row on a path whose real work is the
+    // `n_query × n_train × d` distance pass, and the read-back lands where the
+    // caller was about to synchronize anyway.
+    let oob = DeviceArray::<ActiveRuntime, u32>::from_raw(oob_handle, n_query);
+    let flags = oob.to_host(pool);
+    oob.release_into(pool);
+    if let Some(row) = flags.iter().position(|&f| f != 0) {
+        DeviceArray::<ActiveRuntime, F>::from_raw(out_handle, n_query).release_into(pool);
+        return Err(PrimError::ShapeMismatch {
+            operand: "knn.train_idx",
+            rows: row,
+            cols: k,
+            len: n_train,
+        });
+    }
 
     Ok(DeviceArray::from_raw(out_handle, n_query))
 }
@@ -185,30 +212,10 @@ where
         let dim = CubeDim { x: threads, y: 1, z: 1 };
         copy_elem_cpu_chunked::launch::<F, ActiveRuntime>(&client, count, dim, in_arg, out_arg);
     } else {
-        let (count, dim) = launch_dims_1d(len);
+        let (count, dim) = super::launch_dims_1d(len, capability::gather_launch_width());
         copy_elem::launch::<F, ActiveRuntime>(&client, count, dim, in_arg, out_arg);
     }
     DeviceArray::from_raw(handle, len)
-}
-
-/// Standard ceiling-division 1D launch config (matches `topk.rs::launch_dims_1d`).
-///
-/// The 256-unit block is a GPU warp-multiple. On the cpu backend a unit is an
-/// OS THREAD (`cubecl_cpu::compute::runner`), so a 256-unit launch spawns 256
-/// threads per kernel and pays 256 task hand-offs plus a 256-way join — for the
-/// three GATHER feeders this helper drives (`row_sumsq`, `knn_regress_mean`,
-/// `sqrt_elem`) that overhead can exceed the work itself. On cpu the block is
-/// therefore the core count and the CUBE loop supplies the rest of the range;
-/// every kernel launched through here indexes by `ABSOLUTE_POS_X` alone, so the
-/// split between cube and unit is a pure scheduling choice with no effect on
-/// the result.
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = capability::gather_launch_width();
-    let cubes = ((n as u32) + block - 1) / block;
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
-    )
 }
 
 /// Should the CPU-shaped row-scan kernel serve this selection?
@@ -234,14 +241,14 @@ where
         && k >= 1
         && k <= n_train
         && k <= CPU_K_CAP as usize
-        && std::env::var("MLRS_KNN_CPU_ROWS").map(|v| v != "0").unwrap_or(true)
+        && crate::abflag::var("MLRS_KNN_CPU_ROWS").map(|v| v != "0").unwrap_or(true)
 }
 
 /// Use the SIMD `euclidean_topk_rows_cpu_vec` kernel (default) or the scalar
 /// `euclidean_topk_rows_cpu` one? The two are bitwise-identical, so this is a
 /// pure A/B switch (`MLRS_KNN_CPU_VEC=0` picks scalar).
 fn cpu_rows_vec_selected() -> bool {
-    std::env::var("MLRS_KNN_CPU_VEC").map(|v| v != "0").unwrap_or(true)
+    crate::abflag::var("MLRS_KNN_CPU_VEC").map(|v| v != "0").unwrap_or(true)
 }
 
 /// Should the cpu path use the CANCELLATION-FREE kernel? DEFAULT YES — the one
@@ -267,10 +274,10 @@ fn cpu_rows_vec_selected() -> bool {
 /// `MLRS_KNN_DOT=1` forces the expansion back for A/B; `MLRS_KNN_DIRECT=1` is
 /// accepted for symmetry with the GPU path's switch and is a no-op here.
 fn direct_selected() -> bool {
-    if std::env::var("MLRS_KNN_DIRECT").map(|v| v == "1").unwrap_or(false) {
+    if crate::abflag::is_on("MLRS_KNN_DIRECT") {
         return true;
     }
-    if std::env::var("MLRS_KNN_DOT").map(|v| v == "1").unwrap_or(false) {
+    if crate::abflag::is_on("MLRS_KNN_DOT") {
         return false;
     }
     true
@@ -399,7 +406,7 @@ where
             k as u32,
         );
         if sqrt {
-            let (scount, sdim) = launch_dims_1d(out_len);
+            let (scount, sdim) = super::launch_dims_1d(out_len, capability::gather_launch_width());
             let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
             let sout_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
             sqrt_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg);
@@ -415,13 +422,13 @@ where
     let xnorm_handle = pool.acquire(n_query * size_of::<F>());
     let ynorm_handle = pool.acquire(n_train * size_of::<F>());
     {
-        let (nc, nd) = launch_dims_1d(n_query);
+        let (nc, nd) = super::launch_dims_1d(n_query, capability::gather_launch_width());
         let in_arg = unsafe { ArrayArg::from_raw_parts(xq.handle().clone(), xq.len()) };
         let out_arg = unsafe { ArrayArg::from_raw_parts(xnorm_handle.clone(), n_query) };
         row_sumsq::launch::<F, ActiveRuntime>(
             &client, nc, nd, in_arg, out_arg, n_query as u32, n_features as u32,
         );
-        let (nc, nd) = launch_dims_1d(n_train);
+        let (nc, nd) = super::launch_dims_1d(n_train, capability::gather_launch_width());
         let in_arg = unsafe { ArrayArg::from_raw_parts(x_train.handle().clone(), x_train.len()) };
         let out_arg = unsafe { ArrayArg::from_raw_parts(ynorm_handle.clone(), n_train) };
         row_sumsq::launch::<F, ActiveRuntime>(
@@ -484,7 +491,7 @@ where
 
     // Euclidean sqrt over ONLY the returned k values per row (D-08).
     if sqrt {
-        let (scount, sdim) = launch_dims_1d(out_len);
+        let (scount, sdim) = super::launch_dims_1d(out_len, capability::gather_launch_width());
         let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         let sout_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         sqrt_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg);
@@ -515,7 +522,7 @@ const FUSED_MAX_QUERY: usize = 65_535 * FUSED_QUERY_BLOCK;
 /// on the real target device (a perf kernel must never be gated onto a backend
 /// by extrapolating from a different backend's numbers).
 fn fused_topk_forced_off() -> bool {
-    std::env::var("MLRS_KNN_UNFUSED").map(|v| v == "1").unwrap_or(false)
+    crate::abflag::is_on("MLRS_KNN_UNFUSED")
 }
 
 /// Should the DOT-EXPANSION fused kernel be used (when `n_features <= 32`)?
@@ -529,10 +536,10 @@ fn fused_topk_forced_off() -> bool {
 /// `MLRS_KNN_DIRECT=1` forces direct anywhere, `MLRS_KNN_DOT=1` forces dot
 /// anywhere — the two A/B escape hatches.
 fn dot_fused_selected() -> bool {
-    if std::env::var("MLRS_KNN_DOT").map(|v| v == "1").unwrap_or(false) {
+    if crate::abflag::is_on("MLRS_KNN_DOT") {
         return true;
     }
-    if std::env::var("MLRS_KNN_DIRECT").map(|v| v == "1").unwrap_or(false) {
+    if crate::abflag::is_on("MLRS_KNN_DIRECT") {
         return false;
     }
     true
@@ -565,7 +572,7 @@ enum DotVariant {
 /// `MLRS_KNN_VEC8=1/0` and `MLRS_KNN_VEC=1/0` force/deny each vector variant
 /// anywhere — the A/B escape hatches (VEC8 is consulted first).
 fn dot_variant_selected(n_features: usize) -> DotVariant {
-    match std::env::var("MLRS_KNN_VEC8").ok().as_deref() {
+    match crate::abflag::var("MLRS_KNN_VEC8").as_deref() {
         Some("1") => return DotVariant::Vec8,
         Some("0") => {}
         _ => match capability::active_backend_name() {
@@ -578,7 +585,7 @@ fn dot_variant_selected(n_features: usize) -> DotVariant {
             _ => {}
         },
     }
-    match std::env::var("MLRS_KNN_VEC").ok().as_deref() {
+    match crate::abflag::var("MLRS_KNN_VEC").as_deref() {
         Some("1") => DotVariant::Vec4,
         Some("0") => DotVariant::Scalar,
         _ => match capability::active_backend_name() {
@@ -775,13 +782,13 @@ where
         let xnorm_handle = pool.acquire(n_query * size_of::<F>());
         let ynorm_handle = pool.acquire(n_train * size_of::<F>());
         {
-            let (nc, nd) = launch_dims_1d(n_query);
+            let (nc, nd) = super::launch_dims_1d(n_query, capability::gather_launch_width());
             let in_arg = unsafe { ArrayArg::from_raw_parts(xq.handle().clone(), xq.len()) };
             let out_arg = unsafe { ArrayArg::from_raw_parts(xnorm_handle.clone(), n_query) };
             row_sumsq::launch::<F, ActiveRuntime>(
                 &client, nc, nd, in_arg, out_arg, n_query as u32, n_features as u32,
             );
-            let (nc, nd) = launch_dims_1d(n_train);
+            let (nc, nd) = super::launch_dims_1d(n_train, capability::gather_launch_width());
             let in_arg = unsafe { ArrayArg::from_raw_parts(x_train.handle().clone(), x_train.len()) };
             let out_arg = unsafe { ArrayArg::from_raw_parts(ynorm_handle.clone(), n_train) };
             row_sumsq::launch::<F, ActiveRuntime>(
@@ -909,7 +916,7 @@ where
     // Euclidean sqrt over ONLY the returned k values per row (D-08), identical
     // to `top_k`'s boundary pass.
     if sqrt {
-        let (scount, sdim) = launch_dims_1d(out_len);
+        let (scount, sdim) = super::launch_dims_1d(out_len, capability::gather_launch_width());
         let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         let sout_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         sqrt_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg);
@@ -932,8 +939,7 @@ where
 /// possible or not useful. `MLRS_KNN_STRIPS` overrides the strip count for
 /// on-target A/B.
 fn pick_strips(_n_query: usize, n_train: usize, query_blocks: usize) -> (usize, usize) {
-    let forced = std::env::var("MLRS_KNN_STRIPS")
-        .ok()
+    let forced = crate::abflag::var("MLRS_KNN_STRIPS")
         .and_then(|v| v.parse::<usize>().ok());
     // DEFAULT 1 (measured on the T4, KNN-02d): strip counts of 4-8 REGRESSED
     // every ladder config by 25-60% — the k-round merge phase is a per-cube

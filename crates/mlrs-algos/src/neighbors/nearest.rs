@@ -454,7 +454,7 @@ const TILE_ALIGN_ROWS: usize = 64;
 /// two can be A/B'd on the real target device rather than gated by extrapolation
 /// from a different backend's numbers.
 fn gemm_distance_forced() -> bool {
-    std::env::var("MLRS_KNN_GEMM_DISTANCE").map(|v| v == "1").unwrap_or(false)
+    mlrs_backend::abflag::is_on("MLRS_KNN_GEMM_DISTANCE")
 }
 
 /// `distance → top_k` over the query rows in TILES, writing each tile's results

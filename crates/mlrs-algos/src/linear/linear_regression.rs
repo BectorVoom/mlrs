@@ -46,12 +46,13 @@ use mlrs_backend::prims::center::center_columns;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::gram::gram_xty;
-use mlrs_backend::prims::linear_predict::linear_predict;
+use mlrs_backend::prims::linear_predict::{linear_predict, HostPrediction};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::linear::elastic_net::predict_linear_from_host;
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// Dense-eigensolver feature cap for the large-`n_samples` Gram+eig path
@@ -229,6 +230,31 @@ where
             .as_ref()
             .expect("intercept_ is Some by construction on LinearRegression<F, Fitted>")
             .to_host(pool)[0]
+    }
+
+    /// `predict` for a test matrix that is still on the HOST — returns the
+    /// length-`n_samples` predictions plus the operand-finiteness verdict, as a
+    /// [`HostPrediction`].
+    ///
+    /// The host-ingress twin of [`Predict::predict`]: same result, but it reads
+    /// the caller's buffer in place on cpu instead of paying an `m × n` upload
+    /// that costs more than the prediction. All four dense linear regressors
+    /// share ONE implementation — see [`predict_linear_from_host`] for the
+    /// backend routing, the measurements, and the finiteness verdict's meaning.
+    pub fn predict_from_host(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostPrediction<F>, AlgoError> {
+        predict_linear_from_host(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            "linear_regression",
+            pool,
+            x,
+            shape,
+        )
     }
 }
 

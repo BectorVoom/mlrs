@@ -82,7 +82,7 @@ fn use_shared_gram(dd: usize) -> bool {
     }
     #[cfg(not(feature = "cpu"))]
     {
-        if std::env::var("LR_GRAM_GEMM").is_ok() {
+        if crate::abflag::var("LR_GRAM_GEMM").is_some() {
             return false;
         }
         dd <= 4096
@@ -144,7 +144,7 @@ where
     let px_arg2 = unsafe { ArrayArg::from_raw_parts(pxty.clone(), pxty_len) };
     let g_arg = unsafe { ArrayArg::from_raw_parts(gram.clone(), dd) };
     let xt_arg = unsafe { ArrayArg::from_raw_parts(xty.clone(), d) };
-    let (c2, d2) = launch_dims_1d(dd);
+    let (c2, d2) = super::launch_dims_1d(dd, crate::capability::gather_launch_width());
     gram_xty_reduce_partials::launch::<F, ActiveRuntime>(
         &client, c2, d2, pg_arg2, px_arg2, g_arg, xt_arg, d as u32, nb as u32,
     );
@@ -215,16 +215,5 @@ fn launch_cubes_64(cubes: usize) -> (CubeCount, CubeDim) {
     (
         CubeCount::Static(x, y, 1),
         CubeDim { x: 64, y: 1, z: 1 },
-    )
-}
-
-/// Standard ceiling-division 1D launch config (the `elementwise`/`center`
-/// per-element launch idiom).
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = ((n as u32) + block - 1) / block;
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
     )
 }

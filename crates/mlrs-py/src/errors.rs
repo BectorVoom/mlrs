@@ -154,3 +154,34 @@ pub fn unsupported_dtype_err(found: &arrow::datatypes::DataType) -> PyErr {
         "mlrs: unsupported Arrow dtype {found:?}; expected Float32 or Float64"
     ))
 }
+
+/// Build the `ValueError` for a test matrix containing NaN or ±infinity, with
+/// **byte-identical wording to sklearn's `check_array`**.
+///
+/// `LinearRegression.predict` no longer asks `check_array` for the finite scan:
+/// that scan is a second single-threaded pass over the whole operand (2.4 ms for
+/// a 64 MiB matrix — more than the prediction itself), and the cpu predict path
+/// already reads every element, so the check rides along inside it for free (see
+/// `mlrs_backend::prims::linear_predict::linear_predict_host`). The validation is
+/// therefore moved, not dropped — and because a caller (and sklearn's own
+/// `estimator_checks`) matches on the message text, the message must be the one
+/// `check_array` would have raised:
+///
+/// ```text
+/// Input contains NaN.
+/// Input contains infinity or a value too large for dtype('float32').
+/// ```
+///
+/// sklearn reports NaN whenever any NaN is present and infinity otherwise, which
+/// is what `values` is scanned for here. That scan runs ONLY on the rejection
+/// path, where the input is already being thrown away, so its cost is irrelevant.
+pub fn nonfinite_input_err<T: Copy + Into<f64>>(values: &[T], dtype: &str) -> PyErr {
+    let has_nan = values.iter().any(|v| (*v).into().is_nan());
+    if has_nan {
+        PyValueError::new_err("Input contains NaN.")
+    } else {
+        PyValueError::new_err(format!(
+            "Input contains infinity or a value too large for dtype('{dtype}')."
+        ))
+    }
+}

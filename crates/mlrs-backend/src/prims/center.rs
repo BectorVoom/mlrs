@@ -90,7 +90,7 @@ where
     let elem = size_of::<F>();
     let centred_handle = pool.acquire(a_len * elem);
     let client = pool.client().clone();
-    let (ccount, cdim) = launch_dims_1d(a_len);
+    let (ccount, cdim) = super::launch_dims_1d_folded(a_len, crate::capability::gather_launch_width());
     // SAFETY: `a_len`/`cols` are the carried/validated element counts; the
     // kernel bounds-checks `tid < a.len()` and reads `mean[tid % cols]`
     // (mirrors `covariance.rs`'s identical launch).
@@ -254,27 +254,4 @@ fn validate_geometry(a_len: usize, (rows, cols): (usize, usize)) -> Result<(), P
         });
     }
     Ok(())
-}
-
-/// Ceiling-division per-element launch config, FOLDED across the X/Y grid
-/// axes so the cube count never exceeds `MAX_GRID_DIM` in any single
-/// dimension. The `center_columns` elementwise kernel addresses its element
-/// via the flattened `ABSOLUTE_POS` (which linearizes contiguously across a
-/// multi-axis grid: cube `(x, y)` covers elements
-/// `[(y·CUBE_COUNT_X + x)·block, +block)`) and bounds-checks `tid < a.len()`,
-/// so folding into a 2D grid is transparent to it. The un-folded
-/// `Static(cubes, 1, 1)` form (still used by the sibling `covariance.rs` /
-/// distance prims) silently exceeds the ~65535 per-dimension cap once
-/// `n > 65535·256 ≈ 16.7M` — the large-`n_samples` centering hot path this
-/// perf work targets, so it MUST fold here (`center_test.rs`'s ignored
-/// grid-fold test covers exactly this size).
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = ((n as u32) + block - 1) / block;
-    let x = cubes.min(MAX_GRID_DIM).max(1);
-    let y = cubes.div_ceil(x).max(1);
-    (
-        CubeCount::Static(x, y, 1),
-        CubeDim { x: block, y: 1, z: 1 },
-    )
 }

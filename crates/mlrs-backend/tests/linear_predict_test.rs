@@ -21,7 +21,9 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::capability::{self, FloatKind};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::linear_predict::linear_predict;
+use mlrs_backend::prims::linear_predict::{
+    linear_predict, linear_predict_host, linear_predict_host_units,
+};
 use mlrs_backend::runtime::{self, ActiveRuntime};
 use mlrs_core::{assert_slice_close, PrimError, F32_TOL, F64_TOL};
 
@@ -197,6 +199,196 @@ fn linear_predict_shared_band_multiblock_f64() {
         let (got, exp) = shared_band_case::<f64>(m, n);
         assert_slice_close(&got, &exp, &F64_TOL);
     }
+}
+
+// ---------------------------------------------------------------------------
+// linear_predict_host — the cpu backend's zero-copy path (LINEAR-PRED-CPU)
+// ---------------------------------------------------------------------------
+
+/// Shapes for the host path, chosen to straddle every internal boundary:
+/// `n = 1` and `n = 3` fall entirely in `host_dot`'s scalar remainder (below
+/// `HOST_DOT_LANES = 8`), `n = 16`/`64` are exact lane multiples, `n = 11`/`37`
+/// leave a non-empty remainder after full lane groups, and the row counts run
+/// from a single row up past `HOST_ELEMS_PER_UNIT` so both the single-threaded
+/// and the multi-threaded chunk split are exercised (including a row count that
+/// does NOT divide evenly by the unit count, so the last chunk is short).
+const HOST_SHAPES: &[(usize, usize)] = &[
+    (1, 5),
+    (7, 4),
+    (300, 1),
+    (999, 3),
+    (1000, 16),
+    (513, 64),
+    (4097, 11),
+    (20_003, 37),
+];
+
+/// `linear_predict_host` vs the same direct f64 host reference the kernel paths
+/// are gated against.
+///
+/// This is the primary oracle for the cpu predict path: the estimator routes
+/// cpu through this function instead of a kernel, so without this test the
+/// backend that CI gates on would have no coverage of its own predict
+/// arithmetic. The reassociated lane accumulation (`HOST_DOT_LANES` independent
+/// chains) is deliberately compared against the strictly-sequential reference at
+/// the project tolerance — that is the claim being checked, not an accident of
+/// the tolerance.
+#[test]
+fn linear_predict_host_matches_host_ref_f32() {
+    for &(m, n) in HOST_SHAPES {
+        let x64 = design(m, n);
+        let coef64 = coefs(n);
+        let b = 0.37f64;
+        let x32: Vec<f32> = x64.iter().map(|&v| v as f32).collect();
+        let coef32: Vec<f32> = coef64.iter().map(|&v| v as f32).collect();
+
+        let pred = linear_predict_host::<f32>(&x32, &coef32, b as f32, (m, n)).expect("host");
+        assert!(pred.operand_finite, "the `design` operand is finite");
+        let got: Vec<f64> = pred.values.iter().map(|&v| v as f64).collect();
+        assert_slice_close(&got, &host_predict_ref(&x64, &coef64, b, m, n), &F32_TOL);
+    }
+}
+
+/// f64 twin of [`linear_predict_host_matches_host_ref_f32`]. Runs on every
+/// backend — the host path never touches the device, so an f64-incapable
+/// adapter is irrelevant to it.
+#[test]
+fn linear_predict_host_matches_host_ref_f64() {
+    for &(m, n) in HOST_SHAPES {
+        let x = design(m, n);
+        let coef = coefs(n);
+        let b = 0.37f64;
+        let pred = linear_predict_host::<f64>(&x, &coef, b, (m, n)).expect("host");
+        assert!(pred.operand_finite, "the `design` operand is finite");
+        assert_slice_close(
+            &pred.values,
+            &host_predict_ref(&x, &coef, b, m, n),
+            &F64_TOL,
+        );
+    }
+}
+
+/// The host path is the SAME function whatever the thread split, so forcing the
+/// unit count must not move a single value. Pins the contiguous-chunk row
+/// arithmetic (`i·rows .. i·rows + chunk.len()`), which is the one place a
+/// split-dependent bug could hide: a wrong slab offset would shift whole blocks
+/// of predictions while leaving the shape and the first chunk correct. Unit
+/// counts that do not divide the row count (`3`, `7` into `20_003`) are included
+/// so the short final chunk is exercised.
+///
+/// The split is pinned through the `linear_predict_host_units` ARGUMENT, never
+/// by `set_var`ing `MLRS_CPU_UNITS`: that variable is read per call, and libtest
+/// runs this binary's tests on parallel threads, so mutating it here would race
+/// glibc's `environ` against every sibling test's `getenv` AND silently change
+/// the launch width they run under (see that function's docs).
+#[test]
+fn linear_predict_host_is_thread_split_invariant_f32() {
+    let (m, n) = (20_003usize, 37usize);
+    let x: Vec<f32> = design(m, n).iter().map(|&v| v as f32).collect();
+    let coef: Vec<f32> = coefs(n).iter().map(|&v| v as f32).collect();
+
+    let mut baseline: Option<Vec<f32>> = None;
+    for units in [1usize, 2, 3, 7, 16] {
+        let got = linear_predict_host_units::<f32>(&x, &coef, 0.37, (m, n), Some(units))
+            .expect("host")
+            .values;
+        match &baseline {
+            None => baseline = Some(got),
+            // Bit-exact, not `close`: each row's lane accumulation is
+            // independent of which thread runs it, so the split cannot change
+            // a single bit. Anything else is a chunking bug.
+            Some(want) => assert_eq!(&got, want, "units={units} changed the result"),
+        }
+    }
+
+    // The production entry point (unit count chosen by operand size) must land
+    // on the same values as every pinned split.
+    assert_eq!(
+        &linear_predict_host::<f32>(&x, &coef, 0.37, (m, n))
+            .expect("host")
+            .values,
+        baseline.as_ref().expect("swept at least one unit count"),
+    );
+}
+
+/// The fused NaN/inf verdict (`HostPrediction::operand_finite`) — the sklearn
+/// `check_array(ensure_all_finite=True)` rejection that
+/// `LinearRegression.predict` now sources from this pass instead of a second
+/// scan of its own.
+///
+/// Checked at BOTH ends of the operand and on both sides of the
+/// single-vs-multi-threaded split, since a chunked scan that folded its
+/// per-thread verdicts wrongly (e.g. taking only the first chunk's) would still
+/// pass a small single-threaded case.
+#[test]
+fn linear_predict_host_flags_nonfinite_operand_f32() {
+    for &(m, n) in &[(7usize, 4usize), (20_003, 37)] {
+        let coef: Vec<f32> = coefs(n).iter().map(|&v| v as f32).collect();
+        let clean: Vec<f32> = design(m, n).iter().map(|&v| v as f32).collect();
+
+        assert!(
+            linear_predict_host::<f32>(&clean, &coef, 0.5, (m, n))
+                .expect("host")
+                .operand_finite,
+            "({m}, {n}): a finite operand must not be flagged"
+        );
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for at in [0usize, m * n / 2, m * n - 1] {
+                let mut x = clean.clone();
+                x[at] = bad;
+                assert!(
+                    !linear_predict_host::<f32>(&x, &coef, 0.5, (m, n))
+                        .expect("host")
+                        .operand_finite,
+                    "({m}, {n}): {bad} at index {at} went undetected"
+                );
+            }
+        }
+    }
+}
+
+/// A finite operand whose PREDICTION overflows to infinity must NOT be flagged.
+///
+/// The verdict is about the operand, not the result — the cheap-looking
+/// shortcut of testing `y[r].is_finite()` instead of scanning `x` would reject
+/// this input, which sklearn accepts. Coefficients and values near the `f32`
+/// ceiling make every product finite and their sum overflow.
+#[test]
+fn linear_predict_host_overflowing_prediction_is_not_rejected_f32() {
+    let (m, n) = (4usize, 8usize);
+    let x = vec![1.0e38f32; m * n];
+    let coef = vec![1.0f32; n];
+    let pred = linear_predict_host::<f32>(&x, &coef, 0.0, (m, n)).expect("host");
+    assert!(
+        pred.operand_finite,
+        "every element of x is finite — the operand verdict must say so"
+    );
+    assert!(
+        pred.values.iter().all(|v| v.is_infinite()),
+        "the case is only meaningful if the sum actually overflows"
+    );
+}
+
+/// Geometry rejection on the host path, mirroring
+/// [`linear_predict_rejects_bad_geometry`] for the kernel one: the same typed
+/// `PrimError`s, raised before any work.
+#[test]
+fn linear_predict_host_rejects_bad_geometry() {
+    let coef = vec![1.0f32; 4];
+
+    let err = linear_predict_host::<f32>(&vec![0.0f32; 11], &coef, 0.5, (3, 4))
+        .err()
+        .unwrap();
+    assert!(matches!(err, PrimError::ShapeMismatch { operand: "x", .. }));
+
+    let err = linear_predict_host::<f32>(&vec![0.0f32; 15], &coef, 0.5, (3, 5))
+        .err()
+        .unwrap();
+    assert!(matches!(err, PrimError::DimMismatch { dim: "n_features", .. }));
+
+    let err = linear_predict_host::<f32>(&[], &coef, 0.5, (0, 4)).err().unwrap();
+    assert!(matches!(err, PrimError::ShapeMismatch { operand: "x", .. }));
 }
 
 /// Geometry rejection (ASVS V5): zero-row / zero-col / mismatched-length x /

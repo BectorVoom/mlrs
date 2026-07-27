@@ -79,7 +79,7 @@ fn use_gemm_assign(d: usize, k: usize) -> bool {
     }
     #[cfg(not(feature = "cpu"))]
     {
-        std::env::var("KM_GEMM").is_ok()
+        crate::abflag::var("KM_GEMM").is_some()
     }
 }
 
@@ -99,7 +99,7 @@ fn use_shared_sums(kd: usize) -> bool {
     }
     #[cfg(not(feature = "cpu"))]
     {
-        if std::env::var("KM_SUMS_GATHER").is_ok() {
+        if crate::abflag::var("KM_SUMS_GATHER").is_some() {
             return false;
         }
         kd <= 4096
@@ -184,7 +184,7 @@ where
     let counts_handle = pool.acquire(k * size_of::<u32>());
 
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(sums_len);
+    let (count, dim) = super::launch_dims_1d_folded(sums_len, super::PERF_TUNED_BLOCK);
 
     // SAFETY: lengths are the validated element counts; the kernel bounds-checks
     // `tid < k*d` and only gathers `n` rows (mitigates T-05-03-01).
@@ -332,7 +332,7 @@ where
     let out_handle = pool.acquire(n * size_of::<F>());
 
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(n);
+    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
 
     // SAFETY: validated element counts; the kernel bounds-checks `i < n`.
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
@@ -554,7 +554,7 @@ where
     let out_handle = pool.acquire(n * size_of::<F>());
 
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(n);
+    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
 
     // SAFETY: validated element counts; the kernel bounds-checks `i < n`.
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
@@ -590,7 +590,7 @@ where
     F: Float + CubeElement + Pod,
 {
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(n);
+    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
     // SAFETY: lengths are the carried element counts; the kernel bounds-checks
     // `i < n` and `center_idx < n` is guaranteed by the caller's draw domain.
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
@@ -688,7 +688,7 @@ where
             // SAFETY: validated element counts; kernels bounds-check unit ids.
             let c_arg = unsafe { ArrayArg::from_raw_parts(centers.handle().clone(), centers.len()) };
             let cn_arg = unsafe { ArrayArg::from_raw_parts(cnorm.clone(), k) };
-            let (cc, cd) = launch_dims_1d(k);
+            let (cc, cd) = super::launch_dims_1d_folded(k, super::PERF_TUNED_BLOCK);
             row_sqnorm::launch::<F, ActiveRuntime>(&client, cc, cd, c_arg, cn_arg, k as u32, d as u32);
 
             // Cross term XCᵀ (n × k) on the tiled matmul.
@@ -719,13 +719,13 @@ where
             // x[i, j] once per chunk instead of once per center.
             // KM_ASSIGN_C1=1 switches to the plain per-(row, center) kernel
             // for A/B measurement.
-            if std::env::var("KM_ASSIGN_C1").is_ok() {
-                let (count1, dim1) = launch_dims_1d(dmat_len);
+            if crate::abflag::var("KM_ASSIGN_C1").is_some() {
+                let (count1, dim1) = super::launch_dims_1d_folded(dmat_len, super::PERF_TUNED_BLOCK);
                 dist_direct_2d::launch::<F, ActiveRuntime>(
                     &client, count1, dim1, x_arg, c_arg, dm_arg, n as u32, d as u32, k as u32,
                 );
             } else {
-                let (count1, dim1) = launch_dims_1d(n * k.div_ceil(4));
+                let (count1, dim1) = super::launch_dims_1d_folded(n * k.div_ceil(4), super::PERF_TUNED_BLOCK);
                 dist_direct_2d_c4::launch::<F, ActiveRuntime>(
                     &client, count1, dim1, x_arg, c_arg, dm_arg, n as u32, d as u32, k as u32,
                 );
@@ -739,7 +739,7 @@ where
     let dm_arg2 = unsafe { ArrayArg::from_raw_parts(dmat.handle().clone(), dmat_len) };
     let l_arg = unsafe { ArrayArg::from_raw_parts(labels.handle().clone(), n) };
     let d_arg = unsafe { ArrayArg::from_raw_parts(dist.handle().clone(), n) };
-    let (count2, dim2) = launch_dims_1d(n);
+    let (count2, dim2) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
     argmin_dist_rows::launch::<F, ActiveRuntime>(
         &client, count2, dim2, dm_arg2, l_arg, d_arg, n as u32, k as u32,
     );
@@ -785,7 +785,7 @@ where
     guard_u32("n", n)?;
     guard_u32("d", d)?;
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(n);
+    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
     // SAFETY: validated element counts; the kernel bounds-checks `i < n`, and
     // the labels were produced by the assign kernels (each `< k`).
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
@@ -822,7 +822,7 @@ where
     guard_u32("d", d)?;
     let out = pool.acquire(n * size_of::<F>());
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(n);
+    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
     // SAFETY: validated element counts; the kernel bounds-checks `i < n`.
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
     let o_arg = unsafe { ArrayArg::from_raw_parts(out.clone(), n) };
@@ -857,7 +857,7 @@ where
         });
     }
 
-    if std::env::var("KM_GEMM_SUMS").is_ok() {
+    if crate::abflag::var("KM_GEMM_SUMS").is_some() {
         return centroid_sums_gemm::<F>(pool, x, labels, n, d, k);
     }
     if use_shared_sums(k * d) {
@@ -886,7 +886,7 @@ where
     let l_arg = unsafe { ArrayArg::from_raw_parts(labels.handle().clone(), n) };
     let ps_arg = unsafe { ArrayArg::from_raw_parts(psums.clone(), psums_len) };
     let pc_arg = unsafe { ArrayArg::from_raw_parts(pcounts.clone(), nb * k) };
-    let (count1, dim1) = launch_dims_1d(psums_len);
+    let (count1, dim1) = super::launch_dims_1d_folded(psums_len, super::PERF_TUNED_BLOCK);
     centroid_sumcount_blocked::launch::<F, ActiveRuntime>(
         &client,
         count1,
@@ -906,7 +906,7 @@ where
     let pc_arg2 = unsafe { ArrayArg::from_raw_parts(pcounts.clone(), nb * k) };
     let s_arg = unsafe { ArrayArg::from_raw_parts(sums.clone(), kd) };
     let c_arg = unsafe { ArrayArg::from_raw_parts(counts.clone(), k) };
-    let (count2, dim2) = launch_dims_1d(kd);
+    let (count2, dim2) = super::launch_dims_1d_folded(kd, super::PERF_TUNED_BLOCK);
     centroid_reduce_partials::launch::<F, ActiveRuntime>(
         &client,
         count2,
@@ -989,7 +989,7 @@ where
     // Stage 1b: per-block counts on the same layout.
     let l_arg2 = unsafe { ArrayArg::from_raw_parts(labels.handle().clone(), n) };
     let pc_arg = unsafe { ArrayArg::from_raw_parts(pcounts.clone(), nb * k) };
-    let (c1, d1) = launch_dims_1d(nb * k);
+    let (c1, d1) = super::launch_dims_1d_folded(nb * k, super::PERF_TUNED_BLOCK);
     count_blocked::launch::<ActiveRuntime>(
         &client, c1, d1, l_arg2, pc_arg, n as u32, k as u32, nb as u32, rpb as u32,
     );
@@ -999,7 +999,7 @@ where
     let pc_arg2 = unsafe { ArrayArg::from_raw_parts(pcounts.clone(), nb * k) };
     let s_arg = unsafe { ArrayArg::from_raw_parts(sums.clone(), kd) };
     let c_arg = unsafe { ArrayArg::from_raw_parts(counts.clone(), k) };
-    let (c2, d2) = launch_dims_1d(kd);
+    let (c2, d2) = super::launch_dims_1d_folded(kd, super::PERF_TUNED_BLOCK);
     centroid_reduce_partials::launch::<F, ActiveRuntime>(
         &client, c2, d2, ps_arg2, pc_arg2, s_arg, c_arg, d as u32, k as u32, nb as u32,
     );
@@ -1043,7 +1043,7 @@ where
     // SAFETY: validated element counts; kernels bounds-check their unit ids.
     let l_arg = unsafe { ArrayArg::from_raw_parts(labels.handle().clone(), n) };
     let oh_arg = unsafe { ArrayArg::from_raw_parts(onehot.handle().clone(), oh_len) };
-    let (c1, d1) = launch_dims_1d(oh_len);
+    let (c1, d1) = super::launch_dims_1d_folded(oh_len, super::PERF_TUNED_BLOCK);
     onehot_from_labels::launch::<F, ActiveRuntime>(&client, c1, d1, l_arg, oh_arg, n as u32, k as u32);
 
     // sums = onehotᵀ (k × n) · X (n × d) — transa reads the stored (n, k)
@@ -1058,13 +1058,13 @@ where
     let counts = pool.acquire(k * size_of::<u32>());
     let l_arg2 = unsafe { ArrayArg::from_raw_parts(labels.handle().clone(), n) };
     let pc_arg = unsafe { ArrayArg::from_raw_parts(pcounts.clone(), nb * k) };
-    let (c2, d2) = launch_dims_1d(nb * k);
+    let (c2, d2) = super::launch_dims_1d_folded(nb * k, super::PERF_TUNED_BLOCK);
     count_blocked::launch::<ActiveRuntime>(
         &client, c2, d2, l_arg2, pc_arg, n as u32, k as u32, nb as u32, rpb as u32,
     );
     let pc_arg2 = unsafe { ArrayArg::from_raw_parts(pcounts.clone(), nb * k) };
     let cnt_arg = unsafe { ArrayArg::from_raw_parts(counts.clone(), k) };
-    let (c3, d3) = launch_dims_1d(k);
+    let (c3, d3) = super::launch_dims_1d_folded(k, super::PERF_TUNED_BLOCK);
     count_reduce::launch::<ActiveRuntime>(&client, c3, d3, pc_arg2, cnt_arg, k as u32, nb as u32);
 
     let sums_host: Vec<f64> = sums_dev.to_host(pool).iter().map(|&s| host_to_f64(s)).collect();
@@ -1105,7 +1105,7 @@ pub fn labels_changed(
 
     let out = pool.acquire(nb * size_of::<u32>());
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(nb);
+    let (count, dim) = super::launch_dims_1d_folded(nb, super::PERF_TUNED_BLOCK);
     // SAFETY: validated element counts; the kernel bounds-checks its block id
     // and clamps the row range to `n`.
     let a_arg = unsafe { ArrayArg::from_raw_parts(a.handle().clone(), n) };
@@ -1157,7 +1157,7 @@ where
 
     let out = pool.acquire(nb * size_of::<F>());
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(nb);
+    let (count, dim) = super::launch_dims_1d_folded(nb, super::PERF_TUNED_BLOCK);
     // SAFETY: validated element counts; the kernel bounds-checks its block id.
     let v_arg = unsafe { ArrayArg::from_raw_parts(v.handle().clone(), n) };
     let o_arg = unsafe { ArrayArg::from_raw_parts(out.clone(), nb) };
@@ -1200,7 +1200,7 @@ where
     let idx_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(pool, idx);
     let out = pool.acquire(k * d * size_of::<F>());
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(k * d);
+    let (count, dim) = super::launch_dims_1d_folded(k * d, super::PERF_TUNED_BLOCK);
     // SAFETY: validated element counts + index domain; the kernel bounds-checks
     // its unit id against `k·d`.
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
@@ -1245,7 +1245,7 @@ where
     let plen = nb * d;
 
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(plen);
+    let (count, dim) = super::launch_dims_1d_folded(plen, super::PERF_TUNED_BLOCK);
 
     // Pass 1: blocked column sums → host means (f64 fold of the partials).
     let psums = pool.acquire(plen * size_of::<F>());
@@ -1450,23 +1450,6 @@ fn guard_u32(operand: &'static str, dim: usize) -> Result<(), PrimError> {
         });
     }
     Ok(())
-}
-
-/// Standard ceiling-division 1D launch config (matches `distance.rs`), folding
-/// cube counts past the per-dimension dispatch limit (65535 on wgpu) into the
-/// Y dimension — needed for the `n × k` staging-matrix launches. `ABSOLUTE_POS`
-/// linearizes over the whole grid and every kernel carries an `if tid < total`
-/// guard, so slack cubes are harmless (the `random_forest.rs` shape).
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    const MAX_DIM: u32 = 65_535;
-    let block = 256u32;
-    let cubes = (((n as u32) + block - 1) / block).max(1);
-    let y = cubes.div_ceil(MAX_DIM);
-    let x = cubes.div_ceil(y);
-    (
-        CubeCount::Static(x, y, 1),
-        CubeDim { x: block, y: 1, z: 1 },
-    )
 }
 
 /// 64-thread workgroup grid for a CUBE-addressed kernel (one cube per row

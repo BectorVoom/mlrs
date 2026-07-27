@@ -19,6 +19,7 @@
 //!
 //! Per AGENTS.md §2 tests live here, never an in-source `#[cfg(test)] mod tests`.
 
+use mlrs_backend::abflag;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::knn::knn_regress_mean_gather;
@@ -39,12 +40,18 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Run `top_k` over `dist` on the parallel path and on the serial
-/// (`MLRS_TOPK_SERIAL=1`) path, returning both `(values, indices)` results.
+/// Run `top_k` over `dist` on the one-pass, multi-pass and serial paths,
+/// returning all three `(values, indices)` results.
 ///
-/// The env var is read per call by the prim, so flipping it here selects the
-/// kernel. Tests using this helper must not run concurrently with each other;
-/// they are collected into ONE `#[test]` for that reason.
+/// The variant is selected with `abflag` THREAD-LOCAL overrides, not by
+/// `set_var`ing `MLRS_TOPK_*`. The prim reads those knobs on every call, and
+/// libtest runs this binary's tests on parallel threads, so mutating the
+/// process environment here would (a) race glibc's `environ` against every
+/// sibling test's `getenv` and (b) leak the forced variant into their launches —
+/// which would make an "all three kernels agree bitwise" assertion silently
+/// compare a kernel against itself. A thread-local override is visible only on
+/// the thread that then calls the prim, so neither happens and this helper is
+/// safe to use from any number of concurrent tests.
 #[allow(clippy::type_complexity)]
 fn all_paths(
     dist: &[f32],
@@ -62,20 +69,20 @@ fn all_paths(
     // Default path: single-pass select_k_onepass for k <= 32, else the
     // multi-pass select_k_shared (both must agree bitwise, so running the
     // fallback here for large k keeps the assertions meaningful).
-    std::env::remove_var("MLRS_TOPK_SERIAL");
-    std::env::remove_var("MLRS_TOPK_MULTIPASS");
+    let _ab19 = abflag::clear("MLRS_TOPK_SERIAL");
+    let _ab20 = abflag::clear("MLRS_TOPK_MULTIPASS");
     let (ov, oi) = top_k::<f32>(&mut p, &d, rows, cols, k, true, None, None).expect("onepass");
     let one = (ov.to_host(&p), oi.to_host(&p));
 
-    std::env::set_var("MLRS_TOPK_MULTIPASS", "1");
+    let _ab1 = abflag::force("MLRS_TOPK_MULTIPASS", "1");
     let (pv, pi) = top_k::<f32>(&mut p, &d, rows, cols, k, true, None, None).expect("parallel");
     let par = (pv.to_host(&p), pi.to_host(&p));
-    std::env::remove_var("MLRS_TOPK_MULTIPASS");
+    let _ab21 = abflag::clear("MLRS_TOPK_MULTIPASS");
 
-    std::env::set_var("MLRS_TOPK_SERIAL", "1");
+    let _ab2 = abflag::force("MLRS_TOPK_SERIAL", "1");
     let (sv, si) = top_k::<f32>(&mut p, &d, rows, cols, k, true, None, None).expect("serial");
     let ser = (sv.to_host(&p), si.to_host(&p));
-    std::env::remove_var("MLRS_TOPK_SERIAL");
+    let _ab22 = abflag::clear("MLRS_TOPK_SERIAL");
 
     (one, par, ser)
 }
@@ -199,10 +206,20 @@ fn knn_regress_mean_matches_host_gather() {
     }
 }
 
-/// WR-02 parity: an out-of-range neighbor index must not read out of bounds — the
-/// kernel's `t < n_train` guard makes it contribute nothing.
+/// WR-02 parity: an out-of-range neighbor index must not read out of bounds AND
+/// must not be swallowed — it is a typed error, as it was before KNN-01 moved
+/// the gather onto the device.
+///
+/// The kernel's `t < n_train` guard alone (which is what this test used to
+/// assert: "only `y[1]` contributes; the divisor is still `k`") is the wrong
+/// contract. Skipping a neighbor while still dividing by `k` returns a
+/// numerically PLAUSIBLE wrong prediction — here `2.0 / 2 = 1.0` — so a
+/// corruption in the selection kernels would reach the caller as a slightly-off
+/// regression value with nothing to flag it. The guard stays (it is what
+/// prevents the OOB read); the row now also records the violation in `oob` so
+/// the host can raise.
 #[test]
-fn knn_regress_mean_guards_out_of_range_index() {
+fn knn_regress_mean_rejects_out_of_range_index() {
     let n_train = 4usize;
     let k = 2usize;
     let y: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
@@ -213,12 +230,34 @@ fn knn_regress_mean_guards_out_of_range_index() {
     let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut p, &y);
     let idx_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(&mut p, &idx);
 
-    let got = knn_regress_mean_gather::<f32>(&mut p, &y_dev, &idx_dev, 1, k, n_train)
-        .expect("gather")
-        .to_host(&p);
+    assert!(
+        matches!(
+            knn_regress_mean_gather::<f32>(&mut p, &y_dev, &idx_dev, 1, k, n_train),
+            Err(PrimError::ShapeMismatch { operand: "knn.train_idx", .. })
+        ),
+        "an out-of-range neighbor index must be a typed error, not a skewed mean"
+    );
 
-    // Only y[1] = 2.0 contributes; the divisor is still k.
-    assert!((got[0] - 1.0).abs() < 1e-6, "got {}", got[0]);
+    // The flag is per ROW, so a corrupt row must not condemn a clean one: with
+    // the bad index moved to the SECOND query, the error still fires and names
+    // that row.
+    let idx2: Vec<u32> = vec![1, 2, 0, 9_999];
+    let idx2_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(&mut p, &idx2);
+    match knn_regress_mean_gather::<f32>(&mut p, &y_dev, &idx2_dev, 2, k, n_train) {
+        Err(PrimError::ShapeMismatch { operand: "knn.train_idx", rows, .. }) => {
+            assert_eq!(rows, 1, "the reported row should be the corrupt one");
+        }
+        Err(other) => panic!("expected a knn.train_idx ShapeMismatch, got {other:?}"),
+        Ok(_) => panic!("expected a knn.train_idx ShapeMismatch, got a successful gather"),
+    }
+
+    // And an entirely in-range index set still succeeds (no false rejection).
+    let idx_ok: Vec<u32> = vec![1, 2];
+    let idx_ok_dev: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_host(&mut p, &idx_ok);
+    let got = knn_regress_mean_gather::<f32>(&mut p, &y_dev, &idx_ok_dev, 1, k, n_train)
+        .expect("in-range indices must still gather")
+        .to_host(&p);
+    assert!((got[0] - 2.5).abs() < 1e-6, "got {}", got[0]);
 }
 
 /// ASVS V5: every geometry violation is a typed error raised BEFORE any launch.
@@ -382,30 +421,33 @@ fn distance_tiled_matches_untiled_bitwise() {
         let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut p, &x);
         let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut p, &y);
 
-        for v in ["MLRS_DIST_UNTILED", "MLRS_DIST_TILED1X1", "MLRS_DIST_RB2"] {
-            std::env::remove_var(v);
-        }
+        // Pin the DEFAULT variant for the baseline run, even if the ambient
+        // environment forces one — the guards live to the end of this scope.
+        let _ab_defaults: Vec<_> = ["MLRS_DIST_UNTILED", "MLRS_DIST_TILED1X1", "MLRS_DIST_RB2"]
+            .into_iter()
+            .map(abflag::clear)
+            .collect();
         let rb4 = distance_direct::<f32>(&mut p, &xd, (rows_x, cols), &yd, (rows_y, cols), None)
             .expect("4x4 register-blocked")
             .to_host(&p);
 
-        std::env::set_var("MLRS_DIST_RB2", "1");
+        let _ab3 = abflag::force("MLRS_DIST_RB2", "1");
         let rb = distance_direct::<f32>(&mut p, &xd, (rows_x, cols), &yd, (rows_y, cols), None)
             .expect("2x2 register-blocked")
             .to_host(&p);
-        std::env::remove_var("MLRS_DIST_RB2");
+        let _ab23 = abflag::clear("MLRS_DIST_RB2");
 
-        std::env::set_var("MLRS_DIST_TILED1X1", "1");
+        let _ab4 = abflag::force("MLRS_DIST_TILED1X1", "1");
         let tiled = distance_direct::<f32>(&mut p, &xd, (rows_x, cols), &yd, (rows_y, cols), None)
             .expect("tiled")
             .to_host(&p);
-        std::env::remove_var("MLRS_DIST_TILED1X1");
+        let _ab24 = abflag::clear("MLRS_DIST_TILED1X1");
 
-        std::env::set_var("MLRS_DIST_UNTILED", "1");
+        let _ab5 = abflag::force("MLRS_DIST_UNTILED", "1");
         let untiled = distance_direct::<f32>(&mut p, &xd, (rows_x, cols), &yd, (rows_y, cols), None)
             .expect("untiled")
             .to_host(&p);
-        std::env::remove_var("MLRS_DIST_UNTILED");
+        let _ab25 = abflag::clear("MLRS_DIST_UNTILED");
 
         assert_eq!(
             tiled.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -501,10 +543,10 @@ fn fused_topk_matches_two_kernel_bitwise() {
         // capped so every strip keeps >= 64 columns). Env is read per call.
         let mut fused_runs: Vec<(String, Vec<f32>, Vec<u32>)> = Vec::new();
         for strips in [None, Some(2usize), Some(5)] {
-            match strips {
-                Some(s) => std::env::set_var("MLRS_KNN_STRIPS", s.to_string()),
-                None => std::env::remove_var("MLRS_KNN_STRIPS"),
-            }
+            let _ab_strips = match strips {
+                Some(s) => abflag::force("MLRS_KNN_STRIPS", &s.to_string()),
+                None => abflag::clear("MLRS_KNN_STRIPS"),
+            };
             let (fv, fi) = mlrs_backend::prims::knn::fused_distance_topk::<f32>(
                 &mut p,
                 &xq_dev,
@@ -517,7 +559,7 @@ fn fused_topk_matches_two_kernel_bitwise() {
             .expect("fused");
             fused_runs.push((format!("{strips:?}"), fv.to_host(&p), fi.to_host(&p)));
         }
-        std::env::remove_var("MLRS_KNN_STRIPS");
+        let _ab26 = abflag::clear("MLRS_KNN_STRIPS");
         let (fv, fi) = (fused_runs[0].1.clone(), fused_runs[0].2.clone());
 
         // DOT-forced run: exercises the dot-expansion kernel on backends whose
@@ -525,7 +567,7 @@ fn fused_topk_matches_two_kernel_bitwise() {
         // below (indices exact; values bitwise on quantized cases, 1e-5 rel
         // otherwise — at d > 32 the dispatch falls back to direct and the
         // comparison is trivially bitwise).
-        std::env::set_var("MLRS_KNN_DOT", "1");
+        let _ab7 = abflag::force("MLRS_KNN_DOT", "1");
         let (qv, qi) = mlrs_backend::prims::knn::fused_distance_topk::<f32>(
             &mut p,
             &xq_dev,
@@ -537,7 +579,7 @@ fn fused_topk_matches_two_kernel_bitwise() {
         )
         .expect("fused dot");
         let (qv, qi) = (qv.to_host(&p), qi.to_host(&p));
-        std::env::remove_var("MLRS_KNN_DOT");
+        let _ab27 = abflag::clear("MLRS_KNN_DOT");
 
         // VECTORIZED dot kernel (KNN-03), forced on regardless of backend
         // default. Its claim is the strongest one: for every pair the scalar
@@ -545,8 +587,8 @@ fn fused_topk_matches_two_kernel_bitwise() {
         // the unit→pair assignment changes, and the merge order is total), so
         // values AND indices must match the dot-forced run BITWISE — even on
         // unquantized data.
-        std::env::set_var("MLRS_KNN_DOT", "1");
-        std::env::set_var("MLRS_KNN_VEC", "1");
+        let _ab8 = abflag::force("MLRS_KNN_DOT", "1");
+        let _ab9 = abflag::force("MLRS_KNN_VEC", "1");
         let (vv, vi) = mlrs_backend::prims::knn::fused_distance_topk::<f32>(
             &mut p,
             &xq_dev,
@@ -558,8 +600,8 @@ fn fused_topk_matches_two_kernel_bitwise() {
         )
         .expect("fused dot vec");
         let (vv, vi) = (vv.to_host(&p), vi.to_host(&p));
-        std::env::remove_var("MLRS_KNN_VEC");
-        std::env::remove_var("MLRS_KNN_DOT");
+        let _ab28 = abflag::clear("MLRS_KNN_VEC");
+        let _ab29 = abflag::clear("MLRS_KNN_DOT");
         assert_eq!(
             vi, qi,
             "vec dot indices diverged from scalar dot at n_train={n_train} n_query={n_query} d={d} k={k} quant={quant:?}"
@@ -572,8 +614,8 @@ fn fused_topk_matches_two_kernel_bitwise() {
 
         // 4×8 register-tile vec kernel (KNN-03 r3): same bitwise claim as the
         // 4×4 vec kernel (partition-only change, total merge order).
-        std::env::set_var("MLRS_KNN_DOT", "1");
-        std::env::set_var("MLRS_KNN_VEC8", "1");
+        let _ab10 = abflag::force("MLRS_KNN_DOT", "1");
+        let _ab11 = abflag::force("MLRS_KNN_VEC8", "1");
         let (wv, wi) = mlrs_backend::prims::knn::fused_distance_topk::<f32>(
             &mut p,
             &xq_dev,
@@ -585,8 +627,8 @@ fn fused_topk_matches_two_kernel_bitwise() {
         )
         .expect("fused dot vec8");
         let (wv, wi) = (wv.to_host(&p), wi.to_host(&p));
-        std::env::remove_var("MLRS_KNN_VEC8");
-        std::env::remove_var("MLRS_KNN_DOT");
+        let _ab30 = abflag::clear("MLRS_KNN_VEC8");
+        let _ab31 = abflag::clear("MLRS_KNN_DOT");
         assert_eq!(
             wi, qi,
             "vec8 dot indices diverged from scalar dot at n_train={n_train} n_query={n_query} d={d} k={k} quant={quant:?}"
@@ -600,7 +642,7 @@ fn fused_topk_matches_two_kernel_bitwise() {
         // The cancellation-free DIRECT fused kernel, which must stay bitwise
         // against the two-kernel reference regardless of the dot-expansion
         // default.
-        std::env::set_var("MLRS_KNN_DIRECT", "1");
+        let _ab12 = abflag::force("MLRS_KNN_DIRECT", "1");
         let (dv, di) = mlrs_backend::prims::knn::fused_distance_topk::<f32>(
             &mut p,
             &xq_dev,
@@ -612,7 +654,7 @@ fn fused_topk_matches_two_kernel_bitwise() {
         )
         .expect("fused direct");
         let (dv, di) = (dv.to_host(&p), di.to_host(&p));
-        std::env::remove_var("MLRS_KNN_DIRECT");
+        let _ab32 = abflag::clear("MLRS_KNN_DIRECT");
 
         // Two-kernel reference: direct distance then one-pass/multi-pass top_k
         // (itself gated bitwise against the serial kernel above).
@@ -920,16 +962,16 @@ fn cpu_rows_topk_matches_brute_force() {
         for (arm, vec_mode, dot_mode, direct) in arms {
             let (rv, ri) = host_rows_topk(&xq, &xt, n_query, n_train, d, k, direct);
             for units in ["1", "3", "16"] {
-                std::env::set_var("MLRS_KNN_CPU_VEC", vec_mode);
-                std::env::set_var("MLRS_KNN_DOT", dot_mode);
-                std::env::set_var("MLRS_CPU_UNITS", units);
+                let _ab13 = abflag::force("MLRS_KNN_CPU_VEC", vec_mode);
+                let _ab14 = abflag::force("MLRS_KNN_DOT", dot_mode);
+                let _ab15 = abflag::force("MLRS_CPU_UNITS", units);
                 let (cv, ci) =
                     cpu_rows_topk::<f32>(&mut p, &xq_dev, (n_query, d), &xt_dev, n_train, k, true)
                         .expect("cpu rows");
                 let (cv, ci) = (cv.to_host(&p), ci.to_host(&p));
-                std::env::remove_var("MLRS_KNN_CPU_VEC");
-                std::env::remove_var("MLRS_KNN_DOT");
-                std::env::remove_var("MLRS_CPU_UNITS");
+                let _ab33 = abflag::clear("MLRS_KNN_CPU_VEC");
+                let _ab34 = abflag::clear("MLRS_KNN_DOT");
+                let _ab35 = abflag::clear("MLRS_CPU_UNITS");
 
                 let tag = format!(
                     "arm={arm} units={units} n_train={n_train} n_query={n_query} d={d} \
@@ -1057,16 +1099,16 @@ fn cpu_rows_topk_survives_non_finite() {
                 let mut p = pool();
                 let xqd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut p, xq);
                 let xtd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut p, xt);
-                std::env::set_var("MLRS_KNN_CPU_VEC", vec_mode);
-                std::env::set_var("MLRS_KNN_DOT", dot_mode);
-                std::env::set_var("MLRS_CPU_UNITS", units);
+                let _ab16 = abflag::force("MLRS_KNN_CPU_VEC", vec_mode);
+                let _ab17 = abflag::force("MLRS_KNN_DOT", dot_mode);
+                let _ab18 = abflag::force("MLRS_CPU_UNITS", units);
                 let (v, i) =
                     cpu_rows_topk::<f32>(&mut p, &xqd, (n_query, d), &xtd, n_train, k, true)
                         .expect("cpu rows");
                 let out = i.to_host(&p);
-                std::env::remove_var("MLRS_KNN_CPU_VEC");
-                std::env::remove_var("MLRS_KNN_DOT");
-                std::env::remove_var("MLRS_CPU_UNITS");
+                let _ab36 = abflag::clear("MLRS_KNN_CPU_VEC");
+                let _ab37 = abflag::clear("MLRS_KNN_DOT");
+                let _ab38 = abflag::clear("MLRS_CPU_UNITS");
                 v.release_into(&mut p);
                 out
             };

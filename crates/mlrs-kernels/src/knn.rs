@@ -58,12 +58,21 @@ pub use self::knn_regress_mean as knn_regress_mean_kernel;
 /// ## Bounds guard (WR-02 parity)
 /// The host loop this replaces returned a typed `ShapeMismatch` when a neighbor
 /// index fell outside the target vector. A kernel cannot return an error, so the
-/// same defence is expressed as an `if t < n_train` guard: a corrupted or
+/// defence is split in two: an `if t < n_train` guard means a corrupted or
 /// oversized index CONTRIBUTES NOTHING instead of performing an out-of-bounds
-/// device read. The producing `select_k_shared` only ever emits column indices in
-/// `[0, n_train)`, so the guard is unreachable in practice — it exists so that a
-/// future regression in the selection kernel degrades to a wrong number rather
-/// than to undefined behaviour.
+/// device read, AND the row records that it happened in `oob[q]` so the host can
+/// still raise the typed error.
+///
+/// The guard alone is not enough. Skipping a neighbor while still dividing by
+/// the full `k` yields a numerically PLAUSIBLE but wrong prediction (the mean of
+/// `k-1` targets over `k`), which is a worse failure mode than the hard error it
+/// replaced: a corruption in the selection kernels would reach the user as a
+/// slightly-off regression value with nothing to flag it. `oob` restores
+/// "loud", at the cost of one `u32` per query row.
+///
+/// The producing selection kernels only ever emit column indices in
+/// `[0, n_train)`, so this stays unreachable in practice — it exists so a future
+/// regression there fails loudly instead of silently.
 ///
 /// ## Compensated (Neumaier) accumulation — why the sum is not naive
 /// The host loop this kernel replaced accumulated the `k` neighbour targets in
@@ -84,10 +93,12 @@ pub use self::knn_regress_mean as knn_regress_mean_kernel;
 /// Launched 1D over `n_query` (one unit per query row); the kernel bounds-checks
 /// `q < n_query`, so an over-provisioned launch writes nothing.
 #[cube(launch)]
+#[allow(clippy::too_many_arguments)]
 pub fn knn_regress_mean<F: Float + CubeElement>(
     y_train: &Array<F>,
     idx: &Array<u32>,
     out: &mut Array<F>,
+    oob: &mut Array<u32>,
     n_query: u32,
     k: u32,
     n_train: u32,
@@ -98,6 +109,9 @@ pub fn knn_regress_mean<F: Float + CubeElement>(
         let zero = F::new(0.0_f32);
         let mut acc = zero;
         let mut comp = zero;
+        // Set to 1 by the `else` arm below when this row saw an index outside
+        // `[0, n_train)` — see the `oob[q]` write at the end of the row.
+        let mut bad = 0u32;
         let mut j = 0u32;
         while j < k {
             let t = idx[(base + j) as usize];
@@ -120,11 +134,18 @@ pub fn knn_regress_mean<F: Float + CubeElement>(
                     comp += (v - sum) + acc;
                 }
                 acc = sum;
+            } else {
+                bad = 1u32;
             }
             j += 1u32;
         }
         // `k >= 1` is validated host-side before launch, so the divide is safe.
         out[q as usize] = (acc + comp) / F::cast_from(k);
+        // Row-private slot (unit `q` is the only writer), so reporting the
+        // corruption needs no atomic and no barrier. The host reads this back
+        // and raises the typed error the pre-KNN-01 host gather loop raised —
+        // see `prims::knn::knn_regress_mean_gather`.
+        oob[q as usize] = bad;
     }
 }
 

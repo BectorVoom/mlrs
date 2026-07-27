@@ -171,7 +171,7 @@ where
     //     sqrt is the monotone boundary applied in place over the `rows × k`
     //     distance buffer (never the whole matrix). Indices are unaffected. ---
     if sqrt {
-        let (scount, sdim) = launch_dims_1d(out_len);
+        let (scount, sdim) = super::launch_dims_1d(out_len, capability::gather_launch_width());
         let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         let sout_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         sqrt_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg);
@@ -265,7 +265,7 @@ const ONEPASS_K_CAP: usize = 32;
 /// paths can be A/B'd on the real target device (a perf kernel must never be
 /// gated onto a backend by extrapolating from a different backend's numbers).
 fn serial_select_forced() -> bool {
-    std::env::var("MLRS_TOPK_SERIAL").map(|v| v == "1").unwrap_or(false)
+    crate::abflag::is_on("MLRS_TOPK_SERIAL")
 }
 
 /// Should the cpu backend take the one-unit-per-row `select_k` kernel?
@@ -303,7 +303,7 @@ fn cpu_serial_select() -> bool {
 /// this escape hatch selects the k-pass kernel so the two can be A/B'd on the
 /// real target device.
 fn multipass_select_forced() -> bool {
-    std::env::var("MLRS_TOPK_MULTIPASS").map(|v| v == "1").unwrap_or(false)
+    crate::abflag::is_on("MLRS_TOPK_MULTIPASS")
 }
 
 /// Launch config for `select_k_shared`: ONE cube per query row (`CUBE_POS_X` =
@@ -333,19 +333,5 @@ fn launch_dims_rows(rows: usize) -> (CubeCount, CubeDim) {
     (
         CubeCount::Static((rows as u32).max(1), 1, 1),
         CubeDim { x: 1, y: 1, z: 1 },
-    )
-}
-
-/// Standard ceiling-division 1D launch config for the in-place sqrt pass over the
-/// `rows × k` returned distances (matches `distance.rs::launch_dims_1d`).
-///
-/// `sqrt_elem` is a barrier-free `ABSOLUTE_POS_X` GATHER, so the block width is
-/// whatever the backend schedules best — see [`capability::gather_launch_width`].
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = capability::gather_launch_width();
-    let cubes = ((n as u32) + block - 1) / block;
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
     )
 }

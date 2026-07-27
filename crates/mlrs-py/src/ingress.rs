@@ -83,6 +83,31 @@ pub fn validated_f64(
     Ok(DeviceArray::from_host(pool, validated))
 }
 
+/// Validate an owned `Float32Array` via the UNCHANGED bridge and BORROW its
+/// values — the no-upload sibling of [`validated_f32`].
+///
+/// Same hard-reject validator, same sliced/offset rejection; the only
+/// difference is that nothing is copied to the device. For a prim that consumes
+/// the operand from host memory (`prims::linear_predict::linear_predict_from_host`
+/// on the cpu backend, where "device" memory IS host memory) the upload is a
+/// pure `memcpy` of the whole matrix and dominates the operation — see that
+/// prim's docs for the measurement.
+///
+/// The returned slice borrows the caller's `arr`, which must itself be the view
+/// of an OWNED [`ArrayRef`] (the [`capsule_to_array`] contract), so the data
+/// outlives the borrow without anything reaching back into Python-owned memory
+/// that could be freed underneath it.
+pub fn host_slice_f32<'a>(arr: &'a Float32Array) -> PyResult<&'a [f32]> {
+    validate_f32(arr).map_err(bridge_err_to_py)
+}
+
+/// f64 twin of [`host_slice_f32`]. The f64-on-incapable-backend guard
+/// ([`crate::capability::guard_f64`]) remains the caller's responsibility on the
+/// f64 dispatch arm (D-04), exactly as for [`validated_f64`].
+pub fn host_slice_f64<'a>(arr: &'a Float64Array) -> PyResult<&'a [f64]> {
+    validate_f64(arr).map_err(bridge_err_to_py)
+}
+
 /// Downcast an owned [`ArrayRef`] to a `Float32Array`, or a `PyTypeError` if the
 /// array is not Float32.
 ///

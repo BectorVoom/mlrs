@@ -32,6 +32,7 @@
 
 use std::time::Instant;
 
+use mlrs_backend::abflag;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::distance_direct;
@@ -54,16 +55,22 @@ fn uniform(n: usize, seed: u64) -> Vec<f32> {
 
 /// Time ONLY the pairwise-distance kernel (no top-k, no tiling) for one shape.
 fn time_distance(rows_x: usize, rows_y: usize, cols: usize, reps: usize, variant: &str) -> f64 {
-    for v in ["MLRS_DIST_UNTILED", "MLRS_DIST_TILED1X1", "MLRS_DIST_RB2"] {
-        std::env::remove_var(v);
-    }
-    match variant {
-        "untiled" => std::env::set_var("MLRS_DIST_UNTILED", "1"),
-        "tiled" => std::env::set_var("MLRS_DIST_TILED1X1", "1"),
-        "rb2" => std::env::set_var("MLRS_DIST_RB2", "1"),
-        // "rb4" = the default 4x4 register-blocked kernel; no env var.
-        _ => {}
-    }
+    // Thread-local overrides, not `set_var`: the variable is read per launch and
+    // libtest runs this binary's other tests concurrently, so mutating the
+    // process environment here would race their `getenv` and silently change
+    // which kernel THEY exercise (`mlrs_backend::abflag`). Both guard sets live
+    // to the end of this function, which is the whole timed region.
+    let _ab_defaults: Vec<_> = ["MLRS_DIST_UNTILED", "MLRS_DIST_TILED1X1", "MLRS_DIST_RB2"]
+        .into_iter()
+        .map(abflag::clear)
+        .collect();
+    let _ab_variant = match variant {
+        "untiled" => Some(abflag::force("MLRS_DIST_UNTILED", "1")),
+        "tiled" => Some(abflag::force("MLRS_DIST_TILED1X1", "1")),
+        "rb2" => Some(abflag::force("MLRS_DIST_RB2", "1")),
+        // "rb4" = the default 4x4 register-blocked kernel; no knob.
+        _ => None,
+    };
     let x = uniform(rows_x * cols, 42);
     let y = uniform(rows_y * cols, 7);
 
@@ -88,11 +95,8 @@ fn time_distance(rows_x: usize, rows_y: usize, cols: usize, reps: usize, variant
         let _ = probe.to_host(&pool);
         d.release_into(&mut pool);
     }
-    let t = t0.elapsed().as_secs_f64() / reps as f64;
-    for v in ["MLRS_DIST_UNTILED", "MLRS_DIST_TILED1X1", "MLRS_DIST_RB2"] {
-        std::env::remove_var(v);
-    }
-    t
+    // The `_ab_*` guards restore the previous overrides when this returns.
+    t0.elapsed().as_secs_f64() / reps as f64
 }
 
 /// H1 vs H2, and the tiled-vs-untiled dispatch decision, in one sweep.

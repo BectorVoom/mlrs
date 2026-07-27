@@ -241,7 +241,7 @@ where
     //        already-clamped (non-negative) buffer — so sqrt never sees a
     //        negative argument. Still device-resident. ---
     if sqrt {
-        let (scount, sdim) = launch_dims_1d(out_len);
+        let (scount, sdim) = super::launch_dims_1d(out_len, capability::gather_launch_width());
         let in_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
         let sout_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
         sqrt_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg);
@@ -319,7 +319,7 @@ fn launch_dims_2d(rows: usize, cols: usize) -> (CubeCount, CubeDim) {
 /// The shared-memory tiled kernel is the default. This escape hatch exists so the
 /// two can be A/B'd on the real target device rather than gated by extrapolation.
 fn untiled_distance_forced() -> bool {
-    std::env::var("MLRS_DIST_UNTILED").map(|v| v == "1").unwrap_or(false)
+    crate::abflag::is_on("MLRS_DIST_UNTILED")
 }
 
 /// Is the 1×1 (non-register-blocked) tiled kernel forced via `MLRS_DIST_TILED1X1=1`?
@@ -327,7 +327,7 @@ fn untiled_distance_forced() -> bool {
 /// The 2×2 register-blocked kernel is the default; this selects the previous
 /// tiled kernel so the two can be A/B'd on the real target device.
 fn tiled_1x1_forced() -> bool {
-    std::env::var("MLRS_DIST_TILED1X1").map(|v| v == "1").unwrap_or(false)
+    crate::abflag::is_on("MLRS_DIST_TILED1X1")
 }
 
 /// Is the 2×2 register-blocked kernel forced via `MLRS_DIST_RB2=1`?
@@ -335,7 +335,7 @@ fn tiled_1x1_forced() -> bool {
 /// The 4×4 kernel is the default; this selects the 2×2 one for A/B on the real
 /// target device.
 fn rb2_forced() -> bool {
-    std::env::var("MLRS_DIST_RB2").map(|v| v == "1").unwrap_or(false)
+    crate::abflag::is_on("MLRS_DIST_RB2")
 }
 
 /// Which `distance_direct` kernel the ACTIVE BACKEND can actually run.
@@ -402,16 +402,6 @@ fn launch_dims_blocked(rows: usize, cols: usize, block: u32) -> (CubeCount, Cube
     (
         CubeCount::Static(cx.max(1), cy.max(1), 1),
         CubeDim { x: 16, y: 16, z: 1 },
-    )
-}
-
-/// Standard ceiling-division 1D launch config for the in-place sqrt pass.
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = ((n as u32) + block - 1) / block;
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
     )
 }
 

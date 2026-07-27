@@ -67,7 +67,7 @@ def pick_dtype(X):
     return np.float64 if _backend_supports_f64() else np.float32
 
 
-def normalize_X(X, *, dtype=None):
+def normalize_X(X, *, dtype=None, ensure_all_finite=True):
     """Normalize ``X`` to a fresh-contiguous 1-D pyarrow float array + shape.
 
     Runs sklearn ``check_array`` first (2-D, finite — so dimension/NaN errors
@@ -75,6 +75,15 @@ def normalize_X(X, *, dtype=None):
     unless ``dtype`` is given), then ``np.ascontiguousarray(...).ravel()`` ->
     ``pa.array`` so the result is a FRESH contiguous buffer (offset 0, no parent
     aliasing — Pitfall 3 / T-06-11), never a numpy slice.
+
+    ``ensure_all_finite=False`` MOVES the NaN/inf rejection — it never drops it.
+    ``check_array``'s finite scan is a separate single-threaded pass over the
+    whole matrix (2.4 ms for a 64 MiB operand, more than a ``predict`` costs in
+    total), so a caller whose Rust path already reads every element reports the
+    same verdict from that pass instead and raises ``check_array``'s exact
+    ``ValueError`` itself (``errors.rs::nonfinite_input_err``). Only pass
+    ``False`` from such a caller — ``mlrs.linear.LinearRegression.predict`` is
+    the one today.
 
     Returns ``(pyarrow_array, rows, cols)`` where the array is row-major
     flattened (``rows * cols`` elements).
@@ -86,7 +95,7 @@ def normalize_X(X, *, dtype=None):
     try:
         arr = check_array(
             X,
-            ensure_all_finite=True,
+            ensure_all_finite=ensure_all_finite,
             ensure_2d=True,
             dtype=dtype,
             copy=False,
@@ -94,7 +103,7 @@ def normalize_X(X, *, dtype=None):
     except TypeError:  # pragma: no cover - pre-1.6 sklearn fallback
         arr = check_array(
             X,
-            force_all_finite=True,
+            force_all_finite=ensure_all_finite,
             ensure_2d=True,
             dtype=dtype,
             copy=False,
@@ -160,10 +169,12 @@ def resolve_output_type(input_obj, output_type):
 def to_output(buf, shape, output_type, dtype):
     """Wrap a host buffer ``buf`` into the resolved ``output_type`` (D-03 / D-06).
 
-    ``buf`` is a flat python list / 1-D sequence of host values; ``shape`` is the
-    target numpy shape (``(rows,)`` for vectors, ``(rows, cols)`` for matrices;
-    one axis may be ``-1`` for caller-inferred dims). Integer labels/indices
-    materialize as ``int32`` (D-06); floats keep ``dtype``.
+    ``buf`` is a flat python list / 1-D sequence of host values (or a pyarrow
+    array, for the estimators whose Rust side returns one — see
+    ``egress.rs::f32_vec_to_pyarrow``); ``shape`` is the target numpy shape
+    (``(rows,)`` for vectors, ``(rows, cols)`` for matrices; one axis may be
+    ``-1`` for caller-inferred dims). Integer labels/indices materialize as
+    ``int32`` (D-06); floats keep ``dtype``.
 
     The host buffer is reshaped to ``shape`` FIRST so the geometry the egress
     contract carries (``egress.rs`` ``FloatResult`` ``(rows, cols)``) is honored
@@ -173,9 +184,21 @@ def to_output(buf, shape, output_type, dtype):
     with more than one column) CANNOT be faithfully represented as a 1-D columnar
     pyarrow ``Array``, so this raises ``ValueError`` rather than silently
     flattening it (CR-01 - D-03 narrowed-set; request ``output_type='numpy'``).
+
+    The numpy result is always WRITABLE. ``np.asarray`` over a pyarrow array is a
+    zero-copy view of Arrow-owned memory, which numpy marks read-only (and
+    refuses to un-mark), so ``est.predict(X) -= mean`` / ``preds.sort()`` /
+    ``np.clip(..., out=preds)`` would raise where sklearn — and every list-egress
+    mlrs estimator — accepts it. One ``copy()`` restores the ordinary
+    fresh-owned-array contract; it costs 0.107 ms for a 1 000 000-row f32 result,
+    against the 16.2 ms the Python-list egress it replaced spent on the same
+    data, so the Arrow path is still far ahead. The list path allocates a fresh
+    writable array in ``np.asarray`` already and is left untouched.
     """
     np_dtype = np.dtype(dtype)
     flat = np.asarray(buf, dtype=np_dtype)
+    if not flat.flags.writeable:
+        flat = flat.copy()
     arr = flat.reshape(shape)
     if output_type == _PYARROW:
         # pyarrow Array is 1-D / columnar; a matrix has no faithful 1-D form.

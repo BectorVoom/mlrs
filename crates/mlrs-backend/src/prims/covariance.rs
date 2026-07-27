@@ -120,7 +120,7 @@ where
     let elem = size_of::<F>();
     let centred_handle = pool.acquire(a_len * elem);
     let client = pool.client().clone();
-    let (ccount, cdim) = launch_dims_1d(a_len);
+    let (ccount, cdim) = super::launch_dims_1d(a_len, crate::capability::gather_launch_width());
     // SAFETY: `a_len`/`n_features` are the carried/validated element counts; the
     // kernel bounds-checks `tid < a.len()` and reads `mean[tid % cols]` for
     // `cols = n_features` (mitigates T-0204-01).
@@ -189,7 +189,7 @@ where
 
     let gram_len = n_features * n_features;
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(gram_len);
+    let (count, dim) = super::launch_dims_1d(gram_len, crate::capability::gather_launch_width());
 
     // SAFETY: `gram_len` is the carried Gram element count (n_features², itself
     // derived from the validated `a.len()`); the `scale` kernel bounds-checks
@@ -259,17 +259,6 @@ fn validate_geometry(
         }
     }
     Ok(())
-}
-
-/// Standard ceiling-division 1D launch config for the in-place scale pass
-/// (matches the `elementwise` per-element launch idiom used by distance).
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = ((n as u32) + block - 1) / block;
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
-    )
 }
 
 /// Host reciprocal `1/denom` as an `F` (f32 / f64). `denom` is the

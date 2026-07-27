@@ -26,13 +26,144 @@ use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
 // aliases (mirrors `cluster.rs`) and called via UFCS at each fit/predict arm so
 // the `fit`/`predict`/`predict_labels`/`predict_proba` method-name collisions
 // across the trait family resolve unambiguously.
+use mlrs_algos::error::AlgoError;
 use mlrs_algos::typestate::{
-    Fit as TypestateFit, Predict as TypestatePredict, PredictLabels as TypestatePredictLabels,
-    PredictProba as TypestatePredictProba,
+    Fit as TypestateFit, Fitted as AlgoFitted, Predict as TypestatePredict,
+    PredictLabels as TypestatePredictLabels, PredictProba as TypestatePredictProba,
+};
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::linear_predict::HostPrediction;
+use mlrs_backend::runtime::ActiveRuntime;
+
+use crate::egress::{f32_vec_to_pyarrow, f64_vec_to_pyarrow};
+use crate::errors::{algo_err_to_py, build_err_to_py, nonfinite_input_err, not_fitted};
+use crate::ingress::{
+    as_f32, as_f64, capsule_to_array, float_dtype, host_slice_f32, host_slice_f64, validated_f32,
+    validated_f64, FloatDtype,
 };
 
-use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
-use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
+// ---------------------------------------------------------------------------
+// Shared `predict` body for the four dense linear regressors
+// ---------------------------------------------------------------------------
+
+/// The `predict_from_host` surface `LinearRegression` / `Ridge` / `Lasso` /
+/// `ElasticNet` all expose, so [`dense_predict_f32`] / [`dense_predict_f64`] can
+/// be written ONCE instead of pasted into eight `#[pymethods]` bodies.
+///
+/// A trait rather than a `macro_rules!` because `#[pymethods]` is a proc-macro
+/// attribute that reads the impl block's tokens BEFORE `macro_rules!` expansion
+/// — a macro invoked inside the block would not be registered as a Python
+/// method at all.
+trait DensePredictHost<F>: Sync {
+    /// `y = X·coef_ + intercept_` from a borrowed HOST `x`, plus the operand
+    /// finiteness verdict (`mlrs_algos::linear::elastic_net::predict_linear_from_host`).
+    fn predict_from_host_slice(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostPrediction<F>, AlgoError>;
+}
+
+/// Emit the [`DensePredictHost`] impls for each estimator, at both float widths.
+///
+/// Spelled at the CONCRETE `f32`/`f64` rather than generically over the algos
+/// layer's `F: Float + CubeElement + Pod`, because this crate does not depend on
+/// `cubecl` and so cannot name those bounds. `f32`/`f64` are the only widths the
+/// PyO3 surface ever instantiates anyway — the whole binding is a two-arm dtype
+/// dispatch (D-06).
+macro_rules! impl_dense_predict_host {
+    (@one $estimator:ident, $float:ty) => {
+        impl DensePredictHost<$float> for $estimator<$float, AlgoFitted> {
+            fn predict_from_host_slice(
+                &self,
+                pool: &mut BufferPool<ActiveRuntime>,
+                x: &[$float],
+                shape: (usize, usize),
+            ) -> Result<HostPrediction<$float>, AlgoError> {
+                self.predict_from_host(pool, x, shape)
+            }
+        }
+    };
+    ($($estimator:ident),+ $(,)?) => {
+        $(
+            impl_dense_predict_host!(@one $estimator, f32);
+            impl_dense_predict_host!(@one $estimator, f64);
+        )+
+    };
+}
+
+impl_dense_predict_host!(LinearRegression, Ridge, Lasso, ElasticNet);
+
+/// The whole `predict` body for a fitted f32 dense linear regressor: borrow the
+/// validated Arrow values, predict, reject a non-finite operand, hand the result
+/// back over Arrow. GIL released around the compute.
+///
+/// Two departures from the `predict_f32` template the rest of this file uses,
+/// both measured on the cpu backend and both on the ingress/egress rather than
+/// the arithmetic (see the LINEAR-PRED-CPU notes on `prims::linear_predict` and
+/// [`f32_vec_to_pyarrow`]):
+///
+/// 1. **No upload.** [`host_slice_f32`] runs the SAME hard-reject bridge
+///    validator as `validated_f32` but BORROWS the Arrow values instead of
+///    copying them to a `DeviceArray`, and `predict_from_host` routes cpu to a
+///    host matvec over that borrow. On cpu the upload was a plain memcpy of the
+///    whole test matrix — 13.5 ms for 64 MiB, three times sklearn's entire
+///    `predict`. wgpu/cuda/rocm still upload and run the fused device kernel,
+///    inside `predict_from_host`.
+/// 2. **No Python list.** The result goes back over the Arrow C data interface,
+///    which numpy views in place, instead of being expanded into one boxed
+///    `float` per row (16.2 ms for 1 000 000 rows).
+///
+/// It also OWNS the NaN/inf rejection that `check_array` used to perform on this
+/// path — the `mlrs.linear` wrappers pass `ensure_all_finite=False` because
+/// `predict_from_host` reports the same verdict from the pass it was already
+/// making. [`nonfinite_input_err`] reproduces `check_array`'s exact message so
+/// the contract is unchanged from Python.
+fn dense_predict_f32<'py, E: DensePredictHost<f32>>(
+    py: Python<'py>,
+    x: &Bound<'_, PyAny>,
+    (rows, cols): (usize, usize),
+    est: &E,
+) -> PyResult<Bound<'py, PyAny>> {
+    let xa = capsule_to_array(x)?;
+    let out = py.detach(|| -> PyResult<Vec<f32>> {
+        let mut pool = crate::lock_pool();
+        let xh = host_slice_f32(as_f32(&xa)?)?;
+        let pred = est
+            .predict_from_host_slice(&mut pool, xh, (rows, cols))
+            .map_err(algo_err_to_py)?;
+        if !pred.operand_finite {
+            return Err(nonfinite_input_err(xh, "float32"));
+        }
+        Ok(pred.values)
+    })?;
+    f32_vec_to_pyarrow(py, out)
+}
+
+/// f64 twin of [`dense_predict_f32`]. No `guard_f64` here: reaching this means
+/// the estimator is already in its `F64` fitted arm, which `fit` could only have
+/// produced on an f64-capable backend (D-04).
+fn dense_predict_f64<'py, E: DensePredictHost<f64>>(
+    py: Python<'py>,
+    x: &Bound<'_, PyAny>,
+    (rows, cols): (usize, usize),
+    est: &E,
+) -> PyResult<Bound<'py, PyAny>> {
+    let xa = capsule_to_array(x)?;
+    let out = py.detach(|| -> PyResult<Vec<f64>> {
+        let mut pool = crate::lock_pool();
+        let xh = host_slice_f64(as_f64(&xa)?)?;
+        let pred = est
+            .predict_from_host_slice(&mut pool, xh, (rows, cols))
+            .map_err(algo_err_to_py)?;
+        if !pred.operand_finite {
+            return Err(nonfinite_input_err(xh, "float64"));
+        }
+        Ok(pred.values)
+    })?;
+    f64_vec_to_pyarrow(py, out)
+}
 
 // ---------------------------------------------------------------------------
 // LinearRegression — Fit + Predict; coef_ / intercept_
@@ -124,35 +255,33 @@ impl PyLinearRegression {
         Ok(())
     }
 
-    /// `predict(x)` → length-`rows` host `Vec<f32|f64>` (D-03). GIL released.
-    fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| -> PyResult<Vec<f32>> {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyLinearRegression::F32(est) => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let out = TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(out.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("linear_regression", "predict (f32 path)")),
-            }
-        })
+    /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). See
+    /// [`dense_predict_f32`] for the body all four dense linear regressors share
+    /// and why it departs from this file's `predict_f32` template.
+    fn predict_f32<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyLinearRegression::F32(est) => dense_predict_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("linear_regression", "predict (f32 path)")),
+        }
     }
 
-    fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| -> PyResult<Vec<f64>> {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyLinearRegression::F64(est) => {
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let out = TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?;
-                    Ok(out.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("linear_regression", "predict (f64 path)")),
-            }
-        })
+    fn predict_f64<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyLinearRegression::F64(est) => dense_predict_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("linear_regression", "predict (f64 path)")),
+        }
     }
 
     /// Host `coef_` (f32 arm) or `NotFitted`.
@@ -288,31 +417,19 @@ impl PyRidge {
         Ok(())
     }
 
-    fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyRidge::F32(est) => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("ridge", "predict (f32 path)")),
-            }
-        })
+    /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shared
+    /// body: [`dense_predict_f32`].
+    fn predict_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyRidge::F32(est) => dense_predict_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("ridge", "predict (f32 path)")),
+        }
     }
-    fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyRidge::F64(est) => {
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("ridge", "predict (f64 path)")),
-            }
-        })
+    fn predict_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyRidge::F64(est) => dense_predict_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("ridge", "predict (f64 path)")),
+        }
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
@@ -448,31 +565,19 @@ impl PyLasso {
         Ok(())
     }
 
-    fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyLasso::F32(est) => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("lasso", "predict (f32 path)")),
-            }
-        })
+    /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shared
+    /// body: [`dense_predict_f32`].
+    fn predict_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyLasso::F32(est) => dense_predict_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("lasso", "predict (f32 path)")),
+        }
     }
-    fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyLasso::F64(est) => {
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("lasso", "predict (f64 path)")),
-            }
-        })
+    fn predict_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyLasso::F64(est) => dense_predict_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("lasso", "predict (f64 path)")),
+        }
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
@@ -620,31 +725,19 @@ impl PyElasticNet {
         Ok(())
     }
 
-    fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyElasticNet::F32(est) => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("elastic_net", "predict (f32 path)")),
-            }
-        })
+    /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shared
+    /// body: [`dense_predict_f32`].
+    fn predict_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyElasticNet::F32(est) => dense_predict_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("elastic_net", "predict (f32 path)")),
+        }
     }
-    fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyElasticNet::F64(est) => {
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("elastic_net", "predict (f64 path)")),
-            }
-        })
+    fn predict_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyElasticNet::F64(est) => dense_predict_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("elastic_net", "predict (f64 path)")),
+        }
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {

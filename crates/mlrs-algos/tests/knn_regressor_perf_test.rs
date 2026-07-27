@@ -28,6 +28,7 @@ use std::time::Instant;
 
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
 use mlrs_algos::typestate::{Fit, Predict};
+use mlrs_backend::abflag;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::distance;
@@ -299,20 +300,20 @@ fn knn_stage_breakdown() {
         let _ = probe.to_host(&mut pool);
         let dist_s = t0.elapsed().as_secs_f64();
 
-        std::env::remove_var("MLRS_TOPK_SERIAL");
+        let _ab2 = abflag::clear("MLRS_TOPK_SERIAL");
         let t1 = Instant::now();
         let (val, idx) = top_k::<f32>(&mut pool, &dist, nq, n, k, true, None, None).expect("top_k");
         let _ = idx.to_host(&mut pool);
         let par_s = t1.elapsed().as_secs_f64();
         val.release_into(&mut pool);
 
-        std::env::set_var("MLRS_TOPK_SERIAL", "1");
+        let _ab1 = abflag::force("MLRS_TOPK_SERIAL", "1");
         let t2 = Instant::now();
         let (val, idx) = top_k::<f32>(&mut pool, &dist, nq, n, k, true, None, None).expect("top_k");
         let _ = idx.to_host(&mut pool);
         let ser_s = t2.elapsed().as_secs_f64();
         val.release_into(&mut pool);
-        std::env::remove_var("MLRS_TOPK_SERIAL");
+        let _ab3 = abflag::clear("MLRS_TOPK_SERIAL");
 
         let speedup = ser_s / par_s.max(1e-9);
         println!(

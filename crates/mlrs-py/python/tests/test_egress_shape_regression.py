@@ -137,3 +137,91 @@ def test_fit_accepts_finite_y():
     y = np.arange(10, dtype=np.float64)
     est = mlrs.LinearRegression().fit(X, y)
     assert est.n_features_in_ == 3
+
+
+# --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# LINEAR-PRED-CPU review: the Arrow egress must not leak Arrow's read-only-ness,
+# and relocating the finiteness scan must not reorder the errors sklearn raises
+# --------------------------------------------------------------------------- #
+
+
+def _regression_input(rows=32, cols=4, seed=0):
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((rows, cols)).astype(np.float32)
+    y = rng.standard_normal(rows).astype(np.float32)
+    return X, y
+
+
+# The four dense linear regressors share ONE predict path (borrowed host
+# ingress + Arrow egress + relocated finiteness scan), so both regressions below
+# are checked on all of them — a sibling that drifts off the shared helper is
+# exactly the failure these guard.
+DENSE_LINEAR = [
+    ("LinearRegression", lambda: mlrs.LinearRegression()),
+    ("Ridge", lambda: mlrs.Ridge(alpha=1.0)),
+    ("Lasso", lambda: mlrs.Lasso(alpha=0.01)),
+    ("ElasticNet", lambda: mlrs.ElasticNet(alpha=0.01, l1_ratio=0.5)),
+]
+DENSE_IDS = [n for n, _ in DENSE_LINEAR]
+
+
+@pytest.mark.parametrize("name,build", DENSE_LINEAR, ids=DENSE_IDS)
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_predict_result_is_writable(name, build, dtype):
+    """``predict`` must return an ordinary WRITABLE ndarray (sklearn contract).
+
+    These estimators return their result over the Arrow C data interface
+    (``egress.rs::f32_vec_to_pyarrow``) instead of as a Python list, which makes
+    ``np.asarray`` a zero-copy view of Arrow-owned memory — and numpy marks such
+    a view read-only, and refuses to un-mark it. Without the ``_io.to_output``
+    copy, the in-place operations below raise ``ValueError: ... read-only``
+    where sklearn accepts them.
+    """
+    if dtype is np.float64 and not mlrs.backend_supports_f64():
+        pytest.skip("backend has no f64 support")
+    X, y = _regression_input()
+    X, y = X.astype(dtype), y.astype(dtype)
+
+    preds = build().fit(X, y).predict(X)
+    assert preds.flags.writeable, f"{name}.predict returned a read-only array"
+    # The operations a caller actually performs on a prediction vector.
+    preds -= preds.mean()
+    preds[0] = 0.0
+    np.clip(preds, -1.0, 1.0, out=preds)
+    preds.sort()
+
+
+@pytest.mark.parametrize("name,build", DENSE_LINEAR, ids=DENSE_IDS)
+def test_predict_nonfinite_error_precedes_feature_count_error(name, build):
+    """A wrong-width X that ALSO holds NaN/inf reports that, as sklearn does.
+
+    sklearn validates finiteness inside ``check_array`` and only then compares
+    ``n_features_``. These estimators ask ``check_array`` to skip the scan (the
+    Rust call redoes it in the pass it was already making), so the feature-count
+    guard in ``_check_predict_X`` sits BETWEEN the two and would report the shape
+    error for an input sklearn rejects as non-finite.
+    """
+    X, y = _regression_input(cols=4)
+    fitted = build().fit(X, y)
+
+    for bad_value in (np.nan, np.inf, -np.inf):
+        bad = np.full((5, 3), 1.0, dtype=np.float32)
+        bad[0, 0] = bad_value
+        expected = (
+            "Input contains NaN"
+            if np.isnan(bad_value)
+            else "Input contains infinity"
+        )
+        with pytest.raises(ValueError, match=expected):
+            fitted.predict(bad)
+
+    # A merely mis-shaped (finite) X still reports the feature count.
+    with pytest.raises(ValueError, match="expecting 4 features"):
+        fitted.predict(np.ones((5, 3), dtype=np.float32))
+
+    # And a correctly-shaped non-finite X is rejected too (the ordinary case).
+    bad = np.ones((5, 4), dtype=np.float32)
+    bad[4, 3] = np.nan
+    with pytest.raises(ValueError, match="Input contains NaN"):
+        fitted.predict(bad)

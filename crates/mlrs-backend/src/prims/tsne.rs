@@ -160,7 +160,7 @@ where
     //     the plain per-row GATHER is sub-millisecond. ---
     let rowsum_handle = pool.acquire(n * elem);
     {
-        let (rcount, rdim) = launch_dims_1d(n);
+        let (rcount, rdim) = super::launch_dims_1d(n, crate::capability::gather_launch_width());
         let m_arg = unsafe { ArrayArg::from_raw_parts(qnum.handle().clone(), nn) };
         let o_arg = unsafe { ArrayArg::from_raw_parts(rowsum_handle.clone(), n) };
         tsne_rowsum::launch::<F, ActiveRuntime>(&client, rcount, rdim, m_arg, o_arg, n as u32, n as u32);
@@ -204,16 +204,6 @@ where
     grad_dev.release_into(pool);
 
     Ok(TsneStep { grad, qsum: qsum_safe, qnum })
-}
-
-/// 1D ceiling-division launch config (one unit per row).
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = (((n as u32) + block - 1) / block).max(1);
-    (
-        CubeCount::Static(cubes, 1, 1),
-        CubeDim { x: block, y: 1, z: 1 },
-    )
 }
 
 /// 2D ceiling-division launch config (one unit per output element; the

@@ -31,12 +31,13 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::linear_predict::HostPrediction;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::coordinate_descent::{cd_fit, CD_DEFAULT_MAX_ITER, CD_DEFAULT_TOL};
-use crate::linear::elastic_net::predict_linear;
+use crate::linear::elastic_net::{predict_linear, predict_linear_from_host};
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// L1-penalized least squares (LINEAR-03) — the `l1_ratio == 1` case of
@@ -224,6 +225,30 @@ where
             .as_ref()
             .expect("intercept_ is Some by construction on Lasso<F, Fitted>")
             .to_host(pool)[0]
+    }
+
+    /// `predict` for a test matrix that is still on the HOST — returns the
+    /// length-`n_samples` predictions plus the operand-finiteness verdict.
+    ///
+    /// The host-ingress twin of [`Predict::predict`]: same result, but it reads
+    /// the caller's buffer in place on cpu instead of paying an `m × n` upload
+    /// that costs more than the prediction. All four dense linear regressors
+    /// share ONE implementation — see [`predict_linear_from_host`] for the
+    /// backend routing, the measurements, and the finiteness verdict's meaning.
+    pub fn predict_from_host(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostPrediction<F>, AlgoError> {
+        predict_linear_from_host(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            "lasso",
+            pool,
+            x,
+            shape,
+        )
     }
 }
 

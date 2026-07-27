@@ -11,6 +11,11 @@
 //! real bodies land in Wave 1 (Plans 03/04).
 
 pub mod runtime;
+// A/B kernel-variant knobs (`MLRS_TOPK_SERIAL`, `MLRS_DIST_RB2`, ...) with a
+// thread-local override, so the equivalence tests can drive each variant
+// without `set_var`ing process-global state out from under the sibling tests
+// libtest runs concurrently. Prim dispatchers read knobs through `abflag::var`.
+pub mod abflag;
 pub mod capability;
 pub mod bridge;
 pub mod device_array;

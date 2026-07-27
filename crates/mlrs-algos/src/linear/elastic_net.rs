@@ -40,7 +40,9 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::linear_predict::linear_predict;
+use mlrs_backend::prims::linear_predict::{
+    linear_predict, linear_predict_from_host, HostPrediction,
+};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -261,6 +263,30 @@ where
             .expect("intercept_ is Some by construction on ElasticNet<F, Fitted>")
             .to_host(pool)[0]
     }
+
+    /// `predict` for a test matrix that is still on the HOST — returns the
+    /// length-`n_samples` predictions plus the operand-finiteness verdict.
+    ///
+    /// The host-ingress twin of [`Predict::predict`]: same result, but it reads
+    /// the caller's buffer in place on cpu instead of paying an `m × n` upload
+    /// that costs more than the prediction. All four dense linear regressors
+    /// share ONE implementation — see [`predict_linear_from_host`] for the
+    /// backend routing, the measurements, and the finiteness verdict's meaning.
+    pub fn predict_from_host(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostPrediction<F>, AlgoError> {
+        predict_linear_from_host(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            "elastic_net",
+            pool,
+            x,
+            shape,
+        )
+    }
 }
 
 impl<F> Fit<F> for ElasticNet<F, Unfit>
@@ -391,6 +417,87 @@ where
     // The result stays device-resident; the PyO3 boundary's terminal readback
     // is the only host↔device crossing.
     Ok(linear_predict::<F>(
+        pool,
+        x,
+        coef,
+        intercept,
+        (n_samples, n_features),
+    )?)
+}
+
+/// Host-ingress twin of [`predict_linear`] — `predict` for a test matrix that is
+/// still in the CALLER'S memory, returning host predictions plus the operand
+/// finiteness verdict.
+///
+/// Shared by all four dense linear regressors ([`ElasticNet`],
+/// [`Lasso`](crate::linear::lasso::Lasso),
+/// [`Ridge`](crate::linear::ridge::Ridge),
+/// [`LinearRegression`](crate::linear::linear_regression::LinearRegression)), so
+/// the guards below are written once and every estimator rejects the same shapes
+/// with the same typed error — exactly as [`predict_linear`] does for the
+/// device-ingress side.
+///
+/// Same result as [`predict_linear`] followed by a read-back, different ingress.
+/// `predict_linear` takes an already-uploaded [`DeviceArray`]; every caller that
+/// starts from host memory (i.e. the whole Arrow/PyO3 surface) had to pay a full
+/// `m × n` upload to produce one. On the **cpu** backend that upload is a plain
+/// memcpy of the operand into memory the kernel then reads once — measured at
+/// 13.5 ms for a 64 MiB `f32` matrix, three times sklearn's ENTIRE `predict` for
+/// the same shape — so it dominates a prim whose arithmetic is one pass.
+/// `linear_predict_from_host` routes cpu to a zero-copy thread-parallel host
+/// matvec that reads the caller's buffer in place, and leaves wgpu/cuda/rocm on
+/// the upload + fused-kernel path they already win on (see that prim's docs for
+/// both measurements).
+///
+/// The fitted `coef_`/`intercept_` stay device-resident on every backend (D-03);
+/// only those two small buffers are read to host, and only on the cpu arm.
+/// [`HostPrediction::operand_finite`] carries the sklearn-contract "`X` contains
+/// no NaN/inf" verdict, which the cpu arm computes in the same pass as the
+/// arithmetic; the caller decides whether a `false` is a rejection (the Python
+/// surface's `ValueError`) or not.
+pub(crate) fn predict_linear_from_host<F>(
+    coef_: Option<&DeviceArray<ActiveRuntime, F>>,
+    intercept_: Option<&DeviceArray<ActiveRuntime, F>>,
+    estimator: &'static str,
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &[F],
+    shape: (usize, usize),
+) -> Result<HostPrediction<F>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (n_samples, n_features) = shape;
+
+    let coef = coef_.ok_or(AlgoError::NotFitted {
+        estimator,
+        operation: "predict",
+    })?;
+    let intercept = intercept_.ok_or(AlgoError::NotFitted {
+        estimator,
+        operation: "predict",
+    })?;
+
+    // --- ASVS V5: geometry + fitted-n_features consistency, identical to
+    // `predict_linear`'s. The prim re-validates, but keeping the check here
+    // means both ingresses reject the same shapes with the same typed error
+    // rather than relying on a downstream layer to agree.
+    if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "x",
+            rows: n_samples,
+            cols: n_features,
+            len: x.len(),
+        }));
+    }
+    if coef.len() != n_features {
+        return Err(AlgoError::Prim(PrimError::DimMismatch {
+            dim: "n_features",
+            lhs: coef.len(),
+            rhs: n_features,
+        }));
+    }
+
+    Ok(linear_predict_from_host::<F>(
         pool,
         x,
         coef,

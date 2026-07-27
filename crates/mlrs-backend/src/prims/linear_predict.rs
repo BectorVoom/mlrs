@@ -40,8 +40,34 @@
 //! case a future backend/GPU generation profile differs; `LR_PREDICT_GATHER`
 //! remains available to force GATHER on wgpu too for A/B re-verification.
 //!
-//! Tests live in `crates/mlrs-backend/tests/linear_predict_test.rs`
-//! (AGENTS.md §2).
+//! ## The cpu backend does NOT take either kernel — [`linear_predict_host`]
+//! Both kernels above assume `x` is already device-resident. On a discrete GPU
+//! that is a given (the operand had to cross PCIe anyway). On the **cpu**
+//! backend it is a self-inflicted wound: "device" memory IS host memory, so
+//! `DeviceArray::from_host` is a pure `memcpy` of the whole `m × n` test matrix
+//! — and the matvec then reads that copy exactly once. Measured on a 16-core
+//! Zen5 at `m = 1_000_000`, `n = 16` (a 64 MiB f32 operand):
+//!
+//! | stage | wall-clock |
+//! |---|---|
+//! | one host copy of `x` (`numpy` `x.copy()`) | 13.5 ms |
+//! | `sklearn` `LinearRegression.predict` END TO END | 4.4 ms |
+//! | └ of which its BLAS `X @ coef` | 1.2 ms |
+//!
+//! The copy alone is 3× sklearn's ENTIRE predict, because sklearn reads the
+//! caller's buffer in place and mlrs was reading 64 MiB, writing 64 MiB, then
+//! reading 64 MiB again. No kernel tuning can pay that back: the ingress, not
+//! the arithmetic, is the whole cost. [`linear_predict_host`] deletes it — it
+//! computes straight out of the CALLER'S borrowed host slice (on the Python
+//! path, the validated Arrow buffer numpy already owns), with no upload, no
+//! pooled operand and no cubecl launch at all.
+//!
+//! Two further reasons the host path wins on cpu even discounting the copy:
+//! `cubecl-cpu` JITs at LLVM **`-O0`** (no vectorizer — see the
+//! `mlrs-cubecl-cpu-execution-model` notes), whereas this function is compiled
+//! into the crate at the release profile's `-O3` and auto-vectorizes; and a
+//! cubecl launch spawns one OS thread PER UNIT, while this splits the row axis
+//! across exactly [`crate::capability::cpu_launch_units`] scoped threads.
 
 use bytemuck::Pod;
 use cubecl::prelude::*;
@@ -122,13 +148,440 @@ where
         // or under the `LR_PREDICT_GATHER` A/B hatch — see `use_shared_predict`).
         // The kernel bounds-checks `r < m`, masking the slack lanes of the
         // final block.
-        let (ccount, cdim) = launch_dims_1d(m);
+        let (ccount, cdim) = super::launch_dims_1d_folded(m, crate::capability::gather_launch_width());
         linear_predict_bias::launch::<F, ActiveRuntime>(
             &client, ccount, cdim, x_arg, coef_arg, bias_arg, out_arg, m as u32, n as u32,
         );
     }
 
     Ok(DeviceArray::from_raw(out_handle, m))
+}
+
+/// Compute `y = X·coef + bias` **entirely on the host**, reading the caller's
+/// borrowed `x` in place — the cpu-backend predict path (module docs §"The cpu
+/// backend does NOT take either kernel").
+///
+/// `x` is the `m × n` row-major test matrix, `coef` the length-`n` fitted
+/// coefficients, `bias` the intercept scalar (`0` for the no-intercept case).
+/// Returns the length-`m` predictions plus the operand-finiteness verdict, as a
+/// [`HostPrediction`].
+///
+/// The point is what does NOT happen: no `DeviceArray::from_host` upload, no
+/// pooled operand, no kernel launch, no read-back. `x` stays exactly where the
+/// caller has it (on the Python path, the validated Arrow buffer numpy owns),
+/// so the whole predict touches `m·n` operand bytes ONCE — the same traffic
+/// sklearn's BLAS `sgemv` pays, instead of the 3× a copy-then-read costs.
+///
+/// ## Why the finiteness verdict rides along ([`HostPrediction::operand_finite`])
+/// The sklearn-compatible surface must hard-reject a NaN/±inf test matrix, and
+/// the shim used to get that from `check_array(ensure_all_finite=True)` — a
+/// SECOND full pass over `x`, single-threaded, measured at 2.4 ms for a 64 MiB
+/// operand against 1.4 ms for this entire matvec. Since `x` no longer fits in
+/// last-level cache at that size, that pass is a genuine second trip to DRAM:
+/// validating separately costs as much as predicting. So the scan is fused
+/// here, where every row is ALREADY in L1 from the dot product that just read
+/// it — the check becomes ALU work on cached bytes and the operand is streamed
+/// exactly once. The verdict is a plain "was anything non-finite"; classifying
+/// it (NaN vs infinity, for the error message) is left to the caller's cold
+/// path, since it only runs when the input is already being rejected.
+///
+/// ## Accumulation order (why this is still inside the 1e-5 oracle contract)
+/// [`linear_predict_bias`] sums a row's products strictly in ascending `c`.
+/// This function splits each row's dot product across
+/// [`HOST_DOT_LANES`] independent accumulators and adds those together at the
+/// end — a REASSOCIATION, so it is not bit-identical to the kernel. It is the
+/// same reassociation every vectorized BLAS `sgemv` (including the one behind
+/// `numpy`'s `X @ coef`, which is the sklearn reference) performs, and for the
+/// capped feature axis these models fit (`GRAM_EIG_MAX_FEATURES = 64`) it is
+/// strictly the more accurate of the two — a `⌈n/L⌉`-term chain per lane rather
+/// than one `n`-term chain. `linear_predict_test.rs` gates both paths against
+/// the same f64 host reference at the project tolerance.
+///
+/// ## Parallelism
+/// The row axis is split into [`host_units`] CONTIGUOUS chunks over scoped
+/// threads, so each thread owns a disjoint, cache-line-aligned run of `out` (no
+/// false sharing on the output) and streams a contiguous slab of `x`. The thread
+/// count scales with the OPERAND SIZE rather than the core count — see
+/// [`HOST_ELEMS_PER_UNIT`] — so a small batch runs on the calling thread instead
+/// of paying a fan-out that exceeds its whole cost.
+///
+/// Generic over `F` (`f32` / `f64`) via a size dispatch onto the two concrete
+/// monomorphizations — `F` is opaque arithmetic-wise (its `Float` ops are
+/// CubeCL *kernel* ops, not host ones), so the host math is done on the
+/// bytemuck-cast primitive view.
+pub fn linear_predict_host<F>(
+    x: &[F],
+    coef: &[F],
+    bias: F,
+    (m, n): (usize, usize),
+) -> Result<HostPrediction<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    linear_predict_host_units(x, coef, bias, (m, n), None)
+}
+
+/// [`linear_predict_host`] with an explicit worker-thread count — the test seam
+/// for the one property the thread split must have: NONE.
+///
+/// `units = None` is the production behaviour ([`host_units`] sizes the set from
+/// the operand). `Some(u)` pins it, so a test can sweep the split and assert the
+/// results are bit-identical.
+///
+/// This exists so that sweep does NOT go through `MLRS_CPU_UNITS`. That variable
+/// is read per call by design ([`crate::capability::cpu_launch_units`]), and
+/// libtest runs a binary's `#[test]`s on parallel threads — so `set_var`ing it
+/// from a test body both races glibc's `environ` against every sibling test's
+/// `getenv` (a real data race, which is why `set_var` is `unsafe`) and silently
+/// changes the launch width those siblings run under. An argument has neither
+/// problem. `MLRS_CPU_UNITS` remains the knob for whole-process A/B runs, where
+/// it is set from the environment and never mutated.
+#[doc(hidden)]
+pub fn linear_predict_host_units<F>(
+    x: &[F],
+    coef: &[F],
+    bias: F,
+    (m, n): (usize, usize),
+    units: Option<usize>,
+) -> Result<HostPrediction<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry(x.len(), (m, n), coef.len(), 1)?;
+
+    // `Pod: Zeroable`, and an all-zero bit pattern is `0.0` for both float
+    // widths — every element is overwritten below, this just gets a typed,
+    // initialized buffer without unsafe.
+    let mut values: Vec<F> = vec![bytemuck::Zeroable::zeroed(); m];
+    let operand_finite = match size_of::<F>() {
+        4 => matvec_bias_parallel::<f32>(
+            bytemuck::cast_slice(x),
+            bytemuck::cast_slice(coef),
+            bytemuck::cast(bias),
+            bytemuck::cast_slice_mut(&mut values),
+            n,
+            units,
+        ),
+        8 => matvec_bias_parallel::<f64>(
+            bytemuck::cast_slice(x),
+            bytemuck::cast_slice(coef),
+            bytemuck::cast(bias),
+            bytemuck::cast_slice_mut(&mut values),
+            n,
+            units,
+        ),
+        other => {
+            unreachable!("linear_predict_host is f32/f64 only, got a {other}-byte element")
+        }
+    };
+    Ok(HostPrediction {
+        values,
+        operand_finite,
+    })
+}
+
+/// What [`linear_predict_host`] produces: the predictions, plus whether every
+/// element of the operand it read was finite.
+///
+/// The two travel together because they come from ONE pass over `x` — see
+/// [`linear_predict_host`]'s docs for why re-scanning separately would double
+/// the cost of the whole operation.
+#[derive(Debug, Clone)]
+pub struct HostPrediction<F> {
+    /// The length-`m` predictions, `y[r] = Σ_c x[r,c]·coef[c] + bias`.
+    ///
+    /// **Only meaningful when `operand_finite` is `true`** — check that first.
+    /// A `false` verdict means the caller is about to reject the input, so the
+    /// producer is free to skip the work: the cpu arm still returns a full
+    /// vector (its verdict is fused into the arithmetic, so there was nothing to
+    /// skip), while the device arms return an EMPTY vector rather than paying an
+    /// `m × n` upload, a launch and an `m`-element read-back for a result that
+    /// is immediately discarded.
+    pub values: Vec<F>,
+    /// `false` if ANY element of `x` was NaN or ±infinity.
+    ///
+    /// A sklearn-compatible caller rejects the input in that case. `true` means
+    /// every element read was finite — note this is a statement about the
+    /// OPERAND, not about `values`, which can still overflow to infinity for a
+    /// finite-but-extreme `x` (and must not be rejected for that).
+    pub operand_finite: bool,
+}
+
+/// Predict from a **host-resident** `x` — the backend-routing entry point the
+/// estimator layer calls when the test matrix arrives from the host (which,
+/// coming through the Arrow/PyO3 boundary, is always).
+///
+/// - **cpu**: [`linear_predict_host`] straight off the caller's slice. No
+///   upload, no launch, no read-back (module docs §"The cpu backend does NOT
+///   take either kernel" for the measurement that motivates it).
+/// - **wgpu / cuda / rocm**: unchanged — upload `x`, run [`linear_predict`]'s
+///   fused device kernel, read the length-`m` result back. There the operand
+///   has to cross the bus no matter what, and the device does the arithmetic
+///   far faster than any host loop; this path is already measured well ahead of
+///   cuML/sklearn on a Tesla T4 and is deliberately untouched.
+///
+/// `coef` / `bias` stay device-resident in the estimator on every backend; the
+/// cpu arm reads those two SMALL buffers (length `n ≤ 64` and `1`) to host per
+/// call, which is microseconds and keeps the fitted-state contract (D-03)
+/// identical across backends.
+///
+/// [`HostPrediction::operand_finite`] is a real verdict on EVERY backend, so a
+/// caller may rely on it uniformly. The cpu arm gets it fused into the matvec
+/// for free; the device arms cannot (the arithmetic happens on the device, over
+/// a copy) and pay an explicit host scan before the upload — cheap next to the
+/// bus transfer that follows it, and the alternative (a verdict that silently
+/// means "unchecked" on three of four backends) is exactly the kind of
+/// backend-dependent validation gap this project's abstraction is supposed to
+/// rule out.
+pub fn linear_predict_from_host<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &[F],
+    coef: &DeviceArray<ActiveRuntime, F>,
+    bias: &DeviceArray<ActiveRuntime, F>,
+    (m, n): (usize, usize),
+) -> Result<HostPrediction<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if crate::capability::active_backend_name() == "cpu" {
+        validate_geometry(x.len(), (m, n), coef.len(), bias.len())?;
+        let coef_host = coef.to_host(pool);
+        let bias_host = bias.to_host(pool)[0];
+        return linear_predict_host::<F>(x, &coef_host, bias_host, (m, n));
+    }
+
+    // Scanned BEFORE the upload so a rejected operand never crosses the bus:
+    // the caller discards `values` in that case, and for the 64 MiB operand the
+    // module docs measure, the skipped upload + launch + read-back is tens of
+    // milliseconds of pure waste on an error path.
+    if !operand_all_finite(x) {
+        validate_geometry(x.len(), (m, n), coef.len(), bias.len())?;
+        return Ok(HostPrediction {
+            values: Vec::new(),
+            operand_finite: false,
+        });
+    }
+
+    let x_dev = DeviceArray::from_host(pool, x);
+    let out = linear_predict::<F>(pool, &x_dev, coef, bias, (m, n))?;
+    let values = out.to_host_metered(pool);
+    x_dev.release_into(pool);
+    out.release_into(pool);
+    Ok(HostPrediction {
+        values,
+        operand_finite: true,
+    })
+}
+
+/// Whether every element of a host operand is finite, scanned in parallel —
+/// the STANDALONE form of the check [`matvec_bias_rows`] fuses into its row
+/// loop. Used by [`linear_predict_from_host`]'s device arms, where the
+/// arithmetic runs on the device and there is no host pass to fuse into.
+///
+/// Same `F` → `f32`/`f64` size dispatch as [`linear_predict_host`].
+fn operand_all_finite<F: Pod>(x: &[F]) -> bool {
+    match size_of::<F>() {
+        4 => all_finite_parallel::<f32>(bytemuck::cast_slice(x)),
+        8 => all_finite_parallel::<f64>(bytemuck::cast_slice(x)),
+        other => unreachable!("linear predict is f32/f64 only, got a {other}-byte element"),
+    }
+}
+
+/// [`row_all_finite`] over a whole operand, split across [`host_units`] scoped
+/// threads on contiguous chunks.
+fn all_finite_parallel<T: HostFloat>(x: &[T]) -> bool {
+    let units = host_units(x.len());
+    if units <= 1 {
+        return row_all_finite(x);
+    }
+    let chunk = x.len().div_ceil(units);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = x
+            .chunks(chunk)
+            .map(|c| scope.spawn(move || row_all_finite(c)))
+            .collect();
+        handles
+            .into_iter()
+            .all(|h| h.join().expect("linear predict finiteness worker panicked"))
+    })
+}
+
+/// Operand elements one worker thread must be given before spawning it pays.
+///
+/// The host paths size their thread set by WORK, not by core count:
+/// `units = clamp(elems / HOST_ELEMS_PER_UNIT, 1, cpu_launch_units())`. Spawning
+/// and joining a `std::thread` costs tens of microseconds, which is the entire
+/// budget of a small predict, and small-batch inference (a handful of rows at a
+/// time) is a real workload rather than a benchmark tail — an unconditional
+/// 16-thread fan-out makes it several times SLOWER than doing the work on the
+/// calling thread.
+///
+/// `1 << 18` (262 144 elements, a 1 MiB `f32` operand) is the measured knee on a
+/// 16-core Zen5. Effective bandwidth of `linear_predict_host` by operand size
+/// and forced thread count (`MLRS_CPU_UNITS`, GB/s, best of 6):
+///
+/// | elements | 1 | 2 | 4 | 8 | 16 |
+/// |---|---|---|---|---|---|
+/// | 160 K   | **21.6** | 14.4 | 17.1 | 11.2 | 6.7 |
+/// | 800 K   | 21.4 | 23.9 | **40.0** | 32.7 | 25.1 |
+/// | 1.6 M   | 21.2 | 18.2 | **44.2** | 43.4 | 35.0 |
+/// | 6.4 M   | 26.7 | 29.5 | 57.0 | **68.8** | 60.7 |
+/// | 16 M    | 20.2 | 26.5 | **50.2** | 47.2 | 43.8 |
+///
+/// Below the knee one thread wins outright (3× at 160 K); above it the curve is
+/// broad and flat — anything from 4 threads up is within noise of the peak,
+/// because these passes saturate DRAM bandwidth long before they run out of
+/// cores. So the constant only has to get the SMALL end right, and a ratio that
+/// reaches the core count by a few million elements does that.
+const HOST_ELEMS_PER_UNIT: usize = 1 << 18;
+
+/// Worker threads to split `elems` operand elements across — see
+/// [`HOST_ELEMS_PER_UNIT`]. Never more than the machine offers
+/// ([`crate::capability::cpu_launch_units`], which `MLRS_CPU_UNITS` overrides
+/// for A/B), never fewer than one.
+fn host_units(elems: usize) -> usize {
+    (elems / HOST_ELEMS_PER_UNIT)
+        .clamp(1, crate::capability::cpu_launch_units().max(1) as usize)
+}
+
+/// Independent accumulators [`host_dot`] splits a row's dot product across.
+///
+/// Chosen as the natural SIMD group, not tuned per machine: at `-O3` LLVM keeps
+/// the fixed-size `[T; 8]` in one AVX2 `f32` register (or two AVX `f64` ones)
+/// and turns the body into a single multiply-add pair per chunk, while the 8
+/// independent chains hide FP-add latency. It also divides both feature counts
+/// the fitted dense linear models actually produce (`16` and the `64` cap), so
+/// the scalar remainder loop is usually empty.
+const HOST_DOT_LANES: usize = 8;
+
+/// Host float arithmetic shared by the `f32` and `f64` monomorphizations of
+/// [`linear_predict_host`]. Deliberately minimal: `+`, `*` and a zero — the
+/// operations a dot product needs and nothing that could pull in a libm call.
+///
+/// In particular this does NOT use `mul_add`: without `target-feature=+fma`
+/// (which the default `x86-64` baseline does not have) `f32::mul_add` lowers to
+/// a `fmaf` LIBRARY CALL, which is an order of magnitude slower than the
+/// `mul`+`add` pair LLVM vectorizes here. (On the `cubecl-cpu` kernels the
+/// opposite is true — there `fma()` is one MLIR op instead of two and is a
+/// measured win. Different compiler, opposite advice.)
+trait HostFloat:
+    Copy + Send + Sync + std::ops::Add<Output = Self> + std::ops::Mul<Output = Self>
+{
+    /// The additive identity the accumulators start from.
+    const ZERO: Self;
+
+    /// Whether this value is neither NaN nor ±infinity.
+    ///
+    /// `f32`/`f64::is_finite` is an exponent-bits comparison, so a loop of them
+    /// vectorizes into one packed compare per SIMD group alongside the dot
+    /// product's own arithmetic (see [`row_all_finite`]).
+    fn finite(self) -> bool;
+}
+
+impl HostFloat for f32 {
+    const ZERO: f32 = 0.0;
+
+    #[inline]
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+}
+
+impl HostFloat for f64 {
+    const ZERO: f64 = 0.0;
+
+    #[inline]
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+}
+
+/// `out[r] = Σ_c x[r·n + c]·coef[c] + bias` over `out.len()` rows, split across
+/// scoped threads on contiguous row chunks (see [`linear_predict_host`]).
+/// Returns whether every element of `x` it read was finite.
+///
+/// `units` overrides the work-proportional [`host_units`] count; it is the
+/// [`linear_predict_host_units`] test seam and is `None` in production.
+fn matvec_bias_parallel<T: HostFloat>(
+    x: &[T],
+    coef: &[T],
+    bias: T,
+    out: &mut [T],
+    n: usize,
+    units: Option<usize>,
+) -> bool {
+    let units = units.unwrap_or_else(|| host_units(out.len() * n)).max(1);
+    if units <= 1 {
+        return matvec_bias_rows(x, coef, bias, out, n);
+    }
+
+    // Contiguous chunks: thread `i` owns rows `[i·rows, i·rows + chunk.len())`,
+    // so its `out` run and its `x` slab are both one unbroken range.
+    let rows = out.len().div_ceil(units);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = out
+            .chunks_mut(rows)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let slab = &x[i * rows * n..(i * rows + chunk.len()) * n];
+                scope.spawn(move || matvec_bias_rows(slab, coef, bias, chunk, n))
+            })
+            .collect();
+        // Every chunk is joined before the verdict is folded, so one thread
+        // seeing a non-finite element rejects the whole operand.
+        handles
+            .into_iter()
+            .all(|h| h.join().expect("linear_predict_host row worker panicked"))
+    })
+}
+
+/// The serial row loop — one dot product plus the bias per output element.
+/// Returns whether every element of `x` was finite.
+fn matvec_bias_rows<T: HostFloat>(x: &[T], coef: &[T], bias: T, out: &mut [T], n: usize) -> bool {
+    let mut finite = true;
+    for (r, o) in out.iter_mut().enumerate() {
+        let row = &x[r * n..(r + 1) * n];
+        *o = host_dot(row, coef) + bias;
+        // Scanned AFTER the dot product, so the row is already in L1 — this
+        // costs ALU work, not a second trip to memory. Accumulated with `&`
+        // rather than an early `return` so the loop stays branch-free and
+        // vectorizable on the overwhelmingly common all-finite path.
+        finite &= row_all_finite(row);
+    }
+    finite
+}
+
+/// Whether every element of `row` is finite.
+#[inline]
+fn row_all_finite<T: HostFloat>(row: &[T]) -> bool {
+    let mut ok = true;
+    for v in row {
+        ok &= v.finite();
+    }
+    ok
+}
+
+/// `Σ_i row[i]·coef[i]` over [`HOST_DOT_LANES`] independent accumulators, with
+/// a scalar remainder for the sub-lane tail. `row` and `coef` are the same
+/// length (`n`, validated by the caller).
+#[inline]
+fn host_dot<T: HostFloat>(row: &[T], coef: &[T]) -> T {
+    let mut acc = [T::ZERO; HOST_DOT_LANES];
+    let mut rows = row.chunks_exact(HOST_DOT_LANES);
+    let mut cols = coef.chunks_exact(HOST_DOT_LANES);
+    for (xc, cc) in rows.by_ref().zip(cols.by_ref()) {
+        for i in 0..HOST_DOT_LANES {
+            acc[i] = acc[i] + xc[i] * cc[i];
+        }
+    }
+    let mut sum = T::ZERO;
+    for a in acc {
+        sum = sum + a;
+    }
+    for (xv, cv) in rows.remainder().iter().zip(cols.remainder()) {
+        sum = sum + *xv * *cv;
+    }
+    sum
 }
 
 /// Route `predict` to the coalesced shared-tile kernel
@@ -225,22 +678,4 @@ fn validate_geometry(
         });
     }
     Ok(())
-}
-
-/// Ceiling-division per-row launch config, FOLDED across the X/Y grid axes so
-/// the cube count never exceeds `MAX_GRID_DIM` in any single dimension. The
-/// kernel addresses its row via the flattened `ABSOLUTE_POS` (which linearizes
-/// contiguously across a multi-axis grid — cube `(x, y)` covers rows
-/// `[(y·CUBE_COUNT_X + x)·block, +block)`) and bounds-checks `r < m`, so the
-/// 2D fold is transparent to it (the `prims::center::launch_dims_1d`
-/// precedent, which the large-`m` predict hot path likewise requires).
-fn launch_dims_1d(m: usize) -> (CubeCount, CubeDim) {
-    let block = 256u32;
-    let cubes = ((m as u32) + block - 1) / block;
-    let x = cubes.min(MAX_GRID_DIM).max(1);
-    let y = cubes.div_ceil(x).max(1);
-    (
-        CubeCount::Static(x, y, 1),
-        CubeDim { x: block, y: 1, z: 1 },
-    )
 }

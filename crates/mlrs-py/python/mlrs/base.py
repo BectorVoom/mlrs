@@ -43,15 +43,19 @@ class MlrsBase(BaseEstimator):
 
     # -- ingress (D-02) ---------------------------------------------------- #
 
-    def _normalize(self, X, dtype=None):
-        """numpy/list/pyarrow ``X`` -> ``(fresh pyarrow array, rows, cols)``."""
-        return _io.normalize_X(X, dtype=dtype)
+    def _normalize(self, X, dtype=None, ensure_all_finite=True):
+        """numpy/list/pyarrow ``X`` -> ``(fresh pyarrow array, rows, cols)``.
+
+        ``ensure_all_finite=False`` moves the NaN/inf rejection into the Rust
+        call rather than dropping it — see :func:`mlrs._io.normalize_X`.
+        """
+        return _io.normalize_X(X, dtype=dtype, ensure_all_finite=ensure_all_finite)
 
     def _normalize_y(self, y, dtype):
         """1-D target ``y`` -> a fresh-contiguous pyarrow float array."""
         return _io.normalize_y(y, dtype=dtype)
 
-    def _check_predict_X(self, X, dtype=None):
+    def _check_predict_X(self, X, dtype=None, ensure_all_finite=True):
         """Fitted-guard + feature-count guard for a predict/transform input.
 
         Runs BEFORE any ``_mlrs`` accessor touch so the sklearn contract holds:
@@ -70,13 +74,31 @@ class MlrsBase(BaseEstimator):
         Returns ``(pyarrow array, rows, cols)`` from :meth:`_normalize` (with the
         fitted dtype when ``dtype`` is omitted). Use this at the top of every
         ``predict`` / ``transform`` / ``kneighbors``.
+
+        ``ensure_all_finite=False`` is for the callers whose Rust path already
+        scans every element and raises the identical ``ValueError`` itself; it
+        relocates the NaN/inf check, it does not remove it (:meth:`_normalize`).
         """
         self._check_fitted()
         if dtype is None:
             dtype = self._np_float()
-        xa, rows, cols = self._normalize(X, dtype=dtype)
+        xa, rows, cols = self._normalize(
+            X, dtype=dtype, ensure_all_finite=ensure_all_finite
+        )
         expected = getattr(self, "n_features_in_", None)
         if expected is not None and cols != expected:
+            if not ensure_all_finite:
+                # ORDER matters, not just the presence of both checks. sklearn
+                # validates finiteness inside check_array and only then compares
+                # n_features_, so an X that is BOTH mis-shaped and non-finite
+                # reports the NaN/inf error. With the scan relocated into the
+                # Rust call, returning here would skip it entirely and report
+                # the feature-count error instead — diverging from sklearn and
+                # from every sibling estimator that still validates in-line.
+                # Re-running check_array with the scan on restores the order; it
+                # is a cold path (this raises either way), so its cost is not on
+                # the predict budget the relocation was made for.
+                self._normalize(X, dtype=dtype, ensure_all_finite=True)
             raise ValueError(
                 f"X has {cols} features, but {type(self).__name__} is "
                 f"expecting {expected} features as input."
