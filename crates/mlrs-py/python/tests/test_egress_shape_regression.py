@@ -162,6 +162,12 @@ DENSE_LINEAR = [
     ("Ridge", lambda: mlrs.Ridge(alpha=1.0)),
     ("Lasso", lambda: mlrs.Lasso(alpha=0.01)),
     ("ElasticNet", lambda: mlrs.ElasticNet(alpha=0.01, l1_ratio=0.5)),
+    # SVM-PRED-CPU: LinearSVR predicts through the SAME matvec, so it joined the
+    # shared helper and must hold the same two contracts. `tol` is loosened only
+    # because the f32 solve does not reach the default 1e-4 gate on this tiny
+    # random fixture — `predict` is one matvec over whatever `fit` produced, so
+    # the fitted coefficients are irrelevant to what is being tested here.
+    ("LinearSVR", lambda: mlrs.LinearSVR(tol=1e-2)),
 ]
 DENSE_IDS = [n for n, _ in DENSE_LINEAR]
 
@@ -221,6 +227,83 @@ def test_predict_nonfinite_error_precedes_feature_count_error(name, build):
         fitted.predict(np.ones((5, 3), dtype=np.float32))
 
     # And a correctly-shaped non-finite X is rejected too (the ordinary case).
+    bad = np.ones((5, 4), dtype=np.float32)
+    bad[4, 3] = np.nan
+    with pytest.raises(ValueError, match="Input contains NaN"):
+        fitted.predict(bad)
+
+
+# --------------------------------------------------------------------------- #
+# SVM-PRED-CPU: LinearSVC's LABEL predict took the same borrowed-host-ingress +
+# Arrow-egress + relocated-finiteness-scan treatment, on an int32 result
+# --------------------------------------------------------------------------- #
+
+
+def _svc_input(rows=32, cols=4, seed=0):
+    """A binary problem with NON-CONTIGUOUS class ids.
+
+    `classes_` is `[3, 7]`, not `[0, 1]`, so a predict path that returned the
+    ±1 encoding — or the index into `classes_` — instead of looking the id up
+    would fail here and pass on the usual `{0, 1}` fixture.
+    """
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((rows, cols)).astype(np.float32)
+    y = np.where(X[:, 0] > 0, 7, 3).astype(np.int32)
+    return X, y
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_svc_predict_returns_writable_int32_class_ids(dtype):
+    """`LinearSVC.predict` -> a WRITABLE int32 array of ids drawn from classes_.
+
+    The `test_predict_result_is_writable` twin for the label path: the ids come
+    back over the Arrow C data interface (`egress.rs::i32_vec_to_pyarrow`), a
+    zero-copy view numpy marks read-only, so the `_io.to_output` copy is what
+    keeps the ordinary owned-array contract.
+    """
+    if dtype is np.float64 and not mlrs.backend_supports_f64():
+        pytest.skip("backend has no f64 support")
+    X, y = _svc_input()
+    fitted = mlrs.LinearSVC(tol=1e-2).fit(X.astype(dtype), y)
+
+    preds = fitted.predict(X.astype(dtype))
+    assert preds.dtype == np.int32
+    assert preds.shape == (X.shape[0],)
+    assert set(np.unique(preds)) <= {3, 7}
+    assert preds.flags.writeable, "LinearSVC.predict returned a read-only array"
+    preds[0] = 3
+
+    # The labels are the sign of the decision function through `classes_` — the
+    # gate that a shared-matvec refactor kept the mapping, not just the shape.
+    decision = X.astype(dtype) @ fitted.coef_ + fitted.intercept_
+    expected = np.where(decision >= 0, 7, 3).astype(np.int32)
+    np.testing.assert_array_equal(fitted.predict(X.astype(dtype)), expected)
+
+
+def test_svc_predict_nonfinite_error_precedes_feature_count_error():
+    """`LinearSVC` keeps sklearn's error ORDER with the scan relocated.
+
+    Same contract as `test_predict_nonfinite_error_precedes_feature_count_error`
+    for the regressors; asserted separately because `LinearSVC` takes integer
+    labels and returns int32, so it cannot share their fixture.
+    """
+    X, y = _svc_input(cols=4)
+    fitted = mlrs.LinearSVC(tol=1e-2).fit(X, y)
+
+    for bad_value in (np.nan, np.inf, -np.inf):
+        bad = np.full((5, 3), 1.0, dtype=np.float32)
+        bad[0, 0] = bad_value
+        expected = (
+            "Input contains NaN"
+            if np.isnan(bad_value)
+            else "Input contains infinity"
+        )
+        with pytest.raises(ValueError, match=expected):
+            fitted.predict(bad)
+
+    with pytest.raises(ValueError, match="expecting 4 features"):
+        fitted.predict(np.ones((5, 3), dtype=np.float32))
+
     bad = np.ones((5, 4), dtype=np.float32)
     bad[4, 3] = np.nan
     with pytest.raises(ValueError, match="Input contains NaN"):

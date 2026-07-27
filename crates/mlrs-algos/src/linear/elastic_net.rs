@@ -41,7 +41,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::linear_predict::{
-    linear_predict, linear_predict_from_host, HostPrediction,
+    linear_predict, linear_predict_from_host, HostMirror, HostPrediction,
 };
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
@@ -82,6 +82,13 @@ pub struct ElasticNet<F, S = Unfit> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (length 1), device-resident, `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Memoized host copy of `(coef_, intercept_)` for the host-ingress
+    /// `predict` path (IN-05 `OnceLock` mirror idiom). Empty until the first
+    /// `predict_from_host` on the cpu backend, and never filled at all on the
+    /// device backends — see
+    /// [`HostMirror`](mlrs_backend::prims::linear_predict::HostMirror) for why a
+    /// 64-byte read-back is worth caching. Fresh on every `fit`.
+    predict_mirror: HostMirror<F>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -105,6 +112,7 @@ where
             tol: CD_DEFAULT_TOL,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         }
     }
@@ -237,6 +245,7 @@ impl ElasticNetBuilder {
             tol: self.tol,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }
@@ -281,6 +290,7 @@ where
         predict_linear_from_host(
             self.coef_.as_ref(),
             self.intercept_.as_ref(),
+            &self.predict_mirror,
             "elastic_net",
             pool,
             x,
@@ -338,6 +348,7 @@ where
             tol: self.tol,
             coef_: Some(coef),
             intercept_: Some(intercept),
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }
@@ -458,6 +469,7 @@ where
 pub(crate) fn predict_linear_from_host<F>(
     coef_: Option<&DeviceArray<ActiveRuntime, F>>,
     intercept_: Option<&DeviceArray<ActiveRuntime, F>>,
+    mirror: &HostMirror<F>,
     estimator: &'static str,
     pool: &mut BufferPool<ActiveRuntime>,
     x: &[F],
@@ -502,6 +514,7 @@ where
         x,
         coef,
         intercept,
+        mirror,
         (n_samples, n_features),
     )?)
 }

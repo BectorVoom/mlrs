@@ -71,7 +71,7 @@ use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::center::center_columns;
 use mlrs_backend::prims::cholesky::cholesky_solve;
 use mlrs_backend::prims::gram::gram_xty;
-use mlrs_backend::prims::linear_predict::{linear_predict, HostPrediction};
+use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -100,6 +100,13 @@ pub struct Ridge<F, S = Unfit> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (length 1), device-resident, `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Memoized host copy of `(coef_, intercept_)` for the host-ingress
+    /// `predict` path (IN-05 `OnceLock` mirror idiom). Empty until the first
+    /// `predict_from_host` on the cpu backend, and never filled at all on the
+    /// device backends — see
+    /// [`HostMirror`](mlrs_backend::prims::linear_predict::HostMirror) for why a
+    /// 64-byte read-back is worth caching. Fresh on every `fit`.
+    predict_mirror: HostMirror<F>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -120,6 +127,7 @@ where
             fit_intercept: true,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         }
     }
@@ -216,6 +224,7 @@ impl RidgeBuilder {
             fit_intercept: self.fit_intercept,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }
@@ -261,6 +270,7 @@ where
         predict_linear_from_host(
             self.coef_.as_ref(),
             self.intercept_.as_ref(),
+            &self.predict_mirror,
             "ridge",
             pool,
             x,
@@ -431,6 +441,7 @@ where
             fit_intercept: self.fit_intercept,
             coef_: Some(coef),
             intercept_: Some(intercept_dev),
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }

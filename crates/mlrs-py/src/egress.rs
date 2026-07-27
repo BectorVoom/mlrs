@@ -11,7 +11,7 @@
 //! → `i32` at the boundary); [`labels_to_py`] carries that contract so the shim
 //! materializes numpy `int32`.
 
-use arrow::array::{Array, Float32Array, Float64Array};
+use arrow::array::{Array, Float32Array, Float64Array, Int32Array};
 use arrow::pyarrow::ToPyArrow;
 use pyo3::prelude::*;
 
@@ -99,4 +99,16 @@ pub fn f32_vec_to_pyarrow(py: Python<'_>, values: Vec<f32>) -> PyResult<Bound<'_
 /// f64 twin of [`f32_vec_to_pyarrow`].
 pub fn f64_vec_to_pyarrow(py: Python<'_>, values: Vec<f64>) -> PyResult<Bound<'_, PyAny>> {
     Float64Array::from(values).to_data().to_pyarrow(py)
+}
+
+/// `i32` twin of [`f32_vec_to_pyarrow`], for LABEL results (D-03: labels are
+/// `i32` at egress).
+///
+/// The egress list pathology [`f32_vec_to_pyarrow`] documents is if anything
+/// WORSE for labels: a predicted class id is a small integer, and CPython
+/// interns only `-5..=256`, so a `Vec<i32>` of a million predictions becomes a
+/// million `int` objects — the same O(rows) boxing, on a result whose payload is
+/// four bytes per row.
+pub fn i32_vec_to_pyarrow(py: Python<'_>, values: Vec<i32>) -> PyResult<Bound<'_, PyAny>> {
+    Int32Array::from(values).to_data().to_pyarrow(py)
 }

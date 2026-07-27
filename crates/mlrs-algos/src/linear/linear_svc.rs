@@ -51,10 +51,12 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::lbfgs::{lbfgs_minimize, LbfgsStopReason, LBFGS_FTOL, LBFGS_MAXLS};
+use mlrs_backend::prims::linear_predict::HostMirror;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::linear::elastic_net::{predict_linear, predict_linear_from_host};
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
 use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, Unfit};
 
@@ -80,6 +82,13 @@ pub struct LinearSVC<F, S = Unfit> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (device-resident), `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Memoized host copy of `(coef_, intercept_)` for the host-ingress
+    /// `predict` path (IN-05 `OnceLock` mirror idiom). Empty until the first
+    /// `predict_from_host` on the cpu backend, and never filled at all on the
+    /// device backends — see
+    /// [`HostMirror`](mlrs_backend::prims::linear_predict::HostMirror) for why a
+    /// 64-byte read-back is worth caching. Fresh on every `fit`.
+    predict_mirror: HostMirror<F>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -141,6 +150,97 @@ where
             .expect("intercept_ is Some by construction on LinearSVC<F, Fitted>")
             .to_host(pool)[0]
     }
+
+    /// `predict_labels` for a test matrix still in the CALLER'S memory — the
+    /// ingress the Arrow/PyO3 boundary actually has.
+    ///
+    /// A `LinearSVC` prediction is a decision-function sign test, and the
+    /// decision function is exactly the `X·coef_ + intercept_` matvec the dense
+    /// linear regressors compute — so this reuses their
+    /// [`predict_linear_from_host`] path for the arithmetic and only adds the
+    /// `classes_` lookup on top (D-03: the matvec is implemented once). That
+    /// inherits the backend routing (cpu reads the caller's buffer in place;
+    /// wgpu/cuda/rocm upload and run the fused device kernel) and the fused
+    /// operand-finiteness verdict.
+    ///
+    /// It also removes two whole-result host↔device crossings the
+    /// [`PredictLabels::predict_labels`] device-ingress path has to make for a
+    /// host caller: the labels are produced ON the host, so they are not
+    /// uploaded into an `i32` [`DeviceArray`] only for the binding to read them
+    /// straight back.
+    ///
+    /// `values` is EMPTY when `operand_finite` is `false` — the caller is about
+    /// to reject the input, so no labels are derived (mirrors
+    /// [`HostPrediction`](mlrs_backend::prims::linear_predict::HostPrediction)).
+    pub fn predict_labels_from_host(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostLabels, AlgoError> {
+        let (_, n_features) = shape;
+        // Checked BEFORE the shared matvec so a feature-count disagreement
+        // reports LinearSVC's own operand-vs-fitted error, identically to the
+        // device-ingress path (the shared path would otherwise report the same
+        // mismatch with its arguments the other way round).
+        if n_features != self.n_features {
+            return Err(AlgoError::Prim(PrimError::DimMismatch {
+                dim: "n_features",
+                lhs: n_features,
+                rhs: self.n_features,
+            }));
+        }
+        let pred = predict_linear_from_host(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            &self.predict_mirror,
+            "linear_svc",
+            pool,
+            x,
+            shape,
+        )?;
+        if !pred.operand_finite {
+            return Ok(HostLabels {
+                values: Vec::new(),
+                operand_finite: false,
+            });
+        }
+        Ok(HostLabels {
+            values: self.labels_from_margins(&pred.values),
+            operand_finite: true,
+        })
+    }
+
+    /// Map decision-function values to class ids: `>= 0` selects `classes_[1]`
+    /// (the `+1` class), anything else `classes_[0]` — sklearn's
+    /// `classes_[(decision > 0).astype(int)]` with its `>= 0` tie-break, through
+    /// the stored `classes_` so a non-contiguous label set returns the original
+    /// ids (Pitfall 4).
+    ///
+    /// Shared by both ingresses so the encoding is written once.
+    fn labels_from_margins(&self, margins: &[F]) -> Vec<i32> {
+        let neg = self.classes_[0] as i32;
+        let pos = self.classes_[1] as i32;
+        margins
+            .iter()
+            .map(|&m| if host_to_f64(m) >= 0.0 { pos } else { neg })
+            .collect()
+    }
+}
+
+/// What [`LinearSVC::predict_labels_from_host`] produces: the class ids, plus
+/// whether every element of the operand it read was finite.
+///
+/// The `i32` label twin of
+/// [`HostPrediction`](mlrs_backend::prims::linear_predict::HostPrediction) —
+/// same contract, including that `values` is only meaningful when
+/// `operand_finite` is `true`.
+#[derive(Debug, Clone)]
+pub struct HostLabels {
+    /// The length-`n_query` predicted class ids, drawn from `classes_`.
+    pub values: Vec<i32>,
+    /// `false` if ANY element of `x` was NaN or ±infinity.
+    pub operand_finite: bool,
 }
 
 /// Builder for [`LinearSVC`] (D-01). Default field initializers encode the
@@ -274,6 +374,7 @@ impl LinearSVCBuilder {
             n_features: 0,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }
@@ -407,6 +508,7 @@ where
             n_features,
             coef_: Some(coef),
             intercept_: Some(intercept),
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }
@@ -422,29 +524,13 @@ where
         x: &DeviceArray<ActiveRuntime, F>,
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
-        let (n_query, n_features) = shape;
+        let (_, n_features) = shape;
 
-        // `coef_`/`intercept_` are `Some` by construction on the `Fitted` state
-        // (the compile-time typestate replaces the old runtime `NotFitted`
-        // guard, D-03).
-        let coef = self
-            .coef_
-            .as_ref()
-            .expect("coef_ is Some by construction on LinearSVC<F, Fitted>");
-        let intercept = self
-            .intercept_
-            .as_ref()
-            .expect("intercept_ is Some by construction on LinearSVC<F, Fitted>");
-
-        // --- ASVS V5: geometry + fitted-n_features consistency. ---
-        if n_query == 0 || n_features == 0 || x.len() != n_query * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_query,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
+        // --- ASVS V5: fitted-n_features consistency. The remaining geometry
+        // checks (`n_query`/`n_features` non-zero, `x.len()` consistent) live in
+        // the shared `predict_linear` below and raise the identical
+        // `ShapeMismatch`; this one stays here because it compares against
+        // LinearSVC's own fitted `n_features`. ---
         if n_features != self.n_features {
             return Err(AlgoError::Prim(PrimError::DimMismatch {
                 dim: "n_features",
@@ -453,35 +539,27 @@ where
             }));
         }
 
-        // margin = X·coef + intercept (the on-device matvec GEMM, then host bias).
-        let raw = gemm::<F>(
+        // decision = X·coef + intercept, through the SAME fused matvec+bias prim
+        // the dense linear regressors predict with (D-03) — one launch, no
+        // separate `intercept.to_host()` + host bias loop. `coef_`/`intercept_`
+        // are `Some` by construction on the `Fitted` state (the compile-time
+        // typestate replaces the old runtime `NotFitted` guard, D-03), so the
+        // shared path's `NotFitted` arm is unreachable from here.
+        let raw = predict_linear(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            "linear_svc",
             pool,
             x,
-            (n_query, n_features),
-            coef,
-            (n_features, 1),
-            false,
-            false,
-            None,
+            shape,
         )?;
-        let bias = host_to_f64(intercept.to_host(pool)[0]);
         let raw_host = raw.to_host(pool);
         raw.release_into(pool);
 
-        // sign of the margin selects the class: > 0 → classes_[1] (the +1 class),
-        // else classes_[0] (the −1 class). Ties (margin == 0) break toward the
-        // lower class, matching sklearn's `>= 0 → +1`? sklearn uses `decision >= 0`
-        // → the +1 class; we mirror that with `>= 0`.
-        let mut labels: Vec<i32> = vec![0i32; n_query];
-        for r in 0..n_query {
-            let m = host_to_f64(raw_host[r]) + bias;
-            labels[r] = if m >= 0.0 {
-                self.classes_[1] as i32
-            } else {
-                self.classes_[0] as i32
-            };
-        }
-        Ok(DeviceArray::from_host(pool, &labels))
+        Ok(DeviceArray::from_host(
+            pool,
+            &self.labels_from_margins(&raw_host),
+        ))
     }
 }
 

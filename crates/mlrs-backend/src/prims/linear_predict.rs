@@ -69,6 +69,8 @@
 //! cubecl launch spawns one OS thread PER UNIT, while this splits the row axis
 //! across exactly [`crate::capability::cpu_launch_units`] scoped threads.
 
+use std::sync::OnceLock;
+
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
@@ -307,6 +309,65 @@ pub struct HostPrediction<F> {
     pub operand_finite: bool,
 }
 
+/// Memoized host copy of a fitted `(coef, bias)` pair, for the cpu arm of
+/// [`linear_predict_from_host`].
+///
+/// The estimator owns one of these next to its device-resident `coef_` /
+/// `intercept_` (the IN-05 `OnceLock` host-mirror idiom the covariance
+/// estimators already use for their fitted attributes). The fitted state is
+/// immutable — the typestate has no mutating method on the `Fitted` arm — so a
+/// value read once is valid for the estimator's whole life.
+///
+/// ## Why memoize a 64-byte read
+/// `DeviceArray::to_host` is `client.read_one`, whose cost is a *synchronization*
+/// and barely depends on length: **4.3 µs** for the 16-element `coef` and
+/// **4.5 µs** for the 1-element `bias`, measured through the PyO3 boundary on
+/// the cpu backend. Reading both on every call put ~8.6 µs of pure
+/// synchronization in front of every prediction, which is invisible on a
+/// million-row batch and is 30% of the whole call on a small one — and
+/// small-batch inference is a real workload (`HOST_ELEMS_PER_UNIT` in this
+/// module exists for the same reason). On a discrete GPU the same two reads are
+/// two full device syncs, so this is not a cpu-only saving.
+///
+/// Filled LAZILY, and only by the cpu arm: the device arms never read `coef` /
+/// `bias` to host at all, and pay nothing for holding one of these.
+#[derive(Debug)]
+pub struct HostMirror<F> {
+    cell: OnceLock<(Vec<F>, F)>,
+}
+
+// Hand-written rather than derived: `#[derive(Default)]` would add a spurious
+// `F: Default` bound, which the estimators holding one of these do not require
+// of their float parameter.
+impl<F> Default for HostMirror<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F> HostMirror<F> {
+    /// An empty mirror. Estimators construct one per `fit`, alongside the
+    /// device buffers it mirrors.
+    pub fn new() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+}
+
+impl<F: Pod> HostMirror<F> {
+    /// The host `(coef, bias)`, reading them back on first call only.
+    fn get(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        coef: &DeviceArray<ActiveRuntime, F>,
+        bias: &DeviceArray<ActiveRuntime, F>,
+    ) -> &(Vec<F>, F) {
+        self.cell
+            .get_or_init(|| (coef.to_host(pool), bias.to_host(pool)[0]))
+    }
+}
+
 /// Predict from a **host-resident** `x` — the backend-routing entry point the
 /// estimator layer calls when the test matrix arrives from the host (which,
 /// coming through the Arrow/PyO3 boundary, is always).
@@ -321,9 +382,10 @@ pub struct HostPrediction<F> {
 ///   cuML/sklearn on a Tesla T4 and is deliberately untouched.
 ///
 /// `coef` / `bias` stay device-resident in the estimator on every backend; the
-/// cpu arm reads those two SMALL buffers (length `n ≤ 64` and `1`) to host per
-/// call, which is microseconds and keeps the fitted-state contract (D-03)
-/// identical across backends.
+/// cpu arm needs those two SMALL buffers (length `n ≤ 64` and `1`) on the host,
+/// and takes them from the caller's [`HostMirror`] so the read-back happens once
+/// per fitted estimator rather than once per call. The fitted-state contract
+/// (D-03) is identical across backends.
 ///
 /// [`HostPrediction::operand_finite`] is a real verdict on EVERY backend, so a
 /// caller may rely on it uniformly. The cpu arm gets it fused into the matvec
@@ -338,6 +400,7 @@ pub fn linear_predict_from_host<F>(
     x: &[F],
     coef: &DeviceArray<ActiveRuntime, F>,
     bias: &DeviceArray<ActiveRuntime, F>,
+    mirror: &HostMirror<F>,
     (m, n): (usize, usize),
 ) -> Result<HostPrediction<F>, PrimError>
 where
@@ -345,9 +408,8 @@ where
 {
     if crate::capability::active_backend_name() == "cpu" {
         validate_geometry(x.len(), (m, n), coef.len(), bias.len())?;
-        let coef_host = coef.to_host(pool);
-        let bias_host = bias.to_host(pool)[0];
-        return linear_predict_host::<F>(x, &coef_host, bias_host, (m, n));
+        let (coef_host, bias_host) = mirror.get(pool, coef, bias);
+        return linear_predict_host::<F>(x, coef_host, *bias_host, (m, n));
     }
 
     // Scanned BEFORE the upload so a rejected operand never crosses the bus:

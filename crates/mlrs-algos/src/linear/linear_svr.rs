@@ -29,11 +29,12 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::linear_predict::{HostMirror, HostPrediction};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
-use crate::linear::elastic_net::predict_linear;
+use crate::linear::elastic_net::{predict_linear, predict_linear_from_host};
 use crate::linear::linear_svc::svm_lbfgs_fit;
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
@@ -56,6 +57,13 @@ pub struct LinearSVR<F, S = Unfit> {
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (device-resident), `None` until `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// Memoized host copy of `(coef_, intercept_)` for the host-ingress
+    /// `predict` path (IN-05 `OnceLock` mirror idiom). Empty until the first
+    /// `predict_from_host` on the cpu backend, and never filled at all on the
+    /// device backends — see
+    /// [`HostMirror`](mlrs_backend::prims::linear_predict::HostMirror) for why a
+    /// 64-byte read-back is worth caching. Fresh on every `fit`.
+    predict_mirror: HostMirror<F>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -111,6 +119,32 @@ where
             .as_ref()
             .expect("intercept_ is Some by construction on LinearSVR<F, Fitted>")
             .to_host(pool)[0]
+    }
+
+    /// `predict` for a test matrix still in the CALLER'S memory — the ingress
+    /// the Arrow/PyO3 boundary actually has.
+    ///
+    /// Same result as [`Predict::predict`] followed by a read-back, but it never
+    /// uploads on the cpu backend: `LinearSVR`'s prediction is the same
+    /// `X·coef_ + intercept_` matvec the four dense linear regressors compute,
+    /// so it shares their [`predict_linear_from_host`] path verbatim (D-03 — one
+    /// implementation, not a fifth copy) and inherits the backend routing and
+    /// the fused operand-finiteness verdict described there.
+    pub fn predict_from_host(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostPrediction<F>, AlgoError> {
+        predict_linear_from_host(
+            self.coef_.as_ref(),
+            self.intercept_.as_ref(),
+            &self.predict_mirror,
+            "linear_svr",
+            pool,
+            x,
+            shape,
+        )
     }
 }
 
@@ -252,6 +286,7 @@ impl LinearSVRBuilder {
             intercept_scaling: self.intercept_scaling,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }
@@ -332,6 +367,7 @@ where
             intercept_scaling: self.intercept_scaling,
             coef_: Some(coef),
             intercept_: Some(intercept),
+            predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
     }

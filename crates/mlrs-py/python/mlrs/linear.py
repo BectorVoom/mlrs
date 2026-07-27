@@ -474,9 +474,10 @@ class LinearSVR(RegressorMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._check_predict_X(X)
-        out = self._suffixed("predict")(xa, rows, cols)
-        return self._to_output(out, (rows,), X, self._np_float())
+        # A LinearSVR prediction is the same `X·coef_ + intercept_` matvec the
+        # dense regressors compute, so it takes the same no-upload / no-list
+        # path (and the same relocated NaN/inf scan).
+        return _dense_linear_predict(self, X)
 
     @property
     def coef_(self):
@@ -536,7 +537,12 @@ class LinearSVC(ClassifierMixin, MlrsBase):
         return self
 
     def predict(self, X):
-        xa, rows, cols = self._check_predict_X(X)
+        # `ensure_all_finite=False` relocates the NaN/inf rejection into the
+        # Rust call rather than dropping it — the reasoning in
+        # :func:`_dense_linear_predict` applies verbatim, because a LinearSVC
+        # decision function IS that same matvec over X and only adds the
+        # sign -> ``classes_`` lookup on top (``linear.rs::predict_labels``).
+        xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
         out = self._mlrs_obj.predict_labels(xa, rows, cols)
         return self._to_output(out, (rows,), X, np.int32)
 

@@ -35,7 +35,7 @@ use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::linear_predict::HostPrediction;
 use mlrs_backend::runtime::ActiveRuntime;
 
-use crate::egress::{f32_vec_to_pyarrow, f64_vec_to_pyarrow};
+use crate::egress::{f32_vec_to_pyarrow, f64_vec_to_pyarrow, i32_vec_to_pyarrow};
 use crate::errors::{algo_err_to_py, build_err_to_py, nonfinite_input_err, not_fitted};
 use crate::ingress::{
     as_f32, as_f64, capsule_to_array, float_dtype, host_slice_f32, host_slice_f64, validated_f32,
@@ -93,7 +93,10 @@ macro_rules! impl_dense_predict_host {
     };
 }
 
-impl_dense_predict_host!(LinearRegression, Ridge, Lasso, ElasticNet);
+// `LinearSVR` is in the list because its prediction IS the same
+// `X·coef_ + intercept_` matvec — only its `fit` differs — so it takes the same
+// no-upload / no-list `predict` body rather than a fifth hand-written one.
+impl_dense_predict_host!(LinearRegression, Ridge, Lasso, ElasticNet, LinearSVR);
 
 /// The whole `predict` body for a fitted f32 dense linear regressor: borrow the
 /// validated Arrow values, predict, reject a non-finite operand, hand the result
@@ -1698,23 +1701,62 @@ impl PyLinearSVC {
         Ok(())
     }
 
-    /// `predict(x)` → length-`rows` host `Vec<i32>` class labels (margin sign).
-    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
+    /// `predict(x)` → a length-`rows` **pyarrow** `int32` array of class ids
+    /// (decision-function sign through `classes_`).
+    ///
+    /// The classifier twin of [`dense_predict_f32`], and it departs from this
+    /// file's `predict_labels` template for exactly the two reasons documented
+    /// there — plus a third that is specific to the label path:
+    ///
+    /// 1. **No upload.** `predict_labels_from_host` borrows the validated Arrow
+    ///    values and routes cpu to the host matvec; wgpu/cuda/rocm still upload
+    ///    and run the fused device kernel.
+    /// 2. **No Python list.** The ids go back over Arrow, which numpy views in
+    ///    place, instead of one boxed `int` per row.
+    /// 3. **No round-trip for the labels themselves.** The estimator's
+    ///    device-ingress `predict_labels` derives the ids on the host and then
+    ///    uploads them into an `i32` `DeviceArray` to satisfy its trait
+    ///    signature — which this binding would immediately read straight back.
+    ///    The host-ingress path skips both crossings.
+    ///
+    /// Like the dense regressors it OWNS the NaN/inf rejection (`mlrs.linear`
+    /// passes `ensure_all_finite=False`), reproducing `check_array`'s message
+    /// via [`nonfinite_input_err`].
+    fn predict_labels<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let xa = capsule_to_array(x)?;
-        py.detach(|| {
+        let out = py.detach(|| -> PyResult<Vec<i32>> {
             let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyLinearSVC::F32(est) => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let pred = est
+                        .predict_labels_from_host(&mut pool, xh, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    if !pred.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float32"));
+                    }
+                    Ok(pred.values)
                 }
                 AnyLinearSVC::F64(est) => {
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(TypestatePredictLabels::predict_labels(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let pred = est
+                        .predict_labels_from_host(&mut pool, xh, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    if !pred.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float64"));
+                    }
+                    Ok(pred.values)
                 }
                 _ => Err(not_fitted("linear_svc", "predict")),
             }
-        })
+        })?;
+        i32_vec_to_pyarrow(py, out)
     }
 
     /// The inferred class labels (`classes_`, length 2 for the binary fit).
@@ -1906,31 +1948,32 @@ impl PyLinearSVR {
         Ok(())
     }
 
-    fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyLinearSVR::F32(est) => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("linear_svr", "predict (f32 path)")),
-            }
-        })
+    /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shares
+    /// [`dense_predict_f32`] with the four dense linear regressors — see its
+    /// docs for the no-upload / no-Python-list ingress and egress.
+    fn predict_f32<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyLinearSVR::F32(est) => dense_predict_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("linear_svr", "predict (f32 path)")),
+        }
     }
-    fn predict_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
-        let xa = capsule_to_array(x)?;
-        py.detach(|| {
-            let mut pool = crate::lock_pool();
-            match &self.inner {
-                AnyLinearSVR::F64(est) => {
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    Ok(TypestatePredict::predict(est, &mut pool, &xd, (rows, cols)).map_err(algo_err_to_py)?.to_host_metered(&mut pool))
-                }
-                _ => Err(not_fitted("linear_svr", "predict (f64 path)")),
-            }
-        })
+    fn predict_f64<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyLinearSVR::F64(est) => dense_predict_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("linear_svr", "predict (f64 path)")),
+        }
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
