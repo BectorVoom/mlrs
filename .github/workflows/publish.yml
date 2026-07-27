@@ -49,7 +49,7 @@ jobs:
 
       - name: Build Wheels
         uses: PyO3/maturin-action@v1
-        with
+        with:
           container: off
           target: ${{ matrix.target }}
           args: --release --out dist
