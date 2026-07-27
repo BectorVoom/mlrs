@@ -257,7 +257,7 @@ must be right and the backend abstraction must hold.
 
 ## Estimator / Mixin Pattern
 
-- Thread-local `raft.handle_t` management via `get_handle()`
+- Thread-local `raft.handle_t` management via `get_handle()`s
 - `output_type` routing (numpy / cudf / cupy / numba, etc.)
 - `verbose` / logging-level forwarding
 - `_get_param_names()` for sklearn parameter discovery
@@ -395,3 +395,6 @@ must be right and the backend abstraction must hold.
 
 - `UnsupportedOnGPU` / `UnsupportedOnCPU` (`python/cuml/cuml/internals/interop.py:44`) signal unsupported configurations in `cuml.accel` — triggers CPU fallback in `ProxyBase`
 - Logging via `cuml.internals.logger` (wraps spdlog) for C++-level verbosity; separate `cuml.accel.core.Logger` for accel-layer messages
+
+##  cubecl manual
+/home/user/Documents/workspace/cubecl_manual/manual/Cubecl/*

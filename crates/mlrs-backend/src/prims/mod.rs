@@ -91,6 +91,12 @@ pub mod reduce;
 // mlrs-algos).
 pub mod sgd;
 pub mod svd;
+// Linear-SVM primal objective evaluator (SVM-FIT-CPU perf lever): the margin
+// matvec + per-sample loss + `X̃ᵀg` gradient the `LinearSVC`/`LinearSVR` L-BFGS
+// solve runs every iteration. Keeps the two-GEMM shape on the device backends
+// and replaces it with ONE fused `-O3` host pass on cpu, where a cubecl launch
+// costs three orders of magnitude more than the matvec it performs.
+pub mod svm_objective;
 pub mod topk;
 // TSNE-01: the exact-method t-SNE per-iteration gradient prim (Student-t
 // affinity + KL-gradient GATHER over the Phase-2 distance prim).

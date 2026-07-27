@@ -49,9 +49,9 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::lbfgs::{lbfgs_minimize, LbfgsStopReason, LBFGS_FTOL, LBFGS_MAXLS};
 use mlrs_backend::prims::linear_predict::HostMirror;
+use mlrs_backend::prims::svm_objective::SvmObjective;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -580,11 +580,14 @@ where
 /// (length 1). When `fit_intercept` is false the design is NOT augmented and the
 /// intercept is 0.
 ///
-/// The per-iteration margin is the on-device `x̃ · w` matvec (GEMM); the gradient
-/// `w − 2?` is `w + C·x̃ᵀ·g` with `gᵢ = dloss/dmargin` (a second GEMM, transa).
-/// Both are read back so the (smooth, convex) host L-BFGS recursion can step —
-/// the bounded-allocation iterative-solver shape (05-11), one metered readback per
-/// eval.
+/// The per-iteration `(Σℓ, x̃ᵀg)` evaluation — the entire cost of the solve — is
+/// [`SvmObjective`], which owns the backend routing: two GEMM launches with a
+/// host round-trip on each side for wgpu/cuda/rocm, and ONE fused `-O3` host
+/// pass over the caller's slab on cpu (where a cubecl launch costs three orders
+/// of magnitude more than the matvec it performs — see the prim's module docs
+/// for the measured breakdown). This function owns only the regularizer, the
+/// `C` weight and the L-BFGS driver, so the objective is written once and the
+/// per-backend arithmetic once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn svm_lbfgs_fit<F>(
     pool: &mut BufferPool<ActiveRuntime>,
@@ -598,7 +601,7 @@ pub(crate) fn svm_lbfgs_fit<F>(
     max_iter: usize,
     gtol: f64,
     estimator: &'static str,
-    margin_loss: impl Fn(f64, f64) -> (f64, f64),
+    margin_loss: impl Fn(f64, f64) -> (f64, f64) + Sync,
 ) -> Result<
     (
         DeviceArray<ActiveRuntime, F>,
@@ -609,101 +612,46 @@ pub(crate) fn svm_lbfgs_fit<F>(
 where
     F: Float + CubeElement + Pod,
 {
-    // Augmented feature count: append the synthetic constant column when fitting an
-    // intercept (Pitfall 5). The augmented design lives device-resident for the
-    // whole solve (reused every L-BFGS eval — bounded allocation, 05-11).
-    let d_aug = if fit_intercept { n_features + 1 } else { n_features };
-
-    let x_host = x.to_host(pool);
-    let mut x_aug: Vec<F> = vec![F::from_int(0i64); n_samples * d_aug];
-    for r in 0..n_samples {
-        for col in 0..n_features {
-            x_aug[r * d_aug + col] = x_host[r * n_features + col];
-        }
-        if fit_intercept {
-            x_aug[r * d_aug + n_features] = f64_to_host::<F>(intercept_scaling);
-        }
-    }
-    let x_aug_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x_aug);
+    // The design in the form the active backend evaluates against, prepared ONCE
+    // and reused by every L-BFGS iteration and line-search step (the
+    // bounded-allocation iterative-solver shape, 05-11). `d_aug` counts the
+    // synthetic intercept column when there is one (Pitfall 5).
+    let objective = SvmObjective::<F>::new(
+        pool,
+        x,
+        (n_samples, n_features),
+        targets.to_vec(),
+        intercept_scaling,
+        fit_intercept,
+    )
+    .map_err(AlgoError::Prim)?;
+    let d_aug = objective.d_aug();
 
     // L-BFGS over the augmented weight vector w (length d_aug). The closure is
-    // evaluated every iteration + per line-search step; a device GEMM failure is
+    // evaluated every iteration + per line-search step; an evaluation failure is
     // captured (never panics across the boundary) and surfaced after the solve.
     let mut prim_err: Option<PrimError> = None;
     let closure = |w: &[f64]| -> (f64, Vec<f64>) {
         if prim_err.is_some() {
             return (f64::MAX, vec![0.0f64; d_aug]);
         }
-        // margin m = X̃ · w  (n_samples × 1) via the on-device matvec.
-        let w_host: Vec<F> = w.iter().map(|&v| f64_to_host::<F>(v)).collect();
-        let w_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &w_host);
-        let margins = match gemm::<F>(
-            pool,
-            &x_aug_dev,
-            (n_samples, d_aug),
-            &w_dev,
-            (d_aug, 1),
-            false,
-            false,
-            None,
-        ) {
-            Ok(m) => m,
+        let ev = match objective.eval(pool, w, &margin_loss) {
+            Ok(ev) => ev,
             Err(e) => {
-                w_dev.release_into(pool);
                 prim_err = Some(e);
                 return (f64::MAX, vec![0.0f64; d_aug]);
             }
         };
-        let margins_host = margins.to_host(pool);
-        margins.release_into(pool);
-
-        // Per-sample loss + dloss/dmargin (host — the SVM losses are cheap scalar
-        // maps; the matvecs are the device work).
-        let mut data_loss = 0.0f64;
-        let mut g: Vec<F> = vec![F::from_int(0i64); n_samples];
-        for i in 0..n_samples {
-            let m = host_to_f64(margins_host[i]);
-            let (li, dli) = margin_loss(m, targets[i]);
-            data_loss += li;
-            g[i] = f64_to_host::<F>(dli);
-        }
-        let g_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &g);
-
-        // data-term gradient contribution C · X̃ᵀ · g  (d_aug × 1) via GEMM transa.
-        // The LOGICAL op is (d_aug × n_samples)·(n_samples × 1); the stored X̃ is
-        // (n_samples × d_aug) so transa presents the transposed view (gemm.rs:78).
-        let xtg = match gemm::<F>(
-            pool,
-            &x_aug_dev,
-            (d_aug, n_samples), // logical (m, k) AFTER the transpose
-            &g_dev,
-            (n_samples, 1),
-            true, // transa: X̃ᵀ (d_aug × n_samples)
-            false,
-            None,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                w_dev.release_into(pool);
-                g_dev.release_into(pool);
-                prim_err = Some(e);
-                return (f64::MAX, vec![0.0f64; d_aug]);
-            }
-        };
-        let xtg_host = xtg.to_host(pool);
-        xtg.release_into(pool);
-        w_dev.release_into(pool);
-        g_dev.release_into(pool);
 
         // Total objective = ½‖w‖² + C·Σ ℓ ;  grad = w + C·X̃ᵀg.
         let mut reg = 0.0f64;
         for &wv in w.iter() {
             reg += wv * wv;
         }
-        let loss = 0.5 * reg + c * data_loss;
-        let mut grad = vec![0.0f64; d_aug];
-        for j in 0..d_aug {
-            grad[j] = w[j] + c * host_to_f64(xtg_host[j]);
+        let loss = 0.5 * reg + c * ev.data_loss;
+        let mut grad = ev.xtg;
+        for (j, gj) in grad.iter_mut().enumerate() {
+            *gj = w[j] + c * *gj;
         }
         (loss, grad)
     };
@@ -722,6 +670,10 @@ where
     // or below the dtype floor `k·sqrt(eps_F)` (the smallest gradient a flat-near-
     // minimum float loss can resolve); a residual ABOVE the floor is a genuine
     // non-stationary breakdown and stays `NotConverged` (T-10-04-03 DoS signal).
+    // (On the cpu backend the f32 floor is much lower than `f_epsilon::<f32>()`
+    // implies, because `SvmObjective`'s host arm accumulates in f64 whatever `F`
+    // is — the floor accept then simply never has to fire. It is kept as the
+    // device backends' f32 path still accumulates in `F`.)
     // WR-01: thread the caller-configured L-BFGS gradient tolerance through
     // (sklearn `tol`), clamped to a sane positive floor so a `tol = 0` (the pinned
     // deterministic-epochs oracle override) still requests a deep converged solve
@@ -729,7 +681,7 @@ where
     let gtol = gtol.max(1e-12);
     let result = lbfgs_minimize(x0, closure, gtol, LBFGS_FTOL, LBFGS_MAXLS, max_iter)?;
     if let Some(e) = prim_err {
-        x_aug_dev.release_into(pool);
+        objective.release_into(pool);
         return Err(AlgoError::Prim(e));
     }
 
@@ -741,7 +693,7 @@ where
     let broke = result.stop_reason == LbfgsStopReason::LineSearchFailed && !residual_ok;
     let hit_cap = result.iters >= max_iter && !result.converged && !residual_ok;
     if hit_cap || broke {
-        x_aug_dev.release_into(pool);
+        objective.release_into(pool);
         return Err(AlgoError::NotConverged {
             estimator,
             max_iter,
@@ -763,7 +715,7 @@ where
     let intercept_dev: DeviceArray<ActiveRuntime, F> =
         DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)]);
 
-    x_aug_dev.release_into(pool);
+    objective.release_into(pool);
     Ok((coef_dev, intercept_dev))
 }
 
