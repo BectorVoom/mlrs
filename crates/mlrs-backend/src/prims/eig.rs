@@ -121,6 +121,51 @@ where
 
     let (skip_thr, conv_thr) = compute_thresholds::<F>(pool, a, n * n, n);
 
+    // --- cpu arm (EIG-PERF-CPU): run the SAME sweep on the host. -------------
+    // The kernel launches ONE cube of `n` units with a `sync_cube` inside the
+    // per-round loop. On `cubecl-cpu` that is `n` OS THREADS (60 of them at
+    // `n = 60`) spin-waiting at ~`n · MAX_SWEEPS` barriers on a machine with far
+    // fewer cores, at LLVM `-O0` — the same GPU-shaped-kernel pathology the KNN
+    // and HDBSCAN cpu passes hit. It made `Umap::fit` at `n <= 64` (the spectral
+    // -init path) take minutes. [`host_jacobi_eig`] replays the identical
+    // schedule serially in native code; see it for why the result is unchanged.
+    if host_eig_applicable() {
+        // The working-input handle is either the caller's `out` buffer (released
+        // just below via `a_in_owned`, exactly as the device arm does) or a
+        // ref-counted clone of `a`'s. Wrapping it to read it back does not
+        // transfer ownership — `DeviceArray` frees nothing on drop; the buffer
+        // returns to the pool only through an explicit `release_into`.
+        let a_in = DeviceArray::<ActiveRuntime, F>::from_raw(a_in_handle, n * n);
+        let a_host: Vec<f64> = a_in.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        drop(a_in);
+        if let Some(buf) = a_in_owned {
+            buf.release_into(pool);
+        }
+        pool.release(w_handle, n * elem);
+        pool.release(v_handle, n * n * elem);
+        pool.release(info_handle, 2 * elem);
+
+        let (w64, v64, sweeps_run, residual) = host_jacobi_eig(
+            &a_host,
+            n,
+            host_to_f64(skip_thr),
+            host_to_f64(conv_thr),
+            MAX_SWEEPS,
+        );
+        if sweeps_run >= MAX_SWEEPS && residual.is_finite() && residual > host_to_f64(conv_thr) {
+            return Err(PrimError::NotConverged {
+                operand: "eig",
+                max_sweeps: MAX_SWEEPS,
+                residual,
+            });
+        }
+        let (w_sorted, v_sorted) = sort_descending::<F>(&w64, &v64, n);
+        return Ok((
+            DeviceArray::from_host(pool, &w_sorted),
+            DeviceArray::from_host(pool, &v_sorted),
+        ));
+    }
+
     // SAFETY: lengths are the carried/validated element counts (n*n, n, n*n, 2),
     // NEVER raw caller geometry; the kernel bounds every loop by the runtime `n`
     // and idles units with `i >= n` (mitigates T-03-04-01 / T-03-04-03, the OOB
@@ -182,25 +227,226 @@ where
     v_dev.release_into(pool);
 
     let w64: Vec<f64> = w_host.iter().map(|&x| host_to_f64(x)).collect();
+    let v64: Vec<f64> = v_host.iter().map(|&x| host_to_f64(x)).collect();
 
-    // Descending order of eigenvalues with a permutation; permute V columns.
+    let (w_sorted, v_sorted) = sort_descending::<F>(&w64, &v64, n);
+    let w_final = DeviceArray::from_host(pool, &w_sorted);
+    let v_final = DeviceArray::from_host(pool, &v_sorted);
+    Ok((w_final, v_final))
+}
+
+/// Order the converged spectrum DESCENDING (D-04) and permute `V`'s columns to
+/// match, narrowing both back to `F`.
+///
+/// `w` is the unsorted diagonal; `v` is `V` in COLUMN-major layout
+/// (`v[c*n + r] = V[r, c]`), which the permutation preserves. Shared by the
+/// device and host arms so the two cannot drift in ordering or tie handling.
+fn sort_descending<F>(w: &[f64], v: &[f64], n: usize) -> (Vec<F>, Vec<F>)
+where
+    F: Float + CubeElement + Pod,
+{
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&i, &j| w64[j].partial_cmp(&w64[i]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&i, &j| w[j].partial_cmp(&w[i]).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut w_sorted: Vec<F> = vec![F::from_int(0i64); n];
     let mut v_sorted: Vec<F> = vec![F::from_int(0i64); n * n];
     for (new_j, &old_j) in order.iter().enumerate() {
-        w_sorted[new_j] = f64_to_host::<F>(w64[old_j]);
-        // V is column-major (v_host[c*n + r] = V[r, c]); move column old_j to
-        // new_j, preserving column-major layout.
+        w_sorted[new_j] = f64_to_host::<F>(w[old_j]);
         for r in 0..n {
-            v_sorted[new_j * n + r] = v_host[old_j * n + r];
+            v_sorted[new_j * n + r] = f64_to_host::<F>(v[old_j * n + r]);
         }
     }
+    (w_sorted, v_sorted)
+}
 
-    let w_final = DeviceArray::from_host(pool, &w_sorted);
-    let v_final = DeviceArray::from_host(pool, &v_sorted);
-    Ok((w_final, v_final))
+/// Should the symmetric eigendecomposition run on the host?
+///
+/// True on `cpu` only. `MLRS_EIG_HOST=0` forces the device kernel back on for
+/// on-target A/B; `=1` cannot force the host path onto a non-cpu backend, where
+/// the single-cube kernel is a genuine parallel launch and this serial loop
+/// would be a large regression.
+fn host_eig_applicable() -> bool {
+    crate::capability::active_backend_name() == "cpu"
+        && crate::abflag::var("MLRS_EIG_HOST")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+}
+
+/// Host twin of [`jacobi_eig_sweep`] — the SAME two-sided cyclic Jacobi, in
+/// native scalar code (EIG-PERF-CPU).
+///
+/// Returns `(w, V, sweeps_run, final_off_diag_norm)` with `w` the UNSORTED
+/// diagonal and `V` COLUMN-major, i.e. exactly what the kernel writes to
+/// `w_out` / `v_out` / `info_out`, so the caller's sort + convergence check is
+/// shared verbatim.
+///
+/// ## Why the result is the kernel's result
+/// Every step of the kernel is replayed here in the same order: the same
+/// even-padded circle-method pair schedule, the same `θ / t / c / s` rotation
+/// from the same 2×2 block, the same two phases separated where the kernel puts
+/// its barrier, the same per-row off-diagonal sums reduced by the same
+/// halving tree, and the same `skip_thr` / `conv_thr` comparisons. Within a
+/// round the kernel's units are genuinely order-independent — phase 1's pairs
+/// own DISJOINT COLUMN pairs and phase 2's own disjoint ROW pairs, and neither
+/// reads a location another pair writes in the same phase — so walking those
+/// pairs sequentially computes the identical floating-point values rather than
+/// merely an equivalent decomposition. (This is what makes the host arm a
+/// drop-in and not a second algorithm with its own sign and ordering
+/// conventions.)
+fn host_jacobi_eig(
+    a_in: &[f64],
+    n: usize,
+    skip_thr: f64,
+    conv_thr: f64,
+    max_sweeps: u32,
+) -> (Vec<f64>, Vec<f64>, u32, f64) {
+    // A row-major, V row-major (transposed to column-major at the end, as the
+    // kernel's write-back does).
+    let mut a = a_in.to_vec();
+    let mut v = vec![0.0f64; n * n];
+    for i in 0..n {
+        v[i * n + i] = 1.0;
+    }
+
+    // Even-padded player count for the circle method (the kernel's `players`).
+    let players = if n % 2 != 0 { n + 1 } else { n };
+    let n_steps = players.saturating_sub(1);
+    let half = players / 2;
+
+    let mut off_norm = 0.0f64;
+    let mut sweep = 0u32;
+    let mut converged = false;
+    // Per-pair rotations for the current round, carried from phase 1 to phase 2
+    // exactly as each kernel unit carries `cs`/`sn` in registers across the
+    // barrier (NEVER re-derived from `a_pq`, which phase 1 has already rotated).
+    let mut round: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(half);
+
+    while sweep < max_sweeps && !converged {
+        for step in 0..n_steps {
+            round.clear();
+
+            // --- Phase 1 (A ← A·J, V ← V·J): column pairs, disjoint per pair.
+            for pos in 0..half {
+                let col_a = circle_player(pos, step, players);
+                let col_b = circle_player(players - 1 - pos, step, players);
+                let (lo, hi) = if col_a < col_b {
+                    (col_a, col_b)
+                } else {
+                    (col_b, col_a)
+                };
+                if lo == hi || hi >= n {
+                    continue; // self-pair, or a pairing touching the ghost player
+                }
+
+                let a_pp = a[lo * n + lo];
+                let a_qq = a[hi * n + hi];
+                let a_pq = a[lo * n + hi];
+                if !(a_pq.abs() > skip_thr) {
+                    continue;
+                }
+
+                let theta = (a_qq - a_pp) / (2.0 * a_pq);
+                let denom = theta.abs() + (1.0 + theta * theta).sqrt();
+                let mut t = 1.0 / denom;
+                if theta < 0.0 {
+                    t = -t;
+                }
+                let cs = 1.0 / (1.0 + t * t).sqrt();
+                let sn = cs * t;
+
+                for k in 0..n {
+                    let a_kp = a[k * n + lo];
+                    let a_kq = a[k * n + hi];
+                    a[k * n + lo] = cs * a_kp - sn * a_kq;
+                    a[k * n + hi] = sn * a_kp + cs * a_kq;
+                }
+                for r in 0..n {
+                    let v_rp = v[r * n + lo];
+                    let v_rq = v[r * n + hi];
+                    v[r * n + lo] = cs * v_rp - sn * v_rq;
+                    v[r * n + hi] = sn * v_rp + cs * v_rq;
+                }
+                round.push((lo, hi, cs, sn));
+            }
+
+            // --- Phase 2 (A ← Jᵀ·A): row pairs, disjoint per pair. This is the
+            //     kernel's post-barrier half — it needs the FULLY phase-1-updated
+            //     matrix, which is why it cannot be folded into the loop above.
+            for &(lo, hi, cs, sn) in &round {
+                for kk in 0..n {
+                    let a_pk = a[lo * n + kk];
+                    let a_qk = a[hi * n + kk];
+                    a[lo * n + kk] = cs * a_pk - sn * a_qk;
+                    a[hi * n + kk] = sn * a_pk + cs * a_qk;
+                }
+            }
+        }
+
+        // --- Convergence: per-row off-diagonal sums, then the kernel's halving
+        //     tree reduction (replicated so the summation ORDER — and therefore
+        //     the sweep at which f32 stops — matches).
+        let mut off = vec![0.0f64; n.max(1)];
+        for i in 0..n {
+            let mut acc = 0.0f64;
+            for j in 0..n {
+                if j != i {
+                    let aij = a[i * n + j];
+                    acc += aij * aij;
+                }
+            }
+            off[i] = acc;
+        }
+        let mut s = next_pow2_half(n);
+        while s > 0 {
+            for i in 0..s {
+                if i + s < n {
+                    off[i] += off[i + s];
+                }
+            }
+            s /= 2;
+        }
+        off_norm = off[0].sqrt();
+        if off_norm <= conv_thr {
+            converged = true;
+        }
+        sweep += 1;
+    }
+
+    // Write-back: the diagonal as eigenvalues, V transposed into column-major.
+    let mut w = vec![0.0f64; n];
+    let mut v_col = vec![0.0f64; n * n];
+    for i in 0..n {
+        w[i] = a[i * n + i];
+        for r in 0..n {
+            v_col[i * n + r] = v[r * n + i];
+        }
+    }
+    (w, v_col, sweep, off_norm)
+}
+
+/// Circle-method player index — the host twin of `jacobi_eig::circle_player`.
+/// Position 0 is the fixed pivot; positions `1..players` rotate.
+#[inline]
+fn circle_player(pos: usize, step: usize, players: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let m = players - 1;
+    ((pos - 1 + step) % m) + 1
+}
+
+/// Largest power of two strictly below `n` (0 for `n <= 1`) — the host twin of
+/// `jacobi_eig::next_pow2_half`, so the reduction tree has the same shape.
+#[inline]
+fn next_pow2_half(n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let mut s = 1usize;
+    while s * 2 < n {
+        s *= 2;
+    }
+    s
 }
 
 /// Validate the eig operand geometry (ASVS V5 / T-03-04-01). `a` must be a

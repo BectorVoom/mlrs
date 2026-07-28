@@ -146,7 +146,10 @@ impl super::kdtree::Bounded for KSmallest {
         KSmallest::worst(self)
     }
     #[inline]
-    fn offer(&mut self, d: f64) {
+    fn offer(&mut self, d: f64, _idx: u32) {
+        // Core distances are a pure distance quantity — the neighbour identity
+        // the traversal now reports is UMAP's `host_knn` requirement, not this
+        // one's.
         self.push(d);
     }
 }

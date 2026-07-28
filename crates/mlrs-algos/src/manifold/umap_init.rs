@@ -239,6 +239,18 @@ fn residual_and_grad(x: f64, y: f64, a: f64, b: f64) -> (f64, f64, f64) {
 /// `diffusion_recover = false`; the spectral-family callers keep
 /// `diffusion_recover = true` and stay bit-identical. The value-gate still
 /// compares up-to-sign per column (eigenvectors are sign-arbitrary).
+/// Does [`spectral_init`] at this `n` actually run the eigen path, or does it
+/// take the random-init fallback?
+///
+/// Exposed so a caller can skip BUILDING the dense `n × n` affinity that
+/// [`spectral_init`] would then never look at — that matrix is 800 MB at
+/// `n = 10_000`, and the fallback ignores it entirely. `umap::run_umap_layout`
+/// is the caller; `umap_test::spectral_init_falls_back_above_cap` pins the
+/// skipped path to the same coordinates the full call would return.
+pub fn spectral_init_applicable(n: usize) -> bool {
+    n <= MAX_DIM
+}
+
 pub fn spectral_init<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     g_affinity: &DeviceArray<ActiveRuntime, F>,

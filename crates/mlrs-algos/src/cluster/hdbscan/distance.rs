@@ -27,7 +27,7 @@ use super::Metric;
 /// to [`host_pairwise`]. Re-associating the sum into per-block partials would
 /// vectorize better but would also move an MST edge on a tie — the single thing
 /// the `tie_break_exact` gate exists to catch.
-pub(super) const SCREEN_BLOCK: usize = 8;
+pub(crate) const SCREEN_BLOCK: usize = 8;
 
 /// Σ(Δ²) — the pre-`sqrt` Euclidean aggregate — returning `+inf` as soon as a
 /// block boundary finds the running sum at or past `bound`.
@@ -36,7 +36,7 @@ pub(super) const SCREEN_BLOCK: usize = 8;
 /// widened by a few epsilons, since `sqrt` is not exact at the boundary), so a
 /// bail-out means the true distance cannot matter to it.
 #[inline]
-pub(super) fn sq_euclidean_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
+pub(crate) fn sq_euclidean_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
     let n = a.len();
     let mut s = 0.0f64;
     let mut k = 0usize;
@@ -57,7 +57,7 @@ pub(super) fn sq_euclidean_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
 /// Σ|Δ| (Manhattan) with the same block screening. `fin` is the identity here,
 /// so the bound needs no epsilon widening.
 #[inline]
-pub(super) fn manhattan_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
+pub(crate) fn manhattan_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
     let n = a.len();
     let mut s = 0.0f64;
     let mut k = 0usize;
@@ -76,7 +76,7 @@ pub(super) fn manhattan_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
 
 /// max|Δ| (Chebyshev) with the same block screening.
 #[inline]
-pub(super) fn chebyshev_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
+pub(crate) fn chebyshev_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
     let n = a.len();
     let mut m = 0.0f64;
     let mut k = 0usize;
@@ -99,7 +99,7 @@ pub(super) fn chebyshev_screened(a: &[f64], b: &[f64], bound: f64) -> f64 {
 /// Σ|Δ|^`pp` (Minkowski) with the same block screening. `powf` dominates the
 /// inner loop, so the screen pays for itself here at any `p`.
 #[inline]
-pub(super) fn minkowski_screened(a: &[f64], b: &[f64], bound: f64, pp: f64) -> f64 {
+pub(crate) fn minkowski_screened(a: &[f64], b: &[f64], bound: f64, pp: f64) -> f64 {
     let n = a.len();
     let mut s = 0.0f64;
     let mut k = 0usize;

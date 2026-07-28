@@ -52,7 +52,7 @@ use std::mem::size_of;
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use mlrs_kernels::{degree_guard, laplacian_map, zero_diag_copy};
 
 use crate::device_array::DeviceArray;
@@ -106,6 +106,28 @@ where
     let nn = n * n;
     let elem = size_of::<F>();
     let client = pool.client().clone();
+
+    // --- cpu arm (EIG-PERF-CPU). --------------------------------------------
+    // The device path is three launches around a `row_reduce(Shared)`, which
+    // means ~6 device buffer allocations + read-backs for a matrix that is at
+    // most 64×64 here (the eig cap). On `cubecl-cpu` those allocations dominate
+    // — a stack sample of a stalled `Umap::fit` at n = 60 sat in
+    // `ComputeClient::create` backing off inside `row_reduce`, the same
+    // pathology recorded for `row_reduce(Shared)` elsewhere. All three steps are
+    // trivially expressible on the host, so on cpu they run there and the prim
+    // returns the same two device-resident outputs.
+    //
+    // `MLRS_LAPLACIAN_HOST=0` forces the device path back on for on-target A/B.
+    if host_laplacian_applicable() {
+        let a_host: Vec<f64> = a.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        let (l_host, dd_host) = host_laplacian(&a_host, n);
+        let l_f: Vec<F> = l_host.iter().map(|&v| f64_to_host::<F>(v)).collect();
+        let dd_f: Vec<F> = dd_host.iter().map(|&v| f64_to_host::<F>(v)).collect();
+        return Ok((
+            DeviceArray::from_host(pool, &l_f),
+            DeviceArray::from_host(pool, &dd_f),
+        ));
+    }
 
     // --- Step 1: zero the diagonal of A into a fresh working buffer `m`
     //     (scipy `np.fill_diagonal(m, 0)` BEFORE the degree — RESEARCH "Affinity
@@ -169,6 +191,70 @@ where
     w.release_into(pool);
 
     Ok((l, dd))
+}
+
+/// Should the normalized Laplacian be built on the host?
+///
+/// True on `cpu` only — on a GPU backend the three per-element launches are real
+/// parallel work and this host loop would be a regression. A perf path is gated
+/// on the target it was MEASURED on, never extrapolated.
+fn host_laplacian_applicable() -> bool {
+    crate::capability::active_backend_name() == "cpu"
+        && crate::abflag::var("MLRS_LAPLACIAN_HOST")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+}
+
+/// Host twin of the `zero_diag_copy` → `row_reduce(Sum)` → `degree_guard` →
+/// `laplacian_map` chain. Returns `(L, dd)` as row-major host `f64`.
+///
+/// Same definition, statement for statement:
+/// ```text
+/// m    = A with its diagonal zeroed        (scipy `np.fill_diagonal(m, 0)`)
+/// w[i] = Σ_j m[i][j]                       (the degree)
+/// dd[i]= if w[i] == 0 { 1 } else { sqrt(w[i]) }   (typed-zero guard, no inf)
+/// L[i][j] = -m[i][j] / (dd[i]·dd[j])       for i != j
+/// L[i][i] = if w[i] == 0 { 0 } else { 1 }  (= 1 − isolated)
+/// ```
+///
+/// One deliberate difference from the device path: the degree is summed
+/// left-to-right here, where `row_reduce(Shared)` sums it with a log tree. Both
+/// are the same mathematical row-sum but they round differently in the last ULP,
+/// so `L` can differ by an ULP from the device arm's — unlike the `eig` host arm
+/// (`prims/eig.rs`), which reproduces its kernel's operation order exactly and is
+/// bit-identical. That is well inside the ≤1e-5 spectral oracle gates, and the
+/// downstream eigenvectors are sign- and scale-normalized regardless.
+fn host_laplacian(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut w = vec![0.0f64; n];
+    for i in 0..n {
+        let mut s = 0.0f64;
+        for j in 0..n {
+            if j != i {
+                s += a[i * n + j]; // the zeroed diagonal, without materializing `m`
+            }
+        }
+        w[i] = s;
+    }
+    let dd: Vec<f64> = w
+        .iter()
+        .map(|&d| if d == 0.0 { 1.0 } else { d.sqrt() })
+        .collect();
+
+    let mut l = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            l[i * n + j] = if i == j {
+                if w[i] == 0.0 {
+                    0.0
+                } else {
+                    1.0
+                }
+            } else {
+                -a[i * n + j] / (dd[i] * dd[j])
+            };
+        }
+    }
+    (l, dd)
 }
 
 /// Standard ceiling-division 1D launch config for the per-element passes (the

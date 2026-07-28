@@ -35,6 +35,7 @@
 use std::path::PathBuf;
 
 use mlrs_algos::manifold::umap::{Metric, Umap};
+use mlrs_algos::manifold::umap_init;
 use mlrs_algos::error::{AlgoError, BuildError};
 use mlrs_algos::typestate::{Fit, Transform};
 use mlrs_backend::capability;
@@ -1240,5 +1241,170 @@ fn per_pair_sample_count_matches_schedule() {
              expected ~{expected_pair} (once per direction per due-epoch); the \
              former move_other=1 schedule would inflate this"
         );
+    }
+}
+
+// ===========================================================================
+// UMAP-PERF-CPU: the skipped-work invariants the fit path now relies on
+// ===========================================================================
+
+/// `run_umap_layout` no longer BUILDS the dense `n × n` affinity above the
+/// dense-eig cap: `spectral_init` would take umap-learn's random-init fallback
+/// there without ever reading it, and that matrix is 800 MB at `n = 10_000`.
+/// Skipping it is only sound if the fallback really is `random_init` with the
+/// SAME seed, which this pins — `spectral_init` above the cap must return
+/// exactly what the fit path substitutes for it.
+///
+/// Uses an all-zeros affinity precisely because the real one is irrelevant on
+/// this branch: if the cap check ever regressed to actually decomposing the
+/// matrix, this would stop matching `random_init` immediately.
+#[test]
+fn spectral_init_falls_back_above_cap() {
+    if gate_f64("spectral_init_falls_back_above_cap") {
+        return;
+    }
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let n = 65usize; // one past the MAX_DIM = 64 dense-eig cap
+    let n_components = 2usize;
+    let seed = 1234u64;
+    assert!(
+        !umap_init::spectral_init_applicable(n),
+        "n = {n} must be above the dense-eig cap for this test to exercise the fallback"
+    );
+
+    let affinity = vec![0.0f64; n * n];
+    let aff_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &affinity);
+    let via_spectral =
+        umap_init::spectral_init::<f64>(&mut pool, &aff_dev, n, n_components, seed)
+            .expect("spectral_init takes the fallback rather than erroring above the cap");
+    aff_dev.release_into(&mut pool);
+
+    let via_fallback = umap_init::random_init::<f64>(n, n_components, seed);
+
+    assert_eq!(via_spectral.len(), via_fallback.len(), "same coordinate count");
+    for i in 0..via_spectral.len() {
+        assert_eq!(
+            via_spectral[i].to_bits(),
+            via_fallback[i].to_bits(),
+            "elem {i}: above the cap spectral_init MUST be exactly random_init(seed), \
+             which is what run_umap_layout substitutes to avoid building the n×n affinity"
+        );
+    }
+}
+
+/// The cap predicate itself agrees with the `eig` `MAX_DIM` the fit path assumes:
+/// applicable at and below 64, not above.
+#[test]
+fn spectral_init_applicable_matches_eig_cap() {
+    assert!(umap_init::spectral_init_applicable(1));
+    assert!(umap_init::spectral_init_applicable(64));
+    assert!(!umap_init::spectral_init_applicable(65));
+}
+
+/// The epoch snapshot's load-bearing property: the host layout driver's result
+/// does NOT depend on how many workers ran it.
+///
+/// `drive` splits an epoch's owners across threads, which would normally put the
+/// D-05 same-seed reproducibility contract at the mercy of the scheduler. It does
+/// not, because every worker reads foreign coordinates from a snapshot taken at
+/// the epoch boundary and writes only rows it exclusively owns — so no worker can
+/// observe another's in-flight write and the split cannot change a value. This
+/// asserts that directly, at worker counts that produce genuinely different
+/// splits (1 = the serial path, then several parallel ones), rather than trusting
+/// the argument.
+///
+/// A regression here — someone reading `emb` where the code should read
+/// `snapshot` — makes the fit silently scheduler-dependent, which
+/// `reproducible_f64` alone would NOT catch: two same-seed fits on an idle
+/// machine usually interleave the same way.
+#[test]
+fn host_layout_is_thread_count_independent() {
+    use mlrs_algos::manifold::umap_host_layout::{drive, LayoutParams, OwnerIndex};
+
+    if !mlrs_algos::manifold::umap_host_layout::host_layout_applicable() {
+        println!("host_layout_is_thread_count_independent: SKIPPED (device layout backend)");
+        return;
+    }
+
+    // A symmetric ring-plus-chord graph over `n` vertices: every owner has
+    // edges, the weights vary (so the per-edge sampling schedules differ), and
+    // `n` is large enough that the worker counts below really do split it.
+    let n = 600usize;
+    let dim = 2usize;
+    let (mut head, mut tail, mut weights) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..n {
+        for step in [1usize, 7, 53] {
+            let j = (i + step) % n;
+            head.push(i);
+            tail.push(j);
+            weights.push(0.05 + 0.95 * ((i * 31 + step * 17) % 100) as f64 / 100.0);
+            // Symmetric: the fuzzy graph carries both directions, and the
+            // owner-only update relies on that to cover both endpoints.
+            head.push(j);
+            tail.push(i);
+            weights.push(0.05 + 0.95 * ((i * 31 + step * 17) % 100) as f64 / 100.0);
+        }
+    }
+    let n_epochs = 60usize;
+    let w_max = weights.iter().cloned().fold(0.0f64, f64::max);
+    let eps: Vec<f64> = weights
+        .iter()
+        .map(|&w| {
+            let s = n_epochs as f64 * (w / w_max);
+            if s > 0.0 {
+                n_epochs as f64 / s
+            } else {
+                -1.0
+            }
+        })
+        .collect();
+
+    let owners = OwnerIndex::build(&head, &tail, &eps, n);
+    let init: Vec<f64> = (0..n * dim)
+        .map(|i| ((i * 37 % 101) as f64 - 50.0) / 5.0)
+        .collect();
+
+    let run = |units: usize| -> Vec<f64> {
+        let mut emb = init.clone();
+        let params = LayoutParams {
+            n_owners: n,
+            n_vertices: n,
+            dim,
+            a: 1.577,
+            b: 0.895,
+            gamma: 1.0,
+            initial_alpha: 1.0,
+            negative_sample_rate: 5,
+            n_epochs,
+            seed: 42,
+            substream_seed_mult: 0x9E37_79B9_7F4A_7C15,
+            substream_epoch_mult: 0x1000_0001,
+            units: Some(units),
+        };
+        drive::<f64>(&mut emb, &owners, &params);
+        emb
+    };
+
+    let serial = run(1);
+    // Sanity: the layout actually MOVED the points, so a bug that returns the
+    // init unchanged cannot pass this test vacuously.
+    assert!(
+        serial.iter().zip(init.iter()).any(|(a, b)| a != b),
+        "the layout must move the initial coordinates for this test to mean anything"
+    );
+
+    for units in [2usize, 3, 5, 16] {
+        let parallel = run(units);
+        assert_eq!(serial.len(), parallel.len(), "{units} workers: same length");
+        for i in 0..serial.len() {
+            assert_eq!(
+                serial[i].to_bits(),
+                parallel[i].to_bits(),
+                "elem {i}: {units} workers must produce BIT-IDENTICAL coordinates to 1 worker \
+                 — the epoch snapshot is what guarantees this (D-05)"
+            );
+        }
     }
 }

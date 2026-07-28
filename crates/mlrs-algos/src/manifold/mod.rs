@@ -25,6 +25,8 @@ pub mod umap;
 // `pub` so the Plan-02 value-gate in `tests/umap_test.rs` can reach the host
 // stage fns directly (the plan key_link `umap_test.rs → umap_internals::*`):
 // an integration test is an external crate and cannot see `pub(crate)` items.
+pub mod umap_host_knn;
+pub mod umap_host_layout;
 pub mod umap_init;
 pub mod umap_internals;
 

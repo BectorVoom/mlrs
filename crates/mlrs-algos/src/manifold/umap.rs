@@ -41,7 +41,7 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use mlrs_kernels::{chebyshev_dist, manhattan_dist, minkowski_dist, umap_layout_step};
 
 use crate::error::{AlgoError, BuildError};
-use crate::manifold::{umap_init, umap_internals};
+use crate::manifold::{umap_host_knn, umap_host_layout, umap_init, umap_internals};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
 // ===========================================================================
@@ -728,14 +728,17 @@ where
     let eps = make_epochs_per_sample(&weights, n_epochs)?;
     let seed = cfg.random_state.unwrap_or(42);
 
-    transform_epoch_driver::<F>(
+    // Owners = ALL n + m vertices, but only the m new ones carry edges, so the
+    // frozen training rows get empty ranges and (with `move_other = 0`) are never
+    // written — the shared driver's `n_owners == n_vertices` frozen-subset shape.
+    run_epochs::<F>(
         pool,
         &mut combined,
         &head,
         &tail,
         &eps,
-        n,
-        m,
+        n + m,
+        n + m,
         n_components,
         a,
         b,
@@ -752,177 +755,6 @@ where
         .map(|&v| f64_to_host::<F>(v))
         .collect();
     Ok(new_coords)
-}
-
-/// Frozen-subset host epoch driver for `transform` (UMAP-04, D-03). Drives the
-/// SAME [`umap_layout_step`] kernel as the fit-path [`host_epoch_driver`] but with
-/// `move_other = 0` (the training coords are read-only GATHER targets) and only
-/// the `m` NEW vertices as owners. The owners occupy the contiguous rows
-/// `n..n+m` of `combined`, but `umap_layout_step` treats rows `0..n_owners` as the
-/// owners — so the CSR is keyed by the OWNER-LOCAL index `0..m` while the edge
-/// targets are GLOBAL vertex indices `< n + m`. To reuse the kernel's
-/// `embedding[owner_local]` write semantics with owners placed at the END, the
-/// driver passes a VIEW whose owner rows are the new points: it launches over the
-/// full `(n + m)` buffer with `n_owners = n + m` would move the train rows too —
-/// instead it builds the CSR so ONLY the `m` new owners have edges and launches
-/// with `n_owners = n + m`, `move_other = 0`; train owners (rows `0..n`) get empty
-/// CSR ranges and are never written. Negative samples are drawn over the whole
-/// combined vertex set `0..n_vertices` host-side per `(seed, epoch, edge)` (D-05)
-/// so the transform is byte-identical (matching umap-learn's `optimize_layout`,
-/// which samples negatives over the full `head_embedding` vertex count).
-#[allow(clippy::too_many_arguments)]
-fn transform_epoch_driver<F>(
-    pool: &mut BufferPool<ActiveRuntime>,
-    combined: &mut [f64],
-    head: &[usize],
-    tail: &[usize],
-    epochs_per_sample: &[f64],
-    n_train: usize,
-    m_new: usize,
-    dim: usize,
-    a: f64,
-    b: f64,
-    gamma: f64,
-    initial_alpha: f64,
-    negative_sample_rate: usize,
-    n_epochs: usize,
-    seed: u64,
-) where
-    F: Float + CubeElement + Pod,
-{
-    let n_vertices = n_train + m_new;
-    let n_edges = epochs_per_sample.len();
-    let mut next_sample: Vec<f64> = epochs_per_sample.to_vec();
-    let epochs_per_negative: Vec<f64> = epochs_per_sample
-        .iter()
-        .map(|&e| if e > 0.0 { e / negative_sample_rate as f64 } else { -1.0 })
-        .collect();
-    let mut next_negative: Vec<f64> = epochs_per_negative.clone();
-
-    let client = pool.client().clone();
-
-    for epoch in 0..n_epochs {
-        let alpha = initial_alpha * (1.0 - epoch as f64 / n_epochs as f64);
-
-        // Per-owner CSR over ALL n_vertices owners; only the m new owners (rows
-        // n_train..n_vertices) ever receive edges, so the train owners stay frozen
-        // (empty ranges) AND move_other = 0 prevents any train coordinate write.
-        let mut pos_per_owner: Vec<Vec<u32>> = vec![Vec::new(); n_vertices];
-        let mut neg_per_owner: Vec<Vec<u32>> = vec![Vec::new(); n_vertices];
-
-        for e in 0..n_edges {
-            let eps_e = epochs_per_sample[e];
-            if eps_e <= 0.0 {
-                continue;
-            }
-            if next_sample[e] > epoch as f64 {
-                continue;
-            }
-            let owner = head[e]; // GLOBAL owner index (a new vertex, ≥ n_train)
-            pos_per_owner[owner].push(tail[e] as u32);
-
-            let epn = epochs_per_negative[e];
-            let n_neg = if epn > 0.0 {
-                ((epoch as f64 - next_negative[e]) / epn).floor() as i64
-            } else {
-                0
-            };
-            if n_neg > 0 {
-                let sub_seed = seed
-                    .wrapping_mul(SUBSTREAM_SEED_MULT)
-                    .wrapping_add((epoch as u64).wrapping_mul(SUBSTREAM_EPOCH_MULT))
-                    .wrapping_add(e as u64);
-                let mut rng = SplitMix64::new(sub_seed);
-                for _ in 0..n_neg {
-                    // Negatives are drawn over the WHOLE combined vertex set
-                    // `0..n_vertices` (train ∪ new) — the new point is repelled from
-                    // random vertices of the combined embedding, matching umap-learn's
-                    // `optimize_layout` which samples `tail` over `n_vertices =
-                    // head_embedding.shape[0]`. (Restricting to train-only measurably
-                    // REGRESSED the structural gate for euclidean+cosine, so the
-                    // combined-set draw is the correct, calibrated behaviour.)
-                    let kk = rng.next_below(n_vertices as u64) as u32;
-                    neg_per_owner[owner].push(kk);
-                }
-                next_negative[e] += n_neg as f64 * epn;
-            }
-            next_sample[e] += eps_e;
-        }
-
-        // Flatten per-owner buckets into CSR offsets + tail/neg arrays over the
-        // full n_vertices owner set (train owners have empty ranges).
-        let mut pos_offsets: Vec<u32> = Vec::with_capacity(n_vertices + 1);
-        let mut pos_tail: Vec<u32> = Vec::new();
-        let mut neg_offsets: Vec<u32> = Vec::with_capacity(n_vertices + 1);
-        let mut neg_idx: Vec<u32> = Vec::new();
-        pos_offsets.push(0);
-        neg_offsets.push(0);
-        for o in 0..n_vertices {
-            pos_tail.extend_from_slice(&pos_per_owner[o]);
-            pos_offsets.push(pos_tail.len() as u32);
-            neg_idx.extend_from_slice(&neg_per_owner[o]);
-            neg_offsets.push(neg_idx.len() as u32);
-        }
-
-        if pos_tail.is_empty() && neg_idx.is_empty() {
-            continue;
-        }
-        if pos_tail.is_empty() {
-            pos_tail.push(0);
-        }
-        if neg_idx.is_empty() {
-            neg_idx.push(0);
-        }
-
-        let emb_f: Vec<F> = combined.iter().map(|&v| f64_to_host::<F>(v)).collect();
-        let emb_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &emb_f);
-        let pos_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_offsets);
-        let pos_tail_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_tail);
-        let neg_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_offsets);
-        let neg_idx_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_idx);
-
-        let count = CubeCount::Static(n_vertices as u32, 1, 1);
-        let cube_dim = CubeDim { x: 1, y: 1, z: 1 };
-        let emb_arg =
-            unsafe { ArrayArg::from_raw_parts(emb_dev.handle().clone(), n_vertices * dim) };
-        let pos_off_arg =
-            unsafe { ArrayArg::from_raw_parts(pos_off_dev.handle().clone(), pos_offsets.len()) };
-        let pos_tail_arg =
-            unsafe { ArrayArg::from_raw_parts(pos_tail_dev.handle().clone(), pos_tail.len()) };
-        let neg_off_arg =
-            unsafe { ArrayArg::from_raw_parts(neg_off_dev.handle().clone(), neg_offsets.len()) };
-        let neg_idx_arg =
-            unsafe { ArrayArg::from_raw_parts(neg_idx_dev.handle().clone(), neg_idx.len()) };
-
-        umap_layout_step::launch::<F, ActiveRuntime>(
-            &client,
-            count,
-            cube_dim,
-            emb_arg,
-            pos_off_arg,
-            pos_tail_arg,
-            neg_off_arg,
-            neg_idx_arg,
-            f64_to_host::<F>(a),
-            f64_to_host::<F>(b),
-            f64_to_host::<F>(gamma),
-            f64_to_host::<F>(alpha),
-            dim as u32,
-            n_vertices as u32, // n_owners = all vertices; train owners have empty CSR
-            n_vertices as u32, // n_vertices bound for the GATHER index check
-            0u32,              // move_other = 0 (frozen-subset transform path, D-03)
-        );
-
-        let updated: Vec<f64> =
-            emb_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        combined.copy_from_slice(&updated);
-
-        emb_dev.release_into(pool);
-        pos_off_dev.release_into(pool);
-        pos_tail_dev.release_into(pool);
-        neg_off_dev.release_into(pool);
-        neg_idx_dev.release_into(pool);
-    }
 }
 
 // ===========================================================================
@@ -1161,20 +993,29 @@ where
     let p = minkowski_p(knn_metric);
     // umap clamps n_neighbors to n-1 (can't have more neighbours than points-1).
     let k = cfg.n_neighbors.min(n.saturating_sub(1)).max(1);
-    let (knn_idx_dev, knn_dist_dev) =
-        knn_graph::<F>(pool, x, (n, d), k, knn_metric, false, p)?;
-    let knn_idx_host: Vec<f64> = knn_idx_dev
-        .to_host(pool)
-        .iter()
-        .map(|&v| v as f64)
-        .collect();
-    let knn_dist_host: Vec<f64> = knn_dist_dev
-        .to_host(pool)
-        .iter()
-        .map(|&v| host_to_f64(v))
-        .collect();
-    knn_idx_dev.release_into(pool);
-    knn_dist_dev.release_into(pool);
+    // On the cpu backend the device prim's query-axis tiling costs four orders of
+    // magnitude for no benefit (see `umap_host_knn`), so the same graph is built
+    // by a direct host scan there. Every other backend keeps the prim.
+    let (knn_idx_host, knn_dist_host) = if umap_host_knn::host_knn_applicable() {
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        umap_host_knn::host_knn(&x_host, n, d, k, cfg.metric)
+    } else {
+        let (knn_idx_dev, knn_dist_dev) =
+            knn_graph::<F>(pool, x, (n, d), k, knn_metric, false, p)?;
+        let idx: Vec<f64> = knn_idx_dev
+            .to_host(pool)
+            .iter()
+            .map(|&v| v as f64)
+            .collect();
+        let dist: Vec<f64> = knn_dist_dev
+            .to_host(pool)
+            .iter()
+            .map(|&v| host_to_f64(v))
+            .collect();
+        knn_idx_dev.release_into(pool);
+        knn_dist_dev.release_into(pool);
+        (idx, dist)
+    };
 
     // --- (2) smooth-kNN ρ/σ → membership → t-conorm union (host f64). ---
     let (sigmas, rhos) = umap_internals::smooth_knn_dist(
@@ -1205,17 +1046,14 @@ where
     let seed = cfg.random_state.unwrap_or(42);
     let mut init: Vec<f64> = match cfg.init {
         Init::Spectral => {
-            // Build the dense n×n symmetric affinity from the fuzzy COO and drive
-            // the shared spectral_init (reuses laplacian → eig → recover). It
-            // internally falls back to random_init for n > MAX_DIM (umap's own
-            // behaviour) — no error.
-            let mut affinity = vec![0.0f64; n * n];
+            // Bounds check at the COO-consumption boundary (WR-01): the
+            // Phase-13 prim guarantees `cols < n`, but that is an unchecked
+            // cross-module invariant carried across a host round-trip. A
+            // regression (or a NaN float-encoded index) would otherwise be a
+            // silent OOB write; surface it as a typed error instead. Run this
+            // for EVERY n, including the sizes that never build the dense
+            // matrix below, so the validation is not silently size-dependent.
             for e in 0..g_vals.len() {
-                // Bounds check at the COO-consumption boundary (WR-01): the
-                // Phase-13 prim guarantees `cols < n`, but that is an unchecked
-                // cross-module invariant carried across a host round-trip. A
-                // regression (or a NaN float-encoded index) would otherwise be a
-                // silent OOB write; surface it as a typed error instead.
                 if g_rows[e] >= n || g_cols[e] >= n {
                     return Err(AlgoError::InvalidGraphInput {
                         estimator: "umap",
@@ -1225,13 +1063,30 @@ where
                         ),
                     });
                 }
-                affinity[g_rows[e] * n + g_cols[e]] = g_vals[e];
             }
-            let aff_f: Vec<F> = affinity.iter().map(|&v| f64_to_host::<F>(v)).collect();
-            let aff_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &aff_f);
-            let coords = umap_init::spectral_init::<F>(pool, &aff_dev, n, n_components, seed)?;
-            aff_dev.release_into(pool);
-            coords.iter().map(|&v| host_to_f64(v)).collect()
+            if umap_init::spectral_init_applicable(n) {
+                // Build the dense n×n symmetric affinity from the fuzzy COO and
+                // drive the shared spectral_init (laplacian → eig → recover).
+                let mut affinity = vec![0.0f64; n * n];
+                for e in 0..g_vals.len() {
+                    affinity[g_rows[e] * n + g_cols[e]] = g_vals[e];
+                }
+                let aff_f: Vec<F> = affinity.iter().map(|&v| f64_to_host::<F>(v)).collect();
+                let aff_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &aff_f);
+                let coords = umap_init::spectral_init::<F>(pool, &aff_dev, n, n_components, seed)?;
+                aff_dev.release_into(pool);
+                coords.iter().map(|&v| host_to_f64(v)).collect()
+            } else {
+                // Above the dense-eig cap `spectral_init` takes umap-learn's
+                // random-init fallback and never LOOKS at the affinity — so the
+                // `n × n` matrix (800 MB at n = 10_000) is not built at all. The
+                // fallback is reproduced here rather than reached through
+                // `spectral_init` precisely so that allocation is skipped; the
+                // `spectral_init_falls_back_above_cap` test pins the two paths to
+                // the same coordinates.
+                let coords = umap_init::random_init::<F>(n, n_components, seed);
+                coords.iter().map(|&v| host_to_f64(v)).collect()
+            }
         }
         Init::Random => {
             let coords = umap_init::random_init::<F>(n, n_components, seed);
@@ -1251,12 +1106,13 @@ where
     //     umap_layout_step over owners = all n, OWNER-ONLY (move_other = 0,
     //     via FIT_MOVE_OTHER): the symmetric COO covers both endpoints of each
     //     undirected pair (once per direction) with no foreign-vertex write. ---
-    host_epoch_driver::<F>(
+    run_epochs::<F>(
         pool,
         &mut init,
         &g_rows,
         &g_cols,
         &eps,
+        n,
         n,
         n_components,
         a,
@@ -1307,14 +1163,96 @@ pub fn fit_move_other() -> u32 {
 /// All negative-sample indices are drawn host-side with `SplitMix64::next_below`
 /// keyed as a pure function of `(seed, epoch, edge)` (D-05, unbiased — NEVER
 /// `% n`), packed into a per-epoch `neg_idx` device buffer the kernel GATHERs.
+/// Epoch-driver dispatch: the host driver on the cpu backend, the device
+/// `umap_layout_step` kernel everywhere else.
+///
+/// The two produce the same coordinates — [`umap_host_layout::drive`] replays
+/// the kernel statement for statement in the same owner order — but on
+/// `cubecl-cpu` the device path pays a single-threaded `-O0` launch plus a full
+/// embedding upload/read-back PER EPOCH, which measured 0.17 s/epoch at n=500
+/// (see that module). `MLRS_UMAP_HOST_LAYOUT=0` forces the device arm back on
+/// for on-target A/B.
+///
+/// `n_owners` is the count of contiguous OWNER rows at the front of `embedding`
+/// and `n_vertices` its total row count; `fit` passes `n_owners == n_vertices ==
+/// n`, `transform` passes `n + m` for both (the frozen training owners simply
+/// have no edges, and `move_other = 0` keeps them unwritten).
 #[allow(clippy::too_many_arguments)]
-fn host_epoch_driver<F>(
+fn run_epochs<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    embedding: &mut [f64],
+    head: &[usize],
+    tail: &[usize],
+    epochs_per_sample: &[f64],
+    n_owners: usize,
+    n_vertices: usize,
+    dim: usize,
+    a: f64,
+    b: f64,
+    gamma: f64,
+    initial_alpha: f64,
+    negative_sample_rate: usize,
+    n_epochs: usize,
+    seed: u64,
+) where
+    F: Float + CubeElement + Pod,
+{
+    if umap_host_layout::host_layout_applicable() {
+        let owners =
+            umap_host_layout::OwnerIndex::build(head, tail, epochs_per_sample, n_owners);
+        let params = umap_host_layout::LayoutParams {
+            n_owners,
+            n_vertices,
+            dim,
+            a,
+            b,
+            gamma,
+            initial_alpha,
+            negative_sample_rate,
+            n_epochs,
+            seed,
+            substream_seed_mult: SUBSTREAM_SEED_MULT,
+            substream_epoch_mult: SUBSTREAM_EPOCH_MULT,
+            units: None,
+        };
+        // Arithmetic precision follows the estimator's float type, so the f32
+        // estimator lays out in f32 exactly as the device kernel would (and as
+        // umap-learn does) rather than through an f64 intermediate.
+        if std::mem::size_of::<F>() == 4 {
+            umap_host_layout::drive::<f32>(embedding, &owners, &params);
+        } else {
+            umap_host_layout::drive::<f64>(embedding, &owners, &params);
+        }
+        return;
+    }
+    device_epoch_driver::<F>(
+        pool,
+        embedding,
+        head,
+        tail,
+        epochs_per_sample,
+        n_owners,
+        n_vertices,
+        dim,
+        a,
+        b,
+        gamma,
+        initial_alpha,
+        negative_sample_rate,
+        n_epochs,
+        seed,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn device_epoch_driver<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     embedding: &mut [f64],
     head: &[usize],
     tail: &[usize],
     epochs_per_sample: &[f64],
     n: usize,
+    n_vertices: usize,
     dim: usize,
     a: f64,
     b: f64,
@@ -1372,7 +1310,7 @@ fn host_epoch_driver<F>(
                     .wrapping_add(e as u64);
                 let mut rng = SplitMix64::new(sub_seed);
                 for _ in 0..n_neg {
-                    let k = rng.next_below(n as u64) as u32;
+                    let k = rng.next_below(n_vertices as u64) as u32;
                     neg_per_owner[owner].push(k);
                 }
                 next_negative[e] += n_neg as f64 * epn;
@@ -1419,7 +1357,8 @@ fn host_epoch_driver<F>(
 
         let count = CubeCount::Static(n as u32, 1, 1);
         let cube_dim = CubeDim { x: 1, y: 1, z: 1 };
-        let emb_arg = unsafe { ArrayArg::from_raw_parts(emb_dev.handle().clone(), n * dim) };
+        let emb_arg =
+            unsafe { ArrayArg::from_raw_parts(emb_dev.handle().clone(), n_vertices * dim) };
         let pos_off_arg =
             unsafe { ArrayArg::from_raw_parts(pos_off_dev.handle().clone(), pos_offsets.len()) };
         let pos_tail_arg =
@@ -1443,8 +1382,8 @@ fn host_epoch_driver<F>(
             f64_to_host::<F>(gamma),
             f64_to_host::<F>(alpha),
             dim as u32,
-            n as u32,
-            n as u32,
+            n as u32,         // n_owners
+            n_vertices as u32, // GATHER index bound
             // Fit path is now OWNER-ONLY over the already-symmetric COO. Each
             // undirected pair is covered by BOTH its (r,c) and (c,r) owner-edges
             // with NO foreign-vertex write, so: (a) no owner-cube writes another

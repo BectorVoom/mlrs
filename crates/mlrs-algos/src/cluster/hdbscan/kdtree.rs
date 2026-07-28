@@ -64,7 +64,7 @@ struct Node {
 const NONE: u32 = u32::MAX;
 
 /// A static, median-split KD-tree over the rows of a row-major `n×p` matrix.
-pub(super) struct KdTree {
+pub(crate) struct KdTree {
     /// Row indices, permuted so every node owns a contiguous range.
     perm: Vec<u32>,
     nodes: Vec<Node>,
@@ -82,7 +82,7 @@ impl KdTree {
     /// (`select_nth_unstable_by` — a partition, not a sort), so the tree is
     /// balanced at depth `log2(n / LEAF_SIZE)` regardless of how the data is
     /// ordered on input.
-    pub(super) fn build(x: &[f64], n: usize, p: usize) -> Self {
+    pub(crate) fn build(x: &[f64], n: usize, p: usize) -> Self {
         debug_assert_eq!(x.len(), n * p, "x must be a dense n×p matrix");
         let mut tree = Self {
             perm: (0..n as u32).collect(),
@@ -200,7 +200,7 @@ impl KdTree {
 /// early), `fin` turns an aggregate into a distance, `pre` maps a distance
 /// threshold back into the aggregate domain, and `axis_agg` folds one box offset
 /// into a box bound — the SAME aggregation `acc` performs, one axis at a time.
-pub(super) struct MetricOps<A, Fin, Pre, Ax> {
+pub(crate) struct MetricOps<A, Fin, Pre, Ax> {
     pub acc: A,
     pub fin: Fin,
     pub pre: Pre,
@@ -210,11 +210,16 @@ pub(super) struct MetricOps<A, Fin, Pre, Ax> {
 /// The bounded "`k` smallest so far" list the caller maintains per query. Mirrors
 /// `host_core::KSmallest`; kept behind this trait-free shape so the two modules
 /// share the traversal without exposing either's internals.
-pub(super) trait Bounded {
+pub(crate) trait Bounded {
     /// The current `k`-th smallest distance, or `+inf` while still filling.
     fn worst(&self) -> f64;
-    /// Offer a candidate distance.
-    fn offer(&mut self, d: f64);
+    /// Offer a candidate distance, tagged with the row index it came from.
+    ///
+    /// The index lets a caller that needs the NEIGHBOUR IDENTITIES (UMAP's
+    /// `host_knn`, which returns `(index, distance)` lists) reuse this traversal,
+    /// and lets a caller drop the query itself. Implementations that only need
+    /// the distances ignore it.
+    fn offer(&mut self, d: f64, idx: u32);
 }
 
 /// Answer one query: fold every point whose distance can still enter the `k`
@@ -226,7 +231,7 @@ pub(super) trait Bounded {
 /// `best`, so the pruning strengthens as the descent proceeds.
 /// Returns how many POINTS the traversal actually evaluated — the quantity the
 /// caller's route calibration keys on (see [`brute_is_cheaper`]).
-pub(super) fn query<A, Fin, Pre, Ax, B>(
+pub(crate) fn query<A, Fin, Pre, Ax, B>(
     tree: &KdTree,
     x: &[f64],
     q: &[f64],
@@ -282,7 +287,7 @@ fn descend<A, Fin, Pre, Ax, B>(
             if a.is_finite() {
                 let d = (ops.fin)(a);
                 if d < w {
-                    best.offer(d);
+                    best.offer(d, r);
                 }
             }
         }
@@ -321,7 +326,7 @@ fn descend<A, Fin, Pre, Ax, B>(
 ///
 /// `MLRS_HDBSCAN_CORE_KD=0` forces the brute scan, `=1` forces the tree (skipping
 /// the calibration too), for on-target A/B.
-pub(super) fn kd_applicable(n: usize, _p: usize) -> bool {
+pub(crate) fn kd_applicable(n: usize, _p: usize) -> bool {
     match mlrs_backend::abflag::var("MLRS_HDBSCAN_CORE_KD").as_deref() {
         Some("0") => return false,
         Some("1") => return true,
@@ -331,7 +336,7 @@ pub(super) fn kd_applicable(n: usize, _p: usize) -> bool {
 }
 
 /// Was the route FORCED on, so the calibration should not second-guess it?
-pub(super) fn kd_forced() -> bool {
+pub(crate) fn kd_forced() -> bool {
     mlrs_backend::abflag::var("MLRS_HDBSCAN_CORE_KD").as_deref() == Some("1")
 }
 
@@ -374,7 +379,7 @@ const KD_MIN_ROWS: usize = 512;
 /// both cases, it needs no per-machine tuning, and it is DETERMINISTIC — unlike a
 /// sampled wall-clock A/B, which would have to distinguish these two regimes
 /// through timing noise.
-pub(super) fn brute_is_cheaper(visited: usize, rows: usize, n: usize) -> bool {
+pub(crate) fn brute_is_cheaper(visited: usize, rows: usize, n: usize) -> bool {
     if rows == 0 || n == 0 {
         return false;
     }
@@ -419,12 +424,12 @@ const BRUTE_RATIO: f64 = 0.5;
 /// What the calibration IS worth is the difference from forcing the tree on: on
 /// that same uniform data the forced tree runs 0.51-0.61× the brute speed (up to
 /// ~2× SLOWER), and the calibration turns that into a ≤3% overhead.
-pub(super) const CALIB_ROWS: usize = 4;
+pub(crate) const CALIB_ROWS: usize = 4;
 
 /// Build the tree over all `n` rows.
 ///
 /// Exposed for [`super::host_core`], which owns the metric monomorphization and
 /// the row-parallel split.
-pub(super) fn build_tree(x: &[f64], n: usize, p: usize) -> KdTree {
+pub(crate) fn build_tree(x: &[f64], n: usize, p: usize) -> KdTree {
     KdTree::build(x, n, p)
 }

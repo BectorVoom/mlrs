@@ -52,10 +52,10 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
 // consumes.
 pub mod centers;
 pub mod condense;
-mod distance;
+pub(crate) mod distance;
 pub mod glosh;
 pub mod host_core;
-mod kdtree;
+pub(crate) mod kdtree;
 pub mod mst;
 pub mod select;
 pub mod single_linkage;
