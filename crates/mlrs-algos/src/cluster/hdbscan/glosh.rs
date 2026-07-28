@@ -148,13 +148,20 @@ fn core_distances_hdbscan(dist: &[f64], n: usize, min_samples: usize) -> Vec<f64
     debug_assert_eq!(dist.len(), n * n, "dist must be a dense n×n matrix");
     // hdbscan caps min_points to n-1 BEFORE indexing (so index <= n-1).
     let mp = min_samples.min(n.saturating_sub(1));
-    let mut core = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut row: Vec<f64> = dist[i * n..(i + 1) * n].to_vec();
-        row.sort_by(|a, b| a.total_cmp(b));
-        // `mp` is in `0..=n-1`; index directly (np.partition(...)[mp]).
-        core.push(row[mp]);
-    }
+    let mut core = vec![0.0f64; n];
+    // `select_nth_unstable_by` IS `np.partition`: it puts the `mp`-th smallest at
+    // index `mp` in O(n) per row, where the full sort this replaces was
+    // O(n log n) for a single index. Row-parallel for the same reason the rest of
+    // the dense passes are (HDBS-PERF-CPU).
+    super::host_core::par_row_chunks(&mut core, 1, 64, |row0, out| {
+        let mut row: Vec<f64> = vec![0.0; n];
+        for (r, slot) in out.iter_mut().enumerate() {
+            row.copy_from_slice(&dist[(row0 + r) * n..(row0 + r + 1) * n]);
+            // `mp` is in `0..=n-1`; index directly (np.partition(...)[mp]).
+            let (_, nth, _) = row.select_nth_unstable_by(mp, |a, b| a.total_cmp(b));
+            *slot = *nth;
+        }
+    });
     core
 }
 

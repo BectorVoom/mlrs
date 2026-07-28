@@ -1464,3 +1464,338 @@ fn fit_predict_matches_fit_then_labels() {
         "fit_predict must return exactly the labels fit-then-labels() would (noise = -1)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// HDBS-PERF-CPU: equivalence gates for the three fast paths introduced by the
+// cpu fit-speed work. Each replaces a slower routine that is still present, so
+// each is gated by asserting the two agree EXACTLY — a perf path that changes a
+// label is not a perf path.
+// ---------------------------------------------------------------------------
+
+/// `host_core::core_distances_host` must return exactly what the device
+/// `knn_graph(include_self=true)` prim puts in column `k-1` — the value it
+/// replaces on the cpu backend.
+///
+/// Exact equality, not a tolerance: the core distance feeds the mutual
+/// reachability, which decides MST edges, which decide labels. A one-ULP
+/// difference here is a different clustering, not a rounding difference. The
+/// design is deliberately tie-heavy (a duplicated row and a lattice with equal
+/// spacings) so the bounded-insertion list's `< worst()` admission rule is
+/// exercised against the prim's own tie-break.
+#[test]
+fn core_distances_host_matches_device() {
+    use mlrs_algos::cluster::hdbscan::host_core;
+    use mlrs_backend::abflag;
+    use mlrs_backend::prims::knn_graph::{knn_graph, Metric as KnnMetric};
+
+    if skip_f64("core_distances_host_matches_device") {
+        return;
+    }
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let n = 40usize;
+    let d = 3usize;
+    let mut x: Vec<f64> = Vec::with_capacity(n * d);
+    for i in 0..n {
+        // A coarse integer lattice makes many pairwise distances EQUAL, and row
+        // 7 is duplicated exactly, so distance-0 ties are covered too.
+        let src = if i == 7 { 6 } else { i };
+        x.push((src % 4) as f64);
+        x.push(((src / 4) % 4) as f64);
+        x.push((src / 16) as f64 * 0.5);
+    }
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+
+    for (metric, knn_metric, mink_p) in [
+        (Metric::Euclidean, KnnMetric::Euclidean, 2.0),
+        (Metric::Manhattan, KnnMetric::Manhattan, 2.0),
+        (Metric::Chebyshev, KnnMetric::Chebyshev, 2.0),
+        (Metric::Minkowski { p: 3.0 }, KnnMetric::Minkowski { p: 3.0 }, 3.0),
+        // Cosine is NOT covered: it never reaches the host scan (the Variant-A
+        // path takes its core distances from `cosine_distance_matrix` instead),
+        // precisely BECAUSE `knn_graph`'s GEMM cosine `‖x̂ − ŷ‖²/2` and
+        // `1 − x̂·ŷ` disagree on a zero row.
+    ] {
+        for k in [1usize, 2, 5, 9] {
+            let (idx_dev, dist_dev) =
+                knn_graph::<f64>(&mut pool, &x_dev, (n, d), k, knn_metric, true, mink_p)
+                    .expect("knn_graph succeeds on the gate geometry");
+            let knn_dist: Vec<f64> = dist_dev.to_host(&pool);
+            idx_dev.release_into(&mut pool);
+            dist_dev.release_into(&mut pool);
+            let expected: Vec<f64> = (0..n).map(|i| knn_dist[i * k + (k - 1)]).collect();
+
+            // BOTH host routes must reproduce the device value: the brute scan and
+            // the KD-tree (HDBS-PRED-CPU). This geometry is below the tree's
+            // `KD_MIN_ROWS` default, so the tree is only reached by forcing it —
+            // without the forced arm the gate would silently stop covering the
+            // route that actually runs in production at `n >= 512`.
+            for (route, _guard) in [
+                ("brute", abflag::force("MLRS_HDBSCAN_CORE_KD", "0")),
+                ("kdtree", abflag::force("MLRS_HDBSCAN_CORE_KD", "1")),
+            ] {
+                let got = host_core::core_distances_host(&x, n, d, metric, k);
+                for i in 0..n {
+                    assert!(
+                        (got[i] - expected[i]).abs() <= 1e-12,
+                        "{route} core_distances_host disagrees with knn_graph at \
+                         metric={metric:?} k={k} row={i}: host={} device={}",
+                        got[i],
+                        expected[i],
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The specialized Variant-B Prim (`mst_from_data_matrix_metric`) must emit the
+/// IDENTICAL edge list — order, endpoints and weights — as the generic
+/// closure-driven `mst_from_data_matrix` it replaces, for every FAST metric and
+/// for both its serial and parallel bodies.
+///
+/// The specialized form adds a core-distance prune and a block-screened early
+/// exit; the parallel form additionally splits the scan across workers. All three
+/// claim to be the same computation, and the tie-break (first strict minimum in
+/// ascending `j`) is exactly what a bad split or an over-eager prune would break,
+/// so the geometry below is built to produce many equal reachabilities.
+#[test]
+fn mst_specialized_matches_generic() {
+    use mlrs_algos::cluster::hdbscan::{host_core, mst};
+    use mlrs_backend::abflag;
+
+    // `n` straddles `PAR_MIN_ROWS` so the parallel body is exercised too.
+    for n in [8usize, 64, 512, 1_500] {
+        let d = 4usize;
+        let mut x: Vec<f64> = Vec::with_capacity(n * d);
+        for i in 0..n {
+            // Integer lattice + a duplicate every 37 rows: dense ties.
+            let src = if i % 37 == 0 { i.saturating_sub(1) } else { i };
+            x.push((src % 7) as f64);
+            x.push(((src / 7) % 7) as f64);
+            x.push(((src / 49) % 7) as f64);
+            x.push((src % 3) as f64 * 0.5);
+        }
+        for metric in [
+            Metric::Euclidean,
+            Metric::Manhattan,
+            Metric::Chebyshev,
+            Metric::Minkowski { p: 3.0 },
+        ] {
+            for alpha in [1.0f64, 1.7] {
+                let k = 5usize.min(n);
+                let core = host_core::core_distances_host(&x, n, d, metric, k);
+                let expected = mst::mst_from_data_matrix(&core, n, alpha, |i, j| {
+                    host_pairwise_ref(&x, d, metric, i, j)
+                });
+
+                for (label, _guard) in [
+                    ("serial", abflag::force("MLRS_HDBSCAN_MST_PAR", "0")),
+                    ("parallel", abflag::clear("MLRS_HDBSCAN_MST_PAR")),
+                ] {
+                    let got =
+                        mst::mst_from_data_matrix_metric(&x, n, d, &core, alpha, metric);
+                    assert_eq!(
+                        got.len(),
+                        expected.len(),
+                        "{label} edge count differs at n={n} metric={metric:?} alpha={alpha}"
+                    );
+                    for (e, (g, w)) in got.iter().zip(expected.iter()).enumerate() {
+                        assert_eq!(
+                            (g.0, g.1),
+                            (w.0, w.1),
+                            "{label} edge {e} endpoints differ at n={n} metric={metric:?} \
+                             alpha={alpha}"
+                        );
+                        assert!(
+                            (g.2 - w.2).abs() <= 1e-12,
+                            "{label} edge {e} weight differs at n={n} metric={metric:?} \
+                             alpha={alpha}: {} vs {}",
+                            g.2,
+                            w.2
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The reference pairwise distance the generic Prim is driven with — a verbatim
+/// transcription of the in-crate `distance::host_pairwise` (which is private), so
+/// the equivalence gate above compares the specialized path against an
+/// INDEPENDENT implementation rather than against a helper it shares.
+fn host_pairwise_ref(x: &[f64], p: usize, metric: Metric, i: usize, j: usize) -> f64 {
+    let xi = &x[i * p..(i + 1) * p];
+    let xj = &x[j * p..(j + 1) * p];
+    match metric {
+        Metric::Euclidean => {
+            let mut s = 0.0f64;
+            for k in 0..p {
+                let diff = xi[k] - xj[k];
+                s += diff * diff;
+            }
+            s.sqrt()
+        }
+        Metric::Manhattan => {
+            let mut s = 0.0f64;
+            for k in 0..p {
+                s += (xi[k] - xj[k]).abs();
+            }
+            s
+        }
+        Metric::Chebyshev => {
+            let mut m = 0.0f64;
+            for k in 0..p {
+                let diff = (xi[k] - xj[k]).abs();
+                if diff > m {
+                    m = diff;
+                }
+            }
+            m
+        }
+        Metric::Minkowski { p: pp } => {
+            let mut s = 0.0f64;
+            for k in 0..p {
+                s += (xi[k] - xj[k]).abs().powf(pp);
+            }
+            s.powf(1.0 / pp)
+        }
+        _ => unreachable!("the Variant-B gate covers the FAST metrics only"),
+    }
+}
+
+/// The lazily-computed `outlier_scores_` must equal what the pre-HDBS-PERF-CPU
+/// eager pass produced: the GLOSH pipeline run over the alpha-scaled dense
+/// distance matrix rebuilt from the same input.
+///
+/// `outlier_scores_match_{f32,f64}` already gate the VALUE against the `hdbscan`
+/// 0.8.44 fixture. This gates the DEFERRAL itself — that moving the work out of
+/// `fit` did not change which matrix the tree is built from — and that a second
+/// read returns the memoized vector rather than recomputing something different.
+#[test]
+fn lazy_outlier_scores_match_eager_pipeline() {
+    use mlrs_algos::cluster::hdbscan::glosh;
+
+    if skip_f64("lazy_outlier_scores_match_eager_pipeline") {
+        return;
+    }
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let n = 60usize;
+    let d = 3usize;
+    let mcs = 4usize;
+    let alpha = 1.3f64;
+    let mut x: Vec<f64> = Vec::with_capacity(n * d);
+    for i in 0..n {
+        let blob = (i % 3) as f64 * 8.0;
+        x.push(blob + (i % 5) as f64 * 0.3);
+        x.push(blob + (i % 7) as f64 * 0.2);
+        x.push(blob - (i % 4) as f64 * 0.25);
+    }
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+
+    let fitted = Hdbscan::<f64>::builder()
+        .min_cluster_size(mcs)
+        // Pin `min_samples` explicitly: the builder's `Default` carries
+        // `Some(5)` from `Hdbscan::new()`, so `min_cluster_size` alone does NOT
+        // re-derive it, and the eager reference below must use the same value.
+        .min_samples(Some(mcs))
+        .alpha(alpha)
+        .metric(Metric::Euclidean)
+        .build::<f64>()
+        .expect("valid hyperparameters")
+        .fit(&mut pool, &x_dev, None, (n, d))
+        .expect("euclidean fit succeeds");
+
+    // The eager pipeline, reproduced: dense euclidean distances / alpha, then
+    // the hdbscan-convention GLOSH tree.
+    let mut dense = euclidean_distance_matrix(&x, n, d);
+    for v in dense.iter_mut() {
+        *v /= alpha;
+    }
+    let expected = glosh::hdbscan_outlier_scores(&dense, n, mcs, mcs);
+
+    let first = fitted
+        .outlier_scores(&pool)
+        .expect("a fitted estimator exposes outlier_scores_");
+    assert_eq!(first.len(), n, "outlier_scores_ must be one score per point");
+    for i in 0..n {
+        assert!(
+            (first[i] - expected[i]).abs() <= 1e-12,
+            "lazy outlier score {i} differs from the eager pipeline: {} vs {}",
+            first[i],
+            expected[i]
+        );
+    }
+
+    // Second read hits the memo; it must be the SAME vector, not a recompute
+    // that drifted.
+    let second = fitted
+        .outlier_scores(&pool)
+        .expect("memoized outlier_scores_ stays available");
+    assert_eq!(first, second, "the memoized outlier_scores_ must not change between reads");
+}
+
+/// The KD-tree core-distance route (HDBS-PRED-CPU) must return BIT-IDENTICAL core
+/// distances to the brute scan it replaces, for every Variant-B FAST metric.
+///
+/// The tree changes only WHICH pairs are evaluated; the `k`-th smallest of the
+/// evaluated multiset is the `k`-th smallest overall precisely because the box
+/// prune is conservative. A prune that is one ULP too eager hides a genuine
+/// neighbour, so the geometry below is a coarse integer lattice with duplicated
+/// rows — many pairwise distances are EXACTLY equal, and a query sits exactly on
+/// several box boundaries, which is where an off-by-an-epsilon bound shows up.
+///
+/// `n` spans the tree's `KD_MIN_ROWS` threshold and enough rows to force several
+/// levels of splitting past `LEAF_SIZE`; the equality is asserted on RAW BITS, not
+/// a tolerance, because "same value, fewer pairs" is the whole claim.
+#[test]
+fn core_distances_kdtree_matches_brute() {
+    use mlrs_algos::cluster::hdbscan::host_core;
+    use mlrs_backend::abflag;
+
+    for &(n, d) in &[(600usize, 2usize), (1_500, 4), (1_500, 8), (900, 16)] {
+        let mut x: Vec<f64> = Vec::with_capacity(n * d);
+        for i in 0..n {
+            // Duplicate every 23rd row exactly, and keep the lattice coarse so
+            // whole groups of rows share coordinates on several axes.
+            let src = if i % 23 == 0 { i.saturating_sub(1) } else { i };
+            for j in 0..d {
+                let step = 5 + j;
+                x.push(((src / step.pow(1 + (j as u32 % 2))) % 6) as f64 * 0.5);
+            }
+        }
+
+        for metric in [
+            Metric::Euclidean,
+            Metric::Manhattan,
+            Metric::Chebyshev,
+            Metric::Minkowski { p: 3.0 },
+        ] {
+            for k in [1usize, 2, 5, 17] {
+                let brute = {
+                    let _g = abflag::force("MLRS_HDBSCAN_CORE_KD", "0");
+                    host_core::core_distances_host(&x, n, d, metric, k)
+                };
+                let tree = {
+                    let _g = abflag::force("MLRS_HDBSCAN_CORE_KD", "1");
+                    host_core::core_distances_host(&x, n, d, metric, k)
+                };
+                for i in 0..n {
+                    assert_eq!(
+                        tree[i].to_bits(),
+                        brute[i].to_bits(),
+                        "kd-tree core distance differs from the brute scan at \
+                         n={n} d={d} metric={metric:?} k={k} row={i}: \
+                         tree={} brute={}",
+                        tree[i],
+                        brute[i],
+                    );
+                }
+            }
+        }
+    }
+}

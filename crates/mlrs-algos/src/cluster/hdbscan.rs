@@ -54,10 +54,59 @@ pub mod centers;
 pub mod condense;
 mod distance;
 pub mod glosh;
+pub mod host_core;
+mod kdtree;
 pub mod mst;
 pub mod select;
 pub mod single_linkage;
 pub mod stability;
+
+/// Everything a GLOSH pass needs to rebuild its parallel hdbscan-convention tree
+/// LATER (HDBS-PERF-CPU).
+///
+/// ## Why `outlier_scores_` is computed on demand
+/// GLOSH runs over a structurally different tree than `labels_`/`probabilities_`
+/// (D-07): a dense `n×n` distance matrix → core distances at index `min_samples`
+/// → mutual-reachability → hdbscan's `mst_linkage_core` → condense. That is a
+/// SECOND full pipeline, and it used to run inside every `fit` whether or not the
+/// caller ever read the scores. Measured at `n = 1000, d = 8` on the cpu backend
+/// it was 31 ms of a 36 ms host fit — 86% of the work, for an attribute sklearn's
+/// `HDBSCAN` does not even have.
+///
+/// So `fit` now stores only the INPUT the GLOSH tree is built from (the `n×p`
+/// design matrix, or the `n×n` precomputed matrix — never the derived `n×n`
+/// mutual-reachability block), and [`Hdbscan::outlier_scores`] builds the tree on
+/// first access and memoizes it. Callers that read `outlier_scores_` get the
+/// identical value at the identical tolerance; callers that never touch it stop
+/// paying for it.
+enum GloshSource {
+    /// Feature-metric path: the host copy of the `n×p` design matrix. The dense
+    /// distance matrix is rebuilt from it on demand.
+    Features {
+        /// Row-major `n×p` host copy of the fit input.
+        x: Vec<f64>,
+        /// Number of rows.
+        n: usize,
+        /// Number of features.
+        p: usize,
+        /// The feature-space metric the distances are rebuilt under.
+        metric: Metric,
+        /// Robust-single-linkage scaling (applied to the whole matrix — the
+        /// Variant-A placement the hdbscan generic path uses).
+        alpha: f64,
+    },
+    /// Precomputed path: the host copy of the RAW (unscaled) `n×n` distance
+    /// matrix. `alpha` is applied on demand, matching
+    /// `precomputed_single_linkage`'s Variant-A placement.
+    Precomputed {
+        /// Row-major `n×n` RAW distance matrix.
+        dist: Vec<f64>,
+        /// Number of rows (== columns).
+        n: usize,
+        /// Robust-single-linkage scaling.
+        alpha: f64,
+    },
+}
 
 /// Distance metric for the HDBSCAN neighbor graph (HDBS-01, D-01). The five
 /// feature-space metrics mirror [`mlrs_backend::prims::knn_graph::Metric`]
@@ -165,12 +214,15 @@ pub struct Hdbscan<F, S = Unfit> {
     /// device-resident `F`. `Some` after a precomputed fit (plan 15-04), `None`
     /// otherwise (the feature-metric device front-end lands in plan 15-05).
     probabilities_: Option<DeviceArray<ActiveRuntime, F>>,
-    /// Fitted per-point GLOSH outlier scores (length `n`, in `[0, 1]`),
-    /// device-resident `F` (HDBS-03, plan 15-06). `Some` after any successful fit
-    /// (the GLOSH pass runs over the same condensed tree that produced
-    /// `labels_`/`probabilities_`); `None` until fit. Gated vs the `hdbscan` 0.8.44
-    /// library (sklearn has no GLOSH — D-07).
-    outlier_scores_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// The input the LAZY GLOSH pass rebuilds its parallel hdbscan-convention
+    /// tree from (HDBS-PERF-CPU — see [`GloshSource`]). `Some` after any
+    /// successful fit, `None` until fit. The scores themselves are NOT computed
+    /// here; [`Hdbscan::outlier_scores`] builds them on first access.
+    glosh_: Option<GloshSource>,
+    /// Memoized GLOSH `outlier_scores_` (length `n`, in `[0, 1]`), filled by the
+    /// first [`Hdbscan::outlier_scores`] call from [`Self::glosh_`]. Gated vs the
+    /// `hdbscan` 0.8.44 library (sklearn has no GLOSH — D-07).
+    outlier_scores_: std::sync::OnceLock<Vec<F>>,
     /// Fitted cluster centroids (`store_centers='centroid'`/`'both'`, HDBS-04 /
     /// plan 15-06): a row-major `n_clusters × n_features` block (cluster id `c` at
     /// rows `c*p..(c+1)*p`), each a probability-weighted mean of its members.
@@ -223,7 +275,8 @@ where
             allow_single_cluster: false,
             labels_: None,
             probabilities_: None,
-            outlier_scores_: None,
+            glosh_: None,
+            outlier_scores_: std::sync::OnceLock::new(),
             centroids_: None,
             medoids_: None,
             single_linkage_: None,
@@ -452,7 +505,8 @@ impl HdbscanBuilder {
             allow_single_cluster: self.allow_single_cluster,
             labels_: None,
             probabilities_: None,
-            outlier_scores_: None,
+            glosh_: None,
+            outlier_scores_: std::sync::OnceLock::new(),
             centroids_: None,
             medoids_: None,
             single_linkage_: None,
@@ -516,45 +570,51 @@ where
         //
         // `labels_`/`probabilities_` come from the sklearn-exact tree
         // (`tree_to_labels`). GLOSH `outlier_scores_` come from a PARALLEL
-        // hdbscan-convention tree (D-07, Option A) built from the dense `n×n`
-        // distance matrix `dist_dense` (core distance at index `min_samples`,
-        // hdbscan's `mst_linkage_core` tie-order) — see `glosh::hdbscan_outlier_scores`.
-        // The dense matrix is the alpha-scaled metric distances (precomputed: `X`;
-        // feature metrics: rebuilt host-side via `dense_distance_matrix`).
-        let (single_linkage_, labels, probabilities, dist_dense) =
-            if self.metric == Metric::Precomputed {
-                let dist_dense = self.precomputed_dense_distances(pool, x, n, p)?;
-                let hierarchy = self.precomputed_single_linkage(pool, x, n, p)?;
-                let (labels, probs) = self.tree_to_labels(&hierarchy, n);
-                (Some(hierarchy), labels, probs, dist_dense)
-            } else {
-                // Feature-metric device front-end (plan 15-05): core distances from
-                // the Phase-13 KNN prim (`include_self=true`), then Variant-A
-                // (cosine, dense n×n + the MR kernel) or Variant-B (the other four,
-                // source-tracking, no n×n resident) MST → single-linkage. The Wave-3
-                // host back-end then produces labels + probabilities, identical to the
-                // precomputed path. GLOSH then runs over the hdbscan-convention tree.
-                let dist_dense = self.feature_metric_dense_distances(pool, x, n, p)?;
-                let hierarchy = self.feature_metric_single_linkage(pool, x, n, p)?;
-                let (labels, probs) = self.tree_to_labels(&hierarchy, n);
-                (Some(hierarchy), labels, probs, dist_dense)
-            };
+        // hdbscan-convention tree (D-07, Option A) — core distance at index
+        // `min_samples`, hdbscan's `mst_linkage_core` tie-order. That second
+        // pipeline is now DEFERRED (HDBS-PERF-CPU): `fit` keeps only the host copy
+        // of its input in `glosh_` and `outlier_scores()` builds the tree on first
+        // access. See [`GloshSource`] for the measurement that motivated it.
+        //
+        // The single `to_host` here is also the ONLY one on the fit path: the
+        // Variant-B Prim, the GLOSH source and `store_centers` all read this copy
+        // instead of crossing the boundary once each.
+        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
 
-        // GLOSH `outlier_scores_` over the parallel hdbscan-convention tree (D-07).
-        let min_samples = self.min_samples.unwrap_or(self.min_cluster_size);
-        let outlier_scores =
-            glosh::hdbscan_outlier_scores(&dist_dense, n, min_samples, self.min_cluster_size);
+        let (single_linkage_, labels, probabilities, glosh_) =
+            if self.metric == Metric::Precomputed {
+                let hierarchy = self.precomputed_single_linkage(&x_host, n, p)?;
+                let (labels, probs) = self.tree_to_labels(&hierarchy, n);
+                let src = GloshSource::Precomputed {
+                    dist: x_host,
+                    n,
+                    alpha: self.alpha,
+                };
+                (Some(hierarchy), labels, probs, src)
+            } else {
+                // Feature-metric front-end (plan 15-05): core distances from the
+                // Phase-13 KNN prim (`include_self=true`) on a GPU backend, or the
+                // host scan on cpu (`host_core`), then Variant-A (cosine, dense n×n
+                // + the MR kernel) or Variant-B (the other four, source-tracking, no
+                // n×n resident) MST → single-linkage. The Wave-3 host back-end then
+                // produces labels + probabilities, identical to the precomputed path.
+                let hierarchy = self.feature_metric_single_linkage(pool, x, &x_host, n, p)?;
+                let (labels, probs) = self.tree_to_labels(&hierarchy, n);
+                let src = GloshSource::Features {
+                    x: x_host,
+                    n,
+                    p,
+                    metric: self.metric,
+                    alpha: self.alpha,
+                };
+                (Some(hierarchy), labels, probs, src)
+            };
 
         let labels_dev = DeviceArray::from_host(pool, &labels);
         // probabilities_ is device-resident `F`.
         let probabilities_ = {
             let p_f: Vec<F> = probabilities.iter().map(|&v| f64_to_host::<F>(v)).collect();
             Some(DeviceArray::from_host(pool, &p_f))
-        };
-        // outlier_scores_ is device-resident `F` (GLOSH, HDBS-03).
-        let outlier_scores_ = {
-            let s_f: Vec<F> = outlier_scores.iter().map(|&v| f64_to_host::<F>(v)).collect();
-            Some(DeviceArray::from_host(pool, &s_f))
         };
 
         // store_centers → centroids_/medoids_ (HDBS-04, plan 15-06). Feature-array
@@ -569,9 +629,16 @@ where
                 StoreCenters::Medoid => centers::Centers::Medoid,
                 StoreCenters::Both => centers::Centers::Both,
             };
-            let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+            // Reuses the single fit-path `to_host` copy held by `glosh_` (the
+            // Precomputed arm is unreachable here — the guard above rejects it).
+            let x_host: &[f64] = match &glosh_ {
+                GloshSource::Features { x, .. } => x,
+                GloshSource::Precomputed { .. } => unreachable!(
+                    "store_centers with Metric::Precomputed is rejected before any compute"
+                ),
+            };
             let (cent, med) =
-                centers::weighted_cluster_center(&x_host, &labels, &probabilities, p, self.metric, which);
+                centers::weighted_cluster_center(x_host, &labels, &probabilities, p, self.metric, which);
             // WR-03: honour the documented `None`-means-no-cluster contract. An
             // all-noise fit yields `Some(vec![])`; filter the empty block to `None`
             // so a consumer never receives an empty `Some`.
@@ -600,7 +667,8 @@ where
             allow_single_cluster: self.allow_single_cluster,
             labels_: Some(labels_dev),
             probabilities_,
-            outlier_scores_,
+            glosh_: Some(glosh_),
+            outlier_scores_: std::sync::OnceLock::new(),
             centroids_,
             medoids_,
             single_linkage_,
@@ -631,13 +699,12 @@ where
     /// `1e-9`) below enforces this in test builds (WR-04).
     fn precomputed_single_linkage(
         &self,
-        pool: &BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
+        dist_raw: &[f64],
         n: usize,
         p: usize,
     ) -> Result<Vec<single_linkage::SingleLinkageEdge>, AlgoError> {
         // T-15-03-V5a: a precomputed matrix MUST be square (n == p). Reject with a
-        // typed PrimError before reading anything to host.
+        // typed PrimError before touching the matrix.
         if n != p {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "precomputed_distance_matrix",
@@ -646,9 +713,6 @@ where
                 len: n * p,
             }));
         }
-
-        // Read the dense matrix to host f64 (the shared bridging idiom).
-        let dist_raw: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
 
         // WR-04: sklearn requires the precomputed matrix to be SYMMETRIC
         // (`np.allclose(X, X.T)`); the dense Variant-A MST reads `mr[current_node]`
@@ -703,6 +767,7 @@ where
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
+        x_host: &[f64],
         n: usize,
         p: usize,
     ) -> Result<Vec<single_linkage::SingleLinkageEdge>, AlgoError> {
@@ -716,40 +781,61 @@ where
         // self-inclusive kNN. We request `k = min_samples` self-inclusive neighbours
         // (clamped to `n` so a tiny input doesn't over-request).
         let k = min_samples.clamp(1, n);
-        let knn_metric = self.knn_metric();
-        let mink_p = match self.metric {
-            Metric::Minkowski { p } => p,
-            _ => 2.0, // ignored by non-Minkowski routes (knn_graph precedent).
+
+        // --- Core distances, VARIANT B ONLY.
+        //
+        //     Cosine (Variant A) does not use them: it recomputes its core
+        //     distances from the dense `n×n` cosine matrix below
+        //     (`core_distances_dense(&dist_scaled, ...)`), because the MR kernel
+        //     must see core distances drawn from the SAME matrix it reduces. The
+        //     kNN-sourced `core_raw` was computed and then dropped on that path —
+        //     a whole wasted O(n²·p) pass. It is also NOT interchangeable with the
+        //     dense one: `knn_graph`'s cosine goes through the GEMM expansion and
+        //     reports `‖x̂ − ŷ‖²/2`, which equals `cosine_distance_matrix`'s
+        //     `1 − x̂·ŷ` for unit rows but NOT for a zero row (0 vs 1). Computing
+        //     it only where it is consumed removes both the waste and the trap.
+        //
+        //     On a GPU backend the Phase-13 KNN prim owns this (it validates
+        //     geometry host-side BEFORE any launch, T-15-05-V5). On cpu the prim's
+        //     QUERY_TILE=8 composition costs four orders of magnitude more than
+        //     the scan itself, so `host_core` does it directly — same value, same
+        //     column, no launches. See `host_core`'s module doc. ---
+        let needs_knn_core = !matches!(self.metric, Metric::Cosine);
+        let core_raw: Vec<f64> = if !needs_knn_core {
+            Vec::new()
+        } else if host_core::host_core_applicable() {
+            host_core::core_distances_host(x_host, n, p, self.metric, k)
+        } else {
+            let knn_metric = self.knn_metric();
+            let mink_p = match self.metric {
+                Metric::Minkowski { p } => p,
+                _ => 2.0, // ignored by non-Minkowski routes (knn_graph precedent).
+            };
+            let (idx_dev, dist_dev) = knn_graph::<F>(
+                pool,
+                x,
+                (n, p),
+                k,
+                knn_metric,
+                /* include_self */ true,
+                mink_p,
+            )
+            .map_err(AlgoError::Prim)?;
+            // The KNN indices are not needed for core distances (the ascending
+            // distance column is the core distance) — release them.
+            let knn_dist: Vec<f64> =
+                dist_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+            idx_dev.release_into(pool);
+            dist_dev.release_into(pool);
+
+            // core[i] = the (min_samples-1)-th smallest distance in row i. The
+            // ascending self-inclusive kNN puts it at column `k-1` (k = min_samples
+            // clamped). On a tiny input where k < min_samples (clamp), the last
+            // available column is the closest exact analogue (sklearn np.partition
+            // would clamp similarly).
+            let core_col = k - 1;
+            (0..n).map(|i| knn_dist[i * k + core_col]).collect()
         };
-
-        // --- Core distances via the Phase-13 KNN prim (include_self=true). The prim
-        //     validates geometry host-side BEFORE any launch (T-15-05-V5). ---
-        let (idx_dev, dist_dev) = knn_graph::<F>(
-            pool,
-            x,
-            (n, p),
-            k,
-            knn_metric,
-            /* include_self */ true,
-            mink_p,
-        )
-        .map_err(AlgoError::Prim)?;
-        // The KNN indices are not needed for core distances (the ascending distance
-        // column is the core distance) — release them.
-        let knn_dist: Vec<f64> = dist_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        idx_dev.release_into(pool);
-        dist_dev.release_into(pool);
-
-        // core[i] = the (min_samples-1)-th smallest distance in row i. The ascending
-        // self-inclusive kNN puts it at column `k-1` (k = min_samples clamped). On a
-        // tiny input where k < min_samples (clamp), the last available column is the
-        // closest exact analogue (sklearn np.partition would clamp similarly).
-        let core_col = k - 1;
-        let core_raw: Vec<f64> = (0..n).map(|i| knn_dist[i * k + core_col]).collect();
-
-        // Read the design matrix to host once (for the Variant-B pairwise closure
-        // and the dense-cosine matrix construction).
-        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
 
         let edges = if matches!(self.metric, Metric::Cosine) {
             // --- Variant A (cosine): dense n×n cosine distance, whole-matrix /alpha
@@ -766,7 +852,7 @@ where
                     rhs: n,
                 })
             })?;
-            let dist_dense = cosine_distance_matrix(&x_host, n, p); // RAW (unscaled)
+            let dist_dense = cosine_distance_matrix(x_host, n, p); // RAW (unscaled)
             debug_assert_eq!(dist_dense.len(), nn);
 
             // Variant-A alpha placement: scale the WHOLE matrix by alpha BEFORE core
@@ -778,104 +864,56 @@ where
             let dist_scaled: Vec<f64> = dist_dense.iter().map(|&d| d / alpha).collect();
             let core_scaled = mst::core_distances_dense(&dist_scaled, n, min_samples);
 
-            // Launch the MR GATHER kernel on the device (the dense-cosine path's use
-            // of the new kernel). Upload RAW distance + the scaled-matrix core; the
-            // kernel does the `/alpha`.
-            let dist_f: Vec<F> = dist_dense.iter().map(|&v| f64_to_host::<F>(v)).collect();
-            let core_f: Vec<F> = core_scaled.iter().map(|&v| f64_to_host::<F>(v)).collect();
-            let dist_dev2: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &dist_f);
-            let core_dev2: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &core_f);
-            let mr_dev = mutual_reachability_device::<F>(
-                pool,
-                &dist_dev2,
-                &core_dev2,
-                n,
-                n,
-                f64_to_host::<F>(alpha),
-            )
-            .map_err(AlgoError::Prim)?;
-            let mr: Vec<f64> = mr_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-            dist_dev2.release_into(pool);
-            core_dev2.release_into(pool);
-            mr_dev.release_into(pool);
+            // On cpu, build the mutual-reachability host-side. The device path
+            // below uploads an `n×n` block, launches, and reads it back — three
+            // `n²` boundary crossings around `max(core_i, core_j, d/alpha)`, which
+            // is the same class of round-trip `host_core` removed from the core
+            // distances. `mutual_reachability_dense` is the identical formula (the
+            // GLOSH tree already shares it) over the ALREADY-scaled matrix, so the
+            // `/alpha` is folded in rather than passed to a kernel.
+            if host_core::host_core_applicable() {
+                let mr = mst::mutual_reachability_dense(&dist_scaled, &core_scaled, n);
+                mst::mst_from_mutual_reachability(&mr, n)
+            } else {
+                // Launch the MR GATHER kernel on the device (the dense-cosine
+                // path's use of the new kernel). Upload RAW distance + the
+                // scaled-matrix core; the kernel does the `/alpha`.
+                let dist_f: Vec<F> = dist_dense.iter().map(|&v| f64_to_host::<F>(v)).collect();
+                let core_f: Vec<F> = core_scaled.iter().map(|&v| f64_to_host::<F>(v)).collect();
+                let dist_dev2: DeviceArray<ActiveRuntime, F> =
+                    DeviceArray::from_host(pool, &dist_f);
+                let core_dev2: DeviceArray<ActiveRuntime, F> =
+                    DeviceArray::from_host(pool, &core_f);
+                let mr_dev = mutual_reachability_device::<F>(
+                    pool,
+                    &dist_dev2,
+                    &core_dev2,
+                    n,
+                    n,
+                    f64_to_host::<F>(alpha),
+                )
+                .map_err(AlgoError::Prim)?;
+                let mr: Vec<f64> =
+                    mr_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+                dist_dev2.release_into(pool);
+                core_dev2.release_into(pool);
+                mr_dev.release_into(pool);
 
-            mst::mst_from_mutual_reachability(&mr, n)
+                mst::mst_from_mutual_reachability(&mr, n)
+            }
         } else {
             // --- Variant B (euclidean/manhattan/chebyshev/minkowski): source-
             //     tracking Prim, RAW core, `pair_distance /= alpha`. Recompute the
-            //     pairwise distance host-side from the n×p data — NO n×n resident. ---
-            let alpha = self.alpha;
-            let metric = self.metric;
-            mst::mst_from_data_matrix(&core_raw, n, alpha, |i, j| {
-                distance::host_pairwise(&x_host, p, metric, i, j)
-            })
+            //     pairwise distance host-side from the n×p data — NO n×n resident.
+            //     `mst_from_data_matrix_metric` is the same Prim with the metric
+            //     monomorphized and the two exact prunes applied (HDBS-PERF-CPU);
+            //     `hdbscan_test::mst_specialized_matches_generic` gates that it emits
+            //     the identical edge list. ---
+            mst::mst_from_data_matrix_metric(x_host, n, p, &core_raw, self.alpha, self.metric)
         };
 
         let sorted = mst::argsort_by_weight(&edges);
         Ok(single_linkage::make_single_linkage(&sorted, n))
-    }
-
-    /// Build the alpha-scaled dense `n×n` distance matrix for the GLOSH
-    /// hdbscan-convention tree on the PRECOMPUTED path: `X` is already the square
-    /// `n×n` distance matrix, so we read it to host and divide the WHOLE matrix by
-    /// `alpha` (Variant-A placement, matching `precomputed_single_linkage`). The
-    /// GLOSH pass ([`glosh::hdbscan_outlier_scores`]) then recomputes core
-    /// distances at index `min_samples` from THIS scaled matrix.
-    fn precomputed_dense_distances(
-        &self,
-        pool: &BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        n: usize,
-        p: usize,
-    ) -> Result<Vec<f64>, AlgoError> {
-        if n != p {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "precomputed_distance_matrix",
-                rows: n,
-                cols: p,
-                len: n * p,
-            }));
-        }
-        let alpha = self.alpha;
-        let dist: Vec<f64> = x
-            .to_host(pool)
-            .iter()
-            .map(|&v| host_to_f64(v) / alpha)
-            .collect();
-        Ok(dist)
-    }
-
-    /// Build the alpha-scaled dense `n×n` distance matrix for the GLOSH
-    /// hdbscan-convention tree on the FEATURE-metric path: rebuild the metric
-    /// `pairwise_distances(X)` host-side from the `n×p` design matrix (cosine via
-    /// [`cosine_distance_matrix`]; the four FAST metrics via [`distance::host_pairwise`]),
-    /// then divide the WHOLE matrix by `alpha` (Variant-A placement, the hdbscan
-    /// generic path scales the matrix before core distances). This is a host pass
-    /// — the GLOSH tree is host-side and never resident on the device, so it does
-    /// not affect the `memory_gate` sub-quadratic DEVICE bound.
-    fn feature_metric_dense_distances(
-        &self,
-        pool: &BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        n: usize,
-        p: usize,
-    ) -> Result<Vec<f64>, AlgoError> {
-        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        let mut dist = vec![0.0f64; n * n];
-        if matches!(self.metric, Metric::Cosine) {
-            dist = cosine_distance_matrix(&x_host, n, p);
-        } else {
-            for i in 0..n {
-                for j in 0..n {
-                    dist[i * n + j] = distance::host_pairwise(&x_host, p, self.metric, i, j);
-                }
-            }
-        }
-        let alpha = self.alpha;
-        for d in dist.iter_mut() {
-            *d /= alpha;
-        }
-        Ok(dist)
     }
 
     /// Map the estimator's [`Metric`] onto the Phase-13 KNN prim's
@@ -967,12 +1005,68 @@ where
         self.probabilities_.as_ref().map(|d| d.to_host(pool))
     }
 
-    /// Host copy of the fitted per-point GLOSH `outlier_scores_` (length `n`, in
-    /// `[0, 1]`; HDBS-03). `Some` after any successful fit (the GLOSH pass runs over
-    /// the same condensed tree as `labels_`/`probabilities_`). Gated vs the
-    /// `hdbscan` 0.8.44 library — sklearn has no GLOSH (D-07).
-    pub fn outlier_scores(&self, pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
-        self.outlier_scores_.as_ref().map(|d| d.to_host(pool))
+    /// The fitted per-point GLOSH `outlier_scores_` (length `n`, in `[0, 1]`;
+    /// HDBS-03). `Some` after any successful fit. Gated vs the `hdbscan` 0.8.44
+    /// library — sklearn has no GLOSH (D-07).
+    ///
+    /// COMPUTED ON FIRST ACCESS and memoized (HDBS-PERF-CPU): GLOSH needs a whole
+    /// second pipeline over a structurally different tree (see [`GloshSource`]),
+    /// which used to run inside every `fit` whether or not anyone read it. The
+    /// value and its tolerance are unchanged — only *when* the work happens is.
+    /// The first call is therefore the expensive one; later calls return the
+    /// cached vector.
+    ///
+    /// `pool` is unused (the GLOSH tree is a pure host pipeline — it never puts an
+    /// `n×n` block on the device, which is what keeps the `memory_gate` bound
+    /// intact) and is kept for signature parity with the other accessors.
+    pub fn outlier_scores(&self, _pool: &BufferPool<ActiveRuntime>) -> Option<Vec<F>> {
+        let src = self.glosh_.as_ref()?;
+        Some(
+            self.outlier_scores_
+                .get_or_init(|| {
+                    let min_samples = self.min_samples.unwrap_or(self.min_cluster_size);
+                    // The alpha-scaled dense `n×n` distances the hdbscan-convention
+                    // tree is built from (Variant-A placement: the WHOLE matrix is
+                    // scaled BEFORE core distances).
+                    let (dist, n) = match src {
+                        GloshSource::Precomputed { dist, n, alpha } => {
+                            (dist.iter().map(|&d| d / alpha).collect::<Vec<f64>>(), *n)
+                        }
+                        GloshSource::Features {
+                            x,
+                            n,
+                            p,
+                            metric,
+                            alpha,
+                        } => {
+                            let (n, p) = (*n, *p);
+                            let mut dist = if matches!(metric, Metric::Cosine) {
+                                cosine_distance_matrix(x, n, p)
+                            } else {
+                                let mut d = vec![0.0f64; n * n];
+                                host_core::par_row_chunks(&mut d, n, 64, |row0, out| {
+                                    for (r, row) in out.chunks_mut(n).enumerate() {
+                                        for (j, slot) in row.iter_mut().enumerate() {
+                                            *slot =
+                                                distance::host_pairwise(x, p, *metric, row0 + r, j);
+                                        }
+                                    }
+                                });
+                                d
+                            };
+                            for d in dist.iter_mut() {
+                                *d /= alpha;
+                            }
+                            (dist, n)
+                        }
+                    };
+                    glosh::hdbscan_outlier_scores(&dist, n, min_samples, self.min_cluster_size)
+                        .iter()
+                        .map(|&v| f64_to_host::<F>(v))
+                        .collect()
+                })
+                .clone(),
+        )
     }
 
     /// Host copy of the fitted cluster `centroids_` (row-major
@@ -1025,18 +1119,25 @@ fn cosine_distance_matrix(x: &[f64], n: usize, p: usize) -> Vec<f64> {
         }
     }
     let mut dist = vec![0.0f64; n * n];
-    for i in 0..n {
-        for j in 0..n {
-            let mut dot = 0.0f64;
-            for k in 0..p {
-                dot += xhat[i * p + k] * xhat[j * p + k];
+    // Row-parallel (HDBS-PERF-CPU): each output row reads only its own normalised
+    // row plus the shared read-only block, and the `k` sum runs in the same order
+    // regardless of the split, so the matrix is bit-identical to the serial build.
+    host_core::par_row_chunks(&mut dist, n, 64, |row0, out| {
+        for (r, row) in out.chunks_mut(n).enumerate() {
+            let xi = &xhat[(row0 + r) * p..(row0 + r + 1) * p];
+            for (j, slot) in row.iter_mut().enumerate() {
+                let xj = &xhat[j * p..(j + 1) * p];
+                let mut dot = 0.0f64;
+                for k in 0..p {
+                    dot += xi[k] * xj[k];
+                }
+                // 1 − cos, clamped to `>= 0` (floating dot can drift just past 1.0
+                // on the diagonal of a non-zero row → a tiny negative distance).
+                let d = 1.0 - dot;
+                *slot = if d > 0.0 { d } else { 0.0 };
             }
-            // 1 − cos, clamped to `>= 0` (floating dot can drift just past 1.0 on
-            // the diagonal of a non-zero row → a tiny negative distance otherwise).
-            let d = 1.0 - dot;
-            dist[i * n + j] = if d > 0.0 { d } else { 0.0 };
         }
-    }
+    });
     dist
 }
 
