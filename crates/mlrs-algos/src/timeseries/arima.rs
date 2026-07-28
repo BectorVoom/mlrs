@@ -83,6 +83,17 @@ use crate::typestate::{Fitted, State, Unfit};
 /// statistical requirement).
 const MAX_PQ: usize = 10;
 const MAX_D: usize = 5;
+/// Upper bound on the Kalman state dimension `r = max(p, q+1)` given the
+/// `MAX_PQ` order cap — lets [`kalman_pass`]'s per-timestep recursion (the
+/// dominant cost: called `O(n_params)` times per L-BFGS gradient, itself
+/// called every line-search step) use fixed-size STACK buffers instead of a
+/// fresh heap `Vec` per `r×r`/`r`-sized temporary per timestep. `Arima::build`
+/// and `AutoArima::search` both reject `p`/`q > MAX_PQ` before any fit runs,
+/// so `r <= MAX_R` always holds through the typestate-guarded entry points;
+/// [`loglik`] is the one public escape hatch (a fixed-parameter diagnostic,
+/// not the MLE path) and stays correct for oversized input via `to_vec`
+/// fallbacks instead of silently truncating.
+const MAX_R: usize = MAX_PQ + 1;
 /// Approximate-zero guard for the concentrated variance (a degenerate
 /// all-equal series would otherwise divide by zero).
 const MIN_SIGMA2: f64 = 1e-12;
@@ -450,20 +461,61 @@ where
             }
             -pass.loglik
         };
+        // Central-difference gradient: `2*n_params` independent `barrier_obj`
+        // (Kalman-pass) evaluations, PLUS the 1 base value — every one of
+        // these runs on EVERY line-search trial, so at higher orders
+        // (`n_params` up to `2*MAX_PQ = 20`) this dominates `fit`'s wall
+        // clock far more than the single-pass cost `kalman_pass_bounded`
+        // already optimized. The `k`-th component only touches `x[k]`, so
+        // the `2*n_params` evaluations are mutually independent — host-
+        // parallel over `std::thread::scope`, same convention as
+        // `AutoArima::search` below. Below `PAR_GRAD_MIN_PARAMS` the thread-
+        // spawn overhead would exceed the saved work (a `(p,q)` this small
+        // is already sub-millisecond per `obj` call), so that band stays
+        // serial.
+        const PAR_GRAD_MIN_PARAMS: usize = 4;
         let obj = |x: &[f64]| -> (f64, Vec<f64>) {
             let (phi, theta) = split_params(x, p, q);
             let ll = barrier_obj(&phi, &theta);
             let mut grad = vec![0.0f64; n_params];
-            for k in 0..n_params {
-                let mut xp = x.to_vec();
-                let mut xm = x.to_vec();
-                xp[k] += FD_STEP;
-                xm[k] -= FD_STEP;
-                let (phi_p, theta_p) = split_params(&xp, p, q);
-                let (phi_m, theta_m) = split_params(&xm, p, q);
-                let lp = barrier_obj(&phi_p, &theta_p);
-                let lm = barrier_obj(&phi_m, &theta_m);
-                grad[k] = (lp - lm) / (2.0 * FD_STEP);
+            if n_params < PAR_GRAD_MIN_PARAMS {
+                for k in 0..n_params {
+                    let mut xp = x.to_vec();
+                    let mut xm = x.to_vec();
+                    xp[k] += FD_STEP;
+                    xm[k] -= FD_STEP;
+                    let (phi_p, theta_p) = split_params(&xp, p, q);
+                    let (phi_m, theta_m) = split_params(&xm, p, q);
+                    let lp = barrier_obj(&phi_p, &theta_p);
+                    let lm = barrier_obj(&phi_m, &theta_m);
+                    grad[k] = (lp - lm) / (2.0 * FD_STEP);
+                }
+            } else {
+                let workers = std::thread::available_parallelism()
+                    .map(|v| v.get())
+                    .unwrap_or(1)
+                    .clamp(1, n_params);
+                let per = n_params.div_ceil(workers);
+                let barrier_obj = &barrier_obj;
+                std::thread::scope(|scope| {
+                    for (chunk_idx, grad_chunk) in grad.chunks_mut(per).enumerate() {
+                        let base = chunk_idx * per;
+                        scope.spawn(move || {
+                            for (offset, g) in grad_chunk.iter_mut().enumerate() {
+                                let k = base + offset;
+                                let mut xp = x.to_vec();
+                                let mut xm = x.to_vec();
+                                xp[k] += FD_STEP;
+                                xm[k] -= FD_STEP;
+                                let (phi_p, theta_p) = split_params(&xp, p, q);
+                                let (phi_m, theta_m) = split_params(&xm, p, q);
+                                let lp = barrier_obj(&phi_p, &theta_p);
+                                let lm = barrier_obj(&phi_m, &theta_m);
+                                *g = (lp - lm) / (2.0 * FD_STEP);
+                            }
+                        });
+                    }
+                });
             }
             (ll, grad)
         };
@@ -568,6 +620,36 @@ fn stationary_p1(t_mat: &[f64], q_mat: &[f64], r: usize) -> Vec<f64> {
     p
 }
 
+/// Stack-buffer sibling of [`stationary_p1`] for the hot [`kalman_pass`] path
+/// — writes into `p_out[..r*r]` (a caller-owned `[f64; MAX_R * MAX_R]` slice)
+/// instead of allocating. `tp`/`tpt` scratch are likewise caller-owned so
+/// nothing here touches the heap.
+#[allow(clippy::too_many_arguments)]
+fn stationary_p1_into(
+    t_mat: &[f64],
+    q_mat: &[f64],
+    r: usize,
+    p_out: &mut [f64],
+    tp: &mut [f64],
+    tpt: &mut [f64],
+) {
+    let rr = r * r;
+    p_out[..rr].copy_from_slice(&q_mat[..rr]);
+    for _ in 0..LYAPUNOV_MAX_ITER {
+        mat_mat_into(t_mat, &p_out[..rr], r, &mut tp[..rr]);
+        mat_mat_t_into(&tp[..rr], t_mat, r, &mut tpt[..rr]);
+        let mut max_diff = 0.0f64;
+        for i in 0..rr {
+            let next_i = tpt[i] + q_mat[i];
+            max_diff = max_diff.max((next_i - p_out[i]).abs());
+            p_out[i] = next_i;
+        }
+        if max_diff < 1e-13 {
+            break;
+        }
+    }
+}
+
 /// `r×r · r×r` matrix product.
 fn mat_mat(a: &[f64], b: &[f64], r: usize) -> Vec<f64> {
     let mut out = vec![0.0f64; r * r];
@@ -611,6 +693,67 @@ fn mat_vec(a: &[f64], x: &[f64], r: usize) -> Vec<f64> {
     out
 }
 
+/// Allocation-free siblings of `mat_mat`/`mat_mat_t`/`mat_vec`/`outer`,
+/// writing into a caller-owned `out` slice — the [`kalman_pass`] hot loop
+/// runs one of these per elementary op per timestep, so avoiding a `Vec`
+/// per call is the whole point (was ~10 heap allocations/timestep).
+fn mat_mat_into(a: &[f64], b: &[f64], r: usize, out: &mut [f64]) {
+    for i in 0..r {
+        for j in 0..r {
+            let mut acc = 0.0f64;
+            for k in 0..r {
+                acc += a[i * r + k] * b[k * r + j];
+            }
+            out[i * r + j] = acc;
+        }
+    }
+}
+
+fn mat_mat_t_into(a: &[f64], b: &[f64], r: usize, out: &mut [f64]) {
+    for i in 0..r {
+        for j in 0..r {
+            let mut acc = 0.0f64;
+            for k in 0..r {
+                acc += a[i * r + k] * b[j * r + k];
+            }
+            out[i * r + j] = acc;
+        }
+    }
+}
+
+fn mat_vec_into(a: &[f64], x: &[f64], r: usize, out: &mut [f64]) {
+    for i in 0..r {
+        let mut acc = 0.0f64;
+        for k in 0..r {
+            acc += a[i * r + k] * x[k];
+        }
+        out[i] = acc;
+    }
+}
+
+fn outer_into(x: &[f64], r: usize, out: &mut [f64]) {
+    for i in 0..r {
+        for j in 0..r {
+            out[i * r + j] = x[i] * x[j];
+        }
+    }
+}
+
+/// Stack-buffer sibling of [`build_state_space`] for the hot path — writes
+/// `T` into `t_out[..r*r]` and `R` into `r_out[..r]` (both caller-owned).
+fn build_state_space_into(phi: &[f64], theta: &[f64], r: usize, t_out: &mut [f64], r_out: &mut [f64]) {
+    for i in 0..r {
+        t_out[i * r] = phi.get(i).copied().unwrap_or(0.0);
+        if i + 1 < r {
+            t_out[i * r + i + 1] = 1.0;
+        }
+    }
+    r_out[0] = 1.0;
+    for i in 1..r {
+        r_out[i] = theta.get(i - 1).copied().unwrap_or(0.0);
+    }
+}
+
 /// The result of one full Kalman-filter pass over a (differenced) series.
 struct KalmanPass {
     sigma2: f64,
@@ -621,9 +764,103 @@ struct KalmanPass {
 
 /// One full Kalman-filter pass (Harvey representation, concentrated scale —
 /// module docs). `phi`/`theta` are raw (unconstrained) coefficient vectors.
+///
+/// This is THE hot function: the L-BFGS MLE calls it once per objective
+/// value plus twice per gradient component (central finite differences), per
+/// line-search evaluation, per outer iteration — easily hundreds of calls
+/// per `fit`, thousands across an `AutoArima` grid. Dispatches on `r` vs
+/// [`MAX_R`]: the typestate-guarded entry points (`Arima::fit`,
+/// `AutoArima::search`) both reject `p`/`q > MAX_PQ` at `build()`/`search()`
+/// before any fit runs, so `r <= MAX_R` always holds there and takes the
+/// allocation-free stack-buffer path ([`kalman_pass_bounded`]). [`loglik`] is
+/// a public diagnostic entry point that bypasses that guard, so oversized
+/// input falls back to the original heap-`Vec` recursion
+/// ([`kalman_pass_unbounded`]) instead of silently corrupting/truncating.
 fn kalman_pass(phi: &[f64], theta: &[f64], y: &[f64]) -> KalmanPass {
     let p = phi.len();
     let r = p.max(theta.len() + 1).max(1);
+    if r > MAX_R {
+        kalman_pass_unbounded(phi, theta, y, r)
+    } else {
+        kalman_pass_bounded(phi, theta, y, r)
+    }
+}
+
+/// Fast path: `r <= MAX_R`, so every per-timestep temporary is a stack
+/// `[f64; MAX_R * MAX_R]` (or `MAX_R`) slice written in place via the
+/// `_into` helpers — zero heap allocation in the `for &yt in y` loop, versus
+/// ~10 `Vec` allocations/timestep in the original formulation.
+fn kalman_pass_bounded(phi: &[f64], theta: &[f64], y: &[f64], r: usize) -> KalmanPass {
+    let rr = r * r;
+
+    let mut t_mat = [0.0f64; MAX_R * MAX_R];
+    let mut r_vec = [0.0f64; MAX_R];
+    build_state_space_into(phi, theta, r, &mut t_mat[..rr], &mut r_vec[..r]);
+
+    let mut q_mat = [0.0f64; MAX_R * MAX_R];
+    outer_into(&r_vec[..r], r, &mut q_mat[..rr]); // R Rᵀ (σ²=1, concentrated)
+
+    let mut a = [0.0f64; MAX_R];
+    let mut cov = [0.0f64; MAX_R * MAX_R];
+    let mut lyap_tp = [0.0f64; MAX_R * MAX_R];
+    let mut lyap_tpt = [0.0f64; MAX_R * MAX_R];
+    stationary_p1_into(&t_mat[..rr], &q_mat[..rr], r, &mut cov[..rr], &mut lyap_tp[..rr], &mut lyap_tpt[..rr]);
+
+    let n = y.len();
+    let mut sum_v2_f = 0.0f64;
+    let mut sum_log_f = 0.0f64;
+
+    // Per-timestep scratch, acquired ONCE and reused for every observation.
+    let mut p_col0 = [0.0f64; MAX_R];
+    let mut tp_col0 = [0.0f64; MAX_R];
+    let mut k = [0.0f64; MAX_R];
+    let mut ta = [0.0f64; MAX_R];
+    let mut tp = [0.0f64; MAX_R * MAX_R];
+    let mut tpt = [0.0f64; MAX_R * MAX_R];
+    let mut kk = [0.0f64; MAX_R * MAX_R];
+
+    for &yt in y {
+        let v = yt - a[0]; // Z a = a[0]
+        let f = cov[0].max(1e-300); // Z P Zᵀ = P[0][0]
+        // K = T P Zᵀ / F — Zᵀ selects column 0 of P, so T·P[:,0] / F.
+        for i in 0..r {
+            p_col0[i] = cov[i * r];
+        }
+        mat_vec_into(&t_mat[..rr], &p_col0[..r], r, &mut tp_col0[..r]);
+        for i in 0..r {
+            k[i] = tp_col0[i] / f;
+        }
+
+        mat_vec_into(&t_mat[..rr], &a[..r], r, &mut ta[..r]);
+        for i in 0..r {
+            a[i] = ta[i] + k[i] * v;
+        }
+
+        // P_{t+1} = T P Tᵀ + Q - K F Kᵀ.
+        mat_mat_into(&t_mat[..rr], &cov[..rr], r, &mut tp[..rr]);
+        mat_mat_t_into(&tp[..rr], &t_mat[..rr], r, &mut tpt[..rr]);
+        outer_into(&k[..r], r, &mut kk[..rr]);
+        for i in 0..rr {
+            cov[i] = tpt[i] + q_mat[i] - kk[i] * f;
+        }
+
+        sum_v2_f += v * v / f;
+        sum_log_f += f.ln();
+    }
+
+    let sigma2 = (sum_v2_f / n as f64).max(MIN_SIGMA2);
+    let loglik =
+        -0.5 * n as f64 * (2.0 * std::f64::consts::PI).ln() - 0.5 * n as f64 * (sigma2.ln() + 1.0)
+            - 0.5 * sum_log_f;
+
+    KalmanPass { sigma2, loglik, final_state: a[..r].to_vec(), final_cov: cov[..rr].to_vec() }
+}
+
+/// Original heap-`Vec` recursion — the fallback for `r > MAX_R` (only
+/// reachable through the public [`loglik`] diagnostic entry point, which is
+/// not guarded by `Arima::build`'s `MAX_PQ` cap). Not performance-critical:
+/// nothing on the `Arima::fit`/`AutoArima::search` path can hit it.
+fn kalman_pass_unbounded(phi: &[f64], theta: &[f64], y: &[f64], r: usize) -> KalmanPass {
     let (t_mat, _z, r_vec) = build_state_space(phi, theta, r);
     let q_mat = outer(&r_vec, r); // R Rᵀ (σ²=1, concentrated)
 
@@ -731,23 +968,52 @@ impl AutoArima {
         }
         let y_host: Vec<f64> = y.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
 
-        let mut best: Option<Arima<F, Fitted>> = None;
-        for p in 0..=max_p {
-            for q in 0..=max_q {
-                let candidate = fit_from_host::<F>(p, d, q, &y_host);
-                let Ok(cand) = candidate else { continue };
-                if !cand.converged() || !cand.aicc().is_finite() {
-                    continue;
-                }
-                let better = match &best {
-                    None => true,
-                    Some(b) => cand.aicc() < b.aicc(),
-                };
-                if better {
-                    best = Some(cand);
-                }
+        // Every (p, q) candidate is an independent L-BFGS MLE over its own
+        // objective closure — this exhaustive grid (up to `(MAX_PQ+1)^2 =
+        // 121` fits) is the actual AutoArima cost, and it is embarrassingly
+        // parallel. Host-parallel over `std::thread::scope`, the same
+        // pattern as `prims::random_forest`/`prims::hist_gradient_boosting`'s
+        // per-column workers: split the flattened grid into contiguous
+        // chunks (one per worker), each reduces its OWN local best, then
+        // the chunks reduce again below. Chunks stay in `(p, q)` scan order,
+        // so a tie (equal AICc) still resolves to the same earlier-scanned
+        // candidate `min_by` would have picked serially (T-22-01 determinism).
+        let grid: Vec<(usize, usize)> =
+            (0..=max_p).flat_map(|p| (0..=max_q).map(move |q| (p, q))).collect();
+        let workers = std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1)
+            .clamp(1, grid.len().max(1));
+        let per = grid.len().div_ceil(workers).max(1);
+
+        let mut slots: Vec<Option<Arima<F, Fitted>>> = (0..workers).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            for (chunk, slot) in grid.chunks(per).zip(slots.iter_mut()) {
+                let y_host = &y_host;
+                scope.spawn(move || {
+                    let mut local_best: Option<Arima<F, Fitted>> = None;
+                    for &(p, q) in chunk {
+                        let Ok(cand) = fit_from_host::<F>(p, d, q, y_host) else { continue };
+                        if !cand.converged() || !cand.aicc().is_finite() {
+                            continue;
+                        }
+                        let better = match &local_best {
+                            None => true,
+                            Some(b) => cand.aicc() < b.aicc(),
+                        };
+                        if better {
+                            local_best = Some(cand);
+                        }
+                    }
+                    *slot = local_best;
+                });
             }
-        }
-        best.ok_or(AlgoError::NotConverged { estimator: "auto_arima", max_iter: 200 })
+        });
+
+        slots
+            .into_iter()
+            .flatten()
+            .min_by(|a, b| a.aicc().partial_cmp(&b.aicc()).expect("aicc is finite (filtered above)"))
+            .ok_or(AlgoError::NotConverged { estimator: "auto_arima", max_iter: 200 })
     }
 }
