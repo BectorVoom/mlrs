@@ -965,7 +965,7 @@ where
     // (a no-op on the regressor's unpacked layout). ---
     let binned_handle = pool.acquire(n * d * size_of::<u32>());
     {
-        let (count, dim) = super::launch_dims_1d_folded(n * d, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(n * d, crate::capability::gather_launch_width());
         match &target {
             RfTarget::Class(y_dev, _) => {
                 rf_bin_features_t_packed::launch::<F, ActiveRuntime>(
@@ -1011,7 +1011,7 @@ where
         // no bootstrap: identity rows, filled on device (zero uploads).
         None => {
             let order_a_handle = pool.acquire(t * n * size_of::<u32>());
-            let (count, dim) = super::launch_dims_1d_folded(t * n, super::PERF_TUNED_BLOCK);
+            let (count, dim) = super::launch_dims_1d_folded(t * n, crate::capability::gather_launch_width());
             rf_order_iota::launch::<ActiveRuntime>(
                 &client,
                 count,
@@ -1030,7 +1030,7 @@ where
     let ranges_len = t * max_nodes_level * 2;
     let ranges_a_handle = pool.acquire(ranges_len * size_of::<u32>());
     {
-        let (count, dim) = super::launch_dims_1d_folded(t, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(t, crate::capability::gather_launch_width());
         rf_root_ranges::launch::<ActiveRuntime>(
             &client,
             count,
@@ -1182,7 +1182,7 @@ where
                 let histu = histu_h.as_ref().expect("u32 hist hoisted on atomic path");
                 // K1a: zero the u32 histogram (atomic flush accumulates).
                 {
-                    let (zc, zd) = super::launch_dims_1d_folded(hist_len, super::PERF_TUNED_BLOCK);
+                    let (zc, zd) = super::launch_dims_1d_folded(hist_len, crate::capability::gather_launch_width());
                     rf_hist_zero_u32::launch::<ActiveRuntime>(
                         &client,
                         zc,
@@ -1218,7 +1218,7 @@ where
                 }
                 // K2′: u32 → F conversion + cumulative sum in one pass.
                 {
-                    let (cc, cd) = super::launch_dims_1d_folded(tc * nodes * mf * ncs, super::PERF_TUNED_BLOCK);
+                    let (cc, cd) = super::launch_dims_1d_folded(tc * nodes * mf * ncs, crate::capability::gather_launch_width());
                     rf_hist_cum_u32::launch::<F, ActiveRuntime>(
                         &client,
                         cc,
@@ -1255,7 +1255,7 @@ where
                     } else {
                         hist_h.clone()
                     };
-                    let (count, dim) = super::launch_dims_1d_folded(cols * bh, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(cols * bh, crate::capability::gather_launch_width());
                     match &target {
                         RfTarget::Class(_, _) => {
                             rf_hist_class_part::launch::<F, ActiveRuntime>(
@@ -1309,7 +1309,7 @@ where
                         }
                     }
                     if bh > 1 {
-                        let (rcount, rdim) = super::launch_dims_1d_folded(hist_len, super::PERF_TUNED_BLOCK);
+                        let (rcount, rdim) = super::launch_dims_1d_folded(hist_len, crate::capability::gather_launch_width());
                         rf_hist_reduce::launch::<F, ActiveRuntime>(
                             &client,
                             rcount,
@@ -1325,7 +1325,7 @@ where
 
                 // K2: cumulative histogram over bins.
                 {
-                    let (count, dim) = super::launch_dims_1d_folded(tc * nodes * mf * ncs, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(tc * nodes * mf * ncs, crate::capability::gather_launch_width());
                     rf_hist_cum::launch::<F, ActiveRuntime>(
                         &client,
                         count,
@@ -1347,7 +1347,7 @@ where
             // regressor reads slot 0 only (`nsum = 1`).
             let nsum = if mode_class == 1 { ncs as u32 } else { 1u32 };
             {
-                let (count, dim) = super::launch_dims_1d_folded(stats_len, super::PERF_TUNED_BLOCK);
+                let (count, dim) = super::launch_dims_1d_folded(stats_len, crate::capability::gather_launch_width());
                 rf_node_stats::launch::<F, ActiveRuntime>(
                     &client,
                     count,
@@ -1367,7 +1367,7 @@ where
 
             // K5: split scores.
             {
-                let (count, dim) = super::launch_dims_1d_folded(scores_len, super::PERF_TUNED_BLOCK);
+                let (count, dim) = super::launch_dims_1d_folded(scores_len, crate::capability::gather_launch_width());
                 match &target {
                     RfTarget::Class(_, _) => {
                         rf_split_scores_class::launch::<F, ActiveRuntime>(
@@ -1404,7 +1404,7 @@ where
 
             // K6: per-node best split + leaf finalize (writes model arrays).
             {
-                let (count, dim) = super::launch_dims_1d_folded(stats_len, super::PERF_TUNED_BLOCK);
+                let (count, dim) = super::launch_dims_1d_folded(stats_len, crate::capability::gather_launch_width());
                 rf_best_split::launch::<F, ActiveRuntime>(
                     &client,
                     count,
@@ -1472,7 +1472,7 @@ where
                 .expect("blk buffer hoisted when depth > 0")
                 .clone();
 
-            let (count, dim) = super::launch_dims_1d_folded(units * bp, super::PERF_TUNED_BLOCK);
+            let (count, dim) = super::launch_dims_1d_folded(units * bp, crate::capability::gather_launch_width());
             rf_count_left_blocks::launch::<ActiveRuntime>(
                 &client,
                 count,
@@ -1493,7 +1493,7 @@ where
                 total_nodes as u32,
                 bp as u32,
             );
-            let (count2, dim2) = super::launch_dims_1d_folded(units, super::PERF_TUNED_BLOCK);
+            let (count2, dim2) = super::launch_dims_1d_folded(units, crate::capability::gather_launch_width());
             rf_child_ranges::launch::<ActiveRuntime>(
                 &client,
                 count2,
@@ -1508,7 +1508,7 @@ where
                 total_nodes as u32,
                 bp as u32,
             );
-            let (count3, dim3) = super::launch_dims_1d_folded(units * bp, super::PERF_TUNED_BLOCK);
+            let (count3, dim3) = super::launch_dims_1d_folded(units * bp, crate::capability::gather_launch_width());
             rf_partition_blocks::launch::<ActiveRuntime>(
                 &client,
                 count3,
@@ -1814,7 +1814,7 @@ where
     let t = model.n_trees;
     let d = model.n_features;
     let leaf_h = pool.acquire(t * q * size_of::<u32>());
-    let (count, dim) = super::launch_dims_1d_folded(t * q, super::PERF_TUNED_BLOCK);
+    let (count, dim) = super::launch_dims_1d_folded(t * q, crate::capability::gather_launch_width());
     rf_predict_leaf::launch::<F, ActiveRuntime>(
         &client,
         count,
@@ -1862,7 +1862,7 @@ where
     let t = model.n_trees;
     let nc = model.n_values;
     let proba_h = pool.acquire(q * nc * size_of::<F>());
-    let (count, dim) = super::launch_dims_1d_folded(q, super::PERF_TUNED_BLOCK);
+    let (count, dim) = super::launch_dims_1d_folded(q, crate::capability::gather_launch_width());
     rf_vote_class::launch::<F, ActiveRuntime>(
         &client,
         count,
@@ -1908,7 +1908,7 @@ where
     let client = pool.client().clone();
     let t = model.n_trees;
     let out_h = pool.acquire(q * size_of::<F>());
-    let (count, dim) = super::launch_dims_1d_folded(q, super::PERF_TUNED_BLOCK);
+    let (count, dim) = super::launch_dims_1d_folded(q, crate::capability::gather_launch_width());
     rf_mean_reg::launch::<F, ActiveRuntime>(
         &client,
         count,

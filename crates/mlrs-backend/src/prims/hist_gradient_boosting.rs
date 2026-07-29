@@ -57,7 +57,7 @@ use crate::runtime::ActiveRuntime;
 /// Byte budget for the transient per-level histogram (+ partials + scores)
 /// buffers; deep levels are processed in NODE chunks under it (the
 /// `RF_HIST_BUDGET_BYTES` discipline, extra launches but zero readbacks).
-const HGB_HIST_BUDGET_BYTES: usize = 64 << 20;
+pub(crate) const HGB_HIST_BUDGET_BYTES: usize = 64 << 20;
 
 /// Row-block unit target for the histogram gather: blocks per (tree, node,
 /// feature) are chosen so a level launches roughly this many units, keeping
@@ -66,15 +66,15 @@ const HGB_HIST_BUDGET_BYTES: usize = 64 << 20;
 /// more reduce-pass read of the whole histogram lattice, so past a few
 /// thousand units the management work dominates the row scan (measured: a
 /// 32k-unit / 256-block variant was ~1.7× SLOWER end-to-end at n_bins=255).
-const HGB_HIST_TARGET_UNITS: usize = 4096;
+pub(crate) const HGB_HIST_TARGET_UNITS: usize = 4096;
 
 /// Hard cap on histogram row blocks (bounds the partial-histogram memory and
 /// the `blk * len` u32 index product).
-const HGB_MAX_BLOCKS: usize = 64;
+pub(crate) const HGB_MAX_BLOCKS: usize = 64;
 
 /// sklearn `TreeGrower` internal `min_hessian_to_split` (not exposed on the
 /// estimator surface there either).
-const HGB_MIN_HESSIAN_TO_SPLIT: f64 = 1e-3;
+pub(crate) const HGB_MIN_HESSIAN_TO_SPLIT: f64 = 1e-3;
 
 /// Shared-memory slot budget of [`gbt_hist_atomic`] (fixed comptime
 /// allocation of 4096 × `F`; 16 KiB at f32 / 32 KiB at f64 per cube).
@@ -481,7 +481,7 @@ where
 
         // K1a: zero the histogram (the atomic flush accumulates).
         {
-            let (zc, zd) = super::launch_dims_1d_folded(hist_len, super::PERF_TUNED_BLOCK);
+            let (zc, zd) = super::launch_dims_1d_folded(hist_len, crate::capability::gather_launch_width());
             gbt_hist_zero::launch::<F, ActiveRuntime>(
                 client,
                 zc,
@@ -526,7 +526,7 @@ where
         }
         // K3: cumulative histogram over bins (unchanged).
         {
-            let (count, dim) = super::launch_dims_1d_folded(k * nc * d * 3, super::PERF_TUNED_BLOCK);
+            let (count, dim) = super::launch_dims_1d_folded(k * nc * d * 3, crate::capability::gather_launch_width());
             rf_hist_cum::launch::<F, ActiveRuntime>(
                 client,
                 count,
@@ -564,7 +564,7 @@ where
     {
         let gather_h = part_h.as_ref().unwrap_or(&hist_h);
         let gather_len = if blocks > 1 { part_len } else { hist_len };
-        let (count, dim) = super::launch_dims_1d_folded(k * nc * d * blocks, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(k * nc * d * blocks, crate::capability::gather_launch_width());
         gbt_hist::launch::<F, ActiveRuntime>(
             client,
             count,
@@ -589,7 +589,7 @@ where
 
     // K2: reduce the block axis (skipped when blocks == 1).
     if let Some(part) = &part_h {
-        let (count, dim) = super::launch_dims_1d_folded(hist_len, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(hist_len, crate::capability::gather_launch_width());
         gbt_hist_reduce::launch::<F, ActiveRuntime>(
             client,
             count,
@@ -604,7 +604,7 @@ where
 
     // K3: cumulative histogram over bins (tree.rs kernel, ncs=3).
     {
-        let (count, dim) = super::launch_dims_1d_folded(k * nc * d * 3, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(k * nc * d * 3, crate::capability::gather_launch_width());
         rf_hist_cum::launch::<F, ActiveRuntime>(
             client,
             count,
@@ -662,6 +662,52 @@ where
     // --- ONE host readback: quantile bin edges (the forest concession). ---
     let x_host = x.to_host(pool);
     let edges_host = compute_edges::<F>(&x_host, n, d, nb);
+
+    // --- GBT-PERF-CPU: on the cpu backend the whole boosting loop runs on the
+    //     host worker pool (`hgb_host`), which replays these kernels
+    //     bit-identically without paying `cubecl-cpu`'s thread-per-unit launch
+    //     for every one of the `iters × (depth + 1)` levels. Only the finished
+    //     model arrays go to the device, so predict is unchanged. ---
+    if super::hgb_host::host_fit_applicable() {
+        let (loss, y_f): (super::hgb_host::HostLoss<'_>, Vec<F>) = match &target {
+            HgbTarget::Reg(y) => (super::hgb_host::HostLoss::Reg, y.to_host(pool)),
+            HgbTarget::Binary(y) => (super::hgb_host::HostLoss::Binary, y.to_host(pool)),
+            HgbTarget::Multi(_) => (super::hgb_host::HostLoss::Reg, Vec::new()),
+        };
+        let y_idx_host: Vec<u32> = match &target {
+            HgbTarget::Multi(y) => y.to_host(pool),
+            _ => Vec::new(),
+        };
+        let loss = match &target {
+            HgbTarget::Multi(_) => super::hgb_host::HostLoss::Multi(&y_idx_host),
+            _ => loss,
+        };
+        let hm = super::hgb_host::hgb_fit_host::<F>(
+            &x_host,
+            &edges_host,
+            n,
+            d,
+            &y_f,
+            loss,
+            baseline,
+            params,
+        );
+        drop(x_host);
+        let baseline_f: Vec<F> = baseline.iter().map(|&b| f64_to_host::<F>(b)).collect();
+        return Ok(HgbModel {
+            split_feature: DeviceArray::from_host(pool, &hm.split_feature),
+            threshold: DeviceArray::from_host(pool, &hm.threshold),
+            is_leaf: DeviceArray::from_host(pool, &hm.is_leaf),
+            leaf_value: DeviceArray::from_host(pool, &hm.leaf_value),
+            baseline: DeviceArray::from_host(pool, &baseline_f),
+            n_iters: iters,
+            k,
+            n_classes,
+            max_depth: depth,
+            total_nodes,
+            n_features: d,
+        });
+    }
     drop(x_host);
     let edges_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &edges_host);
 
@@ -670,7 +716,7 @@ where
     // --- Bin the features once on device (n × d u32). ---
     let binned_handle = pool.acquire(n * d * size_of::<u32>());
     {
-        let (count, dim) = super::launch_dims_1d_folded(n * d, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(n * d, crate::capability::gather_launch_width());
         rf_bin_features::launch::<F, ActiveRuntime>(
             &client,
             count,
@@ -691,7 +737,7 @@ where
     // buffer + one launch, once per fit.
     let binned_t_handle = pool.acquire(n * d * size_of::<u32>());
     {
-        let (count, dim) = super::launch_dims_1d_folded(n * d, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(n * d, crate::capability::gather_launch_width());
         rf_bin_features_t::launch::<F, ActiveRuntime>(
             &client,
             count,
@@ -712,7 +758,7 @@ where
     let baseline_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &baseline_f);
     let raw_h = pool.acquire(n * k * size_of::<F>());
     {
-        let (count, dim) = super::launch_dims_1d_folded(n * k, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(n * k, crate::capability::gather_launch_width());
         gbt_init_raw::launch::<F, ActiveRuntime>(
             &client,
             count,
@@ -779,7 +825,7 @@ where
         // G1: per-sample gradients/hessians from the current raw predictions.
         match &target {
             HgbTarget::Reg(y_dev) => {
-                let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
+                let (count, dim) = super::launch_dims_1d_folded(n, crate::capability::gather_launch_width());
                 gbt_grad_reg::launch::<F, ActiveRuntime>(
                     &client,
                     count,
@@ -792,7 +838,7 @@ where
                 );
             }
             HgbTarget::Binary(y_dev) => {
-                let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
+                let (count, dim) = super::launch_dims_1d_folded(n, crate::capability::gather_launch_width());
                 gbt_grad_binary::launch::<F, ActiveRuntime>(
                     &client,
                     count,
@@ -809,7 +855,7 @@ where
                     .as_ref()
                     .expect("softmax staging buffers exist for the Multi target");
                 {
-                    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(n, crate::capability::gather_launch_width());
                     gbt_row_max::launch::<F, ActiveRuntime>(
                         &client,
                         count.clone(),
@@ -819,7 +865,7 @@ where
                         n as u32,
                         k as u32,
                     );
-                    let (count2, dim2) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
+                    let (count2, dim2) = super::launch_dims_1d_folded(n, crate::capability::gather_launch_width());
                     gbt_row_sumexp::launch::<F, ActiveRuntime>(
                         &client,
                         count2,
@@ -831,7 +877,7 @@ where
                         k as u32,
                     );
                 }
-                let (count, dim) = super::launch_dims_1d_folded(n * k, super::PERF_TUNED_BLOCK);
+                let (count, dim) = super::launch_dims_1d_folded(n * k, crate::capability::gather_launch_width());
                 gbt_grad_multi::launch::<F, ActiveRuntime>(
                     &client,
                     count,
@@ -853,7 +899,7 @@ where
         // G2: reset the per-iteration row partition (identity order, root
         // range [0, n) per tree) — a device kernel, zero uploads.
         {
-            let (count, dim) = super::launch_dims_1d_folded(k * n, super::PERF_TUNED_BLOCK);
+            let (count, dim) = super::launch_dims_1d_folded(k * n, crate::capability::gather_launch_width());
             gbt_init_partition::launch::<ActiveRuntime>(
                 &client,
                 count,
@@ -903,7 +949,7 @@ where
                     );
                     let hist_full_h = pool.acquire(hist_len * size_of::<F>());
                     {
-                        let (count, dim) = super::launch_dims_1d_folded(k * left_children * d * nb * 3, super::PERF_TUNED_BLOCK);
+                        let (count, dim) = super::launch_dims_1d_folded(k * left_children * d * nb * 3, crate::capability::gather_launch_width());
                         gbt_hist_subtract::launch::<F, ActiveRuntime>(
                             &client,
                             count,
@@ -940,7 +986,7 @@ where
                 let scores_len = k * nodes * d * (nb - 1);
                 let scores_h = pool.acquire(scores_len * size_of::<F>());
                 {
-                    let (count, dim) = super::launch_dims_1d_folded(scores_len, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(scores_len, crate::capability::gather_launch_width());
                     gbt_split_scores::launch::<F, ActiveRuntime>(
                         &client,
                         count,
@@ -958,7 +1004,7 @@ where
                     );
                 }
                 {
-                    let (count, dim) = super::launch_dims_1d_folded(k * nodes, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(k * nodes, crate::capability::gather_launch_width());
                     gbt_best_split::launch::<F, ActiveRuntime>(
                         &client,
                         count,
@@ -1036,7 +1082,7 @@ where
                     let scores_len = k * nc_now * d * (nb - 1);
                     let scores_h = pool.acquire(scores_len * size_of::<F>());
                     {
-                        let (count, dim) = super::launch_dims_1d_folded(scores_len, super::PERF_TUNED_BLOCK);
+                        let (count, dim) = super::launch_dims_1d_folded(scores_len, crate::capability::gather_launch_width());
                         gbt_split_scores::launch::<F, ActiveRuntime>(
                             &client,
                             count,
@@ -1054,7 +1100,7 @@ where
                         );
                     }
                     {
-                        let (count, dim) = super::launch_dims_1d_folded(k * nc_now, super::PERF_TUNED_BLOCK);
+                        let (count, dim) = super::launch_dims_1d_folded(k * nc_now, crate::capability::gather_launch_width());
                         gbt_best_split::launch::<F, ActiveRuntime>(
                             &client,
                             count,
@@ -1125,7 +1171,7 @@ where
                 let blk_len = units * pb;
                 let blk_h = pool.acquire(blk_len * size_of::<u32>());
                 {
-                    let (count, dim) = super::launch_dims_1d_folded(blk_len, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(blk_len, crate::capability::gather_launch_width());
                     gbt_count_left_blocks::launch::<ActiveRuntime>(
                         &client,
                         count,
@@ -1159,7 +1205,7 @@ where
                     );
                 }
                 {
-                    let (count, dim) = super::launch_dims_1d_folded(units, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(units, crate::capability::gather_launch_width());
                     gbt_child_ranges::launch::<ActiveRuntime>(
                         &client,
                         count,
@@ -1179,7 +1225,7 @@ where
                     );
                 }
                 {
-                    let (count, dim) = super::launch_dims_1d_folded(blk_len, super::PERF_TUNED_BLOCK);
+                    let (count, dim) = super::launch_dims_1d_folded(blk_len, crate::capability::gather_launch_width());
                     gbt_partition_blocks::launch::<ActiveRuntime>(
                         &client,
                         count,
@@ -1224,7 +1270,7 @@ where
         // G3: fold this iteration's trees into the train raw predictions
         // (binned traversal — exactly the training partition rule).
         {
-            let (count, dim) = super::launch_dims_1d_folded(n * k, super::PERF_TUNED_BLOCK);
+            let (count, dim) = super::launch_dims_1d_folded(n * k, crate::capability::gather_launch_width());
             gbt_update_raw::launch::<F, ActiveRuntime>(
                 &client,
                 count,
@@ -1343,7 +1389,7 @@ where
 
     let part_h = pool.acquire(qk * n_blocks * size_of::<F>());
     {
-        let (count, dim) = super::launch_dims_1d_folded(qk * n_blocks, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(qk * n_blocks, crate::capability::gather_launch_width());
         gbt_predict_fused::launch::<F, ActiveRuntime>(
             &client,
             count,
@@ -1392,7 +1438,7 @@ where
 
     let raw_h = pool.acquire(qk * size_of::<F>());
     {
-        let (count, dim) = super::launch_dims_1d_folded(qk, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(qk, crate::capability::gather_launch_width());
         gbt_sum_partials::launch::<F, ActiveRuntime>(
             &client,
             count,
@@ -1455,7 +1501,7 @@ where
 
     if model.k == 1 {
         // Binary: p = σ(raw) → [1 − p, p].
-        let (count, dim) = super::launch_dims_1d_folded(q, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(q, crate::capability::gather_launch_width());
         gbt_proba_binary::launch::<F, ActiveRuntime>(
             &client,
             count,
@@ -1469,7 +1515,7 @@ where
         let mx_h = pool.acquire(q * size_of::<F>());
         let se_h = pool.acquire(q * size_of::<F>());
         {
-            let (count, dim) = super::launch_dims_1d_folded(q, super::PERF_TUNED_BLOCK);
+            let (count, dim) = super::launch_dims_1d_folded(q, crate::capability::gather_launch_width());
             gbt_row_max::launch::<F, ActiveRuntime>(
                 &client,
                 count.clone(),
@@ -1479,7 +1525,7 @@ where
                 q as u32,
                 nc as u32,
             );
-            let (count2, dim2) = super::launch_dims_1d_folded(q, super::PERF_TUNED_BLOCK);
+            let (count2, dim2) = super::launch_dims_1d_folded(q, crate::capability::gather_launch_width());
             gbt_row_sumexp::launch::<F, ActiveRuntime>(
                 &client,
                 count2,
@@ -1491,7 +1537,7 @@ where
                 nc as u32,
             );
         }
-        let (count, dim) = super::launch_dims_1d_folded(q * nc, super::PERF_TUNED_BLOCK);
+        let (count, dim) = super::launch_dims_1d_folded(q * nc, crate::capability::gather_launch_width());
         gbt_proba_multi::launch::<F, ActiveRuntime>(
             &client,
             count,

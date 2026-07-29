@@ -72,6 +72,10 @@ pub mod random_forest;
 // batched level-wise histogram tree pipeline (`mlrs-kernels::gbt` +
 // `tree.rs` binning/traversal reuse).
 pub mod hist_gradient_boosting;
+// GBT-PERF-CPU: the cpu HOST arm of that fit — the same algorithm replayed
+// bit-identically on a persistent worker pool, because `cubecl-cpu` runs one
+// OS thread per unit and the level pipeline is thousands of tiny launches.
+pub(crate) mod hgb_host;
 pub mod eig;
 pub mod gemm;
 pub mod kmeans;
