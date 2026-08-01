@@ -24,7 +24,7 @@
 //! | `sparse_cg` | HOST CG on the device-formed Gram (sklearn's own `Xᵀ(X·x) + αx` operator) | `None` |
 //! | `lsqr` | HOST Paige–Saunders LSQR with `damp = √α` | `Some(itn)` |
 //! | `sag` / `saga` | HOST stochastic average gradient, sklearn's `get_auto_step_size` | `Some(epochs)` |
-//! | `lbfgs` | HOST projected coordinate descent on the Gram (the `positive=True` arm) | `None` |
+//! | `lbfgs` | DEVICE: [`gram_xty`] + [`ridge_nnls`] — projected coordinate descent on the Gram, whole sweep loop in one cube (the `positive=True` arm); HOST twin on cpu / over-cap `d` | `None` |
 //!
 //! The `n_iter_` column is sklearn's, not an mlrs choice: `_ridge_regression`
 //! initializes `n_iter = None` and only `_solve_lsqr` and the `sag`/`saga` arm
@@ -129,7 +129,8 @@
 //! |---|---|---|
 //! | `cholesky` | centering, Gram, factorization, solve — ALL on device | the `d×d` Gram (for the α diagonal write, which cubecl 0.10 cannot do in place) |
 //! | `svd` | centering, SVD (or Gram+eig), both GEMMs | the length-`k` spectrum |
-//! | `sparse_cg`, `lbfgs` | centering, Gram/`Xᵀy` — the whole `O(n·d)` reduction | `d² + d` floats, INDEPENDENT of `n_samples` |
+//! | `lbfgs` | centering, Gram/`Xᵀy`, AND the whole projected-CD solve — one cube, sweep loop in-kernel | NOTHING (host twin on cpu / `d > 256`, which reads `d² + d`) |
+//! | `sparse_cg` | centering, Gram/`Xᵀy` — the whole `O(n·d)` reduction | `d² + d` floats, INDEPENDENT of `n_samples` |
 //! | `lsqr`, `sag`/`saga` | centering | the `n×d` design, ONCE |
 //!
 //! `lsqr` and `sag`/`saga` are the only arms that ship the design matrix back,
@@ -164,6 +165,7 @@ use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::gram::gram_xty;
 use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
+use mlrs_backend::prims::nnls::{device_nnls_applicable, ridge_nnls};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
@@ -542,17 +544,18 @@ where
                 (upload_coef::<F>(pool, &coef), None, RidgeSolver::SparseCg)
             }
             RidgeSolver::Lbfgs => {
-                let (gram, xty) = host_gram::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
-                let (coef, _sweeps) = ridge_solvers::nonnegative_cd(
-                    &gram,
-                    &xty,
+                // sklearn leaves `n_iter_` at None for the lbfgs arm.
+                let coef = solve_nonnegative::<F>(
+                    pool,
+                    x_ref,
+                    y_ref,
+                    n_samples,
                     n_features,
                     alpha64,
                     self.tol,
                     self.max_iter,
-                );
-                // sklearn leaves `n_iter_` at None for the lbfgs arm.
-                (upload_coef::<F>(pool, &coef), None, RidgeSolver::Lbfgs)
+                )?;
+                (coef, None, RidgeSolver::Lbfgs)
             }
             RidgeSolver::Lsqr => {
                 let (xh, yh) = host_design::<F>(pool, x_ref, y_ref);
@@ -1165,12 +1168,64 @@ where
     Ok(coef)
 }
 
+/// The `positive=True` arm (`solver='lbfgs'`): the non-negative ridge solve,
+/// on-device wherever the device kernel applies and on the host otherwise.
+///
+/// Both arms run the SAME projected cyclic coordinate descent on the SAME
+/// device-formed Gram — ascending coordinate order, the same closed-form
+/// projected update off the Gram diagonal, and the same
+/// `max|Δw| ≤ tol·max(1, max|w|)` stop. They differ only in where the arithmetic
+/// happens (and, on the device arm, in the summation order of the per-sweep
+/// gradient rebuild). The objective is strictly convex over a box for `α > 0`,
+/// so the constrained minimiser is UNIQUE and the two arms agree to within the
+/// oracle tolerance rather than merely being "both plausible".
+///
+/// The device arm is the point of the split: `gram_xty` has already produced `G`
+/// and `Xᵀy` in device memory, and the whole `O(d²)`-per-sweep solve fits in one
+/// cube (`prims::nnls`), so nothing crosses the bus — where the host arm must
+/// read `d² + d` floats back, solve, and re-upload `coef`. On cpu (where a
+/// `d`-unit barrier-synchronised cube is a pathology, not a parallel launch) and
+/// for `d` above the kernel's cube-dim cap, the host arm still carries the
+/// solve, so no shape loses support.
+#[allow(clippy::too_many_arguments)]
+fn solve_nonnegative<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_ref: &DeviceArray<ActiveRuntime, F>,
+    y_ref: &DeviceArray<ActiveRuntime, F>,
+    n_samples: usize,
+    n_features: usize,
+    alpha64: f64,
+    tol: f64,
+    max_iter: Option<usize>,
+) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if !device_nnls_applicable::<F>(n_features) {
+        let (gram, xty) = host_gram::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
+        let (coef, _sweeps) =
+            ridge_solvers::nonnegative_cd(&gram, &xty, n_features, alpha64, tol, max_iter);
+        return Ok(upload_coef::<F>(pool, &coef));
+    }
+
+    // Fully device-resident: the Gram stays where `gram_xty` wrote it and the
+    // solve reads it in place, so `coef_` is produced without a single host
+    // round-trip.
+    let (gram, xty) = gram_xty::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
+    let coef = ridge_nnls::<F>(pool, &gram, &xty, n_features, alpha64, tol, max_iter);
+    gram.release_into(pool);
+    xty.release_into(pool);
+    Ok(coef?)
+}
+
 /// Form the raw Gram `XᵀX` (`d×d`) and `Xᵀy` (`d`) on-device and read the two
 /// SMALL results back as `f64` for a host solver.
 ///
 /// The `O(n·d)` reduction stays on the device; what crosses to the host is
-/// `d² + d` floats, independent of `n_samples` — which is why `sparse_cg` and
-/// the `positive` arm never touch the design matrix at all.
+/// `d² + d` floats, independent of `n_samples` — which is why `sparse_cg` (and
+/// the `positive` arm's HOST fallback) never touch the design matrix at all.
+/// The `positive` arm's device path does not call this: it solves the Gram
+/// where `gram_xty` left it, with no read-back (see [`solve_nonnegative`]).
 fn host_gram<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x_ref: &DeviceArray<ActiveRuntime, F>,
