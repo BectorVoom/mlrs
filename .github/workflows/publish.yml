@@ -50,7 +50,7 @@ jobs:
       - name: Build Wheels
         uses: PyO3/maturin-action@v1
         with:
-          manylinux: 2_28
+          container: off
           target: ${{ matrix.target }}
           args: --release --out dist
 
