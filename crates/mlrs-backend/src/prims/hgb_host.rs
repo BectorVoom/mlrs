@@ -105,6 +105,10 @@ pub(crate) trait HostFloat:
     fn from_f64(v: f64) -> Self;
     /// `F::exp`.
     fn exp(self) -> Self;
+    /// `F::abs` (the instance-form `.abs()` the kernels use).
+    fn abs(self) -> Self;
+    /// Widen to `f64` — the host twin of `host_to_f64`.
+    fn to_f64(self) -> f64;
 }
 
 impl HostFloat for f32 {
@@ -122,6 +126,14 @@ impl HostFloat for f32 {
     fn exp(self) -> Self {
         f32::exp(self)
     }
+    #[inline(always)]
+    fn abs(self) -> Self {
+        f32::abs(self)
+    }
+    #[inline(always)]
+    fn to_f64(self) -> f64 {
+        self as f64
+    }
 }
 
 impl HostFloat for f64 {
@@ -138,6 +150,14 @@ impl HostFloat for f64 {
     #[inline(always)]
     fn exp(self) -> Self {
         f64::exp(self)
+    }
+    #[inline(always)]
+    fn abs(self) -> Self {
+        f64::abs(self)
+    }
+    #[inline(always)]
+    fn to_f64(self) -> f64 {
+        self
     }
 }
 

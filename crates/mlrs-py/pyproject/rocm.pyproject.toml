@@ -20,4 +20,4 @@ manifest-path = "crates/mlrs-py/Cargo.toml"
 module-name = "mlrs._mlrs"
 python-source = "crates/mlrs-py/python"
 features = ["rocm", "extension-module"]
-compatibility = "manylinux_2_28"
+compatibility = "manylinux_2_35"

@@ -213,6 +213,22 @@ where
     //     device read. Mirrors cd_solve / laplacian. ---
     validate_geometry(x.len(), y.len(), n, d)?;
 
+    // --- cpu arm (MBSGD-PERF-CPU): the launch-only epoch loop below is
+    //     pathological under cubecl-cpu's one-thread-per-unit mapping — the
+    //     sklearn-equivalent `batch_size == 1` issues ~5 launches per SAMPLE
+    //     for ~2·d FLOP of work. `sgd_host` replays the SAME recurrence, value
+    //     for value, in a scalar host loop. See `sgd_host`'s module docs for
+    //     the bit-identity argument and the measured factor. ---
+    if super::sgd_host::host_solve_applicable() {
+        let x_host = x.to_host(pool);
+        let y_host = y.to_host(pool);
+        let (w, b) = super::sgd_host::sgd_solve_host::<F>(&x_host, &y_host, n, d, params);
+        return Ok((
+            DeviceArray::from_host(pool, &w),
+            DeviceArray::from_host(pool, &[b]),
+        ));
+    }
+
     let elem = size_of::<F>();
     let client = pool.client().clone();
 

@@ -94,6 +94,7 @@ pub mod reduce;
 // scalar params, NOT the algos `SgdConfig` (mlrs-backend does not depend on
 // mlrs-algos).
 pub mod sgd;
+pub(crate) mod sgd_host;
 pub mod svd;
 // Linear-SVM primal objective evaluator (SVM-FIT-CPU perf lever): the margin
 // matvec + per-sample loss + `X̃ᵀg` gradient the `LinearSVC`/`LinearSVR` L-BFGS
