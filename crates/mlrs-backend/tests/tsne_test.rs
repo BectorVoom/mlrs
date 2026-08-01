@@ -130,7 +130,7 @@ fn tsne_gradient_values_f32() {
 
 #[test]
 fn tsne_gradient_values_f64() {
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_case::<f64>(1e-9);

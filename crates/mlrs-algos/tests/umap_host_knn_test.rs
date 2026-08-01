@@ -151,6 +151,13 @@ fn host_knn_matches_device_chebyshev() {
 
 #[test]
 fn host_knn_matches_device_minkowski() {
+    // The minkowski kernel evaluates `F::powf`; a backend without f64
+    // transcendentals cannot compile it (see
+    // `capability::f64_transcendental_supported`). The other metrics are pure
+    // arithmetic and stay covered.
+    if capability::skip_f64_transcendental_with_log() {
+        return;
+    }
     run_agreement("minkowski", Metric::Minkowski { p: 3.0 });
 }
 

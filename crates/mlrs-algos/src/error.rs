@@ -412,6 +412,41 @@ pub enum AlgoError {
         n_samples: usize,
     },
 
+    /// A `fit`-time `sample_weight` carried a NEGATIVE or non-finite entry.
+    /// The weights are data (they arrive with `X`/`y`, not at `build()`), so
+    /// this is an `AlgoError`. It is rejected rather than propagated because
+    /// every weighted solver path either takes `√wᵢ` (NaN for a negative
+    /// weight, which then silently poisons the Gram and every reduction
+    /// downstream of it) or folds `wᵢ` straight into a gradient. Carries the
+    /// FIRST offending index so the caller can find the row.
+    #[error(
+        "estimator '{estimator}': sample_weight[{index}] = {value} is invalid \
+         (must be finite and >= 0)"
+    )]
+    InvalidSampleWeight {
+        /// Which estimator rejected the weights (e.g. `"ridge"`).
+        estimator: &'static str,
+        /// Index of the first offending weight.
+        index: usize,
+        /// The offending weight value.
+        value: f64,
+    },
+
+    /// A `fit`-time `sample_weight` was ALL ZERO. Every sample being weighted
+    /// out leaves no data to fit, and the penalized solve would silently return
+    /// the all-zero coefficient vector as if it were a real answer. sklearn's
+    /// `check_all_zero_sample_weights_error` requires a `ValueError` here whose
+    /// message mentions both "weight" and "zero" — the wording below satisfies
+    /// its `r"(.*weight.*zero.*)|(.*zero.*weight.*)"` pattern.
+    #[error(
+        "estimator '{estimator}': sample_weight sums to zero — at least one \
+         sample must carry a non-zero weight"
+    )]
+    ZeroSampleWeightSum {
+        /// Which estimator rejected the weights (e.g. `"ridge"`).
+        estimator: &'static str,
+    },
+
     /// A construction-class hyperparameter violation raised by a NON-builder
     /// entry point (FIL-01: `ForestInference::from_trees` validates an
     /// imported forest — empty forest / depth over the complete-layout cap —
@@ -949,5 +984,56 @@ pub enum BuildError {
         max_pq: usize,
         /// The `d` bound.
         max_d: usize,
+    },
+
+    /// An iterative-solver estimator was given a negative or non-finite `tol`.
+    /// sklearn's constraint is `Interval(Real, 0, None, closed="left")` — i.e.
+    /// `tol >= 0` — so `0` is ACCEPTED (it just means "iterate to the cap").
+    /// Rejected at `build()` (data-INDEPENDENT, the D-08 split).
+    #[error("estimator '{estimator}': tol = {tol} is invalid (must be finite and >= 0)")]
+    InvalidTol {
+        /// Which estimator's builder rejected the value (e.g. `"ridge"`).
+        estimator: &'static str,
+        /// The offending stopping tolerance.
+        tol: f64,
+    },
+
+    /// An unrecognised `solver` string was supplied (the
+    /// [`TryFrom<&str>`](core::convert::TryFrom) enum-parse failure folded into
+    /// `BuildError` so a single mapper covers it, D-09). Mirrors sklearn's
+    /// `StrOptions` rejection for `Ridge(solver=...)`.
+    #[error("unknown solver '{value}'")]
+    UnknownSolver {
+        /// The unrecognised solver name the caller supplied.
+        value: String,
+    },
+
+    /// `solver='lbfgs'` was requested with `positive=False`. sklearn's
+    /// `Ridge.fit` raises exactly this combination (`"'lbfgs' solver can be used
+    /// only when positive=True."`) because the L-BFGS arm exists solely to carry
+    /// the non-negativity bound; every other solver is faster unconstrained.
+    /// Rejected at `build()` (both operands are data-INDEPENDENT).
+    #[error(
+        "estimator '{estimator}': solver = 'lbfgs' can be used only when \
+         positive = true"
+    )]
+    LbfgsRequiresPositive {
+        /// Which estimator's builder rejected the combination (`"ridge"`).
+        estimator: &'static str,
+    },
+
+    /// `positive=True` was requested with a solver that cannot carry the
+    /// non-negativity bound. sklearn accepts only `'auto'` (which resolves to
+    /// `'lbfgs'`) and `'lbfgs'`; every other solver raises. Rejected at
+    /// `build()` (both operands are data-INDEPENDENT).
+    #[error(
+        "estimator '{estimator}': solver = '{solver}' does not support positive \
+         fitting (use 'auto' or 'lbfgs', or set positive = false)"
+    )]
+    PositiveUnsupportedSolver {
+        /// Which estimator's builder rejected the combination (`"ridge"`).
+        estimator: &'static str,
+        /// The offending solver name.
+        solver: &'static str,
     },
 }

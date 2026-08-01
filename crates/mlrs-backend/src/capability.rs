@@ -146,6 +146,113 @@ pub fn active_plane_width() -> u32 {
         .plane_size_max
 }
 
+/// Does the active backend support f64 TRANSCENDENTALS (`exp` / `ln` / `tanh` /
+/// `powf`) in device code — not merely f64 arithmetic?
+///
+/// [`feature_enabled`]`(FloatKind::F64)` reports whether the adapter accepts the
+/// f64 TYPE (`SHADER_F64`: add / mul / fma / sqrt). That is a strictly weaker
+/// property than being able to EVALUATE a transcendental at f64, and the two
+/// come apart on wgpu:
+///
+/// ```text
+/// ACO ERROR: Unimplemented NIR instr bit size: con 64   %271 = fexp2 %270
+/// ACO ERROR: Unimplemented NIR instr bit size: con 64   %280 = flog2 %276
+/// → SIGSEGV inside the shader compiler
+/// ```
+///
+/// (measured on this environment's adapter, AMD RADV GFX1152, compiling the
+/// softmax loss/grad kernel at f64). The failure is a SEGFAULT in the driver's
+/// compiler, not a clean error return, so a kernel that reaches it takes the
+/// whole process down — `crates/mlrs-backend/tests/lbfgs_test.rs` died with
+/// `signal: 11` and `LogisticRegression`'s f64 oracle either crashed or reported
+/// a spurious `NotConverged`, depending on what else shared the process.
+///
+/// This is not adapter-specific bad luck: WGSL has no `f64` type at all, so a
+/// wgpu backend's f64 support is an extension whose transcendental coverage is
+/// entirely up to the driver. `false` on wgpu is therefore the principled
+/// answer, not a workaround for one GPU. cpu / cuda / rocm evaluate f64
+/// transcendentals natively.
+///
+/// Callers whose kernel uses `exp` / `ln` / `tanh` / `powf` consult this and
+/// take their host arm at f64 (see
+/// [`prims::lbfgs::softmax_loss_grad`](crate::prims::lbfgs::softmax_loss_grad)),
+/// exactly as the shared-memory-budget callers consult
+/// [`active_max_shared_memory`]. Kernels doing only f64 ARITHMETIC are
+/// unaffected and keep running on device.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub const fn f64_transcendental_supported() -> bool {
+    !matches!(active_backend_name().as_bytes(), b"wgpu")
+}
+
+/// Does the active backend FLUSH SUBNORMAL floats to zero in device code?
+///
+/// True on wgpu. WGSL explicitly permits flush-to-zero for subnormals, and this
+/// environment's adapter (AMD RADV/ACO) does flush them, so a subnormal that is
+/// perfectly representable on the host becomes exactly `0.0` once it reaches a
+/// shader. cpu / cuda / rocm preserve subnormals.
+///
+/// This matters wherever a value's meaning depends on a ONE-ULP distinction near
+/// zero. The known case is `ForestInference`'s threshold import: sklearn routes
+/// `x <= t → left` while the mlrs tree kernel routes `x < t → left`, so import
+/// bumps every threshold to `next_up(t)`. For `t = 0.0` that bump is
+/// `1.4e-45` — the smallest positive SUBNORMAL — which a flushing backend turns
+/// straight back into `0.0`, silently undoing the bump and routing
+/// `x == 0.0` RIGHT instead of LEFT (measured: `fil_test` got `proba[0] = 0.375`
+/// where sklearn gives `0.875`).
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub const fn flushes_subnormals() -> bool {
+    matches!(active_backend_name().as_bytes(), b"wgpu")
+}
+
+/// Reject, BEFORE launch, a kernel that needs f64 transcendentals on a backend
+/// that has none — for kernels with no host arm to fall back to.
+///
+/// The alternative is not a failed launch but a SEGFAULT inside the driver's
+/// shader compiler (see [`f64_transcendental_supported`]), which takes the
+/// caller's whole process with it. Returning
+/// [`mlrs_core::PrimError::UnsupportedCapability`] converts that into a
+/// recoverable typed error.
+///
+/// Call this at the NARROWEST site — the specific metric / loss / kernel that
+/// evaluates the transcendental, never a prim's entry point. A whole-prim guard
+/// also rejects callers that never reach the transcendental (euclidean kNN,
+/// squared-loss SGD), which is a functional regression, not a fix. A path that
+/// CAN compute the same thing on the host should do that instead: see
+/// `prims::eig`, `prims::lbfgs::softmax_loss_grad` and `prims::kernel_matrix`,
+/// which stay fully functional at f64 on every backend.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn guard_f64_transcendental<F>(operand: &'static str) -> Result<(), mlrs_core::PrimError> {
+    if std::mem::size_of::<F>() == 8 && !f64_transcendental_supported() {
+        return Err(mlrs_core::PrimError::UnsupportedCapability {
+            operand,
+            capability: "f64 transcendentals (exp/log/powf/tanh) in device code",
+        });
+    }
+    Ok(())
+}
+
+/// Test-side skip gate for the f64-transcendental gap — the sibling of
+/// [`skip_f64_with_log`] for a backend that HAS f64 arithmetic but cannot
+/// evaluate f64 transcendentals.
+///
+/// An f64 oracle whose kernel uses `exp`/`log`/`tanh`/`powf` calls this and
+/// returns early on `true`, so the run is skipped with a logged reason instead
+/// of crashing the test binary. Use it ONLY for primitives that have no host
+/// arm; one that does (eig, softmax loss/grad) must keep running and be
+/// asserted.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn skip_f64_transcendental_with_log() -> bool {
+    if f64_transcendental_supported() {
+        return false;
+    }
+    let backend = active_backend_name();
+    log::warn!(
+        "skipping f64 oracle on {backend}: the adapter accepts f64 but its shader \
+         compiler has no 64-bit exp/log (see capability::f64_transcendental_supported)"
+    );
+    true
+}
+
 /// Active runtime's maximum per-cube shared-memory budget, in bytes.
 ///
 /// Reports `client.properties().hardware.max_shared_memory_size`. Unlike CUDA

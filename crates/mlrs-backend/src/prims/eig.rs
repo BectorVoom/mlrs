@@ -129,7 +129,13 @@ where
     // and HDBSCAN cpu passes hit. It made `Umap::fit` at `n <= 64` (the spectral
     // -init path) take minutes. [`host_jacobi_eig`] replays the identical
     // schedule serially in native code; see it for why the result is unchanged.
-    if host_eig_applicable() {
+    //
+    // The SAME host arm additionally carries every backend whose adapter cannot
+    // hold the kernel's shared tiles at this element width — see
+    // [`eig_shared_memory_fits`]. That is a hard capability constraint, not a
+    // perf choice, so it is checked separately from (and is not overridable by)
+    // the `MLRS_EIG_HOST` A/B knob.
+    if host_eig_applicable() || !eig_shared_memory_fits::<F>() {
         // The working-input handle is either the caller's `out` buffer (released
         // just below via `a_in_owned`, exactly as the device arm does) or a
         // ref-counted clone of `a`'s. Wrapping it to read it back does not
@@ -270,6 +276,44 @@ fn host_eig_applicable() -> bool {
         && crate::abflag::var("MLRS_EIG_HOST")
             .map(|v| v != "0")
             .unwrap_or(true)
+}
+
+/// Can this adapter actually hold [`jacobi_eig_sweep`]'s shared tiles at element
+/// width `F`?
+///
+/// The kernel stages `a_sh` and `v_sh` at the comptime cap
+/// (`MAX_DIM × MAX_DIM` each) plus the length-`MAX_DIM` off-diagonal
+/// accumulator, so it needs `(2·MAX_DIM² + MAX_DIM) · size_of::<F>()` bytes of
+/// shared memory REGARDLESS of the runtime `n` (a comptime allocation cannot
+/// shrink to fit a small matrix). That budget was sized against CUDA's; it
+/// DOUBLES at `f64`:
+///
+/// | width | bytes needed (`MAX_DIM = 64`) |
+/// |---|---|
+/// | `f32` | 33 024 |
+/// | `f64` | 66 048 |
+///
+/// A wgpu adapter advertising the common 65 536-byte limit therefore fits the
+/// `f32` kernel but misses the `f64` one by 512 bytes, and pipeline creation
+/// fails. Crucially it fails SILENTLY: the output buffers are never written, so
+/// the caller reads an all-zero spectrum and reports it as
+/// [`PrimError::NotConverged`] — which is what made every `f64` Gram+eig oracle
+/// red on wgpu (`eig_symmetric_f64_fixture`,
+/// `linear_regression_large_*_f64`, `ridge_svd_gram_eig_matches_cholesky_f64`)
+/// while the `f32` twins passed. Measured on this environment's adapter (AMD
+/// RADV GFX1152): `max_shared_memory_size = 65536`.
+///
+/// This is the same "query the limit and take the other path" guard
+/// `prims::linear_predict::use_shared_predict`, `prims::knn`, and
+/// `prims::distance` already apply to their shared kernels — the difference
+/// being that eig's alternative is the host arm rather than a GATHER kernel.
+/// It also covers a small-LDS adapter at `f32` (16 KiB downlevel default) and a
+/// CUDA device left at the 48 KiB default, neither of which could run the
+/// kernel either.
+fn eig_shared_memory_fits<F>() -> bool {
+    let dim = MAX_DIM as usize;
+    let needed = (2 * dim * dim + dim) * std::mem::size_of::<F>();
+    needed <= crate::capability::active_max_shared_memory()
 }
 
 /// Host twin of [`jacobi_eig_sweep`] — the SAME two-sided cyclic Jacobi, in

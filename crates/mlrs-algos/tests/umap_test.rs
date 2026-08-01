@@ -1075,6 +1075,13 @@ fn transform_property_chebyshev() {
 }
 #[test]
 fn transform_property_minkowski() {
+    // The minkowski kernel evaluates `F::powf`; a backend without f64
+    // transcendentals cannot compile it (see
+    // `capability::f64_transcendental_supported`). The other metrics are pure
+    // arithmetic and stay covered.
+    if capability::skip_f64_transcendental_with_log() {
+        return;
+    }
     run_transform_property("minkowski", Metric::Minkowski { p: 3.0 });
 }
 
@@ -1323,7 +1330,7 @@ fn spectral_init_applicable_matches_eig_cap() {
 fn host_layout_is_thread_count_independent() {
     use mlrs_algos::manifold::umap_host_layout::{drive, LayoutParams, OwnerIndex};
 
-    if !mlrs_algos::manifold::umap_host_layout::host_layout_applicable() {
+    if !mlrs_algos::manifold::umap_host_layout::host_layout_applicable::<f64>() {
         println!("host_layout_is_thread_count_independent: SKIPPED (device layout backend)");
         return;
     }

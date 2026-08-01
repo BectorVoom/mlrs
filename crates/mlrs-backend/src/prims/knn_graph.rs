@@ -136,6 +136,17 @@ pub fn knn_graph<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    // --- Capability guard, MINKOWSKI ONLY: `minkowski_dist` is the one metric
+    //     kernel that evaluates a transcendental (`F::powf`, which lowers to
+    //     `exp2`/`log2`). On a backend with f64 arithmetic but no f64
+    //     transcendentals that kernel SEGFAULTS the driver's shader compiler
+    //     rather than failing the launch. Euclidean / manhattan / chebyshev /
+    //     cosine are pure arithmetic and stay available at f64 everywhere —
+    //     guarding the whole prim instead would reject them too. ---
+    if matches!(metric, Metric::Minkowski { .. }) {
+        crate::capability::guard_f64_transcendental::<F>("knn_graph(minkowski)")?;
+    }
+
     // --- T-13-06 / ASVS V5: validate geometry HOST-SIDE before any launch. ---
     validate_geometry(x.len(), (n, d), k, metric, include_self, p)?;
 

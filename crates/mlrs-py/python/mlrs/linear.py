@@ -75,18 +75,70 @@ class LinearRegression(RegressorMixin, MlrsBase):
 
 
 class Ridge(RegressorMixin, MlrsBase):
-    """L2-regularized least squares (LINEAR-02)."""
+    """L2-regularized least squares (LINEAR-02).
 
-    def __init__(self, alpha=1.0, fit_intercept=True, output_type="input"):
+    ``Ridge(alpha=1.0, fit_intercept=True, copy_X=True, max_iter=None,
+    tol=1e-4, solver='auto', positive=False, random_state=None)`` — the full
+    ``sklearn.linear_model.Ridge`` parameter surface, including
+    ``fit(X, y, sample_weight=...)`` and the ``n_iter_`` / ``solver_`` fitted
+    attributes. See ``crates/mlrs-algos/src/linear/ridge.rs`` for the per-solver
+    routing (and for why ``copy_X`` is a genuine no-op here: mlrs never writes
+    into the caller's buffer).
+    """
+
+    def __init__(
+        self,
+        alpha=1.0,
+        fit_intercept=True,
+        copy_X=True,
+        max_iter=None,
+        tol=1e-4,
+        solver="auto",
+        positive=False,
+        random_state=None,
+        output_type="input",
+    ):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
+        self.copy_X = copy_X
+        self.max_iter = max_iter
+        self.tol = tol
+        self.solver = solver
+        self.positive = positive
+        self.random_state = random_state
         self.output_type = output_type
 
-    def fit(self, X, y):
+    def _seed(self):
+        """``random_state`` -> the ``u64`` seed the Rust ``sag``/``saga`` arm takes.
+
+        ``check_random_state`` accepts all three sklearn spellings (``None`` /
+        ``int`` / ``RandomState``); drawing the seed FROM it keeps an ``int``
+        ``random_state`` reproducible and a ``RandomState`` instance usable,
+        which a plain ``int(...)`` cast would not. ``None`` stays ``None`` so
+        the Rust side applies its documented constant seed.
+        """
+        if self.random_state is None:
+            return None
+        from sklearn.utils import check_random_state
+
+        return int(check_random_state(self.random_state).randint(0, 2**32 - 1))
+
+    def fit(self, X, y, sample_weight=None):
         xa, rows, cols = self._normalize(X)
-        ya = self._normalize_y(y, dtype=LinearRegression._x_float(xa))
-        obj = self._ext().Ridge(self.alpha, self.fit_intercept)
-        obj.fit(xa, ya, rows, cols)
+        dtype = LinearRegression._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = None if sample_weight is None else self._normalize_y(sample_weight, dtype=dtype)
+        obj = self._ext().Ridge(
+            self.alpha,
+            self.fit_intercept,
+            self.copy_X,
+            self.max_iter,
+            self.tol,
+            self.solver,
+            self.positive,
+            self._seed(),
+        )
+        obj.fit(xa, ya, rows, cols, swa)
         self._mlrs_obj = obj
         self._post_fit(cols)
         return self
@@ -104,6 +156,21 @@ class Ridge(RegressorMixin, MlrsBase):
     def intercept_(self):
         self._check_fitted()
         return getattr(self._mlrs_obj, "intercept" + self._suffix())()
+
+    @property
+    def n_iter_(self):
+        """sklearn's ``n_iter_``: ``None`` for the solvers sklearn leaves unset
+        (``cholesky`` / ``svd`` / ``sparse_cg`` / ``lbfgs``)."""
+        self._check_fitted()
+        return self._mlrs_obj.n_iter()
+
+    @property
+    def solver_(self):
+        """sklearn's ``solver_``: the solver that actually ran — ``auto``
+        already resolved, and reflecting the singular-Gram ``cholesky``->``svd``
+        fallback."""
+        self._check_fitted()
+        return self._mlrs_obj.solver_used()
 
 
 class Lasso(RegressorMixin, MlrsBase):

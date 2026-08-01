@@ -1517,6 +1517,17 @@ fn core_distances_host_matches_device() {
         // precisely BECAUSE `knn_graph`'s GEMM cosine `‖x̂ − ŷ‖²/2` and
         // `1 − x̂·ŷ` disagree on a zero row.
     ] {
+        // This gate compares the HOST scan against the DEVICE `knn_graph`, so it
+        // needs the device path to actually run. Minkowski's kernel evaluates
+        // `F::powf`, which a backend without f64 transcendentals cannot compile
+        // (`capability::f64_transcendental_supported`) — skip just that metric
+        // there and keep covering euclidean / manhattan / chebyshev, rather than
+        // dropping the whole gate.
+        if matches!(knn_metric, KnnMetric::Minkowski { .. })
+            && capability::skip_f64_transcendental_with_log()
+        {
+            continue;
+        }
         for k in [1usize, 2, 5, 9] {
             let (idx_dev, dist_dev) =
                 knn_graph::<f64>(&mut pool, &x_dev, (n, d), k, knn_metric, true, mink_p)

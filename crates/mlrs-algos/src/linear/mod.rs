@@ -40,6 +40,7 @@ pub mod lasso;
 pub mod linear_regression;
 pub mod logistic;
 pub mod ridge;
+pub mod ridge_solvers;
 
 // Phase-10 SGD / linear-SVM (SGDSVM-01..04). This index lands the shared
 // `sgd_config` (typed Loss/Penalty/LearningRate enums + `SgdConfig` lowering

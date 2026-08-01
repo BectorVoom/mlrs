@@ -90,6 +90,11 @@ pub fn tsne_gradient<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    // --- Capability guard: the gradient kernel's t-distribution weight is
+    //     `(1 + d²/dof)^(-(dof+1)/2)` — a `powf`, unconditional for every input.
+    //     See capability::guard_f64_transcendental. ---
+    crate::capability::guard_f64_transcendental::<F>("tsne_gradient")?;
+
     // --- ASVS V5: validate geometry HOST-SIDE before any launch. ---
     let nn = n.checked_mul(n).ok_or(PrimError::Overflow {
         operand: "p",

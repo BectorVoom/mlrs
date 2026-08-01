@@ -864,6 +864,19 @@ where
     let q_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &q_f);
     let t_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &t_f);
 
+    // --- Capability guard, MINKOWSKI ONLY: `minkowski_dist` is the one metric
+    //     kernel here that evaluates `F::powf` (lowered to `exp2`/`log2`). On a
+    //     backend with f64 arithmetic but no f64 transcendentals it SEGFAULTS the
+    //     driver's shader compiler instead of failing the launch. Manhattan and
+    //     chebyshev are SEPARATE kernels and pure arithmetic, so they are not
+    //     gated. This transform path launches the metric kernels DIRECTLY rather
+    //     than through `knn_graph`, so it needs its own guard — the one in
+    //     `prims::knn_graph` does not cover it. ---
+    if matches!(knn_metric, knn_graph::Metric::Minkowski { .. }) {
+        mlrs_backend::capability::guard_f64_transcendental::<F>("umap.transform(minkowski)")
+            .map_err(AlgoError::Prim)?;
+    }
+
     // --- distance(X_new, X_train) → (m × n). ---
     let dist: DeviceArray<ActiveRuntime, F> = match knn_metric {
         knn_graph::Metric::Euclidean | knn_graph::Metric::Cosine => {
@@ -996,7 +1009,7 @@ where
     // On the cpu backend the device prim's query-axis tiling costs four orders of
     // magnitude for no benefit (see `umap_host_knn`), so the same graph is built
     // by a direct host scan there. Every other backend keeps the prim.
-    let (knn_idx_host, knn_dist_host) = if umap_host_knn::host_knn_applicable() {
+    let (knn_idx_host, knn_dist_host) = if umap_host_knn::host_knn_applicable::<F>() {
         let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
         umap_host_knn::host_knn(&x_host, n, d, k, cfg.metric)
     } else {
@@ -1197,7 +1210,7 @@ fn run_epochs<F>(
 ) where
     F: Float + CubeElement + Pod,
 {
-    if umap_host_layout::host_layout_applicable() {
+    if umap_host_layout::host_layout_applicable::<F>() {
         let owners =
             umap_host_layout::OwnerIndex::build(head, tail, epochs_per_sample, n_owners);
         let params = umap_host_layout::LayoutParams {

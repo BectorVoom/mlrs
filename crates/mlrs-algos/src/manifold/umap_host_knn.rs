@@ -83,7 +83,19 @@ const MIN_ROWS_PER_THREAD: usize = 16;
 ///
 /// `MLRS_UMAP_HOST_KNN=0` forces the device prim back on for on-target A/B; `=1`
 /// cannot force the host scan onto a non-cpu backend.
-pub fn host_knn_applicable() -> bool {
+
+/// Additionally forced when the element type is `f64` and the backend cannot
+/// evaluate f64 transcendentals: the device path this replaces evaluates
+/// the device kNN prim's minkowski `powf`, and on such a backend that does not fail at launch — the
+/// driver's shader compiler SEGFAULTS (measured: `ACO ERROR: Unimplemented NIR
+/// instr bit size: 64 fexp2` → `signal: 11`). This arm is the only way the f64
+/// path can run there at all, so the capability check is NOT overridable by the
+/// `MLRS_UMAP_HOST_KNN` A/B knob, which stays a pure perf switch. See
+/// `mlrs_backend::capability::f64_transcendental_supported`.
+pub fn host_knn_applicable<F>() -> bool {
+    if std::mem::size_of::<F>() == 8 && !capability::f64_transcendental_supported() {
+        return true;
+    }
     capability::active_backend_name() == "cpu"
         && mlrs_backend::abflag::var("MLRS_UMAP_HOST_KNN")
             .map(|v| v != "0")

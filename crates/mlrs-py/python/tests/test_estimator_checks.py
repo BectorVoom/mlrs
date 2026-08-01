@@ -56,8 +56,18 @@ def _estimators():
         # --- Plan 16-11: the 15 newly-added shim classes. ----------------- #
         mlrs.LinearSVC(),
         mlrs.LinearSVR(),
-        mlrs.MBSGDClassifier(),
-        mlrs.MBSGDRegressor(),
+        # MBSGD: `max_iter` shrunk for the check-sweep's 30-row fixtures, the
+        # same treatment RandomForest/HGB get below. At the class default
+        # (`max_iter=1000`) a SINGLE fit of a 30x4 matrix costs ~163 s on the cpu
+        # backend — ~141 ms per epoch, flat, so the cost is kernel-LAUNCH bound
+        # (one OS thread per unit spawned and joined per epoch on `cubecl-cpu`),
+        # not arithmetic. The harness fits each estimator ~49 times, so the two
+        # MBSGD entries alone contributed hours to the sweep. These checks are
+        # API-conformance on tiny fixtures, not convergence tests, so the
+        # iteration count carries nothing here. Production defaults are
+        # untouched.
+        mlrs.MBSGDClassifier(max_iter=20),
+        mlrs.MBSGDRegressor(max_iter=20),
         mlrs.GaussianNB(),
         mlrs.MultinomialNB(),
         mlrs.BernoulliNB(),
@@ -170,7 +180,25 @@ def _merge(*dicts):
 # type(est).__name__ so a single mapping covers the parametrized instances.
 _EXPECTED = {
     "LinearRegression": _merge(_COMMON, _SUPERVISED),
-    "Ridge": _merge(_COMMON, _SUPERVISED),
+    # Ridge exposes sklearn's full parameter surface, which INCLUDES `max_iter`.
+    # `check_non_transformer_estimators_n_iter` is gated purely on that
+    # parameter existing and then asserts `n_iter_ >= 1` — but sklearn's OWN
+    # Ridge leaves `n_iter_` at None for the default `solver='cholesky'` (only
+    # `lsqr`/`sag`/`saga` populate it in `_ridge_regression`). mlrs reproduces
+    # that exactly, so the check cannot pass without diverging from sklearn.
+    "Ridge": _merge(
+        _COMMON,
+        _SUPERVISED,
+        {
+            "check_non_transformer_estimators_n_iter": (
+                "Ridge has `max_iter` but, like sklearn's own Ridge, reports "
+                "`n_iter_ = None` for the direct solvers (cholesky/svd/"
+                "sparse_cg/lbfgs) — only lsqr/sag/saga set it. Matching "
+                "sklearn's n_iter_ semantics is the point; passing this check "
+                "would require diverging from them."
+            )
+        },
+    ),
     "Lasso": _merge(_COMMON, _SUPERVISED, _N_ITER),
     "ElasticNet": _merge(_COMMON, _SUPERVISED, _N_ITER),
     # LogisticRegression's y (like every supervised estimator's) now goes

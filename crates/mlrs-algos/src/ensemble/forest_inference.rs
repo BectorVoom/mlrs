@@ -36,6 +36,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::random_forest::{rf_predict_proba, rf_predict_reg, RfModel};
@@ -392,14 +393,39 @@ fn tree_depth(t: &TreeSpec, node: usize, depth: usize) -> Option<usize> {
 
 /// `next_up(t)` in the TARGET precision `F` (f32 arm bumps the f32-rounded
 /// value; f64 arm the f64). Non-finite thresholds pass through unchanged.
+///
+/// ## Subnormal bumps on a flush-to-zero backend
+/// `next_up` of a ZERO threshold is the smallest positive SUBNORMAL
+/// (`1.4e-45` at f32). A backend that flushes subnormals — wgpu does, see
+/// [`capability::flushes_subnormals`] — turns that straight back into `0.0` in
+/// the shader, silently undoing the bump: the kernel then evaluates
+/// `x < 0.0` where it should evaluate `x <= 0.0`, so a query sitting exactly ON
+/// a zero threshold routes RIGHT instead of LEFT. That is a WRONG PREDICTION,
+/// not a rounding difference (`fil_test` measured `proba[0] = 0.375` against
+/// sklearn's `0.875`).
+///
+/// On such a backend the bump is snapped up to the smallest NORMAL value
+/// instead. That is exact, not approximate: every value strictly between `0`
+/// and `MIN_POSITIVE` is subnormal, so the backend flushes it to `0` anyway —
+/// `x < MIN_POSITIVE` and `x <= 0` select precisely the same set of
+/// device-representable inputs there. Backends that preserve subnormals keep
+/// the true `next_up`, where snapping WOULD be wrong (it would route a genuine
+/// subnormal `x > 0` to the left child).
 fn bump_threshold<F: Pod>(t: f64) -> F {
+    let flush = capability::flushes_subnormals();
     match std::mem::size_of::<F>() {
         4 => {
-            let b = (t as f32).next_up();
+            let mut b = (t as f32).next_up();
+            if flush && b.is_finite() && b != 0.0 && b.abs() < f32::MIN_POSITIVE {
+                b = f32::MIN_POSITIVE.copysign(b);
+            }
             *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&b))
         }
         8 => {
-            let b = t.next_up();
+            let mut b = t.next_up();
+            if flush && b.is_finite() && b != 0.0 && b.abs() < f64::MIN_POSITIVE {
+                b = f64::MIN_POSITIVE.copysign(b);
+            }
             *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&b))
         }
         _ => unreachable!("forest_inference is f32/f64 only"),

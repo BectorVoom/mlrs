@@ -2076,6 +2076,166 @@ def gen_ridge(seed: int = SEED, dtype=np.float32,
     return out_path
 
 
+# --- Ridge FULL parameter surface (LINEAR-02) ------------------------------ #
+# Geometry for the `gen_ridge_params` fixture. Deliberately larger and
+# better-conditioned than the LIN_* alpha-sweep fixture: the stochastic solvers
+# (`sag`/`saga`) need enough samples for their averaged-gradient table to be
+# meaningful, and every solver must land on the SAME minimizer for the
+# cross-solver agreement assert to be a real gate rather than a tautology.
+RIDGE_PARAMS_N_SAMPLES, RIDGE_PARAMS_N_FEATURES = 40, 5
+# alpha > 0 makes the objective STRICTLY convex, hence a unique minimizer that
+# every solver must reach — the premise of comparing eight solvers to one
+# reference. (alpha = 0 is covered by the LinearRegression fixtures.)
+RIDGE_PARAMS_ALPHA = 1.0
+# Both sides are run to a TIGHT tolerance so the comparison is against the
+# CONVERGED optimum, not against scipy's/sklearn's particular early-stop point:
+# at sklearn's own default tol=1e-4 the iterative solvers stop while still
+# ~1e-4 away, which would make a 1e-5 oracle gate meaningless.
+RIDGE_PARAMS_TOL = 1e-10
+RIDGE_PARAMS_MAX_ITER = 100000
+
+
+def gen_ridge_params(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the Ridge full-parameter-surface fixture (LINEAR-02).
+
+    Covers every ``sklearn.linear_model.Ridge`` ctor parameter that changes the
+    fit — all eight ``solver`` values, ``fit_intercept``, ``positive``, and
+    ``fit(..., sample_weight=...)`` — plus the ``solver_`` attribute each case
+    resolves to. ``copy_X`` is excluded on purpose: it cannot change the result
+    (it only controls whether sklearn centers in place), and ``max_iter``/``tol``
+    are exercised as the CONVERGENCE knobs they are rather than as separate
+    cases (see ``RIDGE_PARAMS_TOL``).
+
+    Each case is stored as ``coef_<case>`` / ``intercept_<case>`` /
+    ``solver_<case>``. The reference is fitted on the design AFTER the
+    round-trip through the fixture dtype, so an f32 fixture's reference is the
+    answer for the exact bytes the test feeds back in (the f32/f64 split is
+    then purely about the solver's working precision).
+
+    Requires ``scikit-learn==1.9.0``.
+    """
+    import warnings
+
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.linear_model import Ridge
+
+    n, d = RIDGE_PARAMS_N_SAMPLES, RIDGE_PARAMS_N_FEATURES
+    rng = np.random.default_rng(seed + 77)
+    # Round-trip through the fixture dtype BEFORE fitting (see the docstring).
+    x = rng.standard_normal((n, d)).astype(dtype).astype(np.float64)
+    true_coef = rng.standard_normal(d)
+    y = (x @ true_coef + 0.5 + 0.01 * rng.standard_normal(n)).astype(dtype).astype(np.float64)
+    # Strictly-positive, non-uniform weights so the weighted cases genuinely
+    # differ from the unweighted ones.
+    sw = rng.uniform(0.25, 3.0, size=n).astype(dtype).astype(np.float64)
+
+    common = dict(
+        alpha=RIDGE_PARAMS_ALPHA,
+        tol=RIDGE_PARAMS_TOL,
+        max_iter=RIDGE_PARAMS_MAX_ITER,
+    )
+    # (case name, ctor kwargs, use_sample_weight)
+    cases = [
+        # --- the eight solver values, fit_intercept=True, unweighted --------- #
+        ("auto", dict(solver="auto"), False),
+        ("cholesky", dict(solver="cholesky"), False),
+        ("svd", dict(solver="svd"), False),
+        ("lsqr", dict(solver="lsqr"), False),
+        ("sparse_cg", dict(solver="sparse_cg"), False),
+        ("sag", dict(solver="sag", random_state=0), False),
+        ("saga", dict(solver="saga", random_state=0), False),
+        # --- positive=True: 'lbfgs' explicitly, and via 'auto' -------------- #
+        ("lbfgs_pos", dict(solver="lbfgs", positive=True), False),
+        ("auto_pos", dict(solver="auto", positive=True), False),
+        # --- fit_intercept=False -------------------------------------------- #
+        ("cholesky_noint", dict(solver="cholesky", fit_intercept=False), False),
+        ("svd_noint", dict(solver="svd", fit_intercept=False), False),
+        ("lsqr_noint", dict(solver="lsqr", fit_intercept=False), False),
+        ("sag_noint", dict(solver="sag", fit_intercept=False, random_state=0), False),
+        ("lbfgs_pos_noint", dict(solver="lbfgs", positive=True, fit_intercept=False), False),
+        # --- sample_weight (the `_rescale_data` regime AND the sag/saga
+        #     direct-weight regime, which sklearn splits on) ------------------ #
+        ("cholesky_sw", dict(solver="cholesky"), True),
+        ("svd_sw", dict(solver="svd"), True),
+        ("lsqr_sw", dict(solver="lsqr"), True),
+        ("sparse_cg_sw", dict(solver="sparse_cg"), True),
+        ("sag_sw", dict(solver="sag", random_state=0), True),
+        ("saga_sw", dict(solver="saga", random_state=0), True),
+        ("lbfgs_pos_sw", dict(solver="lbfgs", positive=True), True),
+        ("cholesky_noint_sw", dict(solver="cholesky", fit_intercept=False), True),
+    ]
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    out = {"X": c(x), "y": c(y), "sample_weight": c(sw)}
+    solver_names = []
+    for name, kwargs, use_sw in cases:
+        est = Ridge(**{**common, **kwargs})
+        with warnings.catch_warnings():
+            # A ConvergenceWarning here would mean the reference itself is not
+            # at the optimum — turn it into an error so a bad fixture cannot be
+            # committed silently.
+            warnings.simplefilter("error", ConvergenceWarning)
+            est.fit(x, y, sample_weight=sw if use_sw else None)
+        out[f"coef_{name}"] = c(est.coef_)
+        out[f"intercept_{name}"] = c([est.intercept_])
+        solver_names.append(f"{name}={est.solver_}")
+
+    # Every unweighted, intercept-fitting, unconstrained solver must agree with
+    # `cholesky` — the premise of the whole fixture. Asserted HERE (at
+    # generation) so a sklearn upgrade that breaks it is caught in the script
+    # rather than showing up as an unexplained Rust test failure.
+    ref = out["coef_cholesky"].astype(np.float64)
+    for name in ("auto", "svd", "lsqr", "sparse_cg", "sag", "saga"):
+        got = out[f"coef_{name}"].astype(np.float64)
+        assert np.allclose(got, ref, atol=1e-7, rtol=1e-7), (
+            f"gen_ridge_params: solver '{name}' disagrees with 'cholesky' "
+            f"({got} vs {ref}) — the converged-optimum premise does not hold"
+        )
+    # The non-negativity constraint must actually BIND (otherwise the positive
+    # cases would silently be the same test as the unconstrained ones).
+    assert (out["coef_lbfgs_pos"] >= 0).all(), "positive fit produced a negative coef_"
+    assert (ref < 0).any(), (
+        "gen_ridge_params: the unconstrained solution is already all-positive, "
+        "so `positive=True` is not exercised — reseed the fixture"
+    )
+
+    # sklearn's `solver_` per case, asserted HERE rather than shipped in the
+    # archive: `mlrs_core::load_npz` rejects any array that is not a 4- or
+    # 8-byte float, so a string array would break the whole fixture load. The
+    # Rust/Python tests carry the same expectations as literals.
+    expected_resolution = {
+        "auto": "cholesky",
+        "cholesky": "cholesky",
+        "svd": "svd",
+        "lsqr": "lsqr",
+        "sparse_cg": "sparse_cg",
+        "sag": "sag",
+        "saga": "saga",
+        "lbfgs_pos": "lbfgs",
+        "auto_pos": "lbfgs",
+    }
+    resolved = dict(pair.split("=", 1) for pair in solver_names)
+    for case, want in expected_resolution.items():
+        assert resolved[case] == want, (
+            f"gen_ridge_params: sklearn resolved solver_ for '{case}' to "
+            f"'{resolved[case]}', expected '{want}' — the auto-dispatch "
+            f"assumption in ridge.rs::RidgeSolver::resolve has drifted"
+        )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"ridge_params_{dtype_tag}_seed{seed}.npz")
+    out["alpha"] = c([RIDGE_PARAMS_ALPHA])
+    # Every array in an oracle .npz must be float32/float64 (the loader's
+    # contract), so max_iter ships as a float and the reader casts it back.
+    out["tol"] = np.asarray([RIDGE_PARAMS_TOL], dtype=np.float64)
+    out["max_iter"] = np.asarray([float(RIDGE_PARAMS_MAX_ITER)], dtype=np.float64)
+    np.savez(out_path, **out)
+    return out_path
+
+
 def gen_pca(seed: int = SEED, dtype=np.float32, shape=PCA_TALL,
             n_components: int = PCA_N_COMPONENTS_TALL, kind: str = "tall") -> str:
     """Generate one seeded PCA fixture (DECOMP-01, sklearn svd_solver='full').
@@ -4566,6 +4726,10 @@ def main() -> None:
     # Ridge (LINEAR-02): cholesky solver, alpha sweep incl. the strict 1.0 case.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_ridge(dtype=dtype)}")
+    # Ridge FULL parameter surface (LINEAR-02): every sklearn `solver`, with and
+    # without `fit_intercept` / `positive` / `sample_weight`.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_ridge_params(dtype=dtype)}")
     # PCA (DECOMP-01): tall (m>n) + wide (n_features>n_samples); svd_solver=full.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_pca(dtype=dtype, shape=PCA_TALL, n_components=PCA_N_COMPONENTS_TALL, kind='tall')}")

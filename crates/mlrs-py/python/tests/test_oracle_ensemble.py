@@ -574,16 +574,6 @@ HGB_DET_KW = dict(
 HGB_ACC_MARGIN = 0.05
 HGB_R2_MARGIN = 0.05
 
-_HGB_XFAIL_REASON = (
-    "HGB algos churn in flight -- see .planning/plans/py-ensemble/PLAN.md "
-    "TASK-17/TASK-24; crates/mlrs-backend/src/prims/hist_gradient_boosting.rs, "
-    "crates/mlrs-kernels/src/gbt.rs, scripts/gen_oracle.py, and all four "
-    "tests/fixtures/hgb_{cls,reg}_{f32,f64}_seed42.npz are uncommitted "
-    "(git status --short re-run fresh 2026-07-18 at TASK-24's own Green "
-    "time: all 7 paths still 'M', identical to TASK-17's finding)."
-)
-
-
 def _hgb_classifier(**kw):
     return mlrs.HistGradientBoostingClassifier(**kw)
 
@@ -592,7 +582,6 @@ def _hgb_regressor(**kw):
     return mlrs.HistGradientBoostingRegressor(**kw)
 
 
-@pytest.mark.xfail(reason=_HGB_XFAIL_REASON, strict=False)
 @pytest.mark.parametrize("fixture", HGB_CLS_FIXTURES)
 @requires_f64
 def test_hgb_classifier_deterministic_multiclass(fixture):
@@ -614,7 +603,6 @@ def test_hgb_classifier_deterministic_multiclass(fixture):
     assert np.allclose(proba, refp, atol=_atol(fixture), rtol=0.0)
 
 
-@pytest.mark.xfail(reason=_HGB_XFAIL_REASON, strict=False)
 @pytest.mark.parametrize("fixture", HGB_CLS_FIXTURES)
 @requires_f64
 def test_hgb_classifier_deterministic_binary(fixture):
@@ -675,7 +663,6 @@ def test_hgb_classifier_invalid_n_bins_raises():
         clf.fit(X, y)
 
 
-@pytest.mark.xfail(reason=_HGB_XFAIL_REASON, strict=False)
 @pytest.mark.parametrize("fixture", HGB_REG_FIXTURES)
 @requires_f64
 def test_hgb_regressor_deterministic(fixture):

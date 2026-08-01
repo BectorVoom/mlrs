@@ -428,7 +428,18 @@ where
         //        the in-place scale-map idiom). ---
         let n_elems = n_query * n_samples;
         let h = f64_to_host::<F>(bandwidth);
-        launch_kde_map_in_place(pool, &dmat, n_elems, self.kernel, h);
+        // The gaussian / exponential / cosine maps evaluate a TRANSCENDENTAL
+        // (`exp`, `cos`); on a backend with f64 arithmetic but no f64
+        // transcendentals those kernels return garbage (a wgpu f64 gaussian KDE
+        // produced `NaN` log-densities and a `+4.45e2` where sklearn has
+        // `-5.60`). Route just the map to the host there — the O(n_query ·
+        // n_samples · d) distance base above stays on device.
+        let dmat = if kde_host_map_applicable::<F>(self.kernel) {
+            kde_map_host(pool, dmat, n_elems, self.kernel, bandwidth)
+        } else {
+            launch_kde_map_in_place(pool, &dmat, n_elems, self.kernel, h);
+            dmat
+        };
 
         // --- 3. Per-query (row) log-sum-exp via the v1 reduce prim (D-11). Plain
         //        reduce-SUM in the linear domain: row_sum = Σ_j kernel_value. The
@@ -471,6 +482,68 @@ where
         }
         Ok(DeviceArray::from_host(pool, &out_host))
     }
+}
+
+/// Does this KD kernel's per-element map need the HOST because the backend
+/// cannot evaluate f64 transcendentals?
+///
+/// Only `Gaussian` (`exp`), `Exponential` (`exp`) and `Cosine` (`cos`) evaluate
+/// one; `Tophat` / `Epanechnikov` / `Linear` are pure arithmetic and keep
+/// running on device at every precision. See
+/// `mlrs_backend::capability::f64_transcendental_supported`.
+fn kde_host_map_applicable<F>(kernel: KdKernel) -> bool {
+    std::mem::size_of::<F>() == 8
+        && !mlrs_backend::capability::f64_transcendental_supported()
+        && matches!(
+            kernel,
+            KdKernel::Gaussian | KdKernel::Exponential | KdKernel::Cosine
+        )
+}
+
+/// Host twin of [`launch_kde_map_in_place`], in `f64`.
+///
+/// Applies the SAME per-element formula each `kde_*_map` kernel applies,
+/// including the compact-support guards, so the only thing that changes is where
+/// the arithmetic runs. `cubecl` 0.10 cannot write in place into an existing
+/// handle, so the distance buffer is released and the mapped values re-staged —
+/// `from_host` recycles the just-freed bytes off the pool free-list, so no
+/// second live `n_query · n_samples` allocation exists.
+fn kde_map_host<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    dmat: DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    kernel: KdKernel,
+    bandwidth: f64,
+) -> DeviceArray<ActiveRuntime, F>
+where
+    F: Float + CubeElement + Pod,
+{
+    let h = bandwidth;
+    let mut host: Vec<F> = dmat.to_host(pool);
+    for v in host.iter_mut().take(n) {
+        let x = host_to_f64(*v);
+        let mapped = match kernel {
+            // `in` is the SQUARED distance for gaussian (Pitfall 4).
+            KdKernel::Gaussian => (-0.5 * x / (h * h)).exp(),
+            // `in` is the RAW distance for exponential.
+            KdKernel::Exponential => (-x / h).exp(),
+            // `in` is the RAW distance for cosine; exact 0 outside support.
+            KdKernel::Cosine => {
+                if x >= h {
+                    0.0
+                } else {
+                    (std::f64::consts::FRAC_PI_2 * x / h).cos()
+                }
+            }
+            // The arithmetic-only kernels never route here (see
+            // `kde_host_map_applicable`); leaving the value untouched would be a
+            // silent wrong answer, so this is unreachable by construction.
+            other => unreachable!("kde_map_host called for a non-transcendental kernel {other:?}"),
+        };
+        *v = f64_to_host::<F>(mapped);
+    }
+    dmat.release_into(pool);
+    DeviceArray::from_host(pool, &host)
 }
 
 /// Launch the per-element KD density-value map IN PLACE over the distance buffer

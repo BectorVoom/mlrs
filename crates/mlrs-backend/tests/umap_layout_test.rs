@@ -40,7 +40,7 @@ fn from_f<F: bytemuck::Pod>(v: F) -> f64 {
 fn gate_f64(case: &str) -> bool {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("umap_layout {case} f64 backend={backend}: SKIPPED (no f64 support)");
         return true;
     }

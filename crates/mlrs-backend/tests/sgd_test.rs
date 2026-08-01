@@ -272,7 +272,7 @@ fn sgd_cpu_launch() {
     run_weight_update_match::<f32>("f32");
 
     // f64 runs on cpu, skips-with-log on rocm (D-07).
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_margin_match::<f64>("f64");
@@ -286,7 +286,7 @@ fn sgd_cpu_launch() {
 fn sgd_margin_matches_host() {
     let _ = env_logger::builder().is_test(true).try_init();
     run_margin_match::<f32>("f32");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_margin_match::<f64>("f64");
@@ -296,7 +296,7 @@ fn sgd_margin_matches_host() {
 fn sgd_weight_update_matches_host() {
     let _ = env_logger::builder().is_test(true).try_init();
     run_weight_update_match::<f32>("f32");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_weight_update_match::<f64>("f64");
@@ -456,7 +456,7 @@ fn sgd_convex_objective() {
     run_convex_objective::<f32>("f32", 1e-3);
 
     // f64: strict 1e-5 (runs on cpu, skips-with-log on rocm).
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_convex_objective::<f64>("f64", 1e-5);
@@ -558,7 +558,7 @@ fn run_grad_match<F: Float + CubeElement + bytemuck::Pod>(label: &str) {
 fn sgd_grad_matches_host_dloss() {
     let _ = env_logger::builder().is_test(true).try_init();
     run_grad_match::<f32>("f32");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_grad_match::<f64>("f64");
@@ -664,7 +664,7 @@ fn run_l1_shrink_match<F: Float + CubeElement + bytemuck::Pod>(label: &str) {
 fn sgd_l1_shrink_matches_host() {
     let _ = env_logger::builder().is_test(true).try_init();
     run_l1_shrink_match::<f32>("f32");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_l1_shrink_match::<f64>("f64");

@@ -464,6 +464,32 @@ where
     // --- ASVS V5 / T-05-06-01: validate geometry BEFORE any unsafe launch. ---
     validate_softmax_geometry(x.len(), y.len(), w.len(), b.len(), n, d, k)?;
 
+    // --- f64-transcendental host arm. The kernel's `.exp()` / `.ln()` are the
+    //     ONLY reason this cannot run everywhere: on a backend whose shader
+    //     compiler has no f64 `exp`/`log` (wgpu — WGSL has no f64 at all, so
+    //     coverage is a driver extension) the launch does not fail cleanly, it
+    //     SEGFAULTS inside the driver. See
+    //     `capability::f64_transcendental_supported` for the measured ACO error.
+    //
+    //     Falling back costs nothing structural here: the kernel is a
+    //     SINGLE-UNIT gather (`if UNIT_POS == 0` — see `mlrs_kernels::lbfgs`),
+    //     so the device version is already fully serial, and `lbfgs_minimize`
+    //     that drives it is host code consuming host scalars. The host twin is
+    //     the same serial recurrence in native f64, which for the f64 element
+    //     type is bit-for-bit the same arithmetic the kernel would have done. ---
+    if size_of::<F>() == 8 && !crate::capability::f64_transcendental_supported() {
+        return Ok(host_softmax_loss_grad(
+            &x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+            &y.to_host(pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+            &w.to_host(pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+            &b.to_host(pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+            n,
+            d,
+            k,
+            l2_reg,
+        ));
+    }
+
     let elem = size_of::<F>();
     let client = pool.client().clone();
 
@@ -524,6 +550,93 @@ where
     pool.release(grad_b_handle, k * elem);
 
     Ok((loss, grad_w, grad_b))
+}
+
+/// Host twin of [`lbfgs_softmax_loss_grad`] — the SAME stable-softmax loss and
+/// gradient, in native f64.
+///
+/// Used only where the device kernel cannot run: a backend without f64
+/// transcendentals (see the dispatch in [`softmax_loss_grad`]). Every step is
+/// replayed in the kernel's order — the forward row-max scan, the
+/// `Σ exp(raw − row_max)` sum, `lse = row_max + ln(sum_exp)`, the
+/// `loss += lse − raw[i, y_i]` accumulation, the `p − [y==k]` gradient gather,
+/// and finally the `1/n` scaling with the L2 term added to `grad_w` but NOT to
+/// `grad_b` (the intercept is unpenalized) and `½·l2_reg·‖w‖²` added to the
+/// loss. Because the kernel is a single-unit gather there is no reduction order
+/// to reproduce: the two compute the identical sequence of f64 operations.
+///
+/// Returns `(loss, grad_w, grad_b)` — exactly the tuple the device path reads
+/// back, so the caller is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn host_softmax_loss_grad(
+    x: &[f64],
+    y: &[f64],
+    w: &[f64],
+    b: &[f64],
+    n: usize,
+    d: usize,
+    k: usize,
+    l2_reg: f64,
+) -> (f64, Vec<f64>, Vec<f64>) {
+    let mut grad_w = vec![0.0f64; k * d];
+    let mut grad_b = vec![0.0f64; k];
+    let mut loss_acc = 0.0f64;
+    let inv_n = 1.0 / n as f64;
+
+    // `raw[i, c] = b[c] + x[i]·w[c]`, recomputed per use exactly as the kernel
+    // does (it keeps no per-row logit buffer).
+    let raw = |i: usize, c: usize| -> f64 {
+        let mut acc = b[c];
+        for j in 0..d {
+            acc += x[i * d + j] * w[c * d + j];
+        }
+        acc
+    };
+
+    for i in 0..n {
+        // Forward if-scan for the row max (seeded with class 0's logit).
+        let mut row_max = 0.0f64;
+        for c in 0..k {
+            let r = raw(i, c);
+            if c == 0 || r > row_max {
+                row_max = r;
+            }
+        }
+
+        // Stable log-sum-exp: subtract the row max BEFORE exp (Pitfall 4).
+        let mut sum_exp = 0.0f64;
+        for c in 0..k {
+            sum_exp += (raw(i, c) - row_max).exp();
+        }
+        let lse_i = row_max + sum_exp.ln();
+
+        let yi = y[i] as usize;
+        loss_acc += lse_i - raw(i, yi);
+
+        for c in 0..k {
+            let p_ic = (raw(i, c) - lse_i).exp();
+            let diff = if c == yi { p_ic - 1.0 } else { p_ic };
+            grad_b[c] += diff;
+            for j in 0..d {
+                grad_w[c * d + j] += diff * x[i * d + j];
+            }
+        }
+    }
+
+    // Scale by 1/n; L2 on grad_w only (the intercept stays unpenalized).
+    let mut w_norm2 = 0.0f64;
+    for c in 0..k {
+        grad_b[c] *= inv_n;
+        for j in 0..d {
+            let idx = c * d + j;
+            let wkj = w[idx];
+            w_norm2 += wkj * wkj;
+            grad_w[idx] = grad_w[idx] * inv_n + l2_reg * wkj;
+        }
+    }
+
+    let loss = loss_acc * inv_n + 0.5 * l2_reg * w_norm2;
+    (loss, grad_w, grad_b)
 }
 
 /// Validate the softmax operand geometry (ASVS V5 / T-05-06-01): `x` is `n×d`,

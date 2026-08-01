@@ -42,7 +42,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use mlrs_kernels::{poly_map, rbf_map, sigmoid_map};
 
 use crate::device_array::DeviceArray;
@@ -163,7 +163,12 @@ where
         // exp(-γ··) map in place over that base buffer (D-03 / Pitfall 4).
         Kernel::Rbf { gamma } => {
             let base = distance::<F>(pool, x, (rows_x, cols), y, (rows_y, cols_y), false, out)?;
-            launch_map_in_place(pool, &base, rows_x * rows_y, |client, count, dim, in_arg, out_arg| {
+            let n = rows_x * rows_y;
+            if host_map_applicable::<F>() {
+                let g = host_to_f64(gamma);
+                return Ok(map_in_place_host::<F>(pool, base, n, |d2| (-g * d2).exp()));
+            }
+            launch_map_in_place(pool, &base, n, |client, count, dim, in_arg, out_arg| {
                 rbf_map::launch::<F, ActiveRuntime>(client, count, dim, in_arg, out_arg, gamma);
             });
             Ok(base)
@@ -172,7 +177,12 @@ where
         Kernel::Poly { gamma, degree, coef0 } => {
             let base =
                 gemm::<F>(pool, x, (rows_x, cols), y, (cols, rows_y), false, true, out)?;
-            launch_map_in_place(pool, &base, rows_x * rows_y, |client, count, dim, in_arg, out_arg| {
+            let n = rows_x * rows_y;
+            if host_map_applicable::<F>() {
+                let (g, c0, deg) = (host_to_f64(gamma), host_to_f64(coef0), host_to_f64(degree));
+                return Ok(map_in_place_host::<F>(pool, base, n, |v| (g * v + c0).powf(deg)));
+            }
+            launch_map_in_place(pool, &base, n, |client, count, dim, in_arg, out_arg| {
                 poly_map::launch::<F, ActiveRuntime>(
                     client, count, dim, in_arg, out_arg, gamma, coef0, degree,
                 );
@@ -183,7 +193,12 @@ where
         Kernel::Sigmoid { gamma, coef0 } => {
             let base =
                 gemm::<F>(pool, x, (rows_x, cols), y, (cols, rows_y), false, true, out)?;
-            launch_map_in_place(pool, &base, rows_x * rows_y, |client, count, dim, in_arg, out_arg| {
+            let n = rows_x * rows_y;
+            if host_map_applicable::<F>() {
+                let (g, c0) = (host_to_f64(gamma), host_to_f64(coef0));
+                return Ok(map_in_place_host::<F>(pool, base, n, |v| (g * v + c0).tanh()));
+            }
+            launch_map_in_place(pool, &base, n, |client, count, dim, in_arg, out_arg| {
                 sigmoid_map::launch::<F, ActiveRuntime>(
                     client, count, dim, in_arg, out_arg, gamma, coef0,
                 );
@@ -191,6 +206,55 @@ where
             Ok(base)
         }
     }
+}
+
+/// Must the per-element kernel map run on the HOST rather than as a device
+/// launch?
+///
+/// True exactly when the element type is `f64` and the backend cannot evaluate
+/// f64 transcendentals (`capability::f64_transcendental_supported`). On such a
+/// backend the `rbf`/`poly`/`sigmoid` map kernels — `exp`, `powf`, `tanh` — do
+/// not fail at launch: the driver's shader compiler either SEGFAULTS or emits
+/// garbage, which is how a wgpu f64 `KernelRidge` fit ended up handing the
+/// Cholesky solve a matrix with a `-5e204` pivot and how `SpectralClustering`'s
+/// affinity produced an `eig` residual of `6.5e63`.
+fn host_map_applicable<F>() -> bool {
+    std::mem::size_of::<F>() == 8 && !crate::capability::f64_transcendental_supported()
+}
+
+/// Apply a per-element map on the HOST, in `f64`, over the base buffer.
+///
+/// The device twin of this is [`launch_map_in_place`]; both rewrite the base
+/// buffer in place, so the caller is unchanged. Only the MAP moves — the base op
+/// (`gemm` / `distance`, the `O(rows_x·rows_y·cols)` work) still runs on device,
+/// and what crosses the bus is the `rows_x · rows_y` result that the map would
+/// have rewritten anyway. The host pass is therefore `O(n²)` against the base
+/// op's `O(n²·d)`, not a fallback to computing the kernel matrix on the CPU.
+///
+/// `f64` throughout, so on the backends that take this path the map is evaluated
+/// at FULL precision — the same arithmetic the device kernel performs on a
+/// backend that supports it.
+fn map_in_place_host<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    base: DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    f: impl Fn(f64) -> f64,
+) -> DeviceArray<ActiveRuntime, F>
+where
+    F: Float + CubeElement + Pod,
+{
+    let mut host: Vec<F> = base.to_host(pool);
+    for v in host.iter_mut().take(n) {
+        *v = f64_to_host::<F>(f(host_to_f64(*v)));
+    }
+    // cubecl 0.10 has no in-place write into an existing handle (see
+    // `DeviceArray::from_host`), so the base buffer is RELEASED first and the
+    // mapped values re-staged — `from_host` then recycles the just-freed
+    // byte-size off the pool free-list, so no second live `rows_x · rows_y`
+    // allocation exists at any point. This is the same release-then-restage
+    // idiom `ridge.rs` uses for its `α`-on-the-diagonal Gram rewrite.
+    base.release_into(pool);
+    DeviceArray::from_host(pool, &host)
 }
 
 /// Launch a per-element map IN PLACE over `base` (input handle == output handle),

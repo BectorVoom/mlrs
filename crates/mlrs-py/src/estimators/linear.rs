@@ -18,7 +18,7 @@ use mlrs_algos::linear::linear_svr::LinearSVR;
 use mlrs_algos::linear::logistic::LogisticRegression;
 use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
 use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
-use mlrs_algos::linear::ridge::Ridge;
+use mlrs_algos::linear::ridge::{Ridge, RidgeSolver};
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
 // Phase 16 (D-01): every estimator in this file now consumes the typestate
 // surface — the legacy trait glob has been removed. The typestate
@@ -332,45 +332,190 @@ impl PyLinearRegression {
 }
 
 // ---------------------------------------------------------------------------
-// Ridge — Fit + Predict; alpha, fit_intercept
+// Ridge — Fit + Predict; the FULL sklearn parameter surface
+//   alpha, fit_intercept, copy_X, max_iter, tol, solver, positive, random_state
+//   + fit(..., sample_weight) and the n_iter_ / solver_ fitted attributes
 // ---------------------------------------------------------------------------
 
 crate::any_estimator_typestate! {
     any:   AnyRidge,
     algo:  mlrs_algos::linear::ridge::Ridge,
-    unfit: { alpha: f64, fit_intercept: bool },
+    unfit: {
+        alpha: f64,
+        fit_intercept: bool,
+        copy_x: bool,
+        max_iter: Option<usize>,
+        tol: f64,
+        solver: String,
+        positive: bool,
+        random_state: Option<u64>,
+    },
+}
+
+/// The verbatim ctor hyperparameters, carried from the `Unfit` arm to `fit`.
+/// `solver` stays a STRING until `fit` because that is what the sklearn shim
+/// passes; the `RidgeSolver` parse (and its `UnknownSolver` rejection) happens
+/// with the rest of the `build()` validation (D-09).
+struct RidgeParams {
+    alpha: f64,
+    fit_intercept: bool,
+    copy_x: bool,
+    max_iter: Option<usize>,
+    tol: f64,
+    solver: String,
+    positive: bool,
+    random_state: Option<u64>,
 }
 
 /// sklearn-compatible `Ridge` (L2-penalized least squares).
 #[pyclass(name = "Ridge")]
 pub struct PyRidge {
     inner: AnyRidge,
+    /// sklearn's `n_iter_`, captured at `fit` (the fitted arms are consumed into
+    /// `AnyRidge`, and a `#[pyclass]` getter cannot reach through the dtype
+    /// dispatch generically, so the two scalars are mirrored here).
+    n_iter: Option<usize>,
+    /// sklearn's `solver_` — the solver that actually ran, after `auto`
+    /// resolution and any singular-Gram fallback.
+    solver_used: Option<String>,
 }
 
 impl PyRidge {
     /// Rust-callable default constructor for the smoke test. See
     /// [`PyLinearRegression::unfit_default`].
     pub fn unfit_default() -> Self {
-        Self { inner: AnyRidge::Unfit { alpha: 1.0, fit_intercept: true } }
+        Self {
+            inner: AnyRidge::Unfit {
+                alpha: 1.0,
+                fit_intercept: true,
+                copy_x: true,
+                max_iter: None,
+                tol: 1e-4,
+                solver: "auto".to_string(),
+                positive: false,
+                random_state: None,
+            },
+            n_iter: None,
+            solver_used: None,
+        }
     }
 
     /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
     pub fn is_unfit(&self) -> bool {
         matches!(self.inner, AnyRidge::Unfit { .. })
     }
+
+    /// Read back the ctor hyperparameters (WR-02: the typestate wrapper rebuilds
+    /// from these at every `fit`, so a second `fit` of the same object works).
+    fn params(&self) -> RidgeParams {
+        match &self.inner {
+            AnyRidge::Unfit {
+                alpha,
+                fit_intercept,
+                copy_x,
+                max_iter,
+                tol,
+                solver,
+                positive,
+                random_state,
+            } => RidgeParams {
+                alpha: *alpha,
+                fit_intercept: *fit_intercept,
+                copy_x: *copy_x,
+                max_iter: *max_iter,
+                tol: *tol,
+                solver: solver.clone(),
+                positive: *positive,
+                random_state: *random_state,
+            },
+            // Already fitted: the shim always constructs a fresh wrapper per
+            // `fit`, so this arm is unreachable in practice; fall back to
+            // sklearn's defaults rather than panicking.
+            _ => RidgeParams {
+                alpha: 1.0,
+                fit_intercept: true,
+                copy_x: true,
+                max_iter: None,
+                tol: 1e-4,
+                solver: "auto".to_string(),
+                positive: false,
+                random_state: None,
+            },
+        }
+    }
+}
+
+/// Build an unfit `Ridge<F>` from the ctor params. Monomorphized per float width
+/// by the macro below so the `solver` parse + the eight builder setters are
+/// written once.
+macro_rules! ridge_build {
+    ($float:ty, $p:expr) => {{
+        let solver = RidgeSolver::try_from($p.solver.as_str()).map_err(build_err_to_py)?;
+        Ridge::<$float>::builder()
+            .alpha($p.alpha)
+            .fit_intercept($p.fit_intercept)
+            .copy_x($p.copy_x)
+            .max_iter($p.max_iter)
+            .tol($p.tol)
+            .solver(solver)
+            .positive($p.positive)
+            .random_state($p.random_state)
+            .build::<$float>()
+            .map_err(build_err_to_py)?
+    }};
 }
 
 #[pymethods]
 impl PyRidge {
-    /// `Ridge(alpha=1.0, fit_intercept=True)`.
+    /// `Ridge(alpha=1.0, fit_intercept=True, copy_X=True, max_iter=None,
+    /// tol=1e-4, solver='auto', positive=False, random_state=None)` — sklearn's
+    /// signature one-for-one. `copy_X` keeps its sklearn spelling at the Python
+    /// boundary and maps to the Rust `copy_x`.
     #[new]
-    #[pyo3(signature = (alpha = 1.0, fit_intercept = true))]
-    fn new(alpha: f64, fit_intercept: bool) -> Self {
+    #[pyo3(signature = (
+        alpha = 1.0,
+        fit_intercept = true,
+        copy_x = true,
+        max_iter = None,
+        tol = 1e-4,
+        solver = "auto".to_string(),
+        positive = false,
+        random_state = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        alpha: f64,
+        fit_intercept: bool,
+        copy_x: bool,
+        max_iter: Option<usize>,
+        tol: f64,
+        solver: String,
+        positive: bool,
+        random_state: Option<u64>,
+    ) -> Self {
         Self {
-            inner: AnyRidge::Unfit { alpha, fit_intercept },
+            inner: AnyRidge::Unfit {
+                alpha,
+                fit_intercept,
+                copy_x,
+                max_iter,
+                tol,
+                solver,
+                positive,
+                random_state,
+            },
+            n_iter: None,
+            solver_used: None,
         }
     }
 
+    /// `fit(X, y, rows, cols, sample_weight=None)`.
+    ///
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — it is borrowed as a host slice (never uploaded), because
+    /// the weighted preprocessing that consumes it is a host pass anyway
+    /// (`ridge.rs::preprocess`).
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -378,46 +523,65 @@ impl PyRidge {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
-        let (alpha, fit_intercept) = match &self.inner {
-            AnyRidge::Unfit { alpha, fit_intercept } => (*alpha, *fit_intercept),
-            _ => (1.0, true),
-        };
-        let fitted = py.detach(|| -> PyResult<AnyRidge> {
-            let mut pool = crate::lock_pool();
-            match dt {
-                FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let est = Ridge::<f32>::builder()
-                        .alpha(alpha)
-                        .fit_intercept(fit_intercept)
-                        .build::<f32>()
-                        .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyRidge::F32(fitted))
+        let p = self.params();
+        let (fitted, n_iter, solver_used) =
+            py.detach(|| -> PyResult<(AnyRidge, Option<usize>, String)> {
+                let mut pool = crate::lock_pool();
+                match dt {
+                    FloatDtype::F32 => {
+                        let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                        let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                        let sw = match swa.as_ref() {
+                            Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                            None => None,
+                        };
+                        let est = ridge_build!(f32, p);
+                        let fitted = est
+                            .fit_with_sample_weight(&mut pool, &xd, Some(&yd), (rows, cols), sw)
+                            .map_err(algo_err_to_py)?;
+                        let n_iter = fitted.n_iter();
+                        let used = fitted.solver().name().to_string();
+                        Ok((AnyRidge::F32(fitted), n_iter, used))
+                    }
+                    FloatDtype::F64 => {
+                        crate::capability::guard_f64()?;
+                        let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                        let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                        let sw = match swa.as_ref() {
+                            Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                            None => None,
+                        };
+                        let est = ridge_build!(f64, p);
+                        let fitted = est
+                            .fit_with_sample_weight(&mut pool, &xd, Some(&yd), (rows, cols), sw)
+                            .map_err(algo_err_to_py)?;
+                        let n_iter = fitted.n_iter();
+                        let used = fitted.solver().name().to_string();
+                        Ok((AnyRidge::F64(fitted), n_iter, used))
+                    }
                 }
-                FloatDtype::F64 => {
-                    crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let est = Ridge::<f64>::builder()
-                        .alpha(alpha)
-                        .fit_intercept(fit_intercept)
-                        .build::<f64>()
-                        .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyRidge::F64(fitted))
-                }
-            }
-        })?;
+            })?;
         self.inner = fitted;
+        self.n_iter = n_iter;
+        self.solver_used = Some(solver_used);
         Ok(())
+    }
+
+    /// sklearn's `n_iter_` (`None` for the solvers sklearn leaves unset —
+    /// `cholesky`, `svd`, `sparse_cg`, `lbfgs`).
+    fn n_iter(&self) -> Option<usize> {
+        self.n_iter
+    }
+
+    /// sklearn's `solver_` — the solver that actually ran.
+    fn solver_used(&self) -> Option<String> {
+        self.solver_used.clone()
     }
 
     /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shared

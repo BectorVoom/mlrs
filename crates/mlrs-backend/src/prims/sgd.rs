@@ -196,6 +196,18 @@ where
 {
     let (n, d) = shape;
 
+    // --- Capability guard, ALL LOSSES: the log-loss gradient
+    //     `-y / (1 + exp(y·p))` (`mlrs_kernels::sgd`) is the only branch that
+    //     evaluates a transcendental, but the loss is a RUNTIME switch inside
+    //     ONE kernel — so `F::exp` is compiled into the shader whichever loss is
+    //     selected, and a backend without f64 `exp` fails at SHADER-COMPILE
+    //     time, not at execution. Gating on `params.loss == Log` therefore does
+    //     NOT help: a hinge-loss f64 fit crashes just the same (measured — it is
+    //     what `mbsgd_classifier_test::exact_labels`, a hinge test, was dying
+    //     on). The guard is unconditional at f64 for that reason, not because
+    //     every loss needs the transcendental. ---
+    crate::capability::guard_f64_transcendental::<F>("sgd_solve")?;
+
     // --- Geometry guard (ASVS V5 / T-10-01-02): validate BEFORE any launch so a
     //     malformed shape is a recoverable typed error, not an out-of-bounds
     //     device read. Mirrors cd_solve / laplacian. ---

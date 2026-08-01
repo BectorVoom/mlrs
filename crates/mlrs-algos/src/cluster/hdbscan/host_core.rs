@@ -79,7 +79,19 @@ use super::Metric;
 ///
 /// `MLRS_HDBSCAN_HOST_CORE=0` forces the device prim back on for on-target A/B;
 /// `=1` cannot force the host scan onto a non-cpu backend.
-pub fn host_core_applicable() -> bool {
+
+/// Additionally forced when the element type is `f64` and the backend cannot
+/// evaluate f64 transcendentals: the device path this replaces evaluates
+/// the `knn_graph` prim's minkowski `powf`, and on such a backend that does not fail at launch — the
+/// driver's shader compiler SEGFAULTS (measured: `ACO ERROR: Unimplemented NIR
+/// instr bit size: 64 fexp2` → `signal: 11`). This arm is the only way the f64
+/// path can run there at all, so the capability check is NOT overridable by the
+/// `MLRS_HDBSCAN_HOST_CORE` A/B knob, which stays a pure perf switch. See
+/// `mlrs_backend::capability::f64_transcendental_supported`.
+pub fn host_core_applicable<F>() -> bool {
+    if std::mem::size_of::<F>() == 8 && !capability::f64_transcendental_supported() {
+        return true;
+    }
     capability::active_backend_name() == "cpu"
         && mlrs_backend::abflag::var("MLRS_HDBSCAN_HOST_CORE")
             .map(|v| v != "0")

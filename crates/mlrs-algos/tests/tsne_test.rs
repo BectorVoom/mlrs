@@ -200,7 +200,7 @@ fn fit_band_f32() {
 
 #[test]
 fn fit_band_f64() {
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         return;
     }
     run_band::<f64>("tsne_f64_seed42.npz");

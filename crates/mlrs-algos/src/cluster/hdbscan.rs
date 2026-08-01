@@ -803,7 +803,7 @@ where
         let needs_knn_core = !matches!(self.metric, Metric::Cosine);
         let core_raw: Vec<f64> = if !needs_knn_core {
             Vec::new()
-        } else if host_core::host_core_applicable() {
+        } else if host_core::host_core_applicable::<F>() {
             host_core::core_distances_host(x_host, n, p, self.metric, k)
         } else {
             let knn_metric = self.knn_metric();
@@ -871,7 +871,7 @@ where
             // distances. `mutual_reachability_dense` is the identical formula (the
             // GLOSH tree already shares it) over the ALREADY-scaled matrix, so the
             // `/alpha` is folded in rather than passed to a kernel.
-            if host_core::host_core_applicable() {
+            if host_core::host_core_applicable::<F>() {
                 let mr = mst::mutual_reachability_dense(&dist_scaled, &core_scaled, n);
                 mst::mst_from_mutual_reachability(&mr, n)
             } else {

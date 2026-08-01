@@ -211,7 +211,7 @@ fn exact_labels_f32() {
 fn exact_labels() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("mbsgd_classifier f64 backend={backend}: SKIPPED (no f64 support)");
         return;
     }
@@ -253,7 +253,7 @@ fn oracle_f32() {
 fn oracle() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("mbsgd_classifier f64 backend={backend}: SKIPPED (no f64 support)");
         return;
     }
@@ -314,7 +314,7 @@ fn oracle_optimal_f32() {
 fn oracle_optimal() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "optimal");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("mbsgd_classifier(optimal) f64 backend={backend}: SKIPPED (no f64 support)");
         return;
     }
@@ -399,7 +399,7 @@ fn proba_f32() {
 fn proba() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "log");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("mbsgd_classifier(log) f64 backend={backend}: SKIPPED (no f64 support)");
         return;
     }

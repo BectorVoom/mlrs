@@ -27,7 +27,18 @@ import mlrs
 # mlrs estimator adds. PCA has no default n_components (v1 requires explicit int).
 EXPECTED_PARAMS = {
     "LinearRegression": {"fit_intercept": True, "output_type": "input"},
-    "Ridge": {"alpha": 1.0, "fit_intercept": True, "output_type": "input"},
+    # Ridge carries sklearn's FULL Ridge signature (alpha .. random_state).
+    "Ridge": {
+        "alpha": 1.0,
+        "fit_intercept": True,
+        "copy_X": True,
+        "max_iter": None,
+        "tol": 1e-4,
+        "solver": "auto",
+        "positive": False,
+        "random_state": None,
+        "output_type": "input",
+    },
     "Lasso": {
         "alpha": 1.0,
         "fit_intercept": True,

@@ -198,7 +198,7 @@ macro_rules! metric_oracle_pair {
             let _ = env_logger::builder().is_test(true).try_init();
             let backend = capability::active_backend_name();
             capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
-            if capability::skip_f64_with_log() {
+            if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
                 println!("knn f64 backend={backend}: SKIPPED (no f64 support on this adapter)");
                 return;
             }
@@ -315,7 +315,7 @@ fn knn_self_drop_duplicate_point_value() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "dup-point R-9");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("knn dup-point f64 backend={backend}: SKIPPED (no f64 on this adapter)");
         return;
     }
@@ -386,7 +386,7 @@ fn knn_include_self_returns_self_at_col0() {
     let _ = env_logger::builder().is_test(true).try_init();
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "include_self");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("knn include_self f64 backend={backend}: SKIPPED (no f64 on this adapter)");
         return;
     }

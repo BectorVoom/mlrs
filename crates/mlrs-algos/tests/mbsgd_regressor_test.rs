@@ -169,7 +169,7 @@ fn oracle_f32() {
 fn oracle() {
     let backend = capability::active_backend_name();
     capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
-    if capability::skip_f64_with_log() {
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
         println!("mbsgd_regressor f64 backend={backend}: SKIPPED (no f64 support)");
         return;
     }

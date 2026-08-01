@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 
 import mlrs
-from conftest import dtype_of, fixture_path, proba_allclose, requires_f64
+from conftest import dtype_of, fixture_path, proba_allclose, requires_f64  # noqa: F401
 
 
 def _atol(fixture):
@@ -77,6 +77,122 @@ def test_ridge_oracle(fixture, alpha_idx):
     atol = _atol(fixture)
     assert np.allclose(np.ravel(np.asarray(est.coef_)), np.ravel(d["coef"][alpha_idx]), atol=atol, rtol=0.0)
     assert np.allclose(np.ravel(np.asarray(est.intercept_)), np.ravel(d["intercept"][alpha_idx]), atol=atol, rtol=0.0)
+
+
+# Ridge FULL parameter surface: every sklearn `solver`, `fit_intercept`,
+# `positive`, and `sample_weight` case in the `ridge_params_*` fixture, driven
+# through the Python shim (the Rust twin is
+# `crates/mlrs-algos/tests/ridge_params_test.rs`). Each entry is
+# (case name, ctor kwargs, uses sample_weight, expected `solver_`).
+RIDGE_PARAM_CASES = [
+    ("auto", {"solver": "auto"}, False, "cholesky"),
+    ("cholesky", {"solver": "cholesky"}, False, "cholesky"),
+    ("svd", {"solver": "svd"}, False, "svd"),
+    ("lsqr", {"solver": "lsqr"}, False, "lsqr"),
+    ("sparse_cg", {"solver": "sparse_cg"}, False, "sparse_cg"),
+    ("sag", {"solver": "sag"}, False, "sag"),
+    ("saga", {"solver": "saga"}, False, "saga"),
+    ("lbfgs_pos", {"solver": "lbfgs", "positive": True}, False, "lbfgs"),
+    ("auto_pos", {"solver": "auto", "positive": True}, False, "lbfgs"),
+    ("cholesky_noint", {"solver": "cholesky", "fit_intercept": False}, False, "cholesky"),
+    ("svd_noint", {"solver": "svd", "fit_intercept": False}, False, "svd"),
+    ("lsqr_noint", {"solver": "lsqr", "fit_intercept": False}, False, "lsqr"),
+    ("sag_noint", {"solver": "sag", "fit_intercept": False}, False, "sag"),
+    ("lbfgs_pos_noint", {"solver": "lbfgs", "positive": True, "fit_intercept": False}, False, "lbfgs"),
+    ("cholesky_sw", {"solver": "cholesky"}, True, "cholesky"),
+    ("svd_sw", {"solver": "svd"}, True, "svd"),
+    ("lsqr_sw", {"solver": "lsqr"}, True, "lsqr"),
+    ("sparse_cg_sw", {"solver": "sparse_cg"}, True, "sparse_cg"),
+    ("sag_sw", {"solver": "sag"}, True, "sag"),
+    ("saga_sw", {"solver": "saga"}, True, "saga"),
+    ("lbfgs_pos_sw", {"solver": "lbfgs", "positive": True}, True, "lbfgs"),
+    ("cholesky_noint_sw", {"solver": "cholesky", "fit_intercept": False}, True, "cholesky"),
+]
+
+# sklearn populates `n_iter_` only for `lsqr` and the SAG family
+# (`_ridge_regression` leaves it None for every other solver).
+_N_ITER_SOLVERS = {"lsqr", "sag", "saga"}
+
+RIDGE_PARAM_IDS = [
+    f"{fx}-{case}"
+    for fx in ("ridge_params_f32_seed42", "ridge_params_f64_seed42")
+    for case, _, _, _ in RIDGE_PARAM_CASES
+]
+
+
+@pytest.mark.parametrize(
+    "fixture,case,kwargs,use_sw,expect_solver",
+    [
+        (fx, case, kwargs, use_sw, want)
+        for fx in ("ridge_params_f32_seed42", "ridge_params_f64_seed42")
+        for case, kwargs, use_sw, want in RIDGE_PARAM_CASES
+    ],
+    ids=RIDGE_PARAM_IDS,
+)
+def test_ridge_params_oracle(fixture, case, kwargs, use_sw, expect_solver):
+    """PY-01: every sklearn Ridge parameter matches sklearn through the shim.
+
+    Both sides are fitted at the fixture's tight ``tol``/``max_iter`` so the
+    iterative solvers are compared at their CONVERGED optimum (see
+    ``gen_oracle.py::gen_ridge_params``).
+
+    Skips PER FIXTURE DTYPE rather than wearing the blanket ``requires_f64``
+    marker the older cases use: that marker skips the whole function, so on an
+    f64-incapable backend (wgpu / rocm) the f32 half — which is exactly the half
+    those backends CAN run, and the one the GPU gate cares about — would be
+    thrown away with it.
+    """
+    if dtype_of(fixture) == np.float64 and not mlrs.backend_supports_f64():
+        pytest.skip("backend does not support f64")
+    d = np.load(fixture_path(fixture))
+    est = mlrs.Ridge(
+        alpha=float(d["alpha"][0]),
+        tol=float(d["tol"][0]),
+        max_iter=int(d["max_iter"][0]),
+        random_state=0,
+        **kwargs,
+    )
+    est.fit(d["X"], d["y"], sample_weight=d["sample_weight"] if use_sw else None)
+
+    atol = _atol(fixture)
+    assert np.allclose(
+        np.ravel(np.asarray(est.coef_)), np.ravel(d[f"coef_{case}"]), atol=atol, rtol=0.0
+    )
+    assert np.allclose(
+        np.ravel(np.asarray(est.intercept_)),
+        np.ravel(d[f"intercept_{case}"]),
+        atol=atol,
+        rtol=0.0,
+    )
+    # `solver_` — the resolved solver, including auto -> cholesky / lbfgs.
+    assert est.solver_ == expect_solver
+    # `n_iter_` — Some exactly where sklearn populates it.
+    assert (est.n_iter_ is not None) == (expect_solver in _N_ITER_SOLVERS)
+    if kwargs.get("positive"):
+        assert (np.asarray(est.coef_) >= -atol).all()
+
+
+def test_ridge_rejects_bad_params():
+    """The sklearn ``ValueError``s Ridge raises for invalid parameter combos.
+
+    Deliberately driven from the f32 fixture: on an f64-incapable backend an f64
+    ``X`` raises ``ValueError`` from the capability guard, which would make every
+    ``pytest.raises(ValueError)`` below pass for the WRONG reason.
+    """
+    d = np.load(fixture_path("ridge_params_f32_seed42"))
+    X, y = d["X"], d["y"]
+    with pytest.raises(ValueError):
+        mlrs.Ridge(alpha=-1.0).fit(X, y)
+    with pytest.raises(ValueError):
+        mlrs.Ridge(tol=-1.0).fit(X, y)
+    with pytest.raises(ValueError):
+        mlrs.Ridge(max_iter=0).fit(X, y)
+    with pytest.raises(ValueError):
+        mlrs.Ridge(solver="lbfgs").fit(X, y)  # lbfgs requires positive=True
+    with pytest.raises(ValueError):
+        mlrs.Ridge(solver="cholesky", positive=True).fit(X, y)
+    with pytest.raises(ValueError):
+        mlrs.Ridge(solver="newton-cholesky").fit(X, y)
 
 
 # LogisticRegression: gauge-fixed predict_proba is the primary gate (D-12).

@@ -181,4 +181,28 @@ pub enum PrimError {
         /// (e.g. `"ReducePath::Shared"`).
         context: &'static str,
     },
+
+    /// A primitive was asked to run on a backend that lacks a device capability
+    /// its kernel requires, and it has no host arm to fall back to.
+    ///
+    /// Introduced for the f64-TRANSCENDENTAL gap: a wgpu adapter can accept the
+    /// f64 type (`SHADER_F64`) while its shader compiler has no 64-bit
+    /// `exp`/`log` — and therefore no `powf`, which lowers to `exp2`/`log2`.
+    /// Reaching such a kernel does NOT fail cleanly at launch: the driver's
+    /// compiler SEGFAULTS, taking the whole process down (measured:
+    /// `ACO ERROR: Unimplemented NIR instr bit size: 64  fexp2` → `signal: 11`).
+    /// Primitives in that position check the capability BEFORE launching and
+    /// return this instead, so an unsupported combination is a recoverable typed
+    /// error at the API boundary rather than a crash. See
+    /// `mlrs_backend::capability::f64_transcendental_supported`.
+    #[error(
+        "primitive '{operand}': the active backend does not support {capability}; \
+         this combination is unsupported (no host fallback for this primitive)"
+    )]
+    UnsupportedCapability {
+        /// Which primitive could not run (e.g. `"knn_graph(minkowski)"`).
+        operand: &'static str,
+        /// The missing capability, phrased for a user.
+        capability: &'static str,
+    },
 }
