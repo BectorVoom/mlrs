@@ -21,7 +21,9 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gemm::gemm;
-use mlrs_backend::prims::sgd::{sgd_solve, SgdLoss, SgdParams, SgdSchedule};
+use mlrs_backend::prims::sgd::{
+    sgd_solve, sgd_solve_host_slice, SgdLoss, SgdParams, SgdSchedule,
+};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -298,6 +300,126 @@ impl MBSGDClassifierBuilder {
     }
 }
 
+/// Derive `classes_` and the ±1 margin target from a host-materialized `y`.
+///
+/// Shared by [`Fit::fit`] and [`MBSGDClassifier::fit_from_host_slice`] so the
+/// two ingress paths cannot drift on label validation. Returns
+/// `(classes_, y_pm1)`: distinct sorted class ids (exactly two), and the
+/// per-sample ±1 remap with `classes_[1] → +1` (sklearn maps the HIGHER class
+/// to `+1`).
+fn prepare_labels<F>(y_host: &[F], n_samples: usize) -> Result<(Vec<i64>, Vec<F>), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
+    for &yv in y_host.iter() {
+        let lf = host_to_f64(yv);
+        let li = lf.round();
+        if (li - lf).abs() > 1e-6 {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "mbsgd_classifier",
+                reason: format!("labels must be integers (got {lf})"),
+            });
+        }
+        raw_labels.push(li as i64);
+    }
+    let mut classes_: Vec<i64> = raw_labels.clone();
+    classes_.sort_unstable();
+    classes_.dedup();
+    if classes_.len() != 2 {
+        return Err(AlgoError::InvalidLabels {
+            estimator: "mbsgd_classifier",
+            reason: format!(
+                "binary classifier needs exactly 2 classes, found {}",
+                classes_.len()
+            ),
+        });
+    }
+    // WR-02: `predict_labels` emits class ids as `i32`; a class id that fits an
+    // `f64` mantissa but exceeds `i32` range would be SILENTLY TRUNCATED (`as
+    // i32` wraps) into a wrong predicted label. Validate the distinct class ids
+    // against `i32` range at fit so an out-of-range label is a typed error, not
+    // a silent wrong prediction.
+    for &cls in classes_.iter() {
+        if i32::try_from(cls).is_err() {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "mbsgd_classifier",
+                reason: format!(
+                    "class label {cls} does not fit in i32 \
+                     (predicted labels are i32)"
+                ),
+            });
+        }
+    }
+    let yp: Vec<F> = raw_labels
+        .iter()
+        .map(|&l| f64_to_host::<F>(if l == classes_[1] { 1.0 } else { -1.0 }))
+        .collect();
+    Ok((classes_, yp))
+}
+
+impl<F> MBSGDClassifier<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// [`Fit::fit`] over HOST slices — the no-upload ingress for backends whose
+    /// SGD solve runs on the host anyway ([`sgd_host_available`]).
+    ///
+    /// `x` is the `n × d` row-major design and `y` the length-`n` raw label
+    /// vector, both borrowed from host memory (at the Python boundary, the
+    /// Arrow values themselves). The fitted `coef_`/`intercept_` are still
+    /// device-resident, so the returned estimator is indistinguishable from one
+    /// produced by [`Fit::fit`] — only the ingress differs, and only two
+    /// `d`-element uploads happen instead of three `n·d` passes.
+    ///
+    /// Returns [`PrimError::UnsupportedCapability`] on a backend without a host
+    /// arm; callers must branch on [`sgd_host_available`] rather than treating
+    /// this as a universal entry point.
+    ///
+    /// [`sgd_host_available`]: mlrs_backend::prims::sgd::sgd_host_available
+    pub fn fit_from_host_slice(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        y: &[F],
+        shape: (usize, usize),
+    ) -> Result<MBSGDClassifier<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+
+        // --- The slice twin of the D-08 geometry guard: `validate_geometry`
+        //     reads a DeviceArray's length, which we do not have here. ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+
+        let (classes_, yp) = prepare_labels::<F>(y, n_samples)?;
+        let params = lower_config(&self.config);
+        let (coef, intercept) = sgd_solve_host_slice::<F>(x, &yp, shape, &params)?;
+
+        Ok(MBSGDClassifier {
+            config: self.config,
+            classes_,
+            n_features,
+            coef_: Some(DeviceArray::from_host(pool, &coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &[intercept])),
+            _state: PhantomData,
+        })
+    }
+}
+
 impl<F> Fit<F> for MBSGDClassifier<F, Unfit>
 where
     F: Float + CubeElement + Pod,
@@ -334,51 +456,7 @@ where
         //     ±1 remap for the margin loss. Phase-10 scope is the binary linear
         //     classifier (A6); a non-binary target is rejected. ---
         let y_host = y.to_host(pool);
-        let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
-        for &yv in y_host.iter() {
-            let lf = host_to_f64(yv);
-            let li = lf.round();
-            if (li - lf).abs() > 1e-6 {
-                return Err(AlgoError::InvalidLabels {
-                    estimator: "mbsgd_classifier",
-                    reason: format!("labels must be integers (got {lf})"),
-                });
-            }
-            raw_labels.push(li as i64);
-        }
-        let mut classes_: Vec<i64> = raw_labels.clone();
-        classes_.sort_unstable();
-        classes_.dedup();
-        if classes_.len() != 2 {
-            return Err(AlgoError::InvalidLabels {
-                estimator: "mbsgd_classifier",
-                reason: format!(
-                    "binary classifier needs exactly 2 classes, found {}",
-                    classes_.len()
-                ),
-            });
-        }
-        // WR-02: `predict_labels` emits class ids as `i32`; a class id that fits
-        // an `f64` mantissa but exceeds `i32` range would be SILENTLY TRUNCATED
-        // (`as i32` wraps) into a wrong predicted label. Validate the distinct
-        // class ids against `i32` range at fit so an out-of-range label is a
-        // typed error, not a silent wrong prediction.
-        for &cls in classes_.iter() {
-            if i32::try_from(cls).is_err() {
-                return Err(AlgoError::InvalidLabels {
-                    estimator: "mbsgd_classifier",
-                    reason: format!(
-                        "class label {cls} does not fit in i32 \
-                         (predicted labels are i32)"
-                    ),
-                });
-            }
-        }
-        // classes_[0] → −1, classes_[1] → +1 (sklearn maps the higher class to +1).
-        let yp: Vec<F> = raw_labels
-            .iter()
-            .map(|&l| f64_to_host::<F>(if l == classes_[1] { 1.0 } else { -1.0 }))
-            .collect();
+        let (classes_, yp) = prepare_labels::<F>(&y_host, n_samples)?;
         let yp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &yp);
 
         // --- Lower the validated SgdConfig into the prim-local flat SgdParams

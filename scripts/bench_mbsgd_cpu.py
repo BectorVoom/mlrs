@@ -20,6 +20,14 @@ The ``--engine`` caveat from ``bench_linear_predict_cpu.py`` applies verbatim:
 OpenBLAS keeps its workers SPINNING after a call, so interleaving both engines
 in one process taxes whichever runs second. Re-run a suspicious rung with
 ``--engine mlrs`` / ``--engine sklearn`` in separate processes.
+
+On a machine with unrelated load, prefer the default INTERLEAVED schedule
+(engines alternate rep by rep, so a load burst hits both) and read the
+``cpu (s)`` column — ``time.process_time`` excludes time the process spent
+descheduled. Both engines are single-threaded on this path, so CPU time and
+wall clock agree on an idle box and CPU time is the one to trust on a busy
+one. ``--schedule blocked`` restores the run-all-reps-of-one-engine-first
+order.
 """
 
 from __future__ import annotations
@@ -49,15 +57,37 @@ def make_classification(n: int, d: int, seed: int = 42):
     return x, labels
 
 
-def best_of(fn, reps):
-    """(best, first, result) wall-clock seconds over `reps` calls."""
-    times = []
-    out = None
-    for _ in range(reps):
-        t0 = time.perf_counter()
-        out = fn()
-        times.append(time.perf_counter() - t0)
-    return min(times), times[0], out
+def timed_call(fn):
+    """(wall, cpu, result) seconds for ONE call."""
+    w0, c0 = time.perf_counter(), time.process_time()
+    out = fn()
+    return time.perf_counter() - w0, time.process_time() - c0, out
+
+
+class Samples:
+    """Per-engine timing accumulator: min wall, min cpu, first wall, last model."""
+
+    def __init__(self):
+        self.wall = []
+        self.cpu = []
+        self.model = None
+
+    def add(self, wall, cpu, model):
+        self.wall.append(wall)
+        self.cpu.append(cpu)
+        self.model = model
+
+    @property
+    def best(self):
+        return min(self.wall)
+
+    @property
+    def best_cpu(self):
+        return min(self.cpu)
+
+    @property
+    def first(self):
+        return self.wall[0]
 
 
 def main() -> None:
@@ -77,6 +107,10 @@ def main() -> None:
                     help="time each engine at its own library defaults (tol/shuffle on)")
     ap.add_argument("--check", action="store_true", help="print max|Δcoef| vs sklearn")
     ap.add_argument("--configs", default="", help="comma-separated n:d:max_iter")
+    ap.add_argument("--schedule", default="interleaved",
+                    choices=["interleaved", "blocked"],
+                    help="alternate engines rep by rep (default) or run each engine's "
+                         "reps back to back")
     args = ap.parse_args()
 
     import mlrs
@@ -95,9 +129,14 @@ def main() -> None:
     print(f"mlrs {mlrs.__name__} | loss={args.loss} penalty={args.penalty} "
           f"lr={args.learning_rate} alpha={args.alpha} dtype={args.dtype} | {mode}")
     header = (f"{'n':>7} {'d':>4} {'iter':>5} | {'engine':>8} "
-              f"{'fit (s)':>10} {'first (s)':>10}")
+              f"{'fit (s)':>10} {'cpu (s)':>10} {'first (s)':>10}")
     print(header)
     print("-" * len(header))
+
+    import warnings
+
+    engines = [e for e in ("mlrs", "sklearn")
+               if args.engine in ("both", e)]
 
     for n, d, cfg_iter in configs:
         max_iter = args.max_iter or cfg_iter
@@ -105,56 +144,60 @@ def main() -> None:
         x = np.ascontiguousarray(x.astype(dt))
 
         common = dict(
-            loss=None, penalty=args.penalty, alpha=args.alpha,
+            penalty=args.penalty, alpha=args.alpha,
             learning_rate=args.learning_rate, eta0=args.eta0, max_iter=max_iter,
         )
-        common.pop("loss")
 
-        results = {}
-        if args.engine in ("both", "mlrs"):
-            def fit_mlrs():
-                m = MlrsEst(loss=args.loss, batch_size=1,
-                            tol=(1e-3 if args.defaults else 0.0),
-                            shuffle=args.defaults, **common)
-                m.fit(x, y)
-                return m
+        def fit_mlrs():
+            m = MlrsEst(loss=args.loss, batch_size=1,
+                        tol=(1e-3 if args.defaults else 0.0),
+                        shuffle=args.defaults, **common)
+            m.fit(x, y)
+            return m
 
-            try:
-                best, first, model = best_of(fit_mlrs, args.reps)
-                results["mlrs"] = (best, first)
-                if args.check:
-                    results["mlrs_coef"] = np.asarray(model.coef_, dtype=np.float64).ravel()
-            except Exception as exc:  # noqa: BLE001
-                print(f"{n:>7} {d:>4} {max_iter:>5} |     mlrs  FAILED: "
-                      f"{type(exc).__name__}: {exc}")
-
-        if args.engine in ("both", "sklearn"):
-            def fit_sk():
-                m = SkEst(loss=sk_loss,
-                          tol=(1e-3 if args.defaults else None),
-                          shuffle=args.defaults, n_iter_no_change=5, **common)
-                m.fit(x, y)
-                return m
-
-            import warnings
-
+        def fit_sk():
+            m = SkEst(loss=sk_loss,
+                      tol=(1e-3 if args.defaults else None),
+                      shuffle=args.defaults, n_iter_no_change=5, **common)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                best, first, model = best_of(fit_sk, args.reps)
-            results["sklearn"] = (best, first)
-            if args.check:
-                results["sk_coef"] = np.asarray(model.coef_, dtype=np.float64).ravel()
+                m.fit(x, y)
+            return m
 
-        for eng in ("mlrs", "sklearn"):
-            if eng in results:
-                best, first = results[eng]
-                print(f"{n:>7} {d:>4} {max_iter:>5} | {eng:>8} "
-                      f"{best:>10.4f} {first:>10.4f}")
-        if "mlrs" in results and "sklearn" in results:
-            speedup = results["sklearn"][0] / results["mlrs"][0]
-            note = f"{speedup:.2f}x vs sklearn"
-            if args.check and "mlrs_coef" in results and "sk_coef" in results:
-                a, b = results["mlrs_coef"], results["sk_coef"]
+        fits = {"mlrs": fit_mlrs, "sklearn": fit_sk}
+        samples = {e: Samples() for e in engines}
+        failed = {}
+
+        # Interleaved by default: a load burst from an unrelated process hits
+        # both engines rather than taxing whichever happens to run second.
+        order = (
+            [e for _ in range(args.reps) for e in engines]
+            if args.schedule == "interleaved"
+            else [e for e in engines for _ in range(args.reps)]
+        )
+        for eng in order:
+            if eng in failed:
+                continue
+            try:
+                samples[eng].add(*timed_call(fits[eng]))
+            except Exception as exc:  # noqa: BLE001
+                failed[eng] = f"{type(exc).__name__}: {exc}"
+
+        for eng, msg in failed.items():
+            print(f"{n:>7} {d:>4} {max_iter:>5} | {eng:>8}  FAILED: {msg}")
+
+        ok = [e for e in engines if e not in failed]
+        for eng in ok:
+            s = samples[eng]
+            print(f"{n:>7} {d:>4} {max_iter:>5} | {eng:>8} "
+                  f"{s.best:>10.4f} {s.best_cpu:>10.4f} {s.first:>10.4f}")
+        if len(ok) == 2:
+            wall_x = samples["sklearn"].best / samples["mlrs"].best
+            cpu_x = samples["sklearn"].best_cpu / samples["mlrs"].best_cpu
+            note = f"{wall_x:.2f}x wall / {cpu_x:.2f}x cpu vs sklearn"
+            if args.check:
+                a = np.asarray(samples["mlrs"].model.coef_, dtype=np.float64).ravel()
+                b = np.asarray(samples["sklearn"].model.coef_, dtype=np.float64).ravel()
                 dev = float(np.max(np.abs(a - b)))
                 rel = dev / max(1e-30, float(np.max(np.abs(b))))
                 note += f" | max|Δcoef| = {dev:.3e} (rel {rel:.3e})"

@@ -458,3 +458,81 @@ fn build_rejects_bad_alpha() {
         "an unknown loss string must be BuildError::UnknownLoss, got {bad_str:?}"
     );
 }
+
+/// MBSGD-PERF-CPU — the no-upload `fit_from_host_slice` ingress must produce a
+/// BIT-IDENTICAL fit to the `DeviceArray` ingress of [`Fit::fit`].
+///
+/// The two differ only in how `x`/`y` reach the solver, so any divergence here
+/// would be an ingress bug (a wrong stride, a truncated tail, a dropped label
+/// remap) — never a legitimate numerical difference. The Python `fit` binding
+/// picks between them purely on `sgd_host_available()`, so a user's `coef_` must
+/// not depend on which side of that branch they landed on.
+///
+/// cpu-only: `fit_from_host_slice` is a typed `UnsupportedCapability` error
+/// elsewhere, which the assertion below also pins.
+#[test]
+fn host_slice_ingress_matches_device_ingress() {
+    let case = load_npz(fixture("mbsgd_classifier_f64_seed42.npz"))
+        .expect("load mbsgd_classifier_f64");
+    let x = case.expect_f64("X");
+    let y = case.expect_f64("y");
+
+    let client = runtime::active_client();
+    let mut pool = BufferPool::<ActiveRuntime>::new(client);
+
+    let build = || {
+        MBSGDClassifier::<f64>::builder()
+            .alpha(SGD_ALPHA)
+            .eta0(SGD_ETA0)
+            .max_iter(SGD_MAX_ITER)
+            .tol(0.0)
+            .learning_rate(LearningRate::Constant)
+            .shuffle(false)
+            .build::<f64>()
+            .expect("build")
+    };
+
+    if !mlrs_backend::prims::sgd::sgd_host_available() {
+        let err = build()
+            .fit_from_host_slice(&mut pool, x, y, (N_SAMPLES, N_FEATURES))
+            .err();
+        assert!(
+            err.is_some(),
+            "off cpu, fit_from_host_slice must be a typed error, not a silent fit"
+        );
+        println!("host-slice ingress is cpu-only: SKIPPED");
+        return;
+    }
+
+    let x_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, x);
+    let y_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, y);
+    let via_device = Fit::fit(
+        build(),
+        &mut pool,
+        &x_dev,
+        Some(&y_dev),
+        (N_SAMPLES, N_FEATURES),
+    )
+    .expect("device-ingress fit");
+    let via_host = build()
+        .fit_from_host_slice(&mut pool, x, y, (N_SAMPLES, N_FEATURES))
+        .expect("host-slice fit");
+
+    assert_eq!(via_host.classes(), via_device.classes(), "classes_");
+    let (dc, hc) = (via_device.coef(&mut pool), via_host.coef(&mut pool));
+    assert_eq!(dc.len(), hc.len(), "coef_ length");
+    for j in 0..dc.len() {
+        assert_eq!(
+            hc[j].to_bits(),
+            dc[j].to_bits(),
+            "coef_[{j}] differs by ingress path (host={}, device={})",
+            hc[j],
+            dc[j]
+        );
+    }
+    assert_eq!(
+        via_host.intercept(&mut pool).to_bits(),
+        via_device.intercept(&mut pool).to_bits(),
+        "intercept_ differs by ingress path"
+    );
+}

@@ -154,6 +154,58 @@ pub fn loss_id(loss: SgdLoss) -> u32 {
     }
 }
 
+/// Whether [`sgd_solve`] runs on the HOST arm for the active backend — i.e.
+/// whether the design matrix would only be uploaded to be read straight back.
+///
+/// Callers holding `x` on the host already (a borrowed Arrow buffer at the
+/// Python boundary, say) should branch on this and use
+/// [`sgd_solve_host_slice`], which skips the round-trip entirely. On a real
+/// device backend this is `false` and the caller must upload as usual.
+///
+/// See `prims::sgd_host` for why the cpu backend has a host arm at all.
+pub fn sgd_host_available() -> bool {
+    super::sgd_host::host_solve_applicable()
+}
+
+/// [`sgd_solve`] over HOST slices, returning the fitted `(coef, intercept)` on
+/// the host — the no-upload entry point for callers that already hold `x`/`y`
+/// in host memory.
+///
+/// Only valid where [`sgd_host_available`] is true; it is a hard error
+/// otherwise, since there is no host implementation of the device kernels to
+/// fall back to.
+///
+/// ## Why this exists (MBSGD-PERF-CPU)
+/// `DeviceArray::from_host` copies, and `DeviceArray::to_host` copies TWICE
+/// (`read_one` materializes a byte buffer, then `cast_slice(..).to_vec()`
+/// materializes the typed one). Routing a host-resident design through the
+/// `DeviceArray` boundary just to reach the host arm therefore costs three
+/// full passes over `x`. Measured on the `50 000 × 64` f32 probe those passes
+/// were 10 ms against 6 ms of actual solving — the ingress, not the
+/// arithmetic, was the dominant term. This entry point removes all three.
+///
+/// Geometry is validated exactly as in [`sgd_solve`] (ASVS V5 / T-10-01-02).
+pub fn sgd_solve_host_slice<F>(
+    x: &[F],
+    y: &[F],
+    shape: (usize, usize),
+    params: &SgdParams,
+) -> Result<(Vec<F>, F), PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (n, d) = shape;
+    crate::capability::guard_f64_transcendental::<F>("sgd_solve")?;
+    validate_geometry(x.len(), y.len(), n, d)?;
+    if !sgd_host_available() {
+        return Err(PrimError::UnsupportedCapability {
+            operand: "sgd_solve_host_slice",
+            capability: "a host-resident SGD solve (this entry point is cpu-only)",
+        });
+    }
+    Ok(super::sgd_host::sgd_solve_host::<F>(x, y, n, d, params))
+}
+
 /// Solve the minibatch-SGD problem on the design `x` (`n × d`, row-major) and
 /// target `y` (length `n`), returning the device-resident pair
 /// `(coef, intercept)` (`coef` length `d`, `intercept` length 1).

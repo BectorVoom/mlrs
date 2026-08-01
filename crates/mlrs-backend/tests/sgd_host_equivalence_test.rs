@@ -8,7 +8,8 @@
 //! the two arms' `(coef, intercept)` BIT FOR BIT (`to_bits`), across every
 //! loss family, both schedules, both float types, the L1 / ElasticNet
 //! cumulative-shrink path, the `tol > 0` convergence-tracking path (whose
-//! delta the host arm FUSES into the update loop), and `batch_size > 1`.
+//! maxima the host arm reduces LANE-SPLIT rather than serially), and
+//! `batch_size > 1`.
 //!
 //! The arms are selected through the public prim with the `abflag`
 //! thread-local override (never `std::env::set_var` — see the `abflag` module
@@ -89,17 +90,15 @@ fn make_data<F: Pod>(n: usize, d: usize, seed: u64) -> (Vec<F>, Vec<F>, Vec<F>) 
 
 /// Run `sgd_solve` on one arm (`host = false` forces the device path via the
 /// `MLRS_SGD_HOST=0` knob) and return the fitted `(coef, intercept)`.
-fn solve_arm<F>(
-    x: &[F],
-    y: &[F],
-    n: usize,
-    d: usize,
-    params: &SgdParams,
-    host: bool,
-) -> (Vec<F>, F)
+fn solve_arm<F>(x: &[F], y: &[F], n: usize, d: usize, params: &SgdParams, host: bool) -> (Vec<F>, F)
 where
     F: Float + CubeElement + Pod,
 {
+    // `MLRS_SGD_WIDE_DOT` is a DELIBERATE reassociation of the margin (see
+    // `sgd_host::wide_dot`); pin it off so an ambient environment cannot turn
+    // this bit-identity gate into a failure — or, worse, quietly redefine what
+    // the "host arm" being asserted here even is.
+    let _wide = abflag::clear("MLRS_SGD_WIDE_DOT");
     let _guard = if host {
         abflag::clear("MLRS_SGD_HOST")
     } else {
