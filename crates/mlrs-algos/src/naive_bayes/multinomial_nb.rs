@@ -8,6 +8,17 @@
 //! GEMM joint-LL). This is a SEPARATE struct from the other variants (D-03 — no
 //! shared base); do NOT copy MultinomialNB into ComplementNB (Pitfall 6).
 //!
+//! ## Fit shape (NB-FIT-CPU)
+//!
+//! The fit is ENTIRELY host-side — one
+//! [`class_grouped_stats_host`](crate::naive_bayes::nb_common) sweep that
+//! validates and accumulates `feature_count_` in a single row-major pass, then
+//! host f64 smoothing. It touches the device once, to upload the
+//! `n_classes × n_features` GEMM operand `predict` needs;
+//! [`MultinomialNB::fit_from_host_slice`] is the entry point the PyO3 bridge
+//! uses so the operands are never round-tripped through a `DeviceArray` just to
+//! be read straight back.
+//!
 //! Tests live in `crates/mlrs-algos/tests/multinomial_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
@@ -23,8 +34,8 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::nb_common::{
-    argmax_decode, class_grouped_sum, empirical_class_log_prior, log_sum_exp_normalize,
-    NB_LABEL_INT_TOL,
+    argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
+    ClassGroupedStats, HostScanCheck, NB_LABEL_INT_TOL,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -179,25 +190,44 @@ impl MultinomialNBBuilder {
     }
 }
 
-impl<F> Fit<F> for MultinomialNB<F, Unfit>
+/// The `MLRS_MNNB_WORKERS` override key handed to
+/// [`crate::naive_bayes::nb_common::host_workers`] — see there for the
+/// worker-count policy. `MLRS_MNNB_WORKERS=1` pins the fully serial arm, which
+/// is what makes the serial-vs-parallel agreement test possible.
+const WORKERS_ENV: &str = "MLRS_MNNB_WORKERS";
+
+impl<F> MultinomialNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    type Fitted = MultinomialNB<F, Fitted>;
-
-    fn fit(
+    /// Fit directly from HOST slices — the no-upload twin of [`Fit::fit`].
+    ///
+    /// A `MultinomialNB` fit reads every element of `x` and `y` on the host (the
+    /// counts are validated and accumulated, then smoothed into host-f64 tables)
+    /// and touches the device exactly once, to upload the
+    /// `n_classes × n_features` GEMM operand `predict` needs. Routing the
+    /// OPERANDS through a `DeviceArray` therefore bought a round trip and nothing
+    /// else. Precedent: `Ridge::fit_from_host_slice` /
+    /// `CategoricalNB::fit_from_host_slice`.
+    ///
+    /// `shape` is `(n_samples, n_features)` and `x` is row-major, exactly as for
+    /// [`Fit::fit`]; the geometry guard is the slice twin of `validate_geometry`.
+    pub fn fit_from_host_slice(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        x: &[F],
+        y: &[F],
         shape: (usize, usize),
     ) -> Result<MultinomialNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        validate_geometry(x, shape)?;
-        let y = y.ok_or(AlgoError::NotFitted {
-            estimator: "multinomial_nb",
-            operation: "fit (requires y)",
-        })?;
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
         if y.len() != n_samples {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "y",
@@ -206,21 +236,75 @@ where
                 len: y.len(),
             }));
         }
+        self.fit_host(pool, x, y, shape)
+    }
 
-        // --- CR-01 / T-11-02: validate X is a finite, non-negative count matrix
-        //     BEFORE the GATHER reaches `((count + alpha) / denom).ln()` (sklearn's
-        //     `check_non_negative` parity; a negative / NaN count otherwise yields a
-        //     silent NaN feature_log_prob_). ---
-        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        validate_non_negative_counts("multinomial_nb", &x_host)?;
+    /// The shared host fit body behind [`Fit::fit`] and
+    /// [`MultinomialNB::fit_from_host_slice`] — both geometry guards run in the
+    /// caller, so this is the math only.
+    ///
+    /// ## Why ONE fused sweep (PERF, NB-FIT-CPU)
+    ///
+    /// The previous body read `x` to host, mapped it into an `n·d` `Vec<f64>`,
+    /// scanned that for the non-negative check, and then called
+    /// `class_grouped_sum` — which read `x` back to the host AGAIN and, for EACH
+    /// class, gathered that class's rows into a fresh block, uploaded the block,
+    /// launched `column_reduce` over it, and read the result back. On the cpu
+    /// backend every launch is a cubecl-cpu kernel with a thread per unit.
+    ///
+    /// Now `class_grouped_stats_host` validates and accumulates
+    /// `feature_count_[c, j]` in ONE row-major sweep, chunked over rows across a
+    /// scoped worker pool with a replicated (lock-free) table per worker. The
+    /// design matrix is read once and never becomes a device buffer.
+    fn fit_host(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x_host: &[F],
+        y_host: &[F],
+        shape: (usize, usize),
+    ) -> Result<MultinomialNB<F, Fitted>, AlgoError> {
+        let (_n_samples, n_features) = shape;
 
         // --- host distinct-sorted classes_ (multiclass, integer labels only, i32
-        //     range guarded — predicted labels are emitted as i32, WR-02). ---
-        let (classes_, class_of_row, n_classes) = decode_classes("multinomial_nb", pool, y, n_samples)?;
+        //     range guarded — predicted labels are emitted as i32, WR-02).
+        //
+        //     ORDER NOTE: the count sweep below needs `class_of_row`, so the label
+        //     decode now runs BEFORE the X validation that used to be its own
+        //     pass. For an input that is invalid BOTH ways the reported error is
+        //     therefore the label one, where it used to be the count one. The case
+        //     users actually hit is unaffected: a NON-FINITE X still reports
+        //     `check_array`'s exact message either way, because the PyO3 arm
+        //     re-scans for one on ANY rejection (`nb_host_fit_err`). Only
+        //     "negative count AND non-integer label" — already doubly invalid, and
+        //     the label restriction is mlrs-specific — changes which message
+        //     comes out. ---
+        let (classes_, class_of_row, n_classes) =
+            decode_classes_host::<F>("multinomial_nb", y_host)?;
 
-        // --- feature_count_[c,j] via the validated GATHER (one owner per
-        //     (class, feature); the counts are accumulated in host f64). ---
-        let feature_count = class_grouped_sum::<F>(pool, x, shape, &class_of_row, n_classes)?;
+        // --- feature_count_[c,j] in ONE sweep, with the CR-01 / T-11-02
+        //     finite-and-non-negative check fused in: sklearn's
+        //     `check_non_negative` parity, and without it a negative / NaN count
+        //     reaches `((count + alpha) / denom).ln()` and yields a silent
+        //     NaN feature_log_prob_. ---
+        let ClassGroupedStats {
+            sum: feature_count,
+            first_invalid,
+            ..
+        } = class_grouped_stats_host::<F>(
+            x_host,
+            shape,
+            &class_of_row,
+            n_classes,
+            HostScanCheck::NonNegative,
+            false,
+            WORKERS_ENV,
+        );
+        if let Some((_, v)) = first_invalid {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "multinomial_nb",
+                reason: format!("input X must be finite and non-negative (got {v})"),
+            });
+        }
 
         // class_count_[c] = #rows of class c.
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
@@ -234,10 +318,11 @@ where
         let alpha = self.alpha;
         let mut flp: Vec<f64> = vec![0.0; n_classes * n_features];
         for c in 0..n_classes {
-            let row_total: f64 = feature_count[c].iter().sum();
+            let row = &feature_count[c * n_features..(c + 1) * n_features];
+            let row_total: f64 = row.iter().sum();
             let denom = row_total + alpha * n_features as f64;
-            for j in 0..n_features {
-                flp[c * n_features + j] = ((feature_count[c][j] + alpha) / denom).ln();
+            for (j, &count) in row.iter().enumerate() {
+                flp[c * n_features + j] = ((count + alpha) / denom).ln();
             }
         }
 
@@ -267,6 +352,44 @@ where
             class_log_prior_: Some(class_log_prior_),
             _state: PhantomData,
         })
+    }
+}
+
+impl<F> Fit<F> for MultinomialNB<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = MultinomialNB<F, Fitted>;
+
+    fn fit(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<MultinomialNB<F, Fitted>, AlgoError> {
+        let (n_samples, _n_features) = shape;
+        validate_geometry(x, shape)?;
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "multinomial_nb",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        // The device buffers exist only because `Fit` is the shared typestate
+        // surface — this fit's math is entirely host-side, so read both operands
+        // once and run the same body `fit_from_host_slice` runs. A caller that
+        // already holds host slices should use that entry point instead and skip
+        // the upload these two reads undo.
+        let x_host = x.to_host(pool);
+        let y_host = y.to_host(pool);
+        self.fit_host(pool, &x_host, &y_host, shape)
     }
 }
 
@@ -461,31 +584,16 @@ pub(crate) fn validate_non_negative_counts(
 }
 
 /// Shared label decode for the discrete NB variants (D-03 — function-level
-/// sharing): read `y` to host, validate integer labels in i32 range (WR-02 —
-/// predicted labels are emitted as i32), and return the distinct-sorted
-/// `classes_`, the dense per-row class index, and `n_classes`. `pub(crate)` so
-/// the sibling discrete fits reuse it without a base struct. `estimator` is the
-/// caller's name, surfaced in the user-facing label errors (IN-03 — no leaking
-/// the internal `"discrete_nb"` helper name).
-pub(crate) fn decode_classes<F>(
-    estimator: &'static str,
-    pool: &BufferPool<ActiveRuntime>,
-    y: &DeviceArray<ActiveRuntime, F>,
-    n_samples: usize,
-) -> Result<(Vec<i64>, Vec<usize>, usize), AlgoError>
-where
-    F: Float + CubeElement + Pod,
-{
-    let y_host = y.to_host(pool);
-    debug_assert_eq!(y_host.len(), n_samples, "decode_classes: y length mismatch");
-    decode_classes_host::<F>(estimator, &y_host)
-}
-
-/// The host-slice twin of [`decode_classes`] — the decode itself, with the
-/// device read-back left to the caller. `CategoricalNB::fit_from_host_slice`
-/// already holds `y` as a host slice (its whole fit is host-side), so it calls
-/// this directly rather than paying an upload + read-back to satisfy the
-/// `DeviceArray` signature.
+/// sharing): validate integer labels in i32 range (WR-02 — predicted labels are
+/// emitted as i32) and return the distinct-sorted `classes_`, the dense per-row
+/// class index, and `n_classes`. `pub(crate)` so the sibling discrete fits reuse
+/// it without a base struct. `estimator` is the caller's name, surfaced in the
+/// user-facing label errors (IN-03 — no leaking the internal `"discrete_nb"`
+/// helper name).
+///
+/// Takes `y` as a HOST slice: every NB fit is host-side (NB-FIT-CPU), so the
+/// `DeviceArray`-taking wrapper this used to have only ever read `y` back and
+/// forwarded it here. `Fit::fit` calls `y.to_host(pool)` itself.
 pub(crate) fn decode_classes_host<F>(
     estimator: &'static str,
     y_host: &[F],

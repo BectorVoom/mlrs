@@ -7,6 +7,17 @@
 //! analog is `linear/mbsgd_classifier.rs` (builder + `classes_` remap +
 //! device-resident fitted state). Construction is the builder (D-01).
 //!
+//! ## Fit shape (NB-FIT-CPU)
+//!
+//! The fit is ENTIRELY host-side — ONE
+//! [`class_grouped_stats_host`](crate::naive_bayes::nb_common) sweep produces
+//! BOTH per-class sufficient statistics (`Σ x` and `Σ x²`), and the global
+//! `epsilon_` column variances fall out of the same totals for free. It touches
+//! the device only to upload the fitted `theta_` / `var_`;
+//! [`GaussianNB::fit_from_host_slice`] is the entry point the PyO3 bridge uses
+//! so the operands are never round-tripped through a `DeviceArray` just to be
+//! read straight back.
+//!
 //! Tests live in `crates/mlrs-algos/tests/gaussian_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
@@ -21,8 +32,8 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::nb_common::{
-    argmax_decode, class_grouped_sum, class_grouped_sumsq, empirical_class_log_prior,
-    log_sum_exp_normalize, NB_LABEL_INT_TOL,
+    argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
+    ClassGroupedStats, HostScanCheck, NB_LABEL_INT_TOL,
 };
 // Phase 16 (D-02 shape-B trait-swap): the pre-existing builder is UNTOUCHED; the
 // estimator gains the `<F, S = Unfit>` state param and migrates from the legacy
@@ -183,26 +194,43 @@ impl GaussianNBBuilder {
     }
 }
 
-impl<F> Fit<F> for GaussianNB<F, Unfit>
+/// The `MLRS_GNB_WORKERS` override key handed to
+/// [`crate::naive_bayes::nb_common::host_workers`] — see there for the
+/// worker-count policy. `MLRS_GNB_WORKERS=1` pins the fully serial arm, which is
+/// what makes the serial-vs-parallel agreement test possible.
+const WORKERS_ENV: &str = "MLRS_GNB_WORKERS";
+
+impl<F> GaussianNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    type Fitted = GaussianNB<F, Fitted>;
-
-    fn fit(
+    /// Fit directly from HOST slices — the no-upload twin of [`Fit::fit`].
+    ///
+    /// A `GaussianNB` fit reads every element of `x` and `y` on the host (the
+    /// per-class sufficient statistics and the global column variances are host
+    /// f64) and touches the device only to upload the fitted `theta_` / `var_`.
+    /// Routing the OPERANDS through a `DeviceArray` therefore bought a round trip
+    /// and nothing else. Precedent: `Ridge::fit_from_host_slice` /
+    /// `CategoricalNB::fit_from_host_slice`.
+    ///
+    /// `shape` is `(n_samples, n_features)` and `x` is row-major, exactly as for
+    /// [`Fit::fit`]; the geometry guard is the slice twin of `validate_geometry`.
+    pub fn fit_from_host_slice(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        x: &[F],
+        y: &[F],
         shape: (usize, usize),
     ) -> Result<GaussianNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        // Data-DEPENDENT geometry guard BEFORE any launch (T-11-02 / ASVS V5).
-        validate_geometry(x, shape)?;
-        let y = y.ok_or(AlgoError::NotFitted {
-            estimator: "gaussian_nb",
-            operation: "fit (requires y)",
-        })?;
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
         if y.len() != n_samples {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "y",
@@ -211,9 +239,40 @@ where
                 len: y.len(),
             }));
         }
+        self.fit_host(pool, x, y, shape)
+    }
+
+    /// The shared host fit body behind [`Fit::fit`] and
+    /// [`GaussianNB::fit_from_host_slice`] — both geometry guards run in the
+    /// caller, so this is the math only.
+    ///
+    /// ## Why ONE fused sweep (PERF, NB-FIT-CPU)
+    ///
+    /// GaussianNB paid the device GATHER TWICE — `class_grouped_sum` and
+    /// `class_grouped_sumsq`, each of which read `x` back to the host and then,
+    /// for EACH class, gathered that class's rows into a fresh block, uploaded
+    /// the block, launched `column_reduce`, and read the result back. That is
+    /// `2 · n_classes` cubecl-cpu kernel launches over the same data, each with
+    /// an OS thread per unit. It THEN ran a third pass for `epsilon_` that looped
+    /// `j` outer and `i` inner — COLUMN-strided, so it touched a distinct cache
+    /// line per row and moved `O(n · d²)` bytes, the same shape that made the
+    /// CategoricalNB fit scale with `d²`.
+    ///
+    /// Now one `class_grouped_stats_host` sweep produces `Σ x` AND `Σ x²`
+    /// together, and the global column statistics `epsilon_` needs are just the
+    /// per-class ones summed over `c` — an `n_classes · n_features` reduction, so
+    /// the third pass over the design matrix is gone entirely rather than merely
+    /// reordered. The matrix is read once and never becomes a device buffer.
+    fn fit_host(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x_host: &[F],
+        y_host: &[F],
+        shape: (usize, usize),
+    ) -> Result<GaussianNB<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
         // --- Pitfall 4: host distinct-sorted classes_ (no class-count
         //     restriction; GaussianNB is multiclass). Integer labels only. ---
-        let y_host = y.to_host(pool);
         let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
         for &yv in y_host.iter() {
             let lf = host_to_f64(yv);
@@ -248,10 +307,30 @@ where
             .map(|l| classes_.binary_search(l).expect("label is in classes_"))
             .collect();
 
-        // --- Per-class sufficient statistics via the validated GATHER prims
-        //     (one owner per (class, feature); NO scatter-add, NO new kernel). ---
-        let sums = class_grouped_sum::<F>(pool, x, shape, &class_of_row, n_classes)?;
-        let sumsqs = class_grouped_sumsq::<F>(pool, x, shape, &class_of_row, n_classes)?;
+        // --- Per-class sufficient statistics: ONE row-major sweep produces both
+        //     Σ x and Σ x². The finite check rides along (GaussianNB models real
+        //     values, so a NEGATIVE feature is perfectly valid — only NaN/±inf are
+        //     rejected), which is what lets the Python shim hand off
+        //     `check_array`'s finite scan. ---
+        let ClassGroupedStats {
+            sum: sums,
+            sumsq: sumsqs,
+            first_invalid,
+        } = class_grouped_stats_host::<F>(
+            x_host,
+            shape,
+            &class_of_row,
+            n_classes,
+            HostScanCheck::Finite,
+            true,
+            WORKERS_ENV,
+        );
+        if let Some((_, v)) = first_invalid {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "gaussian_nb",
+                reason: format!("input X must be finite (got {v})"),
+            });
+        }
 
         // class_count_[c] = #rows of class c (every observed class has >= 1).
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
@@ -267,8 +346,8 @@ where
             let n_c = class_count_[c];
             debug_assert!(n_c > 0.0, "every observed class has at least one sample");
             for j in 0..n_features {
-                let mean = sums[c][j] / n_c;
-                let raw_var = sumsqs[c][j] / n_c - mean * mean;
+                let mean = sums[c * n_features + j] / n_c;
+                let raw_var = sumsqs[c * n_features + j] / n_c - mean * mean;
                 theta[c * n_features + j] = mean;
                 // Population variance can dip slightly negative from f64 round-off
                 // when the true variance is ~0 (e.g. a constant feature); clamp to
@@ -279,17 +358,21 @@ where
 
         // --- epsilon_ = var_smoothing · max_j Var(X[:,j]) over the WHOLE X
         //     (population, ddof=0), computed ONCE — GLOBAL, not per-class
-        //     (Pitfall 3, FEATURES.md `var_smoothing * X.var(axis=0).max()`). ---
-        let x_host = x.to_host(pool);
+        //     (Pitfall 3, FEATURES.md `var_smoothing * X.var(axis=0).max()`).
+        //
+        //     The whole-column totals are just the per-class ones summed over c,
+        //     so this needs NO pass over the design matrix — it reduces the
+        //     `n_classes × n_features` tables the sweep already built. The pass it
+        //     replaces looped `j` outer and `i` inner: COLUMN-strided over a
+        //     working set far larger than L3, i.e. `O(n · d²)` bytes moved. ---
         let n = n_samples as f64;
         let mut max_col_var = 0.0f64;
         for j in 0..n_features {
             let mut s = 0.0f64;
             let mut ss = 0.0f64;
-            for i in 0..n_samples {
-                let v = host_to_f64(x_host[i * n_features + j]);
-                s += v;
-                ss += v * v;
+            for c in 0..n_classes {
+                s += sums[c * n_features + j];
+                ss += sumsqs[c * n_features + j];
             }
             let mean = s / n;
             let col_var = (ss / n - mean * mean).max(0.0);
@@ -365,6 +448,43 @@ where
             epsilon_: Some(epsilon_),
             _state: PhantomData,
         })
+    }
+}
+
+impl<F> Fit<F> for GaussianNB<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = GaussianNB<F, Fitted>;
+
+    fn fit(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<GaussianNB<F, Fitted>, AlgoError> {
+        let (n_samples, _n_features) = shape;
+        // Data-DEPENDENT geometry guard BEFORE any launch (T-11-02 / ASVS V5).
+        validate_geometry(x, shape)?;
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "gaussian_nb",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        // The device buffers exist only because `Fit` is the shared typestate
+        // surface — this fit's math is entirely host-side, so read both operands
+        // once and run the same body `fit_from_host_slice` runs.
+        let x_host = x.to_host(pool);
+        let y_host = y.to_host(pool);
+        self.fit_host(pool, &x_host, &y_host, shape)
     }
 }
 

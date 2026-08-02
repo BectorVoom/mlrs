@@ -43,6 +43,7 @@ use crate::naive_bayes::multinomial_nb::{
 };
 use crate::naive_bayes::nb_common::{
     argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize, NB_LABEL_INT_TOL,
+    PAR_TABLE_MAX_ENTRIES,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -257,20 +258,6 @@ impl CategoricalNBBuilder {
 /// saturating the cast. `u32::MAX` categories in ONE feature would need a
 /// ≥ 16 GiB count table anyway.
 const MAX_CATEGORY: f64 = u32::MAX as f64;
-
-/// Per-worker flat count-table budget, in `u32` entries (4 MiB). The tabulation
-/// replicates an `n_classes · Σ_j n_categories_j` table PER worker, so a fit
-/// with a huge category cross-product drops back to one table (serial) rather
-/// than allocating a copy per core.
-///
-/// Memory footprint, for the record: ONE flat table is `n_classes · Σ_j
-/// n_categories_j` `u32`s — exactly half the size of the `f64`
-/// `feature_log_prob_` the fit must return anyway, so the un-replicated table can
-/// never dominate the estimator it builds. The previous body's per-feature tables
-/// peaked lower (one `n_classes × n_categories_j` table at a time) but paid the
-/// `O(n · d²)` traffic for it; this cap is what keeps the replicated case bounded
-/// (at most `PAR_MAX_WORKERS · 4 MiB` of scratch) rather than scaling with cores.
-const PAR_TABLE_MAX_ENTRIES: usize = 1 << 20;
 
 /// The `MLRS_CATNB_WORKERS` override key handed to
 /// [`crate::naive_bayes::nb_common::host_workers`] — see there for the

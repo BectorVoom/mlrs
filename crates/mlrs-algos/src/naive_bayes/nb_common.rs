@@ -19,6 +19,12 @@
 //!   (`ComplementNB` uses argmin internally, D-08).
 //! - [`accuracy_score`] — the fraction of exact matches, for the shared `score`
 //!   (D-07, sklearn `ClassifierMixin.score`).
+//! - `class_grouped_stats_host` — the per-class column `Σ x` / `Σ x²` sweep that
+//!   every NB fit runs (NB-FIT-CPU). ONE row-major pass over the host design
+//!   matrix, chunked over rows across a scoped worker pool, with the caller's
+//!   per-element validation fused in. `host_workers` / `chunk_rows` /
+//!   `PAR_*` are its shared worker-count policy, also used by the
+//!   CategoricalNB / BernoulliNB tabulation sweeps.
 //! - [`class_grouped_sum`] — the one-owner-per-`(class, feature)` GATHER helper:
 //!   composes the validated v1 `column_reduce` (`ScalarOp::Sum`) prim over
 //!   host-grouped per-class row blocks. It is a GATHER, NEVER a scatter-add: NO
@@ -27,12 +33,14 @@
 //!   per-class sum-of-squares the sibling [`class_grouped_sumsq`] composes
 //!   `column_reduce` with `ScalarOp::SumSq` (resolves RESEARCH assumption A5:
 //!   a per-axis SumSq IS exposed by the reduce prim, so no squared-host-copy is
-//!   needed).
+//!   needed). NO FIT CALLS THESE TWO ANY MORE — see `class_grouped_stats_host`
+//!   for what they cost and why; they stay as `pub` API for a device-resident
+//!   caller.
 //!
 //! All host math is f64 (`mlrs_core::host_to_f64`) regardless of the estimator's
 //! `F`, because the class-conditional sums and the log-sum-exp are accumulation-
-//! heavy and the oracle gate is ≤ 1e-5 vs sklearn. The device touch is ONLY the
-//! reduce-prim launch inside the two GATHER helpers.
+//! heavy and the oracle gate is ≤ 1e-5 vs sklearn. No NB fit touches the device
+//! at all now except to upload the fitted operand `predict` needs.
 //!
 //! Tests live in `crates/mlrs-algos/tests/nb_common_test.rs` (AGENTS.md §2).
 
@@ -56,6 +64,25 @@ pub const NB_LABEL_INT_TOL: f64 = 1e-6;
 /// Below this many `n_samples · n_features` elements a chunked host fit pass
 /// stays single-threaded: spawning a scoped worker costs ~30 µs, which dwarfs a
 /// scan over a few tens of thousands of elements.
+///
+/// Measured for [`class_grouped_stats_host`] on a 16-core box (MultinomialNB,
+/// `C = 4`, min of 9, wall / cpu ms), 1 worker vs 8:
+///
+/// | n·d     | 160 k     | 640 k     | 1.6 M     | 6.4 M      | 12.8 M     |
+/// |---------|-----------|-----------|-----------|------------|------------|
+/// | 1w      | 0.38/0.38 | 1.15/1.15 | 2.71/2.73 | 9.41/9.47  | 23.9/23.9  |
+/// | 8w      | 0.32/0.68 | 0.49/1.72 | 1.47/5.17 | 3.13/13.56 | 5.86/29.8  |
+///
+/// So this threshold is the point where parallelism stops LOSING, not where it
+/// starts paying: at `160 k` it buys 16 % of wall for 80 % more CPU, and only by
+/// `640 k` is it a clear 2.3× win. Raising it to ~`1 << 19` would be defensible
+/// for THIS sweep — it is left alone because the constant is shared with the
+/// CategoricalNB / BernoulliNB tabulation sweeps, whose per-element work is
+/// heavier (a strided scatter, not a column add) and whose crossover is
+/// therefore lower; re-measure all three before moving it. NOTE that a
+/// heavily-loaded box makes the small rungs look far worse than the table above
+/// (8 fresh threads must each win a slot in a deep run queue), which is a
+/// benchmarking artifact, not a cost this threshold should be tuned against.
 pub(crate) const PAR_MIN_ELEMS: usize = 1 << 15;
 
 /// Ceiling on the worker count for a chunked host fit pass. These passes stream
@@ -74,6 +101,14 @@ pub(crate) const PAR_MIN_ELEMS: usize = 1 << 15;
 /// to shave 2 % off one fit is the wrong trade in a library, so the pool is
 /// capped here and the rest of the box is left for the caller's other work.
 pub(crate) const PAR_MAX_WORKERS: usize = 8;
+
+/// Per-worker accumulator budget, in entries. A chunked host fit pass replicates
+/// its `n_classes · <axis>` table PER worker to stay lock-free, so a fit whose
+/// table is already huge runs on ONE table (serial) rather than allocating a
+/// copy per core. 1 Mi entries is 4 MiB as `u32` / 8 MiB as `f64`; one
+/// un-replicated table is at most the size of the `feature_log_prob_` the fit
+/// must return anyway, so it can never dominate the estimator it builds.
+pub(crate) const PAR_TABLE_MAX_ENTRIES: usize = 1 << 20;
 
 /// Worker count for a row-chunked host pass over `n_elems` elements: `1` below
 /// [`PAR_MIN_ELEMS`], else the machine's parallelism capped at
@@ -248,6 +283,11 @@ pub fn accuracy_score(pred: &[i32], y_true: &[i32]) -> f64 {
 /// `class_of_row[i] ∈ [0, n_classes)` is the dense class index of row `i`. A
 /// class with no rows contributes an all-zero row. Returns a `PrimError` only if
 /// the reduce prim's geometry guard trips (it `u32::try_from`-guards the grid).
+/// NOTE (NB-FIT-CPU): **no estimator fit calls this any more.** Every NB fit now
+/// runs [`class_grouped_stats_host`] instead — see its docs for the measured
+/// reason. This device GATHER is retained as the validated reduce-prim
+/// composition (it is `pub` API with its own launch-witness tests) for a caller
+/// that genuinely wants the reduction to stay device-resident.
 pub fn class_grouped_sum<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
@@ -265,8 +305,10 @@ where
 /// `out[c][j] = Σ_{i : class_of_row[i] == c} x[i][j]²`. Composes the same
 /// per-class GATHER over `column_reduce` but with [`ScalarOp::SumSq`], so the
 /// per-axis squared sum is computed by the reduce prim directly (no
-/// squared-host-copy). GaussianNB uses `theta_cj = sum_cj / n_c` and
-/// `var_cj = sumsq_cj / n_c − theta_cj²` from these two GATHERs.
+/// squared-host-copy). GaussianNB used `theta_cj = sum_cj / n_c` and
+/// `var_cj = sumsq_cj / n_c − theta_cj²` from these two GATHERs; it now gets
+/// both from ONE [`class_grouped_stats_host`] sweep. Same retention note as
+/// [`class_grouped_sum`].
 pub fn class_grouped_sumsq<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
@@ -361,4 +403,221 @@ where
     }
 
     Ok(out)
+}
+
+// ===========================================================================
+// The HOST class-grouped sweep (NB-FIT-CPU) — what every NB fit uses instead of
+// the device GATHER above.
+// ===========================================================================
+
+/// Per-element validation applied by [`class_grouped_stats_host`] as it sweeps.
+///
+/// The check is fused into the accumulate loop rather than run as its own pass:
+/// the sweep already reads every element, and `check_array`'s finite scan on the
+/// Python side is a second single-threaded trip over the whole matrix. Every
+/// caller therefore hands `ensure_all_finite=False` to its shim and lets the
+/// PyO3 arm re-raise `check_array`'s exact `ValueError` from this verdict.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HostScanCheck {
+    /// Reject a non-finite value (`NaN` / `±inf`). GaussianNB's check: it models
+    /// real-valued features, so a negative value is perfectly valid.
+    Finite,
+    /// Reject a non-finite OR negative value — sklearn's `check_non_negative`
+    /// parity for the count-based discrete variants, whose
+    /// `((count + alpha) / denom).ln()` would otherwise go silently `NaN`/`-inf`.
+    NonNegative,
+}
+
+impl HostScanCheck {
+    /// Whether `xf` fails this check. Written so a `NaN` — for which EVERY
+    /// ordering comparison is false — is REJECTED, not silently accumulated.
+    #[inline(always)]
+    fn rejects(self, xf: f64) -> bool {
+        match self {
+            HostScanCheck::Finite => !xf.is_finite(),
+            HostScanCheck::NonNegative => !xf.is_finite() || xf < 0.0,
+        }
+    }
+}
+
+/// The per-class column statistics [`class_grouped_stats_host`] returns, flat
+/// `n_classes × n_features` row-major (`[c * n_features + j]`).
+pub(crate) struct ClassGroupedStats {
+    /// `sum[c * n_features + j] = Σ_{i : class_of_row[i] == c} x[i][j]`.
+    pub sum: Vec<f64>,
+    /// The matching `Σ x[i][j]²`, EMPTY when the caller did not ask for it.
+    pub sumsq: Vec<f64>,
+    /// Flat index (in the whole matrix) and value of the first element that
+    /// failed the [`HostScanCheck`], in ROW-MAJOR order — independent of how the
+    /// rows were split across workers. `None` when every element passed.
+    pub first_invalid: Option<(usize, f64)>,
+}
+
+/// One worker's share of the sweep: validate + accumulate `sum` (and `sumsq`
+/// when non-empty) for every row of `chunk`.
+///
+/// `want_sumsq` is hoisted OUT of the inner loop so the common sum-only case
+/// (the three discrete variants) does not pay a branch per element.
+fn stats_chunk<F>(
+    chunk: &[F],
+    class_of_row: &[usize],
+    n_features: usize,
+    check: HostScanCheck,
+    flat_base: usize,
+    sum: &mut [f64],
+    sumsq: &mut [f64],
+) -> Option<(usize, f64)>
+where
+    F: Float + CubeElement + Pod,
+{
+    let want_sumsq = !sumsq.is_empty();
+    for (r, (row, &c)) in chunk
+        .chunks_exact(n_features)
+        .zip(class_of_row.iter())
+        .enumerate()
+    {
+        let base = c * n_features;
+        if want_sumsq {
+            let s = &mut sum[base..base + n_features];
+            let q = &mut sumsq[base..base + n_features];
+            for (j, ((&xv, sa), qa)) in row.iter().zip(s.iter_mut()).zip(q.iter_mut()).enumerate() {
+                let xf = host_to_f64(xv);
+                if check.rejects(xf) {
+                    return Some((flat_base + r * n_features + j, xf));
+                }
+                *sa += xf;
+                *qa += xf * xf;
+            }
+        } else {
+            let s = &mut sum[base..base + n_features];
+            for (j, (&xv, sa)) in row.iter().zip(s.iter_mut()).enumerate() {
+                let xf = host_to_f64(xv);
+                if check.rejects(xf) {
+                    return Some((flat_base + r * n_features + j, xf));
+                }
+                *sa += xf;
+            }
+        }
+    }
+    None
+}
+
+/// `out.sum[c, j] = Σ_{i : class_of_row[i] == c} x[i][j]` (plus `out.sumsq` when
+/// `want_sumsq`), computed in ONE row-major sweep over the HOST design matrix,
+/// chunked over rows across a scoped worker pool.
+///
+/// ## Why this replaced the device GATHER (PERF, NB-FIT-CPU)
+///
+/// [`class_grouped_sum`] read the matrix back to the host and then, for EACH
+/// class, gathered that class's rows into a fresh `n_c × d` block, uploaded the
+/// block, launched `column_reduce` over it, and read the result back — so a fit
+/// moved the whole design matrix `2 + n_classes` extra times and paid
+/// `n_classes` kernel launches. On the cpu backend every launch is a cubecl-cpu
+/// kernel with an OS thread per unit, and a default `1000 × 8` BernoulliNB fit
+/// cost 96.4 s against sklearn's 3.5 ms. GaussianNB paid it TWICE (sum and
+/// sumsq, `2 · n_classes` launches over the same data).
+///
+/// This sweep reads `x` exactly once, writes `n_classes · n_features`
+/// accumulators, creates NO device buffer, and folds the caller's per-element
+/// validation in for free. `sum` and `sumsq` come out of the SAME pass, so
+/// GaussianNB's two GATHERs become one traversal.
+///
+/// Each worker accumulates into a private table and the driver sums them, so the
+/// sweep is lock-free; a table too large to replicate (`n_classes · n_features >
+/// PAR_TABLE_MAX_ENTRIES`) drops to the serial arm rather than allocating a copy
+/// per core. `env_key` names the caller's `MLRS_*_WORKERS` override (see
+/// [`host_workers`]); forcing it to `1` pins the serial arm, which is what makes
+/// a serial-vs-parallel agreement test possible.
+///
+/// A class with no rows contributes an all-zero row, matching the GATHER.
+/// Callers guard geometry themselves; this asserts only the invariant the
+/// indexing depends on.
+pub(crate) fn class_grouped_stats_host<F>(
+    x: &[F],
+    shape: (usize, usize),
+    class_of_row: &[usize],
+    n_classes: usize,
+    check: HostScanCheck,
+    want_sumsq: bool,
+    env_key: &'static str,
+) -> ClassGroupedStats
+where
+    F: Float + CubeElement + Pod,
+{
+    let (n_samples, n_features) = shape;
+    assert_eq!(
+        class_of_row.len(),
+        n_samples,
+        "class_grouped_stats_host: class_of_row length {} != n_samples {n_samples}",
+        class_of_row.len()
+    );
+    let table_len = n_classes * n_features;
+    let workers = if table_len > PAR_TABLE_MAX_ENTRIES {
+        1
+    } else {
+        host_workers(env_key, n_samples * n_features)
+    };
+    let rows_per = chunk_rows(n_samples, workers);
+    let elems_per = rows_per * n_features;
+    let sq_len = if want_sumsq { table_len } else { 0 };
+
+    // One worker's share, returning its private tables and the first invalid
+    // element it saw (flat index + value).
+    let run = |chunk: &[F], cls: &[usize], flat_base: usize| {
+        let mut sum = vec![0.0f64; table_len];
+        let mut sumsq = vec![0.0f64; sq_len];
+        let bad = stats_chunk::<F>(
+            chunk,
+            cls,
+            n_features,
+            check,
+            flat_base,
+            &mut sum,
+            &mut sumsq,
+        );
+        (sum, sumsq, bad)
+    };
+
+    let parts: Vec<(Vec<f64>, Vec<f64>, Option<(usize, f64)>)> = if workers == 1 {
+        vec![run(x, class_of_row, 0)]
+    } else {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = x
+                .chunks(elems_per)
+                .zip(class_of_row.chunks(rows_per))
+                .enumerate()
+                .map(|(ci, (chunk, cls))| {
+                    let run = &run;
+                    scope.spawn(move || run(chunk, cls, ci * elems_per))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("class_grouped_stats_host: worker panicked"))
+                .collect()
+        })
+    };
+
+    // The FIRST offender in row-major order — independent of worker count, so
+    // the caller's error message does not depend on the machine's core count.
+    let first_invalid = parts
+        .iter()
+        .filter_map(|(_, _, e)| *e)
+        .min_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut sum = vec![0.0f64; table_len];
+    let mut sumsq = vec![0.0f64; sq_len];
+    for (s, q, _) in &parts {
+        for (acc, &v) in sum.iter_mut().zip(s.iter()) {
+            *acc += v;
+        }
+        for (acc, &v) in sumsq.iter_mut().zip(q.iter()) {
+            *acc += v;
+        }
+    }
+    ClassGroupedStats {
+        sum,
+        sumsq,
+        first_invalid,
+    }
 }

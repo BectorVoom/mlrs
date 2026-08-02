@@ -44,7 +44,7 @@ use crate::naive_bayes::multinomial_nb::{
     validate_non_negative_counts,
 };
 use crate::naive_bayes::nb_common::{
-    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize,
+    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize, PAR_TABLE_MAX_ENTRIES,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -147,14 +147,6 @@ fn binarize_host(buf: &mut [f64], binarize: Option<f64>) {
 /// worker-count policy. `MLRS_BERNNB_WORKERS=1` pins the fully serial arm, which
 /// is what makes the serial-vs-parallel agreement test possible.
 const WORKERS_ENV: &str = "MLRS_BERNNB_WORKERS";
-
-/// Per-worker accumulator budget, in entries. The fit replicates the
-/// `n_classes · n_features` occurrence table PER worker to stay lock-free, so a
-/// fit whose table is already huge runs on ONE table (serial) rather than
-/// allocating a copy per core. 1 Mi entries is 4 MiB as `u32`; the un-replicated
-/// table is at most the same size as the `feature_log_prob_` the fit must return
-/// anyway, so it can never dominate the estimator it builds.
-const PAR_TABLE_MAX_ENTRIES: usize = 1 << 20;
 
 /// Fused validate + binarize + tabulate over ONE row-chunk, the `binarize =
 /// Some(threshold)` arm: `table[c · n_features + j] += (x[i,j] > threshold)` for

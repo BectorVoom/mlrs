@@ -12,6 +12,17 @@
 //! MultinomialNB — implement it verbatim from FEATURES.md in Wave 1, do NOT copy
 //! Multinomial (Pitfall 6).
 //!
+//! ## Fit shape (NB-FIT-CPU)
+//!
+//! The fit is ENTIRELY host-side — one
+//! [`class_grouped_stats_host`](crate::naive_bayes::nb_common) sweep that
+//! validates and accumulates `feature_count_` in a single row-major pass, then
+//! host f64 complement weighting. It touches the device once, to upload the
+//! `n_classes × n_features` GEMM operand `predict` needs;
+//! [`ComplementNB::fit_from_host_slice`] is the entry point the PyO3 bridge uses
+//! so the operands are never round-tripped through a `DeviceArray` just to be
+//! read straight back.
+//!
 //! Tests live in `crates/mlrs-algos/tests/complement_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
@@ -27,9 +38,13 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::multinomial_nb::{
-    decode_classes, resolve_class_log_prior, validate_discrete_alpha, validate_non_negative_counts,
+    decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
+    validate_non_negative_counts,
 };
-use crate::naive_bayes::nb_common::{argmin_decode, class_grouped_sum, log_sum_exp_normalize};
+use crate::naive_bayes::nb_common::{
+    argmin_decode, class_grouped_stats_host, log_sum_exp_normalize, ClassGroupedStats,
+    HostScanCheck,
+};
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
 // BYTE-IDENTICAL (D-03).
@@ -188,25 +203,44 @@ impl ComplementNBBuilder {
     }
 }
 
-impl<F> Fit<F> for ComplementNB<F, Unfit>
+/// The `MLRS_CNB_WORKERS` override key handed to
+/// [`crate::naive_bayes::nb_common::host_workers`] — see there for the
+/// worker-count policy. `MLRS_CNB_WORKERS=1` pins the fully serial arm, which is
+/// what makes the serial-vs-parallel agreement test possible.
+const WORKERS_ENV: &str = "MLRS_CNB_WORKERS";
+
+impl<F> ComplementNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    type Fitted = ComplementNB<F, Fitted>;
-
-    fn fit(
+    /// Fit directly from HOST slices — the no-upload twin of [`Fit::fit`].
+    ///
+    /// A `ComplementNB` fit reads every element of `x` and `y` on the host (the
+    /// counts are validated and accumulated, then complement-weighted into
+    /// host-f64 tables) and touches the device exactly once, to upload the
+    /// `n_classes × n_features` GEMM operand `predict` needs. Routing the
+    /// OPERANDS through a `DeviceArray` therefore bought a round trip and nothing
+    /// else. Precedent: `Ridge::fit_from_host_slice` /
+    /// `CategoricalNB::fit_from_host_slice`.
+    ///
+    /// `shape` is `(n_samples, n_features)` and `x` is row-major, exactly as for
+    /// [`Fit::fit`]; the geometry guard is the slice twin of `validate_geometry`.
+    pub fn fit_from_host_slice(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        x: &[F],
+        y: &[F],
         shape: (usize, usize),
     ) -> Result<ComplementNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        validate_geometry(x, shape)?;
-        let y = y.ok_or(AlgoError::NotFitted {
-            estimator: "complement_nb",
-            operation: "fit (requires y)",
-        })?;
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
         if y.len() != n_samples {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "y",
@@ -215,17 +249,65 @@ where
                 len: y.len(),
             }));
         }
+        self.fit_host(pool, x, y, shape)
+    }
 
-        // CR-01 / T-11-02: validate X is a finite, non-negative count matrix BEFORE
-        // it reaches `(cc / comp_sum).ln()` (sklearn's `check_non_negative` parity;
-        // a negative count drives comp_sum / the log to NaN/-inf silently).
-        let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        validate_non_negative_counts("complement_nb", &x_host)?;
+    /// The shared host fit body behind [`Fit::fit`] and
+    /// [`ComplementNB::fit_from_host_slice`] — both geometry guards run in the
+    /// caller, so this is the math only.
+    ///
+    /// ## Why ONE fused sweep (PERF, NB-FIT-CPU)
+    ///
+    /// The previous body read `x` to host, mapped it into an `n·d` `Vec<f64>`,
+    /// scanned that for the non-negative check, and then called
+    /// `class_grouped_sum` — which read `x` back to the host AGAIN and, for EACH
+    /// class, gathered that class's rows into a fresh block, uploaded the block,
+    /// launched `column_reduce` over it, and read the result back. On the cpu
+    /// backend every launch is a cubecl-cpu kernel with a thread per unit.
+    ///
+    /// Now `class_grouped_stats_host` validates and accumulates
+    /// `feature_count_[c, j]` in ONE row-major sweep, chunked over rows across a
+    /// scoped worker pool with a replicated (lock-free) table per worker. The
+    /// design matrix is read once and never becomes a device buffer.
+    fn fit_host(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x_host: &[F],
+        y_host: &[F],
+        shape: (usize, usize),
+    ) -> Result<ComplementNB<F, Fitted>, AlgoError> {
+        let (_n_samples, n_features) = shape;
 
-        let (classes_, class_of_row, n_classes) = decode_classes("complement_nb", pool, y, n_samples)?;
+        // ORDER NOTE: the count sweep below needs `class_of_row`, so the label
+        // decode now runs BEFORE the X validation that used to be its own pass.
+        // See `MultinomialNB::fit_host` for what that does and does not change —
+        // same reasoning verbatim.
+        let (classes_, class_of_row, n_classes) =
+            decode_classes_host::<F>("complement_nb", y_host)?;
 
-        // feature_count_[c,j] via the validated GATHER.
-        let feature_count = class_grouped_sum::<F>(pool, x, shape, &class_of_row, n_classes)?;
+        // feature_count_[c,j] in ONE sweep, with the CR-01 / T-11-02
+        // finite-and-non-negative check fused in (sklearn's `check_non_negative`
+        // parity; a negative count drives comp_sum / the log to NaN/-inf
+        // silently).
+        let ClassGroupedStats {
+            sum: feature_count,
+            first_invalid,
+            ..
+        } = class_grouped_stats_host::<F>(
+            x_host,
+            shape,
+            &class_of_row,
+            n_classes,
+            HostScanCheck::NonNegative,
+            false,
+            WORKERS_ENV,
+        );
+        if let Some((_, v)) = first_invalid {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "complement_nb",
+                reason: format!("input X must be finite and non-negative (got {v})"),
+            });
+        }
 
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
         for &c in &class_of_row {
@@ -243,7 +325,7 @@ where
         let mut feature_all: Vec<f64> = vec![0.0; n_features];
         for c in 0..n_classes {
             for j in 0..n_features {
-                feature_all[j] += feature_count[c][j];
+                feature_all[j] += feature_count[c * n_features + j];
             }
         }
 
@@ -251,7 +333,7 @@ where
         for c in 0..n_classes {
             // comp_count row and its sum (per-element +alpha already folded in).
             let comp: Vec<f64> = (0..n_features)
-                .map(|j| feature_all[j] + alpha - feature_count[c][j])
+                .map(|j| feature_all[j] + alpha - feature_count[c * n_features + j])
                 .collect();
             let comp_sum: f64 = comp.iter().sum();
             let logged: Vec<f64> = comp.iter().map(|&cc| (cc / comp_sum).ln()).collect();
@@ -299,6 +381,42 @@ where
             class_log_prior_: Some(class_log_prior_),
             _state: PhantomData,
         })
+    }
+}
+
+impl<F> Fit<F> for ComplementNB<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = ComplementNB<F, Fitted>;
+
+    fn fit(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<ComplementNB<F, Fitted>, AlgoError> {
+        let (n_samples, _n_features) = shape;
+        validate_geometry(x, shape)?;
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "complement_nb",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        // The device buffers exist only because `Fit` is the shared typestate
+        // surface — this fit's math is entirely host-side, so read both operands
+        // once and run the same body `fit_from_host_slice` runs.
+        let x_host = x.to_host(pool);
+        let y_host = y.to_host(pool);
+        self.fit_host(pool, &x_host, &y_host, shape)
     }
 }
 

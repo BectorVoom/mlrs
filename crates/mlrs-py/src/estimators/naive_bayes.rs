@@ -52,11 +52,13 @@ use mlrs_algos::naive_bayes::nb_common::accuracy_score;
 // Phase 16 (D-01/D-02): all five NB estimators are migrated to the typestate
 // surface. The shared predict-surface free functions call `predict_labels` /
 // `predict_proba` / `predict_log_proba` via these typestate accessor traits on the
-// `Fitted`-tagged arm; the fit arms build the `Unfit` estimator and call the
-// consuming-self `TypestateFit::fit`. This file is fully on the typestate surface.
+// `Fitted`-tagged arm. The `Fit` trait itself is NOT imported: every NB fit is
+// host-side (NB-FIT-CPU), so all five fit arms call the estimator's inherent
+// consuming-self `fit_from_host_slice` instead of `TypestateFit::fit` — same
+// body, without the `DeviceArray` round trip.
 use mlrs_algos::typestate::{
-    Fit as TypestateFit, PredictLabels as TypestatePredictLabels,
-    PredictLogProba as TypestatePredictLogProba, PredictProba as TypestatePredictProba,
+    PredictLabels as TypestatePredictLabels, PredictLogProba as TypestatePredictLogProba,
+    PredictProba as TypestatePredictProba,
 };
 
 use crate::errors::{
@@ -386,32 +388,42 @@ impl PyGaussianNB {
             } => (*var_smoothing, priors.clone()),
             _ => return Err(not_fitted("gaussian_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm (NB-FIT-CPU): this fit reads every element of `X`
+        // and `y` on the host and touches the device only to upload the small
+        // fitted operand, so routing the OPERANDS through a `DeviceArray` bought
+        // a `from_host` copy in and a `to_host` copy straight back out and
+        // nothing else. `host_slice_*` runs the SAME hard-reject bridge
+        // validation (`validate_f32`/`validate_f64`: no nulls, no sliced/offset
+        // views) and BORROWS the Arrow values instead. See `nb_host_fit_err` for
+        // where `check_array`'s finite scan went.
         let fitted = py.detach(|| -> PyResult<AnyGaussianNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
                     let est = GaussianNB::<f32>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyGaussianNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
                     let est = GaussianNB::<f64>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyGaussianNB::F64(fitted))
                 }
             }
@@ -530,12 +542,20 @@ impl PyMultinomialNB {
             } => (*alpha, *force_alpha, *fit_prior, class_prior.clone()),
             _ => return Err(not_fitted("multinomial_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm (NB-FIT-CPU): this fit reads every element of `X`
+        // and `y` on the host and touches the device only to upload the small
+        // fitted operand, so routing the OPERANDS through a `DeviceArray` bought
+        // a `from_host` copy in and a `to_host` copy straight back out and
+        // nothing else. `host_slice_*` runs the SAME hard-reject bridge
+        // validation (`validate_f32`/`validate_f64`: no nulls, no sliced/offset
+        // views) and BORROWS the Arrow values instead. See `nb_host_fit_err` for
+        // where `check_array`'s finite scan went.
         let fitted = py.detach(|| -> PyResult<AnyMultinomialNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
                     let est = MultinomialNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -543,14 +563,15 @@ impl PyMultinomialNB {
                         .class_prior(class_prior)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyMultinomialNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
                     let est = MultinomialNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -558,8 +579,9 @@ impl PyMultinomialNB {
                         .class_prior(class_prior)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyMultinomialNB::F64(fitted))
                 }
             }
@@ -830,12 +852,20 @@ impl PyComplementNB {
             } => (*alpha, *force_alpha, *fit_prior, class_prior.clone(), *norm),
             _ => return Err(not_fitted("complement_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm (NB-FIT-CPU): this fit reads every element of `X`
+        // and `y` on the host and touches the device only to upload the small
+        // fitted operand, so routing the OPERANDS through a `DeviceArray` bought
+        // a `from_host` copy in and a `to_host` copy straight back out and
+        // nothing else. `host_slice_*` runs the SAME hard-reject bridge
+        // validation (`validate_f32`/`validate_f64`: no nulls, no sliced/offset
+        // views) and BORROWS the Arrow values instead. See `nb_host_fit_err` for
+        // where `check_array`'s finite scan went.
         let fitted = py.detach(|| -> PyResult<AnyComplementNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
                     let est = ComplementNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -844,14 +874,15 @@ impl PyComplementNB {
                         .norm(norm)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyComplementNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
                     let est = ComplementNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -860,8 +891,9 @@ impl PyComplementNB {
                         .norm(norm)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyComplementNB::F64(fitted))
                 }
             }
