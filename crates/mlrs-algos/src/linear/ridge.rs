@@ -991,14 +991,14 @@ fn drain_profile_probe<F>(
 
 /// Validate an optional `sample_weight` and widen it to `f64` (T-04-05-03).
 ///
-/// Shared by [`Ridge::fit_with_sample_weight`] and
-/// [`Ridge::fit_from_host_slice`] so the two ingress paths cannot drift on
+/// Shared by [`Ridge::fit_with_sample_weight`], [`Ridge::fit_from_host_slice`]
+/// and (`pub(crate)`) `BayesianRidge`'s two ingresses, so no path can drift on
 /// weight validation. A wrong-length vector is a geometry error; a negative or
 /// non-finite weight would make `√w` NaN in the rescale and silently poison
 /// every downstream reduction; an all-zero vector leaves nothing to fit (the
 /// rescale zeroes the whole design and the penalized solve would hand back the
 /// all-zero coefficient vector as though it were an answer).
-fn validate_sample_weight<F>(
+pub(crate) fn validate_sample_weight<F>(
     sample_weight: Option<&[F]>,
     n_samples: usize,
 ) -> Result<Option<Vec<f64>>, AlgoError>
@@ -1678,7 +1678,14 @@ where
 /// Stage a host `f64` coefficient vector back onto the device as `F` (D-03: the
 /// fitted state is device-resident whichever solver produced it, so `predict`
 /// has ONE path).
-fn upload_coef<F>(pool: &mut BufferPool<ActiveRuntime>, coef: &[f64]) -> DeviceArray<ActiveRuntime, F>
+///
+/// `pub(crate)` because `BayesianRidge` ends every fit here too — its evidence
+/// loop is host-side, but its fitted state is device-resident for the same
+/// reason, so the two share the shared `linear_predict` route.
+pub(crate) fn upload_coef<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    coef: &[f64],
+) -> DeviceArray<ActiveRuntime, F>
 where
     F: Float + CubeElement + Pod,
 {

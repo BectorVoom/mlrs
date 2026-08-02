@@ -47,6 +47,7 @@ from .linear import (
     LogisticRegression,
     MBSGDClassifier,
     MBSGDRegressor,
+    BayesianRidge,
     Ridge,
 )
 from .manifold import TSNE, UMAP
@@ -78,6 +79,7 @@ from . import metrics  # noqa: F401
 __all__ = [
     "LinearRegression",
     "Ridge",
+    "BayesianRidge",
     "Lasso",
     "ElasticNet",
     "LogisticRegression",

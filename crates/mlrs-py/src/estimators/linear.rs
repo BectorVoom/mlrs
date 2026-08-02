@@ -10,6 +10,7 @@
 
 use pyo3::prelude::*;
 
+use mlrs_algos::linear::bayesian_ridge::BayesianRidge;
 use mlrs_algos::linear::elastic_net::ElasticNet;
 use mlrs_algos::linear::lasso::Lasso;
 use mlrs_algos::linear::linear_regression::LinearRegression;
@@ -96,7 +97,18 @@ macro_rules! impl_dense_predict_host {
 // `LinearSVR` is in the list because its prediction IS the same
 // `X·coef_ + intercept_` matvec — only its `fit` differs — so it takes the same
 // no-upload / no-list `predict` body rather than a fifth hand-written one.
-impl_dense_predict_host!(LinearRegression, Ridge, Lasso, ElasticNet, LinearSVR);
+// `BayesianRidge` predicts through the same `X·coef_ + intercept_` matvec as
+// the rest; only its `fit` differs. Its `predict(return_std=True)` second
+// return value is a SEPARATE method (`predict_std_*`) because sklearn returns
+// the mean whether or not `return_std` is set.
+impl_dense_predict_host!(
+    LinearRegression,
+    Ridge,
+    Lasso,
+    ElasticNet,
+    LinearSVR,
+    BayesianRidge,
+);
 
 /// The whole `predict` body for a fitted f32 dense linear regressor: borrow the
 /// validated Arrow values, predict, reject a non-finite operand, hand the result
@@ -2229,6 +2241,467 @@ impl PyLinearSVR {
             AnyLinearSVR::Unfit { .. } => None,
             AnyLinearSVR::F32(_) => Some("f32"),
             AnyLinearSVR::F64(_) => Some("f64"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BayesianRidge — Fit + Predict; the FULL sklearn parameter surface
+//   max_iter, tol, alpha_1, alpha_2, lambda_1, lambda_2, alpha_init,
+//   lambda_init, compute_score, fit_intercept, copy_X, verbose
+//   + fit(..., sample_weight) and the alpha_ / lambda_ / sigma_ / scores_ /
+//     n_iter_ / X_offset_ / X_scale_ fitted attributes
+// ---------------------------------------------------------------------------
+
+crate::any_estimator_typestate! {
+    any:   AnyBayesianRidge,
+    algo:  mlrs_algos::linear::bayesian_ridge::BayesianRidge,
+    unfit: {
+        max_iter: usize,
+        tol: f64,
+        alpha_1: f64,
+        alpha_2: f64,
+        lambda_1: f64,
+        lambda_2: f64,
+        alpha_init: Option<f64>,
+        lambda_init: Option<f64>,
+        compute_score: bool,
+        fit_intercept: bool,
+        copy_x: bool,
+        verbose: bool,
+    },
+}
+
+/// The verbatim ctor hyperparameters, carried from the `Unfit` arm to `fit`
+/// (WR-02: the wrapper rebuilds from these at every `fit`, so a second `fit` of
+/// the same object works).
+#[derive(Clone, Copy)]
+struct BayesianRidgeParams {
+    max_iter: usize,
+    tol: f64,
+    alpha_1: f64,
+    alpha_2: f64,
+    lambda_1: f64,
+    lambda_2: f64,
+    alpha_init: Option<f64>,
+    lambda_init: Option<f64>,
+    compute_score: bool,
+    fit_intercept: bool,
+    copy_x: bool,
+    verbose: bool,
+}
+
+/// sklearn-compatible `BayesianRidge` (evidence-maximized ridge regression).
+#[pyclass(name = "BayesianRidge")]
+pub struct PyBayesianRidge {
+    inner: AnyBayesianRidge,
+    /// The scalar/vector fitted attributes, mirrored out of the consumed
+    /// `Fitted` arms at `fit`: a `#[pyclass]` getter cannot reach through the
+    /// dtype dispatch generically, and all of these are `f64` on both arms
+    /// anyway (the evidence iteration accumulates in `f64` whatever the design's
+    /// width — see `bayesian_ridge.rs`).
+    alpha: Option<f64>,
+    lambda: Option<f64>,
+    sigma: Option<Vec<f64>>,
+    scores: Vec<f64>,
+    n_iter: Option<usize>,
+    x_offset: Vec<f64>,
+    x_scale: Vec<f64>,
+}
+
+impl PyBayesianRidge {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyBayesianRidge::Unfit {
+                max_iter: 300,
+                tol: 1e-3,
+                alpha_1: 1e-6,
+                alpha_2: 1e-6,
+                lambda_1: 1e-6,
+                lambda_2: 1e-6,
+                alpha_init: None,
+                lambda_init: None,
+                compute_score: false,
+                fit_intercept: true,
+                copy_x: true,
+                verbose: false,
+            },
+            alpha: None,
+            lambda: None,
+            sigma: None,
+            scores: Vec::new(),
+            n_iter: None,
+            x_offset: Vec::new(),
+            x_scale: Vec::new(),
+        }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyBayesianRidge::Unfit { .. })
+    }
+
+    /// Read back the ctor hyperparameters.
+    fn params(&self) -> BayesianRidgeParams {
+        match &self.inner {
+            AnyBayesianRidge::Unfit {
+                max_iter,
+                tol,
+                alpha_1,
+                alpha_2,
+                lambda_1,
+                lambda_2,
+                alpha_init,
+                lambda_init,
+                compute_score,
+                fit_intercept,
+                copy_x,
+                verbose,
+            } => BayesianRidgeParams {
+                max_iter: *max_iter,
+                tol: *tol,
+                alpha_1: *alpha_1,
+                alpha_2: *alpha_2,
+                lambda_1: *lambda_1,
+                lambda_2: *lambda_2,
+                alpha_init: *alpha_init,
+                lambda_init: *lambda_init,
+                compute_score: *compute_score,
+                fit_intercept: *fit_intercept,
+                copy_x: *copy_x,
+                verbose: *verbose,
+            },
+            // Already fitted: the shim always constructs a fresh wrapper per
+            // `fit`, so this arm is unreachable in practice; fall back to
+            // sklearn's defaults rather than panicking.
+            _ => BayesianRidgeParams {
+                max_iter: 300,
+                tol: 1e-3,
+                alpha_1: 1e-6,
+                alpha_2: 1e-6,
+                lambda_1: 1e-6,
+                lambda_2: 1e-6,
+                alpha_init: None,
+                lambda_init: None,
+                compute_score: false,
+                fit_intercept: true,
+                copy_x: true,
+                verbose: false,
+            },
+        }
+    }
+}
+
+/// Build an unfit `BayesianRidge<F>` from the ctor params. Monomorphized per
+/// float width by the macro below so the twelve builder setters are written
+/// once.
+macro_rules! bayes_build {
+    ($float:ty, $p:expr) => {{
+        BayesianRidge::<$float>::builder()
+            .max_iter($p.max_iter)
+            .tol($p.tol)
+            .alpha_1($p.alpha_1)
+            .alpha_2($p.alpha_2)
+            .lambda_1($p.lambda_1)
+            .lambda_2($p.lambda_2)
+            .alpha_init($p.alpha_init)
+            .lambda_init($p.lambda_init)
+            .compute_score($p.compute_score)
+            .fit_intercept($p.fit_intercept)
+            .copy_x($p.copy_x)
+            .verbose($p.verbose)
+            .build::<$float>()
+            .map_err(build_err_to_py)?
+    }};
+}
+
+/// Build the estimator and run whichever `fit` ingress its shape and backend
+/// call for — the `ridge_fit_dispatch!` shape, for the same reason.
+///
+/// The branch has to happen HERE, before ingress, because the two entry points
+/// take different operand types: `fit_from_host_slice` borrows the Arrow values
+/// directly (`host_slice_*`) and `fit_with_sample_weight` needs a device upload
+/// (`validated_*`). On the host arm — the cpu backend, or below the
+/// dispatch-cost floor on any backend — the `n·d` design is therefore never
+/// copied at all. Both helpers run the SAME hard-reject bridge validator, so the
+/// ingress contract is identical either way.
+macro_rules! bayes_fit_dispatch {
+    ($float:ty, $p:expr, $xa:expr, $ya:expr, $swa:expr, $rows:expr, $cols:expr,
+     $pool:expr, $as:ident, $host_slice:ident, $validated:ident) => {{
+        let est = bayes_build!($float, $p);
+        let sw = match $swa.as_ref() {
+            Some(a) => Some($host_slice($as(a)?)?),
+            None => None,
+        };
+        if est.host_fit_applicable(($rows, $cols)) {
+            let xh = $host_slice($as(&$xa)?)?;
+            let yh = $host_slice($as(&$ya)?)?;
+            est.fit_from_host_slice(&mut $pool, xh, yh, ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        } else {
+            let xd = $validated($as(&$xa)?, &mut $pool)?;
+            let yd = $validated($as(&$ya)?, &mut $pool)?;
+            est.fit_with_sample_weight(&mut $pool, &xd, Some(&yd), ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        }
+    }};
+}
+
+/// Snapshot the fitted attributes a `#[pyclass]` getter cannot reach through the
+/// dtype dispatch. Written once, invoked on both float arms.
+macro_rules! bayes_snapshot {
+    ($fitted:expr) => {{
+        (
+            $fitted.alpha(),
+            $fitted.lambda(),
+            $fitted.sigma().to_vec(),
+            $fitted.scores().to_vec(),
+            $fitted.n_iter(),
+            $fitted.x_offset().to_vec(),
+            $fitted.x_scale().to_vec(),
+        )
+    }};
+}
+
+#[pymethods]
+impl PyBayesianRidge {
+    /// `BayesianRidge(max_iter=300, tol=1e-3, alpha_1=1e-6, alpha_2=1e-6,
+    /// lambda_1=1e-6, lambda_2=1e-6, alpha_init=None, lambda_init=None,
+    /// compute_score=False, fit_intercept=True, copy_X=True, verbose=False)` —
+    /// sklearn's signature one-for-one. `copy_X` keeps its sklearn spelling at
+    /// the Python boundary and maps to the Rust `copy_x`.
+    #[new]
+    #[pyo3(signature = (
+        max_iter = 300,
+        tol = 1e-3,
+        alpha_1 = 1e-6,
+        alpha_2 = 1e-6,
+        lambda_1 = 1e-6,
+        lambda_2 = 1e-6,
+        alpha_init = None,
+        lambda_init = None,
+        compute_score = false,
+        fit_intercept = true,
+        copy_x = true,
+        verbose = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        max_iter: usize,
+        tol: f64,
+        alpha_1: f64,
+        alpha_2: f64,
+        lambda_1: f64,
+        lambda_2: f64,
+        alpha_init: Option<f64>,
+        lambda_init: Option<f64>,
+        compute_score: bool,
+        fit_intercept: bool,
+        copy_x: bool,
+        verbose: bool,
+    ) -> Self {
+        Self {
+            inner: AnyBayesianRidge::Unfit {
+                max_iter,
+                tol,
+                alpha_1,
+                alpha_2,
+                lambda_1,
+                lambda_2,
+                alpha_init,
+                lambda_init,
+                compute_score,
+                fit_intercept,
+                copy_x,
+                verbose,
+            },
+            alpha: None,
+            lambda: None,
+            sigma: None,
+            scores: Vec::new(),
+            n_iter: None,
+            x_offset: Vec::new(),
+            x_scale: Vec::new(),
+        }
+    }
+
+    /// `fit(X, y, rows, cols, sample_weight=None)`.
+    ///
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — it is borrowed as a host slice (never uploaded), because
+    /// the weighted preprocessing that consumes it is a host pass anyway.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
+        let dt = float_dtype(&xa)?;
+        let p = self.params();
+        type Snapshot = (f64, f64, Vec<f64>, Vec<f64>, usize, Vec<f64>, Vec<f64>);
+        let (fitted, snap) = py.detach(|| -> PyResult<(AnyBayesianRidge, Snapshot)> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let fitted = bayes_fit_dispatch!(
+                        f32, p, xa, ya, swa, rows, cols, pool,
+                        as_f32, host_slice_f32, validated_f32
+                    );
+                    let snap = bayes_snapshot!(fitted);
+                    Ok((AnyBayesianRidge::F32(fitted), snap))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let fitted = bayes_fit_dispatch!(
+                        f64, p, xa, ya, swa, rows, cols, pool,
+                        as_f64, host_slice_f64, validated_f64
+                    );
+                    let snap = bayes_snapshot!(fitted);
+                    Ok((AnyBayesianRidge::F64(fitted), snap))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        let (alpha, lambda, sigma, scores, n_iter, x_offset, x_scale) = snap;
+        self.alpha = Some(alpha);
+        self.lambda = Some(lambda);
+        self.sigma = Some(sigma);
+        self.scores = scores;
+        self.n_iter = Some(n_iter);
+        self.x_offset = x_offset;
+        self.x_scale = x_scale;
+        Ok(())
+    }
+
+    /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shared
+    /// body: [`dense_predict_f32`].
+    fn predict_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyBayesianRidge::F32(est) => dense_predict_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("bayesian_ridge", "predict (f32 path)")),
+        }
+    }
+    fn predict_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyBayesianRidge::F64(est) => dense_predict_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("bayesian_ridge", "predict (f64 path)")),
+        }
+    }
+
+    /// sklearn's `predict(X, return_std=True)` second return value — the
+    /// per-sample predictive standard deviation `√(xᵢ·Σ·xᵢᵀ + 1/α)`.
+    ///
+    /// Always `f64`: it is derived from `sigma_` and `alpha_`, both of which are
+    /// `f64` on either fitted arm. Returned over Arrow, like `predict`.
+    fn predict_std_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        let xa = capsule_to_array(x)?;
+        let out = py.detach(|| -> PyResult<Vec<f64>> {
+            let xh = host_slice_f32(as_f32(&xa)?)?;
+            match &self.inner {
+                AnyBayesianRidge::F32(est) => est
+                    .predict_std_from_host(xh, (rows, cols))
+                    .map_err(algo_err_to_py),
+                _ => Err(not_fitted("bayesian_ridge", "predict std (f32 path)")),
+            }
+        })?;
+        f64_vec_to_pyarrow(py, out)
+    }
+    fn predict_std_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        let xa = capsule_to_array(x)?;
+        let out = py.detach(|| -> PyResult<Vec<f64>> {
+            let xh = host_slice_f64(as_f64(&xa)?)?;
+            match &self.inner {
+                AnyBayesianRidge::F64(est) => est
+                    .predict_std_from_host(xh, (rows, cols))
+                    .map_err(algo_err_to_py),
+                _ => Err(not_fitted("bayesian_ridge", "predict std (f64 path)")),
+            }
+        })?;
+        f64_vec_to_pyarrow(py, out)
+    }
+
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyBayesianRidge::F32(e) => Ok(e.coef(&pool)),
+            _ => Err(not_fitted("bayesian_ridge", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyBayesianRidge::F64(e) => Ok(e.coef(&pool)),
+            _ => Err(not_fitted("bayesian_ridge", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<f32> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyBayesianRidge::F32(e) => Ok(e.intercept(&pool)),
+            _ => Err(not_fitted("bayesian_ridge", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<f64> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyBayesianRidge::F64(e) => Ok(e.intercept(&pool)),
+            _ => Err(not_fitted("bayesian_ridge", "intercept_ (f64)")),
+        }
+    }
+
+    /// sklearn's `alpha_` — the estimated noise precision.
+    ///
+    /// Named `*_prec` rather than `alpha`/`lambda` because `lambda` is a Python
+    /// KEYWORD: a `#[pyclass]` method called `lambda` registers fine but is
+    /// unreachable from Python (`obj.lambda()` is a `SyntaxError`), so it would
+    /// only fail at the shim. `alpha` follows the same spelling for symmetry.
+    fn alpha_prec(&self) -> Option<f64> {
+        self.alpha
+    }
+    /// sklearn's `lambda_` — the estimated weight precision. See
+    /// [`PyBayesianRidge::alpha_prec`] for the name.
+    fn lambda_prec(&self) -> Option<f64> {
+        self.lambda
+    }
+    /// sklearn's `sigma_`, flattened row-major (`d × d`); the shim reshapes.
+    fn sigma(&self) -> Option<Vec<f64>> {
+        self.sigma.clone()
+    }
+    /// sklearn's `scores_` — empty unless the estimator was built with
+    /// `compute_score`.
+    fn scores(&self) -> Vec<f64> {
+        self.scores.clone()
+    }
+    /// sklearn's `n_iter_` — evidence iterations actually run.
+    fn n_iter(&self) -> Option<usize> {
+        self.n_iter
+    }
+    /// sklearn's `X_offset_` — the column means removed before the fit.
+    fn x_offset(&self) -> Vec<f64> {
+        self.x_offset.clone()
+    }
+    /// sklearn's `X_scale_` — all ones (the attribute outlived `normalize`).
+    fn x_scale(&self) -> Vec<f64> {
+        self.x_scale.clone()
+    }
+
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyBayesianRidge::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyBayesianRidge::Unfit { .. } => None,
+            AnyBayesianRidge::F32(_) => Some("f32"),
+            AnyBayesianRidge::F64(_) => Some("f64"),
         }
     }
 }
