@@ -173,6 +173,173 @@ class Ridge(RegressorMixin, MlrsBase):
         return self._mlrs_obj.solver_used()
 
 
+class BayesianRidge(RegressorMixin, MlrsBase):
+    """Bayesian ridge regression with evidence-maximized precisions (LINEAR-06).
+
+    ``BayesianRidge(max_iter=300, tol=1e-3, alpha_1=1e-6, alpha_2=1e-6,
+    lambda_1=1e-6, lambda_2=1e-6, alpha_init=None, lambda_init=None,
+    compute_score=False, fit_intercept=True, copy_X=True, verbose=False)`` —
+    the full ``sklearn.linear_model.BayesianRidge`` parameter surface, including
+    ``fit(X, y, sample_weight=...)``, ``predict(X, return_std=True)`` and the
+    ``alpha_`` / ``lambda_`` / ``sigma_`` / ``scores_`` / ``n_iter_`` /
+    ``X_offset_`` / ``X_scale_`` fitted attributes.
+
+    Unlike :class:`Ridge`, the L2 penalty here is not a hyperparameter — it is
+    the fitted ratio ``lambda_ / alpha_``, re-estimated at every iteration
+    alongside the noise precision. See
+    ``crates/mlrs-algos/src/linear/bayesian_ridge.rs`` for the eigenbasis
+    iteration that keeps each step ``O(n_features)`` (and for why ``copy_X`` is
+    a genuine no-op here: mlrs never writes into the caller's buffer).
+    """
+
+    def __init__(
+        self,
+        max_iter=300,
+        tol=1e-3,
+        alpha_1=1e-6,
+        alpha_2=1e-6,
+        lambda_1=1e-6,
+        lambda_2=1e-6,
+        alpha_init=None,
+        lambda_init=None,
+        compute_score=False,
+        fit_intercept=True,
+        copy_X=True,
+        verbose=False,
+        output_type="input",
+    ):
+        self.max_iter = max_iter
+        self.tol = tol
+        self.alpha_1 = alpha_1
+        self.alpha_2 = alpha_2
+        self.lambda_1 = lambda_1
+        self.lambda_2 = lambda_2
+        self.alpha_init = alpha_init
+        self.lambda_init = lambda_init
+        self.compute_score = compute_score
+        self.fit_intercept = fit_intercept
+        self.copy_X = copy_X
+        self.verbose = verbose
+        self.output_type = output_type
+
+    def fit(self, X, y, sample_weight=None):
+        xa, rows, cols = self._normalize(X)
+        dtype = LinearRegression._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
+        obj = self._ext().BayesianRidge(
+            self.max_iter,
+            self.tol,
+            self.alpha_1,
+            self.alpha_2,
+            self.lambda_1,
+            self.lambda_2,
+            self.alpha_init,
+            self.lambda_init,
+            self.compute_score,
+            self.fit_intercept,
+            self.copy_X,
+            self.verbose,
+        )
+        obj.fit(xa, ya, rows, cols, swa)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        return self
+
+    def predict(self, X, return_std=False):
+        """``predict(X)``, or ``(mean, std)`` when ``return_std``.
+
+        The mean shares the four other dense regressors' no-upload path. The
+        standard deviation is a SECOND call rather than a fused one because
+        sklearn returns the mean whether or not ``return_std`` is set, so the
+        common case must not pay for ``sigma_``'s quadratic form.
+        """
+        mean = _dense_linear_predict(self, X)
+        if not return_std:
+            return mean
+        xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
+        std = self._suffixed("predict_std")(xa, rows, cols)
+        import numpy as np
+
+        return mean, self._to_output(std, (rows,), X, np.float64)
+
+    @property
+    def coef_(self):
+        return self._to_output(
+            self._suffixed("coef")(), (-1,), None, self._np_float()
+        )
+
+    @property
+    def intercept_(self):
+        self._check_fitted()
+        return getattr(self._mlrs_obj, "intercept" + self._suffix())()
+
+    @property
+    def alpha_(self):
+        """sklearn's ``alpha_``: the estimated precision of the noise."""
+        self._check_fitted()
+        return self._mlrs_obj.alpha_prec()
+
+    @property
+    def lambda_(self):
+        """sklearn's ``lambda_``: the estimated precision of the weights."""
+        self._check_fitted()
+        return self._mlrs_obj.lambda_prec()
+
+    @property
+    def sigma_(self):
+        """sklearn's ``sigma_``: the ``(n_features, n_features)`` posterior
+        covariance of the weights.
+
+        Always ``float64`` — it is accumulated in ``f64`` on both fitted arms
+        (the evidence iteration does not run at the design's storage width).
+        """
+        self._check_fitted()
+        import numpy as np
+
+        d = self.n_features_in_
+        return np.asarray(self._mlrs_obj.sigma(), dtype=np.float64).reshape(d, d)
+
+    @property
+    def scores_(self):
+        """sklearn's ``scores_``: the log marginal likelihood at each iteration
+        plus one final value, or ``None`` when ``compute_score`` is False (which
+        is how sklearn leaves the attribute absent)."""
+        self._check_fitted()
+        import numpy as np
+
+        s = self._mlrs_obj.scores()
+        return np.asarray(s, dtype=np.float64) if s else None
+
+    @property
+    def n_iter_(self):
+        """sklearn's ``n_iter_``: evidence iterations actually run."""
+        self._check_fitted()
+        return self._mlrs_obj.n_iter()
+
+    @property
+    def X_offset_(self):
+        """sklearn's ``X_offset_``: the (possibly weighted) column means removed
+        before the fit; zeros when ``fit_intercept=False``."""
+        self._check_fitted()
+        import numpy as np
+
+        return np.asarray(self._mlrs_obj.x_offset(), dtype=np.float64)
+
+    @property
+    def X_scale_(self):
+        """sklearn's ``X_scale_``: all ones (the attribute outlived the removed
+        ``normalize`` parameter, and ``_set_intercept`` still divides by it)."""
+        self._check_fitted()
+        import numpy as np
+
+        return np.asarray(self._mlrs_obj.x_scale(), dtype=np.float64)
+
+
 class Lasso(RegressorMixin, MlrsBase):
     """L1-regularized least squares via coordinate descent (LINEAR-03)."""
 
