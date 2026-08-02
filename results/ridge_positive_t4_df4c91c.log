@@ -1,0 +1,167 @@
++ export PATH=/root/.cargo/bin:/opt/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tools/node/bin:/tools/google-cloud-sdk/bin
++ PATH=/root/.cargo/bin:/opt/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tools/node/bin:/tools/google-cloud-sdk/bin
++ export CUDA_PATH=/usr/local/cuda
++ CUDA_PATH=/usr/local/cuda
++ cd /content/mlrs
++ echo '===== COMMIT ====='
+===== COMMIT =====
++ git rev-parse HEAD
+df4c91cf84e988d633dfcea7af26ca9490ab58d7
++ git log --oneline -1
+df4c91c Stage rows in shared memory for the Gram: O(d) global loads per row, not O(d^2)
++ echo '===== GPU/CPU ====='
+===== GPU/CPU =====
++ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+Tesla T4, 15360 MiB, 580.82.07
++ nproc
+2
++ RIDGE='cargo test -p mlrs-algos --release --features cuda --test ridge_positive_perf_test -- --ignored --nocapture'
++ echo '===== A. whole fit - default (shared-staged Gram) ====='
+===== A. whole fit - default (shared-staged Gram) =====
++ MLRS_POS_REPS=9
++ cargo test -p mlrs-algos --release --features cuda --test ridge_positive_perf_test -- --ignored --nocapture
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running tests/ridge_positive_perf_test.rs (target/release/deps/ridge_positive_perf_test-db970cb01ff90b34)
+
+running 1 test
+backend=cuda reps=9
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.1008     0.0000     0.0976 |   host
+    10000    16 |     1.3086     0.0000     2.4764 |   host
+    10000    64 |     3.2621     3.2846     0.5284 | device
+   100000    16 |     9.0775     8.4715     0.8463 | device
+   100000    64 |    29.0534    28.2157     1.6514 | device
+   500000    16 |    39.0243    61.7855     4.3420 | device
+   100000   256 |   316.1314   303.8614    13.0024 | device
+test ridge_positive_fit_perf_ladder ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.76s
+
++ echo '===== B. whole fit - register-tiled Gram forced ====='
+===== B. whole fit - register-tiled Gram forced =====
++ MLRS_POS_REPS=9
++ LR_GRAM_TILED=1
++ cargo test -p mlrs-algos --release --features cuda --test ridge_positive_perf_test -- --ignored --nocapture
+    Finished `release` profile [optimized] target(s) in 0.24s
+     Running tests/ridge_positive_perf_test.rs (target/release/deps/ridge_positive_perf_test-db970cb01ff90b34)
+
+running 1 test
+backend=cuda reps=9
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.0718     0.0000     0.0764 |   host
+    10000    16 |     1.1764     0.0000     1.2450 |   host
+    10000    64 |     3.4227     2.7389     0.6126 | device
+   100000    16 |     8.7525     7.5950     1.1266 | device
+   100000    64 |    29.1725    28.0959     2.1582 | device
+   500000    16 |    40.3956    63.6637     6.0436 | device
+   100000   256 |   338.2142   352.0816    35.8240 | device
+test ridge_positive_fit_perf_ladder ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.88s
+
++ echo '===== C. whole fit - blocked Gram forced ====='
+===== C. whole fit - blocked Gram forced =====
++ MLRS_POS_REPS=9
++ LR_GRAM_BLOCKED=1
++ cargo test -p mlrs-algos --release --features cuda --test ridge_positive_perf_test -- --ignored --nocapture
+    Finished `release` profile [optimized] target(s) in 0.34s
+     Running tests/ridge_positive_perf_test.rs (target/release/deps/ridge_positive_perf_test-db970cb01ff90b34)
+
+running 1 test
+backend=cuda reps=9
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.1008     0.0000     0.0994 |   host
+    10000    16 |     0.9264     0.0000     2.2829 |   host
+    10000    64 |     4.1368     2.9442     1.3891 | device
+   100000    16 |     8.7582     8.6941     0.7460 | device
+   100000    64 |    31.1051    28.2605     4.0031 | device
+   500000    16 |    38.7382    61.1875     4.0112 | device
+   100000   256 |   386.2609   307.7309   106.9006 | device
+test ridge_positive_fit_perf_ladder ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.03s
+
++ echo '===== D. whole fit - host arm forced ====='
+===== D. whole fit - host arm forced =====
++ MLRS_POS_REPS=9
++ MLRS_RIDGE_GRAM_HOST=1
++ cargo test -p mlrs-algos --release --features cuda --test ridge_positive_perf_test -- --ignored --nocapture
+    Finished `release` profile [optimized] target(s) in 0.26s
+     Running tests/ridge_positive_perf_test.rs (target/release/deps/ridge_positive_perf_test-db970cb01ff90b34)
+
+running 1 test
+backend=cuda reps=9
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.0749     0.0000     0.0797 |   host
+    10000    16 |     1.1839     0.0000     1.5030 |   host
+    10000    64 |     6.5278     0.0000     6.5161 |   host
+   100000    16 |     7.6357     0.0000     8.4865 |   host
+   100000    64 |    59.2524     0.0000    62.3525 |   host
+   500000    16 |    37.2181     0.0000    36.9108 |   host
+   100000   256 |   757.6734     0.0000   768.4191 |   host
+test ridge_positive_fit_perf_ladder ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.58s
+
++ echo '===== G. whole fit - pinned upload staging ====='
+===== G. whole fit - pinned upload staging =====
++ MLRS_POS_REPS=9
++ MLRS_UPLOAD_PINNED=1
++ cargo test -p mlrs-algos --release --features cuda --test ridge_positive_perf_test -- --ignored --nocapture
+    Finished `release` profile [optimized] target(s) in 0.25s
+     Running tests/ridge_positive_perf_test.rs (target/release/deps/ridge_positive_perf_test-db970cb01ff90b34)
+
+running 1 test
+backend=cuda reps=9
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.0969     0.0000     0.1106 |   host
+    10000    16 |     1.4418     0.0000     1.5537 |   host
+    10000    64 |     3.7187     3.2408     0.5087 | device
+   100000    16 |     9.6249    12.1977     0.9803 | device
+   100000    64 |    35.9848    33.7844     1.6885 | device
+   500000    16 |    46.7632    76.4379     3.2366 | device
+   100000   256 |   336.3054   358.5273    16.0921 | device
+test ridge_positive_fit_perf_ladder ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.25s
+
++ echo '===== E. Gram phase sweep ====='
+===== E. Gram phase sweep =====
++ MLRS_POS_REPS=9
++ cargo test -p mlrs-backend --release --features cuda --test gram_perf_test -- --ignored --nocapture
+    Finished `release` profile [optimized] target(s) in 0.36s
+     Running tests/gram_perf_test.rs (target/release/deps/gram_perf_test-519ffcba9bcd1381)
+
+running 1 test
+backend=cuda n=100000 reps=9
+    d |    blocked |     t/32 |     t/64 |    t/128 |    t/256 |   t/auto    best
+   16 |      0.556 |    1.018 |    0.980 |    1.724 |    1.411 |    0.698   0.80x
+   32 |      1.178 |    2.168 |    1.507 |    1.954 |    2.237 |    1.176   1.00x
+   64 |      3.446 |    4.762 |    3.359 |    3.787 |    2.925 |    0.738   4.67x
+  128 |      7.892 |   10.683 |    6.916 |    6.343 |    5.559 |    1.446   5.46x
+  256 |     56.367 |   77.019 |   43.300 |   27.506 |   21.175 |    4.056  13.90x
+test gram_formation_perf_sweep ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.02s
+
++ echo '===== F. upload cost breakdown ====='
+===== F. upload cost breakdown =====
++ MLRS_POS_REPS=7
++ cargo test -p mlrs-backend --release --features cuda --test upload_perf_test -- --ignored --nocapture
+    Finished `release` profile [optimized] target(s) in 0.29s
+     Running tests/upload_perf_test.rs (target/release/deps/upload_perf_test-279dcdfd776df615)
+
+running 1 test
+backend=cuda reps=7  (min-of-N, ms; GB/s in parentheses)
+      MB |    1 host to_vec   2 empty(alloc)         3 create  4 staged create      5 from_host   6 chunked 32MB 7 from_host+drop
+     6.4 |       0.9 (7.34)      0.1 (46.50)       6.4 (0.98)       4.1 (1.52)      10.4 (0.60)       7.4 (0.84)       7.2 (0.86)
+    25.6 |       5.3 (4.71)     0.1 (167.14)      34.9 (0.72)      22.7 (1.10)      50.9 (0.49)      40.6 (0.62)      39.9 (0.63)
+    32.0 |      22.8 (1.37)     0.3 (119.68)      79.3 (0.39)      62.1 (0.50)     101.1 (0.31)     100.9 (0.31)     100.5 (0.31)
+   102.4 |      72.0 (1.39)     0.1 (689.45)     266.1 (0.38)     197.7 (0.51)     338.0 (0.30)     311.8 (0.32)     331.7 (0.30)
+test upload_cost_breakdown ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.02s
+
++ echo MEASURE_DONE_MARKER
+MEASURE_DONE_MARKER
+

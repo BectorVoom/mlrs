@@ -13,12 +13,31 @@
 //! buffer so no parallel `n²` allocation), launch the single cube, read back the
 //! tiny `info` array, and surface a typed error on a non-SPD pivot.
 //!
+//! ## Two kernels, one contract ([`use_wide_kernel`])
+//! [`mlrs_kernels::cholesky_solve`] stages the whole `n × n` factor in LDS and
+//! serializes it on one unit. That is the right shape while `n ≤ MAX_DIM = 64`
+//! and impossible past it, which is why `Ridge` at `d = 128` and `KernelRidge`
+//! above 64 samples used to be rejected outright with
+//! [`PrimError::NotSquare`]. [`mlrs_kernels::cholesky_solve_wide`] carries
+//! `64 < n ≤ CHOLESKY_MAX_DIM`: `L` in global memory, the columns distributed
+//! over the cube, and only `O(n)` staged in shared. The two are not
+//! bitwise-equal (the wide arm re-associates), so `MLRS_CHOLESKY_WIDE` forces
+//! either one on an order both support and the test compares them within
+//! tolerance.
+//!
+//! ## `alpha` on the diagonal is a kernel parameter, not a host pass
+//! [`cholesky_solve_reg`] factors `(A + αI)` by adding `α` as the kernel reads
+//! the diagonal. `Ridge`'s normal equations need exactly that, and the
+//! composition it replaces read the whole `d × d` Gram back to the host, added
+//! `α` to `d` of its `d²` entries, and re-uploaded it — a synchronising
+//! round-trip over the one buffer the device path exists to keep resident.
+//!
 //! ## Validate-before-launch (ASVS V5 / T-04-02-01)
-//! `a.len() == n*n` (else [`PrimError::NotSquare`]), `n ≤ MAX_DIM` (the
-//! single-cube kernel stages `L` in shared memory capped at `MAX_DIM`; else
-//! `NotSquare`), and `b.len() == n*rhs` (else [`PrimError::ShapeMismatch`]) are
-//! all checked BEFORE any `unsafe { ArrayArg::from_raw_parts }`, so a wrong shape
-//! is a recoverable typed error rather than an out-of-bounds device read.
+//! `a.len() == n*n` (else [`PrimError::NotSquare`]), `n` within the ACTIVE
+//! kernel's cap (else `NotSquare`), and `b.len() == n*rhs` (else
+//! [`PrimError::ShapeMismatch`]) are all checked BEFORE any
+//! `unsafe { ArrayArg::from_raw_parts }`, so a wrong shape is a recoverable
+//! typed error rather than an out-of-bounds device read.
 //!
 //! ## Non-SPD guard (T-04-02-02 / RESEARCH Pitfall 4)
 //! A near-singular or indefinite `A` produces a non-positive diagonal pivot under
@@ -31,14 +50,87 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
-use mlrs_core::host_to_f64;
+use mlrs_core::{f64_to_host, host_to_f64};
 use mlrs_core::PrimError;
 use mlrs_kernels::cholesky_solve as cholesky_solve_kernel;
-use mlrs_kernels::MAX_DIM;
+use mlrs_kernels::cholesky_solve_wide as cholesky_solve_wide_kernel;
+use mlrs_kernels::{CHOLESKY_WIDE_MAX_DIM, MAX_DIM};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
 use crate::runtime::ActiveRuntime;
+
+/// Largest order this prim solves on-device.
+///
+/// [`MAX_DIM`] (64) is the shared-memory kernel's factor cap; past it the
+/// [`mlrs_kernels::cholesky_solve_wide`] arm keeps `L` in global memory and only
+/// this (much larger) bound applies. `Ridge`'s `d = 256` design and
+/// `KernelRidge`'s `n_samples × n_samples` system both used to be rejected here
+/// with [`PrimError::NotSquare`].
+pub const CHOLESKY_MAX_DIM: usize = CHOLESKY_WIDE_MAX_DIM as usize;
+
+/// Which factorization kernel [`cholesky_solve_reg`] runs for an order-`n`
+/// system.
+///
+/// The narrow kernel stages the whole `n × n` factor in LDS and serializes it on
+/// one unit — the right shape while `n ≤ 64` (a 16 KiB `f32` factor and 43 k
+/// dependent operations), and impossible past it (`n = 256` is a 256 KiB
+/// factor). The wide kernel keeps `L` in global memory and distributes each
+/// column over the cube.
+///
+/// `MLRS_CHOLESKY_WIDE=1` forces the wide arm at any order and `=0` pins the
+/// narrow one, so the two can be A/B'd and compared against each other on an
+/// order both support (`cholesky_test.rs` does exactly that — without the knob
+/// the arms cover disjoint ranges and no test could compare them). Read through
+/// [`crate::abflag`], never `std::env`. Note that `=0` is not a symmetric
+/// override: it pins the arm that CANNOT do `n > MAX_DIM`, so it turns those
+/// orders back into the [`PrimError::NotSquare`] rejection they used to be. Use
+/// it to force the narrow arm at a small order, not to sweep a ladder.
+///
+/// ## The threshold is a correctness boundary, not a measured crossover
+///
+/// `MAX_DIM` is where the narrow kernel STOPS WORKING. Nobody has shown it is
+/// where the narrow kernel stops WINNING, and one measurement says it is not:
+/// on a Colab T4 (min-of-9, whole `Ridge()` fit, upload included) forcing the
+/// wide arm below the cap gave
+///
+/// | shape | narrow | wide | |
+/// |---|---|---|---|
+/// | 10 000 × 64 | 4.43 ms | 2.37 ms | **1.87×** |
+/// | 10 000 × 16 | 0.96 ms | 0.87 ms | 1.10× |
+/// | 100 000 × 16 | 6.01 ms | 5.91 ms | wash |
+/// | 100 000 × 64 | 30.7 ms | 29.6 ms | wash (upload-bound) |
+///
+/// which is what the schedules predict: at `d = 64` the narrow arm is 43 k
+/// DEPENDENT operations on one lane, and the wide arm spreads the same work
+/// over 64.
+///
+/// It is deliberately not shipped. That is a single-adapter number, and this
+/// codebase has been burned before by gating a kernel on one backend's
+/// measurement; the local wgpu adapter could not corroborate it (the `=0`
+/// direction cannot run the `d > 64` rungs at all, and the box was too noisy for
+/// the rest — the same host arm swung 3× between interleaved runs). The lever is
+/// real, the evidence is one machine, and the knob is there for whoever sweeps
+/// the second one.
+fn use_wide_kernel(n: usize) -> bool {
+    match crate::abflag::var("MLRS_CHOLESKY_WIDE").as_deref() {
+        Some("0") => false,
+        Some(_) => true,
+        None => n > MAX_DIM as usize,
+    }
+}
+
+/// Does the wide kernel's shared-memory staging fit this adapter?
+///
+/// It stages two length-[`CHOLESKY_WIDE_MAX_DIM`] vectors at the COMPTIME size
+/// regardless of the runtime `n` — 8 KiB (`f32`) / 16 KiB (`f64`), which should
+/// never bind. Checked rather than assumed because a shared-memory overrun is
+/// SILENT (the `prims::eig` finding); an adapter below the budget gets the
+/// [`PrimError::NotSquare`] rejection it had before the wide arm existed rather
+/// than an all-zero factor.
+fn wide_shared_fits<F>() -> bool {
+    2 * CHOLESKY_MAX_DIM * std::mem::size_of::<F>() <= crate::capability::active_max_shared_memory()
+}
 
 /// Factor a square SPD `a` (`n × n`, row-major, TRUSTED symmetric — D-06) and
 /// solve `A·x = b` for `rhs` right-hand-side columns, returning the device-
@@ -67,7 +159,35 @@ pub fn cholesky_solve<F>(
 where
     F: Float + CubeElement + Pod,
 {
-    let (x, l) = cholesky_solve_with_factor(pool, a, b, n, rhs, out)?;
+    cholesky_solve_reg(pool, a, b, n, rhs, 0.0, out)
+}
+
+/// [`cholesky_solve`] of the RIDGE-regularized system `(A + αI)·x = b`, without
+/// anyone ever materializing `A + αI`.
+///
+/// `alpha` is added to the diagonal as the kernel reads it. The alternative —
+/// the composition this replaces — is to read the whole `n × n` `A` back to the
+/// host, add `α` to `n` of its `n²` entries in a loop, and re-upload it: two
+/// synchronising transfers of `d²` floats, on a device path whose entire point
+/// is that the Gram never leaves the device. At `d = 256` that is 256 KiB each
+/// way plus a full pipeline drain, to change 256 numbers.
+///
+/// `alpha = 0.0` is exactly [`cholesky_solve`] (the addition is a no-op on a
+/// positive diagonal), which is how the unregularized callers keep their
+/// behaviour bit for bit.
+pub fn cholesky_solve_reg<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    a: &DeviceArray<ActiveRuntime, F>,
+    b: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    rhs: usize,
+    alpha: f64,
+    out: Option<DeviceArray<ActiveRuntime, F>>,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, l) = cholesky_solve_with_factor_reg(pool, a, b, n, rhs, alpha, out)?;
     // The L factor is internal scratch for this public path; release it.
     l.release_into(pool);
     Ok(x)
@@ -100,8 +220,42 @@ pub fn cholesky_solve_with_factor<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    cholesky_solve_with_factor_reg(pool, a, b, n, rhs, 0.0, out)
+}
+
+/// [`cholesky_solve_with_factor`] of `(A + αI)` — see [`cholesky_solve_reg`] for
+/// why the penalty is a kernel parameter rather than a host pass over `A`. The
+/// returned `L` is the factor of `A + αI`, so `‖L·Lᵀ − (A + αI)‖` is the
+/// reconstruction invariant to check.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn cholesky_solve_with_factor_reg<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    a: &DeviceArray<ActiveRuntime, F>,
+    b: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    rhs: usize,
+    alpha: f64,
+    out: Option<DeviceArray<ActiveRuntime, F>>,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    PrimError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
     // --- ASVS V5 / T-04-02-01: validate geometry BEFORE any unsafe launch. ---
-    validate_geometry(a.len(), b.len(), n, rhs, out.as_ref().map(DeviceArray::len))?;
+    let wide = use_wide_kernel(n);
+    validate_geometry::<F>(
+        a.len(),
+        b.len(),
+        n,
+        rhs,
+        out.as_ref().map(DeviceArray::len),
+        wide,
+    )?;
 
     let elem = size_of::<F>();
 
@@ -125,34 +279,59 @@ where
 
     let client = pool.client().clone();
     let count = CubeCount::Static(1, 1, 1);
+    // The narrow kernel wants exactly one unit per row (unit 0 acts, the rest
+    // idle at the barriers); the wide kernel distributes the columns, so it
+    // takes as many units as the order can keep busy, capped at the portable
+    // maximum workgroup size X.
     let dim = CubeDim {
-        x: n as u32,
+        x: if wide {
+            (n as u32).min(WIDE_CUBE_DIM)
+        } else {
+            n as u32
+        },
         y: 1,
         z: 1,
     };
 
     // SAFETY: lengths are the carried/validated element counts (n*n, n*rhs,
-    // n*rhs, n*n, 2), NEVER raw caller geometry; the kernel bounds every loop by
-    // the runtime `n`/`rhs` and only unit 0 acts (mitigates T-04-02-01 /
-    // T-04-02-03, the OOB device-read threat, ASVS V5).
+    // n*rhs, n*n, 3), NEVER raw caller geometry; both kernels bound every loop
+    // by the runtime `n`/`rhs` (mitigates T-04-02-01 / T-04-02-03, the OOB
+    // device-read threat, ASVS V5).
     let a_in_arg = unsafe { ArrayArg::from_raw_parts(a_in_handle, n * n) };
     let b_arg = unsafe { ArrayArg::from_raw_parts(b.handle().clone(), n * rhs) };
     let x_arg = unsafe { ArrayArg::from_raw_parts(x_handle.clone(), n * rhs) };
     let l_arg = unsafe { ArrayArg::from_raw_parts(l_handle.clone(), n * n) };
     let info_arg = unsafe { ArrayArg::from_raw_parts(info_handle.clone(), 3) };
 
-    cholesky_solve_kernel::launch::<F, ActiveRuntime>(
-        &client,
-        count,
-        dim,
-        a_in_arg,
-        b_arg,
-        x_arg,
-        l_arg,
-        info_arg,
-        n as u32,
-        rhs as u32,
-    );
+    if wide {
+        cholesky_solve_wide_kernel::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            a_in_arg,
+            b_arg,
+            x_arg,
+            l_arg,
+            info_arg,
+            n as u32,
+            rhs as u32,
+            f64_to_host::<F>(alpha),
+        );
+    } else {
+        cholesky_solve_kernel::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            a_in_arg,
+            b_arg,
+            x_arg,
+            l_arg,
+            info_arg,
+            n as u32,
+            rhs as u32,
+            f64_to_host::<F>(alpha),
+        );
+    }
 
     // The reused `out` working buffer (if any) is now consumed by the launch;
     // release it back to the pool (the kernel only read it). When `out` was None
@@ -187,18 +366,26 @@ where
     Ok((x, l))
 }
 
+/// Units the wide kernel launches, capped at the portable maximum workgroup
+/// size X (wgpu's downlevel default; CUDA allows 1024). The kernel strides its
+/// row loops by `CUBE_DIM_X`, so a cube narrower than `n` costs correctness
+/// nothing — only parallelism.
+const WIDE_CUBE_DIM: u32 = 256;
+
 /// Validate the Cholesky operand geometry (ASVS V5 / T-04-02-01). `a` must be a
-/// square `n × n` (`a.len() == n*n`); the single-cube kernel stages `L` in shared
-/// memory capped at `MAX_DIM`, so `n ≤ MAX_DIM` is required (both rejected with
+/// square `n × n` (`a.len() == n*n`); the narrow kernel stages `L` in shared
+/// memory capped at `MAX_DIM` and the wide kernel at
+/// [`CHOLESKY_MAX_DIM`], so the applicable cap is required (both rejected with
 /// [`PrimError::NotSquare`]). `b` must be `n × rhs` (`b.len() == n*rhs`, else
 /// [`PrimError::ShapeMismatch`]). The optional reused `out` buffer must itself be
 /// the `n × n` operand. All checks run BEFORE any unsafe launch.
-fn validate_geometry(
+fn validate_geometry<F>(
     a_len: usize,
     b_len: usize,
     n: usize,
     rhs: usize,
     out_len: Option<usize>,
+    wide: bool,
 ) -> Result<(), PrimError> {
     // Squareness: a.len() must equal n*n.
     if n == 0 || n.checked_mul(n).map(|v| v != a_len).unwrap_or(true) {
@@ -208,8 +395,12 @@ fn validate_geometry(
             cols: if n == 0 { 0 } else { a_len / n.max(1) },
         });
     }
-    // Over-cap: the single-cube kernel cannot stage L > MAX_DIM in shared memory.
-    if n > MAX_DIM as usize {
+    // Over-cap: the narrow kernel cannot stage L > MAX_DIM in shared memory, and
+    // the wide kernel's O(n) staging is itself comptime-capped. An adapter whose
+    // shared budget cannot hold that staging keeps the pre-wide-arm rejection
+    // rather than silently receiving an all-zero factor.
+    let cap = if wide { CHOLESKY_MAX_DIM } else { MAX_DIM as usize };
+    if n > cap || (wide && !wide_shared_fits::<F>()) {
         return Err(PrimError::NotSquare {
             operand: "cholesky",
             rows: n,

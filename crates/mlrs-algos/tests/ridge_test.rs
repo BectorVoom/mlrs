@@ -318,3 +318,236 @@ fn defaults_equal() {
         "Ridge::new() and builder().build()? must agree on hyperparameters (BLDR-01)"
     );
 }
+
+/// The ON-DEVICE intercept must agree with the host twin it replaced.
+///
+/// `Ridge(positive=True)`'s fused arm now finishes entirely on the device:
+/// `ridge_intercept_device` computes `ȳ − x̄·coef` where the means and `coef`
+/// already live, instead of reading all three back to do the dot in `f64` and
+/// uploading one scalar. The two arms differ in exactly one respect — the
+/// kernel accumulates in `F`, the host in `f64` — so this pins that difference
+/// to rounding rather than letting it become a silent behaviour change.
+///
+/// The bound is relative to the operand magnitude, not to the intercept: the
+/// intercept is a DIFFERENCE (`ȳ` minus a `d`-term dot), so it can sit near
+/// zero while its inputs do not, and a bound relative to the result alone would
+/// be unsatisfiable by any correct implementation. `f32` carries ~7 decimal
+/// digits, so `1e-5 · max(|ȳ|, |x̄·coef|)` is a rounding-scale bound that a real
+/// defect (a dropped term, a wrong index, a missing `ȳ`) blows through.
+#[test]
+fn ridge_device_intercept_matches_host_f32() {
+    let widths: &[usize] = &[4, 17, 64, 200];
+    for &d in widths {
+        let n = 500usize;
+        // Deliberately large, per-column-varying means: centering is then a real
+        // cancellation, which is the regime where an f32 dot would drift if the
+        // implementation were doing something other than the host's summation.
+        let x: Vec<f32> = (0..n * d)
+            .map(|i| ((i % 23) as f32) * 0.05 - 0.5 + 4.0 + (i % d) as f32 * 0.25)
+            .collect();
+        let y: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.1 + 7.0).collect();
+
+        let fit_one = |host_arm: bool| -> f64 {
+            let _g = if host_arm {
+                mlrs_backend::abflag::force("MLRS_RIDGE_HOST_INTERCEPT", "1")
+            } else {
+                mlrs_backend::abflag::clear("MLRS_RIDGE_HOST_INTERCEPT")
+            };
+            let client = runtime::active_client();
+            let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+            let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+            let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+            let fitted = Ridge::<f32>::builder()
+                .alpha(1.0)
+                .fit_intercept(true)
+                .positive(true)
+                .build::<f32>()
+                .expect("build")
+                .fit(&mut pool, &xd, Some(&yd), (n, d))
+                .expect("fit");
+            fitted.intercept(&pool) as f64
+        };
+
+        let dev = fit_one(false);
+        let host = fit_one(true);
+        assert!(
+            dev.is_finite() && host.is_finite(),
+            "non-finite intercept at d={d}: device={dev} host={host}"
+        );
+
+        // Scale: the dot's magnitude, reconstructed from the operands rather
+        // than from the (possibly cancelling) result.
+        let y_bar: f64 = y.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        let scale = y_bar.abs().max(host.abs()).max(1.0);
+        let diff = (dev - host).abs();
+        assert!(
+            diff <= 1e-5 * scale,
+            "device intercept drifted from host at d={d}: device={dev} host={host} \
+             diff={diff} > {}",
+            1e-5 * scale
+        );
+    }
+}
+
+/// RIDGE-DEFAULT-CUDA: the default (`positive = false`) fit works — and is
+/// right — ABOVE the shared-memory Cholesky kernel's `MAX_DIM = 64` order.
+///
+/// Before the wide factorization arm this was not a slow path, it was an error:
+/// `cholesky_solve` rejected `n > MAX_DIM` with `PrimError::NotSquare`, so
+/// `Ridge()` at `d = 128` returned `Err` on every GPU backend, and the shipped
+/// perf ladder stopped at `d = 64` for that reason. `d ≥ 128` is also exactly
+/// the regime where a GPU fit can beat a CPU one (the arithmetic is `n·d²/2`
+/// over an `n·d` transfer), so the cap was capping the only shapes worth
+/// running on a device.
+///
+/// The reference is the HOST arm — `centered_gram_xty` + `cholesky_ridge`, all
+/// in `f64` — forced on with `MLRS_RIDGE_GRAM_HOST=1`. It shares no code with
+/// the device composition being checked: different means pass, different Gram,
+/// different factorization schedule, different accumulator width.
+#[test]
+fn ridge_default_fit_above_cholesky_max_dim_f32() {
+    if capability::active_backend_name() == "cpu" {
+        // This test's whole subject is the DEVICE factorization arm, and the cpu
+        // backend cannot be made to run it in bounded time: `gram_path` there is
+        // the `gemm` fallback, so the fused route defers to `center_columns`,
+        // whose cpu arm walks the `d` columns one at a time with an upload +
+        // launch + blocking readback each (59.6 s for `d = 8` at `n = 1 000`).
+        // At `d = 256` that is half an hour to re-check something the host arm —
+        // the arm the cpu backend actually takes — already covers in
+        // `ridge_host_fit_test.rs`.
+        println!("ridge default d>MAX_DIM: SKIPPED on cpu (device arm is the \
+                  center_columns per-column round-trip; the host arm is the cpu path)");
+        return;
+    }
+    let n = 2_000usize;
+    for &d in &[100usize, 128, 256] {
+        // A well-conditioned design with per-column offsets, so centering does
+        // real work and the Gram is not trivially diagonal.
+        let x: Vec<f32> = (0..n * d)
+            .map(|i| {
+                let r = (i / d) as f32;
+                let c = (i % d) as f32;
+                ((i % 37) as f32) * 0.031 - 0.5 + 0.01 * c + 0.001 * (r % 11.0)
+            })
+            .collect();
+        let y: Vec<f32> = (0..n)
+            .map(|r| ((r % 17) as f32) * 0.07 + 1.5 + 0.002 * r as f32)
+            .collect();
+
+        let client = runtime::active_client();
+        let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+        let (dev_coef, dev_int) = {
+            let _g = mlrs_backend::abflag::force("MLRS_RIDGE_GRAM_HOST", "0");
+            let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+            let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+            let fitted = Ridge::<f32>::builder()
+                .alpha(1.0)
+                .build::<f32>()
+                .expect("build")
+                .fit(&mut pool, &xd, Some(&yd), (n, d))
+                .unwrap_or_else(|e| panic!("device fit at d={d} must succeed: {e}"));
+            (
+                fitted.coef(&pool).iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                fitted.intercept(&pool) as f64,
+            )
+        };
+
+        let (host_coef, host_int) = {
+            let _g = mlrs_backend::abflag::force("MLRS_RIDGE_GRAM_HOST", "1");
+            let est = Ridge::<f32>::builder().alpha(1.0).build::<f32>().expect("build");
+            assert!(
+                est.host_fit_applicable((n, d)),
+                "the knob must force the host reference arm at d={d}"
+            );
+            let fitted = est
+                .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
+                .unwrap_or_else(|e| panic!("host fit at d={d} must succeed: {e}"));
+            (
+                fitted.coef(&pool).iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                fitted.intercept(&pool) as f64,
+            )
+        };
+
+        assert_eq!(dev_coef.len(), d);
+        // Compare on the RESIDUAL scale rather than entry-by-entry: an f32 Gram
+        // of a 2 000-row design is the accuracy limit here, not the solve, and
+        // the two arms differ in accumulator width by construction.
+        let num: f64 = dev_coef
+            .iter()
+            .zip(&host_coef)
+            .map(|(&a, &b)| (a - b) * (a - b))
+            .sum::<f64>()
+            .sqrt();
+        let den = host_coef.iter().map(|&v| v * v).sum::<f64>().sqrt().max(1.0);
+        let rel = num / den;
+        // 2e-4 leaves ~8x headroom over the measured 1.3-2.6e-5 (wgpu, f32) —
+        // enough for adapter-to-adapter rounding, tight enough that a wrong
+        // factorization cannot slip through.
+        assert!(
+            rel <= 2e-4,
+            "d={d}: device coef_ diverged from the f64 host arm, rel={rel:e}"
+        );
+        assert!(
+            (dev_int - host_int).abs() <= 2e-4 * host_int.abs().max(1.0),
+            "d={d}: device intercept_={dev_int} vs host {host_int}"
+        );
+        println!("ridge default d={d}: coef rel={rel:e}, intercept {dev_int} vs {host_int}");
+    }
+}
+
+/// RIDGE-DEFAULT-CUDA: the singular-Gram retry still fires ON THE FUSED ROUTE.
+///
+/// sklearn's `_ridge_regression` wraps `_solve_cholesky` in
+/// `except LinAlgError` and re-solves with `svd`, reporting the fallback through
+/// `solver_`. Fusing the centering into the Gram changed what that retry has to
+/// work with: the SVD arm consumes the centered DESIGN, and the fused route
+/// deliberately never materializes one. The retry therefore builds it on demand,
+/// and this is the only test that reaches that branch.
+///
+/// A duplicated column with `alpha = 0` makes `XᵀX` exactly rank-deficient, so
+/// the factorization hits a non-positive pivot rather than merely a small one.
+#[test]
+fn ridge_singular_gram_falls_back_to_svd_on_the_fused_route() {
+    if capability::active_backend_name() == "cpu" {
+        println!("singular-Gram retry: SKIPPED on cpu (device arm is the \
+                  center_columns per-column round-trip)");
+        return;
+    }
+    let n = 200usize;
+    let d = 4usize;
+    let mut x = vec![0.0f32; n * d];
+    for r in 0..n {
+        let a = ((r % 7) as f32) * 0.3 - 1.0;
+        let b = ((r % 11) as f32) * 0.17 + 0.4;
+        x[r * d] = a;
+        x[r * d + 1] = b;
+        x[r * d + 2] = a; // exact duplicate of column 0 -> rank-deficient Gram
+        x[r * d + 3] = 1.5 * b; // and an exact multiple of column 1
+    }
+    let y: Vec<f32> = (0..n).map(|r| ((r % 5) as f32) * 0.6 + 2.0).collect();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+
+    let fitted = Ridge::<f32>::builder()
+        .alpha(0.0)
+        .fit_intercept(true)
+        .build::<f32>()
+        .expect("build")
+        .fit(&mut pool, &xd, Some(&yd), (n, d))
+        .expect("a singular Gram must fall back, not error");
+
+    assert_eq!(
+        fitted.solver().name(),
+        "svd",
+        "a rank-deficient Gram must report the sklearn-faithful svd fallback"
+    );
+    let coef = fitted.coef(&pool);
+    assert!(
+        coef.iter().all(|v| v.is_finite()) && fitted.intercept(&pool).is_finite(),
+        "the fallback must never emit NaN coefficients: {coef:?}"
+    );
+}

@@ -23,10 +23,13 @@
 
 use std::path::PathBuf;
 
+use mlrs_backend::abflag;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::cholesky::{cholesky_solve, cholesky_solve_with_factor};
+use mlrs_backend::prims::cholesky::{
+    cholesky_solve, cholesky_solve_reg, cholesky_solve_with_factor,
+};
 use mlrs_backend::runtime::{self, ActiveRuntime};
 use mlrs_core::{load_npz, OracleCase, PrimError};
 
@@ -250,6 +253,263 @@ fn cholesky_factor_reconstructs_f64() {
         return;
     }
     check_factor::<f64>("cholesky_f64_seed42.npz");
+}
+
+// ---------------------------------------------------------------------------
+// RIDGE-DEFAULT-CUDA: the `alpha` diagonal parameter and the wide (`n > MAX_DIM`)
+// factorization arm.
+// ---------------------------------------------------------------------------
+
+/// A well-conditioned SPD `n × n` system built on the host: `A = MᵀM + n·I` with
+/// `M` from a counter-based splitmix64 stream (the `gram_test.rs` generator), plus
+/// a length-`n` right-hand side. Returned in `f64`; callers narrow.
+fn spd_system(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut s = seed;
+    let mut next = || {
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+    };
+    let m: Vec<f64> = (0..n * n).map(|_| next()).collect();
+    let mut a = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = 0.0f64;
+            for k in 0..n {
+                acc += m[k * n + i] * m[k * n + j];
+            }
+            a[i * n + j] = acc;
+        }
+        a[i * n + i] += n as f64;
+    }
+    let b: Vec<f64> = (0..n).map(|_| next()).collect();
+    (a, b)
+}
+
+/// Reference `f64` host Cholesky solve of `(A + αI)·x = b` — the oracle the
+/// device arms are checked against. Deliberately the textbook row-oriented
+/// recurrence, i.e. NOT the schedule either kernel uses, so an error in the
+/// kernels' shared work would not be reproduced here.
+fn host_solve_reg(a: &[f64], b: &[f64], n: usize, alpha: f64) -> Vec<f64> {
+    let mut l = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[i * n + j] + if i == j { alpha } else { 0.0 };
+            for k in 0..j {
+                sum -= l[i * n + k] * l[j * n + k];
+            }
+            l[i * n + j] = if i == j { sum.sqrt() } else { sum / l[j * n + j] };
+        }
+    }
+    let mut z = vec![0.0f64; n];
+    for i in 0..n {
+        let mut s = b[i];
+        for k in 0..i {
+            s -= l[i * n + k] * z[k];
+        }
+        z[i] = s / l[i * n + i];
+    }
+    let mut x = vec![0.0f64; n];
+    for step in 0..n {
+        let i = n - 1 - step;
+        let mut s = z[i];
+        for k in (i + 1)..n {
+            s -= l[k * n + i] * x[k];
+        }
+        x[i] = s / l[i * n + i];
+    }
+    x
+}
+
+/// Solve `(A + αI)·x = b` on the device (one rhs) and return `x` in `f64`.
+fn device_solve_reg<F>(a64: &[f64], b64: &[f64], n: usize, alpha: f64) -> Vec<f64>
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + bytemuck::Pod,
+{
+    let a: Vec<F> = a64.iter().map(|&v| from_f64::<F>(v)).collect();
+    let b: Vec<F> = b64.iter().map(|&v| from_f64::<F>(v)).collect();
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let a_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &a);
+    let b_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &b);
+    let x_dev = cholesky_solve_reg::<F>(&mut pool, &a_dev, &b_dev, n, 1, alpha, None)
+        .expect("regularized cholesky solve on an SPD system");
+    let x = x_dev.to_host(&pool).iter().map(|&v| host_to_f64(v)).collect();
+    x_dev.release_into(&mut pool);
+    a_dev.release_into(&mut pool);
+    b_dev.release_into(&mut pool);
+    x
+}
+
+/// Relative `‖got − want‖ / max(‖want‖, 1)` of two host vectors.
+fn rel_err(got: &[f64], want: &[f64]) -> f64 {
+    let diff: Vec<f64> = got.iter().zip(want).map(|(&g, &w)| g - w).collect();
+    fro(&diff) / fro(want).max(1.0)
+}
+
+/// The `alpha` parameter must factor `(A + αI)` — i.e. adding the penalty inside
+/// the kernel must equal adding it on the host and solving the plain system.
+///
+/// This is the check that makes the `d²` Gram round-trip removable: `Ridge`
+/// stopped reading its Gram back to write `α` on the diagonal, so the ONLY thing
+/// standing between the two formations is this equality.
+#[test]
+fn cholesky_alpha_matches_a_host_regularized_matrix() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    const N: usize = 32;
+    const ALPHA: f64 = 3.5;
+    let (a, b) = spd_system(N, 42);
+
+    // The device arm with `alpha` folded in.
+    let folded = device_solve_reg::<f32>(&a, &b, N, ALPHA);
+
+    // The composition it replaces: add α on the host, solve the plain system.
+    let mut a_reg = a.clone();
+    for i in 0..N {
+        a_reg[i * N + i] += ALPHA;
+    }
+    let unfolded = device_solve_reg::<f32>(&a_reg, &b, N, 0.0);
+
+    let rel = rel_err(&folded, &unfolded);
+    assert!(
+        rel <= SOLVE_TOL,
+        "alpha-in-kernel vs alpha-on-host disagree by {rel:e} (> {SOLVE_TOL:e}) — \
+         the Ridge round-trip removal is not equivalence-preserving"
+    );
+
+    // ...and both agree with an f64 host reference, so this is not two arms
+    // being wrong the same way.
+    let want = host_solve_reg(&a, &b, N, ALPHA);
+    let rel_ref = rel_err(&folded, &want);
+    assert!(
+        rel_ref <= SOLVE_TOL,
+        "alpha-in-kernel vs the f64 host oracle disagree by {rel_ref:e} (> {SOLVE_TOL:e})"
+    );
+}
+
+/// `alpha = 0` must leave the unregularized callers BIT-IDENTICAL, which is what
+/// lets `cholesky_solve` be a thin forward to `cholesky_solve_reg`.
+#[test]
+fn cholesky_alpha_zero_is_bitwise_the_plain_solve() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    const N: usize = 16;
+    let (a, b) = spd_system(N, 7);
+    let a32: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+    let b32: Vec<f32> = b.iter().map(|&v| v as f32).collect();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let a_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &a32);
+    let b_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &b32);
+
+    let plain = cholesky_solve::<f32>(&mut pool, &a_dev, &b_dev, N, 1, None).expect("plain solve");
+    let reg =
+        cholesky_solve_reg::<f32>(&mut pool, &a_dev, &b_dev, N, 1, 0.0, None).expect("alpha=0");
+    assert_eq!(
+        plain.to_host(&pool),
+        reg.to_host(&pool),
+        "alpha=0 must be the plain solve BIT for BIT — anything else is a silent \
+         behaviour change for KernelRidge and the memory-gate callers"
+    );
+}
+
+/// The wide arm must solve an order the narrow (shared-memory) kernel cannot
+/// hold — the cap that used to reject `Ridge` at `d > 64` and `KernelRidge`
+/// above 64 samples with `NotSquare`.
+#[test]
+fn cholesky_wide_arm_solves_above_max_dim() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    for &n in &[100usize, 256] {
+        let (a, b) = spd_system(n, 1234 + n as u64);
+        let got = device_solve_reg::<f32>(&a, &b, n, 1.0);
+        let want = host_solve_reg(&a, &b, n, 1.0);
+        let rel = rel_err(&got, &want);
+        assert!(
+            rel <= SOLVE_TOL,
+            "wide cholesky at n={n} backend={backend}: rel={rel:e} > {SOLVE_TOL:e}"
+        );
+        println!("cholesky wide n={n} backend={backend}: rel={rel:e}");
+    }
+}
+
+/// The two arms must AGREE on an order both support.
+///
+/// They cover disjoint `n` ranges in production, so without `MLRS_CHOLESKY_WIDE`
+/// no test could compare them and a broken wide kernel would only ever be
+/// checked against a host oracle it might match for the wrong reason. The knob
+/// is read BEFORE the size gate ([`use_wide_kernel`]) precisely so this can force
+/// each arm at the same `n`; see the vacuity trap in the Gram dispatcher.
+#[test]
+fn cholesky_wide_and_narrow_arms_agree() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    const N: usize = 48; // below MAX_DIM, so the DEFAULT here is the narrow arm
+    const ALPHA: f64 = 0.75;
+    let (a, b) = spd_system(N, 99);
+
+    let narrow = {
+        let _g = abflag::force("MLRS_CHOLESKY_WIDE", "0");
+        device_solve_reg::<f32>(&a, &b, N, ALPHA)
+    };
+    let wide = {
+        let _g = abflag::force("MLRS_CHOLESKY_WIDE", "1");
+        device_solve_reg::<f32>(&a, &b, N, ALPHA)
+    };
+
+    // Mutation guard: if the force were ignored the two would be bit-identical,
+    // which would make the tolerance assertion below vacuous. The arms
+    // re-associate differently, so on a well-conditioned f32 system they agree
+    // closely but essentially never exactly — assert they are CLOSE, and report
+    // the exact-equality case so a silently-disarmed knob is visible.
+    let rel = rel_err(&wide, &narrow);
+    assert!(
+        rel <= SOLVE_TOL,
+        "wide and narrow cholesky arms disagree at n={N}: rel={rel:e} > {SOLVE_TOL:e}"
+    );
+    if wide == narrow {
+        println!(
+            "NOTE cholesky wide/narrow agreed BIT for BIT at n={N} — check that \
+             MLRS_CHOLESKY_WIDE actually reaches the dispatcher"
+        );
+    }
+    let want = host_solve_reg(&a, &b, N, ALPHA);
+    assert!(
+        rel_err(&wide, &want) <= SOLVE_TOL && rel_err(&narrow, &want) <= SOLVE_TOL,
+        "both arms must also match the f64 host oracle at n={N}"
+    );
+}
+
+/// The wide arm's non-SPD guard: it factors past the failing pivot with a finite
+/// placeholder (so every barrier stays unconditional), but the host must STILL
+/// see `NotPositiveDefinite` and never hand back the garbage solution.
+#[test]
+fn cholesky_wide_arm_rejects_non_spd() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    const N: usize = 96;
+    let mut a = vec![0.0f32; N * N];
+    for i in 0..N {
+        a[i * N + i] = if i == N / 2 { -4.0 } else { 2.0 };
+    }
+    let b = vec![1.0f32; N];
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let a_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &a);
+    let b_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &b);
+
+    match cholesky_solve::<f32>(&mut pool, &a_dev, &b_dev, N, 1, None) {
+        Err(PrimError::NotPositiveDefinite { pivot_index, .. }) => {
+            assert_eq!(
+                pivot_index,
+                N / 2,
+                "the wide arm must report the FIRST failing pivot, not a later one"
+            );
+        }
+        Ok(_) => panic!("the wide arm accepted an indefinite matrix — the SPD guard is broken"),
+        Err(other) => panic!("expected NotPositiveDefinite, got {other:?}"),
+    }
 }
 
 /// Non-SPD guard: feed a synthetically INDEFINITE matrix (a negative diagonal

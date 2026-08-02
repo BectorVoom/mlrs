@@ -70,9 +70,33 @@ impl<R: cubecl::Runtime, F: Pod> DeviceArray<R, F> {
         // Single host copy into an owned byte Vec, then hand ownership to
         // CubeCL (A3 — no borrow/no-copy Bytes constructor exists in 0.10).
         let byte_vec: Vec<u8> = bytemuck::cast_slice::<F, u8>(host).to_vec();
-        let handle = pool
-            .client()
-            .create(cubecl::bytes::Bytes::from_bytes_vec(byte_vec));
+        let mut bytes = cubecl::bytes::Bytes::from_bytes_vec(byte_vec);
+
+        // `MLRS_UPLOAD_PINNED=1` moves the staging buffer to PAGE-LOCKED host
+        // memory before the transfer, which lets the driver DMA straight out of
+        // it instead of bouncing through its own internal pinned buffer.
+        //
+        // Off by default, and MEASURED to belong that way on cuda. It buys a
+        // faster transfer with an extra full host copy, so it only pays when
+        // the transfer dominates that copy — and on a Colab T4 it does not:
+        //
+        // | 102.4 MB          | ms    | GB/s |
+        // |-------------------|-------|------|
+        // | transfer alone    | 266.1 | 0.38 |
+        // | pinned + transfer | 197.7 | 0.51 |
+        //
+        // The transfer half genuinely improves 1.35×, but the extra host copy
+        // that buys it costs ~72 ms (host memcpy on that VM runs at 1.39 GB/s),
+        // which more than eats the gain. End to end the whole `d=256` fit went
+        // 316.1 ms → 336.3 ms with this on — a REGRESSION, exactly the way the
+        // isolated column said it would not. Trust the end-to-end number.
+        //
+        // `cubecl-cuda`'s `reserve_cpu` also refuses pinned memory above 100 MB
+        // unless explicitly marked, so the 102.4 MB rung may not even be pinned.
+        if crate::abflag::is_on("MLRS_UPLOAD_PINNED") {
+            pool.client().staging(std::iter::once(&mut bytes), false);
+        }
+        let handle = pool.client().create(bytes);
 
         Self {
             handle,

@@ -465,6 +465,40 @@ macro_rules! ridge_build {
     }};
 }
 
+/// Build the estimator and run whichever `fit` ingress its configuration, shape
+/// and backend call for. Monomorphized per float width by the caller so the
+/// two-arm branch is written once.
+///
+/// The branch has to happen HERE, before ingress, because the two entry points
+/// take different operand types: `Ridge::fit_from_host_slice` borrows the Arrow
+/// values directly (`host_slice_*`) and `Ridge::fit_with_sample_weight` needs a
+/// device upload (`validated_*`). On the host arm — either normal-equations
+/// solver (`cholesky`, i.e. the DEFAULT, or `lbfgs`) on the cpu backend, or
+/// below the dispatch-cost floor on any backend — the `n·d` design is therefore
+/// never copied at all. Both helpers run the SAME hard-reject
+/// bridge validator, so the ingress contract is identical either way.
+macro_rules! ridge_fit_dispatch {
+    ($float:ty, $p:expr, $xa:expr, $ya:expr, $swa:expr, $rows:expr, $cols:expr,
+     $pool:expr, $as:ident, $host_slice:ident, $validated:ident) => {{
+        let est = ridge_build!($float, $p);
+        let sw = match $swa.as_ref() {
+            Some(a) => Some($host_slice($as(a)?)?),
+            None => None,
+        };
+        if est.host_fit_applicable(($rows, $cols)) {
+            let xh = $host_slice($as(&$xa)?)?;
+            let yh = $host_slice($as(&$ya)?)?;
+            est.fit_from_host_slice(&mut $pool, xh, yh, ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        } else {
+            let xd = $validated($as(&$xa)?, &mut $pool)?;
+            let yd = $validated($as(&$ya)?, &mut $pool)?;
+            est.fit_with_sample_weight(&mut $pool, &xd, Some(&yd), ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        }
+    }};
+}
+
 #[pymethods]
 impl PyRidge {
     /// `Ridge(alpha=1.0, fit_intercept=True, copy_X=True, max_iter=None,
@@ -535,32 +569,20 @@ impl PyRidge {
                 let mut pool = crate::lock_pool();
                 match dt {
                     FloatDtype::F32 => {
-                        let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                        let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                        let sw = match swa.as_ref() {
-                            Some(a) => Some(host_slice_f32(as_f32(a)?)?),
-                            None => None,
-                        };
-                        let est = ridge_build!(f32, p);
-                        let fitted = est
-                            .fit_with_sample_weight(&mut pool, &xd, Some(&yd), (rows, cols), sw)
-                            .map_err(algo_err_to_py)?;
+                        let fitted = ridge_fit_dispatch!(
+                            f32, p, xa, ya, swa, rows, cols, pool,
+                            as_f32, host_slice_f32, validated_f32
+                        );
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
                         Ok((AnyRidge::F32(fitted), n_iter, used))
                     }
                     FloatDtype::F64 => {
                         crate::capability::guard_f64()?;
-                        let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                        let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                        let sw = match swa.as_ref() {
-                            Some(a) => Some(host_slice_f64(as_f64(a)?)?),
-                            None => None,
-                        };
-                        let est = ridge_build!(f64, p);
-                        let fitted = est
-                            .fit_with_sample_weight(&mut pool, &xd, Some(&yd), (rows, cols), sw)
-                            .map_err(algo_err_to_py)?;
+                        let fitted = ridge_fit_dispatch!(
+                            f64, p, xa, ya, swa, rows, cols, pool,
+                            as_f64, host_slice_f64, validated_f64
+                        );
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
                         Ok((AnyRidge::F64(fitted), n_iter, used))
@@ -1305,6 +1327,18 @@ impl PyMBSGDClassifier {
     /// strings are parsed (`TryFrom` → `ValueError` on a bad string, D-05) and the
     /// builder validates the data-independent params (`build()` → `ValueError`,
     /// D-09) BEFORE the device launch; GIL released (PY-03); f64 guarded (D-04).
+    ///
+    /// **No upload on cpu** (MBSGD-PERF-CPU). Where the SGD solve runs on the
+    /// host arm anyway ([`sgd_host_available`]), the design matrix is BORROWED
+    /// from the Arrow values via [`host_slice_f32`] / [`host_slice_f64`] — the
+    /// same hard-reject bridge validator `validated_f32` runs, minus the copy —
+    /// and handed to `fit_from_host_slice`. Routing it through a `DeviceArray`
+    /// instead costs three full passes over `x` (one to upload, two more
+    /// because `to_host` materializes a byte buffer and then a typed one); at
+    /// `50 000 × 64` f32 that was 10 ms against 6 ms of actual solving. Real
+    /// device backends keep the upload and the device epoch loop.
+    ///
+    /// [`sgd_host_available`]: mlrs_backend::prims::sgd::sgd_host_available
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -1334,12 +1368,11 @@ impl PyMBSGDClassifier {
         let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
         let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
         let lr = LearningRate::try_from(lr_s.as_str()).map_err(build_err_to_py)?;
+        let host_ingress = mlrs_backend::prims::sgd::sgd_host_available();
         let fitted = py.detach(|| -> PyResult<AnyMBSGDClassifier> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
                     let est = MBSGDClassifier::<f32>::builder()
                         .loss(loss)
                         .penalty(penalty)
@@ -1356,14 +1389,23 @@ impl PyMBSGDClassifier {
                         .seed(seed)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if host_ingress {
+                        est.fit_from_host_slice(
+                            &mut pool,
+                            host_slice_f32(as_f32(&xa)?)?,
+                            host_slice_f32(as_f32(&ya)?)?,
+                            (rows, cols),
+                        )
+                    } else {
+                        let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                        let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                    }
+                    .map_err(algo_err_to_py)?;
                     Ok(AnyMBSGDClassifier::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
                     let est = MBSGDClassifier::<f64>::builder()
                         .loss(loss)
                         .penalty(penalty)
@@ -1380,8 +1422,19 @@ impl PyMBSGDClassifier {
                         .seed(seed)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if host_ingress {
+                        est.fit_from_host_slice(
+                            &mut pool,
+                            host_slice_f64(as_f64(&xa)?)?,
+                            host_slice_f64(as_f64(&ya)?)?,
+                            (rows, cols),
+                        )
+                    } else {
+                        let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                        let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                    }
+                    .map_err(algo_err_to_py)?;
                     Ok(AnyMBSGDClassifier::F64(fitted))
                 }
             }

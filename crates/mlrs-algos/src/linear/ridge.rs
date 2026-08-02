@@ -19,12 +19,12 @@
 //! | `solver` | path | `n_iter_` |
 //! |---|---|---|
 //! | `auto` | resolves to `lbfgs` when `positive`, else `cholesky` (sklearn's `resolve_solver_for_numpy` for dense `X`) | — |
-//! | `cholesky` | DEVICE: [`gram_xty`] + [`cholesky_solve`] on `(XᵀX + αI)·coef = Xᵀy` | `None` |
+//! | `cholesky` | DEVICE: [`column_means`] + [`gram_xty_centered`] (centering FUSED) + [`cholesky_solve_reg`] (`α` on the diagonal IN-KERNEL) + [`ridge_intercept_device`] — no host round-trip at all; a fully HOST arm on cpu / small shapes | `None` |
 //! | `svd` | DEVICE: [`svd`] then `coef = V·diag(σ/(σ²+α))·Uᵀy`; the Gram+[`eig`] form above the Jacobi caps | `None` |
 //! | `sparse_cg` | HOST CG on the device-formed Gram (sklearn's own `Xᵀ(X·x) + αx` operator) | `None` |
 //! | `lsqr` | HOST Paige–Saunders LSQR with `damp = √α` | `Some(itn)` |
 //! | `sag` / `saga` | HOST stochastic average gradient, sklearn's `get_auto_step_size` | `Some(epochs)` |
-//! | `lbfgs` | HOST projected coordinate descent on the Gram (the `positive=True` arm) | `None` |
+//! | `lbfgs` | DEVICE: [`column_means`] + [`gram_xty_centered`] (centering FUSED into the Gram pass) + [`ridge_nnls`] — projected coordinate descent on the Gram, whole sweep loop in one cube (the `positive=True` arm); a fully HOST arm on cpu / small shapes / over-cap `d` | `None` |
 //!
 //! The `n_iter_` column is sklearn's, not an mlrs choice: `_ridge_regression`
 //! initializes `n_iter = None` and only `_solve_lsqr` and the `sag`/`saga` arm
@@ -127,9 +127,10 @@
 //!
 //! | solver | device work | host read-back |
 //! |---|---|---|
-//! | `cholesky` | centering, Gram, factorization, solve — ALL on device | the `d×d` Gram (for the α diagonal write, which cubecl 0.10 cannot do in place) |
+//! | `cholesky` | centering, Gram, factorization, solve, intercept — ALL on device | NOTHING (the `α` diagonal write and the intercept dot both moved into kernels) |
 //! | `svd` | centering, SVD (or Gram+eig), both GEMMs | the length-`k` spectrum |
-//! | `sparse_cg`, `lbfgs` | centering, Gram/`Xᵀy` — the whole `O(n·d)` reduction | `d² + d` floats, INDEPENDENT of `n_samples` |
+//! | `lbfgs` | centering, Gram/`Xᵀy`, AND the whole projected-CD solve — one cube, sweep loop in-kernel | NOTHING (host twin on cpu / `d > 256`, which reads `d² + d`) |
+//! | `sparse_cg` | centering, Gram/`Xᵀy` — the whole `O(n·d)` reduction | `d² + d` floats, INDEPENDENT of `n_samples` |
 //! | `lsqr`, `sag`/`saga` | centering | the `n×d` design, ONCE |
 //!
 //! `lsqr` and `sag`/`saga` are the only arms that ship the design matrix back,
@@ -147,6 +148,51 @@
 //! means and the `√w` row rescale have no `center_columns` equivalent). The
 //! unweighted path — the default — never pays it.
 //!
+//! ## Measured: `Ridge()` on a Colab T4 (RIDGE-DEFAULT-CUDA, f32, min-of-9,
+//! ## upload INSIDE the timer — `results/ridge_default_t4_dd37f93.log`)
+//!
+//! Whole-fit, device arm against mlrs's own host arm forced on the same VM (a
+//! 2-vCPU Xeon @2GHz — see the caveat below):
+//!
+//! | shape | host arm | device arm | |
+//! |---|---|---|---|
+//! | 1 000 × 8 | 0.078 ms | 0.400 ms | 0.20× |
+//! | 10 000 × 16 | 1.10 ms | 0.96 ms | 1.15× |
+//! | 10 000 × 64 | 6.37 ms | 4.43 ms | 1.44× |
+//! | 100 000 × 16 | 7.53 ms | 6.01 ms | 1.25× |
+//! | 100 000 × 64 | 58.9 ms | 30.7 ms | 1.92× |
+//! | 500 000 × 16 | 35.8 ms | 38.9 ms | 0.92× |
+//! | 100 000 × 128 | 206 ms | 59.2 ms | **3.49×** |
+//! | 100 000 × 256 | 786 ms | 313 ms | **2.51×** |
+//!
+//! Two things that table does NOT say. First, the two rungs where the device
+//! arm loses are the two `host_fit_applicable` already routes to the host
+//! (`1 000 × 8`) or calls a wash (`500 000 × 16`, 8%) — a Python caller gets the
+//! better arm at every rung but that one. Second, the host column is the SAME
+//! CODE the cpu backend runs, on a 2-thread VM; on the 16-thread dev box it is
+//! roughly 4× faster (`100 000 × 256` in 77.9 ms, not 786), so against THAT cpu
+//! the T4 does not win at any rung on this ladder. The GPU's advantage is
+//! `n·d²/2` arithmetic over an `n·d` transfer, so it grows with `d` and the
+//! crossover against a 16-thread host sits above `d = 256`.
+//!
+//! The upload is why. Drained laps at `100 000 × 256`: 308 ms of upload against
+//! 4.8 ms of means + 13.3 ms of Gram+solve. The compute is 5.8% of the fit and
+//! the transfer is 96% — the same wall the `positive=True` campaign hit
+//! (`results/ridge_positive_t4_*.log`: 0.33–0.92 GB/s on a link that should do
+//! 6–12, and getting WORSE as the operand grows, which is the signature of a
+//! per-call allocation cost rather than a slow link). Nothing here changes it,
+//! and on this hardware it is the only lever left.
+//!
+//! ## Both normal-equations arms have a second, fully-HOST route
+//! [`Ridge::fit_from_host_slice`] runs the whole fit — means, centering, Gram,
+//! `Xᵀy`, solve — from host memory, uploading only the fitted `coef_` and
+//! `intercept_`. [`Ridge::host_fit_applicable`] picks it for `cholesky` and
+//! `lbfgs` on the cpu backend (where the device composition is pathological:
+//! `center_columns` falls back to the per-column-round-trip `column_reduce`
+//! there, measured at 59.6 s of a 60.1 s `1 000 × 8` fit) and, on ANY backend,
+//! below the fixed dispatch-cost floor. Everything else keeps the device route
+//! above.
+//!
 //! Tests live in `crates/mlrs-algos/tests/ridge_test.rs` and
 //! `crates/mlrs-algos/tests/ridge_params_test.rs` (AGENTS.md §2), never an
 //! in-source `#[cfg(test)] mod tests`.
@@ -159,11 +205,15 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::center::center_columns;
-use mlrs_backend::prims::cholesky::cholesky_solve;
+use mlrs_backend::prims::cholesky::cholesky_solve_reg;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
-use mlrs_backend::prims::gram::gram_xty;
+use mlrs_backend::prims::gram::{
+    column_means, fused_centering_available, gram_xty, gram_xty_centered,
+};
+use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable};
 use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
+use mlrs_backend::prims::nnls::{device_nnls_applicable, ridge_intercept_device, ridge_nnls};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
@@ -258,6 +308,25 @@ impl RidgeSolver {
     /// the `√w` row rescale)? sklearn: `if solver not in ["sag", "saga"]`.
     fn takes_sample_weight_directly(self) -> bool {
         matches!(self, RidgeSolver::Sag | RidgeSolver::Saga)
+    }
+
+    /// Does this solver read ONLY the normal equations (`XᵀX`, `Xᵀy`) and never
+    /// the design matrix itself?
+    ///
+    /// This is the precondition for FUSED centering. Every solver needs the
+    /// design centered, but a Gram-only solver never needs the centered design
+    /// to EXIST: the subtraction can happen inside the accumulation kernel, so
+    /// the `n × d` centered copy — its allocation, its write and its re-read —
+    /// disappears. On a `100 000 × 256` wgpu fit that copy measured 151 ms of
+    /// 528. `lsqr` and `sag`/`saga` genuinely consume rows and cannot fuse;
+    /// `svd` consumes `X` directly below the Jacobi caps and so cannot either.
+    ///
+    /// `cholesky` — the DEFAULT, `positive = false` arm — can, and this is where
+    /// that route came from: it was written for `lbfgs` and left keyed on that
+    /// one solver, so `Ridge()` with no arguments kept paying for a centered
+    /// design it never looked at.
+    fn consumes_gram_only(self) -> bool {
+        matches!(self, RidgeSolver::Cholesky | RidgeSolver::Lbfgs)
     }
 }
 
@@ -446,34 +515,7 @@ where
         //     vector is a geometry error; a negative or non-finite weight would
         //     make `√w` NaN in the rescale and silently poison every downstream
         //     reduction, so it is rejected as a typed error instead. ---
-        let sw64: Option<Vec<f64>> = match sample_weight {
-            Some(sw) => {
-                if sw.len() != n_samples {
-                    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                        operand: "sample_weight",
-                        rows: n_samples,
-                        cols: 1,
-                        len: sw.len(),
-                    }));
-                }
-                let sw: Vec<f64> = sw.iter().map(|&v| host_to_f64(v)).collect();
-                if let Some(bad) = sw.iter().position(|v| !v.is_finite() || *v < 0.0) {
-                    return Err(AlgoError::InvalidSampleWeight {
-                        estimator: "ridge",
-                        index: bad,
-                        value: sw[bad],
-                    });
-                }
-                // All-zero weights leave nothing to fit: the `√w` rescale zeroes
-                // the whole design and the penalized solve would hand back the
-                // all-zero coefficient vector as though it were an answer.
-                if sw.iter().all(|&v| v == 0.0) {
-                    return Err(AlgoError::ZeroSampleWeightSum { estimator: "ridge" });
-                }
-                Some(sw)
-            }
-            None => None,
-        };
+        let sw64: Option<Vec<f64>> = validate_sample_weight::<F>(sample_weight, n_samples)?;
 
         let resolved = self.solver.resolve(self.positive);
 
@@ -484,25 +526,58 @@ where
         // `gram_xty`/`cholesky_solve` pins each phase's lap to ITS OWN kernels
         // rather than bleeding into the next phase's).
         let profile = std::env::var("RIDGE_PROFILE").is_ok();
+        // A lap only means something if it ENDS with a real blocking read-back:
+        // `client.sync()` returns a future, so an undrained lap measures enqueue
+        // time and silently bleeds into whatever readback comes next
+        // (RIDGE-POS-PERF). This one-element array is read after each phase to
+        // pin every lap to its own kernels. Allocated only when profiling, and
+        // the drains forbid cross-phase overlap, so a profiled TOTAL runs a
+        // little high — the split is what this is for, not the total.
+        let probe: Option<DeviceArray<ActiveRuntime, F>> = if profile {
+            Some(DeviceArray::from_host(pool, &[f64_to_host::<F>(1.0)]))
+        } else {
+            None
+        };
         let lap0 = std::time::Instant::now();
 
         // --- 1. Centering + (for the non-SAG solvers) the `√w` row rescale.
         //        With NO sample_weight this is the original DEVICE-resident
         //        `center_columns` composition, unchanged: no host round-trip of
         //        the full n×d design. See `preprocess` for the weighted arm. ---
+        //
+        //        The `positive` device arm takes the FUSED route instead: only
+        //        the column means are formed here, and the subtraction happens
+        //        inside `gram_xty_centered`'s accumulation kernel. That drops
+        //        the `n×d` centered allocation, its write and its re-read — the
+        //        second largest device cost of the fit after the design upload
+        //        (measured 9 ms of a 25 ms `n=100 000, d=64` wgpu fit, 151 ms of
+        //        528 ms at `d=256`). Only this arm can do it: every other solver
+        //        consumes the centered DESIGN, not its Gram.
         let rescale = sw64.is_some() && !resolved.takes_sample_weight_directly();
-        let (x_mean, y_mean, x_owned, y_owned) = preprocess::<F>(
-            pool,
-            x,
-            y,
-            n_samples,
-            n_features,
-            self.fit_intercept,
-            sw64.as_deref(),
-            rescale,
-        )?;
+        let fused_center = resolved.consumes_gram_only()
+            && sw64.is_none()
+            && self.fit_intercept
+            && fused_centering_available::<F>(n_features)
+            && (resolved != RidgeSolver::Lbfgs || device_nnls_applicable::<F>(n_features));
+        let (mut x_mean, mut y_mean, x_owned, y_owned, dev_means) = if fused_center {
+            let (xm, ym) = column_means::<F>(pool, x, y, n_samples, n_features)?;
+            (Vec::new(), 0.0f64, None, None, Some((xm, ym)))
+        } else {
+            let (xm, ym, xo, yo) = preprocess::<F>(
+                pool,
+                x,
+                y,
+                n_samples,
+                n_features,
+                self.fit_intercept,
+                sw64.as_deref(),
+                rescale,
+            )?;
+            (xm, ym, xo, yo, None)
+        };
         let x_ref = x_owned.as_ref().unwrap_or(x);
         let y_ref = y_owned.as_ref().unwrap_or(y);
+        drain_profile_probe::<F>(pool, &probe);
         let t_center = if profile { lap0.elapsed().as_secs_f64() } else { 0.0 };
 
         // --- 2. Solve. Each arm returns the device-resident `coef_`, the
@@ -513,14 +588,43 @@ where
         let (coef, n_iter, solver_used) = match resolved {
             RidgeSolver::Auto => unreachable!("resolve() never returns Auto"),
             RidgeSolver::Cholesky => {
-                match solve_cholesky::<F>(pool, x_ref, y_ref, n_samples, n_features, alpha64) {
+                let means = dev_means.as_ref().map(|(xm, ym)| (xm, ym));
+                match solve_cholesky::<F>(
+                    pool, x_ref, y_ref, means, n_samples, n_features, alpha64,
+                ) {
                     Ok(coef) => (coef, None, RidgeSolver::Cholesky),
                     // sklearn's `except LinAlgError: solver = "svd"` retry.
-                    Err(AlgoError::Prim(PrimError::NotPositiveDefinite { .. })) => (
-                        solve_svd::<F>(pool, x_ref, y_ref, n_samples, n_features, alpha64)?,
-                        None,
-                        RidgeSolver::Svd,
-                    ),
+                    Err(AlgoError::Prim(PrimError::NotPositiveDefinite { .. })) => {
+                        // The SVD arm consumes the centered DESIGN, which the
+                        // fused route deliberately never materializes. Build it
+                        // here rather than penalizing every successful fit for a
+                        // branch that only runs after a factorization has
+                        // already failed. `center_columns` recomputes the same
+                        // means the fused pass has on the device, so the retry
+                        // sees exactly the operands the unfused route would have
+                        // handed it.
+                        let staged = if dev_means.is_some() {
+                            let (xc, xm) =
+                                center_columns::<F>(pool, x, (n_samples, n_features))?;
+                            let (yc, ym) = center_columns::<F>(pool, y, (n_samples, 1))?;
+                            xm.release_into(pool);
+                            ym.release_into(pool);
+                            Some((xc, yc))
+                        } else {
+                            None
+                        };
+                        let (sx, sy) = match &staged {
+                            Some((xc, yc)) => (xc, yc),
+                            None => (x_ref, y_ref),
+                        };
+                        let coef =
+                            solve_svd::<F>(pool, sx, sy, n_samples, n_features, alpha64);
+                        if let Some((xc, yc)) = staged {
+                            xc.release_into(pool);
+                            yc.release_into(pool);
+                        }
+                        (coef?, None, RidgeSolver::Svd)
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -542,17 +646,19 @@ where
                 (upload_coef::<F>(pool, &coef), None, RidgeSolver::SparseCg)
             }
             RidgeSolver::Lbfgs => {
-                let (gram, xty) = host_gram::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
-                let (coef, _sweeps) = ridge_solvers::nonnegative_cd(
-                    &gram,
-                    &xty,
+                // sklearn leaves `n_iter_` at None for the lbfgs arm.
+                let coef = solve_nonnegative::<F>(
+                    pool,
+                    x_ref,
+                    y_ref,
+                    dev_means.as_ref().map(|(xm, ym)| (xm, ym)),
+                    n_samples,
                     n_features,
                     alpha64,
                     self.tol,
                     self.max_iter,
-                );
-                // sklearn leaves `n_iter_` at None for the lbfgs arm.
-                (upload_coef::<F>(pool, &coef), None, RidgeSolver::Lbfgs)
+                )?;
+                (coef, None, RidgeSolver::Lbfgs)
             }
             RidgeSolver::Lsqr => {
                 let (xh, yh) = host_design::<F>(pool, x_ref, y_ref);
@@ -584,7 +690,9 @@ where
                 (upload_coef::<F>(pool, &coef), Some(epochs), resolved)
             }
         };
+        drain_profile_probe::<F>(pool, &probe);
         let t_solve = if profile { lap1.elapsed().as_secs_f64() } else { 0.0 };
+        let lap2 = std::time::Instant::now();
 
         if let Some(xc) = x_owned {
             xc.release_into(pool);
@@ -596,25 +704,65 @@ where
         // --- 3. intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 (D-05). α
         //        is NOT applied here — the intercept is unpenalized — and NEITHER
         //        is the `positive` bound (sklearn constrains only `coef_`). ---
-        let coef_host = coef.to_host(pool);
-        let intercept = if self.fit_intercept {
-            let mut dot = 0.0f64;
-            for c in 0..n_features {
-                dot += x_mean[c] * host_to_f64(coef_host[c]);
-            }
-            y_mean - dot
+        //
+        // TWO ARMS. The fused (`positive`) route leaves `x̄`/`ȳ` on the device
+        // and the solve leaves `coef` there, so every operand of this dot is
+        // already resident: `ridge_intercept_device` finishes the fit without a
+        // single host round-trip. The host arm reads `x̄`, `ȳ` and `coef` back —
+        // three BLOCKING read-backs — to do the same dot in `f64` and upload one
+        // scalar.
+        //
+        // The device arm is the default because it is what "device-resident
+        // fit" should mean, but the host arm is NOT vestigial: it is the only
+        // one available to the non-fused solvers (whose means were computed on
+        // the host by `preprocess`), and it accumulates in `f64` where the
+        // kernel accumulates in `F`. `MLRS_RIDGE_HOST_INTERCEPT=1` forces it
+        // anywhere, which is how the two are A/B'd for both speed and drift.
+        let device_intercept = self.fit_intercept
+            && dev_means.is_some()
+            && !mlrs_backend::abflag::is_on("MLRS_RIDGE_HOST_INTERCEPT");
+
+        let intercept_dev: DeviceArray<ActiveRuntime, F> = if device_intercept {
+            let (xm, ym) = dev_means.expect("device_intercept implies dev_means");
+            let out = ridge_intercept_device::<F>(pool, &xm, &ym, &coef, n_features)?;
+            xm.release_into(pool);
+            ym.release_into(pool);
+            out
         } else {
-            0.0
+            // The fused arm's means still live on the device here; `d + 1`
+            // floats cross once, where this arm's dot needs them anyway.
+            if let Some((xm, ym)) = dev_means {
+                x_mean = xm.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+                y_mean = host_to_f64(ym.to_host(pool)[0]);
+                xm.release_into(pool);
+                ym.release_into(pool);
+            }
+            let coef_host = coef.to_host(pool);
+            let intercept = if self.fit_intercept {
+                let mut dot = 0.0f64;
+                for c in 0..n_features {
+                    dot += x_mean[c] * host_to_f64(coef_host[c]);
+                }
+                y_mean - dot
+            } else {
+                0.0
+            };
+            DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)])
         };
-        let intercept_dev: DeviceArray<ActiveRuntime, F> =
-            DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)]);
 
         if profile {
+            // `tail` is the intercept recovery: three blocking read-backs
+            // (x_mean, y_mean, coef) plus the scalar upload. It was noise when
+            // the Gram cost 21 ms; it is not noise now that the Gram costs 4.
+            let t_tail = lap2.elapsed().as_secs_f64();
             eprintln!(
                 "RIDGE_PROFILE n={n_samples} d={n_features} solver={}: \
-                 preprocess={t_center:.4}s solve={t_solve:.4}s",
+                 preprocess={t_center:.4}s solve={t_solve:.4}s tail={t_tail:.4}s",
                 solver_used.name()
             );
+        }
+        if let Some(p) = probe {
+            p.release_into(pool);
         }
 
         Ok(Ridge {
@@ -634,6 +782,252 @@ where
             _state: PhantomData,
         })
     }
+
+    /// Does the fully-HOST fit arm ([`Ridge::fit_from_host_slice`]) apply to
+    /// this configuration?
+    ///
+    /// `true` for the two NORMAL-EQUATIONS solvers — `cholesky` (the
+    /// `positive = false` default) and `lbfgs` (the `positive = true` arm) —
+    /// and only where the formation belongs on the host
+    /// (`prims::gram_host::gram_host_applicable` — the cpu backend, plus the
+    /// fixed-dispatch-cost floor on every backend). Both consume only `XᵀX` and
+    /// `Xᵀy`, which is what makes a host arm possible at all: the solve after
+    /// them is `O(d³)` on a matrix a few hundred wide. Every other solver still
+    /// runs the device path.
+    ///
+    /// The `cholesky` half is the RIDGE-DEFAULT-CUDA addition, and it closes a
+    /// live 100 000× regression rather than merely adding a fast path: on the
+    /// cpu backend `Ridge()` went through `center_columns`, whose cpu arm walks
+    /// the `d` columns one at a time with an upload + launch + blocking readback
+    /// each. That was measured at 59.6 s of a 60.1 s `1 000 × 8` fit for the
+    /// `positive = true` arm before it got a host route, and `positive = false`
+    /// — the DEFAULT — was still paying it.
+    ///
+    /// `shape` is `(n_samples, n_features)`; the floor is a function of the
+    /// problem size, so the caller must know it before deciding.
+    ///
+    /// Callers branch on this rather than letting `fit_from_host_slice` decide,
+    /// because the two entry points take DIFFERENT operand types (host slice vs
+    /// [`DeviceArray`]) and the choice therefore has to be made before ingress —
+    /// which is the whole point: on the applicable arm the design is never
+    /// uploaded at all.
+    pub fn host_fit_applicable(&self, shape: (usize, usize)) -> bool {
+        self.solver.resolve(self.positive).consumes_gram_only()
+            && gram_host_applicable(shape.0, shape.1)
+    }
+
+    /// [`Fit::fit`] over HOST slices — the no-upload, no-launch ingress for the
+    /// `positive = true` arm on the cpu backend.
+    ///
+    /// `x` is the `n × d` row-major design and `y` the length-`n` target, both
+    /// borrowed from host memory (at the Python boundary, the Arrow values
+    /// themselves). Nothing about the FITTED estimator differs from one produced
+    /// by [`Fit::fit`] — `coef_`/`intercept_` are still device-resident, so
+    /// `predict` has one path — only the route there does:
+    ///
+    /// | | [`Fit::fit`] on cpu | this |
+    /// |---|---|---|
+    /// | design upload | `n·d` | none |
+    /// | column means | `d` × (upload + launch + blocking readback) | one parallel host pass |
+    /// | centering | one launch writing a fresh `n·d` buffer | folded into the tile build, never materialized |
+    /// | Gram / `Xᵀy` | `gram_xty` launch | one parallel host pass |
+    /// | solve | on the read-back Gram | the same solver, same Gram |
+    ///
+    /// The solve is [`ridge_solvers::cholesky_ridge`] for `positive = false` —
+    /// with [`ridge_solvers::gram_eig_ridge`] as sklearn's singular-Gram retry —
+    /// and [`ridge_solvers::nonnegative_cd`] for `positive = true`. Both read
+    /// only `XᵀX` / `Xᵀy`, which is the property that makes this arm possible.
+    ///
+    /// Measured at `1 000 × 8`, `positive=True`, f64: 60.1 s → 0.2 ms.
+    ///
+    /// Returns [`PrimError::UnsupportedCapability`] when
+    /// [`Ridge::host_fit_applicable`] is false, so a caller that forgets to
+    /// branch gets a typed error rather than a silently different answer.
+    pub fn fit_from_host_slice(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        y: &[F],
+        shape: (usize, usize),
+        sample_weight: Option<&[F]>,
+    ) -> Result<Ridge<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+        if !self.host_fit_applicable(shape) {
+            return Err(AlgoError::Prim(PrimError::UnsupportedCapability {
+                operand: "ridge.fit_from_host_slice",
+                capability: "the host fit arm (a normal-equations solver on a host-Gram backend)",
+            }));
+        }
+        let resolved = self.solver.resolve(self.positive);
+
+        // --- The slice twin of the D-08 geometry guard: `validate_geometry`
+        //     reads a DeviceArray's length, which we do not have here. ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        let sw64 = validate_sample_weight::<F>(sample_weight, n_samples)?;
+
+        let profile = std::env::var("RIDGE_PROFILE").is_ok();
+        let lap0 = std::time::Instant::now();
+
+        // Centering, the `√w` rescale, the Gram and `Xᵀy` in TWO passes over the
+        // design — and the centered/rescaled `n × d` design is never
+        // materialized, because centering is folded into the tile the Gram
+        // sweep reads.
+        let (x_mean, y_mean, gram, xty) = centered_gram_xty::<F>(
+            x,
+            y,
+            n_samples,
+            n_features,
+            sw64.as_deref(),
+            self.fit_intercept,
+        );
+        let t_center = if profile { lap0.elapsed().as_secs_f64() } else { 0.0 };
+
+        let lap1 = std::time::Instant::now();
+        let alpha64 = host_to_f64(self.alpha);
+        // Same solver split as the device arm, on the same normal equations.
+        // sklearn leaves `n_iter_` at None for BOTH of these, so no sweep count
+        // is kept.
+        let (coef64, solver_used) = match resolved {
+            RidgeSolver::Lbfgs => {
+                let (w, _sweeps) = ridge_solvers::nonnegative_cd(
+                    &gram,
+                    &xty,
+                    n_features,
+                    alpha64,
+                    self.tol,
+                    self.max_iter,
+                );
+                (w, RidgeSolver::Lbfgs)
+            }
+            // sklearn's `except LinAlgError: solver = "svd"` retry, host-side:
+            // a non-positive pivot re-solves through the eigendecomposition and
+            // reports `solver_ = "svd"`, exactly as the device arm does.
+            _ => match ridge_solvers::cholesky_ridge(&gram, &xty, n_features, alpha64) {
+                Some(w) => (w, RidgeSolver::Cholesky),
+                None => (
+                    ridge_solvers::gram_eig_ridge(&gram, &xty, n_features, alpha64),
+                    RidgeSolver::Svd,
+                ),
+            },
+        };
+        let t_solve = if profile { lap1.elapsed().as_secs_f64() } else { 0.0 };
+
+        // intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 (D-05); α is not
+        // applied (the intercept is unpenalized) and neither is the `positive`
+        // bound (sklearn constrains only `coef_`) — the same arithmetic
+        // `fit_with_sample_weight` does, on the means this pass already has.
+        let intercept = if self.fit_intercept {
+            let dot: f64 = x_mean
+                .iter()
+                .zip(coef64.iter())
+                .map(|(m, c)| m * c)
+                .sum();
+            y_mean - dot
+        } else {
+            0.0
+        };
+
+        if profile {
+            eprintln!(
+                "RIDGE_PROFILE n={n_samples} d={n_features} solver={} (host): \
+                 preprocess={t_center:.4}s solve={t_solve:.4}s",
+                solver_used.name()
+            );
+        }
+
+        Ok(Ridge {
+            alpha: self.alpha,
+            fit_intercept: self.fit_intercept,
+            copy_x: self.copy_x,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            solver: self.solver,
+            positive: self.positive,
+            random_state: self.random_state,
+            coef_: Some(upload_coef::<F>(pool, &coef64)),
+            intercept_: Some(DeviceArray::from_host(
+                pool,
+                &[f64_to_host::<F>(intercept)],
+            )),
+            n_iter_: None,
+            solver_: Some(solver_used),
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+
+/// Drain the device queue for [`RIDGE_PROFILE`] lap attribution.
+///
+/// A no-op when profiling is off. See the call site for why `client.sync()`
+/// cannot be used here.
+fn drain_profile_probe<F>(
+    pool: &BufferPool<ActiveRuntime>,
+    probe: &Option<DeviceArray<ActiveRuntime, F>>,
+) where
+    F: Float + CubeElement + Pod,
+{
+    if let Some(p) = probe {
+        let v = p.to_host(pool);
+        debug_assert!(!v.is_empty());
+    }
+}
+
+/// Validate an optional `sample_weight` and widen it to `f64` (T-04-05-03).
+///
+/// Shared by [`Ridge::fit_with_sample_weight`] and
+/// [`Ridge::fit_from_host_slice`] so the two ingress paths cannot drift on
+/// weight validation. A wrong-length vector is a geometry error; a negative or
+/// non-finite weight would make `√w` NaN in the rescale and silently poison
+/// every downstream reduction; an all-zero vector leaves nothing to fit (the
+/// rescale zeroes the whole design and the penalized solve would hand back the
+/// all-zero coefficient vector as though it were an answer).
+fn validate_sample_weight<F>(
+    sample_weight: Option<&[F]>,
+    n_samples: usize,
+) -> Result<Option<Vec<f64>>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let Some(sw) = sample_weight else {
+        return Ok(None);
+    };
+    if sw.len() != n_samples {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "sample_weight",
+            rows: n_samples,
+            cols: 1,
+            len: sw.len(),
+        }));
+    }
+    let sw: Vec<f64> = sw.iter().map(|&v| host_to_f64(v)).collect();
+    if let Some(bad) = sw.iter().position(|v| !v.is_finite() || *v < 0.0) {
+        return Err(AlgoError::InvalidSampleWeight {
+            estimator: "ridge",
+            index: bad,
+            value: sw[bad],
+        });
+    }
+    if sw.iter().all(|&v| v == 0.0) {
+        return Err(AlgoError::ZeroSampleWeightSum { estimator: "ridge" });
+    }
+    Ok(Some(sw))
 }
 
 impl<F> Default for Ridge<F, Unfit>
@@ -976,15 +1370,40 @@ where
     Ok((x_mean, y_mean, Some(x_dev), Some(y_dev)))
 }
 
-/// The default DEVICE solve: `(XᵀX + αI)·coef = Xᵀy` by Cholesky.
+/// The default DEVICE solve: `(XᵀX + αI)·coef = Xᵀy` by Cholesky — and, since
+/// RIDGE-DEFAULT-CUDA, without a single host round-trip.
 ///
-/// Byte-identical to the pre-parameter-surface implementation — the committed
-/// `ridge_f32/f64_seed42` fixtures exercise exactly this path and see NO
-/// behavioural change.
+/// `means` is the `(x̄, ȳ)` pair from [`column_means`] on the FUSED route, in
+/// which case `x_ref`/`y_ref` are the caller's RAW design and the centering
+/// happens inside the accumulation kernel. `None` means `x_ref`/`y_ref` are
+/// already centered (or the fit has no intercept) and the raw Gram is formed
+/// directly.
+///
+/// Two host round-trips used to live in this function and no longer do:
+///
+/// | | before | now |
+/// |---|---|---|
+/// | centered design | an `n × d` buffer written by `center_columns`, then re-read by `gram_xty` | never materialized — [`gram_xty_centered`] subtracts as it accumulates |
+/// | `α` on the diagonal | `gram.to_host()`, a host loop over `d` of the `d²` entries, `from_host()` | [`cholesky_solve_reg`]'s `alpha`, added as the kernel reads `A[i][i]` |
+///
+/// The α round-trip is the smaller of the two in bytes and the larger in
+/// synchronisation: it drained the queue in the middle of the fit, between the
+/// Gram and the factorization, so neither could overlap the other.
+///
+/// The numerical result is unchanged in kind — `α` still lands on the Gram
+/// diagonal only, never on the intercept (D-05 / T-04-05-02) — but it is NOT
+/// bit-identical to the pre-fusion path: fusing the centering re-associates the
+/// accumulation. The committed `ridge_f32/f64_seed42` fixtures gate that at the
+/// 1e-5 oracle tolerance.
+#[allow(clippy::too_many_arguments)]
 fn solve_cholesky<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x_ref: &DeviceArray<ActiveRuntime, F>,
     y_ref: &DeviceArray<ActiveRuntime, F>,
+    means: Option<(
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    )>,
     n_samples: usize,
     n_features: usize,
     alpha64: f64,
@@ -995,41 +1414,29 @@ where
     // --- Raw Gram G = XᵀX (d×d) and c = Xᵀy (d×1) via the row-blocked
     //     `gram_xty` prim (RESEARCH Open Q1 — NOT the scaled covariance;
     //     LINEAR-01/02 perf lever shared with LinearRegression). ---
-    let (raw_gram, xty) = gram_xty::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
+    let (gram, xty) = match means {
+        Some(m) => gram_xty_centered::<F>(pool, x_ref, y_ref, m, n_samples, n_features)?,
+        None => gram_xty::<F>(pool, x_ref, y_ref, n_samples, n_features)?,
+    };
 
-    // --- alpha on the Gram DIAGONAL only (D-05 / T-04-05-02). Add `alpha` to
-    //     element [i·n+i]; NEVER to the intercept (the intercept is recovered
-    //     post-solve, outside this penalized system). cubecl 0.10 has no
-    //     in-place device write, so we materialize the small n×n Gram, add α on
-    //     the diagonal, RELEASE the raw-Gram buffer back to the pool (so no
-    //     parallel n² buffer lives), and re-stage the regularized Gram —
-    //     `from_host` recycles the just-released n² byte-size from the free-list
-    //     (D-11 gate 2: no second live n²). ---
-    let mut gram_host = raw_gram.to_host(pool);
-    for i in 0..n_features {
-        let d = host_to_f64(gram_host[i * n_features + i]) + alpha64;
-        gram_host[i * n_features + i] = f64_to_host::<F>(d);
-    }
-    raw_gram.release_into(pool);
-    let gram: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &gram_host);
-
-    // --- Thread the regularized Gram buffer through `out` so the factor reuses
-    //     it in place — no parallel n² allocation (D-11 gate 2). The kernel only
-    //     READS `out` as its working input, so the threaded buffer is consumed
-    //     (released back to the pool) by the call; we clone the handle for `out`
-    //     and keep `gram` as the `a` operand. A non-SPD pivot (near-singular
-    //     Gram) surfaces NotPositiveDefinite → the caller's sklearn-faithful SVD
-    //     retry (Pitfall 4 / T-04-05-01), never NaN coef_. ---
+    // --- Thread the Gram buffer through `out` so the factor reuses it in place
+    //     — no parallel n² allocation (D-11 gate 2). The kernel only READS `out`
+    //     as its working input, so the threaded buffer is consumed (released
+    //     back to the pool) by the call; we clone the handle for `out` and keep
+    //     `gram` as the `a` operand. A non-SPD pivot (near-singular Gram)
+    //     surfaces NotPositiveDefinite → the caller's sklearn-faithful SVD retry
+    //     (Pitfall 4 / T-04-05-01), never NaN coef_. ---
     let gram_out =
         DeviceArray::<ActiveRuntime, F>::from_raw(gram.handle().clone(), n_features * n_features);
-    let coef = cholesky_solve::<F>(pool, &gram, &xty, n_features, 1, Some(gram_out))?;
+    let coef = cholesky_solve_reg::<F>(pool, &gram, &xty, n_features, 1, alpha64, Some(gram_out));
 
     // The Gram buffer was consumed (its cloned handle threaded through `out` and
     // released by the Cholesky solve — so we do NOT release `gram` again here,
-    // avoiding a double-release of the shared allocation).
+    // avoiding a double-release of the shared allocation). `xty` is ours either
+    // way, INCLUDING on the error path that feeds the SVD retry.
     drop(gram);
     xty.release_into(pool);
-    Ok(coef)
+    Ok(coef?)
 }
 
 /// The `solver='svd'` arm: `coef = V·diag(σ/(σ²+α))·Uᵀ·y`, sklearn's
@@ -1165,12 +1572,74 @@ where
     Ok(coef)
 }
 
+/// The `positive=True` arm (`solver='lbfgs'`): the non-negative ridge solve,
+/// on-device wherever the device kernel applies and on the host otherwise.
+///
+/// Both arms run the SAME projected cyclic coordinate descent on the SAME
+/// device-formed Gram — ascending coordinate order, the same closed-form
+/// projected update off the Gram diagonal, and the same
+/// `max|Δw| ≤ tol·max(1, max|w|)` stop. They differ only in where the arithmetic
+/// happens (and, on the device arm, in the summation order of the per-sweep
+/// gradient rebuild). The objective is strictly convex over a box for `α > 0`,
+/// so the constrained minimiser is UNIQUE and the two arms agree to within the
+/// oracle tolerance rather than merely being "both plausible".
+///
+/// The device arm is the point of the split: `gram_xty` has already produced `G`
+/// and `Xᵀy` in device memory, and the whole `O(d²)`-per-sweep solve fits in one
+/// cube (`prims::nnls`), so nothing crosses the bus — where the host arm must
+/// read `d² + d` floats back, solve, and re-upload `coef`. On cpu (where a
+/// `d`-unit barrier-synchronised cube is a pathology, not a parallel launch) and
+/// for `d` above the kernel's cube-dim cap, the host arm still carries the
+/// solve, so no shape loses support.
+#[allow(clippy::too_many_arguments)]
+fn solve_nonnegative<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_ref: &DeviceArray<ActiveRuntime, F>,
+    y_ref: &DeviceArray<ActiveRuntime, F>,
+    means: Option<(
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    )>,
+    n_samples: usize,
+    n_features: usize,
+    alpha64: f64,
+    tol: f64,
+    max_iter: Option<usize>,
+) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if !device_nnls_applicable::<F>(n_features) {
+        // `means` is `None` on this arm by construction (the caller gates the
+        // fused route on the same predicate), so `x_ref` is already centered.
+        let (gram, xty) = host_gram::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
+        let (coef, _sweeps) =
+            ridge_solvers::nonnegative_cd(&gram, &xty, n_features, alpha64, tol, max_iter);
+        return Ok(upload_coef::<F>(pool, &coef));
+    }
+
+    // Fully device-resident: the Gram stays where `gram_xty` wrote it and the
+    // solve reads it in place, so `coef_` is produced without a single host
+    // round-trip. With `means` present the centering is fused into that same
+    // accumulation and `x_ref` is the caller's RAW design.
+    let (gram, xty) = match means {
+        Some(m) => gram_xty_centered::<F>(pool, x_ref, y_ref, m, n_samples, n_features)?,
+        None => gram_xty::<F>(pool, x_ref, y_ref, n_samples, n_features)?,
+    };
+    let coef = ridge_nnls::<F>(pool, &gram, &xty, n_features, alpha64, tol, max_iter);
+    gram.release_into(pool);
+    xty.release_into(pool);
+    Ok(coef?)
+}
+
 /// Form the raw Gram `XᵀX` (`d×d`) and `Xᵀy` (`d`) on-device and read the two
 /// SMALL results back as `f64` for a host solver.
 ///
 /// The `O(n·d)` reduction stays on the device; what crosses to the host is
-/// `d² + d` floats, independent of `n_samples` — which is why `sparse_cg` and
-/// the `positive` arm never touch the design matrix at all.
+/// `d² + d` floats, independent of `n_samples` — which is why `sparse_cg` (and
+/// the `positive` arm's HOST fallback) never touch the design matrix at all.
+/// The `positive` arm's device path does not call this: it solves the Gram
+/// where `gram_xty` left it, with no read-back (see [`solve_nonnegative`]).
 fn host_gram<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x_ref: &DeviceArray<ActiveRuntime, F>,

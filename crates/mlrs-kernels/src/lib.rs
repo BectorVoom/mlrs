@@ -58,6 +58,11 @@ pub mod linear_predict;
 // shape). This file owns its `pub mod` + `pub use` (file-disjoint, single-owner,
 // the distance/self-drop re-export precedent).
 pub mod mutual_reachability;
+// Bound-constrained (non-negative) ridge CD on the Gram — the device arm of
+// `Ridge(positive=True)`. Unlike `coordinate`'s design-matrix CD it needs no
+// per-coordinate launch, so the whole solve is one cube. This file owns its
+// `pub mod` + `pub use` (file-disjoint, single-owner — the `gram` precedent).
+pub mod nnls;
 pub mod reduce;
 // Phase-10 SGD kernels (Wave-0 scaffold plan 10-01 owns this registration; the
 // Wave-1 plan drives them from `prims/sgd.rs` — file-disjoint, parallel-safe).
@@ -80,7 +85,7 @@ pub mod tree;
 pub mod tsne;
 pub mod umap_layout;
 
-pub use cholesky::cholesky_solve;
+pub use cholesky::{cholesky_solve, cholesky_solve_wide, CHOLESKY_WIDE_MAX_DIM};
 // Phase-13 KNN-graph (PRIM-11): direct pairwise distance kernels + per-row
 // index-identity self-drop GATHER. Plan 13-02 owns this re-export (file-disjoint,
 // single-owner) alongside the kernel bodies in `distance.rs`.
@@ -113,6 +118,7 @@ pub use linear_predict::{
     PREDICT_ROWS_PER_BLOCK, PREDICT_SHARED_ELEMS, PREDICT_SHARED_MIN_FEATURES,
 };
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
+pub use nnls::{ridge_intercept, ridge_nnls_cd, NNLS_MAX_DIM};
 // Phase-15 HDBSCAN mutual-reachability GATHER (HDBS-01, plan 15-05): launched by
 // the feature-metric/dense-cosine device front-end via the backend host wrapper
 // in `prims/mutual_reachability.rs`. Re-exported under an explicit alias because

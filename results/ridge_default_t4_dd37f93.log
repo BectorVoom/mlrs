@@ -1,0 +1,294 @@
+========================================================================
+mlrs Ridge() [positive=False, solver=cholesky] CUDA probe
+utc      : 2026-08-02T11:28:53Z
+commit   : dd37f93e421280ca018cb2994453bae85e4983a0
+           dd37f93 Cover the singular-Gram retry on the fused route
+gpu      : Tesla T4, 15360 MiB, 580.82.07
+cpu      : Model name:                              Intel(R) Xeon(R) CPU @ 2.00GHz (2 threads)
+========================================================================
+
+------------------------------------------------------------------------
+A. correctness on the T4 (wide Cholesky arm, fused default path)
+------------------------------------------------------------------------
+    Finished `release` profile [optimized] target(s) in 0.32s
+     Running tests/cholesky_test.rs (target/release/deps/cholesky_test-3fcfd87f4df33d53)
+
+running 11 tests
+test cholesky_alpha_matches_a_host_regularized_matrix ... ok
+test cholesky_alpha_zero_is_bitwise_the_plain_solve ... ok
+cholesky f64 backend=cuda: SKIPPED (no f64 support on this adapter)
+test cholesky_factor_reconstructs_f64 ... ok
+cholesky non-SPD backend=cuda: rejected at pivot 0 (value=-4e0) — typed error, not a NaN factor
+test cholesky_rejects_non_spd ... ok
+test cholesky_factor_reconstructs_f32 ... ok
+cholesky f64 backend=cuda: SKIPPED (no f64 support on this adapter)
+test cholesky_solves_spd_system_f64 ... ok
+test cholesky_solves_spd_system_f32 ... ok
+test cholesky_wide_arm_rejects_non_spd ... ok
+test cholesky_wide_and_narrow_arms_agree ... ok
+test fixture_loads ... ok
+cholesky wide n=100 backend=cuda: rel=1.1042099702516777e-8
+cholesky wide n=256 backend=cuda: rel=1.1750786811157236e-8
+test cholesky_wide_arm_solves_above_max_dim ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+
+   Compiling mlrs-algos v0.1.0 (/content/mlrs/crates/mlrs-algos)
+    Finished `release` profile [optimized] target(s) in 2m 38s
+     Running tests/ridge_host_fit_test.rs (target/release/deps/ridge_host_fit_test-055b5cefd249d52c)
+
+running 6 tests
+test fit_from_host_slice_rejects_an_inapplicable_configuration ... ok
+test cholesky_host_and_device_arms_agree ... ok
+test fit_from_host_slice_rejects_bad_geometry ... ok
+test host_and_device_arms_agree ... ok
+test ridge_host_fit_matches_sklearn_f64 ... ok
+test ridge_host_fit_matches_sklearn_f32 ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/ridge_params_test.rs (target/release/deps/ridge_params_test-dde8cfd26e3b449e)
+
+running 12 tests
+test defaults_equal_full_surface ... ok
+test ridge_builder_rejects_invalid_hyperparameters ... ok
+ridge max_iter f64 backend=cuda: SKIPPED (no f64 support)
+test ridge_max_iter_caps_the_iteration_f64 ... ok
+test ridge_copy_x_is_inert_f32 ... ok
+ridge params f64 backend=cuda: SKIPPED (no f64 support on this adapter)
+test ridge_params_all_cases_f64 ... ok
+ridge random_state f64 backend=cuda: SKIPPED (no f64 support)
+test ridge_random_state_reproducible_f64 ... ok
+ridge bad-sw f64 backend=cuda: SKIPPED (no f64 support)
+test ridge_rejects_invalid_sample_weight_f64 ... ok
+test ridge_solver_string_parse ... ok
+test ridge_svd_gram_eig_matches_cholesky_f32 ... ok
+ridge svd-large f64 backend=cuda: SKIPPED (no f64 support)
+test ridge_svd_gram_eig_matches_cholesky_f64 ... ok
+ridge unit-sw f64 backend=cuda: SKIPPED (no f64 support)
+test ridge_unit_sample_weight_matches_unweighted_f64 ... ok
+test ridge_params_all_cases_f32 ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.61s
+
+     Running tests/ridge_test.rs (target/release/deps/ridge_test-9a6d68add0911623)
+
+running 9 tests
+test defaults_equal ... ok
+ridge f64 backend=cuda: SKIPPED (no f64 support on this adapter)
+test ridge_coef_intercept_alpha_sweep_f64 ... ok
+test ridge_coef_intercept_alpha_sweep_f32 ... ok
+ridge default d=100: coef rel=1.3214699212366023e-5, intercept 3.6509902477264404 vs 3.651000738143921
+ridge default d=128: coef rel=1.5196899134242116e-5, intercept 3.507998466491699 vs 3.508009910583496
+test ridge_device_intercept_matches_host_f32 ... ok
+ridge default d=256: coef rel=2.711861703037081e-5, intercept 2.829285144805908 vs 2.82919979095459
+test ridge_default_fit_above_cholesky_max_dim_f32 ... ok
+ridge intercept f64 backend=cuda: SKIPPED (no f64 support on this adapter)
+test ridge_intercept_not_penalized_f64 ... ok
+test ridge_intercept_not_penalized_f32 ... ok
+test ridge_predict_consistency_f32 ... ok
+test ridge_singular_gram_falls_back_to_svd_on_the_fused_route ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.84s
+
+
+------------------------------------------------------------------------
+B. whole-fit ladder - default dispatch
+------------------------------------------------------------------------
+    Finished `release` profile [optimized] target(s) in 0.24s
+     Running tests/ridge_default_perf_test.rs (target/release/deps/ridge_default_perf_test-dccb8435d25adeb1)
+
+running 1 test
+backend=cuda reps=9 solver=cholesky (positive=False)
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.0746     0.0000     0.0808 |   host
+    10000    16 |     1.2131     0.0000     1.2018 |   host
+    10000    64 |     4.4941     3.2341     1.6328 | device
+   100000    16 |     8.3502     8.1178     0.8605 | device
+   100000    64 |    29.0372    37.4662     3.6846 | device
+   500000    16 |    38.0479    60.8707     4.5733 | device
+   100000   128 |    61.3429    84.6094     8.6179 | device
+   100000   256 |   321.5314   308.5976    17.7541 | device
+
+backend=cuda reps=9 — forced-arm A/B
+        n     d |   host (ms) device (ms) |   speedup
+     1000     8 |      0.0780      0.4000 |     0.20x
+    10000    16 |      1.1019      0.9558 |     1.15x
+    10000    64 |      6.3730      4.4344 |     1.44x
+   100000    16 |      7.5340      6.0069 |     1.25x
+   100000    64 |     58.9336     30.7443 |     1.92x
+   500000    16 |     35.7757     38.9240 |     0.92x
+   100000   128 |    206.3164     59.1593 |     3.49x
+   100000   256 |    785.8121    312.9948 |     2.51x
+test ridge_default_perf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.40s
+
+
+------------------------------------------------------------------------
+C. per-phase attribution (RIDGE_PROFILE=1, drained laps)
+------------------------------------------------------------------------
+    Finished `release` profile [optimized] target(s) in 0.24s
+     Running tests/ridge_default_perf_test.rs (target/release/deps/ridge_default_perf_test-dccb8435d25adeb1)
+
+running 1 test
+backend=cuda reps=1 solver=cholesky (positive=False)
+        n     d |   fit (ms)     upload    compute |    arm
+RIDGE_PROFILE n=1000 d=8 solver=cholesky (host): preprocess=0.0001s solve=0.0000s
+RIDGE_PROFILE n=1000 d=8 solver=cholesky (host): preprocess=0.0000s solve=0.0000s
+RIDGE_PROFILE n=1000 d=8 solver=cholesky (host): preprocess=0.0000s solve=0.0000s
+     1000     8 |     0.1489     0.0000     0.1234 |   host
+RIDGE_PROFILE n=10000 d=16 solver=cholesky (host): preprocess=0.0011s solve=0.0000s
+RIDGE_PROFILE n=10000 d=16 solver=cholesky (host): preprocess=0.0011s solve=0.0000s
+    10000    16 |     1.4193     0.0000     1.3777 |   host
+RIDGE_PROFILE n=10000 d=64 solver=cholesky: preprocess=0.2307s solve=0.6172s tail=0.0000s
+RIDGE_PROFILE n=10000 d=64 solver=cholesky: preprocess=0.0003s solve=0.0015s tail=0.0000s
+    10000    64 |   905.8210     4.7525     1.8885 | device
+RIDGE_PROFILE n=100000 d=16 solver=cholesky: preprocess=0.0020s solve=0.3991s tail=0.0000s
+RIDGE_PROFILE n=100000 d=16 solver=cholesky: preprocess=0.0002s solve=0.0005s tail=0.0000s
+   100000    16 |   411.7570     9.3318     0.7773 | device
+RIDGE_PROFILE n=100000 d=64 solver=cholesky: preprocess=0.0066s solve=0.0020s tail=0.0000s
+RIDGE_PROFILE n=100000 d=64 solver=cholesky: preprocess=0.0002s solve=0.0019s tail=0.0000s
+   100000    64 |    81.2757    49.6418     2.2597 | device
+RIDGE_PROFILE n=500000 d=16 solver=cholesky: preprocess=0.0084s solve=0.0025s tail=0.0000s
+RIDGE_PROFILE n=500000 d=16 solver=cholesky: preprocess=0.0009s solve=0.0025s tail=0.0000s
+   500000    16 |    98.3759    86.3351     3.6131 | device
+RIDGE_PROFILE n=100000 d=128 solver=cholesky: preprocess=0.0122s solve=0.1413s tail=0.0000s
+RIDGE_PROFILE n=100000 d=128 solver=cholesky: preprocess=0.0087s solve=0.0039s tail=0.0000s
+   100000   128 |   245.2495   100.9913    12.7913 | device
+RIDGE_PROFILE n=100000 d=256 solver=cholesky: preprocess=0.0297s solve=0.1458s tail=0.0000s
+RIDGE_PROFILE n=100000 d=256 solver=cholesky: preprocess=0.0048s solve=0.0133s tail=0.0000s
+   100000   256 |   459.8458   308.0273    18.3055 | device
+
+backend=cuda reps=1 — forced-arm A/B
+        n     d |   host (ms) device (ms) |   speedup
+RIDGE_PROFILE n=1000 d=8 solver=cholesky: preprocess=0.0003s solve=0.2623s tail=0.0000s
+RIDGE_PROFILE n=1000 d=8 solver=cholesky (host): preprocess=0.0001s solve=0.0000s
+RIDGE_PROFILE n=1000 d=8 solver=cholesky: preprocess=0.0001s solve=0.0003s tail=0.0000s
+     1000     8 |      0.1349      0.5403 |     0.25x
+RIDGE_PROFILE n=10000 d=16 solver=cholesky (host): preprocess=0.0010s solve=0.0000s
+RIDGE_PROFILE n=10000 d=16 solver=cholesky: preprocess=0.0003s solve=0.0004s tail=0.0000s
+    10000    16 |      1.3588      1.1347 |     1.20x
+RIDGE_PROFILE n=10000 d=64 solver=cholesky (host): preprocess=0.0064s solve=0.0001s
+RIDGE_PROFILE n=10000 d=64 solver=cholesky: preprocess=0.0007s solve=0.0026s tail=0.0000s
+    10000    64 |      7.1738      4.4283 |     1.62x
+RIDGE_PROFILE n=100000 d=16 solver=cholesky (host): preprocess=0.0076s solve=0.0000s
+RIDGE_PROFILE n=100000 d=16 solver=cholesky: preprocess=0.0017s solve=0.0008s tail=0.0000s
+   100000    16 |      7.9444      6.6393 |     1.20x
+RIDGE_PROFILE n=100000 d=64 solver=cholesky (host): preprocess=0.0582s solve=0.0001s
+RIDGE_PROFILE n=100000 d=64 solver=cholesky: preprocess=0.0070s solve=0.0035s tail=0.0000s
+   100000    64 |     58.5323     44.4687 |     1.32x
+RIDGE_PROFILE n=500000 d=16 solver=cholesky (host): preprocess=0.0371s solve=0.0000s
+RIDGE_PROFILE n=500000 d=16 solver=cholesky: preprocess=0.0129s solve=0.0024s tail=0.0000s
+   500000    16 |     37.3454     59.2279 |     0.63x
+RIDGE_PROFILE n=100000 d=128 solver=cholesky (host): preprocess=0.2318s solve=0.0007s
+RIDGE_PROFILE n=100000 d=128 solver=cholesky: preprocess=0.0122s solve=0.0038s tail=0.0000s
+   100000   128 |    232.8068    166.7049 |     1.40x
+RIDGE_PROFILE n=100000 d=256 solver=cholesky (host): preprocess=1.1596s solve=0.0047s
+RIDGE_PROFILE n=100000 d=256 solver=cholesky: preprocess=0.0296s solve=0.0133s tail=0.0000s
+   100000   256 |   1165.1436    363.8425 |     3.20x
+test ridge_default_perf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.77s
+
+
+------------------------------------------------------------------------
+D1. register-tiled Gram forced
+------------------------------------------------------------------------
+    Finished `release` profile [optimized] target(s) in 0.33s
+     Running tests/ridge_default_perf_test.rs (target/release/deps/ridge_default_perf_test-dccb8435d25adeb1)
+
+running 1 test
+backend=cuda reps=9 solver=cholesky (positive=False)
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.0713     0.0000     0.1193 |   host
+    10000    16 |     1.5435     0.0000     2.9667 |   host
+    10000    64 |     5.8356     2.9747     3.0923 | device
+   100000    16 |     8.7761     7.4679     1.5287 | device
+   100000    64 |    30.7873    36.5014     4.9706 | device
+   500000    16 |    39.3954    64.5097     8.4446 | device
+   100000   128 |   112.3031   103.0252    16.5710 | device
+   100000   256 |   340.8303   307.7051    39.9473 | device
+
+backend=cuda reps=9 — forced-arm A/B
+        n     d |   host (ms) device (ms) |   speedup
+     1000     8 |      0.0804      0.4921 |     0.16x
+    10000    16 |      1.3095      1.0496 |     1.25x
+    10000    64 |      6.5211      4.7724 |     1.37x
+   100000    16 |      7.4744      6.3672 |     1.17x
+   100000    64 |     58.2895     32.3049 |     1.80x
+   500000    16 |     35.2721     40.7595 |     0.87x
+   100000   128 |    313.1506     65.3672 |     4.79x
+   100000   256 |    758.5496    343.1047 |     2.21x
+test ridge_default_perf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.22s
+
+
+------------------------------------------------------------------------
+D2. blocked Gram forced
+------------------------------------------------------------------------
+    Finished `release` profile [optimized] target(s) in 0.34s
+     Running tests/ridge_default_perf_test.rs (target/release/deps/ridge_default_perf_test-dccb8435d25adeb1)
+
+running 1 test
+backend=cuda reps=9 solver=cholesky (positive=False)
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.0694     0.0000     0.0691 |   host
+    10000    16 |     0.9874     0.0000     2.9805 |   host
+    10000    64 |     5.0121     2.9203     2.2546 | device
+   100000    16 |     8.3815     7.6922     1.0783 | device
+   100000    64 |    32.7835    39.9738     5.8577 | device
+   500000    16 |    38.8243    60.1777     7.0591 | device
+   100000   128 |   119.7602   103.8598    22.4967 | device
+   100000   256 |   383.7450   306.4202    81.2625 | device
+
+backend=cuda reps=9 — forced-arm A/B
+        n     d |   host (ms) device (ms) |   speedup
+     1000     8 |      0.0848      0.2867 |     0.30x
+    10000    16 |      1.2204      0.7836 |     1.56x
+    10000    64 |      6.4238      3.9288 |     1.64x
+   100000    16 |      7.3687      5.7897 |     1.27x
+   100000    64 |     58.9193     30.0763 |     1.96x
+   500000    16 |     35.4943     38.1213 |     0.93x
+   100000   128 |    315.1775     69.5794 |     4.53x
+   100000   256 |    784.0700    411.8281 |     1.90x
+test ridge_default_perf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.77s
+
+
+------------------------------------------------------------------------
+E. wide Cholesky arm forced at every order
+------------------------------------------------------------------------
+    Finished `release` profile [optimized] target(s) in 0.35s
+     Running tests/ridge_default_perf_test.rs (target/release/deps/ridge_default_perf_test-dccb8435d25adeb1)
+
+running 1 test
+backend=cuda reps=9 solver=cholesky (positive=False)
+        n     d |   fit (ms)     upload    compute |    arm
+     1000     8 |     0.1033     0.0000     0.5534 |   host
+    10000    16 |     1.3773     0.0000     0.9929 |   host
+    10000    64 |     3.3141     3.0975     0.3422 | device
+   100000    16 |     8.5861     7.7359     0.8737 | device
+   100000    64 |    28.1065    39.0420     1.9147 | device
+   500000    16 |    38.8106    61.0042     5.0769 | device
+   100000   128 |    81.7198    76.7632     8.9940 | device
+   100000   256 |   313.6334   306.1617    19.0265 | device
+
+backend=cuda reps=9 — forced-arm A/B
+        n     d |   host (ms) device (ms) |   speedup
+     1000     8 |      0.0781      0.3836 |     0.20x
+    10000    16 |      1.2089      0.8673 |     1.39x
+    10000    64 |      6.3847      2.3727 |     2.69x
+   100000    16 |      7.8372      5.9144 |     1.33x
+   100000    64 |     58.5718     29.6306 |     1.98x
+   500000    16 |     40.3278     38.5810 |     1.05x
+   100000   128 |    201.4607     56.0772 |     3.59x
+   100000   256 |    756.2160    307.7840 |     2.46x
+test ridge_default_perf ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.25s
+
+
+MEASURE_COMPLETE
