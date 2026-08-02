@@ -76,16 +76,23 @@ impl<R: cubecl::Runtime, F: Pod> DeviceArray<R, F> {
         // memory before the transfer, which lets the driver DMA straight out of
         // it instead of bouncing through its own internal pinned buffer.
         //
-        // Off by default, and deliberately so: it is an extra full host copy
-        // bought against a faster transfer, so it only pays where the transfer
-        // is the larger of the two. Measured on the local wgpu adapter at
-        // 102 MB it is a 1.4× win (102.2 ms → 72.9 ms), but that adapter shares
-        // physical memory with the host and is no guide to a discrete GPU's
-        // PCIe path. It also has a CLIFF: `cubecl-cuda`'s `reserve_cpu` refuses
-        // pinned memory above 100 MB unless explicitly marked, so a 102.4 MB
-        // design (the `n=100 000, d=256` rung) would allocate and ZERO a second
-        // plain buffer and copy into it for no benefit at all — strictly worse.
-        // Left as a knob until measured per backend, per size.
+        // Off by default, and MEASURED to belong that way on cuda. It buys a
+        // faster transfer with an extra full host copy, so it only pays when
+        // the transfer dominates that copy — and on a Colab T4 it does not:
+        //
+        // | 102.4 MB          | ms    | GB/s |
+        // |-------------------|-------|------|
+        // | transfer alone    | 266.1 | 0.38 |
+        // | pinned + transfer | 197.7 | 0.51 |
+        //
+        // The transfer half genuinely improves 1.35×, but the extra host copy
+        // that buys it costs ~72 ms (host memcpy on that VM runs at 1.39 GB/s),
+        // which more than eats the gain. End to end the whole `d=256` fit went
+        // 316.1 ms → 336.3 ms with this on — a REGRESSION, exactly the way the
+        // isolated column said it would not. Trust the end-to-end number.
+        //
+        // `cubecl-cuda`'s `reserve_cpu` also refuses pinned memory above 100 MB
+        // unless explicitly marked, so the 102.4 MB rung may not even be pinned.
         if crate::abflag::is_on("MLRS_UPLOAD_PINNED") {
             pool.client().staging(std::iter::once(&mut bytes), false);
         }

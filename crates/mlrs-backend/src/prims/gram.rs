@@ -380,9 +380,24 @@ const BLOCKED_MAX_DD: usize = 256 * 256;
 /// | 128 | 3.63 | 5.06 | 4.03 | **wins** |
 /// | 256 | 6.28–8.63 | | | **wins** |
 ///
-/// Crossover between 32 and 64, hence `d = 64`. Like [`TILED_MIN_DD`] this is
-/// an ADAPTER property and must be re-swept per backend; `LR_GRAM_SHARED_TILED=1`
-/// forces the arm at any size for exactly that purpose.
+/// Crossover between 32 and 64, hence `d = 64`.
+///
+/// **Confirmed on a Colab Tesla T4** (same probe, min-of-9) — independently,
+/// and by a far larger margin than the wgpu sweep suggested:
+///
+/// | `d` | blocked | shared-staged | |
+/// |---|---|---|---|
+/// | 16 | 0.556 ms | 0.698 ms | 0.80× |
+/// | 32 | 1.178 ms | 1.176 ms | 1.00× |
+/// | 64 | 3.446 ms | 0.738 ms | **4.67×** |
+/// | 128 | 7.892 ms | 1.446 ms | **5.46×** |
+/// | 256 | 56.367 ms | 4.056 ms | **13.90×** |
+///
+/// The crossover lands between 32 and 64 on BOTH adapters, so this threshold is
+/// measured on two independent devices rather than transferred from one. (The
+/// register tile's crossover did NOT transfer that cleanly, which is why each
+/// arm gets its own swept constant.) `LR_GRAM_SHARED_TILED=1` forces the arm at
+/// any size for re-sweeping on a new backend.
 #[cfg_attr(feature = "cpu", allow(dead_code))]
 const SHARED_TILED_MIN_DD: usize = 64 * 64;
 
