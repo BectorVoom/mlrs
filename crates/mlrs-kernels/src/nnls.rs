@@ -232,3 +232,42 @@ pub fn ridge_nnls_cd<F: Float + CubeElement>(
         w_out[i as usize] = w_sh[i as usize];
     }
 }
+
+/// `intercept = ȳ − x̄·coef`, computed ON-DEVICE so the `positive` fit needs no
+/// host round-trip at all.
+///
+/// ## Why one unit, and why a serial ascending loop
+/// This is `d ≤ NNLS_MAX_DIM` multiply-adds — 256 at the widest shape the
+/// device solve accepts — so there is nothing to parallelize that would beat
+/// the barriers a tree reduction would cost. Running it on a single unit in
+/// ASCENDING `c` also reproduces the host twin's summation order exactly, which
+/// is the only thing keeping the two arms comparable: the remaining difference
+/// between them is purely the accumulator width (`F` here against the host's
+/// `f64`), not a re-association.
+///
+/// That width difference is real and is why the caller keeps both arms: the
+/// intercept is oracle-checked against scikit-learn at a strict `1e-5`, and an
+/// `f32` dot over 256 terms whose partial sums cancel can drift further than an
+/// `f64` one. `mlrs_algos::linear::ridge` gates this behind
+/// `MLRS_RIDGE_HOST_INTERCEPT` for exactly that reason.
+///
+/// `out` is a length-1 buffer. `fit_intercept = false` is handled by the caller
+/// (it never launches this).
+#[cube(launch)]
+pub fn ridge_intercept<F: Float + CubeElement>(
+    xmean: &Array<F>,
+    ymean: &Array<F>,
+    coef: &Array<F>,
+    out: &mut Array<F>,
+    d: u32,
+) {
+    if UNIT_POS == 0 {
+        let mut dot = F::new(0.0_f32);
+        let mut c = 0u32;
+        while c < d {
+            dot += xmean[c as usize] * coef[c as usize];
+            c += 1u32;
+        }
+        out[0] = ymean[0] - dot;
+    }
+}

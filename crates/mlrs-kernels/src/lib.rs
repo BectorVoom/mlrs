@@ -118,7 +118,7 @@ pub use linear_predict::{
     PREDICT_ROWS_PER_BLOCK, PREDICT_SHARED_ELEMS, PREDICT_SHARED_MIN_FEATURES,
 };
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
-pub use nnls::{ridge_nnls_cd, NNLS_MAX_DIM};
+pub use nnls::{ridge_intercept, ridge_nnls_cd, NNLS_MAX_DIM};
 // Phase-15 HDBSCAN mutual-reachability GATHER (HDBS-01, plan 15-05): launched by
 // the feature-metric/dense-cosine device front-end via the backend host wrapper
 // in `prims/mutual_reachability.rs`. Re-exported under an explicit alias because

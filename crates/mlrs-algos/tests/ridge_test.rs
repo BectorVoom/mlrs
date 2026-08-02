@@ -318,3 +318,73 @@ fn defaults_equal() {
         "Ridge::new() and builder().build()? must agree on hyperparameters (BLDR-01)"
     );
 }
+
+/// The ON-DEVICE intercept must agree with the host twin it replaced.
+///
+/// `Ridge(positive=True)`'s fused arm now finishes entirely on the device:
+/// `ridge_intercept_device` computes `ȳ − x̄·coef` where the means and `coef`
+/// already live, instead of reading all three back to do the dot in `f64` and
+/// uploading one scalar. The two arms differ in exactly one respect — the
+/// kernel accumulates in `F`, the host in `f64` — so this pins that difference
+/// to rounding rather than letting it become a silent behaviour change.
+///
+/// The bound is relative to the operand magnitude, not to the intercept: the
+/// intercept is a DIFFERENCE (`ȳ` minus a `d`-term dot), so it can sit near
+/// zero while its inputs do not, and a bound relative to the result alone would
+/// be unsatisfiable by any correct implementation. `f32` carries ~7 decimal
+/// digits, so `1e-5 · max(|ȳ|, |x̄·coef|)` is a rounding-scale bound that a real
+/// defect (a dropped term, a wrong index, a missing `ȳ`) blows through.
+#[test]
+fn ridge_device_intercept_matches_host_f32() {
+    let widths: &[usize] = &[4, 17, 64, 200];
+    for &d in widths {
+        let n = 500usize;
+        // Deliberately large, per-column-varying means: centering is then a real
+        // cancellation, which is the regime where an f32 dot would drift if the
+        // implementation were doing something other than the host's summation.
+        let x: Vec<f32> = (0..n * d)
+            .map(|i| ((i % 23) as f32) * 0.05 - 0.5 + 4.0 + (i % d) as f32 * 0.25)
+            .collect();
+        let y: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.1 + 7.0).collect();
+
+        let fit_one = |host_arm: bool| -> f64 {
+            let _g = if host_arm {
+                mlrs_backend::abflag::force("MLRS_RIDGE_HOST_INTERCEPT", "1")
+            } else {
+                mlrs_backend::abflag::clear("MLRS_RIDGE_HOST_INTERCEPT")
+            };
+            let client = runtime::active_client();
+            let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+            let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+            let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+            let fitted = Ridge::<f32>::builder()
+                .alpha(1.0)
+                .fit_intercept(true)
+                .positive(true)
+                .build::<f32>()
+                .expect("build")
+                .fit(&mut pool, &xd, Some(&yd), (n, d))
+                .expect("fit");
+            fitted.intercept(&pool) as f64
+        };
+
+        let dev = fit_one(false);
+        let host = fit_one(true);
+        assert!(
+            dev.is_finite() && host.is_finite(),
+            "non-finite intercept at d={d}: device={dev} host={host}"
+        );
+
+        // Scale: the dot's magnitude, reconstructed from the operands rather
+        // than from the (possibly cancelling) result.
+        let y_bar: f64 = y.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+        let scale = y_bar.abs().max(host.abs()).max(1.0);
+        let diff = (dev - host).abs();
+        assert!(
+            diff <= 1e-5 * scale,
+            "device intercept drifted from host at d={d}: device={dev} host={host} \
+             diff={diff} > {}",
+            1e-5 * scale
+        );
+    }
+}

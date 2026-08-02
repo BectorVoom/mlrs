@@ -175,7 +175,7 @@ use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::gram::{column_means, gram_xty, gram_xty_centered};
 use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable};
 use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
-use mlrs_backend::prims::nnls::{device_nnls_applicable, ridge_nnls};
+use mlrs_backend::prims::nnls::{device_nnls_applicable, ridge_intercept_device, ridge_nnls};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
@@ -614,32 +614,54 @@ where
             yc.release_into(pool);
         }
 
-        // The fused arm left the means on the device so the Gram and the solve
-        // could be queued behind the mean pass without a synchronizing
-        // read-back; `d + 1` floats cross here, once, where the intercept needs
-        // them anyway.
-        if let Some((xm, ym)) = dev_means {
-            x_mean = xm.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-            y_mean = host_to_f64(ym.to_host(pool)[0]);
-            xm.release_into(pool);
-            ym.release_into(pool);
-        }
-
         // --- 3. intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 (D-05). α
         //        is NOT applied here — the intercept is unpenalized — and NEITHER
         //        is the `positive` bound (sklearn constrains only `coef_`). ---
-        let coef_host = coef.to_host(pool);
-        let intercept = if self.fit_intercept {
-            let mut dot = 0.0f64;
-            for c in 0..n_features {
-                dot += x_mean[c] * host_to_f64(coef_host[c]);
-            }
-            y_mean - dot
+        //
+        // TWO ARMS. The fused (`positive`) route leaves `x̄`/`ȳ` on the device
+        // and the solve leaves `coef` there, so every operand of this dot is
+        // already resident: `ridge_intercept_device` finishes the fit without a
+        // single host round-trip. The host arm reads `x̄`, `ȳ` and `coef` back —
+        // three BLOCKING read-backs — to do the same dot in `f64` and upload one
+        // scalar.
+        //
+        // The device arm is the default because it is what "device-resident
+        // fit" should mean, but the host arm is NOT vestigial: it is the only
+        // one available to the non-fused solvers (whose means were computed on
+        // the host by `preprocess`), and it accumulates in `f64` where the
+        // kernel accumulates in `F`. `MLRS_RIDGE_HOST_INTERCEPT=1` forces it
+        // anywhere, which is how the two are A/B'd for both speed and drift.
+        let device_intercept = self.fit_intercept
+            && dev_means.is_some()
+            && !mlrs_backend::abflag::is_on("MLRS_RIDGE_HOST_INTERCEPT");
+
+        let intercept_dev: DeviceArray<ActiveRuntime, F> = if device_intercept {
+            let (xm, ym) = dev_means.expect("device_intercept implies dev_means");
+            let out = ridge_intercept_device::<F>(pool, &xm, &ym, &coef, n_features)?;
+            xm.release_into(pool);
+            ym.release_into(pool);
+            out
         } else {
-            0.0
+            // The fused arm's means still live on the device here; `d + 1`
+            // floats cross once, where this arm's dot needs them anyway.
+            if let Some((xm, ym)) = dev_means {
+                x_mean = xm.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+                y_mean = host_to_f64(ym.to_host(pool)[0]);
+                xm.release_into(pool);
+                ym.release_into(pool);
+            }
+            let coef_host = coef.to_host(pool);
+            let intercept = if self.fit_intercept {
+                let mut dot = 0.0f64;
+                for c in 0..n_features {
+                    dot += x_mean[c] * host_to_f64(coef_host[c]);
+                }
+                y_mean - dot
+            } else {
+                0.0
+            };
+            DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)])
         };
-        let intercept_dev: DeviceArray<ActiveRuntime, F> =
-            DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)]);
 
         if profile {
             // `tail` is the intercept recovery: three blocking read-backs

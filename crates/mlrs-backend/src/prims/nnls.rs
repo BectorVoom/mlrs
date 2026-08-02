@@ -25,7 +25,7 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use mlrs_core::{f64_to_host, PrimError};
-use mlrs_kernels::{ridge_nnls_cd, NNLS_MAX_DIM};
+use mlrs_kernels::{ridge_intercept, ridge_nnls_cd, NNLS_MAX_DIM};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
@@ -168,4 +168,69 @@ fn validate_geometry(gram_len: usize, xty_len: usize, d: usize) -> Result<(), Pr
         });
     }
     Ok(())
+}
+
+/// `intercept = ȳ − x̄·coef` on-device, returning the length-1 device buffer.
+///
+/// The last host round-trip in the `positive` fit. Before this, recovering the
+/// intercept read `x̄`, `ȳ` and `coef` back (three BLOCKING read-backs) to do a
+/// `d`-term dot on the CPU and upload the single scalar again — four
+/// synchronisation points to produce one number from operands that were all
+/// already resident.
+///
+/// Geometry is validated before the launch (ASVS V5): `xmean.len() == coef.len()
+/// == d`, `ymean.len() == 1`, `d` non-zero and within the kernel's cap.
+///
+/// See [`mlrs_kernels::ridge_intercept`] for why this runs on a single unit,
+/// and for the accumulator-width caveat that keeps the host twin alive.
+pub fn ridge_intercept_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    xmean: &DeviceArray<ActiveRuntime, F>,
+    ymean: &DeviceArray<ActiveRuntime, F>,
+    coef: &DeviceArray<ActiveRuntime, F>,
+    d: usize,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if d == 0 || d > NNLS_MAX_DIM as usize || xmean.len() != d || coef.len() != d {
+        return Err(PrimError::ShapeMismatch {
+            operand: "ridge_intercept.xmean",
+            rows: d,
+            cols: 1,
+            len: xmean.len(),
+        });
+    }
+    if ymean.len() != 1 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "ridge_intercept.ymean",
+            rows: 1,
+            cols: 1,
+            len: ymean.len(),
+        });
+    }
+
+    let elem = size_of::<F>();
+    let out = pool.acquire(elem);
+    let client = pool.client().clone();
+
+    // SAFETY: lengths are the geometry validated immediately above; the kernel
+    // walks `c < d` only and writes a single slot.
+    let xm = unsafe { ArrayArg::from_raw_parts(xmean.handle().clone(), d) };
+    let ym = unsafe { ArrayArg::from_raw_parts(ymean.handle().clone(), 1) };
+    let cf = unsafe { ArrayArg::from_raw_parts(coef.handle().clone(), d) };
+    let ov = unsafe { ArrayArg::from_raw_parts(out.clone(), 1) };
+
+    ridge_intercept::launch::<F, ActiveRuntime>(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        CubeDim { x: 1, y: 1, z: 1 },
+        xm,
+        ym,
+        cf,
+        ov,
+        d as u32,
+    );
+
+    Ok(DeviceArray::from_raw(out, 1))
 }
