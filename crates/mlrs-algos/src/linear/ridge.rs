@@ -469,6 +469,18 @@ where
         // `gram_xty`/`cholesky_solve` pins each phase's lap to ITS OWN kernels
         // rather than bleeding into the next phase's).
         let profile = std::env::var("RIDGE_PROFILE").is_ok();
+        // A lap only means something if it ENDS with a real blocking read-back:
+        // `client.sync()` returns a future, so an undrained lap measures enqueue
+        // time and silently bleeds into whatever readback comes next
+        // (RIDGE-POS-PERF). This one-element array is read after each phase to
+        // pin every lap to its own kernels. Allocated only when profiling, and
+        // the drains forbid cross-phase overlap, so a profiled TOTAL runs a
+        // little high — the split is what this is for, not the total.
+        let probe: Option<DeviceArray<ActiveRuntime, F>> = if profile {
+            Some(DeviceArray::from_host(pool, &[f64_to_host::<F>(1.0)]))
+        } else {
+            None
+        };
         let lap0 = std::time::Instant::now();
 
         // --- 1. Centering + (for the non-SAG solvers) the `√w` row rescale.
@@ -507,6 +519,7 @@ where
         };
         let x_ref = x_owned.as_ref().unwrap_or(x);
         let y_ref = y_owned.as_ref().unwrap_or(y);
+        drain_profile_probe::<F>(pool, &probe);
         let t_center = if profile { lap0.elapsed().as_secs_f64() } else { 0.0 };
 
         // --- 2. Solve. Each arm returns the device-resident `coef_`, the
@@ -590,7 +603,9 @@ where
                 (upload_coef::<F>(pool, &coef), Some(epochs), resolved)
             }
         };
+        drain_profile_probe::<F>(pool, &probe);
         let t_solve = if profile { lap1.elapsed().as_secs_f64() } else { 0.0 };
+        let lap2 = std::time::Instant::now();
 
         if let Some(xc) = x_owned {
             xc.release_into(pool);
@@ -627,11 +642,18 @@ where
             DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)]);
 
         if profile {
+            // `tail` is the intercept recovery: three blocking read-backs
+            // (x_mean, y_mean, coef) plus the scalar upload. It was noise when
+            // the Gram cost 21 ms; it is not noise now that the Gram costs 4.
+            let t_tail = lap2.elapsed().as_secs_f64();
             eprintln!(
                 "RIDGE_PROFILE n={n_samples} d={n_features} solver={}: \
-                 preprocess={t_center:.4}s solve={t_solve:.4}s",
+                 preprocess={t_center:.4}s solve={t_solve:.4}s tail={t_tail:.4}s",
                 solver_used.name()
             );
+        }
+        if let Some(p) = probe {
+            p.release_into(pool);
         }
 
         Ok(Ridge {
@@ -804,6 +826,23 @@ where
             predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })
+    }
+}
+
+
+/// Drain the device queue for [`RIDGE_PROFILE`] lap attribution.
+///
+/// A no-op when profiling is off. See the call site for why `client.sync()`
+/// cannot be used here.
+fn drain_profile_probe<F>(
+    pool: &BufferPool<ActiveRuntime>,
+    probe: &Option<DeviceArray<ActiveRuntime, F>>,
+) where
+    F: Float + CubeElement + Pod,
+{
+    if let Some(p) = probe {
+        let v = p.to_host(pool);
+        debug_assert!(!v.is_empty());
     }
 }
 
