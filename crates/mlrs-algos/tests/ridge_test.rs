@@ -495,3 +495,59 @@ fn ridge_default_fit_above_cholesky_max_dim_f32() {
         println!("ridge default d={d}: coef rel={rel:e}, intercept {dev_int} vs {host_int}");
     }
 }
+
+/// RIDGE-DEFAULT-CUDA: the singular-Gram retry still fires ON THE FUSED ROUTE.
+///
+/// sklearn's `_ridge_regression` wraps `_solve_cholesky` in
+/// `except LinAlgError` and re-solves with `svd`, reporting the fallback through
+/// `solver_`. Fusing the centering into the Gram changed what that retry has to
+/// work with: the SVD arm consumes the centered DESIGN, and the fused route
+/// deliberately never materializes one. The retry therefore builds it on demand,
+/// and this is the only test that reaches that branch.
+///
+/// A duplicated column with `alpha = 0` makes `XᵀX` exactly rank-deficient, so
+/// the factorization hits a non-positive pivot rather than merely a small one.
+#[test]
+fn ridge_singular_gram_falls_back_to_svd_on_the_fused_route() {
+    if capability::active_backend_name() == "cpu" {
+        println!("singular-Gram retry: SKIPPED on cpu (device arm is the \
+                  center_columns per-column round-trip)");
+        return;
+    }
+    let n = 200usize;
+    let d = 4usize;
+    let mut x = vec![0.0f32; n * d];
+    for r in 0..n {
+        let a = ((r % 7) as f32) * 0.3 - 1.0;
+        let b = ((r % 11) as f32) * 0.17 + 0.4;
+        x[r * d] = a;
+        x[r * d + 1] = b;
+        x[r * d + 2] = a; // exact duplicate of column 0 -> rank-deficient Gram
+        x[r * d + 3] = 1.5 * b; // and an exact multiple of column 1
+    }
+    let y: Vec<f32> = (0..n).map(|r| ((r % 5) as f32) * 0.6 + 2.0).collect();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+
+    let fitted = Ridge::<f32>::builder()
+        .alpha(0.0)
+        .fit_intercept(true)
+        .build::<f32>()
+        .expect("build")
+        .fit(&mut pool, &xd, Some(&yd), (n, d))
+        .expect("a singular Gram must fall back, not error");
+
+    assert_eq!(
+        fitted.solver().name(),
+        "svd",
+        "a rank-deficient Gram must report the sklearn-faithful svd fallback"
+    );
+    let coef = fitted.coef(&pool);
+    assert!(
+        coef.iter().all(|v| v.is_finite()) && fitted.intercept(&pool).is_finite(),
+        "the fallback must never emit NaN coefficients: {coef:?}"
+    );
+}
