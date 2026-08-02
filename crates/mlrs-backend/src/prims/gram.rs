@@ -189,7 +189,7 @@ where
         return Ok((xm, ym));
     }
 
-    let (nb, rpb) = row_blocking(n, d);
+    let (nb, rpb) = mean_row_blocking(n, d);
     let psum_len = nb * d;
     let psum = pool.acquire(psum_len * size_of::<F>());
     let pysum = pool.acquire(nb * size_of::<F>());
@@ -244,6 +244,28 @@ where
         DeviceArray::from_raw(xmean, d),
         DeviceArray::from_raw(ymean, 1),
     ))
+}
+
+
+/// `(nblocks, rows_per_block)` for the MEAN pass.
+///
+/// [`column_means`] used [`row_blocking`], whose `nblocks` cap is sized for the
+/// GRAM's `nblocks · d²` partial buffer. The mean pass's partial is only
+/// `nblocks · d` — a factor of `d` smaller — so it was inheriting a constraint
+/// from a different kernel and starving itself of parallelism: at
+/// `n = 100 000, d = 256` that cap pinned it to 128 cubes × 64 units = 8192
+/// threads, roughly 20% of a T4's 40 960, and the pass measured **4.2 ms of a
+/// 13.2 ms fit** — a third of on-device time to compute `d + 1` numbers.
+///
+/// 128 rows per block puts `n = 100 000` at 782 cubes (≈50 000 threads, enough
+/// to fill the device) while keeping the fold's per-output scan short: stage 2
+/// walks `nblocks` partials with only `d` units, so an unbounded `nblocks`
+/// trades a stage-1 win for a stage-2 loss.
+fn mean_row_blocking(n: usize, d: usize) -> (usize, usize) {
+    let nb_cap = ((8usize << 20) / d.max(1)).max(1);
+    let nb = n.div_ceil(128).clamp(1, nb_cap);
+    let rpb = n.div_ceil(nb);
+    (n.div_ceil(rpb), rpb)
 }
 
 /// `(nblocks, rows_per_block)` for the cube-per-row-block kernels.
