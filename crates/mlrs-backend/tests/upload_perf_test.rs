@@ -68,14 +68,15 @@ fn upload_cost_breakdown() {
         mlrs_backend::capability::active_backend_name()
     );
     println!(
-        "{:>8} | {:>16} {:>16} {:>16} {:>16} {:>16} {:>16}",
+        "{:>8} | {:>16} {:>16} {:>16} {:>16} {:>16} {:>16} {:>16}",
         "MB",
         "1 host to_vec",
         "2 empty(alloc)",
         "3 create",
         "4 staged create",
         "5 from_host",
-        "6 chunked 32MB"
+        "6 chunked 32MB",
+        "7 from_host+drop"
     );
 
     // The ladder's actual operand sizes: 100k×16, 10k×256/100k×64, 500k×16,
@@ -93,6 +94,7 @@ fn upload_cost_breakdown() {
         let mut t_staged = f64::INFINITY;
         let mut t_full = f64::INFINITY;
         let mut t_chunk = f64::INFINITY;
+        let mut t_drop = f64::INFINITY;
 
         for _ in 0..reps {
             // 1. Host copy alone — allocation + first-touch faults + memcpy.
@@ -142,6 +144,23 @@ fn upload_cost_breakdown() {
             //    scales badly (allocating and faulting in one huge host buffer,
             //    and landing above cubecl's 100 MB pinned cutoff), then several
             //    small uploads beat one large one and this column shows it.
+            // 7. The shipped path, but DROPPING the array instead of returning
+            //    it to the pool.
+            //
+            //    `from_host` populates its buffer with `client.create`, which
+            //    always allocates; the pool's free-list can only be drained by
+            //    `acquire`. So a handle returned via `release_into` after an
+            //    upload can never serve another upload — it is just held alive,
+            //    denying cubecl's own allocator the chance to reuse it, and live
+            //    device memory grows by one whole design per call. If that is
+            //    what degrades the transfer, dropping instead of pooling is
+            //    faster, and the gap widens with size.
+            let t0 = Instant::now();
+            let dev2: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &src);
+            drain(&mut pool, &probe);
+            t_drop = t_drop.min(t0.elapsed().as_secs_f64());
+            drop(dev2);
+
             let t0 = Instant::now();
             let rows_per_chunk = (32 * 1024 * 1024 / 4).min(elems).max(1);
             let mut chunks: Vec<DeviceArray<ActiveRuntime, f32>> = Vec::new();
@@ -160,13 +179,14 @@ fn upload_cost_breakdown() {
 
         let cell = |s: f64| format!("{:.1} ({:.2})", s * 1e3, gbs(bytes, s));
         println!(
-            "{mb:>8.1} | {:>16} {:>16} {:>16} {:>16} {:>16} {:>16}",
+            "{mb:>8.1} | {:>16} {:>16} {:>16} {:>16} {:>16} {:>16} {:>16}",
             cell(t_tovec),
             cell(t_empty),
             cell(t_create),
             cell(t_staged),
             cell(t_full),
             cell(t_chunk),
+            cell(t_drop),
         );
     }
 }

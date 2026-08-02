@@ -134,11 +134,11 @@ UPLOAD = ("cd /content/mlrs && MLRS_POS_REPS=7 cargo test -p mlrs-backend --rele
 # assumed on this device: the crossover between them is an adapter property
 # (the local iGPU puts it between d=64 and d=128) and has never been measured
 # on a T4.
-for label, env in [("A. whole fit — default dispatch",      ""),
-                   ("B. whole fit — tiled Gram forced",     "LR_GRAM_TILED=1"),
-                   ("C. whole fit — blocked Gram forced",   "LR_GRAM_BLOCKED=1"),
-                   ("D. whole fit — host arm forced",       "MLRS_RIDGE_GRAM_HOST=1"),
-                   ("G. whole fit — pinned upload staging", "MLRS_UPLOAD_PINNED=1")]:
+for label, env in [("A. whole fit — default (shared-staged Gram)", ""),
+                   ("B. whole fit — register-tiled Gram forced",  "LR_GRAM_TILED=1"),
+                   ("C. whole fit — blocked Gram forced",         "LR_GRAM_BLOCKED=1"),
+                   ("D. whole fit — host arm forced",             "MLRS_RIDGE_GRAM_HOST=1"),
+                   ("G. whole fit — pinned upload staging",       "MLRS_UPLOAD_PINNED=1")]:
     cap("\n" + "-" * 72)
     cap(label)
     cap("-" * 72)

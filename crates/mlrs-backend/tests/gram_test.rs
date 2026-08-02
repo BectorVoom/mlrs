@@ -467,9 +467,22 @@ fn gram_xty_tiled_matches_blocked_bitwise_f32() {
             run_gram_case::<f32>(&x, &y, n, d)
         };
 
+        let (shared_gram, shared_xty) = {
+            let _g = mlrs_backend::abflag::force("LR_GRAM_SHARED_TILED", "1");
+            run_gram_case::<f32>(&x, &y, n, d)
+        };
+
         assert_eq!(
             tiled_gram, blocked_gram,
             "tiled/blocked gram differ at n={n} d={d}"
+        );
+        assert_eq!(
+            shared_gram, blocked_gram,
+            "shared-tiled/blocked gram differ at n={n} d={d}"
+        );
+        assert_eq!(
+            shared_xty, blocked_xty,
+            "shared-tiled/blocked xty differ at n={n} d={d}"
         );
         assert_eq!(
             tiled_xty, blocked_xty,
@@ -525,6 +538,13 @@ fn gram_xty_centered_tiled_matches_blocked_bitwise_f32() {
             let _g = mlrs_backend::abflag::force("LR_GRAM_BLOCKED", "1");
             run_centered_case::<f32>(&x, &y, n, d)
         };
+
+        let shared = {
+            let _g = mlrs_backend::abflag::force("LR_GRAM_SHARED_TILED", "1");
+            run_centered_case::<f32>(&x, &y, n, d)
+        };
+        assert_eq!(shared.2, blocked.2, "shared-tiled centered gram differs at n={n} d={d}");
+        assert_eq!(shared.3, blocked.3, "shared-tiled centered xty differs at n={n} d={d}");
 
         assert_eq!(tiled.0, blocked.0, "x_mean differs at n={n} d={d}");
         assert_eq!(tiled.1, blocked.1, "y_mean differs at n={n} d={d}");

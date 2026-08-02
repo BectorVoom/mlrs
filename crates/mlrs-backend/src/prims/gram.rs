@@ -42,7 +42,8 @@ use mlrs_core::PrimError;
 use mlrs_core::f64_to_host;
 use mlrs_kernels::gram::{
     col_sums_blocked, col_sums_reduce, gram_xty_blocked, gram_xty_reduce_partials, gram_xty_shared,
-    gram_xty_tiled, GRAM_REG_TILE, GRAM_TILE,
+    gram_xty_shared_tiled, gram_xty_tiled, GRAM_BLK, GRAM_CHUNK_ROWS, GRAM_REG_TILE,
+    GRAM_SHARED_UNITS, GRAM_TILE,
 };
 
 use crate::device_array::DeviceArray;
@@ -81,8 +82,10 @@ where
 {
     validate_geometry(x.len(), (n, d), y.len())?;
 
-    match gram_path(d * d) {
-        GramPath::Tiled | GramPath::Blocked => gram_xty_blocked_impl::<F>(pool, x, y, None, n, d),
+    match gram_path::<F>(d * d) {
+        GramPath::SharedTiled | GramPath::Tiled | GramPath::Blocked => {
+            gram_xty_blocked_impl::<F>(pool, x, y, None, n, d)
+        }
         GramPath::Shared => gram_xty_shared_impl::<F>(pool, x, y, n, d),
         GramPath::Gemm => gram_xty_gemm_fallback::<F>(pool, x, y, n, d),
     }
@@ -131,8 +134,8 @@ where
         });
     }
 
-    match gram_path(d * d) {
-        GramPath::Tiled | GramPath::Blocked => {
+    match gram_path::<F>(d * d) {
+        GramPath::SharedTiled | GramPath::Tiled | GramPath::Blocked => {
             gram_xty_blocked_impl::<F>(pool, x, y, Some(means), n, d)
         }
         // No fused kernel on these arms: center first, then form the Gram of
@@ -175,7 +178,10 @@ where
 {
     validate_geometry(x.len(), (n, d), y.len())?;
 
-    if !matches!(gram_path(d * d), GramPath::Tiled | GramPath::Blocked) {
+    if !matches!(
+        gram_path::<F>(d * d),
+        GramPath::SharedTiled | GramPath::Tiled | GramPath::Blocked
+    ) {
         let (xc, xm) = crate::prims::center::center_columns::<F>(pool, x, (n, d))?;
         let (yc, ym) = crate::prims::center::center_columns::<F>(pool, y, (n, 1))?;
         xc.release_into(pool);
@@ -260,8 +266,11 @@ fn row_blocking(n: usize, d: usize) -> (usize, usize) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "cpu", allow(dead_code))]
 enum GramPath {
+    /// [`mlrs_kernels::gram::gram_xty_shared_tiled`] — shared-memory row
+    /// staging, `O(d)` global loads per row.
+    SharedTiled,
     /// [`mlrs_kernels::gram::gram_xty_tiled`] — the 2-D register-tiled,
-    /// barrier-free default.
+    /// barrier-free arm.
     Tiled,
     /// [`mlrs_kernels::gram::gram_xty_blocked`] — the previous 1×8 tile, kept
     /// as the `LR_GRAM_BLOCKED=1` A/B arm.
@@ -284,7 +293,7 @@ enum GramPath {
 /// Two A/B escape hatches, read through [`crate::abflag`]: `LR_GRAM_SHARED=1`
 /// forces the previous shared-memory kernel, `LR_GRAM_GEMM=1` the original
 /// two-`gemm` formation (the pre-existing knob, unchanged).
-fn gram_path(dd: usize) -> GramPath {
+fn gram_path<F>(dd: usize) -> GramPath {
     #[cfg(feature = "cpu")]
     {
         let _ = dd;
@@ -310,14 +319,31 @@ fn gram_path(dd: usize) -> GramPath {
         if crate::abflag::var("LR_GRAM_BLOCKED").is_some() {
             return GramPath::Blocked;
         }
+        // Every FORCE is honoured before any size gate. Ordering these after
+        // the `TILED_MIN_DD` early return silently disarms them below the
+        // threshold — which made both bitwise A/B tests compare the blocked
+        // kernel against itself and pass green over two deliberately broken
+        // kernels. A knob that cannot reach the arm it names is worse than no
+        // knob.
         if crate::abflag::var("LR_GRAM_TILED").is_some() {
             return GramPath::Tiled;
         }
-        if dd >= TILED_MIN_DD {
-            GramPath::Tiled
-        } else {
-            GramPath::Blocked
+        if crate::abflag::var("LR_GRAM_SHARED_TILED").is_some() {
+            return GramPath::SharedTiled;
         }
+        // The shared-staged kernel is a strict traffic reduction over BOTH
+        // register kernels, so it takes precedence wherever it applies. It
+        // needs a shared-memory budget they do not, and an overrun surfaces as
+        // a SILENT all-zero Gram (the `prims::eig` finding), so the budget is
+        // checked, never assumed.
+        if dd >= SHARED_TILED_MIN_DD && shared_tiled_fits::<F>() {
+            return GramPath::SharedTiled;
+        }
+        // Fallback ladder for adapters without the shared budget.
+        if dd >= TILED_MIN_DD {
+            return GramPath::Tiled;
+        }
+        GramPath::Blocked
     }
 }
 
@@ -330,6 +356,35 @@ fn gram_path(dd: usize) -> GramPath {
 /// into the starved-GEMM formation.
 #[cfg_attr(feature = "cpu", allow(dead_code))]
 const BLOCKED_MAX_DD: usize = 256 * 256;
+
+
+/// `d²` at or above which [`GramPath::SharedTiled`] is used.
+///
+/// The shared-staged kernel reads each design element from global memory ONCE
+/// per cube (`O(d)` loads per row) where both register kernels re-read it once
+/// per output tile (`O(d²)` per row). That is a strictly larger win the larger
+/// `d` is, so it displaces [`GramPath::Tiled`] everywhere the latter applied
+/// and reaches further down — its crossover sits a full octave lower, because
+/// staging also fixes the parallelism starvation that made the register tile
+/// lose at small `d` (a cube covers a whole `64 × 64` block with 256 units
+/// rather than handing out `d²/32` tiles).
+///
+/// Measured on the local wgpu adapter (`gram_perf_test.rs`, `n = 100 000`,
+/// min-of-9, three runs, shared-tiled ÷ blocked):
+///
+/// | `d` | run 1 | run 2 | run 3 | verdict |
+/// |---|---|---|---|---|
+/// | 16 | 0.72 | 0.72 | 0.79 | loses |
+/// | 32 | 0.99 | 0.92 | 0.92 | wash |
+/// | 64 | 2.11 | 1.33 | 2.19 | **wins** |
+/// | 128 | 3.63 | 5.06 | 4.03 | **wins** |
+/// | 256 | 6.28–8.63 | | | **wins** |
+///
+/// Crossover between 32 and 64, hence `d = 64`. Like [`TILED_MIN_DD`] this is
+/// an ADAPTER property and must be re-swept per backend; `LR_GRAM_SHARED_TILED=1`
+/// forces the arm at any size for exactly that purpose.
+#[cfg_attr(feature = "cpu", allow(dead_code))]
+const SHARED_TILED_MIN_DD: usize = 64 * 64;
 
 /// `d²` at or above which [`GramPath::Tiled`] replaces [`GramPath::Blocked`].
 ///
@@ -373,6 +428,22 @@ const BLOCKED_MAX_DD: usize = 256 * 256;
 /// shipped behaviour where a measurement supports it.
 #[cfg_attr(feature = "cpu", allow(dead_code))]
 const TILED_MIN_DD: usize = 128 * 128;
+
+
+/// Does [`mlrs_kernels::gram::gram_xty_shared_tiled`]'s staging budget fit this
+/// adapter's per-workgroup shared memory?
+///
+/// The kernel stages two `GRAM_CHUNK_ROWS × GRAM_BLK` tiles plus the target
+/// column, at the COMPTIME size regardless of the runtime `d`. This is checked
+/// rather than assumed because a shared-memory overrun does not fail loudly —
+/// it produces a silently all-zero result (the `prims::eig` finding, which cost
+/// a whole debugging cycle). At 8.3 KiB (`f32`) / 16.5 KiB (`f64`) it should
+/// never bind, and the register-tiled arm carries any adapter where it does.
+#[cfg_attr(feature = "cpu", allow(dead_code))]
+fn shared_tiled_fits<F>() -> bool {
+    let staged = 2 * (GRAM_CHUNK_ROWS * GRAM_BLK) as usize + GRAM_CHUNK_ROWS as usize;
+    staged * std::mem::size_of::<F>() <= crate::capability::active_max_shared_memory()
+}
 
 /// `(lower-triangle tile count, units per cube)` for
 /// [`mlrs_kernels::gram::gram_xty_tiled`] at this `d`.
@@ -476,7 +547,28 @@ where
     let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.handle().clone(), 1) };
     let pg_arg = unsafe { ArrayArg::from_raw_parts(pgram.clone(), pgram_len) };
     let px_arg = unsafe { ArrayArg::from_raw_parts(pxty.clone(), pxty_len) };
-    if gram_path(dd) == GramPath::Blocked {
+    let path = gram_path::<F>(dd);
+    if path == GramPath::SharedTiled {
+        let tb = (d as u32).div_ceil(GRAM_BLK);
+        let ntb = tb * (tb + 1) / 2;
+        let (cc, cd) = launch_cubes(nb * ntb as usize, GRAM_SHARED_UNITS);
+        gram_xty_shared_tiled::launch::<F, ActiveRuntime>(
+            &client,
+            cc,
+            cd,
+            x_arg,
+            y_arg,
+            xm_arg,
+            ym_arg,
+            pg_arg,
+            px_arg,
+            n as u32,
+            d as u32,
+            nb as u32,
+            rpb as u32,
+            ntb,
+        );
+    } else if path == GramPath::Blocked {
         let groups_per_row = (d as u32).div_ceil(GRAM_REG_TILE);
         let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
         gram_xty_blocked::launch::<F, ActiveRuntime>(

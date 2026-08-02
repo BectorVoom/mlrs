@@ -436,6 +436,283 @@ pub fn gram_xty_tiled<F: Float + CubeElement>(
     }
 }
 
+/// Gram block edge one CUBE of [`gram_xty_shared_tiled`] owns (`64 × 64`).
+pub const GRAM_BLK: u32 = 64;
+
+/// Rows staged into shared memory per chunk by [`gram_xty_shared_tiled`].
+///
+/// `2 · 16 · 64` elements is 8.3 KiB at `f32` and 16.5 KiB at `f64` — inside
+/// every adapter's workgroup budget, and the caller re-checks
+/// ([`crate::gram::GRAM_BLK`] docs on the host side) rather than assuming, since
+/// a shared-memory overrun surfaces as a SILENT all-zero result.
+pub const GRAM_CHUNK_ROWS: u32 = 16;
+
+/// Units per cube of [`gram_xty_shared_tiled`] — a `16 × 16` grid of `4 × 4`
+/// output tiles covering the cube's `64 × 64` Gram block.
+pub const GRAM_SHARED_UNITS: u32 = 256;
+
+/// Row-blocked partial Gram + Xty with SHARED-MEMORY row staging — the
+/// traffic-bound rewrite of [`gram_xty_tiled`].
+///
+/// ## Why this exists
+/// [`gram_xty_tiled`] is at the memory roofline, not merely slow: measured on a
+/// T4 at `n = 100 000, d = 256` it issues 1.64 G loads (6.55 GB) in 21.3 ms,
+/// which is **308 GB/s against that card's ~320 GB/s peak**, while sitting at
+/// 3.8% of its f32 FLOP peak. No cube shape, tile shape or unroll moves a kernel
+/// that is already saturating DRAM. The only thing that can is issuing fewer
+/// loads.
+///
+/// Both register kernels re-read the design once per output tile, so global
+/// loads scale as `O(d²)` per row: `≈ 0.5625·d²` for the `1×8` blocked kernel
+/// and `≈ 0.25·d²` for the `4×4` tile. Here each cube owns ONE `64 × 64` block
+/// of the Gram and stages the rows it needs into shared memory ONCE per chunk,
+/// so every element of the design is read from global memory exactly once per
+/// cube — `O(d)` per row instead of `O(d²)`:
+///
+/// | | global loads per row | at `d = 256` |
+/// |---|---|---|
+/// | `gram_xty_blocked` | `0.5625·d²` | 36 864 |
+/// | `gram_xty_tiled` | `0.25·d²` | 16 384 |
+/// | this | `2·64·⌈d/64⌉(⌈d/64⌉+1)/2 / 1` | 1 280 |
+///
+/// — a 12.8× traffic cut at `d = 256`, which is what turns a DRAM-bound kernel
+/// into a shared-memory/FLOP-bound one.
+///
+/// ## Shape
+/// One cube per (row block, lower-triangle Gram block) pair. The cube's 256
+/// units form a `16 × 16` grid, each owning a `4 × 4` output tile of the
+/// `64 × 64` block, so a unit's 16 accumulators live in registers across the
+/// WHOLE row block — which is why the chunk loop has to be the outer,
+/// cube-uniform one (per-unit chunking would put `sync_cube` inside divergent
+/// control flow).
+///
+/// Staging is coalesced by construction: consecutive units load consecutive
+/// columns of the same staged row.
+///
+/// ## Bitwise contract
+/// Every `gram[a][b]` is still ONE register chain summed over ascending rows,
+/// the row blocking is the caller's shared [`row_blocking`], and the partial
+/// fold is unchanged — so this kernel is bit-for-bit identical to
+/// [`gram_xty_tiled`] and [`gram_xty_blocked`]. Centering moves from use-time to
+/// stage-time, which changes when the subtraction happens but not the value or
+/// the summation order.
+///
+/// [`row_blocking`]: mlrs_backend::prims::gram
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn gram_xty_shared_tiled<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    xmean: &Array<F>,
+    ymean: &Array<F>,
+    pgram: &mut Array<F>,
+    pxty: &mut Array<F>,
+    n: u32,
+    d: u32,
+    nblocks: u32,
+    rows_per_block: u32,
+    ntb: u32,
+) {
+    let mut sha = SharedMemory::<F>::new(1024usize);
+    let mut shb = SharedMemory::<F>::new(1024usize);
+    let mut shy = SharedMemory::<F>::new(16usize);
+
+    let cid = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as u32;
+    if cid < nblocks * ntb {
+        let bidx = cid / ntb;
+        let tb = cid % ntb;
+
+        // Lower-triangle block decode, by running triangular number rather than
+        // `sqrt` — exact, and off the f64-transcendental paths some adapters
+        // lack. Cube-uniform, so the `sync_cube`s below stay uniform too.
+        let mut bi = 0u32;
+        let mut tri = 0u32;
+        while tri + bi + 1u32 <= tb {
+            tri += bi + 1u32;
+            bi += 1u32;
+        }
+        let bj = tb - tri;
+        let a0 = bi * 64u32;
+        let b0 = bj * 64u32;
+
+        let u = UNIT_POS as u32;
+        let ti = u / 16u32;
+        let tj = u % 16u32;
+        let ra = a0 + ti * 4u32;
+        let cb = b0 + tj * 4u32;
+
+        let start = bidx * rows_per_block;
+        let mut end = start + rows_per_block;
+        if end > n {
+            end = n;
+        }
+
+        let zero = F::new(0.0_f32);
+        let mut c00 = zero;
+        let mut c01 = zero;
+        let mut c02 = zero;
+        let mut c03 = zero;
+        let mut c10 = zero;
+        let mut c11 = zero;
+        let mut c12 = zero;
+        let mut c13 = zero;
+        let mut c20 = zero;
+        let mut c21 = zero;
+        let mut c22 = zero;
+        let mut c23 = zero;
+        let mut c30 = zero;
+        let mut c31 = zero;
+        let mut c32 = zero;
+        let mut c33 = zero;
+        let mut t0 = zero;
+        let mut t1 = zero;
+        let mut t2 = zero;
+        let mut t3 = zero;
+        let my = ymean[0];
+        // `Xᵀy` rides on the DIAGONAL blocks' diagonal tiles: those cover each
+        // column exactly once across the whole grid.
+        let does_xty = bi == bj && ti == tj;
+
+        let mut r = start;
+        while r < end {
+            let mut rows = end - r;
+            if rows > 16u32 {
+                rows = 16u32;
+            }
+
+            // Cooperative stage — 1024 elements over 256 units, consecutive
+            // units on consecutive columns of one row (coalesced). Centering is
+            // applied HERE, once per element per cube, instead of once per use.
+            let mut k = u;
+            while k < 1024u32 {
+                let rr = k / 64u32;
+                let cc = k % 64u32;
+                let mut va = zero;
+                let mut vb = zero;
+                if rr < rows {
+                    let xbase = (r + rr) * d;
+                    if a0 + cc < d {
+                        va = x[(xbase + a0 + cc) as usize] - xmean[(a0 + cc) as usize];
+                    }
+                    if b0 + cc < d {
+                        vb = x[(xbase + b0 + cc) as usize] - xmean[(b0 + cc) as usize];
+                    }
+                }
+                sha[k as usize] = va;
+                shb[k as usize] = vb;
+                k += 256u32;
+            }
+            if u < 16u32 {
+                let mut vy = zero;
+                if u < rows {
+                    vy = y[(r + u) as usize] - my;
+                }
+                shy[u as usize] = vy;
+            }
+            sync_cube();
+
+            let mut rr = 0u32;
+            while rr < rows {
+                let ab = rr * 64u32 + ti * 4u32;
+                let bb = rr * 64u32 + tj * 4u32;
+                let a0v = sha[ab as usize];
+                let a1v = sha[(ab + 1u32) as usize];
+                let a2v = sha[(ab + 2u32) as usize];
+                let a3v = sha[(ab + 3u32) as usize];
+                let b0v = shb[bb as usize];
+                let b1v = shb[(bb + 1u32) as usize];
+                let b2v = shb[(bb + 2u32) as usize];
+                let b3v = shb[(bb + 3u32) as usize];
+                c00 += a0v * b0v;
+                c01 += a0v * b1v;
+                c02 += a0v * b2v;
+                c03 += a0v * b3v;
+                c10 += a1v * b0v;
+                c11 += a1v * b1v;
+                c12 += a1v * b2v;
+                c13 += a1v * b3v;
+                c20 += a2v * b0v;
+                c21 += a2v * b1v;
+                c22 += a2v * b2v;
+                c23 += a2v * b3v;
+                c30 += a3v * b0v;
+                c31 += a3v * b1v;
+                c32 += a3v * b2v;
+                c33 += a3v * b3v;
+                if does_xty {
+                    let yv = shy[rr as usize];
+                    t0 += a0v * yv;
+                    t1 += a1v * yv;
+                    t2 += a2v * yv;
+                    t3 += a3v * yv;
+                }
+                rr += 1u32;
+            }
+            // Both barriers are cube-uniform: `rows`/`end` derive from the cube
+            // id alone, never from the unit.
+            sync_cube();
+            r += 16u32;
+        }
+
+        let gbase = bidx * d * d;
+        let mut k = 0u32;
+        while k < 4u32 {
+            let arow = ra + k;
+            if arow < d {
+                let base = gbase + arow * d + cb;
+                let mut v0 = c00;
+                let mut v1 = c01;
+                let mut v2 = c02;
+                let mut v3 = c03;
+                if k == 1u32 {
+                    v0 = c10;
+                    v1 = c11;
+                    v2 = c12;
+                    v3 = c13;
+                }
+                if k == 2u32 {
+                    v0 = c20;
+                    v1 = c21;
+                    v2 = c22;
+                    v3 = c23;
+                }
+                if k == 3u32 {
+                    v0 = c30;
+                    v1 = c31;
+                    v2 = c32;
+                    v3 = c33;
+                }
+                if cb < d {
+                    pgram[base as usize] = v0;
+                }
+                if cb + 1u32 < d {
+                    pgram[(base + 1u32) as usize] = v1;
+                }
+                if cb + 2u32 < d {
+                    pgram[(base + 2u32) as usize] = v2;
+                }
+                if cb + 3u32 < d {
+                    pgram[(base + 3u32) as usize] = v3;
+                }
+                if does_xty {
+                    let mut tv = t0;
+                    if k == 1u32 {
+                        tv = t1;
+                    }
+                    if k == 2u32 {
+                        tv = t2;
+                    }
+                    if k == 3u32 {
+                        tv = t3;
+                    }
+                    pxty[(bidx * d + arow) as usize] = tv;
+                }
+            }
+            k += 1u32;
+        }
+    }
+}
+
 /// Row-blocked partial column sums of `x` (`d`) and of `y` (1) — the mean pass
 /// [`gram_xty_blocked`]'s fused centering needs, in the SAME cube-per-row-block
 /// shape.
