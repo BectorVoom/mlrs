@@ -189,7 +189,7 @@ where
         return Ok((xm, ym));
     }
 
-    let (nb, rpb) = mean_row_blocking(n, d);
+    let (nb, rpb) = row_blocking(n, d);
     let psum_len = nb * d;
     let psum = pool.acquire(psum_len * size_of::<F>());
     let pysum = pool.acquire(nb * size_of::<F>());
@@ -247,27 +247,28 @@ where
 }
 
 
-/// `(nblocks, rows_per_block)` for the MEAN pass.
+/// Why [`column_means`] does NOT get its own, wider row blocking.
 ///
-/// [`column_means`] used [`row_blocking`], whose `nblocks` cap is sized for the
-/// GRAM's `nblocks · d²` partial buffer. The mean pass's partial is only
-/// `nblocks · d` — a factor of `d` smaller — so it was inheriting a constraint
-/// from a different kernel and starving itself of parallelism: at
-/// `n = 100 000, d = 256` that cap pinned it to 128 cubes × 64 units = 8192
-/// threads, roughly 20% of a T4's 40 960, and the pass measured **4.2 ms of a
-/// 13.2 ms fit** — a third of on-device time to compute `d + 1` numbers.
+/// It shares the Gram's [`row_blocking`], whose `nblocks` cap is sized for the
+/// `nblocks · d²` partial buffer — a factor of `d` stricter than this pass
+/// needs, since its partial is only `nblocks · d`. At `n = 100 000, d = 256`
+/// that pins the mean pass to 128 cubes × 64 units = 8192 threads, ~20% of a
+/// T4's 40 960, and the drained laps show it costing 4.2 ms of a 13.2 ms
+/// on-device fit. That looks exactly like an occupancy bug.
 ///
-/// 128 rows per block puts `n = 100 000` at 782 cubes (≈50 000 threads, enough
-/// to fill the device) while keeping the fold's per-output scan short: stage 2
-/// walks `nblocks` partials with only `d` units, so an unbounded `nblocks`
-/// trades a stage-1 win for a stage-2 loss.
-fn mean_row_blocking(n: usize, d: usize) -> (usize, usize) {
-    let nb_cap = ((8usize << 20) / d.max(1)).max(1);
-    let nb = n.div_ceil(128).clamp(1, nb_cap);
-    let rpb = n.div_ceil(nb);
-    (n.div_ceil(rpb), rpb)
-}
-
+/// **It is not, and the obvious fix was measured and reverted.** Giving the
+/// pass its own cap (`8M/d`, 128 rows per block → 782 cubes, ~50 000 threads)
+/// moved the isolated `column_means` + `gram_xty_centered` phase on a T4 from
+/// 4.06 ms to 3.90/4.32 ms across two min-of-9 runs — a wash — while the
+/// whole-fit attribution pass got slightly WORSE at all five rungs (4.2 → 5.4 ms
+/// at `d = 256`). Six times the threads bought nothing, so the pass is not
+/// thread-starved.
+///
+/// It is also not bandwidth-bound: 102 MiB in ~4 ms is ~25 GB/s against the
+/// card's ~320. Whatever the real limiter is, it has not been identified, and
+/// the next attempt should start by finding it rather than by adding
+/// parallelism that has already been shown not to help.
+///
 /// `(nblocks, rows_per_block)` for the cube-per-row-block kernels.
 ///
 /// 256 rows per block is the sizing `gram_xty_shared_impl` established; the cap
