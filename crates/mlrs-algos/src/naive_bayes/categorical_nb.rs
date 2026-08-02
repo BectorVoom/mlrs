@@ -15,6 +15,16 @@
 //! `fit` / `predict` (data-DEPENDENT — [`AlgoError::InvalidCategoricalInput`]),
 //! wired in Wave 1.
 //!
+//! ## Fit shape (CATNB-FIT-CPU)
+//!
+//! The fit is ENTIRELY host-side — there is no `#[cube]` kernel here, only a
+//! validate pass and a tabulation pass over the design matrix. Both are
+//! ROW-MAJOR and chunked over rows across a scoped worker pool
+//! ([`CategoricalNB::fit_host`] documents why, and what the column-strided shape
+//! it replaced cost); [`CategoricalNB::fit_from_host_slice`] is the entry point
+//! the PyO3 bridge uses so the operands are never round-tripped through a
+//! `DeviceArray` just to be read straight back.
+//!
 //! Tests live in `crates/mlrs-algos/tests/categorical_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
@@ -28,7 +38,9 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
-use crate::naive_bayes::multinomial_nb::{decode_classes, resolve_class_log_prior, validate_discrete_alpha};
+use crate::naive_bayes::multinomial_nb::{
+    decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
+};
 use crate::naive_bayes::nb_common::{argmax_decode, log_sum_exp_normalize, NB_LABEL_INT_TOL};
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -236,25 +248,181 @@ impl CategoricalNBBuilder {
     }
 }
 
-impl<F> Fit<F> for CategoricalNB<F, Unfit>
+/// The largest category index the fit can encode. The pass-1 scan narrows each
+/// validated feature value to a `u32` (halving pass-2's index arithmetic and
+/// keeping the flat count table cache-resident), so a value beyond this is
+/// rejected with [`AlgoError::InvalidCategoricalInput`] rather than silently
+/// saturating the cast. `u32::MAX` categories in ONE feature would need a
+/// ≥ 16 GiB count table anyway.
+const MAX_CATEGORY: f64 = u32::MAX as f64;
+
+/// Below this many `n_samples · n_features` elements the fit stays
+/// single-threaded: spawning a scoped worker costs ~30 µs, which dwarfs a scan
+/// over a few tens of thousands of elements.
+const PAR_MIN_ELEMS: usize = 1 << 15;
+
+/// Per-worker flat count-table budget, in `u32` entries (4 MiB). The tabulation
+/// replicates an `n_classes · Σ_j n_categories_j` table PER worker, so a fit
+/// with a huge category cross-product drops back to one table (serial) rather
+/// than allocating a copy per core.
+///
+/// Memory footprint, for the record: ONE flat table is `n_classes · Σ_j
+/// n_categories_j` `u32`s — exactly half the size of the `f64`
+/// `feature_log_prob_` the fit must return anyway, so the un-replicated table can
+/// never dominate the estimator it builds. The previous body's per-feature tables
+/// peaked lower (one `n_classes × n_categories_j` table at a time) but paid the
+/// `O(n · d²)` traffic for it; this cap is what keeps the replicated case bounded
+/// (at most `PAR_MAX_WORKERS · 4 MiB` of scratch) rather than scaling with cores.
+const PAR_TABLE_MAX_ENTRIES: usize = 1 << 20;
+
+/// Ceiling on the worker count. BOTH fit passes stream the design matrix, so
+/// they are DRAM-bandwidth-bound, not core-bound: the wall clock stops improving
+/// long before the cores run out, while CPU time keeps climbing linearly with
+/// every worker added. Measured on a 16-core box, `100 000 × 128` fit
+/// (wall / cpu, min of 5):
+///
+/// | workers | 1     | 2     | 4     | 8     | 16    |
+/// |---------|-------|-------|-------|-------|-------|
+/// | wall ms | 67.8  | 53.3  | 41.6  | 36.0  | 35.2  |
+/// | cpu ms  | 67.4  | 77.5  | 74.5  | 88.0  | 132.4 |
+///
+/// 8 is the knee: it takes the last real wall-clock gain (13 % over 4), and
+/// doubling again buys 2 % for half as much CPU again. Spending a whole machine
+/// to shave 2 % off one fit is the wrong trade in a library, so the pool is
+/// capped here and the rest of the box is left for the caller's other work.
+/// Override with `MLRS_CATNB_WORKERS` to re-measure on new hardware.
+const PAR_MAX_WORKERS: usize = 8;
+
+/// Worker count for a row-chunked host pass over `n_elems` elements: `1` below
+/// [`PAR_MIN_ELEMS`], else the machine's parallelism capped at
+/// [`PAR_MAX_WORKERS`].
+///
+/// `MLRS_CATNB_WORKERS=<n>` forces the count (read through
+/// [`mlrs_backend::abflag`], so a test can scope the override to its own thread
+/// rather than racing `environ`). `MLRS_CATNB_WORKERS=1` pins the fully serial
+/// arm, which is what makes a serial-vs-parallel agreement test possible.
+fn host_workers(n_elems: usize) -> usize {
+    if let Some(forced) = mlrs_backend::abflag::var("MLRS_CATNB_WORKERS")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+    {
+        return forced;
+    }
+    if n_elems < PAR_MIN_ELEMS {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .clamp(1, PAR_MAX_WORKERS)
+}
+
+/// Row-chunk size (in ROWS) for a `workers`-way split of `n_samples`, capped at
+/// `u32::MAX` rows so a per-chunk `u32` count can never overflow (a count is
+/// bounded by its chunk's row count).
+fn chunk_rows(n_samples: usize, workers: usize) -> usize {
+    n_samples
+        .div_ceil(workers.max(1))
+        .max(1)
+        .min(u32::MAX as usize)
+}
+
+/// Pass 1 over ONE row-chunk: validate the categorical encoding and learn each
+/// feature's observed max, in a single ROW-MAJOR sweep.
+///
+/// Returns `(per_feature_max, first_invalid)`, where `first_invalid` is the flat
+/// index (in the WHOLE matrix — `flat_base` is the chunk's offset) and value of
+/// the first element that is not a non-negative integer within
+/// [`NB_LABEL_INT_TOL`] / is beyond [`MAX_CATEGORY`]. Reporting the flat index
+/// lets the parallel driver pick the FIRST offender in row-major order, so the
+/// error message does not depend on the worker count.
+///
+/// The integer test is written as `!(diff <= tol)` rather than `diff > tol` so a
+/// `NaN` — for which EVERY comparison is false — is REJECTED rather than silently
+/// rounding to category `0`. That is what lets the PyO3 fit arm relocate
+/// `check_array`'s finite scan into this pass (`ensure_all_finite=False`):
+/// `+inf`/`-inf` already fail the `> MAX_CATEGORY` / `< 0.0` arms.
+fn scan_chunk<F>(chunk: &[F], n_features: usize, flat_base: usize) -> (Vec<u32>, Option<(usize, f64)>)
 where
     F: Float + CubeElement + Pod,
 {
-    type Fitted = CategoricalNB<F, Fitted>;
+    let mut fmax = vec![0u32; n_features];
+    for (r, row) in chunk.chunks_exact(n_features).enumerate() {
+        for (j, (&xv, m)) in row.iter().zip(fmax.iter_mut()).enumerate() {
+            let xf = host_to_f64(xv);
+            let xr = xf.round();
+            if !((xr - xf).abs() <= NB_LABEL_INT_TOL) || xr < 0.0 || xr > MAX_CATEGORY {
+                return (fmax, Some((flat_base + r * n_features + j, xf)));
+            }
+            let k = xr as u32;
+            if k > *m {
+                *m = k;
+            }
+        }
+    }
+    (fmax, None)
+}
 
-    fn fit(
+/// Pass 2 over ONE row-chunk: tabulate `(class, feature, category)` counts into
+/// the FLAT table `table[c · total + off[j] + k]`, where `off[j]` is feature
+/// `j`'s base in the ragged category axis and `total = Σ_j n_categories_j`.
+///
+/// One flat table replaces the per-feature tables the previous body built, so
+/// the whole tabulation is ONE row-major sweep instead of `n_features` column-
+/// strided ones. Every index is in range by construction (`k ≤ observed_max_j <
+/// n_categories_j` from pass 1), and a `u32` count cannot overflow because
+/// [`chunk_rows`] caps a chunk at `u32::MAX` rows.
+fn count_chunk<F>(
+    chunk: &[F],
+    class_of_row: &[usize],
+    n_features: usize,
+    off: &[usize],
+    total: usize,
+    table: &mut [u32],
+) where
+    F: Float + CubeElement + Pod,
+{
+    for (row, &c) in chunk.chunks_exact(n_features).zip(class_of_row.iter()) {
+        let base = c * total;
+        for (&xv, &o) in row.iter().zip(off.iter()) {
+            let k = host_to_f64(xv).round() as u32 as usize;
+            table[base + o + k] += 1;
+        }
+    }
+}
+
+impl<F> CategoricalNB<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Fit directly from HOST slices — the no-upload twin of [`Fit::fit`].
+    ///
+    /// `CategoricalNB` is a pure host estimator: every element of `x` and `y` is
+    /// read on the host (the categorical encoding is validated, tabulated, and
+    /// turned into ragged host-f64 tables — there is no device kernel on this
+    /// path). Routing the operands through a `DeviceArray` therefore bought a
+    /// round trip and nothing else: `from_host` copied `n·d` floats into a pool
+    /// buffer and `to_host` copied them straight back out, ~2 × 8 `n·d` bytes of
+    /// pure overhead. The PyO3 bridge hands the Arrow values here instead, so a
+    /// fit touches the caller's buffer once.
+    ///
+    /// `shape` is `(n_samples, n_features)` and `x` is row-major, exactly as for
+    /// [`Fit::fit`]; the geometry guard is the slice twin of `validate_geometry`.
+    pub fn fit_from_host_slice(
         self,
-        pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        x: &[F],
+        y: &[F],
         shape: (usize, usize),
     ) -> Result<CategoricalNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        validate_geometry(x, shape)?;
-        let y = y.ok_or(AlgoError::NotFitted {
-            estimator: "categorical_nb",
-            operation: "fit (requires y)",
-        })?;
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
         if y.len() != n_samples {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "y",
@@ -263,32 +431,96 @@ where
                 len: y.len(),
             }));
         }
+        self.fit_host(x, y, shape)
+    }
+
+    /// The shared host fit body behind [`Fit::fit`] and
+    /// [`CategoricalNB::fit_from_host_slice`] — both geometry guards run in the
+    /// caller, so this is the math only.
+    ///
+    /// ## Why two row-major passes (PERF)
+    ///
+    /// The previous body materialized an `n·d` `Vec<usize>` category matrix, then
+    /// ran `n_features` COLUMN-strided passes over it to find each feature's
+    /// observed max, then `n_features` MORE column-strided passes to fill one
+    /// count table per feature. Each of those passes touches a distinct cache
+    /// line per row over a working set far larger than L3, so the fit moved
+    /// `O(n · d²)` bytes: at `d = 512` a `20 000 × 512` fit cost as much as a
+    /// `100 000 × 64` one with 8× fewer elements, and mlrs' margin over sklearn
+    /// collapsed from ~2× to ~1× as `d` grew.
+    ///
+    /// Now: pass 1 ([`scan_chunk`]) validates and learns all `d` maxes in ONE
+    /// row-major sweep; pass 2 ([`count_chunk`]) tabulates all `d` features into
+    /// ONE flat offset-indexed table in a second row-major sweep. Traffic is
+    /// `O(n · d)`, and the intermediate category matrix is gone entirely (pass 2
+    /// re-derives each index from the already-validated float — an ALU op against
+    /// what would be another `4 n d` bytes written and read back). Both passes
+    /// are chunked over rows across a scoped worker pool; the reductions
+    /// (elementwise max, table sum) are `O(d)` and `O(n_classes · Σ n_cat_j)`.
+    fn fit_host(
+        self,
+        x_host: &[F],
+        y_host: &[F],
+        shape: (usize, usize),
+    ) -> Result<CategoricalNB<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
         // WR-08: `force_alpha` is fitted-config provenance (D-06 clip already
         // applied at build()); it is now exposed via the `force_alpha()` accessor
         // so the field is genuinely used (the prior `let _ = self.force_alpha;`
         // suppression is removed).
 
-        // --- T-11-04-01: validate X is a non-negative-INTEGER categorical encoding
-        //     BEFORE any table is sized (a negative / non-integer value would later
-        //     index a ragged table out of bounds). Round-to-nearest within 1e-6 to
-        //     tolerate the f32/f64 round-trip of integer-encoded categories. ---
-        let x_host = x.to_host(pool);
-        let mut x_cat: Vec<usize> = Vec::with_capacity(n_samples * n_features);
-        for &xv in x_host.iter() {
-            let xf = host_to_f64(xv);
-            let xr = xf.round();
-            if (xr - xf).abs() > NB_LABEL_INT_TOL || xr < 0.0 {
-                return Err(AlgoError::InvalidCategoricalInput {
-                    estimator: "categorical_nb",
-                    reason: format!("feature values must be non-negative integers (got {xf})"),
-                });
+        // --- PASS 1 (T-11-04-01): validate X is a non-negative-INTEGER
+        //     categorical encoding AND learn each feature's observed max, in one
+        //     row-major sweep, BEFORE any table is sized (a negative /
+        //     non-integer value would later index a ragged table out of bounds).
+        //     Round-to-nearest within 1e-6 to tolerate the f32/f64 round-trip of
+        //     integer-encoded categories. ---
+        let n_elems = n_samples * n_features;
+        let workers = host_workers(n_elems);
+        let rows_per = chunk_rows(n_samples, workers);
+        let elems_per = rows_per * n_features;
+
+        let scans: Vec<(Vec<u32>, Option<(usize, f64)>)> = if workers == 1 {
+            vec![scan_chunk::<F>(x_host, n_features, 0)]
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = x_host
+                    .chunks(elems_per)
+                    .enumerate()
+                    .map(|(ci, chunk)| {
+                        scope.spawn(move || scan_chunk::<F>(chunk, n_features, ci * elems_per))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("categorical_nb: pass-1 worker panicked"))
+                    .collect()
+            })
+        };
+        // The FIRST offender in row-major order — independent of worker count.
+        if let Some((_, xf)) = scans
+            .iter()
+            .filter_map(|(_, e)| *e)
+            .min_by_key(|(idx, _)| *idx)
+        {
+            return Err(AlgoError::InvalidCategoricalInput {
+                estimator: "categorical_nb",
+                reason: format!("feature values must be non-negative integers (got {xf})"),
+            });
+        }
+        let mut observed_max = vec![0u32; n_features];
+        for (fmax, _) in &scans {
+            for (m, &v) in observed_max.iter_mut().zip(fmax.iter()) {
+                if v > *m {
+                    *m = v;
+                }
             }
-            x_cat.push(xr as usize);
         }
 
         // --- classes_ / dense per-row class index / n_classes via the shared
         //     discrete decode (integer + i32-range label guard, WR-02). ---
-        let (classes_, class_of_row, n_classes) = decode_classes::<F>("categorical_nb", pool, y, n_samples)?;
+        let (classes_, class_of_row, n_classes) =
+            decode_classes_host::<F>("categorical_nb", y_host)?;
 
         // class_count_[c] = #rows of class c (every observed class has >= 1).
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
@@ -312,11 +544,7 @@ where
         }
         let mut n_categories_: Vec<usize> = Vec::with_capacity(n_features);
         for j in 0..n_features {
-            let mut observed_max = 0usize;
-            for i in 0..n_samples {
-                observed_max = observed_max.max(x_cat[i * n_features + j]);
-            }
-            let base = observed_max + 1;
+            let base = observed_max[j] as usize + 1;
             let min_j = match &self.min_categories {
                 MinCategories::Infer => 0,
                 MinCategories::Uniform(u) => *u,
@@ -325,28 +553,85 @@ where
             n_categories_.push(base.max(min_j));
         }
 
-        // --- Host-tabulate category_count_[j][c, k] (one owner per
-        //     (feature, class, category) — a host count, NEVER a device scatter).
-        //     feature_log_prob_[j][c, k] = log((count + alpha) /
+        // --- PASS 2: host-tabulate category_count_[j][c, k] (one owner per
+        //     (feature, class, category) — a host count, NEVER a device scatter)
+        //     into ONE flat table indexed `c * total + off[j] + k`. ---
+        let mut off: Vec<usize> = Vec::with_capacity(n_features);
+        let mut total = 0usize;
+        for &n_cat_j in &n_categories_ {
+            off.push(total);
+            total += n_cat_j;
+        }
+        let table_len = n_classes * total;
+        // Replicating the table per worker is what makes the tabulation
+        // lock-free; drop to one table (serial) when that replication would cost
+        // more than the scan it accelerates.
+        let count_workers = if table_len > PAR_TABLE_MAX_ENTRIES {
+            1
+        } else {
+            workers
+        };
+        let count_rows_per = chunk_rows(n_samples, count_workers);
+        let count_elems_per = count_rows_per * n_features;
+
+        let mut counts: Vec<f64> = vec![0.0; table_len];
+        {
+            let mut accumulate = |table: &[u32]| {
+                for (acc, &v) in counts.iter_mut().zip(table.iter()) {
+                    *acc += v as f64;
+                }
+            };
+            // The `n_samples <= u32::MAX` arm is not about parallelism: a single
+            // table over MORE rows than that could overflow its `u32` counters,
+            // so such a fit takes the chunked branch (whose chunks are capped at
+            // `u32::MAX` rows by `chunk_rows`) even at one worker.
+            if count_workers == 1 && n_samples <= u32::MAX as usize {
+                let mut table = vec![0u32; table_len];
+                count_chunk::<F>(x_host, &class_of_row, n_features, &off, total, &mut table);
+                accumulate(&table);
+            } else {
+                let tables: Vec<Vec<u32>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = x_host
+                        .chunks(count_elems_per)
+                        .zip(class_of_row.chunks(count_rows_per))
+                        .map(|(chunk, cls)| {
+                            let off = &off;
+                            scope.spawn(move || {
+                                let mut table = vec![0u32; table_len];
+                                count_chunk::<F>(
+                                    chunk, cls, n_features, off, total, &mut table,
+                                );
+                                table
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("categorical_nb: pass-2 worker panicked"))
+                        .collect()
+                });
+                for table in &tables {
+                    accumulate(table);
+                }
+            }
+        }
+
+        // --- feature_log_prob_[j][c, k] = log((count + alpha) /
         //       (class_count[c] + alpha · n_categories_j))  (Pitfall 4 — the
-        //     denominator smoothing is alpha · n_categories_j). ---
+        //     denominator smoothing is alpha · n_categories_j). The ragged
+        //     per-feature matrices are sliced back out of the flat table. ---
         let alpha = self.alpha;
         let mut feature_log_prob_: Vec<Vec<f64>> = Vec::with_capacity(n_features);
         for j in 0..n_features {
             let n_cat_j = n_categories_[j];
-            // category_count[c * n_cat_j + k]
-            let mut count = vec![0.0f64; n_classes * n_cat_j];
-            for i in 0..n_samples {
-                let c = class_of_row[i];
-                let k = x_cat[i * n_features + j];
-                // k < n_cat_j by construction (n_categories_j >= observed_max+1).
-                count[c * n_cat_j + k] += 1.0;
-            }
+            let o = off[j];
             let mut flp = vec![0.0f64; n_classes * n_cat_j];
             for c in 0..n_classes {
                 let denom = class_count_[c] + alpha * n_cat_j as f64;
-                for k in 0..n_cat_j {
-                    flp[c * n_cat_j + k] = ((count[c * n_cat_j + k] + alpha) / denom).ln();
+                let src = &counts[c * total + o..c * total + o + n_cat_j];
+                let dst = &mut flp[c * n_cat_j..(c + 1) * n_cat_j];
+                for (d, &count) in dst.iter_mut().zip(src.iter()) {
+                    *d = ((count + alpha) / denom).ln();
                 }
             }
             feature_log_prob_.push(flp);
@@ -381,6 +666,42 @@ where
             _marker: std::marker::PhantomData,
             _state: PhantomData,
         })
+    }
+}
+
+impl<F> Fit<F> for CategoricalNB<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = CategoricalNB<F, Fitted>;
+
+    fn fit(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<CategoricalNB<F, Fitted>, AlgoError> {
+        let (n_samples, _n_features) = shape;
+        validate_geometry(x, shape)?;
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "categorical_nb",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        // The device buffers exist only because `Fit` is the shared typestate
+        // surface — this estimator's math is entirely host-side, so read both
+        // operands back once and run the SAME body as `fit_from_host_slice`.
+        let x_host = x.to_host(pool);
+        let y_host = y.to_host(pool);
+        self.fit_host(&x_host, &y_host, shape)
     }
 }
 

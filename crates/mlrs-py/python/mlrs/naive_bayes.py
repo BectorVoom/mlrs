@@ -206,7 +206,17 @@ class CategoricalNB(_BaseNB):
         self.output_type = output_type
 
     def fit(self, X, y):
-        xa, rows, cols = self._normalize(X)
+        # ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the
+        # Rust fit's validation pass reads every element of ``X`` anyway (it has
+        # to — a category index must be a non-negative integer), so it reports
+        # the same verdict from that pass and the PyO3 arm raises
+        # ``check_array``'s exact ``ValueError`` itself
+        # (``estimators/naive_bayes.rs::categorical_fit_err``). ``check_array``'s
+        # own scan is a second single-threaded trip over the whole matrix — the
+        # largest remaining cost of a CategoricalNB fit once the tabulation went
+        # row-major. ``y`` keeps its scan: it is 1-D and the label decode has no
+        # equivalent hand-off.
+        xa, rows, cols = self._normalize(X, ensure_all_finite=False)
         ya = self._normalize_y(y, dtype=GaussianNB._x_float(xa))
         obj = self._ext().CategoricalNB(
             self.alpha,

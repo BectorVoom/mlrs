@@ -22,6 +22,21 @@
 //!   - `build_rejects_bad_alpha` — `build()` rejects `alpha < 0`.
 //!   - `refit_releases_buffers` — the PoolStats no-leak gate across a re-fit.
 //!
+//! The PERF-rewrite gates (row-major two-pass tabulation + the no-upload
+//! host-slice fit arm) close the file:
+//!
+//!   - `parallel_passes_match_serial_reference` — the worker-chunked passes
+//!     reproduce a naive serial tabulation BITWISE.
+//!   - `worker_count_does_not_change_the_fit` — every `MLRS_CATNB_WORKERS`
+//!     setting yields bitwise-identical tables.
+//!   - `host_slice_fit_matches_device_fit` — the two fit entry points agree on
+//!     every fitted table.
+//!   - `fit_rejects_nonfinite_input` — NaN/±inf are rejected (the Python shim
+//!     now relies on this instead of `check_array`'s own scan).
+//!   - `rejection_reports_first_offender_regardless_of_chunking` — the error
+//!     names the earliest offender in row-major order, not the worker's.
+//!   - `host_slice_fit_guards_geometry` — the slice twin of `validate_geometry`.
+//!
 //! f64 cases carry the `skip_f64_with_log` capability gate (cpu runs; rocm skips,
 //! D-07). Per AGENTS.md §2 tests live in `crates/mlrs-algos/tests/`.
 
@@ -38,6 +53,7 @@ use mlrs_algos::typestate::{
     Fit as TypestateFit, PredictLabels as TypestatePredictLabels,
     PredictProba as TypestatePredictProba, Unfit,
 };
+use mlrs_backend::abflag;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -390,6 +406,268 @@ fn refit_releases_buffers() {
         assert!(
             live <= live_after_first,
             "live_bytes grew across re-construct+fit {k}: {live} > first {live_after_first} (WR-07 leak)"
+        );
+    }
+}
+
+// ===========================================================================
+// PERF-rewrite regression gates (row-major two-pass tabulation + the no-upload
+// host-slice fit arm). These lock the properties the rewrite could plausibly
+// break: the two fit entry points must agree, the WORKER-CHUNKED passes must
+// reproduce a naive serial tabulation, and the rejection messages must not
+// depend on how the rows were split across workers.
+// ===========================================================================
+
+/// A deterministic categorical matrix + labels, large enough (`n·d` well past
+/// the `PAR_MIN_ELEMS` threshold) that both fit passes run CHUNKED across the
+/// scoped worker pool. Category counts differ per feature so the ragged
+/// `n_categories_` / flat-offset indexing is genuinely exercised.
+fn par_dataset() -> (Vec<f64>, Vec<f64>, usize, usize, usize) {
+    const N: usize = 5_000;
+    const D: usize = 13;
+    const C: usize = 4;
+    let mut x = Vec::with_capacity(N * D);
+    let mut y = Vec::with_capacity(N);
+    // A cheap reproducible LCG — no dev-dependency on an RNG crate.
+    let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = |m: u64| {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (s >> 33) % m
+    };
+    for _ in 0..N {
+        for j in 0..D {
+            // Feature j spans j+2 categories -> a genuinely ragged table.
+            x.push(next((j + 2) as u64) as f64);
+        }
+        y.push(next(C as u64) as f64);
+    }
+    (x, y, N, D, C)
+}
+
+/// Every worker count produces BITWISE identical fitted tables.
+///
+/// This is the gate the `MLRS_CATNB_WORKERS` knob exists for: both passes split
+/// the rows across a scoped pool, so a reduction that dropped a chunk, mis-sized
+/// the last (short) chunk, or lost a per-worker count table would show up here
+/// and nowhere else. `1` pins the fully serial arm; the counts are exact
+/// integers accumulated in `f64`, so "close enough" is not the contract —
+/// equality is.
+#[test]
+fn worker_count_does_not_change_the_fit() {
+    let (x, y, n, d, _c) = par_dataset();
+
+    let reference = {
+        let _g = abflag::force("MLRS_CATNB_WORKERS", "1");
+        CategoricalNB::<f64>::builder()
+            .build::<f64>()
+            .expect("builds")
+            .fit_from_host_slice(&x, &y, (n, d))
+            .expect("serial fit")
+    };
+
+    for workers in ["2", "3", "5", "8", "64"] {
+        let _g = abflag::force("MLRS_CATNB_WORKERS", workers);
+        let got = CategoricalNB::<f64>::builder()
+            .build::<f64>()
+            .expect("builds")
+            .fit_from_host_slice(&x, &y, (n, d))
+            .expect("chunked fit");
+        assert_eq!(
+            got.n_categories(),
+            reference.n_categories(),
+            "n_categories_ changed at {workers} workers (pass-1 max reduction)"
+        );
+        assert_eq!(
+            got.feature_log_prob(),
+            reference.feature_log_prob(),
+            "feature_log_prob_ changed at {workers} workers (pass-2 table reduction)"
+        );
+        assert_eq!(
+            got.class_count(),
+            reference.class_count(),
+            "class_count_ changed at {workers} workers"
+        );
+    }
+}
+
+/// The chunked two-pass tabulation reproduces a NAIVE serial reference for both
+/// `n_categories_` (pass 1's per-feature max reduction) and `feature_log_prob_`
+/// (pass 2's flat per-worker count tables summed back together).
+#[test]
+fn parallel_passes_match_serial_reference() {
+    let (x, y, n, d, n_classes) = par_dataset();
+    let alpha = 1.0f64;
+
+    let clf = CategoricalNB::<f64>::builder().build::<f64>().expect("builds");
+    let fitted = clf
+        .fit_from_host_slice(&x, &y, (n, d))
+        .expect("chunked fit succeeds");
+
+    // --- Naive reference: per-feature max, then one count table per feature. ---
+    let mut n_cat_ref = vec![0usize; d];
+    for i in 0..n {
+        for j in 0..d {
+            n_cat_ref[j] = n_cat_ref[j].max(x[i * d + j] as usize + 1);
+        }
+    }
+    assert_eq!(
+        fitted.n_categories().expect("fitted"),
+        n_cat_ref.as_slice(),
+        "pass-1 per-feature max reduction diverged from the serial reference"
+    );
+
+    let mut class_count = vec![0.0f64; n_classes];
+    for i in 0..n {
+        class_count[y[i] as usize] += 1.0;
+    }
+    let flp = fitted.feature_log_prob().expect("fitted");
+    for j in 0..d {
+        let n_cat_j = n_cat_ref[j];
+        let mut count = vec![0.0f64; n_classes * n_cat_j];
+        for i in 0..n {
+            count[y[i] as usize * n_cat_j + x[i * d + j] as usize] += 1.0;
+        }
+        for c in 0..n_classes {
+            let denom = class_count[c] + alpha * n_cat_j as f64;
+            for k in 0..n_cat_j {
+                let want = ((count[c * n_cat_j + k] + alpha) / denom).ln();
+                let got = flp[j][c * n_cat_j + k];
+                assert_eq!(
+                    got, want,
+                    "feature_log_prob_[{j}][{c},{k}] diverged from the serial reference \
+                     (counts are exact integers in f64, so this must be BITWISE equal)"
+                );
+            }
+        }
+    }
+}
+
+/// The no-upload [`CategoricalNB::fit_from_host_slice`] arm and the `DeviceArray`
+/// [`TypestateFit::fit`] arm run the SAME body, so every fitted table must be
+/// BITWISE identical. This is the gate that keeps the PyO3 host-slice route
+/// honest against the typestate route the Rust callers use.
+#[test]
+fn host_slice_fit_matches_device_fit() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
+    if capability::skip_f64_with_log() {
+        println!("categorical_nb host-slice f64 backend={backend}: SKIPPED (no f64 support)");
+        return;
+    }
+    let (x, y, n, d, _c) = par_dataset();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y);
+
+    let via_device = TypestateFit::fit(
+        CategoricalNB::<f64>::builder().build::<f64>().expect("builds"),
+        &mut pool,
+        &x_dev,
+        Some(&y_dev),
+        (n, d),
+    )
+    .expect("device fit");
+    let via_host = CategoricalNB::<f64>::builder()
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&x, &y, (n, d))
+        .expect("host-slice fit");
+
+    assert_eq!(via_host.classes(), via_device.classes(), "classes_ diverged");
+    assert_eq!(
+        via_host.n_categories(),
+        via_device.n_categories(),
+        "n_categories_ diverged"
+    );
+    assert_eq!(
+        via_host.class_count(),
+        via_device.class_count(),
+        "class_count_ diverged"
+    );
+    assert_eq!(
+        via_host.class_log_prior(),
+        via_device.class_log_prior(),
+        "class_log_prior_ diverged"
+    );
+    assert_eq!(
+        via_host.feature_log_prob(),
+        via_device.feature_log_prob(),
+        "feature_log_prob_ diverged between the host-slice and device fit arms"
+    );
+}
+
+/// A NaN feature value is REJECTED. Before the rewrite `(round(v) - v).abs() >
+/// tol` was FALSE for NaN (every NaN comparison is false), so a NaN silently
+/// rounded to category `0`; the test-visible consequence was masked only by the
+/// Python shim's `check_array` scan. The scan now lives in this pass, so the
+/// rejection has to be real here.
+#[test]
+fn fit_rejects_nonfinite_input() {
+    for (label, bad) in [("NaN", f64::NAN), ("+inf", f64::INFINITY), ("-inf", f64::NEG_INFINITY)] {
+        let y: Vec<f64> = vec![0.0, 1.0];
+        let mut x: Vec<f64> = vec![0.0, 1.0, 1.0, 2.0];
+        x[3] = bad;
+        let got = CategoricalNB::<f64>::builder()
+            .build::<f64>()
+            .expect("builds")
+            .fit_from_host_slice(&x, &y, (2, 2))
+            .err();
+        assert!(
+            matches!(got, Some(AlgoError::InvalidCategoricalInput { .. })),
+            "a {label} feature value must be InvalidCategoricalInput, got {got:?}"
+        );
+    }
+}
+
+/// The reported offender is the FIRST one in ROW-MAJOR order, not whichever
+/// worker happened to finish first. Pass 1 is split over row chunks, so without
+/// the flat-index reduction the message would depend on the machine's core
+/// count — a genuinely irreproducible error.
+#[test]
+fn rejection_reports_first_offender_regardless_of_chunking() {
+    let (mut x, y, n, d, _c) = par_dataset();
+    // Two invalid values, deliberately far apart so they land in DIFFERENT row
+    // chunks on any plausible worker count.
+    let early = 7 * d + 1;
+    let late = (n - 5) * d + 2;
+    x[early] = -3.0;
+    x[late] = 0.25;
+
+    let got = CategoricalNB::<f64>::builder()
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&x, &y, (n, d))
+        .err();
+    match got {
+        Some(AlgoError::InvalidCategoricalInput { reason, .. }) => assert!(
+            reason.contains("-3"),
+            "must report the EARLIEST offender (-3 at flat index {early}), got: {reason}"
+        ),
+        other => panic!("expected InvalidCategoricalInput, got {other:?}"),
+    }
+}
+
+/// The host-slice arm carries the slice twin of the `validate_geometry` guard:
+/// a length that does not match `n_samples · n_features`, an empty geometry, or
+/// a mismatched `y` is a `ShapeMismatch`, never an out-of-bounds index.
+#[test]
+fn host_slice_fit_guards_geometry() {
+    let x: Vec<f64> = vec![0.0, 1.0, 1.0, 0.0];
+    let y: Vec<f64> = vec![0.0, 1.0];
+    let build = || CategoricalNB::<f64>::builder().build::<f64>().expect("builds");
+
+    for (label, xs, ys, shape) in [
+        ("x too short", &x[..3], &y[..], (2usize, 2usize)),
+        ("y too short", &x[..], &y[..1], (2, 2)),
+        ("zero rows", &x[..0], &y[..0], (0, 2)),
+        ("zero features", &x[..0], &y[..], (2, 0)),
+    ] {
+        let got = build().fit_from_host_slice(xs, ys, shape).err();
+        assert!(
+            matches!(got, Some(AlgoError::Prim(_))),
+            "{label} must be a geometry PrimError, got {got:?}"
         );
     }
 }

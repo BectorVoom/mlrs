@@ -477,7 +477,23 @@ where
     F: Float + CubeElement + Pod,
 {
     let y_host = y.to_host(pool);
-    let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
+    debug_assert_eq!(y_host.len(), n_samples, "decode_classes: y length mismatch");
+    decode_classes_host::<F>(estimator, &y_host)
+}
+
+/// The host-slice twin of [`decode_classes`] — the decode itself, with the
+/// device read-back left to the caller. `CategoricalNB::fit_from_host_slice`
+/// already holds `y` as a host slice (its whole fit is host-side), so it calls
+/// this directly rather than paying an upload + read-back to satisfy the
+/// `DeviceArray` signature.
+pub(crate) fn decode_classes_host<F>(
+    estimator: &'static str,
+    y_host: &[F],
+) -> Result<(Vec<i64>, Vec<usize>, usize), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let mut raw_labels: Vec<i64> = Vec::with_capacity(y_host.len());
     for &yv in y_host.iter() {
         let lf = host_to_f64(yv);
         let li = lf.round();

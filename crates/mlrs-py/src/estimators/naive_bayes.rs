@@ -59,9 +59,12 @@ use mlrs_algos::typestate::{
     PredictLogProba as TypestatePredictLogProba, PredictProba as TypestatePredictProba,
 };
 
-use crate::errors::{algo_err_to_py, build_err_to_py, dtype_mismatch, not_fitted};
+use crate::errors::{
+    algo_err_to_py, build_err_to_py, dtype_mismatch, nonfinite_input_err, not_fitted,
+};
 use crate::ingress::{
-    as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype,
+    as_f32, as_f64, capsule_to_array, float_dtype, host_slice_f32, host_slice_f64, validated_f32,
+    validated_f64, FloatDtype,
 };
 
 // ===========================================================================
@@ -889,6 +892,32 @@ impl PyComplementNB {
 // min_categories (None | int | list → MinCategories::{Infer,Uniform,PerFeature}).
 // ===========================================================================
 
+/// Map a `CategoricalNB::fit_from_host_slice` failure to Python, OWNING the
+/// NaN/inf rejection that `check_array` used to perform on this path.
+///
+/// `mlrs.naive_bayes.CategoricalNB.fit` passes `ensure_all_finite=False` because
+/// the Rust fit's pass-1 scan already reads every element of `X` and rejects a
+/// non-finite one (`scan_chunk` — `NaN` fails the integer test, `±inf` the range
+/// test). It relocates the check, it does not drop it: on ANY rejection this
+/// re-scans the operand for a non-finite value and, if one is present, raises
+/// `check_array`'s exact `ValueError` via [`nonfinite_input_err`] instead of
+/// mlrs' own message — so a NaN in `X` reports "Input contains NaN." exactly as
+/// before. That re-scan runs ONLY on the rejection path, where the input is
+/// already being thrown away, so it costs nothing on a successful fit.
+///
+/// The precedence also matches `check_array`, which scans the WHOLE matrix: a
+/// matrix holding both a NaN and (earlier) a negative category still reports the
+/// NaN, because the non-finite verdict is taken first here too.
+fn categorical_fit_err<T>(err: mlrs_algos::error::AlgoError, xh: &[T], dtype: &str) -> PyErr
+where
+    T: Copy + Into<f64>,
+{
+    if xh.iter().any(|v| !(*v).into().is_finite()) {
+        return nonfinite_input_err(xh, dtype);
+    }
+    algo_err_to_py(err)
+}
+
 /// sklearn-compatible `CategoricalNB`.
 #[pyclass(name = "CategoricalNB")]
 pub struct PyCategoricalNB {
@@ -991,12 +1020,19 @@ impl PyCategoricalNB {
             ),
             _ => return Err(not_fitted("categorical_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm: `CategoricalNB`'s fit is entirely host-side (it
+        // validates + tabulates the categorical encoding into ragged host-f64
+        // tables — no device kernel), so routing the operands through a
+        // `DeviceArray` bought a `from_host` copy in and a `to_host` copy straight
+        // back out and nothing else. `host_slice_*` runs the SAME hard-reject
+        // bridge validation (`validate_f32`/`validate_f64`: no nulls, no
+        // sliced/offset views) and BORROWS the Arrow values instead. This is the
+        // `Ridge::fit_from_host_slice` precedent — no pool handle is taken at all.
         let fitted = py.detach(|| -> PyResult<AnyCategoricalNB> {
-            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
                     let est = CategoricalNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -1005,14 +1041,15 @@ impl PyCategoricalNB {
                         .min_categories(min_categories)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(xh, yh, (rows, cols))
+                        .map_err(|e| categorical_fit_err(e, xh, "float32"))?;
                     Ok(AnyCategoricalNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
                     let est = CategoricalNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -1021,8 +1058,9 @@ impl PyCategoricalNB {
                         .min_categories(min_categories)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(xh, yh, (rows, cols))
+                        .map_err(|e| categorical_fit_err(e, xh, "float64"))?;
                     Ok(AnyCategoricalNB::F64(fitted))
                 }
             }
