@@ -455,7 +455,11 @@ fn gram_xty_tiled_matches_blocked_bitwise_f32() {
         let y: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
 
         let (tiled_gram, tiled_xty) = {
-            let _g = mlrs_backend::abflag::clear("LR_GRAM_BLOCKED");
+            // FORCED, not defaulted: `gram_path` sends `d < 128` to the blocked
+            // arm, so relying on the default here would compare the blocked
+            // kernel against itself and pass vacuously at every shape in
+            // `SHAPES` (all have `d <= 100`).
+            let _g = mlrs_backend::abflag::force("LR_GRAM_TILED", "1");
             run_gram_case::<f32>(&x, &y, n, d)
         };
         let (blocked_gram, blocked_xty) = {
@@ -471,6 +475,24 @@ fn gram_xty_tiled_matches_blocked_bitwise_f32() {
             tiled_xty, blocked_xty,
             "tiled/blocked xty differ at n={n} d={d}"
         );
+
+        // f64 is a shipped element width for this kernel, and it is the one the
+        // oracle suites above exercise most strictly — cover it here too rather
+        // than assuming the f32 agreement generalises across the element type.
+        if !capability::skip_f64_with_log() {
+            let x64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            let y64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+            let (t_gram, t_xty) = {
+                let _g = mlrs_backend::abflag::force("LR_GRAM_TILED", "1");
+                run_gram_case::<f64>(&x64, &y64, n, d)
+            };
+            let (b_gram, b_xty) = {
+                let _g = mlrs_backend::abflag::force("LR_GRAM_BLOCKED", "1");
+                run_gram_case::<f64>(&x64, &y64, n, d)
+            };
+            assert_eq!(t_gram, b_gram, "f64 tiled/blocked gram differ at n={n} d={d}");
+            assert_eq!(t_xty, b_xty, "f64 tiled/blocked xty differ at n={n} d={d}");
+        }
     }
 }
 
@@ -494,7 +516,9 @@ fn gram_xty_centered_tiled_matches_blocked_bitwise_f32() {
         let y: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.2 - 1.0 + 2.0).collect();
 
         let tiled = {
-            let _g = mlrs_backend::abflag::clear("LR_GRAM_BLOCKED");
+            // Forced for the same reason as above — `CENTERED_SHAPES` is also
+            // entirely below the `TILED_MIN_DD` dispatch threshold.
+            let _g = mlrs_backend::abflag::force("LR_GRAM_TILED", "1");
             run_centered_case::<f32>(&x, &y, n, d)
         };
         let blocked = {

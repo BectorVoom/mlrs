@@ -310,7 +310,14 @@ fn gram_path(dd: usize) -> GramPath {
         if crate::abflag::var("LR_GRAM_BLOCKED").is_some() {
             return GramPath::Blocked;
         }
-        GramPath::Tiled
+        if crate::abflag::var("LR_GRAM_TILED").is_some() {
+            return GramPath::Tiled;
+        }
+        if dd >= TILED_MIN_DD {
+            GramPath::Tiled
+        } else {
+            GramPath::Blocked
+        }
     }
 }
 
@@ -324,6 +331,49 @@ fn gram_path(dd: usize) -> GramPath {
 #[cfg_attr(feature = "cpu", allow(dead_code))]
 const BLOCKED_MAX_DD: usize = 256 * 256;
 
+/// `d²` at or above which [`GramPath::Tiled`] replaces [`GramPath::Blocked`].
+///
+/// The two kernels trade the SAME two quantities in opposite directions, and
+/// which one binds depends only on `d`:
+///
+/// | | loads issued | work items (parallelism) |
+/// |---|---|---|
+/// | `Blocked` (1×8) | `≈ 0.5625 · d²` per row | `≈ d²/16` groups |
+/// | `Tiled` (4×4) | `≈ 0.25 · d²` per row | `≈ d²/32` tiles |
+///
+/// So the tile issues 2.25× fewer loads for HALF the work items. Below the
+/// crossover the reduction is not bandwidth-bound at all — a `d = 16` Gram
+/// hands out ten tiles, nowhere near enough to hide memory latency — and the
+/// coarser granularity loses; above it the load count is the whole cost and the
+/// tile wins by very close to that 2.25×.
+///
+/// Measured on the local wgpu adapter (`gram_perf_test.rs`, `n = 100 000`,
+/// min-of-9, THREE independent runs — this adapter swings ±30% between runs, so
+/// a single sweep is not enough to place a threshold):
+///
+/// | `d` | tiled ÷ blocked (3 runs) | verdict |
+/// |---|---|---|
+/// | 16 | 0.86 / 1.10 / 1.10 | wash |
+/// | 32 | 0.77 / 1.05 / 0.88 | wash |
+/// | 64 | 0.66 / 0.61 / 0.60 | **loses, consistently** |
+/// | 128 | 1.34 / 1.20 / 1.21 | **wins, consistently** |
+/// | 256 | 2.12 / 1.42 / 1.76 | **wins, consistently** |
+///
+/// The crossover sits between 64 and 128, hence `d = 128`. (A first single-run
+/// sweep read `d = 128` at 1.52× and a second at 0.98×; neither was
+/// reproducible on its own, which is why the table above is the one to trust.)
+///
+/// **This constant is calibrated on ONE adapter.** The mechanism
+/// (parallelism-bound below, load-bound above) is architectural, but the `d`
+/// where they cross is not — a device with more SMs starves at a larger `d`,
+/// one with more bandwidth crosses later. `LR_GRAM_TILED=1` / `LR_GRAM_BLOCKED=1`
+/// force either arm so the crossover can be re-swept per backend
+/// (`gram_perf_test.rs` does exactly that), and until a cuda sweep exists this
+/// threshold is deliberately conservative: it only diverges from the previously
+/// shipped behaviour where a measurement supports it.
+#[cfg_attr(feature = "cpu", allow(dead_code))]
+const TILED_MIN_DD: usize = 128 * 128;
+
 /// `(lower-triangle tile count, units per cube)` for
 /// [`mlrs_kernels::gram::gram_xty_tiled`] at this `d`.
 ///
@@ -333,9 +383,20 @@ const BLOCKED_MAX_DD: usize = 256 * 256;
 /// 256-unit cube would leave 246 of them with no tile at all). Rounded up to a
 /// 32-unit warp multiple and capped at 256, which is where a `d = 256` fit's
 /// 2080 tiles already fold to 9 passes.
+/// `MLRS_GRAM_TILE_DIM` overrides the width for on-target A/B — the cube shape
+/// is the one parameter here whose best value is a property of the ADAPTER
+/// (warp/wavefront width, register file, scheduler) rather than of the problem,
+/// so it must be swept on the machine that will run it rather than derived.
 fn tile_launch(d: usize) -> (u32, u32) {
     let t = (d as u32).div_ceil(GRAM_TILE);
     let ntiles = t * (t + 1) / 2;
+    if let Some(v) = crate::abflag::var("MLRS_GRAM_TILE_DIM") {
+        if let Ok(dim) = v.parse::<u32>() {
+            if dim > 0 {
+                return (ntiles, dim);
+            }
+        }
+    }
     let dim = ntiles.min(256).div_ceil(32) * 32;
     (ntiles, dim.max(32))
 }
