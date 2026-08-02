@@ -67,8 +67,17 @@ def sh(cmd):
 
 sh(f"cd /content/mlrs && git fetch origin {BRANCH} && "
    f"git checkout -B {BRANCH} origin/{BRANCH} && git log --oneline -1")
-sh("cd /content/mlrs && MLRS_POS_REPS=9 cargo test -p mlrs-algos --release "
-   "--features cuda --test ridge_positive_perf_test -- --ignored --nocapture")
+
+RUN = ("cd /content/mlrs && MLRS_POS_REPS=9 {env} cargo test -p mlrs-algos --release "
+       "--features cuda --test ridge_positive_perf_test -- --ignored --nocapture")
+
+# A/B the two Gram formations on the ACTUAL target. The local integrated
+# adapter disagrees with itself across d here, so neither arm may be assumed.
+for label, env in [("tiled 4x4 (new default)", ""),
+                   ("blocked 1x8 (previous)", "LR_GRAM_BLOCKED=1"),
+                   ("host arm forced", "MLRS_RIDGE_GRAM_HOST=1")]:
+    print(f"\n===== {label} =====")
+    sh(RUN.format(env=env))
 """
 
 if __name__ == "__main__":

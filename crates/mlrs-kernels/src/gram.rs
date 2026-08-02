@@ -219,6 +219,223 @@ pub fn gram_xty_blocked<F: Float + CubeElement>(
     }
 }
 
+/// Output tile edge one unit of [`gram_xty_tiled`] owns, in each of the two
+/// Gram axes.
+///
+/// A `4 × 4` tile turns 8 loads per row into 16 multiply-adds. That ratio is
+/// NOT why it is fast, though — [`gram_xty_blocked`]'s `1 × 8` tile already
+/// reaches 1.125 loads/MAC, and both kernels are bound by something else
+/// entirely: the number of times the cube re-streams its row block from
+/// memory, which is `ceil(tiles / CUBE_DIM)`. Squaring the tile squares the
+/// slot coverage per pass, so at `d = 256` the lower-triangle tile count drops
+/// from `d · d/8 = 8192` to `T(T+1)/2 = 2080` with `T = d/4` — 4× fewer passes
+/// over the design, on top of the 2× the wider cube buys.
+pub const GRAM_TILE: u32 = 4;
+
+/// Row-blocked partial Gram (`d×d`) + Xty (`d`) accumulation with a
+/// TWO-DIMENSIONAL register tile — one cube per row block, no shared memory
+/// and no barriers.
+///
+/// ## What changes against [`gram_xty_blocked`]
+/// That kernel gives each unit ONE Gram row and eight consecutive columns of
+/// it, so a cube of 64 units covers 64 of the `d · ceil(d/8)` slot groups per
+/// pass and has to re-read the whole row block `ceil(d · ceil(d/8) / 64)`
+/// times — 128 times at `d = 256`. Since the reduction is memory-bound, that
+/// re-streaming IS the cost: 128 passes over a 102 MiB design is 13 GiB of
+/// traffic to produce a 256 KiB Gram.
+///
+/// Here a unit owns a [`GRAM_TILE`]`²` SQUARE of the Gram instead, and the
+/// units are handed only the tiles that intersect the lower triangle
+/// (`ti ≥ tj`), so a `d = 256` fit walks 2080 tiles rather than 8192 groups.
+/// With a 256-unit cube that is 8 passes instead of 128.
+///
+/// The tile index is decoded to `(ti, tj)` by advancing a running triangular
+/// number rather than by `sqrt` — `t` only ever increases within a unit, so the
+/// walk is `O(T + tiles/CUBE_DIM)` integer adds in total, and it stays exact
+/// (and stays off the f64-transcendental paths some adapters lack).
+///
+/// `xmean` / `ymean` are subtracted as the operands are read, exactly as in
+/// [`gram_xty_blocked`]; pass all-zero means for the raw Gram. `Xᵀy` is
+/// accumulated by the DIAGONAL tiles only (tile `(ti, ti)` owns columns
+/// `4·ti … 4·ti+3`, which partitions the columns exactly once), so it costs
+/// `T` extra row-block reads out of `T(T+1)/2` rather than a whole extra pass.
+///
+/// Only the lower triangle is written; `gram_xty_reduce_partials` with
+/// `lower_only = 1` mirrors the rest.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn gram_xty_tiled<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    xmean: &Array<F>,
+    ymean: &Array<F>,
+    pgram: &mut Array<F>,
+    pxty: &mut Array<F>,
+    n: u32,
+    d: u32,
+    nblocks: u32,
+    rows_per_block: u32,
+    ntiles: u32,
+) {
+    let bidx = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as u32;
+    if bidx < nblocks {
+        let stride = CUBE_DIM_X;
+        let start = bidx * rows_per_block;
+        let mut end = start + rows_per_block;
+        if end > n {
+            end = n;
+        }
+        let gbase = bidx * d * d;
+        let my = ymean[0];
+
+        // Running triangular decode: `ti` is the tile row and `tri` is
+        // `ti·(ti+1)/2`, the index of that row's first tile. `t` is
+        // non-decreasing within this unit, so the inner advance is amortized.
+        let mut ti = 0u32;
+        let mut tri = 0u32;
+
+        let mut t = UNIT_POS as u32;
+        while t < ntiles {
+            while tri + ti + 1u32 <= t {
+                tri += ti + 1u32;
+                ti += 1u32;
+            }
+            let tj = t - tri;
+            let a0 = ti * 4u32;
+            let b0 = tj * 4u32;
+            let mut ca = d - a0;
+            if ca > 4u32 {
+                ca = 4u32;
+            }
+            let mut cb = d - b0;
+            if cb > 4u32 {
+                cb = 4u32;
+            }
+
+            if ca == 4u32 && cb == 4u32 {
+                let ma0 = xmean[a0 as usize];
+                let ma1 = xmean[(a0 + 1u32) as usize];
+                let ma2 = xmean[(a0 + 2u32) as usize];
+                let ma3 = xmean[(a0 + 3u32) as usize];
+                let mb0 = xmean[b0 as usize];
+                let mb1 = xmean[(b0 + 1u32) as usize];
+                let mb2 = xmean[(b0 + 2u32) as usize];
+                let mb3 = xmean[(b0 + 3u32) as usize];
+
+                let mut c00 = F::new(0.0_f32);
+                let mut c01 = F::new(0.0_f32);
+                let mut c02 = F::new(0.0_f32);
+                let mut c03 = F::new(0.0_f32);
+                let mut c10 = F::new(0.0_f32);
+                let mut c11 = F::new(0.0_f32);
+                let mut c12 = F::new(0.0_f32);
+                let mut c13 = F::new(0.0_f32);
+                let mut c20 = F::new(0.0_f32);
+                let mut c21 = F::new(0.0_f32);
+                let mut c22 = F::new(0.0_f32);
+                let mut c23 = F::new(0.0_f32);
+                let mut c30 = F::new(0.0_f32);
+                let mut c31 = F::new(0.0_f32);
+                let mut c32 = F::new(0.0_f32);
+                let mut c33 = F::new(0.0_f32);
+
+                let mut i = start;
+                while i < end {
+                    let base = i * d;
+                    let xa0 = x[(base + a0) as usize] - ma0;
+                    let xa1 = x[(base + a0 + 1u32) as usize] - ma1;
+                    let xa2 = x[(base + a0 + 2u32) as usize] - ma2;
+                    let xa3 = x[(base + a0 + 3u32) as usize] - ma3;
+                    let xb0 = x[(base + b0) as usize] - mb0;
+                    let xb1 = x[(base + b0 + 1u32) as usize] - mb1;
+                    let xb2 = x[(base + b0 + 2u32) as usize] - mb2;
+                    let xb3 = x[(base + b0 + 3u32) as usize] - mb3;
+                    c00 += xa0 * xb0;
+                    c01 += xa0 * xb1;
+                    c02 += xa0 * xb2;
+                    c03 += xa0 * xb3;
+                    c10 += xa1 * xb0;
+                    c11 += xa1 * xb1;
+                    c12 += xa1 * xb2;
+                    c13 += xa1 * xb3;
+                    c20 += xa2 * xb0;
+                    c21 += xa2 * xb1;
+                    c22 += xa2 * xb2;
+                    c23 += xa2 * xb3;
+                    c30 += xa3 * xb0;
+                    c31 += xa3 * xb1;
+                    c32 += xa3 * xb2;
+                    c33 += xa3 * xb3;
+                    i += 1u32;
+                }
+
+                let r0 = gbase + a0 * d + b0;
+                pgram[r0 as usize] = c00;
+                pgram[(r0 + 1u32) as usize] = c01;
+                pgram[(r0 + 2u32) as usize] = c02;
+                pgram[(r0 + 3u32) as usize] = c03;
+                let r1 = r0 + d;
+                pgram[r1 as usize] = c10;
+                pgram[(r1 + 1u32) as usize] = c11;
+                pgram[(r1 + 2u32) as usize] = c12;
+                pgram[(r1 + 3u32) as usize] = c13;
+                let r2 = r1 + d;
+                pgram[r2 as usize] = c20;
+                pgram[(r2 + 1u32) as usize] = c21;
+                pgram[(r2 + 2u32) as usize] = c22;
+                pgram[(r2 + 3u32) as usize] = c23;
+                let r3 = r2 + d;
+                pgram[r3 as usize] = c30;
+                pgram[(r3 + 1u32) as usize] = c31;
+                pgram[(r3 + 2u32) as usize] = c32;
+                pgram[(r3 + 3u32) as usize] = c33;
+            } else {
+                // Ragged edge tile (`d % 4 != 0`): at most one tile row and one
+                // tile column of the grid, walked a slot at a time.
+                let mut k = 0u32;
+                while k < ca {
+                    let mk = xmean[(a0 + k) as usize];
+                    let mut l = 0u32;
+                    while l < cb {
+                        let ml = xmean[(b0 + l) as usize];
+                        let mut acc = F::new(0.0_f32);
+                        let mut i = start;
+                        while i < end {
+                            let base = i * d;
+                            acc += (x[(base + a0 + k) as usize] - mk)
+                                * (x[(base + b0 + l) as usize] - ml);
+                            i += 1u32;
+                        }
+                        pgram[(gbase + (a0 + k) * d + b0 + l) as usize] = acc;
+                        l += 1u32;
+                    }
+                    k += 1u32;
+                }
+            }
+
+            // `Xᵀy` rides on the diagonal tiles: tile `(ti, ti)` owns exactly
+            // columns `a0 … a0+ca-1`, and the diagonal tiles partition the
+            // columns, so every column is accumulated once and only once.
+            if ti == tj {
+                let mut k = 0u32;
+                while k < ca {
+                    let mk = xmean[(a0 + k) as usize];
+                    let mut acc = F::new(0.0_f32);
+                    let mut i = start;
+                    while i < end {
+                        acc += (x[(i * d + a0 + k) as usize] - mk) * (y[i as usize] - my);
+                        i += 1u32;
+                    }
+                    pxty[(bidx * d + a0 + k) as usize] = acc;
+                    k += 1u32;
+                }
+            }
+
+            t += stride;
+        }
+    }
+}
+
 /// Row-blocked partial column sums of `x` (`d`) and of `y` (1) — the mean pass
 /// [`gram_xty_blocked`]'s fused centering needs, in the SAME cube-per-row-block
 /// shape.

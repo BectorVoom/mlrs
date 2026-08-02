@@ -427,3 +427,84 @@ fn gram_xty_rejects_bad_geometry() {
     x_dev.release_into(&mut pool);
     y_dev.release_into(&mut pool);
 }
+
+/// The 2-D register-tiled kernel must agree with the 1×8 register-blocked one
+/// it replaced, BIT FOR BIT.
+///
+/// This is a stronger claim than an oracle tolerance and it is deliberate: the
+/// two kernels differ only in which unit owns which output slot, not in how any
+/// single slot is summed. Every `gram[a][b]` is still one register chain walked
+/// over the block's rows in ascending order, the row blocking
+/// (`row_blocking`) is shared, and `gram_xty_reduce_partials` folds the same
+/// partials in the same order. So the answer must be identical, and an
+/// `assert_eq` here catches a re-associated accumulation — the one refactor
+/// that would silently move results inside the oracle band while breaking the
+/// bitwise-reproducibility property the rest of the suite relies on.
+///
+/// Also the only test that pins the TILE geometry: a wrong triangular decode,
+/// a missed ragged edge (`d % 4 != 0`), or an `Xᵀy` accumulated by the wrong
+/// tiles shows up as a mismatch rather than as a tolerance drift.
+#[test]
+fn gram_xty_tiled_matches_blocked_bitwise_f32() {
+    if capability::active_backend_name() == "cpu" {
+        println!("gram_xty tiled/blocked A/B backend=cpu: SKIPPED (gram_path is the gemm arm)");
+        return;
+    }
+    for &(n, d) in SHAPES {
+        let x: Vec<f32> = (0..n * d).map(|i| ((i % 17) as f32) * 0.1 - 0.8).collect();
+        let y: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.2 - 1.0).collect();
+
+        let (tiled_gram, tiled_xty) = {
+            let _g = mlrs_backend::abflag::clear("LR_GRAM_BLOCKED");
+            run_gram_case::<f32>(&x, &y, n, d)
+        };
+        let (blocked_gram, blocked_xty) = {
+            let _g = mlrs_backend::abflag::force("LR_GRAM_BLOCKED", "1");
+            run_gram_case::<f32>(&x, &y, n, d)
+        };
+
+        assert_eq!(
+            tiled_gram, blocked_gram,
+            "tiled/blocked gram differ at n={n} d={d}"
+        );
+        assert_eq!(
+            tiled_xty, blocked_xty,
+            "tiled/blocked xty differ at n={n} d={d}"
+        );
+    }
+}
+
+/// The same bitwise A/B for the FUSED-CENTERING pair, which is the entry point
+/// `Ridge(positive=True)` actually takes. Centering is folded into the tile
+/// build, so a mean applied to the wrong axis of a `4 × 4` tile (the `ma`/`mb`
+/// swap) is invisible on a symmetric fixture — hence the asymmetric column
+/// offsets below.
+#[test]
+fn gram_xty_centered_tiled_matches_blocked_bitwise_f32() {
+    if skip_fused_centering() {
+        return;
+    }
+    for &(n, d) in CENTERED_SHAPES {
+        // Per-COLUMN offsets: a `ma`/`mb` swap inside the tile cancels exactly
+        // when every column shares one mean, so the offsets must differ by
+        // column for this test to have any power.
+        let x: Vec<f32> = (0..n * d)
+            .map(|i| ((i % 17) as f32) * 0.1 - 0.8 + 3.0 + (i % d) as f32)
+            .collect();
+        let y: Vec<f32> = (0..n).map(|i| ((i % 11) as f32) * 0.2 - 1.0 + 2.0).collect();
+
+        let tiled = {
+            let _g = mlrs_backend::abflag::clear("LR_GRAM_BLOCKED");
+            run_centered_case::<f32>(&x, &y, n, d)
+        };
+        let blocked = {
+            let _g = mlrs_backend::abflag::force("LR_GRAM_BLOCKED", "1");
+            run_centered_case::<f32>(&x, &y, n, d)
+        };
+
+        assert_eq!(tiled.0, blocked.0, "x_mean differs at n={n} d={d}");
+        assert_eq!(tiled.1, blocked.1, "y_mean differs at n={n} d={d}");
+        assert_eq!(tiled.2, blocked.2, "centered gram differs at n={n} d={d}");
+        assert_eq!(tiled.3, blocked.3, "centered xty differs at n={n} d={d}");
+    }
+}

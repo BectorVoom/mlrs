@@ -42,7 +42,7 @@ use mlrs_core::PrimError;
 use mlrs_core::f64_to_host;
 use mlrs_kernels::gram::{
     col_sums_blocked, col_sums_reduce, gram_xty_blocked, gram_xty_reduce_partials, gram_xty_shared,
-    GRAM_REG_TILE,
+    gram_xty_tiled, GRAM_REG_TILE, GRAM_TILE,
 };
 
 use crate::device_array::DeviceArray;
@@ -82,7 +82,7 @@ where
     validate_geometry(x.len(), (n, d), y.len())?;
 
     match gram_path(d * d) {
-        GramPath::Blocked => gram_xty_blocked_impl::<F>(pool, x, y, None, n, d),
+        GramPath::Tiled | GramPath::Blocked => gram_xty_blocked_impl::<F>(pool, x, y, None, n, d),
         GramPath::Shared => gram_xty_shared_impl::<F>(pool, x, y, n, d),
         GramPath::Gemm => gram_xty_gemm_fallback::<F>(pool, x, y, n, d),
     }
@@ -132,7 +132,9 @@ where
     }
 
     match gram_path(d * d) {
-        GramPath::Blocked => gram_xty_blocked_impl::<F>(pool, x, y, Some(means), n, d),
+        GramPath::Tiled | GramPath::Blocked => {
+            gram_xty_blocked_impl::<F>(pool, x, y, Some(means), n, d)
+        }
         // No fused kernel on these arms: center first, then form the Gram of
         // the centered copy — the pre-fusion composition, same answer.
         GramPath::Shared | GramPath::Gemm => {
@@ -173,7 +175,7 @@ where
 {
     validate_geometry(x.len(), (n, d), y.len())?;
 
-    if gram_path(d * d) != GramPath::Blocked {
+    if !matches!(gram_path(d * d), GramPath::Tiled | GramPath::Blocked) {
         let (xc, xm) = crate::prims::center::center_columns::<F>(pool, x, (n, d))?;
         let (yc, ym) = crate::prims::center::center_columns::<F>(pool, y, (n, 1))?;
         xc.release_into(pool);
@@ -258,7 +260,11 @@ fn row_blocking(n: usize, d: usize) -> (usize, usize) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "cpu", allow(dead_code))]
 enum GramPath {
-    /// [`gram_xty_blocked_impl`] — the register-blocked, barrier-free default.
+    /// [`mlrs_kernels::gram::gram_xty_tiled`] — the 2-D register-tiled,
+    /// barrier-free default.
+    Tiled,
+    /// [`mlrs_kernels::gram::gram_xty_blocked`] — the previous 1×8 tile, kept
+    /// as the `LR_GRAM_BLOCKED=1` A/B arm.
     Blocked,
     /// [`gram_xty_shared_impl`] — the previous shared-memory kernel, kept as
     /// the `LR_GRAM_SHARED=1` A/B arm.
@@ -298,11 +304,13 @@ fn gram_path(dd: usize) -> GramPath {
                 GramPath::Gemm
             };
         }
-        if dd <= BLOCKED_MAX_DD {
-            GramPath::Blocked
-        } else {
-            GramPath::Gemm
+        if dd > BLOCKED_MAX_DD {
+            return GramPath::Gemm;
         }
+        if crate::abflag::var("LR_GRAM_BLOCKED").is_some() {
+            return GramPath::Blocked;
+        }
+        GramPath::Tiled
     }
 }
 
@@ -315,6 +323,22 @@ fn gram_path(dd: usize) -> GramPath {
 /// into the starved-GEMM formation.
 #[cfg_attr(feature = "cpu", allow(dead_code))]
 const BLOCKED_MAX_DD: usize = 256 * 256;
+
+/// `(lower-triangle tile count, units per cube)` for
+/// [`mlrs_kernels::gram::gram_xty_tiled`] at this `d`.
+///
+/// The cube is sized to the WORK, not to a fixed width: the kernel's cost is
+/// `ceil(ntiles / CUBE_DIM)` re-streams of the row block, so a cube wider than
+/// `ntiles` buys nothing and only idles units (`d = 16` has ten tiles — a
+/// 256-unit cube would leave 246 of them with no tile at all). Rounded up to a
+/// 32-unit warp multiple and capped at 256, which is where a `d = 256` fit's
+/// 2080 tiles already fold to 9 passes.
+fn tile_launch(d: usize) -> (u32, u32) {
+    let t = (d as u32).div_ceil(GRAM_TILE);
+    let ntiles = t * (t + 1) / 2;
+    let dim = ntiles.min(256).div_ceil(32) * 32;
+    (ntiles, dim.max(32))
+}
 
 /// Units per cube of the register-blocked kernel.
 ///
@@ -380,35 +404,56 @@ where
     let xty = pool.acquire(d * size_of::<F>());
 
     let client = pool.client().clone();
-    let groups_per_row = (d as u32).div_ceil(GRAM_REG_TILE);
 
     // Stage 1: one cube per row block, register accumulators, no barriers.
-    // SAFETY: validated element counts (caller); the kernel bounds-checks the
-    // cube id against `nblocks`, clamps each block's row range to `n`, and
-    // walks slot groups only while `g < d · groups_per_row`.
+    // SAFETY: validated element counts (caller); both kernels bounds-check the
+    // cube id against `nblocks`, clamp each block's row range to `n`, and walk
+    // only their own slot/tile space.
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
     let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
     let xm_arg = unsafe { ArrayArg::from_raw_parts(xmean.handle().clone(), d) };
     let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.handle().clone(), 1) };
     let pg_arg = unsafe { ArrayArg::from_raw_parts(pgram.clone(), pgram_len) };
     let px_arg = unsafe { ArrayArg::from_raw_parts(pxty.clone(), pxty_len) };
-    let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
-    gram_xty_blocked::launch::<F, ActiveRuntime>(
-        &client,
-        cc,
-        cd,
-        x_arg,
-        y_arg,
-        xm_arg,
-        ym_arg,
-        pg_arg,
-        px_arg,
-        n as u32,
-        d as u32,
-        nb as u32,
-        rpb as u32,
-        groups_per_row,
-    );
+    if gram_path(dd) == GramPath::Blocked {
+        let groups_per_row = (d as u32).div_ceil(GRAM_REG_TILE);
+        let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
+        gram_xty_blocked::launch::<F, ActiveRuntime>(
+            &client,
+            cc,
+            cd,
+            x_arg,
+            y_arg,
+            xm_arg,
+            ym_arg,
+            pg_arg,
+            px_arg,
+            n as u32,
+            d as u32,
+            nb as u32,
+            rpb as u32,
+            groups_per_row,
+        );
+    } else {
+        let (ntiles, dim) = tile_launch(d);
+        let (cc, cd) = launch_cubes(nb, dim);
+        gram_xty_tiled::launch::<F, ActiveRuntime>(
+            &client,
+            cc,
+            cd,
+            x_arg,
+            y_arg,
+            xm_arg,
+            ym_arg,
+            pg_arg,
+            px_arg,
+            n as u32,
+            d as u32,
+            nb as u32,
+            rpb as u32,
+            ntiles,
+        );
+    }
 
     // Stage 2: fold the (small, capped) nblocks partials.
     let pg_arg2 = unsafe { ArrayArg::from_raw_parts(pgram.clone(), pgram_len) };
