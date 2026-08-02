@@ -82,7 +82,36 @@ pub const CHOLESKY_MAX_DIM: usize = CHOLESKY_WIDE_MAX_DIM as usize;
 /// narrow one, so the two can be A/B'd and compared against each other on an
 /// order both support (`cholesky_test.rs` does exactly that — without the knob
 /// the arms cover disjoint ranges and no test could compare them). Read through
-/// [`crate::abflag`], never `std::env`.
+/// [`crate::abflag`], never `std::env`. Note that `=0` is not a symmetric
+/// override: it pins the arm that CANNOT do `n > MAX_DIM`, so it turns those
+/// orders back into the [`PrimError::NotSquare`] rejection they used to be. Use
+/// it to force the narrow arm at a small order, not to sweep a ladder.
+///
+/// ## The threshold is a correctness boundary, not a measured crossover
+///
+/// `MAX_DIM` is where the narrow kernel STOPS WORKING. Nobody has shown it is
+/// where the narrow kernel stops WINNING, and one measurement says it is not:
+/// on a Colab T4 (min-of-9, whole `Ridge()` fit, upload included) forcing the
+/// wide arm below the cap gave
+///
+/// | shape | narrow | wide | |
+/// |---|---|---|---|
+/// | 10 000 × 64 | 4.43 ms | 2.37 ms | **1.87×** |
+/// | 10 000 × 16 | 0.96 ms | 0.87 ms | 1.10× |
+/// | 100 000 × 16 | 6.01 ms | 5.91 ms | wash |
+/// | 100 000 × 64 | 30.7 ms | 29.6 ms | wash (upload-bound) |
+///
+/// which is what the schedules predict: at `d = 64` the narrow arm is 43 k
+/// DEPENDENT operations on one lane, and the wide arm spreads the same work
+/// over 64.
+///
+/// It is deliberately not shipped. That is a single-adapter number, and this
+/// codebase has been burned before by gating a kernel on one backend's
+/// measurement; the local wgpu adapter could not corroborate it (the `=0`
+/// direction cannot run the `d > 64` rungs at all, and the box was too noisy for
+/// the rest — the same host arm swung 3× between interleaved runs). The lever is
+/// real, the evidence is one machine, and the knob is there for whoever sweeps
+/// the second one.
 fn use_wide_kernel(n: usize) -> bool {
     match crate::abflag::var("MLRS_CHOLESKY_WIDE").as_deref() {
         Some("0") => false,

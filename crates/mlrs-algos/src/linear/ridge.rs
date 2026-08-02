@@ -148,6 +148,41 @@
 //! means and the `√w` row rescale have no `center_columns` equivalent). The
 //! unweighted path — the default — never pays it.
 //!
+//! ## Measured: `Ridge()` on a Colab T4 (RIDGE-DEFAULT-CUDA, f32, min-of-9,
+//! ## upload INSIDE the timer — `results/ridge_default_t4_dd37f93.log`)
+//!
+//! Whole-fit, device arm against mlrs's own host arm forced on the same VM (a
+//! 2-vCPU Xeon @2GHz — see the caveat below):
+//!
+//! | shape | host arm | device arm | |
+//! |---|---|---|---|
+//! | 1 000 × 8 | 0.078 ms | 0.400 ms | 0.20× |
+//! | 10 000 × 16 | 1.10 ms | 0.96 ms | 1.15× |
+//! | 10 000 × 64 | 6.37 ms | 4.43 ms | 1.44× |
+//! | 100 000 × 16 | 7.53 ms | 6.01 ms | 1.25× |
+//! | 100 000 × 64 | 58.9 ms | 30.7 ms | 1.92× |
+//! | 500 000 × 16 | 35.8 ms | 38.9 ms | 0.92× |
+//! | 100 000 × 128 | 206 ms | 59.2 ms | **3.49×** |
+//! | 100 000 × 256 | 786 ms | 313 ms | **2.51×** |
+//!
+//! Two things that table does NOT say. First, the two rungs where the device
+//! arm loses are the two `host_fit_applicable` already routes to the host
+//! (`1 000 × 8`) or calls a wash (`500 000 × 16`, 8%) — a Python caller gets the
+//! better arm at every rung but that one. Second, the host column is the SAME
+//! CODE the cpu backend runs, on a 2-thread VM; on the 16-thread dev box it is
+//! roughly 4× faster (`100 000 × 256` in 77.9 ms, not 786), so against THAT cpu
+//! the T4 does not win at any rung on this ladder. The GPU's advantage is
+//! `n·d²/2` arithmetic over an `n·d` transfer, so it grows with `d` and the
+//! crossover against a 16-thread host sits above `d = 256`.
+//!
+//! The upload is why. Drained laps at `100 000 × 256`: 308 ms of upload against
+//! 4.8 ms of means + 13.3 ms of Gram+solve. The compute is 5.8% of the fit and
+//! the transfer is 96% — the same wall the `positive=True` campaign hit
+//! (`results/ridge_positive_t4_*.log`: 0.33–0.92 GB/s on a link that should do
+//! 6–12, and getting WORSE as the operand grows, which is the signature of a
+//! per-call allocation cost rather than a slow link). Nothing here changes it,
+//! and on this hardware it is the only lever left.
+//!
 //! ## Both normal-equations arms have a second, fully-HOST route
 //! [`Ridge::fit_from_host_slice`] runs the whole fit — means, centering, Gram,
 //! `Xᵀy`, solve — from host memory, uploading only the fitted `coef_` and
