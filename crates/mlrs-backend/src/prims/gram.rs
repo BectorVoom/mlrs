@@ -8,13 +8,30 @@
 //! split-K, so this shape starves the GPU of independent output tiles no
 //! matter how large `n_samples` is — the EXACT pathology that made KMeans'
 //! `onehotᵀX` GEMM-sums "catastrophic" (`prims::kmeans` module docs). This
-//! prim applies the SAME fix: [`gram_xty`] dispatches to a row-blocked
-//! shared-memory accumulation ([`mlrs_kernels::gram::gram_xty_shared`] +
-//! [`mlrs_kernels::gram::gram_xty_reduce_partials`]) on every backend except
-//! cpu (whose MLIR lowering rejects `SharedMemory` — the `use_shared_sums`
-//! precedent), falling back to the original two-`gemm` formation there (and
-//! whenever `d² > 4096`, though the caller's `GRAM_EIG_MAX_FEATURES = 64` cap
-//! means that never happens in practice today).
+//! prim applies the SAME fix: split `n_samples` into row BLOCKS so the
+//! parallelism is `nblocks`-way rather than `d×d`-way, accumulate a private
+//! partial Gram per block, and fold the (small, capped) partials
+//! ([`mlrs_kernels::gram::gram_xty_reduce_partials`]).
+//!
+//! ## Three formations, and why the default changed (RIDGE-POS-PERF)
+//! - [`GramPath::Blocked`] — the DEFAULT
+//!   ([`mlrs_kernels::gram::gram_xty_blocked`]): register-resident
+//!   accumulators, no shared memory, no barriers, only the lower triangle
+//!   computed, and centering fusable into the same pass
+//!   ([`gram_xty_centered`]).
+//! - [`GramPath::Shared`] — the previous default
+//!   ([`mlrs_kernels::gram::gram_xty_shared`]), kept as the `LR_GRAM_SHARED=1`
+//!   A/B arm. It stages one row at a time into `SharedMemory` and pays TWO
+//!   `sync_cube` barriers PER ROW; measured at `n=100 000, d=64` on the local
+//!   wgpu adapter it took 40 ms against the blocked kernel's 4.8 ms.
+//! - [`GramPath::Gemm`] — the original two-`gemm` formation. Still the cpu
+//!   backend's arm (whose MLIR lowering rejects `SharedMemory` — the
+//!   `use_shared_sums` precedent — and where `prims::gram_host` carries the
+//!   `Ridge` fit anyway) and the arm above [`BLOCKED_MAX_DD`].
+//!
+//! The register accumulator also lifted the `d ≤ 64` ceiling the shared
+//! kernel's fixed 4096-slot `SharedMemory` budget imposed: `64 < d ≤ 256` used
+//! to fall into the starved-GEMM formation and now does not.
 //!
 //! Tests live in `crates/mlrs-backend/tests/gram_test.rs` (AGENTS.md §2).
 
@@ -22,7 +39,11 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use mlrs_core::PrimError;
-use mlrs_kernels::gram::{gram_xty_reduce_partials, gram_xty_shared};
+use mlrs_core::f64_to_host;
+use mlrs_kernels::gram::{
+    col_sums_blocked, col_sums_reduce, gram_xty_blocked, gram_xty_reduce_partials, gram_xty_shared,
+    GRAM_REG_TILE,
+};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
@@ -36,9 +57,9 @@ use crate::runtime::ActiveRuntime;
 /// - Shapes are validated (`n * d == x.len()`, `y.len() == n`, both dims
 ///   non-zero) BEFORE any launch; a mismatch returns
 ///   [`PrimError::ShapeMismatch`].
-/// - Dispatches to the row-blocked shared-memory kernels
-///   ([`use_shared_gram`]) or the `gemm`-based fallback (cpu backend, or
-///   `d² > 4096`, or the `LR_GRAM_GEMM` A/B env override).
+/// - Dispatches per [`gram_path`]: the register-blocked kernels by default, the
+///   previous shared-memory pair under `LR_GRAM_SHARED=1`, or the `gemm`
+///   fallback (cpu backend, `d² > `[`BLOCKED_MAX_DD`], or `LR_GRAM_GEMM=1`).
 ///
 /// Generic over the float element type `F` (`f32` / `f64`); the f64 path is
 /// capability-gated by the caller via `skip_f64_with_log`.
@@ -60,33 +81,356 @@ where
 {
     validate_geometry(x.len(), (n, d), y.len())?;
 
-    if use_shared_gram(d * d) {
-        gram_xty_shared_impl::<F>(pool, x, y, n, d)
-    } else {
-        gram_xty_gemm_fallback::<F>(pool, x, y, n, d)
+    match gram_path(d * d) {
+        GramPath::Blocked => gram_xty_blocked_impl::<F>(pool, x, y, None, n, d),
+        GramPath::Shared => gram_xty_shared_impl::<F>(pool, x, y, n, d),
+        GramPath::Gemm => gram_xty_gemm_fallback::<F>(pool, x, y, n, d),
     }
 }
 
-/// Whether to use the row-blocked shared-memory Gram kernels. `false` on the
-/// cpu backend (MLIR rejects `SharedMemory` — the `use_shared_sums`
-/// precedent in `prims::kmeans`) and whenever the `d × d` Gram would exceed
-/// the fixed 4096-slot `SharedMemory` budget (never happens under the
-/// caller's `GRAM_EIG_MAX_FEATURES = 64` cap, but kept as a defensive bound
-/// rather than an assert). `LR_GRAM_GEMM=1` forces the `gemm` fallback
-/// everywhere, for A/B benchmarking (mirrors `KM_SUMS_GATHER`).
-fn use_shared_gram(dd: usize) -> bool {
+/// [`gram_xty`] of the CENTERED design, without ever materializing it:
+/// `gram[i,j] = Σ_r (x[r,i] − x̄_i)(x[r,j] − x̄_j)` and
+/// `xty[i] = Σ_r (x[r,i] − x̄_i)(y_r − ȳ)`.
+///
+/// `means` is the `(x̄, ȳ)` pair [`column_means`] produces, both device-resident
+/// (length `d` and length 1). The subtraction is fused into the accumulation
+/// kernel, so against the `center_columns` → [`gram_xty`] composition this
+/// saves a full `n × d` allocation, its write, and its re-read — the second
+/// largest device cost of a `Ridge` fit after the design upload itself.
+///
+/// Falls back to `center_columns` + the unfused formation on the paths that
+/// have no fused kernel (the cpu backend and the over-cap `d`, see
+/// [`gram_path`]), so the result is identical on every backend.
+pub fn gram_xty_centered<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    y: &DeviceArray<ActiveRuntime, F>,
+    means: (
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    ),
+    n: usize,
+    d: usize,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    PrimError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry(x.len(), (n, d), y.len())?;
+    if means.0.len() != d || means.1.len() != 1 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "gram.xmean",
+            rows: d,
+            cols: 1,
+            len: means.0.len(),
+        });
+    }
+
+    match gram_path(d * d) {
+        GramPath::Blocked => gram_xty_blocked_impl::<F>(pool, x, y, Some(means), n, d),
+        // No fused kernel on these arms: center first, then form the Gram of
+        // the centered copy — the pre-fusion composition, same answer.
+        GramPath::Shared | GramPath::Gemm => {
+            let (xc, _) = crate::prims::center::center_columns::<F>(pool, x, (n, d))?;
+            let (yc, _) = crate::prims::center::center_columns::<F>(pool, y, (n, 1))?;
+            let out = gram_xty::<F>(pool, &xc, &yc, n, d);
+            xc.release_into(pool);
+            yc.release_into(pool);
+            out
+        }
+    }
+}
+
+/// Device-resident column means of the `n × d` row-major `x` and the mean of
+/// the length-`n` `y`, returned as `(x̄, ȳ)` device buffers.
+///
+/// The row-blocked coalesced pass (see
+/// [`mlrs_kernels::gram::col_sums_blocked`]) — adjacent units read adjacent
+/// addresses, where `prims::center`'s column-mean walks one column at a time
+/// with a `d`-element stride. On the paths with no blocked kernel
+/// ([`gram_path`]) it defers to `center_columns`, discarding the centered copy,
+/// so every backend gets the same means.
+pub fn column_means<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    y: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    PrimError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry(x.len(), (n, d), y.len())?;
+
+    if gram_path(d * d) != GramPath::Blocked {
+        let (xc, xm) = crate::prims::center::center_columns::<F>(pool, x, (n, d))?;
+        let (yc, ym) = crate::prims::center::center_columns::<F>(pool, y, (n, 1))?;
+        xc.release_into(pool);
+        yc.release_into(pool);
+        return Ok((xm, ym));
+    }
+
+    let (nb, rpb) = row_blocking(n, d);
+    let psum_len = nb * d;
+    let psum = pool.acquire(psum_len * size_of::<F>());
+    let pysum = pool.acquire(nb * size_of::<F>());
+    let xmean = pool.acquire(d * size_of::<F>());
+    let ymean = pool.acquire(size_of::<F>());
+    let client = pool.client().clone();
+
+    // SAFETY: validated element counts (above); the kernel bounds-checks the
+    // cube id against `nblocks`, clamps each block's row range to `n`, and
+    // walks columns only while `c < d`.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+    let ps_arg = unsafe { ArrayArg::from_raw_parts(psum.clone(), psum_len) };
+    let py_arg = unsafe { ArrayArg::from_raw_parts(pysum.clone(), nb) };
+    let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
+    col_sums_blocked::launch::<F, ActiveRuntime>(
+        &client,
+        cc,
+        cd,
+        x_arg,
+        y_arg,
+        ps_arg,
+        py_arg,
+        n as u32,
+        d as u32,
+        nb as u32,
+        rpb as u32,
+    );
+
+    let ps_arg2 = unsafe { ArrayArg::from_raw_parts(psum.clone(), psum_len) };
+    let py_arg2 = unsafe { ArrayArg::from_raw_parts(pysum.clone(), nb) };
+    let xm_arg = unsafe { ArrayArg::from_raw_parts(xmean.clone(), d) };
+    let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.clone(), 1) };
+    let (c2, d2) = super::launch_dims_1d_folded(d, crate::capability::gather_launch_width());
+    col_sums_reduce::launch::<F, ActiveRuntime>(
+        &client,
+        c2,
+        d2,
+        ps_arg2,
+        py_arg2,
+        xm_arg,
+        ym_arg,
+        d as u32,
+        nb as u32,
+        f64_to_host::<F>(1.0 / n as f64),
+    );
+
+    pool.release(psum, psum_len * size_of::<F>());
+    pool.release(pysum, nb * size_of::<F>());
+
+    Ok((
+        DeviceArray::from_raw(xmean, d),
+        DeviceArray::from_raw(ymean, 1),
+    ))
+}
+
+/// `(nblocks, rows_per_block)` for the cube-per-row-block kernels.
+///
+/// 256 rows per block is the sizing `gram_xty_shared_impl` established; the cap
+/// keeps the `nblocks · d²` partial buffer inside an ~8 M-element budget
+/// (`prims::kmeans::centroid_sums_shared`'s precedent).
+fn row_blocking(n: usize, d: usize) -> (usize, usize) {
+    let nb_cap = ((8usize << 20) / (d * d).max(1)).max(1);
+    let nb = n.div_ceil(256).clamp(1, nb_cap);
+    let rpb = n.div_ceil(nb);
+    (n.div_ceil(rpb), rpb)
+}
+
+/// Which Gram/Xty formation [`gram_xty`] runs.
+///
+/// `Blocked` / `Shared` are unreachable under `--features cpu` (whose
+/// [`gram_path`] short-circuits to `Gemm`), hence the cfg'd `dead_code`
+/// allowance rather than a cfg'd enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "cpu", allow(dead_code))]
+enum GramPath {
+    /// [`gram_xty_blocked_impl`] — the register-blocked, barrier-free default.
+    Blocked,
+    /// [`gram_xty_shared_impl`] — the previous shared-memory kernel, kept as
+    /// the `LR_GRAM_SHARED=1` A/B arm.
+    Shared,
+    /// [`gram_xty_gemm_fallback`] — the cpu backend and the over-cap `d`.
+    Gemm,
+}
+
+/// Pick the Gram/Xty formation for a `d × d` output.
+///
+/// The register-blocked kernel is the default everywhere except the cpu backend
+/// — where every launch is an OS thread spawn and the `gemm` fallback is
+/// already validated (the `use_shared_sums` precedent) — and above
+/// [`BLOCKED_MAX_DD`], where the `nblocks · d²` partial buffer stops being
+/// worth its footprint.
+///
+/// Two A/B escape hatches, read through [`crate::abflag`]: `LR_GRAM_SHARED=1`
+/// forces the previous shared-memory kernel, `LR_GRAM_GEMM=1` the original
+/// two-`gemm` formation (the pre-existing knob, unchanged).
+fn gram_path(dd: usize) -> GramPath {
     #[cfg(feature = "cpu")]
     {
         let _ = dd;
-        false
+        GramPath::Gemm
     }
     #[cfg(not(feature = "cpu"))]
     {
         if crate::abflag::var("LR_GRAM_GEMM").is_some() {
-            return false;
+            return GramPath::Gemm;
         }
-        dd <= 4096
+        if crate::abflag::var("LR_GRAM_SHARED").is_some() {
+            // The shared kernel's accumulator is a fixed 4096-slot
+            // `SharedMemory`, so the A/B arm only exists below that cap.
+            return if dd <= 4096 {
+                GramPath::Shared
+            } else {
+                GramPath::Gemm
+            };
+        }
+        if dd <= BLOCKED_MAX_DD {
+            GramPath::Blocked
+        } else {
+            GramPath::Gemm
+        }
     }
+}
+
+/// Largest `d × d` Gram the register-blocked path forms.
+///
+/// The partial buffer is `nblocks · d²` elements and `nblocks` is floored at 1,
+/// so past this point one partial alone is 512 KiB (`f32`) and the fold stops
+/// paying for itself. `d = 256` — well past the `d ≤ 64` the shared kernel
+/// could reach, which is the point: the shapes between 64 and 256 used to fall
+/// into the starved-GEMM formation.
+#[cfg_attr(feature = "cpu", allow(dead_code))]
+const BLOCKED_MAX_DD: usize = 256 * 256;
+
+/// Units per cube of the register-blocked kernel.
+///
+/// 64 keeps the previous kernel's cube shape (and so its row-block sizing and
+/// grid folding), which matters because the parallelism that actually fills the
+/// device here is the ROW-BLOCK count, not the unit count: at `d = 16` there
+/// are only `16 · 2 = 32` slot groups to hand out, so a wider cube would idle
+/// half of itself either way.
+const BLOCKED_CUBE_DIM: u32 = 64;
+
+/// Register-blocked, barrier-free Gram/Xty formation — the default path (see
+/// [`mlrs_kernels::gram::gram_xty_blocked`]). Same row-block sizing and
+/// two-stage fold as [`gram_xty_shared_impl`]; the difference is entirely
+/// inside the stage-1 kernel.
+fn gram_xty_blocked_impl<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    y: &DeviceArray<ActiveRuntime, F>,
+    means: Option<(
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    )>,
+    n: usize,
+    d: usize,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    PrimError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    let dd = d * d;
+    let (nb, rpb) = row_blocking(n, d);
+
+    // The RAW Gram is the fused kernel with an all-zero mean — one `d + 1`
+    // element buffer instead of a second kernel.
+    let zeros: Option<(
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    )> = if means.is_none() {
+        let z = f64_to_host::<F>(0.0);
+        Some((
+            DeviceArray::from_host(pool, &vec![z; d]),
+            DeviceArray::from_host(pool, &[z]),
+        ))
+    } else {
+        None
+    };
+    let (xmean, ymean) = match (&means, &zeros) {
+        (Some((xm, ym)), _) => (*xm, *ym),
+        (None, Some((xm, ym))) => (xm, ym),
+        (None, None) => unreachable!("zeros is Some whenever means is None"),
+    };
+
+    let pgram_len = nb * dd;
+    let pxty_len = nb * d;
+    let pgram = pool.acquire(pgram_len * size_of::<F>());
+    let pxty = pool.acquire(pxty_len * size_of::<F>());
+    let gram = pool.acquire(dd * size_of::<F>());
+    let xty = pool.acquire(d * size_of::<F>());
+
+    let client = pool.client().clone();
+    let groups_per_row = (d as u32).div_ceil(GRAM_REG_TILE);
+
+    // Stage 1: one cube per row block, register accumulators, no barriers.
+    // SAFETY: validated element counts (caller); the kernel bounds-checks the
+    // cube id against `nblocks`, clamps each block's row range to `n`, and
+    // walks slot groups only while `g < d · groups_per_row`.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+    let xm_arg = unsafe { ArrayArg::from_raw_parts(xmean.handle().clone(), d) };
+    let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.handle().clone(), 1) };
+    let pg_arg = unsafe { ArrayArg::from_raw_parts(pgram.clone(), pgram_len) };
+    let px_arg = unsafe { ArrayArg::from_raw_parts(pxty.clone(), pxty_len) };
+    let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
+    gram_xty_blocked::launch::<F, ActiveRuntime>(
+        &client,
+        cc,
+        cd,
+        x_arg,
+        y_arg,
+        xm_arg,
+        ym_arg,
+        pg_arg,
+        px_arg,
+        n as u32,
+        d as u32,
+        nb as u32,
+        rpb as u32,
+        groups_per_row,
+    );
+
+    // Stage 2: fold the (small, capped) nblocks partials.
+    let pg_arg2 = unsafe { ArrayArg::from_raw_parts(pgram.clone(), pgram_len) };
+    let px_arg2 = unsafe { ArrayArg::from_raw_parts(pxty.clone(), pxty_len) };
+    let g_arg = unsafe { ArrayArg::from_raw_parts(gram.clone(), dd) };
+    let xt_arg = unsafe { ArrayArg::from_raw_parts(xty.clone(), d) };
+    let (c2, d2) = super::launch_dims_1d_folded(dd, crate::capability::gather_launch_width());
+    gram_xty_reduce_partials::launch::<F, ActiveRuntime>(
+        &client, c2, d2, pg_arg2, px_arg2, g_arg, xt_arg, d as u32, nb as u32, 1u32,
+    );
+
+    pool.release(pgram, pgram_len * size_of::<F>());
+    pool.release(pxty, pxty_len * size_of::<F>());
+    if let Some((xm, ym)) = zeros {
+        xm.release_into(pool);
+        ym.release_into(pool);
+    }
+
+    Ok((
+        DeviceArray::from_raw(gram, dd),
+        DeviceArray::from_raw(xty, d),
+    ))
 }
 
 /// Row-blocked shared-memory Gram/Xty formation — the LINEAR-01 perf path.
@@ -146,7 +490,7 @@ where
     let xt_arg = unsafe { ArrayArg::from_raw_parts(xty.clone(), d) };
     let (c2, d2) = super::launch_dims_1d(dd, crate::capability::gather_launch_width());
     gram_xty_reduce_partials::launch::<F, ActiveRuntime>(
-        &client, c2, d2, pg_arg2, px_arg2, g_arg, xt_arg, d as u32, nb as u32,
+        &client, c2, d2, pg_arg2, px_arg2, g_arg, xt_arg, d as u32, nb as u32, 0u32,
     );
 
     pool.release(pgram, pgram_len * size_of::<F>());
@@ -208,12 +552,22 @@ fn validate_geometry(x_len: usize, (n, d): (usize, usize), y_len: usize) -> Resu
 /// block; folds past the per-dimension dispatch limit; slack cubes are
 /// guarded in-kernel — mirrors `prims::kmeans::launch_cubes_64`).
 fn launch_cubes_64(cubes: usize) -> (CubeCount, CubeDim) {
+    launch_cubes(cubes, 64)
+}
+
+/// [`launch_cubes_64`] with an explicit cube width, for the register-blocked
+/// path's [`BLOCKED_CUBE_DIM`].
+fn launch_cubes(cubes: usize, dim_x: u32) -> (CubeCount, CubeDim) {
     const MAX_DIM: u32 = 65_535;
     let c = (cubes as u32).max(1);
     let y = c.div_ceil(MAX_DIM);
     let x = c.div_ceil(y);
     (
         CubeCount::Static(x, y, 1),
-        CubeDim { x: 64, y: 1, z: 1 },
+        CubeDim {
+            x: dim_x,
+            y: 1,
+            z: 1,
+        },
     )
 }

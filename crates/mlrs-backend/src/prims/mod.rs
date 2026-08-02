@@ -23,6 +23,11 @@ pub mod covariance;
 // to the original `gemm` formation on the cpu backend (SharedMemory-unsafe
 // there, the `use_shared_sums` precedent).
 pub mod gram;
+// Host arm of the same normal-equations formation (RIDGE-POS-PERF-CPU): column
+// means + centered Gram/Xᵀy computed straight from host memory, for the cpu
+// backend where `center_columns` falls back to the per-column-round-trip
+// `column_reduce` and every launch costs an OS thread spawn.
+pub mod gram_host;
 // Phase-7 prim stubs (Wave-0 scaffold owns these registrations; plans 07-02
 // (rng) / 07-03 (incremental_svd) fill their own file body — file-disjoint,
 // parallel-safe). Each is an empty compiling module until its plan adds the

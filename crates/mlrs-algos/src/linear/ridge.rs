@@ -24,7 +24,7 @@
 //! | `sparse_cg` | HOST CG on the device-formed Gram (sklearn's own `Xᵀ(X·x) + αx` operator) | `None` |
 //! | `lsqr` | HOST Paige–Saunders LSQR with `damp = √α` | `Some(itn)` |
 //! | `sag` / `saga` | HOST stochastic average gradient, sklearn's `get_auto_step_size` | `Some(epochs)` |
-//! | `lbfgs` | DEVICE: [`gram_xty`] + [`ridge_nnls`] — projected coordinate descent on the Gram, whole sweep loop in one cube (the `positive=True` arm); HOST twin on cpu / over-cap `d` | `None` |
+//! | `lbfgs` | DEVICE: [`column_means`] + [`gram_xty_centered`] (centering FUSED into the Gram pass) + [`ridge_nnls`] — projected coordinate descent on the Gram, whole sweep loop in one cube (the `positive=True` arm); a fully HOST arm on cpu / small shapes / over-cap `d` | `None` |
 //!
 //! The `n_iter_` column is sklearn's, not an mlrs choice: `_ridge_regression`
 //! initializes `n_iter = None` and only `_solve_lsqr` and the `sag`/`saga` arm
@@ -148,6 +148,15 @@
 //! means and the `√w` row rescale have no `center_columns` equivalent). The
 //! unweighted path — the default — never pays it.
 //!
+//! ## The `positive=True` arm has a second, fully-HOST route
+//! [`Ridge::fit_from_host_slice`] runs the whole fit — means, centering, Gram,
+//! `Xᵀy`, solve — from host memory, uploading only the fitted `coef_` and
+//! `intercept_`. [`Ridge::host_fit_applicable`] picks it on the cpu backend
+//! (where the device composition is pathological: `center_columns` falls back
+//! to the per-column-round-trip `column_reduce` there, measured at 59.6 s of a
+//! 60.1 s `1 000 × 8` fit) and, on ANY backend, below the fixed
+//! dispatch-cost floor. Everything else keeps the device route above.
+//!
 //! Tests live in `crates/mlrs-algos/tests/ridge_test.rs` and
 //! `crates/mlrs-algos/tests/ridge_params_test.rs` (AGENTS.md §2), never an
 //! in-source `#[cfg(test)] mod tests`.
@@ -163,7 +172,8 @@ use mlrs_backend::prims::center::center_columns;
 use mlrs_backend::prims::cholesky::cholesky_solve;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
-use mlrs_backend::prims::gram::gram_xty;
+use mlrs_backend::prims::gram::{column_means, gram_xty, gram_xty_centered};
+use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable};
 use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
 use mlrs_backend::prims::nnls::{device_nnls_applicable, ridge_nnls};
 use mlrs_backend::prims::svd::svd;
@@ -448,34 +458,7 @@ where
         //     vector is a geometry error; a negative or non-finite weight would
         //     make `√w` NaN in the rescale and silently poison every downstream
         //     reduction, so it is rejected as a typed error instead. ---
-        let sw64: Option<Vec<f64>> = match sample_weight {
-            Some(sw) => {
-                if sw.len() != n_samples {
-                    return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                        operand: "sample_weight",
-                        rows: n_samples,
-                        cols: 1,
-                        len: sw.len(),
-                    }));
-                }
-                let sw: Vec<f64> = sw.iter().map(|&v| host_to_f64(v)).collect();
-                if let Some(bad) = sw.iter().position(|v| !v.is_finite() || *v < 0.0) {
-                    return Err(AlgoError::InvalidSampleWeight {
-                        estimator: "ridge",
-                        index: bad,
-                        value: sw[bad],
-                    });
-                }
-                // All-zero weights leave nothing to fit: the `√w` rescale zeroes
-                // the whole design and the penalized solve would hand back the
-                // all-zero coefficient vector as though it were an answer.
-                if sw.iter().all(|&v| v == 0.0) {
-                    return Err(AlgoError::ZeroSampleWeightSum { estimator: "ridge" });
-                }
-                Some(sw)
-            }
-            None => None,
-        };
+        let sw64: Option<Vec<f64>> = validate_sample_weight::<F>(sample_weight, n_samples)?;
 
         let resolved = self.solver.resolve(self.positive);
 
@@ -492,17 +475,36 @@ where
         //        With NO sample_weight this is the original DEVICE-resident
         //        `center_columns` composition, unchanged: no host round-trip of
         //        the full n×d design. See `preprocess` for the weighted arm. ---
+        //
+        //        The `positive` device arm takes the FUSED route instead: only
+        //        the column means are formed here, and the subtraction happens
+        //        inside `gram_xty_centered`'s accumulation kernel. That drops
+        //        the `n×d` centered allocation, its write and its re-read — the
+        //        second largest device cost of the fit after the design upload
+        //        (measured 9 ms of a 25 ms `n=100 000, d=64` wgpu fit, 151 ms of
+        //        528 ms at `d=256`). Only this arm can do it: every other solver
+        //        consumes the centered DESIGN, not its Gram.
         let rescale = sw64.is_some() && !resolved.takes_sample_weight_directly();
-        let (x_mean, y_mean, x_owned, y_owned) = preprocess::<F>(
-            pool,
-            x,
-            y,
-            n_samples,
-            n_features,
-            self.fit_intercept,
-            sw64.as_deref(),
-            rescale,
-        )?;
+        let fused_center = resolved == RidgeSolver::Lbfgs
+            && sw64.is_none()
+            && self.fit_intercept
+            && device_nnls_applicable::<F>(n_features);
+        let (mut x_mean, mut y_mean, x_owned, y_owned, dev_means) = if fused_center {
+            let (xm, ym) = column_means::<F>(pool, x, y, n_samples, n_features)?;
+            (Vec::new(), 0.0f64, None, None, Some((xm, ym)))
+        } else {
+            let (xm, ym, xo, yo) = preprocess::<F>(
+                pool,
+                x,
+                y,
+                n_samples,
+                n_features,
+                self.fit_intercept,
+                sw64.as_deref(),
+                rescale,
+            )?;
+            (xm, ym, xo, yo, None)
+        };
         let x_ref = x_owned.as_ref().unwrap_or(x);
         let y_ref = y_owned.as_ref().unwrap_or(y);
         let t_center = if profile { lap0.elapsed().as_secs_f64() } else { 0.0 };
@@ -549,6 +551,7 @@ where
                     pool,
                     x_ref,
                     y_ref,
+                    dev_means.as_ref().map(|(xm, ym)| (xm, ym)),
                     n_samples,
                     n_features,
                     alpha64,
@@ -596,6 +599,17 @@ where
             yc.release_into(pool);
         }
 
+        // The fused arm left the means on the device so the Gram and the solve
+        // could be queued behind the mean pass without a synchronizing
+        // read-back; `d + 1` floats cross here, once, where the intercept needs
+        // them anyway.
+        if let Some((xm, ym)) = dev_means {
+            x_mean = xm.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+            y_mean = host_to_f64(ym.to_host(pool)[0]);
+            xm.release_into(pool);
+            ym.release_into(pool);
+        }
+
         // --- 3. intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 (D-05). α
         //        is NOT applied here — the intercept is unpenalized — and NEITHER
         //        is the `positive` bound (sklearn constrains only `coef_`). ---
@@ -637,6 +651,201 @@ where
             _state: PhantomData,
         })
     }
+
+    /// Does the fully-HOST fit arm ([`Ridge::fit_from_host_slice`]) apply to
+    /// this configuration?
+    ///
+    /// `true` only for the `positive = true` / `solver = 'lbfgs'` arm, and only
+    /// where the normal-equations formation belongs on the host
+    /// (`prims::gram_host::gram_host_applicable` — the cpu backend, plus the
+    /// fixed-dispatch-cost floor on every backend). Every other solver still
+    /// runs the device path, which is the faster arm there.
+    ///
+    /// `shape` is `(n_samples, n_features)`; the floor is a function of the
+    /// problem size, so the caller must know it before deciding.
+    ///
+    /// Callers branch on this rather than letting `fit_from_host_slice` decide,
+    /// because the two entry points take DIFFERENT operand types (host slice vs
+    /// [`DeviceArray`]) and the choice therefore has to be made before ingress —
+    /// which is the whole point: on the applicable arm the design is never
+    /// uploaded at all.
+    pub fn host_fit_applicable(&self, shape: (usize, usize)) -> bool {
+        self.solver.resolve(self.positive) == RidgeSolver::Lbfgs
+            && gram_host_applicable(shape.0, shape.1)
+    }
+
+    /// [`Fit::fit`] over HOST slices — the no-upload, no-launch ingress for the
+    /// `positive = true` arm on the cpu backend.
+    ///
+    /// `x` is the `n × d` row-major design and `y` the length-`n` target, both
+    /// borrowed from host memory (at the Python boundary, the Arrow values
+    /// themselves). Nothing about the FITTED estimator differs from one produced
+    /// by [`Fit::fit`] — `coef_`/`intercept_` are still device-resident, so
+    /// `predict` has one path — only the route there does:
+    ///
+    /// | | [`Fit::fit`] on cpu | this |
+    /// |---|---|---|
+    /// | design upload | `n·d` | none |
+    /// | column means | `d` × (upload + launch + blocking readback) | one parallel host pass |
+    /// | centering | one launch writing a fresh `n·d` buffer | folded into the tile build, never materialized |
+    /// | Gram / `Xᵀy` | `gram_xty` launch | one parallel host pass |
+    /// | solve | `nonnegative_cd` on the read-back Gram | `nonnegative_cd`, same Gram |
+    ///
+    /// Measured at `1 000 × 8`, `positive=True`, f64: 60.1 s → 0.2 ms.
+    ///
+    /// Returns [`PrimError::UnsupportedCapability`] when
+    /// [`Ridge::host_fit_applicable`] is false, so a caller that forgets to
+    /// branch gets a typed error rather than a silently different answer.
+    pub fn fit_from_host_slice(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        y: &[F],
+        shape: (usize, usize),
+        sample_weight: Option<&[F]>,
+    ) -> Result<Ridge<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+        if !self.host_fit_applicable(shape) {
+            return Err(AlgoError::Prim(PrimError::UnsupportedCapability {
+                operand: "ridge.fit_from_host_slice",
+                capability: "the host fit arm (positive=True on a host-Gram backend)",
+            }));
+        }
+
+        // --- The slice twin of the D-08 geometry guard: `validate_geometry`
+        //     reads a DeviceArray's length, which we do not have here. ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        let sw64 = validate_sample_weight::<F>(sample_weight, n_samples)?;
+
+        let profile = std::env::var("RIDGE_PROFILE").is_ok();
+        let lap0 = std::time::Instant::now();
+
+        // Centering, the `√w` rescale, the Gram and `Xᵀy` in TWO passes over the
+        // design — and the centered/rescaled `n × d` design is never
+        // materialized, because centering is folded into the tile the Gram
+        // sweep reads.
+        let (x_mean, y_mean, gram, xty) = centered_gram_xty::<F>(
+            x,
+            y,
+            n_samples,
+            n_features,
+            sw64.as_deref(),
+            self.fit_intercept,
+        );
+        let t_center = if profile { lap0.elapsed().as_secs_f64() } else { 0.0 };
+
+        let lap1 = std::time::Instant::now();
+        let alpha64 = host_to_f64(self.alpha);
+        // sklearn leaves `n_iter_` at None for the lbfgs arm, so the sweep count
+        // is discarded here exactly as it is on the device arm.
+        let (coef64, _sweeps) = ridge_solvers::nonnegative_cd(
+            &gram,
+            &xty,
+            n_features,
+            alpha64,
+            self.tol,
+            self.max_iter,
+        );
+        let t_solve = if profile { lap1.elapsed().as_secs_f64() } else { 0.0 };
+
+        // intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 (D-05); α is not
+        // applied (the intercept is unpenalized) and neither is the `positive`
+        // bound (sklearn constrains only `coef_`) — the same arithmetic
+        // `fit_with_sample_weight` does, on the means this pass already has.
+        let intercept = if self.fit_intercept {
+            let dot: f64 = x_mean
+                .iter()
+                .zip(coef64.iter())
+                .map(|(m, c)| m * c)
+                .sum();
+            y_mean - dot
+        } else {
+            0.0
+        };
+
+        if profile {
+            eprintln!(
+                "RIDGE_PROFILE n={n_samples} d={n_features} solver=lbfgs (host): \
+                 preprocess={t_center:.4}s solve={t_solve:.4}s"
+            );
+        }
+
+        Ok(Ridge {
+            alpha: self.alpha,
+            fit_intercept: self.fit_intercept,
+            copy_x: self.copy_x,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            solver: self.solver,
+            positive: self.positive,
+            random_state: self.random_state,
+            coef_: Some(upload_coef::<F>(pool, &coef64)),
+            intercept_: Some(DeviceArray::from_host(
+                pool,
+                &[f64_to_host::<F>(intercept)],
+            )),
+            n_iter_: None,
+            solver_: Some(RidgeSolver::Lbfgs),
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+/// Validate an optional `sample_weight` and widen it to `f64` (T-04-05-03).
+///
+/// Shared by [`Ridge::fit_with_sample_weight`] and
+/// [`Ridge::fit_from_host_slice`] so the two ingress paths cannot drift on
+/// weight validation. A wrong-length vector is a geometry error; a negative or
+/// non-finite weight would make `√w` NaN in the rescale and silently poison
+/// every downstream reduction; an all-zero vector leaves nothing to fit (the
+/// rescale zeroes the whole design and the penalized solve would hand back the
+/// all-zero coefficient vector as though it were an answer).
+fn validate_sample_weight<F>(
+    sample_weight: Option<&[F]>,
+    n_samples: usize,
+) -> Result<Option<Vec<f64>>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let Some(sw) = sample_weight else {
+        return Ok(None);
+    };
+    if sw.len() != n_samples {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "sample_weight",
+            rows: n_samples,
+            cols: 1,
+            len: sw.len(),
+        }));
+    }
+    let sw: Vec<f64> = sw.iter().map(|&v| host_to_f64(v)).collect();
+    if let Some(bad) = sw.iter().position(|v| !v.is_finite() || *v < 0.0) {
+        return Err(AlgoError::InvalidSampleWeight {
+            estimator: "ridge",
+            index: bad,
+            value: sw[bad],
+        });
+    }
+    if sw.iter().all(|&v| v == 0.0) {
+        return Err(AlgoError::ZeroSampleWeightSum { estimator: "ridge" });
+    }
+    Ok(Some(sw))
 }
 
 impl<F> Default for Ridge<F, Unfit>
@@ -1192,6 +1401,10 @@ fn solve_nonnegative<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x_ref: &DeviceArray<ActiveRuntime, F>,
     y_ref: &DeviceArray<ActiveRuntime, F>,
+    means: Option<(
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    )>,
     n_samples: usize,
     n_features: usize,
     alpha64: f64,
@@ -1202,6 +1415,8 @@ where
     F: Float + CubeElement + Pod,
 {
     if !device_nnls_applicable::<F>(n_features) {
+        // `means` is `None` on this arm by construction (the caller gates the
+        // fused route on the same predicate), so `x_ref` is already centered.
         let (gram, xty) = host_gram::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
         let (coef, _sweeps) =
             ridge_solvers::nonnegative_cd(&gram, &xty, n_features, alpha64, tol, max_iter);
@@ -1210,8 +1425,12 @@ where
 
     // Fully device-resident: the Gram stays where `gram_xty` wrote it and the
     // solve reads it in place, so `coef_` is produced without a single host
-    // round-trip.
-    let (gram, xty) = gram_xty::<F>(pool, x_ref, y_ref, n_samples, n_features)?;
+    // round-trip. With `means` present the centering is fused into that same
+    // accumulation and `x_ref` is the caller's RAW design.
+    let (gram, xty) = match means {
+        Some(m) => gram_xty_centered::<F>(pool, x_ref, y_ref, m, n_samples, n_features)?,
+        None => gram_xty::<F>(pool, x_ref, y_ref, n_samples, n_features)?,
+    };
     let coef = ridge_nnls::<F>(pool, &gram, &xty, n_features, alpha64, tol, max_iter);
     gram.release_into(pool);
     xty.release_into(pool);
