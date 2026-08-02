@@ -151,6 +151,29 @@ where
     }
 }
 
+/// Does the FUSED centering route actually fuse for this `(F, d)`?
+///
+/// [`gram_xty_centered`] and [`column_means`] are correct on every backend, but
+/// on the arms with no fused kernel ([`GramPath::Shared`] / [`GramPath::Gemm`] —
+/// the cpu backend and the over-cap `d`) they both fall back to
+/// `center_columns`, so the "fused" composition centers the design TWICE: once
+/// inside `column_means`, whose centered copy is thrown away, and once inside
+/// `gram_xty_centered`. That is strictly worse than centering once and forming
+/// the Gram of the result.
+///
+/// A caller choosing between the fused and unfused compositions (`Ridge`) must
+/// therefore ask whether the fusion is real, not merely whether it is available.
+/// `false` means "take the `center_columns` → [`gram_xty`] route".
+pub fn fused_centering_available<F>(d: usize) -> bool
+where
+    F: Float + CubeElement + Pod,
+{
+    matches!(
+        gram_path::<F>(d * d),
+        GramPath::SharedTiled | GramPath::Tiled | GramPath::Blocked
+    )
+}
+
 /// Device-resident column means of the `n × d` row-major `x` and the mean of
 /// the length-`n` `y`, returned as `(x̄, ȳ)` device buffers.
 ///
@@ -178,10 +201,7 @@ where
 {
     validate_geometry(x.len(), (n, d), y.len())?;
 
-    if !matches!(
-        gram_path::<F>(d * d),
-        GramPath::SharedTiled | GramPath::Tiled | GramPath::Blocked
-    ) {
+    if !fused_centering_available::<F>(d) {
         let (xc, xm) = crate::prims::center::center_columns::<F>(pool, x, (n, d))?;
         let (yc, ym) = crate::prims::center::center_columns::<F>(pool, y, (n, 1))?;
         xc.release_into(pool);

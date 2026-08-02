@@ -472,9 +472,10 @@ macro_rules! ridge_build {
 /// The branch has to happen HERE, before ingress, because the two entry points
 /// take different operand types: `Ridge::fit_from_host_slice` borrows the Arrow
 /// values directly (`host_slice_*`) and `Ridge::fit_with_sample_weight` needs a
-/// device upload (`validated_*`). On the host arm — `positive=True` on the cpu
-/// backend, or below the dispatch-cost floor on any backend — the `n·d` design
-/// is therefore never copied at all. Both helpers run the SAME hard-reject
+/// device upload (`validated_*`). On the host arm — either normal-equations
+/// solver (`cholesky`, i.e. the DEFAULT, or `lbfgs`) on the cpu backend, or
+/// below the dispatch-cost floor on any backend — the `n·d` design is therefore
+/// never copied at all. Both helpers run the SAME hard-reject
 /// bridge validator, so the ingress contract is identical either way.
 macro_rules! ridge_fit_dispatch {
     ($float:ty, $p:expr, $xa:expr, $ya:expr, $swa:expr, $rows:expr, $cols:expr,

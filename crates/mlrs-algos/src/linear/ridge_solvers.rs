@@ -475,6 +475,170 @@ pub fn nonnegative_cd(
     (w, sweeps)
 }
 
+/// The `solver='cholesky'` normal-equations solve, on the HOST — the twin of
+/// `prims::cholesky::cholesky_solve_reg` that `Ridge::fit_from_host_slice` uses.
+///
+/// Solves `(G + αI)·w = Xᵀy` by Cholesky–Banachiewicz in `f64`, over the `d × d`
+/// Gram the host pass already formed. This is `d³/6` multiply-adds on a matrix
+/// that is at most a few hundred wide, so it is microseconds next to the
+/// `n·d²/2` normal-equations formation that precedes it — the reason the whole
+/// `positive = false` fit can live on the host at all.
+///
+/// Returns `None` on a non-positive pivot, which is the host spelling of the
+/// device prim's [`PrimError::NotPositiveDefinite`](mlrs_core::PrimError) and
+/// drives the same sklearn-faithful retry: `_ridge_regression` wraps
+/// `_solve_cholesky` in `except LinAlgError` and re-solves with the SVD arm.
+/// [`gram_eig_ridge`] is that retry.
+///
+/// The `1e-12` pivot floor is the device kernel's, verbatim, so the two arms
+/// declare the same matrices non-SPD rather than disagreeing about which fits
+/// fall back.
+pub fn cholesky_ridge(gram: &[f64], xty: &[f64], d: usize, alpha: f64) -> Option<Vec<f64>> {
+    const PIVOT_FLOOR: f64 = 1e-12;
+    let mut l = vec![0.0f64; d * d];
+    for i in 0..d {
+        for j in 0..i {
+            let mut sum = gram[i * d + j];
+            for k in 0..j {
+                sum -= l[i * d + k] * l[j * d + k];
+            }
+            l[i * d + j] = sum / l[j * d + j];
+        }
+        let mut diag = gram[i * d + i] + alpha;
+        for k in 0..i {
+            diag -= l[i * d + k] * l[i * d + k];
+        }
+        if !(diag > PIVOT_FLOOR) {
+            return None;
+        }
+        l[i * d + i] = diag.sqrt();
+    }
+
+    // Forward solve L·z = c, then back solve Lᵀ·w = z.
+    let mut w = vec![0.0f64; d];
+    for i in 0..d {
+        let mut s = xty[i];
+        for k in 0..i {
+            s -= l[i * d + k] * w[k];
+        }
+        w[i] = s / l[i * d + i];
+    }
+    for step in 0..d {
+        let i = d - 1 - step;
+        let mut s = w[i];
+        for k in (i + 1)..d {
+            s -= l[k * d + i] * w[k];
+        }
+        w[i] = s / l[i * d + i];
+    }
+    Some(w)
+}
+
+/// The singular-Gram retry: `coef = V·diag(1/(λ+α))·Vᵀ·Xᵀy` from the symmetric
+/// eigendecomposition of `G`, the host twin of `ridge.rs`'s `solve_svd_gram_eig`.
+///
+/// sklearn falls back from `cholesky` to `svd` on a `LinAlgError`, and this is
+/// what that means on the host arm. Algebraically identical to `_solve_svd`:
+/// with `G = XᵀX = V·diag(λ)·Vᵀ` and `λ = σ²`, `V·diag(1/(λ+α))·Vᵀ·Xᵀy` has the
+/// same entries as `V·diag(σ/(σ²+α))·Uᵀy` term for term, and the `σ = 0`
+/// directions drop out of both.
+///
+/// The decomposition is cyclic Jacobi. It is `O(d³)` per sweep on a matrix at
+/// most a few hundred wide and this is a COLD path — reached only after a
+/// factorization has already failed — so the simplest correct rotation sweep is
+/// the right one; there is no case for a tridiagonal-QR here.
+///
+/// Unlike the device arm this carries no feature cap: `solve_svd_gram_eig`
+/// rejects `d > 64` because the Jacobi eig KERNEL stages `d × d` in shared
+/// memory, which is a property of that kernel and not of the algorithm.
+pub fn gram_eig_ridge(gram: &[f64], xty: &[f64], d: usize, alpha: f64) -> Vec<f64> {
+    /// sklearn's `_solve_svd` cutoff (`s > 1e-15`, "same default as
+    /// scipy.linalg.pinv"), applied to `σ = √λ` so both arms drop the same
+    /// directions.
+    const ZERO_SIGMA: f64 = 1e-15;
+    const MAX_SWEEPS: usize = 100;
+
+    let mut a = gram.to_vec();
+    // `v` accumulates the rotations COLUMN-wise: `v[r*d + c]` is component `r`
+    // of eigenvector `c`.
+    let mut v = vec![0.0f64; d * d];
+    for i in 0..d {
+        v[i * d + i] = 1.0;
+    }
+
+    for _ in 0..MAX_SWEEPS {
+        // Off-diagonal Frobenius mass; the sweep stops once the matrix is
+        // diagonal to working precision.
+        let mut off = 0.0f64;
+        for p in 0..d {
+            for q in (p + 1)..d {
+                off += a[p * d + q] * a[p * d + q];
+            }
+        }
+        if off <= 1e-30 {
+            break;
+        }
+        for p in 0..d {
+            for q in (p + 1)..d {
+                let apq = a[p * d + q];
+                if apq == 0.0 {
+                    continue;
+                }
+                let theta = (a[q * d + q] - a[p * d + p]) / (2.0 * apq);
+                let t = if theta >= 0.0 {
+                    1.0 / (theta + (1.0 + theta * theta).sqrt())
+                } else {
+                    -1.0 / (-theta + (1.0 + theta * theta).sqrt())
+                };
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+                for k in 0..d {
+                    let akp = a[k * d + p];
+                    let akq = a[k * d + q];
+                    a[k * d + p] = c * akp - s * akq;
+                    a[k * d + q] = s * akp + c * akq;
+                }
+                for k in 0..d {
+                    let apk = a[p * d + k];
+                    let aqk = a[q * d + k];
+                    a[p * d + k] = c * apk - s * aqk;
+                    a[q * d + k] = s * apk + c * aqk;
+                }
+                for k in 0..d {
+                    let vkp = v[k * d + p];
+                    let vkq = v[k * d + q];
+                    v[k * d + p] = c * vkp - s * vkq;
+                    v[k * d + q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+
+    // t = Vᵀ·(Xᵀy), filtered, then coef = V·t.
+    let mut t = vec![0.0f64; d];
+    for c in 0..d {
+        let lambda = a[c * d + c].max(0.0);
+        let denom = lambda + alpha;
+        if lambda.sqrt() <= ZERO_SIGMA || denom <= 0.0 {
+            continue;
+        }
+        let mut acc = 0.0f64;
+        for r in 0..d {
+            acc += v[r * d + c] * xty[r];
+        }
+        t[c] = acc / denom;
+    }
+    let mut coef = vec![0.0f64; d];
+    for r in 0..d {
+        let mut acc = 0.0f64;
+        for c in 0..d {
+            acc += v[r * d + c] * t[c];
+        }
+        coef[r] = acc;
+    }
+    coef
+}
+
 /// `a·b` for equal-length host slices.
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()

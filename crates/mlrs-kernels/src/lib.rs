@@ -85,7 +85,7 @@ pub mod tree;
 pub mod tsne;
 pub mod umap_layout;
 
-pub use cholesky::cholesky_solve;
+pub use cholesky::{cholesky_solve, cholesky_solve_wide, CHOLESKY_WIDE_MAX_DIM};
 // Phase-13 KNN-graph (PRIM-11): direct pairwise distance kernels + per-row
 // index-identity self-drop GATHER. Plan 13-02 owns this re-export (file-disjoint,
 // single-owner) alongside the kernel bodies in `distance.rs`.

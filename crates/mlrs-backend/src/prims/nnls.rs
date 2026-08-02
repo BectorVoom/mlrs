@@ -193,7 +193,11 @@ pub fn ridge_intercept_device<F>(
 where
     F: Float + CubeElement + Pod,
 {
-    if d == 0 || d > NNLS_MAX_DIM as usize || xmean.len() != d || coef.len() != d {
+    // No `NNLS_MAX_DIM` here: that cap belongs to `ridge_nnls`, which launches
+    // one unit PER FEATURE. This kernel is a single unit walking `c < d`, so any
+    // `d` is in range — and the default (`positive = false`) arm reaches it at
+    // `d` the non-negative solve never sees.
+    if d == 0 || xmean.len() != d || coef.len() != d {
         return Err(PrimError::ShapeMismatch {
             operand: "ridge_intercept.xmean",
             rows: d,

@@ -319,10 +319,102 @@ fn host_and_device_arms_agree() {
     }
 }
 
+/// RIDGE-DEFAULT-CUDA: the `positive = false` (`cholesky`) host arm agrees with
+/// the device arm, including with `fit_intercept = false` and with weights.
+///
+/// This is the equivalence that lets the cpu backend take the host route for the
+/// DEFAULT estimator. It is also the only test that compares the fused device
+/// composition (`column_means` + `gram_xty_centered` + in-kernel `α` +
+/// `ridge_intercept_device`) against an independent implementation of the same
+/// algebra — the host arm centers, forms and solves in `f64` with none of those
+/// four pieces in common.
+#[test]
+fn cholesky_host_and_device_arms_agree() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let case = load_npz(fixture("ridge_params_f64_seed42.npz")).expect("load ridge_params_f64");
+    let (x, y, sw) = fixture_data::<f64>(&case);
+    let alpha = case.expect_f64("alpha")[0];
+
+    for &(label, fit_intercept, weighted) in &[
+        ("cholesky", true, false),
+        ("cholesky_noint", false, false),
+        ("cholesky_sw", true, true),
+        ("cholesky_noint_sw", false, true),
+    ] {
+        let mk = || {
+            Ridge::<f64>::builder()
+                .alpha(alpha)
+                .fit_intercept(fit_intercept)
+                .solver(RidgeSolver::Cholesky)
+                .build::<f64>()
+                .expect("cholesky builds")
+        };
+        let swopt = weighted.then_some(sw.as_slice());
+
+        let client = runtime::active_client();
+        let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+        let (hc, hi) = {
+            let _g = abflag::force("MLRS_RIDGE_GRAM_HOST", "1");
+            let est = mk();
+            assert!(est.host_fit_applicable((N_SAMPLES, N_FEATURES)));
+            let f = est
+                .fit_from_host_slice(&mut pool, &x, &y, (N_SAMPLES, N_FEATURES), swopt)
+                .unwrap_or_else(|e| panic!("[{label}] host arm must fit: {e}"));
+            assert_eq!(
+                f.solver(),
+                RidgeSolver::Cholesky,
+                "[{label}] a well-conditioned Gram must not take the singular retry"
+            );
+            (
+                f.coef(&pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+                host_to_f64(f.intercept(&pool)),
+            )
+        };
+
+        let (dc, di) = {
+            let _g = abflag::force("MLRS_RIDGE_GRAM_HOST", "0");
+            let est = mk();
+            assert!(!est.host_fit_applicable((N_SAMPLES, N_FEATURES)));
+            let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+            let y_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y);
+            let f = est
+                .fit_with_sample_weight(
+                    &mut pool,
+                    &x_dev,
+                    Some(&y_dev),
+                    (N_SAMPLES, N_FEATURES),
+                    swopt,
+                )
+                .unwrap_or_else(|e| panic!("[{label}] device arm must fit: {e}"));
+            (
+                f.coef(&pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+                host_to_f64(f.intercept(&pool)),
+            )
+        };
+
+        assert_close(&hc, &dc, &F64_TOL, &format!("cholesky arm coef_ [{label}]"));
+        assert_close(
+            &[hi],
+            &[di],
+            &F64_TOL,
+            &format!("cholesky arm intercept_ [{label}]"),
+        );
+    }
+}
+
 /// The host entry point REFUSES a configuration it does not apply to, rather
-/// than silently returning a differently-computed answer: a non-`positive`
-/// solver never reaches it, and neither does anything while the A/B knob points
-/// at the device arm.
+/// than silently returning a differently-computed answer: a solver that reads
+/// the DESIGN rather than the normal equations never reaches it, and neither
+/// does anything while the A/B knob points at the device arm.
+///
+/// `cholesky` is no longer in this list — it joined `lbfgs` on the host arm
+/// (RIDGE-DEFAULT-CUDA), which is what the `lsqr` case below replaces it with.
+/// The two rejected shapes are the ones that matter: `lsqr` consumes rows of
+/// `X` (there is no `d × d` summary of it to solve on the host), and the knob
+/// override must be honoured whatever the solver.
 #[test]
 fn fit_from_host_slice_rejects_an_inapplicable_configuration() {
     let client = runtime::active_client();
@@ -333,13 +425,31 @@ fn fit_from_host_slice_rejects_an_inapplicable_configuration() {
     {
         let _g = abflag::force("MLRS_RIDGE_GRAM_HOST", "1");
         let est = Ridge::<f32>::builder()
-            .solver(RidgeSolver::Cholesky)
+            .solver(RidgeSolver::Lsqr)
             .build::<f32>()
-            .expect("cholesky builds");
-        assert!(!est.host_fit_applicable((N_SAMPLES, N_FEATURES)));
+            .expect("lsqr builds");
+        assert!(
+            !est.host_fit_applicable((N_SAMPLES, N_FEATURES)),
+            "lsqr reads rows of X, so it has no host normal-equations arm"
+        );
         assert!(est
             .fit_from_host_slice(&mut pool, &x, &y, (N_SAMPLES, N_FEATURES), None)
             .is_err());
+    }
+    {
+        // ...while `cholesky` — the default — now DOES route here.
+        let _g = abflag::force("MLRS_RIDGE_GRAM_HOST", "1");
+        let est = Ridge::<f32>::builder()
+            .solver(RidgeSolver::Cholesky)
+            .build::<f32>()
+            .expect("cholesky builds");
+        assert!(
+            est.host_fit_applicable((N_SAMPLES, N_FEATURES)),
+            "cholesky consumes only XᵀX/Xᵀy, so the host arm applies"
+        );
+        assert!(est
+            .fit_from_host_slice(&mut pool, &x, &y, (N_SAMPLES, N_FEATURES), None)
+            .is_ok());
     }
     {
         let _g = abflag::force("MLRS_RIDGE_GRAM_HOST", "0");
