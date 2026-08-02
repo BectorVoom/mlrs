@@ -70,9 +70,26 @@ impl<R: cubecl::Runtime, F: Pod> DeviceArray<R, F> {
         // Single host copy into an owned byte Vec, then hand ownership to
         // CubeCL (A3 — no borrow/no-copy Bytes constructor exists in 0.10).
         let byte_vec: Vec<u8> = bytemuck::cast_slice::<F, u8>(host).to_vec();
-        let handle = pool
-            .client()
-            .create(cubecl::bytes::Bytes::from_bytes_vec(byte_vec));
+        let mut bytes = cubecl::bytes::Bytes::from_bytes_vec(byte_vec);
+
+        // `MLRS_UPLOAD_PINNED=1` moves the staging buffer to PAGE-LOCKED host
+        // memory before the transfer, which lets the driver DMA straight out of
+        // it instead of bouncing through its own internal pinned buffer.
+        //
+        // Off by default, and deliberately so: it is an extra full host copy
+        // bought against a faster transfer, so it only pays where the transfer
+        // is the larger of the two. Measured on the local wgpu adapter at
+        // 102 MB it is a 1.4× win (102.2 ms → 72.9 ms), but that adapter shares
+        // physical memory with the host and is no guide to a discrete GPU's
+        // PCIe path. It also has a CLIFF: `cubecl-cuda`'s `reserve_cpu` refuses
+        // pinned memory above 100 MB unless explicitly marked, so a 102.4 MB
+        // design (the `n=100 000, d=256` rung) would allocate and ZERO a second
+        // plain buffer and copy into it for no benefit at all — strictly worse.
+        // Left as a knob until measured per backend, per size.
+        if crate::abflag::is_on("MLRS_UPLOAD_PINNED") {
+            pool.client().staging(std::iter::once(&mut bytes), false);
+        }
+        let handle = pool.client().create(bytes);
 
         Self {
             handle,

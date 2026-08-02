@@ -62,6 +62,8 @@ sh("cd /content/mlrs && cargo test -p mlrs-algos --release --features cuda "
    "--test ridge_positive_perf_test --no-run")
 sh("cd /content/mlrs && cargo test -p mlrs-backend --release --features cuda "
    "--test gram_perf_test --no-run")
+sh("cd /content/mlrs && cargo test -p mlrs-backend --release --features cuda "
+   "--test upload_perf_test --no-run")
 print("SETUP OK — run CELL 2")
 """
 
@@ -125,6 +127,8 @@ RIDGE = ("cd /content/mlrs && MLRS_POS_REPS=9 {env} cargo test -p mlrs-algos --r
          "--features cuda --test ridge_positive_perf_test -- --ignored --nocapture")
 GRAM  = ("cd /content/mlrs && MLRS_POS_REPS=9 cargo test -p mlrs-backend --release "
          "--features cuda --test gram_perf_test -- --ignored --nocapture")
+UPLOAD = ("cd /content/mlrs && MLRS_POS_REPS=7 cargo test -p mlrs-backend --release "
+          "--features cuda --test upload_perf_test -- --ignored --nocapture")
 
 # The whole-fit ladder under each dispatch arm. Neither Gram formation may be
 # assumed on this device: the crossover between them is an adapter property
@@ -133,7 +137,8 @@ GRAM  = ("cd /content/mlrs && MLRS_POS_REPS=9 cargo test -p mlrs-backend --relea
 for label, env in [("A. whole fit — default dispatch",      ""),
                    ("B. whole fit — tiled Gram forced",     "LR_GRAM_TILED=1"),
                    ("C. whole fit — blocked Gram forced",   "LR_GRAM_BLOCKED=1"),
-                   ("D. whole fit — host arm forced",       "MLRS_RIDGE_GRAM_HOST=1")]:
+                   ("D. whole fit — host arm forced",       "MLRS_RIDGE_GRAM_HOST=1"),
+                   ("G. whole fit — pinned upload staging", "MLRS_UPLOAD_PINNED=1")]:
     cap("\n" + "-" * 72)
     cap(label)
     cap("-" * 72)
@@ -146,6 +151,15 @@ cap("\n" + "-" * 72)
 cap("E. Gram phase only — formation + cube-width sweep")
 cap("-" * 72)
 sh(GRAM, echo=False)
+
+# The upload is 85-91% of every device-arm fit on this GPU, at 0.33-0.92 GB/s
+# against a PCIe link that should do 6-12. This breaks that number into the host
+# copy, the device allocation, the transfer, a pinned-staging variant and a
+# chunked variant, so the fix targets whichever one is actually expensive.
+cap("\n" + "-" * 72)
+cap("F. Upload cost breakdown — where the 0.33 GB/s actually goes")
+cap("-" * 72)
+sh(UPLOAD, echo=False)
 
 # --- push the log ----------------------------------------------------------
 stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
