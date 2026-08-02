@@ -673,12 +673,22 @@ impl PyBernoulliNB {
             } => (*alpha, *force_alpha, *binarize, *fit_prior, class_prior.clone()),
             _ => return Err(not_fitted("bernoulli_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm: a `BernoulliNB` fit reads every element of `X` and
+        // `y` on the host (validate + threshold + count in one sweep) and touches
+        // the device only to upload the tiny `n_classes × n_features` predict
+        // operand, so routing the OPERANDS through a `DeviceArray` bought a
+        // `from_host` copy in and a `to_host` copy straight back out and nothing
+        // else. `host_slice_*` runs the SAME hard-reject bridge validation
+        // (`validate_f32`/`validate_f64`: no nulls, no sliced/offset views) and
+        // BORROWS the Arrow values instead. The pool handle is still taken — the
+        // fitted operand upload needs it (`CategoricalNB`, whose fitted tables are
+        // host-side, takes none).
         let fitted = py.detach(|| -> PyResult<AnyBernoulliNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
                     let est = BernoulliNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -687,14 +697,15 @@ impl PyBernoulliNB {
                         .class_prior(class_prior)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyBernoulliNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
                     let est = BernoulliNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -703,8 +714,9 @@ impl PyBernoulliNB {
                         .class_prior(class_prior)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyBernoulliNB::F64(fitted))
                 }
             }
@@ -892,23 +904,25 @@ impl PyComplementNB {
 // min_categories (None | int | list → MinCategories::{Infer,Uniform,PerFeature}).
 // ===========================================================================
 
-/// Map a `CategoricalNB::fit_from_host_slice` failure to Python, OWNING the
-/// NaN/inf rejection that `check_array` used to perform on this path.
+/// Map a host-slice NB fit failure to Python, OWNING the NaN/inf rejection that
+/// `check_array` used to perform on that path.
 ///
-/// `mlrs.naive_bayes.CategoricalNB.fit` passes `ensure_all_finite=False` because
-/// the Rust fit's pass-1 scan already reads every element of `X` and rejects a
-/// non-finite one (`scan_chunk` — `NaN` fails the integer test, `±inf` the range
-/// test). It relocates the check, it does not drop it: on ANY rejection this
-/// re-scans the operand for a non-finite value and, if one is present, raises
-/// `check_array`'s exact `ValueError` via [`nonfinite_input_err`] instead of
-/// mlrs' own message — so a NaN in `X` reports "Input contains NaN." exactly as
-/// before. That re-scan runs ONLY on the rejection path, where the input is
-/// already being thrown away, so it costs nothing on a successful fit.
+/// `mlrs.naive_bayes.CategoricalNB.fit` and `.BernoulliNB.fit` pass
+/// `ensure_all_finite=False` because the Rust fit already reads every element of
+/// `X` and rejects a non-finite one — CategoricalNB in its pass-1 scan (`NaN`
+/// fails the integer test, `±inf` the range test), BernoulliNB in the fused
+/// count sweep (`!xf.is_finite()`). It relocates the check, it does not drop it:
+/// on ANY rejection this re-scans the operand for a non-finite value and, if one
+/// is present, raises `check_array`'s exact `ValueError` via
+/// [`nonfinite_input_err`] instead of mlrs' own message — so a NaN in `X`
+/// reports "Input contains NaN." exactly as before. That re-scan runs ONLY on
+/// the rejection path, where the input is already being thrown away, so it costs
+/// nothing on a successful fit.
 ///
 /// The precedence also matches `check_array`, which scans the WHOLE matrix: a
-/// matrix holding both a NaN and (earlier) a negative category still reports the
+/// matrix holding both a NaN and (earlier) a negative value still reports the
 /// NaN, because the non-finite verdict is taken first here too.
-fn categorical_fit_err<T>(err: mlrs_algos::error::AlgoError, xh: &[T], dtype: &str) -> PyErr
+fn nb_host_fit_err<T>(err: mlrs_algos::error::AlgoError, xh: &[T], dtype: &str) -> PyErr
 where
     T: Copy + Into<f64>,
 {
@@ -1043,7 +1057,7 @@ impl PyCategoricalNB {
                         .map_err(build_err_to_py)?;
                     let fitted = est
                         .fit_from_host_slice(xh, yh, (rows, cols))
-                        .map_err(|e| categorical_fit_err(e, xh, "float32"))?;
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyCategoricalNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
@@ -1060,7 +1074,7 @@ impl PyCategoricalNB {
                         .map_err(build_err_to_py)?;
                     let fitted = est
                         .fit_from_host_slice(xh, yh, (rows, cols))
-                        .map_err(|e| categorical_fit_err(e, xh, "float64"))?;
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyCategoricalNB::F64(fitted))
                 }
             }

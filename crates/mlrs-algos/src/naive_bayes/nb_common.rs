@@ -53,6 +53,63 @@ use mlrs_core::{host_to_f64, PrimError};
 /// index check) stay consistent if the tolerance is ever tuned.
 pub const NB_LABEL_INT_TOL: f64 = 1e-6;
 
+/// Below this many `n_samples · n_features` elements a chunked host fit pass
+/// stays single-threaded: spawning a scoped worker costs ~30 µs, which dwarfs a
+/// scan over a few tens of thousands of elements.
+pub(crate) const PAR_MIN_ELEMS: usize = 1 << 15;
+
+/// Ceiling on the worker count for a chunked host fit pass. These passes stream
+/// the design matrix, so they are DRAM-bandwidth-bound, not core-bound: the wall
+/// clock stops improving long before the cores run out, while CPU time keeps
+/// climbing linearly with every worker added. Measured on a 16-core box with the
+/// CategoricalNB `100 000 × 128` fit (wall / cpu ms, min of 5):
+///
+/// | workers | 1     | 2     | 4     | 8     | 16    |
+/// |---------|-------|-------|-------|-------|-------|
+/// | wall ms | 67.8  | 53.3  | 41.6  | 36.0  | 35.2  |
+/// | cpu ms  | 67.4  | 77.5  | 74.5  | 88.0  | 132.4 |
+///
+/// 8 is the knee: it takes the last real wall-clock gain (13 % over 4), and
+/// doubling again buys 2 % for half as much CPU again. Spending a whole machine
+/// to shave 2 % off one fit is the wrong trade in a library, so the pool is
+/// capped here and the rest of the box is left for the caller's other work.
+pub(crate) const PAR_MAX_WORKERS: usize = 8;
+
+/// Worker count for a row-chunked host pass over `n_elems` elements: `1` below
+/// [`PAR_MIN_ELEMS`], else the machine's parallelism capped at
+/// [`PAR_MAX_WORKERS`].
+///
+/// `env_key` (e.g. `MLRS_CATNB_WORKERS` / `MLRS_BERNNB_WORKERS`) forces the
+/// count when set, read through [`mlrs_backend::abflag`] so a test can scope the
+/// override to its own thread rather than racing `environ`. Forcing `1` pins the
+/// fully serial arm, which is what makes a serial-vs-parallel agreement test
+/// possible. Override on new hardware to re-measure the table above.
+pub(crate) fn host_workers(env_key: &'static str, n_elems: usize) -> usize {
+    if let Some(forced) = mlrs_backend::abflag::var(env_key)
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+    {
+        return forced;
+    }
+    if n_elems < PAR_MIN_ELEMS {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
+        .clamp(1, PAR_MAX_WORKERS)
+}
+
+/// Row-chunk size (in ROWS) for a `workers`-way split of `n_samples`, capped at
+/// `u32::MAX` rows so a per-chunk `u32` count can never overflow (a count is
+/// bounded by its chunk's row count).
+pub(crate) fn chunk_rows(n_samples: usize, workers: usize) -> usize {
+    n_samples
+        .div_ceil(workers.max(1))
+        .max(1)
+        .min(u32::MAX as usize)
+}
+
 /// Normalize a SINGLE row of `n_classes` joint log-likelihoods into
 /// `(proba, log_proba)` (Pattern 3 — host f64, per-row max-shift, single terminal
 /// log).

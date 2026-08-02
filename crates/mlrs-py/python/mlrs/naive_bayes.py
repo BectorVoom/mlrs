@@ -129,7 +129,17 @@ class BernoulliNB(_BaseNB):
         self.output_type = output_type
 
     def fit(self, X, y):
-        xa, rows, cols = self._normalize(X)
+        # ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the
+        # Rust fit's fused count sweep reads every element of ``X`` anyway (it
+        # has to — every value is thresholded into a per-class count), so it
+        # reports the same verdict from that sweep and the PyO3 arm raises
+        # ``check_array``'s exact ``ValueError`` itself
+        # (``estimators/naive_bayes.rs::nb_host_fit_err``). ``check_array``'s own
+        # scan is a second single-threaded trip over the whole matrix — one of
+        # the largest remaining costs of a fit once the counting went
+        # single-pass. ``y`` keeps its scan: it is 1-D and the label decode has
+        # no equivalent hand-off.
+        xa, rows, cols = self._normalize(X, ensure_all_finite=False)
         ya = self._normalize_y(y, dtype=GaussianNB._x_float(xa))
         obj = self._ext().BernoulliNB(
             self.alpha,

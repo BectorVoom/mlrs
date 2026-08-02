@@ -41,7 +41,9 @@ use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::multinomial_nb::{
     decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
 };
-use crate::naive_bayes::nb_common::{argmax_decode, log_sum_exp_normalize, NB_LABEL_INT_TOL};
+use crate::naive_bayes::nb_common::{
+    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize, NB_LABEL_INT_TOL,
+};
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
 // BYTE-IDENTICAL (D-03).
@@ -256,11 +258,6 @@ impl CategoricalNBBuilder {
 /// ≥ 16 GiB count table anyway.
 const MAX_CATEGORY: f64 = u32::MAX as f64;
 
-/// Below this many `n_samples · n_features` elements the fit stays
-/// single-threaded: spawning a scoped worker costs ~30 µs, which dwarfs a scan
-/// over a few tens of thousands of elements.
-const PAR_MIN_ELEMS: usize = 1 << 15;
-
 /// Per-worker flat count-table budget, in `u32` entries (4 MiB). The tabulation
 /// replicates an `n_classes · Σ_j n_categories_j` table PER worker, so a fit
 /// with a huge category cross-product drops back to one table (serial) rather
@@ -275,57 +272,10 @@ const PAR_MIN_ELEMS: usize = 1 << 15;
 /// (at most `PAR_MAX_WORKERS · 4 MiB` of scratch) rather than scaling with cores.
 const PAR_TABLE_MAX_ENTRIES: usize = 1 << 20;
 
-/// Ceiling on the worker count. BOTH fit passes stream the design matrix, so
-/// they are DRAM-bandwidth-bound, not core-bound: the wall clock stops improving
-/// long before the cores run out, while CPU time keeps climbing linearly with
-/// every worker added. Measured on a 16-core box, `100 000 × 128` fit
-/// (wall / cpu, min of 5):
-///
-/// | workers | 1     | 2     | 4     | 8     | 16    |
-/// |---------|-------|-------|-------|-------|-------|
-/// | wall ms | 67.8  | 53.3  | 41.6  | 36.0  | 35.2  |
-/// | cpu ms  | 67.4  | 77.5  | 74.5  | 88.0  | 132.4 |
-///
-/// 8 is the knee: it takes the last real wall-clock gain (13 % over 4), and
-/// doubling again buys 2 % for half as much CPU again. Spending a whole machine
-/// to shave 2 % off one fit is the wrong trade in a library, so the pool is
-/// capped here and the rest of the box is left for the caller's other work.
-/// Override with `MLRS_CATNB_WORKERS` to re-measure on new hardware.
-const PAR_MAX_WORKERS: usize = 8;
-
-/// Worker count for a row-chunked host pass over `n_elems` elements: `1` below
-/// [`PAR_MIN_ELEMS`], else the machine's parallelism capped at
-/// [`PAR_MAX_WORKERS`].
-///
-/// `MLRS_CATNB_WORKERS=<n>` forces the count (read through
-/// [`mlrs_backend::abflag`], so a test can scope the override to its own thread
-/// rather than racing `environ`). `MLRS_CATNB_WORKERS=1` pins the fully serial
-/// arm, which is what makes a serial-vs-parallel agreement test possible.
-fn host_workers(n_elems: usize) -> usize {
-    if let Some(forced) = mlrs_backend::abflag::var("MLRS_CATNB_WORKERS")
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v >= 1)
-    {
-        return forced;
-    }
-    if n_elems < PAR_MIN_ELEMS {
-        return 1;
-    }
-    std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1)
-        .clamp(1, PAR_MAX_WORKERS)
-}
-
-/// Row-chunk size (in ROWS) for a `workers`-way split of `n_samples`, capped at
-/// `u32::MAX` rows so a per-chunk `u32` count can never overflow (a count is
-/// bounded by its chunk's row count).
-fn chunk_rows(n_samples: usize, workers: usize) -> usize {
-    n_samples
-        .div_ceil(workers.max(1))
-        .max(1)
-        .min(u32::MAX as usize)
-}
+/// The `MLRS_CATNB_WORKERS` override key handed to
+/// [`crate::naive_bayes::nb_common::host_workers`] — see there for the
+/// worker-count policy and the measured wall/cpu table behind it.
+const WORKERS_ENV: &str = "MLRS_CATNB_WORKERS";
 
 /// Pass 1 over ONE row-chunk: validate the categorical encoding and learn each
 /// feature's observed max, in a single ROW-MAJOR sweep.
@@ -476,7 +426,7 @@ where
         //     Round-to-nearest within 1e-6 to tolerate the f32/f64 round-trip of
         //     integer-encoded categories. ---
         let n_elems = n_samples * n_features;
-        let workers = host_workers(n_elems);
+        let workers = host_workers(WORKERS_ENV, n_elems);
         let rows_per = chunk_rows(n_samples, workers);
         let elems_per = rows_per * n_features;
 

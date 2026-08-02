@@ -14,6 +14,17 @@
 //! `flp = log p − log(1 − p)` + a per-class constant `Σ_j log(1 − p_cj)`
 //! (Pitfall 5) — set up there, not here.
 //!
+//! ## Fit shape (BERNNB-FIT-CPU)
+//!
+//! The fit is ENTIRELY host-side — there is no `#[cube]` kernel on this path,
+//! only ONE row-major sweep that validates, binarizes, and accumulates the
+//! per-`(class, feature)` occurrence counts at the same time
+//! ([`BernoulliNB::fit_host`] documents what the sweep replaced and why).
+//! [`BernoulliNB::fit_from_host_slice`] is the entry point the PyO3 bridge uses,
+//! so the operands are never round-tripped through a `DeviceArray` just to be
+//! read straight back; the only device buffer a fit creates is the tiny
+//! `n_classes × n_features` GEMM operand it returns for `predict`.
+//!
 //! Tests live in `crates/mlrs-algos/tests/bernoulli_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
@@ -29,9 +40,12 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::naive_bayes::multinomial_nb::{
-    decode_classes, resolve_class_log_prior, validate_discrete_alpha, validate_non_negative_counts,
+    decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
+    validate_non_negative_counts,
 };
-use crate::naive_bayes::nb_common::{argmax_decode, class_grouped_sum, log_sum_exp_normalize};
+use crate::naive_bayes::nb_common::{
+    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize,
+};
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
 // BYTE-IDENTICAL (D-03).
@@ -117,12 +131,105 @@ where
 
 /// Apply the D-04 binarization to a host f64 buffer: `Some(t)` maps `x > t → 1.0`
 /// else `0.0`; `None` assumes the input is already binary and passes it through.
+///
+/// PREDICT-side only. The fit never materializes a binarized copy — it folds the
+/// threshold into the accumulate step ([`count_chunk_binarized`]).
 fn binarize_host(buf: &mut [f64], binarize: Option<f64>) {
     if let Some(t) = binarize {
         for v in buf.iter_mut() {
             *v = if *v > t { 1.0 } else { 0.0 };
         }
     }
+}
+
+/// The `MLRS_BERNNB_WORKERS` override key handed to
+/// [`crate::naive_bayes::nb_common::host_workers`] — see there for the
+/// worker-count policy. `MLRS_BERNNB_WORKERS=1` pins the fully serial arm, which
+/// is what makes the serial-vs-parallel agreement test possible.
+const WORKERS_ENV: &str = "MLRS_BERNNB_WORKERS";
+
+/// Per-worker accumulator budget, in entries. The fit replicates the
+/// `n_classes · n_features` occurrence table PER worker to stay lock-free, so a
+/// fit whose table is already huge runs on ONE table (serial) rather than
+/// allocating a copy per core. 1 Mi entries is 4 MiB as `u32`; the un-replicated
+/// table is at most the same size as the `feature_log_prob_` the fit must return
+/// anyway, so it can never dominate the estimator it builds.
+const PAR_TABLE_MAX_ENTRIES: usize = 1 << 20;
+
+/// Fused validate + binarize + tabulate over ONE row-chunk, the `binarize =
+/// Some(threshold)` arm: `table[c · n_features + j] += (x[i,j] > threshold)` for
+/// every row `i` of the chunk, where `c = class_of_row[i]`.
+///
+/// Returns the flat index (in the WHOLE matrix — `flat_base` is the chunk's
+/// offset) and value of the first element that is not finite and non-negative,
+/// or `None`. Reporting the flat index lets the parallel driver pick the FIRST
+/// offender in row-major order, so the error message does not depend on the
+/// worker count. The predicate is written `!xf.is_finite() || xf < 0.0` — the
+/// `is_finite` arm is what rejects a `NaN`, for which every ordering comparison
+/// (including `xf > threshold`) is false and which would otherwise be silently
+/// counted as a non-occurrence.
+///
+/// Counts are `u32`: a count is bounded by the chunk's row count, and
+/// [`chunk_rows`] caps a chunk at `u32::MAX` rows. That halves the accumulator
+/// traffic against an `f64` table, and the occurrence count is EXACT — the
+/// per-class row block sum this replaced accumulated in floating point.
+fn count_chunk_binarized<F>(
+    chunk: &[F],
+    class_of_row: &[usize],
+    n_features: usize,
+    threshold: f64,
+    flat_base: usize,
+    table: &mut [u32],
+) -> Option<(usize, f64)>
+where
+    F: Float + CubeElement + Pod,
+{
+    for (r, (row, &c)) in chunk
+        .chunks_exact(n_features)
+        .zip(class_of_row.iter())
+        .enumerate()
+    {
+        let acc = &mut table[c * n_features..(c + 1) * n_features];
+        for (j, (&xv, a)) in row.iter().zip(acc.iter_mut()).enumerate() {
+            let xf = host_to_f64(xv);
+            if !xf.is_finite() || xf < 0.0 {
+                return Some((flat_base + r * n_features + j, xf));
+            }
+            *a += u32::from(xf > threshold);
+        }
+    }
+    None
+}
+
+/// The `binarize = None` twin of [`count_chunk_binarized`]: the input is assumed
+/// already binary, so the raw value is summed (sklearn's `binarize=None` feeds
+/// `X` to the count GEMM unchanged). Accumulates in `f64` because a pass-through
+/// value need not be an integer.
+fn count_chunk_raw<F>(
+    chunk: &[F],
+    class_of_row: &[usize],
+    n_features: usize,
+    flat_base: usize,
+    table: &mut [f64],
+) -> Option<(usize, f64)>
+where
+    F: Float + CubeElement + Pod,
+{
+    for (r, (row, &c)) in chunk
+        .chunks_exact(n_features)
+        .zip(class_of_row.iter())
+        .enumerate()
+    {
+        let acc = &mut table[c * n_features..(c + 1) * n_features];
+        for (j, (&xv, a)) in row.iter().zip(acc.iter_mut()).enumerate() {
+            let xf = host_to_f64(xv);
+            if !xf.is_finite() || xf < 0.0 {
+                return Some((flat_base + r * n_features + j, xf));
+            }
+            *a += xf;
+        }
+    }
+    None
 }
 
 /// Builder for [`BernoulliNB`] (D-01). Defaults (D-02): `alpha=1.0`,
@@ -207,25 +314,43 @@ impl BernoulliNBBuilder {
     }
 }
 
-impl<F> Fit<F> for BernoulliNB<F, Unfit>
+impl<F> BernoulliNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    type Fitted = BernoulliNB<F, Fitted>;
-
-    fn fit(
+    /// Fit directly from HOST slices — the no-upload twin of [`Fit::fit`].
+    ///
+    /// A `BernoulliNB` fit reads every element of `x` and `y` on the host (the
+    /// counts are validated, thresholded, and smoothed into host-f64 tables) and
+    /// touches the device exactly once, to upload the `n_classes × n_features`
+    /// GEMM operand `predict` needs. Routing the OPERANDS through a `DeviceArray`
+    /// therefore bought a round trip and nothing else: `from_host` copied `n·d`
+    /// floats into a pool buffer and `to_host` copied them straight back out. The
+    /// PyO3 bridge hands the Arrow values here instead, so a fit touches the
+    /// caller's buffer once. Precedent: `Ridge::fit_from_host_slice` /
+    /// `CategoricalNB::fit_from_host_slice`.
+    ///
+    /// `pool` is still required — the fitted `feature_log_prob_` is
+    /// device-resident (D-03) — but only that one small upload uses it.
+    ///
+    /// `shape` is `(n_samples, n_features)` and `x` is row-major, exactly as for
+    /// [`Fit::fit`]; the geometry guard is the slice twin of `validate_geometry`.
+    pub fn fit_from_host_slice(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        x: &[F],
+        y: &[F],
         shape: (usize, usize),
     ) -> Result<BernoulliNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
-        validate_geometry(x, shape)?;
-        let y = y.ok_or(AlgoError::NotFitted {
-            estimator: "bernoulli_nb",
-            operation: "fit (requires y)",
-        })?;
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
         if y.len() != n_samples {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "y",
@@ -234,38 +359,126 @@ where
                 len: y.len(),
             }));
         }
+        self.fit_host(pool, x, y, shape)
+    }
 
-        let (classes_, class_of_row, n_classes) = decode_classes("bernoulli_nb", pool, y, n_samples)?;
+    /// The shared host fit body behind [`Fit::fit`] and
+    /// [`BernoulliNB::fit_from_host_slice`] — both geometry guards run in the
+    /// caller, so this is the math only.
+    ///
+    /// ## Why ONE fused sweep (PERF)
+    ///
+    /// The previous body did the same work in seven full passes over the design
+    /// matrix plus `n_classes` device launches: read `x` to host, map it into an
+    /// `n·d` `Vec<f64>`, scan that for finiteness, scan it again to binarize,
+    /// map it back into an `n·d` `Vec<F>`, upload THAT, and then hand it to
+    /// `class_grouped_sum` — which read it back to the host, and for EACH class
+    /// gathered that class's rows into a fresh `n_c·d` block, uploaded the block,
+    /// launched `column_reduce` over it, and read the result back. On the cpu
+    /// backend every one of those launches is a cubecl-cpu kernel with a thread
+    /// per unit, so a fit cost seconds where the arithmetic is one pass of adds.
+    ///
+    /// Now: [`count_chunk_binarized`] validates, thresholds, and accumulates
+    /// `feature_count_[c, j]` in ONE row-major sweep, chunked over rows across a
+    /// scoped worker pool with a replicated (lock-free) `u32` accumulator per
+    /// worker. No binarized copy is materialized, no per-class row block is
+    /// gathered, and no device buffer is created for the design matrix at all —
+    /// the sweep reads `x` exactly once and writes `n_classes · n_features`
+    /// counts. The only device touch left is the fitted operand upload.
+    fn fit_host(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x_host: &[F],
+        y_host: &[F],
+        shape: (usize, usize),
+    ) -> Result<BernoulliNB<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
 
-        // --- D-04 binarize: apply x>t → 1 on a host copy BEFORE the GATHER so the
-        //     per-(class, feature) counts are occurrence counts. binarize=None
-        //     assumes the input is already binary (pass-through). ---
-        let mut x_bin: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        // CR-01 / T-11-02: validate the RAW input is finite and non-negative BEFORE
-        // binarization (sklearn's BernoulliNB calls `check_non_negative`; a NaN
-        // input would otherwise survive binarization in an undefined way and a
-        // negative count is rejected for parity).
-        validate_non_negative_counts("bernoulli_nb", &x_bin)?;
-        binarize_host(&mut x_bin, self.binarize);
-        let x_bin_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
-            pool,
-            &x_bin.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<F>>(),
-        );
+        // Labels first: the previous body decoded `classes_` BEFORE it scanned
+        // `X`, so a fit with both a bad label and a bad feature value reports the
+        // label error. Keep that precedence — the X validation now lives inside
+        // the count sweep below.
+        let (classes_, class_of_row, n_classes) = decode_classes_host::<F>("bernoulli_nb", y_host)?;
 
-        // feature_count_[c,j] = Σ over class-c rows of binarized x[i,j].
-        // WR-03: release `x_bin_dev` on BOTH the Ok and Err arms before propagating
-        // so a GATHER failure does not leak the binarized scratch (WR-07 contract).
-        let feature_count =
-            match class_grouped_sum::<F>(pool, &x_bin_dev, shape, &class_of_row, n_classes) {
-                Ok(fc) => {
-                    x_bin_dev.release_into(pool);
-                    fc
+        // --- The fused sweep: validate the RAW input is finite and non-negative
+        //     (CR-01 / T-11-02 — a NaN would otherwise be silently counted as a
+        //     non-occurrence and a negative count is rejected for parity), apply
+        //     the D-04 `x > t → 1` threshold, and accumulate
+        //     feature_count_[c,j] = Σ over class-c rows of the binarized x[i,j],
+        //     all in one pass. `binarize=None` assumes the input is already
+        //     binary (pass-through). ---
+        let table_len = n_classes * n_features;
+        let workers = if table_len > PAR_TABLE_MAX_ENTRIES {
+            1
+        } else {
+            host_workers(WORKERS_ENV, n_samples * n_features)
+        };
+        let rows_per = chunk_rows(n_samples, workers);
+        let elems_per = rows_per * n_features;
+        let binarize = self.binarize;
+
+        // One worker's share of the sweep, returning its private count table and
+        // the first invalid element it saw (flat index + value).
+        let run = |chunk: &[F], cls: &[usize], flat_base: usize| -> (Vec<f64>, Option<(usize, f64)>) {
+            match binarize {
+                Some(t) => {
+                    let mut table = vec![0u32; table_len];
+                    let bad = count_chunk_binarized::<F>(
+                        chunk, cls, n_features, t, flat_base, &mut table,
+                    );
+                    (table.iter().map(|&v| f64::from(v)).collect(), bad)
                 }
-                Err(e) => {
-                    x_bin_dev.release_into(pool);
-                    return Err(AlgoError::from(e));
+                None => {
+                    let mut table = vec![0.0f64; table_len];
+                    let bad = count_chunk_raw::<F>(chunk, cls, n_features, flat_base, &mut table);
+                    (table, bad)
                 }
+            }
+        };
+
+        // The `n_samples <= u32::MAX` arm is not about parallelism: a single
+        // table over MORE rows than that could overflow its `u32` counters, so
+        // such a fit takes the chunked branch (whose chunks are capped at
+        // `u32::MAX` rows by `chunk_rows`) even at one worker.
+        let parts: Vec<(Vec<f64>, Option<(usize, f64)>)> =
+            if workers == 1 && n_samples <= u32::MAX as usize {
+                vec![run(x_host, &class_of_row, 0)]
+            } else {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = x_host
+                        .chunks(elems_per)
+                        .zip(class_of_row.chunks(rows_per))
+                        .enumerate()
+                        .map(|(ci, (chunk, cls))| {
+                            let run = &run;
+                            scope.spawn(move || run(chunk, cls, ci * elems_per))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("bernoulli_nb: fit worker panicked"))
+                        .collect()
+                })
             };
+
+        // The FIRST offender in row-major order — independent of worker count,
+        // and the same value the whole-matrix scan this replaced reported.
+        if let Some((_, xf)) = parts
+            .iter()
+            .filter_map(|(_, e)| *e)
+            .min_by(|(a, _), (b, _)| a.cmp(b))
+        {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "bernoulli_nb",
+                reason: format!("input X must be finite and non-negative (got {xf})"),
+            });
+        }
+        let mut feature_count: Vec<f64> = vec![0.0; table_len];
+        for (table, _) in &parts {
+            for (acc, &v) in feature_count.iter_mut().zip(table.iter()) {
+                *acc += v;
+            }
+        }
 
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
         for &c in &class_of_row {
@@ -277,12 +490,12 @@ where
         //     operand is the DELTA log p − log(1−p) and the per-class const
         //     Σ_j log(1−p_cj) becomes the bias (Pitfall 5). ---
         let alpha = self.alpha;
-        let mut flp_delta: Vec<f64> = vec![0.0; n_classes * n_features];
+        let mut flp_delta: Vec<f64> = vec![0.0; table_len];
         let mut neg_prob_sum: Vec<f64> = vec![0.0; n_classes];
         for c in 0..n_classes {
             let denom = class_count_[c] + 2.0 * alpha;
             for j in 0..n_features {
-                let p = (feature_count[c][j] + alpha) / denom;
+                let p = (feature_count[c * n_features + j] + alpha) / denom;
                 let log_p = p.ln();
                 let log_1mp = (1.0 - p).ln();
                 flp_delta[c * n_features + j] = log_p - log_1mp;
@@ -319,6 +532,44 @@ where
             class_log_prior_: Some(class_log_prior_),
             _state: PhantomData,
         })
+    }
+}
+
+impl<F> Fit<F> for BernoulliNB<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    type Fitted = BernoulliNB<F, Fitted>;
+
+    fn fit(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y: Option<&DeviceArray<ActiveRuntime, F>>,
+        shape: (usize, usize),
+    ) -> Result<BernoulliNB<F, Fitted>, AlgoError> {
+        let (n_samples, _n_features) = shape;
+        validate_geometry(x, shape)?;
+        let y = y.ok_or(AlgoError::NotFitted {
+            estimator: "bernoulli_nb",
+            operation: "fit (requires y)",
+        })?;
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        // The device buffers exist only because `Fit` is the shared typestate
+        // surface — this fit's math is entirely host-side, so read both operands
+        // once and run the same body `fit_from_host_slice` runs. A caller that
+        // already holds host slices should use that entry point instead and skip
+        // the upload these two reads undo.
+        let x_host = x.to_host(pool);
+        let y_host = y.to_host(pool);
+        self.fit_host(pool, &x_host, &y_host, shape)
     }
 }
 
