@@ -82,7 +82,10 @@ use mlrs_core::PrimError;
 // arbitrarily large `m` (`> 65535·256 ≈ 16.7M` predict rows) never overflows a
 // single grid dimension and silently drops tail rows.
 use mlrs_kernels::colmean::MAX_GRID_DIM;
-use mlrs_kernels::{linear_predict_bias, linear_predict_bias_shared, PREDICT_ROWS_PER_BLOCK};
+use mlrs_kernels::{
+    linear_predict_bias, linear_predict_bias_multi, linear_predict_bias_shared,
+    linear_predict_classify, PREDICT_ROWS_PER_BLOCK,
+};
 // The shared-tile winning-band bounds are only consulted by `use_shared_predict`'s
 // wgpu arm (the ONE backend where the kernel measurably wins — module docs
 // above); importing them unconditionally would warn `unused` on cuda/rocm/cpu.
@@ -157,6 +160,279 @@ where
     }
 
     Ok(DeviceArray::from_raw(out_handle, m))
+}
+
+/// Multi-target twin of [`linear_predict`] (RIDGE-MULTI-TARGET): `out[r,t] =
+/// Σ_c x[r,c]·coef[c,t] + bias[t]` for `k` targets, `coef` row-major `n × k`,
+/// `bias` length `k`. Returns the `m × k` row-major device-resident predictions.
+///
+/// One [`linear_predict_bias_multi`] GATHER launch — no shared-tile arm (unlike
+/// [`linear_predict`]'s wgpu path): the coalescing win that kernel chases is
+/// orthogonal to the target axis this adds, and `k` is small in every fitted
+/// multi-output model, so the extra per-target row re-read (see the kernel's
+/// module docs) is not worth a second staged variant until measurement says
+/// otherwise. `k == 1` callers should use [`linear_predict`] instead — this
+/// prim does not special-case it away.
+///
+/// Generic over the float element type `F` (`f32` / `f64`); the f64 path is
+/// capability-gated by the caller via `skip_f64_with_log`.
+pub fn linear_predict_multi<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    coef: &DeviceArray<ActiveRuntime, F>,
+    bias: &DeviceArray<ActiveRuntime, F>,
+    (m, n): (usize, usize),
+    k: usize,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry_multi(x.len(), (m, n), coef.len(), bias.len(), k)?;
+
+    let elem = size_of::<F>();
+    let out_handle = pool.acquire(m * k * elem);
+    let client = pool.client().clone();
+
+    // SAFETY: `x.len()`/`coef.len()`/`bias.len()`/`m`/`n`/`k` are the
+    // validated element counts above; the kernel bounds-checks `r < m` and
+    // reads only `x[r*n + c]` for `c < n`, `coef[c*k + t]` and `bias[t]` for
+    // `t < k` — all in range by the geometry validation.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let coef_arg = unsafe { ArrayArg::from_raw_parts(coef.handle().clone(), coef.len()) };
+    let bias_arg = unsafe { ArrayArg::from_raw_parts(bias.handle().clone(), bias.len()) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), m * k) };
+
+    let (ccount, cdim) = super::launch_dims_1d_folded(m, crate::capability::gather_launch_width());
+    linear_predict_bias_multi::launch::<F, ActiveRuntime>(
+        &client, ccount, cdim, x_arg, coef_arg, bias_arg, out_arg, m as u32, n as u32, k as u32,
+    );
+
+    Ok(DeviceArray::from_raw(out_handle, m * k))
+}
+
+/// Fused decision + label kernel (RIDGECLF-CUDA): `X · coefᵀ + bias`, its
+/// `argmax` (or, for `k == 1`, its STRICT sign), and the `classes_` lookup, all
+/// in ONE launch — a length-`m` device-resident `i32` label array.
+///
+/// `coef` is row-major `n × k` (FEATURE-major, the fit's native layout), `bias`
+/// length `k`, and `classes` the `i32` label table: length 2 for a binary fit
+/// (`k == 1`, `[negative_class, positive_class]`) and length `k` for a
+/// multiclass one.
+///
+/// ## Why this is not `linear_predict_multi` followed by an argmax pass
+/// The `m × k` score matrix would exist only to be collapsed to `m` integers.
+/// Fusing removes that allocation, its write and its re-read, and shrinks the
+/// EGRESS by a factor of `k` (plus the `f32`→`i32` width): a 26-class,
+/// 100 000-row `predict` returns 400 KB of labels instead of 10.4 MB of scores.
+/// Since `predict` is `O(m·n)` of compute over an `O(m·n)` transfer — the one
+/// linear-model operation whose compute-to-transfer ratio a GPU cannot improve
+/// — the egress is the only side of the bus this can shrink, and `k` targets is
+/// the only reason the compute side is worth `k`× more here than in the
+/// single-target `Ridge` predict that measured 10–23× SLOWER than its own host
+/// arm on a P100.
+///
+/// Callers that need the SCORES themselves (`decision_function`) use
+/// [`linear_predict_multi`]; this is `predict` only.
+pub fn linear_predict_labels<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    coef: &DeviceArray<ActiveRuntime, F>,
+    bias: &DeviceArray<ActiveRuntime, F>,
+    classes: &DeviceArray<ActiveRuntime, i32>,
+    (m, n): (usize, usize),
+    k: usize,
+) -> Result<DeviceArray<ActiveRuntime, i32>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry_multi(x.len(), (m, n), coef.len(), bias.len(), k)?;
+    // The binary arm indexes `classes[0]`/`classes[1]`; the multiclass arm
+    // indexes `classes[t]` for `t < k`. Both are checked BEFORE the launch so a
+    // short table is a typed error, never an out-of-bounds device read.
+    let needed = if k == 1 { 2 } else { k };
+    if classes.len() != needed {
+        return Err(PrimError::ShapeMismatch {
+            operand: "linear_predict_labels.classes",
+            rows: needed,
+            cols: 1,
+            len: classes.len(),
+        });
+    }
+
+    let out_handle = pool.acquire(m * size_of::<i32>());
+    let client = pool.client().clone();
+
+    // SAFETY: every element count below is validated immediately above; the
+    // kernel bounds-checks `r < m` and reads only `x[r*n + c]` for `c < n`,
+    // `coef[c*k + t]` / `bias[t]` for `t < k`, and `classes` within `needed`.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let coef_arg = unsafe { ArrayArg::from_raw_parts(coef.handle().clone(), coef.len()) };
+    let bias_arg = unsafe { ArrayArg::from_raw_parts(bias.handle().clone(), bias.len()) };
+    let cls_arg = unsafe { ArrayArg::from_raw_parts(classes.handle().clone(), classes.len()) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), m) };
+
+    let (ccount, cdim) = super::launch_dims_1d_folded(m, crate::capability::gather_launch_width());
+    linear_predict_classify::launch::<F, ActiveRuntime>(
+        &client, ccount, cdim, x_arg, coef_arg, bias_arg, cls_arg, out_arg, m as u32, n as u32,
+        k as u32,
+    );
+
+    Ok(DeviceArray::from_raw(out_handle, m))
+}
+
+/// Multi-target twin of [`linear_predict_host`]: `out[r,t] = Σ_c x[r,c]·coef[c,t]
+/// + bias[t]`, `coef` row-major `n × k`, `bias` length `k`. Returns the `m × k`
+/// row-major predictions plus the operand-finiteness verdict — same no-upload,
+/// no-launch, zero-copy contract as the single-target host path (module docs
+/// §"The cpu backend does NOT take either kernel").
+///
+/// Row-major over `(row, target)`: thread `i` owns a contiguous run of
+/// ROWS (never splits a row's `k` targets across threads), so `out`'s per-thread
+/// slice stays one unbroken range exactly as [`matvec_bias_parallel`] does.
+pub fn linear_predict_multi_host<F>(
+    x: &[F],
+    coef: &[F],
+    bias: &[F],
+    (m, n): (usize, usize),
+    k: usize,
+) -> Result<HostPrediction<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry_multi(x.len(), (m, n), coef.len(), bias.len(), k)?;
+
+    let mut values: Vec<F> = vec![bytemuck::Zeroable::zeroed(); m * k];
+    let operand_finite = match size_of::<F>() {
+        4 => matvec_bias_multi_parallel::<f32>(
+            bytemuck::cast_slice(x),
+            bytemuck::cast_slice(coef),
+            bytemuck::cast_slice(bias),
+            bytemuck::cast_slice_mut(&mut values),
+            n,
+            k,
+        ),
+        8 => matvec_bias_multi_parallel::<f64>(
+            bytemuck::cast_slice(x),
+            bytemuck::cast_slice(coef),
+            bytemuck::cast_slice(bias),
+            bytemuck::cast_slice_mut(&mut values),
+            n,
+            k,
+        ),
+        other => {
+            unreachable!("linear_predict_multi_host is f32/f64 only, got a {other}-byte element")
+        }
+    };
+    Ok(HostPrediction {
+        values,
+        operand_finite,
+    })
+}
+
+/// [`matvec_bias_parallel`]'s multi-target twin: `out` is `m × k` row-major,
+/// split into contiguous ROW chunks across [`host_units`] scoped threads (so a
+/// thread's slice of `out` is one unbroken range and its `x` slab is
+/// contiguous, exactly as the single-target split).
+fn matvec_bias_multi_parallel<T: HostFloat>(
+    x: &[T],
+    coef: &[T],
+    bias: &[T],
+    out: &mut [T],
+    n: usize,
+    k: usize,
+) -> bool {
+    let m = out.len() / k;
+    let units = host_units(out.len() * n).max(1);
+    if units <= 1 || m <= 1 {
+        return matvec_bias_multi_rows(x, coef, bias, out, n, k);
+    }
+
+    let rows_per_unit = m.div_ceil(units);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = out
+            .chunks_mut(rows_per_unit * k)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let rows_here = chunk.len() / k;
+                let slab = &x[i * rows_per_unit * n..(i * rows_per_unit + rows_here) * n];
+                scope.spawn(move || matvec_bias_multi_rows(slab, coef, bias, chunk, n, k))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .all(|h| h.join().expect("linear_predict_multi_host row worker panicked"))
+    })
+}
+
+/// The serial multi-target row loop: for each row, `k` dot products against
+/// `coef`'s columns plus their own `bias[t]`. Returns whether every element of
+/// `x` was finite.
+fn matvec_bias_multi_rows<T: HostFloat>(
+    x: &[T],
+    coef: &[T],
+    bias: &[T],
+    out: &mut [T],
+    n: usize,
+    k: usize,
+) -> bool {
+    let mut finite = true;
+    let rows = out.len() / k;
+    for r in 0..rows {
+        let row = &x[r * n..(r + 1) * n];
+        finite &= row_all_finite(row);
+        for t in 0..k {
+            let mut acc = T::ZERO;
+            for c in 0..n {
+                acc = acc + row[c] * coef[c * k + t];
+            }
+            out[r * k + t] = acc + bias[t];
+        }
+    }
+    finite
+}
+
+/// Validate the multi-target inference operand geometry: `x` is `m × n`
+/// row-major, `coef` is `n × k` row-major, `bias` is length `k` (one intercept
+/// per target). All three dims non-zero.
+fn validate_geometry_multi(
+    x_len: usize,
+    (m, n): (usize, usize),
+    coef_len: usize,
+    bias_len: usize,
+    k: usize,
+) -> Result<(), PrimError> {
+    if k == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "coef",
+            rows: n,
+            cols: 0,
+            len: coef_len,
+        });
+    }
+    if m == 0 || n == 0 || m.checked_mul(n).map(|v| v != x_len).unwrap_or(true) {
+        return Err(PrimError::ShapeMismatch {
+            operand: "x",
+            rows: m,
+            cols: n,
+            len: x_len,
+        });
+    }
+    if coef_len != n * k {
+        return Err(PrimError::DimMismatch {
+            dim: "n_features*n_targets",
+            lhs: coef_len,
+            rhs: n * k,
+        });
+    }
+    if bias_len != k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "bias",
+            rows: k,
+            cols: 1,
+            len: bias_len,
+        });
+    }
+    Ok(())
 }
 
 /// Compute `y = X·coef + bias` **entirely on the host**, reading the caller's
@@ -368,6 +644,113 @@ impl<F: Pod> HostMirror<F> {
     }
 }
 
+/// Multi-target twin of [`HostMirror`]: caches a fitted `(coef, bias)` pair
+/// where `bias` is length `k` (one intercept per target) instead of a scalar.
+/// Kept as its OWN type rather than widening [`HostMirror`] itself — every
+/// other dense linear regressor ([`DensePredictHost`](crate) callers:
+/// `LinearRegression`/`Lasso`/`ElasticNet`/`LinearSVR`/`BayesianRidge`) is
+/// single-target-only and already depends on `HostMirror`'s `(Vec<F>, F)`
+/// shape, so this stays Ridge-multi-target-only rather than touching a type
+/// four other estimators share.
+#[derive(Debug)]
+pub struct HostMirrorMulti<F> {
+    cell: OnceLock<(Vec<F>, Vec<F>)>,
+}
+
+impl<F> Default for HostMirrorMulti<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F> HostMirrorMulti<F> {
+    /// An empty mirror. The estimator constructs one per multi-target `fit`.
+    pub fn new() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+}
+
+impl<F: Pod> HostMirrorMulti<F> {
+    /// The host `(coef, bias)` — `coef` row-major `n × k`, `bias` length `k` —
+    /// reading them back on first call only (see [`HostMirror::get`] for why
+    /// this read is worth memoizing).
+    fn get(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        coef: &DeviceArray<ActiveRuntime, F>,
+        bias: &DeviceArray<ActiveRuntime, F>,
+    ) -> &(Vec<F>, Vec<F>) {
+        self.cell
+            .get_or_init(|| (coef.to_host(pool), bias.to_host(pool)))
+    }
+}
+
+/// Multi-target twin of [`linear_predict_from_host`]: routes a **host-resident**
+/// `m × n` test matrix to the cpu no-upload matvec or the fused device kernel,
+/// producing `m × k` row-major predictions plus the operand-finiteness verdict.
+///
+/// Same backend split as the single-target path: cpu never uploads `x` at all;
+/// wgpu/cuda/rocm upload once and run [`linear_predict_multi`]'s fused kernel.
+pub fn linear_predict_multi_from_host<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &[F],
+    coef: &DeviceArray<ActiveRuntime, F>,
+    bias: &DeviceArray<ActiveRuntime, F>,
+    mirror: &HostMirrorMulti<F>,
+    (m, n): (usize, usize),
+    k: usize,
+) -> Result<HostPrediction<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if crate::capability::active_backend_name() == "cpu" {
+        validate_geometry_multi(x.len(), (m, n), coef.len(), bias.len(), k)?;
+        let (coef_host, bias_host) = mirror.get(pool, coef, bias);
+        return linear_predict_multi_host::<F>(x, coef_host, bias_host, (m, n), k);
+    }
+
+    if !operand_all_finite(x) {
+        validate_geometry_multi(x.len(), (m, n), coef.len(), bias.len(), k)?;
+        return Ok(HostPrediction {
+            values: Vec::new(),
+            operand_finite: false,
+        });
+    }
+
+    let x_dev = DeviceArray::from_host(pool, x);
+    let out = linear_predict_multi::<F>(pool, &x_dev, coef, bias, (m, n), k)?;
+    let values = out.to_host_metered(pool);
+    x_dev.release_into(pool);
+    out.release_into(pool);
+    Ok(HostPrediction {
+        values,
+        operand_finite: true,
+    })
+}
+
+/// [`linear_predict_multi_from_host`] with the HOST arm forced on EVERY backend
+/// (RIDGE-PREDICT-CUDA-VS-CPU) — see [`linear_predict_from_host_forced_host`]'s
+/// docs for the measured justification; this is its multi-target twin, used by
+/// [`crate`]'s Ridge multi-target predict.
+pub fn linear_predict_multi_from_host_forced_host<F>(
+    pool: &BufferPool<ActiveRuntime>,
+    x: &[F],
+    coef: &DeviceArray<ActiveRuntime, F>,
+    bias: &DeviceArray<ActiveRuntime, F>,
+    mirror: &HostMirrorMulti<F>,
+    (m, n): (usize, usize),
+    k: usize,
+) -> Result<HostPrediction<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry_multi(x.len(), (m, n), coef.len(), bias.len(), k)?;
+    let (coef_host, bias_host) = mirror.get(pool, coef, bias);
+    linear_predict_multi_host::<F>(x, coef_host, bias_host, (m, n), k)
+}
+
 /// Predict from a **host-resident** `x` — the backend-routing entry point the
 /// estimator layer calls when the test matrix arrives from the host (which,
 /// coming through the Arrow/PyO3 boundary, is always).
@@ -433,6 +816,47 @@ where
         values,
         operand_finite: true,
     })
+}
+
+/// [`linear_predict_from_host`] with the HOST arm forced on EVERY backend,
+/// including cuda/rocm/wgpu (RIDGE-PREDICT-CUDA-VS-CPU, 2026-08-03).
+///
+/// `linear_predict_from_host`'s "always device on non-cpu backends" default was
+/// validated only against cuML/sklearn on a Tesla T4 (7-50x faster — see the
+/// `mlrs-linear-predict-optimization`/`-coalesced` project memory) — never
+/// against mlrs's OWN [`linear_predict_host`], which did not exist yet when that
+/// default shipped. Measured on a Kaggle P100
+/// (`ridge_predict_device_vs_host_perf_test.rs`, single-target): the device
+/// kernel LOSES to this exact host arithmetic by **10-23x** across every shape
+/// tried (`n` 10k-1M, `d` 16-64). The reason generalizes past this one adapter:
+/// `predict` is `O(n·d)` compute over the SAME `O(n·d)` transfer — a strictly
+/// WORSE compute-to-transfer ratio than `fit`'s `O(n·d²)`, so the GPU's
+/// advantage never gets the chance to pay back the upload+launch+readback the
+/// way it does on the fit side (`mlrs-ridge-default-cuda` memory's `d ≥ 128`
+/// fit crossover has no `predict` analogue in this shape range).
+///
+/// Used by `Ridge::predict_from_host` UNCONDITIONALLY for single-target
+/// predict. Other dense linear regressors (`LinearRegression`/`Lasso`/
+/// `ElasticNet`/`LinearSVR`/`BayesianRidge`, which still call
+/// [`linear_predict_from_host`] via their shared `DensePredictHost` plumbing in
+/// `mlrs-py`) are UNCHANGED — this fix is scoped to Ridge, where it was
+/// measured; the same class of fix likely applies to the others too (same
+/// kernel, same shape regime) but that is not yet verified on hardware for them
+/// and is left as a documented follow-up rather than shipped by inference.
+pub fn linear_predict_from_host_forced_host<F>(
+    pool: &BufferPool<ActiveRuntime>,
+    x: &[F],
+    coef: &DeviceArray<ActiveRuntime, F>,
+    bias: &DeviceArray<ActiveRuntime, F>,
+    mirror: &HostMirror<F>,
+    (m, n): (usize, usize),
+) -> Result<HostPrediction<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry(x.len(), (m, n), coef.len(), bias.len())?;
+    let (coef_host, bias_host) = mirror.get(pool, coef, bias);
+    linear_predict_host::<F>(x, coef_host, *bias_host, (m, n))
 }
 
 /// Whether every element of a host operand is finite, scanned in parallel —

@@ -115,7 +115,7 @@ where
     let se = SpectralEmbedding::<F>::builder()
         .n_components(n_components)
         .affinity("rbf".to_string())
-        .n_neighbors(3)
+        .n_neighbors(Some(3))
         .build::<F>()
         .expect("SpectralEmbedding builder");
     // `Fit::fit` CONSUMES the `Unfit` estimator and returns the `Fitted` sibling

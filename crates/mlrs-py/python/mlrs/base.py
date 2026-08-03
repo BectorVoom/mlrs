@@ -51,9 +51,13 @@ class MlrsBase(BaseEstimator):
         """
         return _io.normalize_X(X, dtype=dtype, ensure_all_finite=ensure_all_finite)
 
-    def _normalize_y(self, y, dtype):
-        """1-D target ``y`` -> a fresh-contiguous pyarrow float array."""
-        return _io.normalize_y(y, dtype=dtype)
+    def _normalize_y(self, y, dtype, ensure_all_finite=True):
+        """1-D target ``y`` -> a fresh-contiguous pyarrow float array.
+
+        ``ensure_all_finite=False`` relocates the NaN/inf rejection into the
+        Rust call rather than dropping it — see :func:`mlrs._io.normalize_y`.
+        """
+        return _io.normalize_y(y, dtype=dtype, ensure_all_finite=ensure_all_finite)
 
     def _check_predict_X(self, X, dtype=None, ensure_all_finite=True):
         """Fitted-guard + feature-count guard for a predict/transform input.

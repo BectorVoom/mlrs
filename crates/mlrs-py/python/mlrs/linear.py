@@ -124,8 +124,19 @@ class Ridge(RegressorMixin, MlrsBase):
         return int(check_random_state(self.random_state).randint(0, 2**32 - 1))
 
     def fit(self, X, y, sample_weight=None):
+        """``y`` may be a 1-D length-``n_samples`` target (the ORIGINAL,
+        full-eight-solver contract, unchanged) or a 2-D ``n_samples ×
+        n_targets`` array (RIDGE-MULTI-TARGET) — matching sklearn's own
+        single-vs-multi-output ``Ridge`` split. Multi-target ``y`` is currently
+        supported only for the DEFAULT solver (``auto``/``cholesky`` with
+        ``positive=False``); every other ``solver``/``positive`` combination
+        raises the same typed rejection the Rust side raises, rather than
+        silently mis-fitting.
+        """
         xa, rows, cols = self._normalize(X)
         dtype = LinearRegression._x_float(xa)
+        y_arr = np.asarray(y)
+        n_targets = int(y_arr.shape[1]) if y_arr.ndim == 2 and y_arr.shape[1] > 1 else 1
         ya = self._normalize_y(y, dtype=dtype)
         swa = None if sample_weight is None else self._normalize_y(sample_weight, dtype=dtype)
         obj = self._ext().Ridge(
@@ -138,16 +149,30 @@ class Ridge(RegressorMixin, MlrsBase):
             self.positive,
             self._seed(),
         )
-        obj.fit(xa, ya, rows, cols, swa)
+        obj.fit(xa, ya, rows, cols, swa, n_targets)
         self._mlrs_obj = obj
+        self._n_targets_ = n_targets
         self._post_fit(cols)
         return self
 
     def predict(self, X):
+        if getattr(self, "_n_targets_", 1) > 1:
+            xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
+            out = self._suffixed("predict_multi")(xa, rows, cols)
+            return self._to_output(
+                out, (rows, self._n_targets_), X, self._np_float()
+            )
         return _dense_linear_predict(self, X)
 
     @property
     def coef_(self):
+        if getattr(self, "_n_targets_", 1) > 1:
+            # Rust returns `n_features x n_targets` row-major; sklearn's
+            # multi-output `coef_` is `(n_targets, n_features)`.
+            d, t = self.n_features_in_, self._n_targets_
+            flat = self._suffixed("coef_multi")()
+            arr = self._to_output(flat, (d, t), None, self._np_float())
+            return arr.T
         return self._to_output(
             self._suffixed("coef")(), (-1,), None, self._np_float()
         )
@@ -155,6 +180,10 @@ class Ridge(RegressorMixin, MlrsBase):
     @property
     def intercept_(self):
         self._check_fitted()
+        if getattr(self, "_n_targets_", 1) > 1:
+            return self._to_output(
+                self._suffixed("intercept_multi")(), (-1,), None, self._np_float()
+            )
         return getattr(self._mlrs_obj, "intercept" + self._suffix())()
 
     @property
@@ -169,6 +198,142 @@ class Ridge(RegressorMixin, MlrsBase):
         """sklearn's ``solver_``: the solver that actually ran — ``auto``
         already resolved, and reflecting the singular-Gram ``cholesky``->``svd``
         fallback."""
+        self._check_fitted()
+        return self._mlrs_obj.solver_used()
+
+
+def _seed_from_random_state(random_state):
+    """``random_state`` -> the ``u64`` seed the Rust ``sag``/``saga`` arm takes
+    (the :meth:`Ridge._seed` logic, shared with :class:`RidgeClassifier`).
+
+    ``check_random_state`` accepts all three sklearn spellings (``None`` /
+    ``int`` / ``RandomState``); drawing the seed FROM it keeps an ``int``
+    ``random_state`` reproducible and a ``RandomState`` instance usable, which
+    a plain ``int(...)`` cast would not. ``None`` stays ``None`` so the Rust
+    side applies its documented constant seed.
+    """
+    if random_state is None:
+        return None
+    from sklearn.utils import check_random_state
+
+    return int(check_random_state(random_state).randint(0, 2**32 - 1))
+
+
+class RidgeClassifier(ClassifierMixin, MlrsBase):
+    """Ridge regression used as a classifier (LINEAR-07).
+
+    ``RidgeClassifier(alpha=1.0, fit_intercept=True, copy_X=True,
+    max_iter=None, tol=1e-4, class_weight=None, solver='auto',
+    positive=False, random_state=None)`` — the full
+    ``sklearn.linear_model.RidgeClassifier`` parameter surface. The target is
+    encoded as ``{-1, +1}`` (one-hot per class for K>2, sklearn's
+    ``LabelBinarizer(neg_label=-1, pos_label=1)`` convention) and fitted as a
+    multi-output Ridge regression; ``predict`` reads the sign (binary) or the
+    ``argmax`` (multiclass) of ``decision_function``. Unlike
+    :class:`LogisticRegression`, there is no ``predict_proba`` — sklearn's own
+    ``RidgeClassifier`` does not expose one either.
+
+    See ``crates/mlrs-algos/src/linear/ridge_classifier.rs`` for the cpu
+    shared-Gram fast path (the whole point of a dedicated estimator rather
+    than a `Ridge`-per-class-column loop) and for why ``copy_X`` is a genuine
+    no-op here (mlrs never writes into the caller's buffer).
+    """
+
+    def __init__(
+        self,
+        alpha=1.0,
+        fit_intercept=True,
+        copy_X=True,
+        max_iter=None,
+        tol=1e-4,
+        class_weight=None,
+        solver="auto",
+        positive=False,
+        random_state=None,
+        output_type="input",
+    ):
+        self.alpha = alpha
+        self.fit_intercept = fit_intercept
+        self.copy_X = copy_X
+        self.max_iter = max_iter
+        self.tol = tol
+        self.class_weight = class_weight
+        self.solver = solver
+        self.positive = positive
+        self.random_state = random_state
+        self.output_type = output_type
+
+    def fit(self, X, y, sample_weight=None):
+        xa, rows, cols = self._normalize(X)
+        dtype = LinearRegression._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = None if sample_weight is None else self._normalize_y(sample_weight, dtype=dtype)
+        obj = self._ext().RidgeClassifier(
+            self.alpha,
+            self.fit_intercept,
+            self.copy_X,
+            self.max_iter,
+            self.tol,
+            self.class_weight,
+            self.solver,
+            self.positive,
+            _seed_from_random_state(self.random_state),
+        )
+        obj.fit(xa, ya, rows, cols, swa)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        # classes_ are the core's DISTINCT sorted training labels, so a
+        # non-contiguous target (e.g. {0, 2}) round-trips through predict
+        # (WR-01, the LogisticRegression precedent).
+        self.classes_ = np.asarray(obj.classes_(), dtype=np.int32)
+        return self
+
+    def predict(self, X):
+        xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
+        out = self._mlrs_obj.predict_labels(xa, rows, cols)
+        return self._to_output(out, (rows,), X, np.int32)
+
+    def decision_function(self, X):
+        """Confidence scores: length ``rows`` for binary (`>0` predicts
+        ``classes_[1]``), or ``rows x n_classes`` for multiclass (`argmax`
+        predicts), matching sklearn's own squeeze."""
+        xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
+        out = self._suffixed("decision_function")(xa, rows, cols)
+        n_targets = self._mlrs_obj.n_targets()
+        shape = (rows,) if n_targets == 1 else (rows, n_targets)
+        return self._to_output(out, shape, X, self._np_float())
+
+    @property
+    def coef_(self):
+        n_targets = self._mlrs_obj.n_targets()
+        shape = (-1,) if n_targets == 1 else (n_targets, -1)
+        return self._to_output(self._suffixed("coef")(), shape, None, self._np_float())
+
+    @property
+    def intercept_(self):
+        # sklearn's own `RidgeClassifier.intercept_` is an ndarray of shape
+        # (1,) for binary and (n_classes,) for multiclass — EXCEPT when
+        # `fit_intercept=False`, where `_set_intercept` stores the bare Python
+        # scalar `0.0` regardless of `n_targets` (a shape quirk sklearn does
+        # not special-case away; every target's intercept is 0 either way).
+        if not self.fit_intercept:
+            return 0.0
+        return self._to_output(
+            self._suffixed("intercept")(), (-1,), None, self._np_float()
+        )
+
+    @property
+    def n_iter_(self):
+        """sklearn's ``n_iter_``: ``None`` unless the resolved solver is
+        ``lsqr`` / ``sag`` / ``saga`` (in which case it is length
+        ``n_targets``)."""
+        self._check_fitted()
+        v = self._mlrs_obj.n_iter()
+        return None if v is None else np.asarray(v)
+
+    @property
+    def solver_(self):
+        """sklearn's ``solver_`` — the solver that actually ran."""
         self._check_fitted()
         return self._mlrs_obj.solver_used()
 

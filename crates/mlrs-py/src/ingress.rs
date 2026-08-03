@@ -108,6 +108,60 @@ pub fn host_slice_f64<'a>(arr: &'a Float64Array) -> PyResult<&'a [f64]> {
     validate_f64(arr).map_err(bridge_err_to_py)
 }
 
+/// Is every value in `v` finite (no NaN, no ±inf)?
+///
+/// The host-side half of the RELOCATED NaN/inf rejection: a wrapper that passes
+/// `ensure_all_finite=False` to the shim's `_normalize` has moved the check
+/// here, it has NOT dropped it — pair this with
+/// [`crate::errors::nonfinite_input_err`], which reproduces `check_array`'s
+/// exact message so the contract is unchanged from Python.
+///
+/// ## Why the sum, and why it is sound
+/// A plain `iter().all(f32::is_finite)` short-circuits, which stops the compiler
+/// vectorizing it; on a 25 MB operand that is the difference between a
+/// memory-bound pass and a scalar one. Summing instead is a branch-free
+/// reduction over eight independent accumulators, and it is a valid FILTER
+/// because non-finiteness propagates: a NaN input makes the sum NaN, and a lone
+/// infinity makes it infinite (two opposite infinities give NaN — still not
+/// finite). So a FINITE sum proves every input was finite, and the function can
+/// return `true` immediately.
+///
+/// The converse does not hold — a sum can overflow to infinity from entirely
+/// finite inputs — which is why a non-finite sum falls through to the exact
+/// elementwise scan rather than reporting a violation. The fast path is a
+/// filter, never the verdict. This is the same structure `numpy`'s own
+/// `_assert_all_finite` uses.
+pub fn all_finite_f32(v: &[f32]) -> bool {
+    let mut acc = [0f32; 8];
+    let mut chunks = v.chunks_exact(8);
+    for c in &mut chunks {
+        for i in 0..8 {
+            acc[i] += c[i];
+        }
+    }
+    let mut total: f32 = acc.iter().sum();
+    for &x in chunks.remainder() {
+        total += x;
+    }
+    total.is_finite() || v.iter().all(|x| x.is_finite())
+}
+
+/// f64 twin of [`all_finite_f32`]. Same filter-then-verify structure.
+pub fn all_finite_f64(v: &[f64]) -> bool {
+    let mut acc = [0f64; 8];
+    let mut chunks = v.chunks_exact(8);
+    for c in &mut chunks {
+        for i in 0..8 {
+            acc[i] += c[i];
+        }
+    }
+    let mut total: f64 = acc.iter().sum();
+    for &x in chunks.remainder() {
+        total += x;
+    }
+    total.is_finite() || v.iter().all(|x| x.is_finite())
+}
+
 /// Downcast an owned [`ArrayRef`] to a `Float32Array`, or a `PyTypeError` if the
 /// array is not Float32.
 ///

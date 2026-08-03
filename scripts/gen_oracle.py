@@ -806,6 +806,137 @@ def gen_knn(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# KNeighborsRegressor full-parameter oracle (KNN-REG-PARAMS). Larger than
+# `gen_knn`'s 30x3 blob because the parameter surface needs shapes that blob
+# cannot express: a second target column (multi-output) and a query that
+# COINCIDES with a training point (the `weights='distance'` 1/0 branch).
+KNN_REG_N_TRAIN, KNN_REG_N_QUERY, KNN_REG_N_FEATURES = 40, 12, 4
+KNN_REG_K = 5
+KNN_REG_N_OUTPUTS = 2
+# Non-degenerate Minkowski exponent — p != 1, 2, inf, so it exercises the
+# general `minkowski_dist` kernel rather than one of the collapsed fast paths.
+KNN_REG_P = 3.0
+# Query rows overwritten with an exact copy of a TRAIN row. `weights='distance'`
+# then divides by zero for those rows and must take sklearn's indicator branch
+# (coincident neighbours weight 1, all others 0) instead of producing NaN. Two
+# rows so the case is not a single-row accident, and a train row that is itself
+# duplicated (see `_knn_reg_data`) so a row can have TWO zero-distance
+# neighbours — the case where "use the nearest" and "use all the zeros" differ.
+KNN_REG_COINCIDENT_QUERIES = (3, 9)
+
+
+def _knn_reg_data(seed: int):
+    """The shared `(X, Xq, y, y_multi)` design for the KNN-regressor fixtures.
+
+    Train points are spread widely with a per-row offset so pairwise distances
+    are distinct (Pitfall 8 — a tie would make the oracle's neighbour choice
+    ambiguous), EXCEPT for one deliberately duplicated pair, and two query rows
+    are exact copies of train rows so the zero-distance weighting branch is
+    reachable. All rows are shifted positive before the cosine cases so no row
+    is near-zero-norm, where cosine distance is numerically meaningless and
+    sklearn and mlrs would legitimately disagree.
+    """
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((KNN_REG_N_TRAIN, KNN_REG_N_FEATURES)) * 3.0
+    x += np.arange(KNN_REG_N_TRAIN)[:, None] * 0.01
+    # Push every row off the origin: cosine distance is undefined at zero norm
+    # and unstable near it.
+    x += 5.0
+    # One duplicated TRAIN pair, so a coincident query has two zero-distance
+    # neighbours rather than one.
+    x[7] = x[2]
+
+    xq = rng.standard_normal((KNN_REG_N_QUERY, KNN_REG_N_FEATURES)) * 3.0 + 5.0
+    for i, q in enumerate(KNN_REG_COINCIDENT_QUERIES):
+        xq[q] = x[2 if i == 0 else 15]
+
+    y = x @ rng.standard_normal(KNN_REG_N_FEATURES) + 0.5
+    y_multi = np.column_stack(
+        [y, x @ rng.standard_normal(KNN_REG_N_FEATURES) - 1.25]
+    )
+    return x, xq, y, y_multi
+
+
+def gen_knn_regressor_params(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the KNeighborsRegressor full-parameter oracle (KNN-REG-PARAMS).
+
+    One fixture, every hyperparameter combination the DEVICE path serves, all
+    from `sklearn.neighbors.KNeighborsRegressor(algorithm='brute', ...)`:
+
+      * `weights` in {uniform, distance}
+      * `metric` in {euclidean, manhattan, chebyshev, minkowski(p=3), cosine}
+      * a multi-output target under both weightings
+
+    Array names are `predict_<metric>_<weights>`, plus
+    `predict_multi_<weights>` for the 2-column target and
+    `distances_manhattan` / `indices_manhattan` for the `kneighbors` surface
+    under a NON-default metric (the one place a metric bug could hide behind a
+    correct `predict`).
+
+    The callable-`weights` and callable-`metric` paths are deliberately NOT
+    stored here: they are host-side reimplementations of sklearn's own host
+    code, so a committed oracle would only pin numpy against numpy. The Python
+    tests exercise them against a live sklearn instead, which is the comparison
+    that can actually fail.
+    """
+    from sklearn.neighbors import KNeighborsRegressor
+
+    x, xq, y, y_multi = _knn_reg_data(seed)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {
+        "X": c(x),
+        "Xq": c(xq),
+        "y": c(y),
+        "y_multi": c(y_multi),
+        "k": c([KNN_REG_K]),
+        "p": c([KNN_REG_P]),
+    }
+
+    metrics = {
+        "euclidean": dict(metric="euclidean"),
+        "manhattan": dict(metric="manhattan"),
+        "chebyshev": dict(metric="chebyshev"),
+        "minkowski": dict(metric="minkowski", p=KNN_REG_P),
+        "cosine": dict(metric="cosine"),
+    }
+    for name, kw in metrics.items():
+        for weights in ("uniform", "distance"):
+            reg = KNeighborsRegressor(
+                n_neighbors=KNN_REG_K,
+                algorithm="brute",
+                weights=weights,
+                **kw,
+            ).fit(x, y)
+            out[f"predict_{name}_{weights}"] = c(reg.predict(xq))
+
+    for weights in ("uniform", "distance"):
+        reg = KNeighborsRegressor(
+            n_neighbors=KNN_REG_K,
+            algorithm="brute",
+            weights=weights,
+            metric="euclidean",
+        ).fit(x, y_multi)
+        out[f"predict_multi_{weights}"] = c(reg.predict(xq))
+
+    nn = KNeighborsRegressor(
+        n_neighbors=KNN_REG_K, algorithm="brute", metric="manhattan"
+    ).fit(x, y)
+    dist, idx = nn.kneighbors(xq)
+    out["distances_manhattan"] = c(dist)
+    out["indices_manhattan"] = c(idx)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"knn_reg_params_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
 # Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05). The fixed Minkowski-p
 # test exponent (p != 1, 2 so it is a genuine non-degenerate Minkowski case that
 # the general direct kernel — not a special-cased L1/L2 fast path — must satisfy).
@@ -2236,6 +2367,149 @@ def gen_ridge_params(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# --- RidgeClassifier FULL parameter surface (LINEAR-07) -------------------- #
+
+
+def gen_ridge_classifier(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -> str:
+    """Generate the RidgeClassifier full-parameter-surface fixture (LINEAR-07).
+
+    Covers every ``sklearn.linear_model.RidgeClassifier`` ctor parameter that
+    changes the fit — the ``solver`` family (via the shared ``Ridge`` normal
+    equations), ``fit_intercept``, ``positive``, ``class_weight`` (``None`` /
+    ``'balanced'`` / a PARTIAL dict, to exercise the "class absent from the
+    dict keeps weight 1.0" default-fill) and ``fit(..., sample_weight=...)`` —
+    for both a binary (2-class) and multiclass (3-class) target, reusing the
+    tight ``tol``/``max_iter`` from ``gen_ridge_params`` so every iterative
+    solver lands on the SAME converged optimum as ``cholesky``.
+
+    Stores ``coef_<case>`` (``atleast_2d``, so binary is `(1, d)`),
+    ``intercept_<case>``, ``predict_<case>`` and ``decision_<case>``
+    (reshaped to `(n_test, -1)`, so binary is `(n_test, 1)`). Requires
+    ``scikit-learn==1.9.0``.
+    """
+    import warnings
+
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.linear_model import RidgeClassifier
+
+    n_classes = 3 if multiclass else 2
+    n, d = (90, 6) if multiclass else (60, 5)
+    n_test_per_class = 4
+    rng = np.random.default_rng(seed + 133)
+    centers = rng.standard_normal((n_classes, d)) * 4.0
+    per = n // n_classes
+    x = np.vstack(
+        [centers[k] + rng.standard_normal((per, d)) for k in range(n_classes)]
+    ).astype(dtype).astype(np.float64)
+    y = np.concatenate([np.full(per, k) for k in range(n_classes)])
+    n = x.shape[0]
+    xq = np.vstack(
+        [centers[k] + rng.standard_normal((n_test_per_class, d)) for k in range(n_classes)]
+    ).astype(dtype).astype(np.float64)
+
+    # Strictly-positive, non-uniform weights (the `gen_ridge_params` precedent)
+    # so the weighted cases genuinely differ from the unweighted ones.
+    sw = rng.uniform(0.25, 3.0, size=n).astype(dtype).astype(np.float64)
+    # A PARTIAL dict — only class 0 is named — to exercise sklearn's
+    # "classes absent from class_weight keep weight 1.0" fill rule.
+    cw_partial = {0: 2.5}
+
+    common = dict(alpha=RIDGE_PARAMS_ALPHA, tol=RIDGE_PARAMS_TOL, max_iter=RIDGE_PARAMS_MAX_ITER)
+    # (case name, ctor kwargs, use_sample_weight)
+    cases = [
+        ("auto", dict(solver="auto"), False),
+        ("cholesky", dict(solver="cholesky"), False),
+        ("svd", dict(solver="svd"), False),
+        ("lsqr", dict(solver="lsqr"), False),
+        ("sparse_cg", dict(solver="sparse_cg"), False),
+        ("sag", dict(solver="sag", random_state=0), False),
+        ("saga", dict(solver="saga", random_state=0), False),
+        ("lbfgs_pos", dict(solver="lbfgs", positive=True), False),
+        ("cholesky_noint", dict(solver="cholesky", fit_intercept=False), False),
+        ("cholesky_balanced", dict(solver="cholesky", class_weight="balanced"), False),
+        ("cholesky_dict_partial", dict(solver="cholesky", class_weight=cw_partial), False),
+        ("cholesky_sw", dict(solver="cholesky"), True),
+        ("cholesky_sw_balanced", dict(solver="cholesky", class_weight="balanced"), True),
+    ]
+
+    def c(arr):
+        # `ascontiguousarray` BEFORE the dtype cast: sklearn's multi-target
+        # `RidgeClassifier.coef_` is `Ridge`'s `linalg.solve(...).T`, an
+        # F-CONTIGUOUS view (`.astype`'s default `order='K'` preserves that
+        # layout), and `np.savez` records the array's OWN memory order in the
+        # `.npy` header. The Rust loader (`npyz`) reads the flat byte buffer
+        # assuming row-major, so a Fortran-ordered array round-trips
+        # TRANSPOSED — this bites `coef_`, not the 1-D arrays, which is why no
+        # earlier generator needed it.
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {"X": c(x), "Xq": c(xq), "y": c(y), "sample_weight": c(sw)}
+    solver_names = []
+    coefs = {}
+    for name, kwargs, use_sw in cases:
+        est = RidgeClassifier(**{**common, **kwargs})
+        with warnings.catch_warnings():
+            # A ConvergenceWarning here would mean the reference itself is not
+            # at the optimum — turn it into an error so a bad fixture cannot be
+            # committed silently.
+            warnings.simplefilter("error", ConvergenceWarning)
+            est.fit(x, y, sample_weight=sw if use_sw else None)
+        coef2d = np.atleast_2d(est.coef_)
+        out[f"coef_{name}"] = c(coef2d)
+        out[f"intercept_{name}"] = c(np.atleast_1d(est.intercept_))
+        out[f"predict_{name}"] = c(est.predict(xq))
+        out[f"decision_{name}"] = c(est.decision_function(xq).reshape(len(xq), -1))
+        solver_names.append(f"{name}={est.solver_}")
+        coefs[name] = coef2d.astype(np.float64)
+
+    # Every unweighted, intercept-fitting, unconstrained solver must agree with
+    # `cholesky` — the premise of the whole fixture (the `gen_ridge_params`
+    # precedent, now over the multi-output `{-1,+1}` target).
+    ref = coefs["cholesky"]
+    for name in ("auto", "svd", "lsqr", "sparse_cg", "sag", "saga"):
+        assert np.allclose(coefs[name], ref, atol=1e-7, rtol=1e-7), (
+            f"gen_ridge_classifier: solver '{name}' disagrees with 'cholesky' "
+            f"({coefs[name]} vs {ref})"
+        )
+    assert (coefs["lbfgs_pos"] >= 0).all(), "positive fit produced a negative coef_"
+    assert (ref < 0).any(), (
+        "gen_ridge_classifier: the unconstrained solution is already all-positive, "
+        "so `positive=True` is not exercised — reseed the fixture"
+    )
+
+    expected_resolution = {
+        "auto": "cholesky",
+        "cholesky": "cholesky",
+        "svd": "svd",
+        "lsqr": "lsqr",
+        "sparse_cg": "sparse_cg",
+        "sag": "sag",
+        "saga": "saga",
+        "lbfgs_pos": "lbfgs",
+    }
+    resolved = dict(pair.split("=", 1) for pair in solver_names)
+    for case, want in expected_resolution.items():
+        assert resolved[case] == want, (
+            f"gen_ridge_classifier: sklearn resolved solver_ for '{case}' to "
+            f"'{resolved[case]}', expected '{want}'"
+        )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    kind = "multi" if multiclass else "binary"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"ridge_classifier_{kind}_{dtype_tag}_seed{seed}.npz")
+    out["alpha"] = c([RIDGE_PARAMS_ALPHA])
+    # Every array in an oracle .npz must be float32/float64 (the loader's
+    # contract), so max_iter/n_classes ship as floats and the reader casts back.
+    out["tol"] = np.asarray([RIDGE_PARAMS_TOL], dtype=np.float64)
+    out["max_iter"] = np.asarray([float(RIDGE_PARAMS_MAX_ITER)], dtype=np.float64)
+    out["n_classes"] = np.asarray([float(n_classes)], dtype=np.float64)
+    out["cw_partial_label"] = np.asarray([float(next(iter(cw_partial)))], dtype=np.float64)
+    out["cw_partial_weight"] = np.asarray([float(next(iter(cw_partial.values())))], dtype=np.float64)
+    np.savez(out_path, **out)
+    return out_path
+
+
 # --- BayesianRidge FULL parameter surface (LINEAR-06) ---------------------- #
 # Two geometries, because sklearn's `_update_coef_` and `_log_marginal_likelihood`
 # each branch on `n_samples > n_features` and its `sigma_` uses a FULL-matrix SVD
@@ -3060,6 +3334,207 @@ def gen_spectral_embedding(
         payload["embedding_knn"] = c(se_knn.fit_transform(x))
 
     np.savez(out_path, **payload)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# LARGE SpectralEmbedding fixtures (SPECTRAL-PERF-CPU) — the Lanczos branch
+# ---------------------------------------------------------------------------
+# The host pipeline routes `n_samples <= DENSE_N (512)` to a dense `sym_eig` and
+# everything above it to a thick-restart Lanczos. Every fixture above is n=12,
+# so the Lanczos arm had NO sklearn oracle at all. These two fixtures sit well
+# above the threshold (800 / 700) and pin BOTH affinity families on it.
+#
+# Two properties are VERIFIED before a fixture is written (a violation of either
+# makes a per-element value comparison meaningless, so both are hard asserts):
+#
+#   1. the affinity graph is CONNECTED — `_graph_is_connected`, the same
+#      predicate whose failure makes sklearn warn. A disconnected graph gives
+#      the normalized Laplacian a zero eigenvalue of multiplicity = #components,
+#      and the kept eigenvectors are then an arbitrary basis of that null space.
+#   2. the kept part of the spectrum is NON-DEGENERATE — every consecutive gap
+#      among `λ_0 … λ_nev` (INCLUDING the boundary gap `λ_{nev-1} → λ_nev`, which
+#      is what makes the retained subspace itself well defined) exceeds
+#      `SE_LARGE_MIN_GAP`. Two eigenvalues within ~1e-6 would leave the pair
+#      defined only up to a rotation and ARPACK's choice inside it would be
+#      unreproducible by any other solver.
+#
+# The gaps that hold for the committed parameters are printed by
+# `_spectral_spectrum_report` at generation time and recorded in the Rust test.
+
+# kNN case: 800 samples in 8 features. `centers=3, cluster_std=8.0` deliberately
+# OVERLAPS the blobs — three tight, well-separated blobs would give the kNN graph
+# three components (verified: cluster_std=2.5 is disconnected at every k tried),
+# and this is the spectral analogue of the well-separated-clusters requirement
+# running the OTHER way.
+SE_LARGE_N, SE_LARGE_D, SE_LARGE_COMPONENTS = 800, 8, 3
+SE_LARGE_CENTERS, SE_LARGE_STD = 3, 8.0
+SE_LARGE_N_NEIGHBORS = 15
+# rbf case: 700 samples in 6 features, `gamma=None → 1/n_features`. A dense
+# Gaussian kernel is strictly positive, so the graph is connected by
+# construction; the assert still runs, since that is a property of the DATA.
+SE_LARGE_RBF_N, SE_LARGE_RBF_D, SE_LARGE_RBF_COMPONENTS = 700, 6, 2
+# Minimum admissible consecutive eigenvalue gap over the kept spectrum. Six
+# orders of magnitude above the ~1e-6 degeneracy floor the brief names, so a
+# small perturbation of the data cannot silently turn the fixture degenerate.
+SE_LARGE_MIN_GAP = 1e-3
+
+
+def _spectral_spectrum_report(affinity, nev, label):
+    """Connectivity + eigenvalue-gap gate for a large spectral fixture.
+
+    ``affinity`` is the sklearn-side affinity (sparse or dense, EXACTLY what
+    ``SpectralEmbedding`` builds internally). Forms the same normalized
+    Laplacian ``_spectral_embedding`` decomposes — ``csgraph.laplacian(A,
+    normed=True)`` followed by sklearn's ``_set_diag(L, 1)`` — takes its dense
+    spectrum with scipy, prints the smallest eigenvalues and their gaps, and
+    ASSERTS the fixture is usable for a per-element value comparison. Returns
+    the smallest ``nev + 2`` eigenvalues so the caller can commit them.
+    """
+    from scipy.sparse.csgraph import laplacian as csgraph_laplacian
+    from scipy.linalg import eigvalsh
+    from sklearn.manifold._spectral_embedding import _graph_is_connected
+
+    connected = _graph_is_connected(affinity)
+    dense = affinity.toarray() if hasattr(affinity, "toarray") else np.asarray(affinity)
+    lap = csgraph_laplacian(dense, normed=True)
+    # sklearn's `_set_diag(laplacian, 1, norm_laplacian)` — unconditional, so it
+    # overrides scipy's `1 - isolated` on a zero-degree node.
+    np.fill_diagonal(lap, 1.0)
+    w = eigvalsh(lap)
+    gaps = np.diff(w[: nev + 1])
+    print(f"  {label}: connected={connected}")
+    print(f"  {label}: smallest {nev + 2} eigs = "
+          f"{np.array2string(w[: nev + 2], precision=8)}")
+    print(f"  {label}: gaps over the kept spectrum = "
+          f"{np.array2string(gaps, precision=8)}")
+    assert connected, (
+        f"{label}: affinity graph is DISCONNECTED — the zero eigenvalue is "
+        "degenerate and the embedding is not reproducible; raise n_neighbors "
+        "or spread the data"
+    )
+    assert gaps.min() > SE_LARGE_MIN_GAP, (
+        f"{label}: smallest kept eigenvalue gap {gaps.min():.3e} <= "
+        f"{SE_LARGE_MIN_GAP:.0e} — the retained eigenspace is (near-)degenerate "
+        "and a per-element oracle comparison would be meaningless"
+    )
+    return w[: nev + 2]
+
+
+def gen_spectral_embedding_large(seed: int = SEED, dtype=np.float64) -> str:
+    """Large-`n` kNN SpectralEmbedding fixture (SPECTRAL-PERF-CPU).
+
+    ``n_samples=800 > DENSE_N=512``, so the host pipeline solves this one with
+    the THICK-RESTART LANCZOS arm rather than the dense ``sym_eig`` every other
+    spectral fixture exercises. ``affinity='nearest_neighbors'`` with an
+    EXPLICIT ``n_neighbors=SE_LARGE_N_NEIGHBORS`` chosen so the graph is
+    connected (the ``None`` default would resolve to ``80`` here, which is a far
+    denser graph and defeats the point of a sparse oracle).
+
+    Stores row-major ``X``, sklearn's ``embedding_`` (``n × 3``), the neighbor
+    count, the resolved shape, and the smallest Laplacian eigenvalues (the
+    verified non-degenerate spectrum, for provenance). Returns the path.
+    """
+    from sklearn.datasets import make_blobs
+    from sklearn.manifold import SpectralEmbedding
+    from sklearn.neighbors import kneighbors_graph
+
+    n, d, k = SE_LARGE_N, SE_LARGE_D, SE_LARGE_N_NEIGHBORS
+    x, _ = make_blobs(
+        n_samples=n,
+        n_features=d,
+        centers=SE_LARGE_CENTERS,
+        cluster_std=SE_LARGE_STD,
+        random_state=seed,
+    )
+
+    # The affinity sklearn builds internally for `nearest_neighbors`:
+    # `kneighbors_graph(X, k, include_self=True)` symmetrized as `0.5*(A + Aᵀ)`.
+    aff = kneighbors_graph(x, k, include_self=True)
+    aff = 0.5 * (aff + aff.T)
+    # drop_first=True → the estimator asks for n_components + 1 eigenvectors.
+    nev = SE_LARGE_COMPONENTS + 1
+    eigs = _spectral_spectrum_report(aff, nev, "spectral_embedding_large (knn)")
+
+    se = SpectralEmbedding(
+        n_components=SE_LARGE_COMPONENTS,
+        affinity="nearest_neighbors",
+        n_neighbors=k,
+        random_state=seed,
+    )
+    embedding = se.fit_transform(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"spectral_embedding_large_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        embedding=c(embedding),
+        n_neighbors=c([k]),
+        shape=c([n, d]),
+        n_components=c([SE_LARGE_COMPONENTS]),
+        eigs=c(eigs),
+    )
+    return out_path
+
+
+def gen_spectral_embedding_large_rbf(seed: int = SEED, dtype=np.float64) -> str:
+    """Large-`n` rbf SpectralEmbedding fixture (SPECTRAL-PERF-CPU).
+
+    The DENSE-affinity twin of :func:`gen_spectral_embedding_large`:
+    ``n_samples=700 > DENSE_N=512`` so the Lanczos arm runs, but here it drives a
+    dense `n × n` operator instead of a CSR one, which is a different matvec
+    path. ``gamma=None`` is left UNSET on the estimator so sklearn resolves it to
+    ``1/n_features`` itself (D-04) — the committed ``gamma`` array records the
+    value that resolution must produce.
+
+    Plain Gaussian data (not blobs): three tight blobs would put the smallest
+    non-trivial eigenvalues within ~1e-3 of each other, which is exactly the
+    near-degeneracy this fixture must avoid. Returns the path.
+    """
+    from sklearn.manifold import SpectralEmbedding
+    from sklearn.metrics.pairwise import rbf_kernel
+
+    n, d = SE_LARGE_RBF_N, SE_LARGE_RBF_D
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((n, d))
+    gamma = 1.0 / d  # D-04: gamma=None → 1/n_features, resolved at fit.
+
+    aff = rbf_kernel(x, gamma=gamma)
+    nev = SE_LARGE_RBF_COMPONENTS + 1
+    eigs = _spectral_spectrum_report(aff, nev, "spectral_embedding_large (rbf)")
+
+    se = SpectralEmbedding(
+        n_components=SE_LARGE_RBF_COMPONENTS,
+        affinity="rbf",
+        random_state=seed,
+    )
+    embedding = se.fit_transform(x)
+    assert se.gamma_ == gamma, "sklearn must resolve gamma=None to 1/n_features"
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"spectral_embedding_large_rbf_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        embedding=c(embedding),
+        gamma=c([gamma]),
+        shape=c([n, d]),
+        n_components=c([SE_LARGE_RBF_COMPONENTS]),
+        eigs=c(eigs),
+    )
     return out_path
 
 
@@ -4904,6 +5379,11 @@ def main() -> None:
     # without `fit_intercept` / `positive` / `sample_weight`.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_ridge_params(dtype=dtype)}")
+    # RidgeClassifier FULL parameter surface (LINEAR-07): binary + multiclass,
+    # every solver, class_weight, positive, sample_weight.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_ridge_classifier(dtype=dtype, multiclass=False)}")
+        print(f"wrote {gen_ridge_classifier(dtype=dtype, multiclass=True)}")
     # BayesianRidge FULL parameter surface (LINEAR-06): the evidence iteration,
     # both n_samples <=> n_features branches, hyperpriors, inits, scores, weights.
     for dtype in (np.float32, np.float64):
@@ -4929,6 +5409,11 @@ def main() -> None:
     # regressor; distinct distances (Pitfall 8).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_knn(dtype=dtype)}")
+    # KNeighborsRegressor full parameter surface (KNN-REG-PARAMS): every
+    # weights x metric combination the device path serves, plus a multi-output
+    # target and a coincident query (the weights='distance' 1/0 branch).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_knn_regressor_params(dtype=dtype)}")
     # Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05): the full fixed
     # metric set (euclidean, manhattan, cosine, chebyshev, minkowski-p) × {f32
     # (rocm gate), f64 (cpu gate)}, each carrying a DUPLICATE-POINT train row
@@ -5050,6 +5535,12 @@ def main() -> None:
         print(f"wrote {gen_spectral_embedding(dtype=dtype, degenerate=False)}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_spectral_embedding(dtype=dtype, degenerate=True)}")
+    # SpectralEmbedding LANCZOS arm (SPECTRAL-PERF-CPU): n_samples above the
+    # host pipeline's DENSE_N=512 dense/iterative threshold, one sparse (kNN)
+    # and one dense (rbf) affinity. f64 only — the Lanczos arm is a host f64
+    # pipeline and the fixtures gate its sklearn parity, not a dtype band.
+    print(f"wrote {gen_spectral_embedding_large(dtype=np.float64)}")
+    print(f"wrote {gen_spectral_embedding_large_rbf(dtype=np.float64)}")
     # SpectralClustering (SPECTRAL-02): default-constructor labels on a
     # well-separated fixture (D-01/D-10) — exact labels up to permutation.
     for dtype in (np.float32, np.float64):

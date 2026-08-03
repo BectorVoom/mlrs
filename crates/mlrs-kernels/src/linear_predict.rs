@@ -68,6 +68,139 @@ pub fn linear_predict_bias<F: Float + CubeElement>(
     }
 }
 
+/// Multi-target fused linear-model inference (RIDGE-MULTI-TARGET):
+/// `out[r,t] = Σ_c x[r,c]·coef[c,t] + bias[t]`, `coef` row-major `n × k` and
+/// `bias` length `k` (one intercept per target).
+///
+/// One unit per output ROW (`r < m`), same as [`linear_predict_bias`]; the unit
+/// loops over its `k` targets and, for each, re-walks the row's `n` features.
+/// This re-reads `x[r,·]` from global memory `k` times instead of caching it in
+/// registers across targets — `k` (fitted target count) is small in every
+/// realistic multi-output regression (a handful to a few dozen columns) and `n`
+/// is already capped at `GRAM_EIG_MAX_FEATURES = 64`, so the row a warp
+/// re-reads is short and stays hot in L1/L2 across the `k` passes. Caching the
+/// row in a per-unit scratch buffer (mirroring [`linear_predict_bias_shared`]'s
+/// staged tile) is a real lever for large `k` and is deliberately NOT taken here
+/// — CubeCL local arrays need a comptime bound and `k` is a runtime value, so
+/// caching would need either a `SharedMemory` staging scheme (barriers, adapter
+/// SLM budget checks — the `linear_predict_bias_shared` precedent) or a capped
+/// fixed-size local array; both are follow-up work, not required for
+/// correctness or for beating a host matvec, which is what this kernel exists
+/// to do.
+///
+/// ## cubecl-cpu MLIR safety
+/// GATHER-only, same as [`linear_predict_bias`]: no `SharedMemory`, no atomics,
+/// nested ascending `while` scans over `F` accumulators. Safe on every backend.
+#[cube(launch)]
+pub fn linear_predict_bias_multi<F: Float + CubeElement>(
+    x: &Array<F>,
+    coef: &Array<F>,
+    bias: &Array<F>,
+    out: &mut Array<F>,
+    m: u32,
+    n: u32,
+    k: u32,
+) {
+    let r = ABSOLUTE_POS;
+    if r < m as usize {
+        let base = r * n as usize;
+        let mut t = 0u32;
+        while t < k {
+            let mut acc = F::new(0.0_f32);
+            let mut c = 0u32;
+            while c < n {
+                acc += x[base + c as usize] * coef[(c * k + t) as usize];
+                c += 1u32;
+            }
+            out[r * k as usize + t as usize] = acc + bias[t as usize];
+            t += 1u32;
+        }
+    }
+}
+
+/// Fused linear DECISION + label kernel (RIDGECLF-CUDA): the scores of
+/// [`linear_predict_bias_multi`] reduced, in the same launch, to ONE class label
+/// per query row.
+///
+/// `out[r] = classes[argmax_t (Σ_c x[r,c]·coef[c,t] + bias[t])]` for a
+/// multiclass fit (`k > 1`), and `out[r] = classes[score > 0]` for a binary one
+/// (`k == 1`, the STRICT sign sklearn's `LinearClassifierMixin.predict` takes).
+/// `coef` is row-major `n × k`, `bias` length `k`, `classes` the length-`n_classes`
+/// `i32` label table (`2` entries when `k == 1`, `k` entries otherwise).
+///
+/// ## Why fuse the argmax in rather than reduce the scores afterwards
+/// A separate score buffer is `m · k` floats that exist only to be collapsed to
+/// `m` integers. Fusing removes the intermediate allocation, its write and its
+/// re-read, and — the part that matters on a discrete GPU — shrinks the
+/// EGRESS by a factor of `k` (plus the `f32`→`i32` width): a 26-class,
+/// 100 000-row `predict` returns 400 KB of labels instead of 10.4 MB of scores.
+/// `predict` is the one linear-model operation whose compute-to-transfer ratio
+/// a GPU cannot improve (the same `O(m·n)` design has to cross the bus either
+/// way), so the egress is the only side of the transfer this can shrink — and
+/// `k` targets is also the only reason the compute side is worth `k`× more here
+/// than in the single-target `Ridge` predict that measured 10–23× SLOWER than
+/// its own host arm.
+///
+/// The running max keeps the FIRST maximizing column (`acc > bestv`, never
+/// `>=`), which is numpy's `argmax` tie-break and the host twin's.
+///
+/// ## cubecl-cpu MLIR safety
+/// GATHER-only: no `SharedMemory`, no atomics, ascending `while` scans over `F`
+/// accumulators and one `i32` output store.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn linear_predict_classify<F: Float + CubeElement>(
+    x: &Array<F>,
+    coef: &Array<F>,
+    bias: &Array<F>,
+    classes: &Array<i32>,
+    out: &mut Array<i32>,
+    m: u32,
+    n: u32,
+    k: u32,
+) {
+    let r = ABSOLUTE_POS;
+    if r < m as usize {
+        let base = r * n as usize;
+        if k == 1u32 {
+            let mut acc = F::new(0.0_f32);
+            let mut c = 0u32;
+            while c < n {
+                acc += x[base + c as usize] * coef[c as usize];
+                c += 1u32;
+            }
+            acc += bias[0];
+            let mut lab = classes[0];
+            if acc > F::new(0.0_f32) {
+                lab = classes[1];
+            }
+            out[r] = lab;
+        } else {
+            let mut best = 0u32;
+            let mut bestv = F::new(0.0_f32);
+            let mut t = 0u32;
+            while t < k {
+                let mut acc = F::new(0.0_f32);
+                let mut c = 0u32;
+                while c < n {
+                    acc += x[base + c as usize] * coef[(c * k + t) as usize];
+                    c += 1u32;
+                }
+                acc += bias[t as usize];
+                if t == 0u32 {
+                    bestv = acc;
+                    best = 0u32;
+                } else if acc > bestv {
+                    bestv = acc;
+                    best = t;
+                }
+                t += 1u32;
+            }
+            out[r] = classes[best as usize];
+        }
+    }
+}
+
 /// Rows per cube for the coalesced [`linear_predict_bias_shared`] tile. Also the
 /// cube's thread count (`CubeDim.x`), so each thread finalizes exactly one row.
 /// Kept `64` (2 warps) to match the `gram_xty_shared` 64-thread cube that wins

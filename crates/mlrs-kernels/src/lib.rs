@@ -90,7 +90,7 @@ pub use cholesky::{cholesky_solve, cholesky_solve_wide, CHOLESKY_WIDE_MAX_DIM};
 // index-identity self-drop GATHER. Plan 13-02 owns this re-export (file-disjoint,
 // single-owner) alongside the kernel bodies in `distance.rs`.
 pub use distance::{
-    chebyshev_dist, euclidean_sq_dist, euclidean_sq_dist_rb, euclidean_sq_dist_rb4,
+    chebyshev_dist, cosine_dist, euclidean_sq_dist, euclidean_sq_dist_rb, euclidean_sq_dist_rb4,
     euclidean_sq_dist_tiled,
     manhattan_dist,
     minkowski_dist, self_drop_gather,
@@ -114,11 +114,12 @@ pub use gbt::{
 };
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use linear_predict::{
-    linear_predict_bias, linear_predict_bias_shared, PREDICT_MAX_FEATURES,
-    PREDICT_ROWS_PER_BLOCK, PREDICT_SHARED_ELEMS, PREDICT_SHARED_MIN_FEATURES,
+    linear_predict_bias, linear_predict_bias_multi, linear_predict_bias_shared,
+    linear_predict_classify, PREDICT_MAX_FEATURES, PREDICT_ROWS_PER_BLOCK, PREDICT_SHARED_ELEMS,
+    PREDICT_SHARED_MIN_FEATURES,
 };
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
-pub use nnls::{ridge_intercept, ridge_nnls_cd, NNLS_MAX_DIM};
+pub use nnls::{ridge_intercept, ridge_intercept_multi, ridge_nnls_cd, NNLS_MAX_DIM};
 // Phase-15 HDBSCAN mutual-reachability GATHER (HDBS-01, plan 15-05): launched by
 // the feature-metric/dense-cosine device front-end via the backend host wrapper
 // in `prims/mutual_reachability.rs`. Re-exported under an explicit alias because

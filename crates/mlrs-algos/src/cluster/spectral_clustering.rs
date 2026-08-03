@@ -1,36 +1,93 @@
-//! `SpectralClustering` (SPECTRAL-02) — spectral embedding → v1 KMeans, matching
+//! `SpectralClustering` (SPECTRAL-02) — spectral embedding of an affinity graph
+//! followed by a discrete label assignment, matching
 //! `sklearn.cluster.SpectralClustering`.
 //!
-//! ## Pipeline (RESEARCH System Diagram + Pattern 2)
-//! `affinity A` (rbf via `kernel_matrix(Rbf)` D-02, or kNN-connectivity D-03) →
-//! normalized Laplacian `(L, dd) = laplacian(A, n)` → the smallest `n_components`
-//! eigenvectors via v1 `eig` (reversed to ascending; `drop_first = false` for SC,
-//! D-11 — the trivial ≈0 eigenvector is KEPT) → `D^-1/2` recovery (`/ dd`, D-07) →
-//! [`KMeans::new`](crate::cluster::kmeans::KMeans) (default kmeans++, `n_init = 1`,
-//! D-10) → `labels_`. `labels_` matches sklearn up to a label permutation (the
-//! exact-labels gate via a well-separated fixture, D-10).
+//! ## Pipeline
+//! `affinity A` → normalized Laplacian `(L, dd)` → the smallest `n_components`
+//! eigenvectors (`drop_first = FALSE` — the trivial ≈0 eigenvector is KEPT, and
+//! sklearn is explicit that spectral CLUSTERING wants it) → `D^-1/2` recovery
+//! (`/dd`) → deterministic sign flip → `maps` (`n × n_components`) →
+//! `assign_labels` → `labels_`.
 //!
-//! ## Affinity defaults & gamma (D-01 / D-04)
-//! Default affinity is `"rbf"` (sklearn `SpectralClustering`'s own default, D-01),
-//! with `gamma` default `1.0` (literal, D-04 — NOT the `1/n_features` default of
-//! `SpectralEmbedding`). `n_components` defaults to `None` → `n_clusters` at fit
-//! (D-11). `n_clusters` defaults to `8`, `n_neighbors` to `10`.
+//! Everything up to `maps` is [`crate::cluster::spectral_host::run`], shared
+//! verbatim with `SpectralEmbedding`, so the two estimators cannot drift on the
+//! Laplacian convention, the `_set_diag` fix-up, or the sign-flip ORDER (sklearn
+//! takes the argmax over the ALREADY-`/dd`-scaled vector).
 //!
-//! ## n_samples ≤ 64 (D-05 / D-06)
-//! The Laplacian is `n_samples × n_samples` and v1 `eig` caps `n ≤ MAX_DIM = 64`.
-//! `fit` rejects `n_samples > 64` with [`AlgoError::NSamplesExceedsMaxDim`] BEFORE
-//! any affinity / Laplacian / eig launch (ASVS V5).
+//! ## The `n_samples <= 64` cap is GONE (SPECTRAL-PERF-CPU)
+//! The former implementation built a dense `n × n` affinity and Laplacian on the
+//! device and asked the cyclic-Jacobi `eig` kernel for the FULL spectrum. That
+//! kernel stages its working matrices as comptime-sized shared memory at
+//! `MAX_DIM × MAX_DIM`, so it rejected `n > 64` — which made the estimator
+//! unusable on any real dataset, and `O(n³)` even on the toy ones. The host
+//! pipeline has no size cap: the `nearest_neighbors` affinity stays SPARSE and
+//! only the wanted eigenpairs are computed.
 //!
-//! ## Builder-fronted construction (Phase 16 retrofit, D-01/D-08)
-//! Construct with the zero-arg [`SpectralClustering::new`] (sklearn defaults) or
-//! the WIDE [`SpectralClusteringBuilder`] (the 6-arg legacy `new` is fully folded
-//! into setters: `.n_clusters`/`.n_components`/`.affinity`/`.gamma`/`.n_neighbors`/
-//! `.seed`). The `affinity` (`String`) and `n_components` (`Option<usize>`)
-//! setters are the wide-builder shapes proven here for the KMeans `init()` setter
-//! in Plan 06. The `gamma > 0` validation stays in the fit body because it is
-//! affinity-branch-coupled (only the `"rbf"` path uses gamma) — relocating it to
-//! `build()` would change behavior for the `"nearest_neighbors"` path, so the fit
-//! body math stays byte-identical (D-03).
+//! The label-assignment stage moved to the host with it. The device
+//! [`KMeans`](crate::cluster::kmeans::KMeans) has no `n_init` (sklearn runs 10
+//! restarts and keeps the best inertia) and, on the `cpu` backend, every Lloyd
+//! step is a cubecl launch onto a runtime that spawns one OS thread per unit and
+//! JITs at `-O0` — pathological for the `d = n_components` geometry a spectral
+//! embedding produces. [`spectral_host::host_kmeans`] replaces it.
+//!
+//! ## sklearn parameter surface
+//! `SpectralClustering(n_clusters=8, *, eigen_solver=None, n_components=None,
+//! random_state=None, n_init=10, gamma=1.0, affinity='rbf', n_neighbors=10,
+//! eigen_tol='auto', assign_labels='kmeans', degree=3, coef0=1,
+//! kernel_params=None, n_jobs=None, verbose=False)` — every parameter is present
+//! except `kernel_params`, with these resolution rules (all verified against the
+//! installed `sklearn/cluster/_spectral.py`, 1.9.0):
+//!
+//! - `gamma` defaults to the LITERAL `1.0`, NOT `SpectralEmbedding`'s
+//!   `1/n_features`. The constraint is `Interval(Real, 0, None, closed="left")`,
+//!   so `gamma = 0` is LEGAL here (it yields a constant all-ones affinity); the
+//!   pre-rewrite code rejected it, citing a `closed="neither"` interval that 1.9
+//!   does not have.
+//! - `n_neighbors` defaults to the INT `10`, not `SpectralEmbedding`'s
+//!   `None → max(n_samples // 10, 1)`. The `None` branch is unreachable here, so
+//!   the plan always carries `Some(n_neighbors)`.
+//! - `n_components = None` → `n_clusters`.
+//! - `affinity` accepts everything `pairwise_kernels` does (`linear`, `poly` /
+//!   `polynomial`, `sigmoid`, `rbf`, `laplacian`, `cosine`, `chi2`,
+//!   `additive_chi2` — i.e. exactly `KERNEL_PARAMS`) plus `nearest_neighbors`,
+//!   `precomputed` and `precomputed_nearest_neighbors`. A CALLABLE affinity is
+//!   not supported; there is no Rust analogue of handing sklearn a Python
+//!   function, and the string set is the whole non-callable surface.
+//! - `kernel_params` is DELIBERATELY ABSENT, and this is a parity decision, not
+//!   an omission. sklearn merges the dict and then executes
+//!   `params["gamma"] = self.gamma; params["degree"] = self.degree;
+//!   params["coef0"] = self.coef0` whenever `affinity` is not callable —
+//!   OVERWRITING any of those three the dict supplied — and calls
+//!   `pairwise_kernels(..., filter_params=True)`, which DROPS every key outside
+//!   `KERNEL_PARAMS[metric]`. Since `KERNEL_PARAMS` contains only `gamma`,
+//!   `degree` and `coef0`, a `kernel_params` dict is provably a no-op for every
+//!   string affinity. It can only matter for a callable affinity, which is out
+//!   of scope, so accepting it would be accepting a parameter that could never
+//!   change a result.
+//! - `eigen_solver` ∈ {`arpack`, `lobpcg`, `amg`, `None`} is accepted and
+//!   VALIDATED against the same set `SpectralEmbedding` uses. All four name a
+//!   way to reach the SAME invariant subspace; mlrs has one solver (dense below
+//!   `DENSE_N`, a restarted block Krylov iteration above) and routes every value
+//!   to it, so the
+//!   parameter selects nothing — but an out-of-set string is rejected exactly as
+//!   sklearn rejects it rather than silently ignored.
+//! - `eigen_tol = "auto"` (`None` here) is the solver's own machine-precision
+//!   target, which is what sklearn's `tol=0` asks ARPACK for.
+//! - `n_jobs` is accepted for signature compatibility. The host pipeline sizes
+//!   its worker pool from `MLRS_CPU_UNITS` / available parallelism rather than
+//!   from this parameter.
+//! - `verbose` is accepted and stored. sklearn's only use of it is a
+//!   `print(f"Computing label assignment using {self.assign_labels}")` plus
+//!   forwarding to `k_means`; a library crate must not write to stdout, so it is
+//!   exposed via [`SpectralClustering::verbose`] for a binding layer to act on.
+//! - `random_state` seeds BOTH the deterministic Krylov start block and the label
+//!   assignment (k-means++ draws / the `discretize` initial rotation), mirroring
+//!   sklearn threading one `random_state` through both stages.
+//!
+//! ## Fitted attributes
+//! sklearn sets `affinity_matrix_`, `labels_` and `n_features_in_`; all three
+//! are exposed, plus the connected-component count behind the `"Graph is not
+//! fully connected"` warning sklearn emits.
 //!
 //! Tests live in `crates/mlrs-algos/tests/spectral_clustering_test.rs`
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
@@ -42,61 +99,75 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::eig::eig;
-use mlrs_backend::prims::kernel_matrix::{kernel_matrix, Kernel};
-use mlrs_backend::prims::laplacian::laplacian;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, host_to_f64};
 
-use crate::cluster::kmeans::KMeans;
-// WR-06 / IN-02: shared spectral host recovery math + kNN-connectivity affinity
-// builder (formerly duplicated in this file).
-use crate::cluster::spectral::recover;
+use crate::cluster::spectral_embedding::EIGEN_SOLVERS;
+use crate::cluster::spectral_host::{self, AssignLabels, Csr, HostAffinity, SpectralPlan};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{Fit, Fitted, Unfit};
 
-/// The v1 dense-eig MAX_DIM cap (`eig.rs` `MAX_DIM = 64`). The normalized
-/// Laplacian is `n_samples × n_samples`, so `n_samples ≤ 64` is the documented
-/// spectral problem-size ceiling (D-05). Rejected at `fit` with the
-/// spectral-domain [`AlgoError::NSamplesExceedsMaxDim`] (D-06).
-const MAX_DIM: usize = 64;
-
-/// Spectral clustering (SPECTRAL-02): spectral embedding of an affinity graph
-/// followed by v1 KMeans on the embedding (D-10).
+/// Spectral clustering (SPECTRAL-02): the spectral embedding of an affinity
+/// graph, discretized into `n_clusters` labels.
 ///
-/// Construct with the zero-arg [`SpectralClustering::new`] (sklearn defaults:
-/// `n_clusters = 8`, `affinity = "rbf"`, `gamma = 1.0`, `n_neighbors = 10`) or
-/// [`SpectralClustering::builder`], then the consuming [`Fit::fit`] (returns the
-/// `Fitted`-tagged sibling) and read `labels_`. Fitted `labels_` (length `n`,
-/// `i32` — the KMeans i32 idiom) is device-resident (D-03); the host accessor
-/// materializes it on demand and exists ONLY on `SpectralClustering<F, Fitted>`
-/// (the compile-time typestate replaces the old runtime `NotFitted` guard, D-03).
+/// Construct with the zero-arg [`SpectralClustering::new`] (sklearn defaults) or
+/// [`SpectralClustering::builder`], then the consuming [`Fit::fit`] (or the
+/// no-upload [`SpectralClustering::fit_from_host_slice`]) and read `labels_`.
+/// The fitted accessors exist ONLY on `SpectralClustering<F, Fitted>` — the
+/// compile-time typestate replaces the runtime `NotFitted` guard.
 pub struct SpectralClustering<F, S = Unfit> {
-    /// Number of clusters `k` (sklearn default `8`). Validated `1 ≤ k ≤ n_samples`
-    /// at `fit` via the existing [`AlgoError::InvalidK`].
+    /// Number of clusters `k` (sklearn default `8`). `1 <= k` is checked at
+    /// `build`; the data-DEPENDENT `k <= n_samples` at `fit`.
     n_clusters: usize,
-    /// Embedding dimensionality; `None` resolves to `n_clusters` at `fit` (sklearn
-    /// default `n_components = n_clusters`, D-11).
+    /// `eigen_solver` — validated against [`EIGEN_SOLVERS`], see the module docs.
+    eigen_solver: Option<String>,
+    /// Embedding dimensionality; `None` resolves to `n_clusters` at `fit`.
     n_components: Option<usize>,
-    /// Affinity construction (`"rbf"` default, D-01 — `kernel_matrix(Rbf)`, D-02;
-    /// `"nearest_neighbors"` uses the kNN-connectivity graph, D-03).
-    affinity: String,
-    /// Kernel coefficient `γ` for the rbf affinity (sklearn default `1.0` literal,
-    /// D-04 — NOT the `1/n_features` default of `SpectralEmbedding`).
+    /// Seed for the deterministic Krylov start block AND the label assignment
+    /// (sklearn's `random_state`, which likewise serves both).
+    random_state: Option<u64>,
+    /// Number of k-means restarts, lowest inertia winning (sklearn default
+    /// `10`). Used only by `assign_labels = "kmeans"`.
+    n_init: usize,
+    /// Kernel coefficient `γ` (sklearn default `1.0` LITERAL — not
+    /// `SpectralEmbedding`'s `1/n_features`). Ignored by the non-kernel
+    /// affinities.
     gamma: F,
-    /// Number of neighbors for the `"nearest_neighbors"` affinity (sklearn
-    /// default `10`, D-03).
+    /// Affinity construction (`"rbf"` default).
+    affinity: String,
+    /// Neighbor count for the kNN affinities (sklearn default `10`).
     n_neighbors: usize,
-    /// Seed for the inner KMeans k-means++ host PRNG (D-10 — init-invariant on a
-    /// well-separated fixture, so the exact seed is immaterial to the label gate).
-    seed: u64,
-    /// Fitted length-`n` integer labels (`i32`, the KMeans idiom), device-resident,
-    /// `None` until `fit`.
+    /// `eigen_tol`; `None` is sklearn's `"auto"`.
+    eigen_tol: Option<f64>,
+    /// Label-assignment strategy (`"kmeans"` / `"discretize"` / `"cluster_qr"`),
+    /// kept as the raw string so an invalid value is rejected at `fit` where
+    /// sklearn's `StrOptions` rejects it.
+    assign_labels: String,
+    /// `pairwise_kernels` polynomial degree (sklearn default `3`).
+    degree: f64,
+    /// `pairwise_kernels` independent term (sklearn default `1`).
+    coef0: f64,
+    /// `n_jobs`, accepted for signature compatibility (see the module docs).
+    n_jobs: Option<i64>,
+    /// `verbose`, accepted and stored (see the module docs).
+    verbose: bool,
+
+    /// Fitted length-`n` integer labels (`i32`, the KMeans idiom),
+    /// device-resident, `None` until `fit`.
     labels_: Option<DeviceArray<ActiveRuntime, i32>>,
-    /// WR-03: the host copy of `labels_` produced by `fit`, kept so `fit_predict`
-    /// can build its returned device buffer WITHOUT the extra device→host read-back
+    /// The host copy of `labels_` produced by `fit`, kept so `fit_predict` can
+    /// build its returned device buffer WITHOUT the extra device→host read-back
     /// that calling `self.labels(pool)` would incur.
     labels_host_: Option<Vec<i32>>,
+    /// Fitted `affinity_matrix_`, in its builder's layout.
+    affinity_matrix_: Option<HostAffinity>,
+    /// Connected components of the affinity graph. sklearn warns when this is
+    /// `> 1`; it changes nothing else.
+    n_graph_components_: usize,
+    /// `n_features_in_`.
+    n_features_in_: usize,
+    /// `n_samples` seen at fit (the `labels_` length).
+    n_samples_: usize,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -105,57 +176,266 @@ impl<F> SpectralClustering<F, Unfit>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Construct an unfitted `SpectralClustering` with sklearn's
-    /// `SpectralClustering` defaults (`n_clusters = 8`, `n_components = None`,
-    /// `affinity = "rbf"`, `gamma = 1.0` literal D-04, `n_neighbors = 10`,
-    /// `seed = 0`) directly in the `Unfit` state. SINGLE source of truth for the
-    /// defaults (D-08): the builder `Default` re-derives via
-    /// [`SpectralClustering::into_builder`]. Defaults are trusted valid, so this
-    /// bypasses [`SpectralClusteringBuilder::build`]'s validation.
+    /// Construct an unfitted `SpectralClustering` with sklearn's defaults
+    /// (`n_clusters = 8`, `eigen_solver = None`, `n_components = None`,
+    /// `random_state = None`, `n_init = 10`, `gamma = 1.0`, `affinity = "rbf"`,
+    /// `n_neighbors = 10`, `eigen_tol = "auto"`, `assign_labels = "kmeans"`,
+    /// `degree = 3`, `coef0 = 1`, `n_jobs = None`, `verbose = false`) directly
+    /// in the `Unfit` state. SINGLE source of truth for the defaults: the
+    /// builder `Default` re-derives via [`SpectralClustering::into_builder`].
     pub fn new() -> Self {
         Self {
             n_clusters: 8,
+            eigen_solver: None,
             n_components: None,
-            affinity: "rbf".to_string(),
+            random_state: None,
+            n_init: 10,
             gamma: F::from_int(1),
+            affinity: "rbf".to_string(),
             n_neighbors: 10,
-            seed: 0,
+            eigen_tol: None,
+            assign_labels: "kmeans".to_string(),
+            degree: 3.0,
+            coef0: 1.0,
+            n_jobs: None,
+            verbose: false,
             labels_: None,
             labels_host_: None,
+            affinity_matrix_: None,
+            n_graph_components_: 0,
+            n_features_in_: 0,
+            n_samples_: 0,
             _state: PhantomData,
         }
     }
 
-    /// Start building a `SpectralClustering` from sklearn's defaults (D-08 single
-    /// source).
+    /// Start building a `SpectralClustering` from sklearn's defaults.
     pub fn builder() -> SpectralClusteringBuilder {
         SpectralClusteringBuilder::default()
     }
 
     /// Decompose this (unfit) estimator back into its builder, copying every
-    /// hyperparameter. Used by [`SpectralClusteringBuilder::default`] to re-derive
-    /// the defaults from [`SpectralClustering::new`] (D-08).
+    /// hyperparameter. Used by [`SpectralClusteringBuilder::default`] to
+    /// re-derive the defaults from [`SpectralClustering::new`].
     pub fn into_builder(self) -> SpectralClusteringBuilder {
         SpectralClusteringBuilder {
             n_clusters: self.n_clusters,
+            eigen_solver: self.eigen_solver,
             n_components: self.n_components,
-            affinity: self.affinity,
+            random_state: self.random_state,
+            n_init: self.n_init,
             gamma: host_to_f64(self.gamma),
+            affinity: self.affinity,
             n_neighbors: self.n_neighbors,
-            seed: self.seed,
+            eigen_tol: self.eigen_tol,
+            assign_labels: self.assign_labels,
+            degree: self.degree,
+            coef0: self.coef0,
+            n_jobs: self.n_jobs,
+            verbose: self.verbose,
         }
     }
 
     /// Compare the hyperparameter subset of two `Unfit` estimators (the fitted
-    /// `labels_` is excluded — `None` in any `Unfit` value). Used by the
+    /// attributes are excluded — all absent in any `Unfit` value). Used by the
     /// defaults-equality test (BLDR-01).
     pub fn hyperparams_eq(&self, other: &Self) -> bool {
         self.n_clusters == other.n_clusters
+            && self.eigen_solver == other.eigen_solver
             && self.n_components == other.n_components
-            && self.affinity == other.affinity
+            && self.random_state == other.random_state
+            && self.n_init == other.n_init
             && host_to_f64(self.gamma) == host_to_f64(other.gamma)
+            && self.affinity == other.affinity
             && self.n_neighbors == other.n_neighbors
-            && self.seed == other.seed
+            && self.eigen_tol == other.eigen_tol
+            && self.assign_labels == other.assign_labels
+            && self.degree == other.degree
+            && self.coef0 == other.coef0
+            && self.n_jobs == other.n_jobs
+            && self.verbose == other.verbose
+    }
+
+    /// Whether the caller should reach [`Self::fit_from_host_slice`] instead of
+    /// uploading `x` and calling [`Fit::fit`].
+    ///
+    /// Always `true`: the spectral pipeline and all three label-assignment
+    /// strategies are a single HOST implementation on every backend, so an
+    /// upload before `fit` is pure waste — `from_host` copies once and the
+    /// `to_host` that `fit` would then need copies twice. The predicate exists
+    /// anyway because the two entry points take DIFFERENT operand types (host
+    /// slice vs `DeviceArray`), so the choice has to be made BEFORE ingress;
+    /// keeping it named matches the `SpectralEmbedding` / Ridge shape and leaves
+    /// one place to change if a device arm ever returns.
+    pub fn host_fit_applicable(&self, _shape: (usize, usize)) -> bool {
+        true
+    }
+
+    /// Fit directly from a host-resident row-major `n × d` slice — the
+    /// no-upload arm (see [`Self::host_fit_applicable`]).
+    ///
+    /// For the `precomputed` / `precomputed_nearest_neighbors` affinities `x` is
+    /// the `n × n` affinity / distance matrix instead, and sklearn reports
+    /// `n_features_in_ = n_samples` there, which this reproduces because the
+    /// caller passes `shape = (n, n)`.
+    pub fn fit_from_host_slice(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<SpectralClustering<F, Fitted>, AlgoError> {
+        let x64: Vec<f64> = x.iter().map(|&v| host_to_f64(v)).collect();
+        self.fit_host_core(pool, &x64, shape)
+    }
+
+    /// The one implementation both entry points reach, so they cannot drift.
+    fn fit_host_core(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x64: &[f64],
+        shape: (usize, usize),
+    ) -> Result<SpectralClustering<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+        if n_samples == 0 || n_features == 0 {
+            return Err(AlgoError::InvalidGraphInput {
+                estimator: "spectral_clustering",
+                reason: format!("empty design ({n_samples} x {n_features})"),
+            });
+        }
+        // `eigen_solver` and `assign_labels` are validated at `fit` rather than
+        // at `build` so the error surfaces at the same point sklearn's
+        // `_fit_context` `StrOptions` validation does.
+        if let Some(s) = self.eigen_solver.as_deref() {
+            if !EIGEN_SOLVERS.contains(&s) {
+                return Err(AlgoError::Unsupported {
+                    estimator: "spectral_clustering",
+                    operation: "eigen_solver (expected one of arpack / lobpcg / amg)",
+                });
+            }
+        }
+        let assign = AssignLabels::parse(&self.assign_labels).ok_or(AlgoError::Unsupported {
+            estimator: "spectral_clustering",
+            operation: "assign_labels (expected one of kmeans / discretize / cluster_qr)",
+        })?;
+        // The `1 <= n_clusters <= n_samples` upper half is data-DEPENDENT: you
+        // cannot ask for more clusters than there are samples. sklearn surfaces
+        // the same condition from inside `k_means`.
+        if self.n_clusters < 1 || self.n_clusters > n_samples {
+            return Err(AlgoError::InvalidK {
+                estimator: "spectral_clustering",
+                k: self.n_clusters,
+                n_samples,
+            });
+        }
+        let n_components = self.n_components.unwrap_or(self.n_clusters);
+        let seed = self.random_state.unwrap_or(0);
+
+        let plan = SpectralPlan {
+            estimator: "spectral_clustering",
+            affinity: &self.affinity,
+            // The LITERAL default (module docs): unlike `SpectralEmbedding`,
+            // sklearn's `SpectralClustering.gamma` is never `None`, so the
+            // `1/n_features` fork in the shared plan is never taken.
+            gamma: Some(host_to_f64(self.gamma)),
+            degree: self.degree,
+            coef0: self.coef0,
+            // Always `Some`: sklearn's default is the int 10, so the plan's
+            // `None → max(n_samples / 10, 1)` branch belongs to
+            // `SpectralEmbedding` alone.
+            n_neighbors: Some(self.n_neighbors),
+            n_components,
+            // KEEP the trivial ≈0 eigenvector — sklearn's comment is explicit
+            // that spectral clustering wants it as a feature.
+            drop_first: false,
+            seed,
+            // The full `pairwise_kernels` family is in scope here.
+            allow_kernels: true,
+        };
+        let out = spectral_host::run(&plan, x64, n_samples, n_features)?;
+
+        // `maps` is the `n × n_components` embedding; every assignment strategy
+        // consumes it unchanged.
+        let maps = &out.embedding;
+        let labels_host: Vec<i32> = match assign {
+            AssignLabels::KMeans => {
+                spectral_host::host_kmeans(
+                    maps,
+                    n_samples,
+                    n_components,
+                    self.n_clusters,
+                    self.n_init,
+                    seed,
+                )
+                .labels
+            }
+            AssignLabels::ClusterQr => {
+                // sklearn's `cluster_qr` derives the cluster count from the
+                // embedding WIDTH, not from `n_clusters` — it returns an argmax
+                // over `n_components` columns. With the default
+                // `n_components = None → n_clusters` the two coincide; when they
+                // do not, sklearn's label range is `n_components`, and so is
+                // this one.
+                spectral_host::cluster_qr_labels(maps, n_samples, n_components)
+            }
+            AssignLabels::Discretize => {
+                // Same width-not-`n_clusters` remark as `cluster_qr`: sklearn's
+                // `discretize` builds an `n_components`-column partition matrix.
+                spectral_host::discretize_labels(maps, n_samples, n_components, seed)?
+            }
+        };
+        let labels_dev: DeviceArray<ActiveRuntime, i32> =
+            DeviceArray::from_host(pool, &labels_host);
+
+        Ok(SpectralClustering {
+            n_clusters: self.n_clusters,
+            eigen_solver: self.eigen_solver,
+            n_components: self.n_components,
+            random_state: self.random_state,
+            n_init: self.n_init,
+            gamma: self.gamma,
+            affinity: self.affinity,
+            n_neighbors: self.n_neighbors,
+            eigen_tol: self.eigen_tol,
+            assign_labels: self.assign_labels,
+            degree: self.degree,
+            coef0: self.coef0,
+            n_jobs: self.n_jobs,
+            verbose: self.verbose,
+            labels_: Some(labels_dev),
+            labels_host_: Some(labels_host),
+            affinity_matrix_: Some(out.affinity),
+            n_graph_components_: out.n_graph_components,
+            n_features_in_: n_features,
+            n_samples_: n_samples,
+            _state: PhantomData,
+        })
+    }
+
+    /// Convenience `fit_predict` (sklearn `ClusterMixin`): fit to `x` then
+    /// return the fitted `labels_` as a fresh device-resident `i32` buffer.
+    /// CONSUMES `self` (the typestate `fit` transition) and returns BOTH the
+    /// `Fitted`-tagged estimator and the labels buffer.
+    ///
+    /// The returned buffer is built directly from the host labels `fit` just
+    /// materialized, avoiding the device→host→device round trip a fresh
+    /// read-back of `labels_` would incur. It is an INDEPENDENT device
+    /// allocation — it does not alias `labels_`, so the caller may
+    /// `release_into` it freely.
+    pub fn fit_predict(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<(SpectralClustering<F, Fitted>, DeviceArray<ActiveRuntime, i32>), AlgoError> {
+        let fitted = self.fit(pool, x, None, shape)?;
+        // `fit` always sets `labels_host_` on success; the `expect` is a
+        // defensive fallback that cannot trigger on the post-`fit` path.
+        let labels = fitted
+            .labels_host_
+            .as_ref()
+            .expect("labels_host_ is Some by construction after fit");
+        let labels_dev = DeviceArray::from_host(pool, labels);
+        Ok((fitted, labels_dev))
     }
 }
 
@@ -168,25 +448,32 @@ where
     }
 }
 
-/// Builder for [`SpectralClustering`] (D-01) — the WIDE builder that subsumes the
-/// 6-arg legacy `new`. Setters are `f64`-typed for the scalar `gamma` (A5);
-/// `affinity` (`String`) and `n_components` (`Option<usize>`) setters take their
-/// values directly. `Default` re-derives the sklearn defaults from
-/// [`SpectralClustering::new`] (D-08 single source).
+/// Builder for [`SpectralClustering`] — one setter per sklearn parameter.
+/// `gamma` / `degree` / `coef0` are `f64`-typed (the scalar `gamma` narrows to
+/// `F` at `build::<F>()`); `Default` re-derives the sklearn defaults from
+/// [`SpectralClustering::new`] (single source).
 #[derive(Debug, Clone)]
 pub struct SpectralClusteringBuilder {
     n_clusters: usize,
+    eigen_solver: Option<String>,
     n_components: Option<usize>,
-    affinity: String,
+    random_state: Option<u64>,
+    n_init: usize,
     gamma: f64,
+    affinity: String,
     n_neighbors: usize,
-    seed: u64,
+    eigen_tol: Option<f64>,
+    assign_labels: String,
+    degree: f64,
+    coef0: f64,
+    n_jobs: Option<i64>,
+    verbose: bool,
 }
 
 impl Default for SpectralClusteringBuilder {
-    /// Re-derive the sklearn defaults from [`SpectralClustering::new`] (D-08
-    /// single source). `f64` is pinned only to read the F-independent scalar
-    /// defaults — the builder is non-generic, so the choice of `F` is irrelevant.
+    /// Re-derive the sklearn defaults from [`SpectralClustering::new`]. `f64` is
+    /// pinned only to read the F-independent scalar defaults — the builder is
+    /// non-generic, so the choice of `F` is irrelevant.
     fn default() -> Self {
         SpectralClustering::<f64, Unfit>::new().into_builder()
     }
@@ -199,61 +486,190 @@ impl SpectralClusteringBuilder {
         self
     }
 
-    /// Set the embedding dimensionality (`None` → `n_clusters` at fit, D-11). The
-    /// wide-builder `Option<usize>` setter shape.
+    /// Set `eigen_solver` (`"arpack"` / `"lobpcg"` / `"amg"` / `None`), which
+    /// names a route to the same invariant subspace rather than selecting one
+    /// (module docs).
+    pub fn eigen_solver(mut self, v: Option<String>) -> Self {
+        self.eigen_solver = v;
+        self
+    }
+
+    /// Set the embedding dimensionality (`None` → `n_clusters` at fit).
     pub fn n_components(mut self, v: Option<usize>) -> Self {
         self.n_components = v;
         self
     }
 
-    /// Set the affinity construction (`"rbf"` / `"nearest_neighbors"`). The
-    /// wide-builder `String` setter shape (proven here for KMeans's `init()`
-    /// setter in Plan 06).
-    pub fn affinity(mut self, v: String) -> Self {
-        self.affinity = v;
+    /// Set sklearn's `random_state`, which seeds the deterministic Krylov start
+    /// AND the label assignment.
+    pub fn random_state(mut self, v: Option<u64>) -> Self {
+        self.random_state = v;
         self
     }
 
-    /// Set the rbf kernel coefficient `γ` (A5: `f64` setter, narrowed to `F` at
-    /// `build::<F>()`).
+    /// Set the seed. Retained spelling of [`Self::random_state`] for callers
+    /// that predate the sklearn-named setter; `seed(v)` is exactly
+    /// `random_state(Some(v))`.
+    pub fn seed(mut self, v: u64) -> Self {
+        self.random_state = Some(v);
+        self
+    }
+
+    /// Set the number of k-means restarts (lowest inertia wins). Used only by
+    /// `assign_labels = "kmeans"`, exactly as in sklearn.
+    pub fn n_init(mut self, v: usize) -> Self {
+        self.n_init = v;
+        self
+    }
+
+    /// Set the kernel coefficient `γ` (narrowed to `F` at `build::<F>()`).
     pub fn gamma(mut self, v: f64) -> Self {
         self.gamma = v;
         self
     }
 
-    /// Set the neighbor count for the `"nearest_neighbors"` affinity.
+    /// Set the affinity construction — any `pairwise_kernels` metric plus
+    /// `"nearest_neighbors"` / `"precomputed"` /
+    /// `"precomputed_nearest_neighbors"` (module docs).
+    pub fn affinity(mut self, v: String) -> Self {
+        self.affinity = v;
+        self
+    }
+
+    /// Set the neighbor count for the kNN affinities.
     pub fn n_neighbors(mut self, v: usize) -> Self {
         self.n_neighbors = v;
         self
     }
 
-    /// Set the inner-KMeans PRNG seed.
-    pub fn seed(mut self, v: u64) -> Self {
-        self.seed = v;
+    /// Set `eigen_tol` (`None` is sklearn's `"auto"`).
+    pub fn eigen_tol(mut self, v: Option<f64>) -> Self {
+        self.eigen_tol = v;
+        self
+    }
+
+    /// Set the label-assignment strategy (`"kmeans"` / `"discretize"` /
+    /// `"cluster_qr"`).
+    pub fn assign_labels(mut self, v: String) -> Self {
+        self.assign_labels = v;
+        self
+    }
+
+    /// Set the polynomial-kernel degree.
+    pub fn degree(mut self, v: f64) -> Self {
+        self.degree = v;
+        self
+    }
+
+    /// Set the polynomial / sigmoid independent term.
+    pub fn coef0(mut self, v: f64) -> Self {
+        self.coef0 = v;
+        self
+    }
+
+    /// Set `n_jobs` (accepted for signature compatibility).
+    pub fn n_jobs(mut self, v: Option<i64>) -> Self {
+        self.n_jobs = v;
+        self
+    }
+
+    /// Set `verbose` (accepted and stored; a library crate must not print).
+    pub fn verbose(mut self, v: bool) -> Self {
+        self.verbose = v;
         self
     }
 
     /// Build the (unfit) estimator, narrowing the stored `f64` `gamma` to the
-    /// target float `F` (A5). SpectralClustering has no purely data-INDEPENDENT
-    /// hyperparameter that is unconditionally validated: the `gamma > 0` check is
-    /// affinity-branch-coupled (only the `"rbf"` path uses gamma) and stays in the
-    /// fit body to keep the math byte-identical and preserve the
-    /// `"nearest_neighbors"` path's behavior (D-03 / the D-08 split is a no-op
-    /// here). The `Result` is kept for family uniformity with the other Phase-16
-    /// builders so the `build_err_to_py` PyO3 mapper is shape-identical.
+    /// target float `F`.
+    ///
+    /// Only the data-INDEPENDENT bounds are checked here, and each mirrors the
+    /// matching sklearn `_parameter_constraints` entry:
+    /// `n_clusters >= 1`, `n_components >= 1`, `n_init >= 1`, `n_neighbors >= 1`
+    /// (`Interval(Integral, 1, None, closed="left")`), `eigen_tol >= 0` finite
+    /// and `degree >= 0` finite (`Interval(Real, 0, None, closed="left")`), and
+    /// `coef0` finite (`Interval(Real, None, None, closed="neither")`).
+    ///
+    /// `gamma`'s admissibility is affinity-coupled (only the kernel affinities
+    /// consume it) and `n_clusters <= n_samples` needs the data, so both stay in
+    /// the fit body. `gamma >= 0` — the `closed="left"` bound, which ADMITS
+    /// zero — is enforced there by the shared plan.
     pub fn build<F>(self) -> Result<SpectralClustering<F, Unfit>, BuildError>
     where
         F: Float + CubeElement + Pod,
     {
+        if self.n_clusters < 1 {
+            return Err(BuildError::InvalidNClusters {
+                estimator: "spectral_clustering",
+                n_clusters: self.n_clusters,
+            });
+        }
+        if let Some(c) = self.n_components {
+            if c < 1 {
+                return Err(BuildError::InvalidNComponents {
+                    estimator: "spectral_clustering",
+                    param: "n_components",
+                    value: c,
+                });
+            }
+        }
+        if self.n_init < 1 {
+            return Err(BuildError::InvalidNComponents {
+                estimator: "spectral_clustering",
+                param: "n_init",
+                value: self.n_init,
+            });
+        }
+        if self.n_neighbors < 1 {
+            return Err(BuildError::InvalidNNeighbors {
+                estimator: "spectral_clustering",
+                n_neighbors: self.n_neighbors,
+            });
+        }
+        if let Some(t) = self.eigen_tol {
+            if !(t >= 0.0) || !t.is_finite() {
+                return Err(BuildError::InvalidEps {
+                    estimator: "spectral_clustering",
+                    eps: t,
+                });
+            }
+        }
+        if !(self.degree >= 0.0) || !self.degree.is_finite() {
+            return Err(BuildError::InvalidHyperprior {
+                estimator: "spectral_clustering",
+                param: "degree",
+                value: self.degree,
+                bound: ">= 0",
+            });
+        }
+        if !self.coef0.is_finite() {
+            return Err(BuildError::InvalidHyperprior {
+                estimator: "spectral_clustering",
+                param: "coef0",
+                value: self.coef0,
+                bound: "a real number",
+            });
+        }
         Ok(SpectralClustering {
             n_clusters: self.n_clusters,
+            eigen_solver: self.eigen_solver,
             n_components: self.n_components,
-            affinity: self.affinity,
+            random_state: self.random_state,
+            n_init: self.n_init,
             gamma: f64_to_host::<F>(self.gamma),
+            affinity: self.affinity,
             n_neighbors: self.n_neighbors,
-            seed: self.seed,
+            eigen_tol: self.eigen_tol,
+            assign_labels: self.assign_labels,
+            degree: self.degree,
+            coef0: self.coef0,
+            n_jobs: self.n_jobs,
+            verbose: self.verbose,
             labels_: None,
             labels_host_: None,
+            affinity_matrix_: None,
+            n_graph_components_: 0,
+            n_features_in_: 0,
+            n_samples_: 0,
             _state: PhantomData,
         })
     }
@@ -264,13 +680,61 @@ where
     F: Float + CubeElement + Pod,
 {
     /// Host copy of the fitted `labels_` (length `n`, `i32`). `Some` by
-    /// construction on the `Fitted` state, so no `NotFitted` branch is needed (the
-    /// compile-time typestate replaces the runtime guard, D-03).
+    /// construction on the `Fitted` state, so no `NotFitted` branch is needed.
     pub fn labels(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<i32> {
         self.labels_
             .as_ref()
             .expect("labels_ is Some by construction on SpectralClustering<F, Fitted>")
             .to_host(pool)
+    }
+
+    /// `affinity_matrix_` densified to a row-major `n × n` matrix.
+    ///
+    /// The kNN affinities are stored SPARSE, so this materializes `n²` values on
+    /// demand — reach for [`Self::affinity_matrix_sparse`] instead when the
+    /// caller can consume CSR (which is what sklearn returns there).
+    pub fn affinity_matrix_dense(&self) -> Vec<f64> {
+        self.affinity_matrix_
+            .as_ref()
+            .expect("affinity_matrix_ is Some by construction on the Fitted state")
+            .to_dense(self.n_samples_)
+    }
+
+    /// `affinity_matrix_` as CSR when the affinity builder produced a sparse
+    /// graph (`nearest_neighbors` / `precomputed_nearest_neighbors`), else
+    /// `None`. Mirrors sklearn, which returns a `csr_matrix` there and a dense
+    /// `ndarray` for the kernel and `precomputed` affinities.
+    pub fn affinity_matrix_sparse(&self) -> Option<&Csr> {
+        match self.affinity_matrix_.as_ref() {
+            Some(HostAffinity::Sparse(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Connected components of the fitted affinity graph. sklearn emits
+    /// `"Graph is not fully connected, spectral embedding may not work as
+    /// expected."` when this exceeds 1 and changes nothing else; exposing the
+    /// count lets the binding layer raise the same warning.
+    pub fn n_graph_components(&self) -> usize {
+        self.n_graph_components_
+    }
+
+    /// `n_features_in_`.
+    pub fn n_features_in(&self) -> usize {
+        self.n_features_in_
+    }
+
+    /// Number of training samples (the `labels_` length).
+    pub fn n_samples(&self) -> usize {
+        self.n_samples_
+    }
+
+    /// The stored `verbose` flag. sklearn prints
+    /// `"Computing label assignment using <assign_labels>"` when it is set; a
+    /// library crate must not write to stdout, so the flag is surfaced for a
+    /// binding layer to act on instead.
+    pub fn verbose(&self) -> bool {
+        self.verbose
     }
 }
 
@@ -281,18 +745,14 @@ where
     type Fitted = SpectralClustering<F, Fitted>;
 
     /// Fit the spectral clustering to the affinity graph of `x`
-    /// (`shape = (n_samples, n_features)`, row-major), CONSUMING `self`. Rejects
-    /// `n_samples > 64` with [`AlgoError::NSamplesExceedsMaxDim`] BEFORE any launch
-    /// (D-06).
+    /// (`shape = (n_samples, n_features)`, row-major), CONSUMING `self`.
     ///
-    /// Pipeline (D-11, pinned to sklearn `SpectralClustering.fit`): affinity (rbf
-    /// via `kernel_matrix(Rbf{gamma})`, D-02/D-04 literal gamma; OR the
-    /// kNN-connectivity builder) → `laplacian` `(L, dd)` → `eig(L)` (DESCENDING,
-    /// reversed to ascending) → slice the smallest `n_components` columns →
-    /// `/dd` recovery → `_deterministic_vector_sign_flip` → KEEP row 0
-    /// (`drop_first = FALSE`, D-11) → `maps` (`n × n_components`) →
-    /// `KMeans::new(n_clusters, seed).fit(maps)` (kmeans++, `n_init = 1`, D-10) →
-    /// `labels_`.
+    /// This is the DEVICE-operand entry point, kept so the estimator stays on
+    /// the single `Fit` trait surface. Because the pipeline is host-side it
+    /// reads `x` back first, which costs two copies. Callers already holding
+    /// host data should branch on
+    /// [`SpectralClustering::host_fit_applicable`] and use
+    /// [`SpectralClustering::fit_from_host_slice`], which never uploads at all.
     fn fit(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -300,250 +760,7 @@ where
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<SpectralClustering<F, Fitted>, AlgoError> {
-        let (n_samples, n_features) = shape;
-
-        // --- T-9-VAL / ASVS V5: validate the untrusted hyperparameters +
-        //     geometry BEFORE any affinity/Laplacian/eig/KMeans device work. The
-        //     n_samples > 64 guard names the SPECTRAL cap (D-06), NOT eig's
-        //     generic PrimError::NotSquare. Mirrors kmeans.rs:238 /
-        //     spectral_embedding.rs:141. ---
-        if n_samples > MAX_DIM {
-            return Err(AlgoError::NSamplesExceedsMaxDim {
-                estimator: "spectral_clustering",
-                n_samples,
-                max: MAX_DIM,
-            });
-        }
-        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "x",
-                rows: n_samples,
-                cols: n_features,
-                len: x.len(),
-            }));
-        }
-        // n_clusters: 1 ≤ k ≤ n_samples (the KMeans gate, surfaced here pre-launch).
-        if self.n_clusters < 1 || self.n_clusters > n_samples {
-            return Err(AlgoError::InvalidK {
-                estimator: "spectral_clustering",
-                k: self.n_clusters,
-                n_samples,
-            });
-        }
-        // n_components defaults to n_clusters (D-11). drop_first=FALSE keeps ALL
-        // n_components eigenvectors (including the trivial ≈0 one), so we need the
-        // smallest n_components eigenvectors to exist (n_components ≤ n_samples).
-        let n_components = self.n_components.unwrap_or(self.n_clusters);
-        if n_components < 1 || n_components > n_samples {
-            return Err(AlgoError::InvalidNComponents {
-                estimator: "spectral_clustering",
-                requested: n_components,
-                max: n_samples,
-            });
-        }
-
-        // --- Build the affinity matrix A (n×n) by the `affinity` string. ---
-        let a = match self.affinity.as_str() {
-            // rbf (D-02/D-04): A = kernel_matrix(X, X, Rbf{gamma}). For SC the
-            // gamma default is the LITERAL 1.0 (D-04 — NO 1/n_features fork); the
-            // typed `self.gamma` is the resolved coefficient, validated finite
-            // (T-9-VAL / InvalidGamma).
-            "rbf" => {
-                let gamma64 = host_to_f64(self.gamma);
-                // WR-04: sklearn's kernel-coefficient contract is
-                // Interval(Real, 0, None, closed='neither') — STRICTLY positive.
-                // gamma == 0 yields exp(0) = 1 for all pairs (a constant all-ones
-                // affinity → degenerate graph); a negative gamma blows the affinity
-                // up monotonically with distance. Reject gamma <= 0, not just the
-                // non-finite case (the finiteness check is subsumed: NaN and ±inf
-                // both fail `> 0.0`). This validation is affinity-branch-coupled
-                // (only the rbf path uses gamma), so it stays here in the fit body
-                // rather than relocating to build() — the nearest_neighbors path
-                // does NOT validate gamma (Phase-16 D-03 byte-identical contract).
-                if !(gamma64 > 0.0) {
-                    return Err(AlgoError::InvalidGamma {
-                        estimator: "spectral_clustering",
-                        gamma: gamma64,
-                    });
-                }
-                // IN-03 (explicit parity decision): only `gamma <= 0` / non-finite
-                // is rejected. A finite-positive gamma so tiny that `exp(-gamma*dist)`
-                // underflows to an effective-constant all-ones affinity is ACCEPTED
-                // — this matches sklearn, which likewise gates solely on
-                // `Interval(Real, 0, None, closed='neither')` and does NOT guard the
-                // effective-zero underflow boundary. Intentional sklearn parity, not
-                // an oversight.
-                kernel_matrix::<F>(
-                    pool,
-                    x,
-                    (n_samples, n_features),
-                    x,
-                    (n_samples, n_features),
-                    Kernel::Rbf { gamma: self.gamma },
-                    None,
-                )?
-            }
-            // nearest_neighbors (D-03): the sklearn-exact binary connectivity
-            // builder (RESEARCH Pattern 3), shared with SpectralEmbedding.
-            "nearest_neighbors" => {
-                // WR-03: sklearn's kneighbors_graph does NOT error when
-                // n_neighbors > n_samples — NearestNeighbors silently caps at
-                // n_samples. Clamp to min(n_neighbors, n_samples); only reject
-                // k < 1. Mirrors SpectralEmbedding.
-                let k = self.n_neighbors.min(n_samples);
-                if k < 1 {
-                    return Err(AlgoError::InvalidK {
-                        estimator: "spectral_clustering",
-                        k: self.n_neighbors,
-                        n_samples,
-                    });
-                }
-                // IN-02: shared free function (was a verbatim per-estimator method).
-                crate::cluster::spectral::knn_connectivity_affinity::<F>(
-                    pool, x, n_samples, n_features, k,
-                )?
-            }
-            // Any other affinity string is out of scope (CONTEXT — precomputed /
-            // precomputed_nearest_neighbors deferred). Fail loud with a typed error.
-            other => {
-                return Err(AlgoError::InvalidKernel {
-                    estimator: "spectral_clustering",
-                    kernel: other.to_string(),
-                });
-            }
-        };
-
-        // --- Normalized Laplacian (L, dd) = laplacian(A, n) (PRIM-09). `dd` is
-        //     the D^(1/2) degree vector used for the /dd recovery (D-07). ---
-        let (l, dd) = laplacian::<F>(pool, &a, n_samples)?;
-        a.release_into(pool);
-        let dd_host: Vec<f64> = dd.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        dd.release_into(pool);
-
-        // --- Full symmetric spectrum via v1 eig (DESCENDING, V col-major). Thread
-        //     the Laplacian buffer through `out` so eig reuses it as its working
-        //     input — saving one n² allocation. Mirrors spectral_embedding.rs.
-        //
-        //     WR-05: `&l` (the eig `a` input) and `l_out` (the eig `out`) wrap the
-        //     SAME ref-counted cubecl handle (l.handle().clone()). This aliasing is
-        //     SOUND only because of two load-bearing, eig-internal invariants:
-        //       (1) eig READS `a_in` (= the `out` handle) and NEVER writes it — it
-        //           writes its separate w/V/info outputs (eig.rs jacobi_eig_sweep);
-        //       (2) eig ACQUIRES w/V/info from the pool BEFORE it releases the `out`
-        //           working buffer (eig.rs: acquire happens before the
-        //           `a_in_owned.release_into(pool)` post-launch), so the freed
-        //           handle is never re-handed mid-call.
-        //     If eig ever writes its working input in place, or reorders the
-        //     acquire/release, this reuse becomes an aliased-write / use-after-free
-        //     with NO compile-time signal — keep those invariants if eig changes.
-        let l_out = DeviceArray::<ActiveRuntime, F>::from_raw(
-            l.handle().clone(),
-            n_samples * n_samples,
-        );
-        let (w_desc, v_desc) = eig::<F>(pool, &l, n_samples, Some(l_out))?;
-        // eig released the CLONE threaded through `out`; this drops `l`'s remaining
-        // handle clone (the ref-counted buffer's last owner returns it to the pool).
-        // `l` is not read again afterwards.
-        drop(l);
-        w_desc.release_into(pool);
-        let v_host: Vec<f64> = v_desc
-            .to_host(pool)
-            .iter()
-            .map(|&v| host_to_f64(v))
-            .collect();
-        v_desc.release_into(pool);
-
-        // --- Post-eig recovery host math (D-07/D-11): slice the smallest
-        //     n_components → /dd → sign-flip → KEEP row 0 (drop_first = FALSE for
-        //     SC) → transpose into the n × n_components `maps`. ---
-        // WR-06: drop_first = FALSE for SpectralClustering (D-11) — KEEP the trivial
-        // ≈0 eigenvector as a KMeans feature. Shared recovery helper (was recover_maps).
-        let maps_host =
-            recover::<F>(&v_host, &dd_host, n_samples, n_components, false, true);
-        let maps_dev = DeviceArray::from_host(pool, &maps_host);
-
-        // --- v1 KMeans on the embedding (D-10): the typestate builder (kmeans++,
-        //     n_init=1; NO injected init — init-injection is rejected for SC). The
-        //     well-separated fixture makes the partition unique up to permutation,
-        //     so the SplitMix64-vs-MT19937 RNG gap is immaterial to the labels.
-        //     The inner KMeans is now on the typestate `Fit` (Plan 06): build via
-        //     the builder, then the consuming `Fit::fit` returns the `Fitted`
-        //     sibling. The byte-identical kmeans++ compute is preserved (D-03). ---
-        // KMeans's `build()` is infallible-but-typed (no data-INDEPENDENT
-        // hyperparameter validation — the `1 ≤ k ≤ n_samples` and injected-init
-        // checks are data-DEPENDENT and stay in its `fit`), so this `expect` cannot
-        // trigger; `n_clusters` is re-validated against `n_components` inside the
-        // inner `fit` exactly as before.
-        let kmeans = KMeans::<F>::builder()
-            .n_clusters(self.n_clusters)
-            .seed(self.seed)
-            .build::<F>()
-            .expect("KMeans::build is infallible (no data-independent validation)");
-        let kmeans = kmeans.fit(pool, &maps_dev, None, (n_samples, n_components))?;
-        maps_dev.release_into(pool);
-
-        let labels_host = kmeans.labels(pool);
-        // WR-01: the function-local KMeans owns fitted device buffers
-        // (cluster_centers_ k×n_components, labels_ i32 length n). DeviceArray has
-        // no Drop, so return them to the pool before `kmeans` falls out of scope —
-        // otherwise their acquired bytes leak the pool accounting (live_bytes grows
-        // monotonically across re-fits, the FOUND-05 invariant). Done AFTER copying
-        // the labels to the host.
-        kmeans.release_into(pool);
-        let labels_dev: DeviceArray<ActiveRuntime, i32> =
-            DeviceArray::from_host(pool, &labels_host);
-
-        Ok(SpectralClustering {
-            n_clusters: self.n_clusters,
-            n_components: self.n_components,
-            affinity: self.affinity,
-            gamma: self.gamma,
-            n_neighbors: self.n_neighbors,
-            seed: self.seed,
-            labels_: Some(labels_dev),
-            // WR-03: retain the host labels (already materialized above) so
-            // `fit_predict` can rebuild a fresh device buffer without a redundant
-            // device→host read-back of `labels_`.
-            labels_host_: Some(labels_host),
-            _state: PhantomData,
-        })
+        let x64: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
+        self.fit_host_core(pool, &x64, shape)
     }
 }
-
-impl<F> SpectralClustering<F, Unfit>
-where
-    F: Float + CubeElement + Pod,
-{
-    /// Convenience `fit_predict` (sklearn `ClusterMixin`): fit to `x` then return
-    /// the fitted `labels_` as a fresh device-resident `i32` buffer. CONSUMES
-    /// `self` (the typestate `fit` transition) and returns BOTH the `Fitted`-tagged
-    /// estimator and the labels buffer.
-    ///
-    /// WR-03: builds the returned buffer directly from the host labels `fit` just
-    /// materialized (`labels_host_`), avoiding the extra device→host→device round
-    /// trip that a fresh read-back of `labels_` would incur. The returned buffer is
-    /// an INDEPENDENT device allocation — it does not alias `labels_`, so the caller
-    /// may `release_into` it freely.
-    pub fn fit_predict(
-        self,
-        pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
-        shape: (usize, usize),
-    ) -> Result<(SpectralClustering<F, Fitted>, DeviceArray<ActiveRuntime, i32>), AlgoError> {
-        let fitted = self.fit(pool, x, None, shape)?;
-        // `fit` always sets `labels_host_` on success; the `expect` is a defensive
-        // fallback that cannot trigger on the post-`fit` path.
-        let labels = fitted
-            .labels_host_
-            .as_ref()
-            .expect("labels_host_ is Some by construction after fit");
-        let labels_dev = DeviceArray::from_host(pool, labels);
-        Ok((fitted, labels_dev))
-    }
-}
-
-// WR-06: `recover_maps` (now `recover(.., drop_first = false)`), `host_to_f64`, and
-// `f64_to_host` moved to the shared `crate::cluster::spectral` module (imported
-// above) so the embedding and clustering recovery paths stay bit-identical.
-// IN-02: `knn_connectivity_affinity` likewise moved to the shared module (was a
-// verbatim copy of the SpectralEmbedding builder) so the two cannot drift.

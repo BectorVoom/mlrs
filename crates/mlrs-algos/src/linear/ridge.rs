@@ -193,9 +193,33 @@
 //! below the fixed dispatch-cost floor. Everything else keeps the device route
 //! above.
 //!
-//! Tests live in `crates/mlrs-algos/tests/ridge_test.rs` and
-//! `crates/mlrs-algos/tests/ridge_params_test.rs` (AGENTS.md §2), never an
-//! in-source `#[cfg(test)] mod tests`.
+//! ## `predict` is a DIFFERENT split: the host-ingress arm ALWAYS wins the
+//! host comparison (RIDGE-PREDICT-CUDA-VS-CPU, 2026-08-03)
+//! [`Predict::predict`] (device `DeviceArray` in, `DeviceArray` out) still
+//! runs the fused GATHER kernel on-device — that half of D-03's "device
+//! residency" claim is unchanged. But every REAL caller (the whole Arrow/PyO3
+//! surface) starts from a host-resident test matrix and calls
+//! [`Ridge::predict_from_host`] / [`Ridge::predict_multi_from_host`] instead,
+//! and THOSE now take the host arm
+//! (`mlrs_backend::prims::linear_predict::linear_predict_from_host_forced_host`)
+//! UNCONDITIONALLY, on every backend
+//! including cuda/wgpu/rocm. Measured on a Kaggle P100
+//! (`ridge_predict_device_vs_host_perf_test.rs`): the device kernel LOSES to
+//! this crate's own host-native matvec by **10-23x** across every
+//! single-target shape tried (`n` 10k-1M, `d` 16-64), and by 2-3x at
+//! `n_targets=4`; it wins only marginally (~1.1-1.5x, two data points, close
+//! to a wash at `d=64`) at `n_targets=16` — too thin a result to gate a
+//! dispatch threshold on. The reason generalizes past this one adapter:
+//! `predict` is `O(n·d)` compute over the SAME `O(n·d)` transfer that fit also
+//! pays, a strictly worse compute-to-transfer ratio than fit's `O(n·d²)`, so
+//! the GPU never gets fit's chance to pay the upload back. This is the OPPOSITE
+//! of the fit-side story two sections up, where the device arm wins at large
+//! `d` — do not assume the two share a crossover.
+//!
+//! Tests live in `crates/mlrs-algos/tests/ridge_test.rs`,
+//! `crates/mlrs-algos/tests/ridge_params_test.rs` and
+//! `crates/mlrs-algos/tests/ridge_multi_target_test.rs` (AGENTS.md §2), never
+//! an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
 
@@ -212,14 +236,16 @@ use mlrs_backend::prims::gram::{
     column_means, fused_centering_available, gram_xty, gram_xty_centered,
 };
 use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable};
-use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
+use mlrs_backend::prims::linear_predict::{
+    linear_predict, linear_predict_from_host_forced_host, linear_predict_multi,
+    linear_predict_multi_from_host_forced_host, HostMirror, HostMirrorMulti, HostPrediction,
+};
 use mlrs_backend::prims::nnls::{device_nnls_applicable, ridge_intercept_device, ridge_nnls};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
-use crate::linear::elastic_net::predict_linear_from_host;
 use crate::linear::ridge_solvers;
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
@@ -399,6 +425,13 @@ pub struct Ridge<F, S = Unfit> {
     /// [`HostMirror`](mlrs_backend::prims::linear_predict::HostMirror) for why a
     /// 64-byte read-back is worth caching. Fresh on every `fit`.
     predict_mirror: HostMirror<F>,
+    /// Multi-target twin of `predict_mirror`
+    /// ([`HostMirrorMulti`](mlrs_backend::prims::linear_predict::HostMirrorMulti)),
+    /// for [`Ridge::predict_multi_from_host`] (RIDGE-MULTI-TARGET). Empty and
+    /// unused on every single-target (`n_targets == 1`) fit — it costs nothing
+    /// beyond one `OnceLock`'s worth of stack space until a multi-target cpu
+    /// predict actually reads it.
+    predict_mirror_multi: HostMirrorMulti<F>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
 }
@@ -430,6 +463,7 @@ where
             n_iter_: None,
             solver_: None,
             predict_mirror: HostMirror::new(),
+            predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
         }
     }
@@ -779,6 +813,166 @@ where
             n_iter_: n_iter,
             solver_: Some(solver_used),
             predict_mirror: HostMirror::new(),
+            predict_mirror_multi: HostMirrorMulti::new(),
+            _state: PhantomData,
+        })
+    }
+
+    /// Multi-target `fit` (RIDGE-MULTI-TARGET): `y_multi` is `n_samples ×
+    /// n_targets` row-major (sklearn's 2D-`y` convention), producing `coef_` as
+    /// `n_features × n_targets` row-major and `intercept_` as length
+    /// `n_targets` — read back via [`Ridge::coef_multi`] /
+    /// [`Ridge::intercept_multi`] rather than the single-target
+    /// [`Ridge::coef`] / [`Ridge::intercept`] (which only ever see target 0's
+    /// values through this entry point, and are the wrong call once
+    /// `n_targets > 1`).
+    ///
+    /// **Solver coverage**: `n_targets == 1` runs through the FULL eight-solver
+    /// surface (this is just a convenience path onto
+    /// [`Ridge::fit_with_sample_weight`]). `n_targets > 1` is currently
+    /// supported ONLY for the two solvers that resolve to `cholesky` with
+    /// `positive = false` (`auto` and an explicit `cholesky`) — every other
+    /// `solver`/`positive` pair with `n_targets > 1` returns
+    /// [`PrimError::UnsupportedCapability`] rather than silently guessing at
+    /// unvalidated multi-output behaviour for `svd`/`lsqr`/`sparse_cg`/`sag`/
+    /// `saga`/`lbfgs`.
+    ///
+    /// ## Implementation: `n_targets` independent single-target fits, stacked
+    /// Each target column runs through the SAME, already-validated
+    /// [`Ridge::fit_with_sample_weight`] — the Gram, Cholesky, centering and
+    /// intercept-recovery machinery is completely untouched, and re-runs once
+    /// PER TARGET (the Gram depends only on `X`, so this recomputes an
+    /// `O(n·d²)` reduction `n_targets` times; a fused multi-RHS Gram/`Xᵀy` pass
+    /// that forms the Gram ONCE — [`cholesky_solve_reg`]'s `rhs` parameter
+    /// already supports multiple right-hand sides in one launch — is the
+    /// obvious next lever and is deliberately NOT taken here: this path is
+    /// fit-side bookkeeping, not the perf-critical one, which is `predict` via
+    /// [`linear_predict_multi`]). The `n_targets` resulting `(coef_,
+    /// intercept_)` pairs are read back to host — each is tiny, `n_features`
+    /// and `1` floats — and interleaved into ONE `n_features × n_targets`
+    /// device buffer and ONE length-`n_targets` device buffer, so `predict`
+    /// still issues a SINGLE fused kernel launch regardless of how the fit was
+    /// assembled (D-03 — the fitted state is device-resident whichever path
+    /// produced it). The whole-`y_multi` read-back this needs (to slice out
+    /// each target's column) is one `n_samples × n_targets` transfer, the same
+    /// order of magnitude as re-uploading each target's column individually.
+    ///
+    /// `n_iter_`/`solver_` are taken from target 0. For the supported
+    /// `cholesky` arm this is exact — the singular-Gram→SVD retry trigger
+    /// depends only on `X`/`α` (never on `y`), so it is IDENTICAL across every
+    /// target — sklearn itself does not report a real per-target `n_iter_` on
+    /// this solver either (module-doc table: `cholesky` leaves it `None`).
+    pub fn fit_multi_target_with_sample_weight(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y_multi: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+        n_targets: usize,
+        sample_weight: Option<&[F]>,
+    ) -> Result<Ridge<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+        validate_geometry(x, shape)?;
+        if n_targets == 0 || y_multi.len() != n_samples * n_targets {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: n_targets,
+                len: y_multi.len(),
+            }));
+        }
+
+        let (alpha, fit_intercept, copy_x, max_iter, tol, solver, positive, random_state) = (
+            self.alpha,
+            self.fit_intercept,
+            self.copy_x,
+            self.max_iter,
+            self.tol,
+            self.solver,
+            self.positive,
+            self.random_state,
+        );
+        let resolved = solver.resolve(positive);
+        if n_targets > 1 && resolved != RidgeSolver::Cholesky {
+            return Err(AlgoError::Prim(PrimError::UnsupportedCapability {
+                operand: "ridge.fit_multi_target",
+                capability: "multi-target y with a solver other than the default cholesky (positive=False)",
+            }));
+        }
+
+        let y_host = y_multi.to_host(pool);
+        let mut coef_host: Vec<F> = vec![F::from_int(0i64); n_features * n_targets];
+        let mut intercept_host: Vec<F> = vec![F::from_int(0i64); n_targets];
+        let mut n_iter0: Option<usize> = None;
+        let mut solver_used0: Option<RidgeSolver> = None;
+        for t in 0..n_targets {
+            let mut y_t: Vec<F> = Vec::with_capacity(n_samples);
+            for r in 0..n_samples {
+                y_t.push(y_host[r * n_targets + t]);
+            }
+            let y_t_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y_t);
+            let fresh = Ridge {
+                alpha,
+                fit_intercept,
+                copy_x,
+                max_iter,
+                tol,
+                solver,
+                positive,
+                random_state,
+                coef_: None,
+                intercept_: None,
+                n_iter_: None,
+                solver_: None,
+                predict_mirror: HostMirror::new(),
+                predict_mirror_multi: HostMirrorMulti::new(),
+                _state: PhantomData,
+            };
+            let single =
+                fresh.fit_with_sample_weight(pool, x, Some(&y_t_dev), shape, sample_weight)?;
+            y_t_dev.release_into(pool);
+
+            let coef_t = single
+                .coef_
+                .as_ref()
+                .expect("coef_ is Some by construction on Ridge<F, Fitted>")
+                .to_host(pool);
+            let intercept_t = single
+                .intercept_
+                .as_ref()
+                .expect("intercept_ is Some by construction on Ridge<F, Fitted>")
+                .to_host(pool)[0];
+            for c in 0..n_features {
+                coef_host[c * n_targets + t] = coef_t[c];
+            }
+            intercept_host[t] = intercept_t;
+            if t == 0 {
+                n_iter0 = single.n_iter_;
+                solver_used0 = single.solver_;
+            }
+            if let Some(c) = single.coef_ {
+                c.release_into(pool);
+            }
+            if let Some(i) = single.intercept_ {
+                i.release_into(pool);
+            }
+        }
+
+        Ok(Ridge {
+            alpha,
+            fit_intercept,
+            copy_x,
+            max_iter,
+            tol,
+            solver,
+            positive,
+            random_state,
+            coef_: Some(DeviceArray::from_host(pool, &coef_host)),
+            intercept_: Some(DeviceArray::from_host(pool, &intercept_host)),
+            n_iter_: n_iter0,
+            solver_: solver_used0,
+            predict_mirror: HostMirror::new(),
+            predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
         })
     }
@@ -967,6 +1161,7 @@ where
             n_iter_: None,
             solver_: Some(solver_used),
             predict_mirror: HostMirror::new(),
+            predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
         })
     }
@@ -1185,6 +1380,7 @@ impl RidgeBuilder {
             n_iter_: None,
             solver_: None,
             predict_mirror: HostMirror::new(),
+            predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
         })
     }
@@ -1230,26 +1426,141 @@ where
     /// `predict` for a test matrix that is still on the HOST — returns the
     /// length-`n_samples` predictions plus the operand-finiteness verdict.
     ///
-    /// The host-ingress twin of [`Predict::predict`]: same result, but it reads
-    /// the caller's buffer in place on cpu instead of paying an `m × n` upload
-    /// that costs more than the prediction. All four dense linear regressors
-    /// share ONE implementation — see [`predict_linear_from_host`] for the
-    /// backend routing, the measurements, and the finiteness verdict's meaning.
+    /// The host-ingress twin of [`Predict::predict`]. The OTHER three dense
+    /// linear regressors (`LinearRegression`/`Lasso`/`ElasticNet`) share ONE
+    /// implementation for this
+    /// (`crate::linear::elastic_net::predict_linear_from_host`), which keeps
+    /// the device kernel on every non-cpu backend.
+    ///
+    /// RIDGE-PREDICT-CUDA-VS-CPU (2026-08-03): unlike those, Ridge takes the
+    /// HOST arm (`linear_predict_from_host_forced_host`) UNCONDITIONALLY
+    /// here — a Kaggle P100 measurement
+    /// (`ridge_predict_device_vs_host_perf_test.rs`) found the device kernel
+    /// LOSES to this exact host arithmetic by 10-23x across every
+    /// single-target shape tried, because `predict` is `O(n·d)` compute over
+    /// the SAME `O(n·d)` transfer — a worse compute-to-transfer ratio than
+    /// `fit` ever has. See that prim's doc comment for the full measurement
+    /// and why this is scoped to Ridge rather than the shared path.
     pub fn predict_from_host(
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &[F],
         shape: (usize, usize),
     ) -> Result<HostPrediction<F>, AlgoError> {
-        predict_linear_from_host(
-            self.coef_.as_ref(),
-            self.intercept_.as_ref(),
-            &self.predict_mirror,
-            "ridge",
+        let (n_samples, n_features) = shape;
+        let coef = self.coef_.as_ref().expect(
+            "coef_ is Some by construction on Ridge<F, Fitted>",
+        );
+        let intercept = self.intercept_.as_ref().expect(
+            "intercept_ is Some by construction on Ridge<F, Fitted>",
+        );
+        // Byte-identical geometry guard to `Predict::predict`'s inline check
+        // (2026-07-22 review precedent: a benign, deliberate duplication so
+        // both ingresses reject the same shapes with the same typed error).
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if coef.len() != n_features {
+            return Err(AlgoError::Prim(PrimError::DimMismatch {
+                dim: "n_features",
+                lhs: coef.len(),
+                rhs: n_features,
+            }));
+        }
+        Ok(linear_predict_from_host_forced_host(
             pool,
             x,
+            coef,
+            intercept,
+            &self.predict_mirror,
             shape,
-        )
+        )?)
+    }
+
+    /// The fitted target count (RIDGE-MULTI-TARGET): `1` for every estimator
+    /// produced by [`Ridge::fit`] / [`Ridge::fit_with_sample_weight`] /
+    /// [`Ridge::fit_from_host_slice`], or the caller's `n_targets` when produced
+    /// by [`Ridge::fit_multi_target_with_sample_weight`]. Derived from
+    /// `intercept_.len()` rather than stored separately — `intercept_` is
+    /// exactly length `n_targets` by construction on every fit path, so this
+    /// cannot drift from it.
+    pub fn n_targets(&self) -> usize {
+        self.intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on Ridge<F, Fitted>")
+            .len()
+    }
+
+    /// Host copy of the fitted `coef_`, row-major `n_features × n_targets`
+    /// (RIDGE-MULTI-TARGET). For a single-target fit (`n_targets() == 1`) this
+    /// is the same `n_features`-length vector [`Ridge::coef`] returns — use
+    /// whichever accessor matches the caller's known target count.
+    pub fn coef_multi(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on Ridge<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// Host copy of the fitted `intercept_`, length `n_targets`
+    /// (RIDGE-MULTI-TARGET). For a single-target fit this is the same
+    /// length-1 vector [`Ridge::intercept`] reads its scalar from.
+    pub fn intercept_multi(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on Ridge<F, Fitted>")
+            .to_host(pool)
+    }
+
+    /// Multi-target twin of [`Ridge::predict_from_host`]
+    /// (RIDGE-MULTI-TARGET): returns `n_samples × n_targets` row-major
+    /// predictions plus the operand-finiteness verdict, from a test matrix
+    /// still on the HOST. A SEPARATE method rather than an `n_targets`-aware
+    /// branch inside [`Ridge::predict_from_host`] to keep the two call sites'
+    /// geometry small and independently readable — both now take the HOST arm
+    /// unconditionally (RIDGE-PREDICT-CUDA-VS-CPU), so there is no shared
+    /// backend-routing logic left to fork on `n_targets` in the first place.
+    ///
+    /// RIDGE-PREDICT-CUDA-VS-CPU (2026-08-03): takes the HOST arm
+    /// ([`linear_predict_multi_from_host_forced_host`]) UNCONDITIONALLY, same
+    /// reasoning as [`Ridge::predict_from_host`]. The P100 multi-target sweep
+    /// (`ridge_predict_device_vs_host_perf_test.rs`) measured the device kernel
+    /// losing 2-3x at `n_targets=4` and winning only marginally (~1.1-1.5x, TWO
+    /// data points, close to a wash at `d=64`) at `n_targets=16` — too thin a
+    /// result to gate a dispatch threshold on (see
+    /// `mlrs-feedback-verify-on-target-hardware` project memory on trusting
+    /// sparse cross-configuration sweeps). Defaulting to host bounds the
+    /// possible regression at that one thin, unconfirmed high-`n_targets` case
+    /// to ~35%, against a confirmed 2-23x win everywhere else measured.
+    pub fn predict_multi_from_host(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostPrediction<F>, AlgoError> {
+        let coef = self
+            .coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on Ridge<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on Ridge<F, Fitted>");
+        let n_targets = intercept.len();
+        Ok(linear_predict_multi_from_host_forced_host(
+            pool,
+            x,
+            coef,
+            intercept,
+            &self.predict_mirror_multi,
+            shape,
+            n_targets,
+        )?)
     }
 }
 
@@ -1727,27 +2038,55 @@ where
                 len: x.len(),
             }));
         }
-        if coef.len() != n_features {
-            return Err(AlgoError::Prim(PrimError::DimMismatch {
-                dim: "n_features",
-                lhs: coef.len(),
-                rhs: n_features,
-            }));
+        // RIDGE-MULTI-TARGET: `n_targets` is derived from `intercept_.len()`
+        // (see `Ridge::n_targets`), never stored separately. `n_targets == 1`
+        // is the ORIGINAL single-target path, byte-for-byte — same kernel, same
+        // shape check, same return length `n_samples` — so nothing about it
+        // changed for the overwhelmingly common case.
+        let n_targets = intercept.len();
+        if n_targets == 1 {
+            if coef.len() != n_features {
+                return Err(AlgoError::Prim(PrimError::DimMismatch {
+                    dim: "n_features",
+                    lhs: coef.len(),
+                    rhs: n_features,
+                }));
+            }
+
+            // y_pred = X_test · coef + intercept via ONE fused device launch
+            // (LINEAR-02 predict perf lever): the `linear_predict` prim's GATHER
+            // matvec+bias kernel replaces the prior gemm→`intercept.to_host()`→
+            // `raw.to_host()`→host bias-loop→`from_host` round-trips (the
+            // `center`/`gram` host-sync pathology, same class of fix). The result
+            // stays device-resident; the PyO3 boundary's terminal readback is the
+            // only host↔device crossing.
+            return Ok(linear_predict::<F>(
+                pool,
+                x,
+                coef,
+                intercept,
+                (n_samples, n_features),
+            )?);
         }
 
-        // y_pred = X_test · coef + intercept via ONE fused device launch
-        // (LINEAR-02 predict perf lever): the `linear_predict` prim's GATHER
-        // matvec+bias kernel replaces the prior gemm→`intercept.to_host()`→
-        // `raw.to_host()`→host bias-loop→`from_host` round-trips (the
-        // `center`/`gram` host-sync pathology, same class of fix). The result
-        // stays device-resident; the PyO3 boundary's terminal readback is the
-        // only host↔device crossing.
-        Ok(linear_predict::<F>(
+        // Multi-target: `coef` is `n_features × n_targets` row-major. Returns
+        // `n_samples × n_targets` row-major, ONE fused
+        // `linear_predict_bias_multi` launch (RIDGE-MULTI-TARGET) — the literal
+        // "Ridge predict on device" perf target this campaign measures.
+        if coef.len() != n_features * n_targets {
+            return Err(AlgoError::Prim(PrimError::DimMismatch {
+                dim: "n_features*n_targets",
+                lhs: coef.len(),
+                rhs: n_features * n_targets,
+            }));
+        }
+        Ok(linear_predict_multi::<F>(
             pool,
             x,
             coef,
             intercept,
             (n_samples, n_features),
+            n_targets,
         )?)
     }
 }

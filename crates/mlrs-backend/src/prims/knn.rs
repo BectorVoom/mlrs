@@ -27,8 +27,8 @@ use mlrs_core::PrimError;
 use mlrs_kernels::knn::{
     euclidean_topk_fused, euclidean_topk_fused_dot, euclidean_topk_fused_dot_vec,
     euclidean_topk_fused_dot_vec8, euclidean_topk_rows_cpu, euclidean_topk_rows_cpu_direct,
-    euclidean_topk_rows_cpu_vec, knn_regress_mean, row_sumsq, CPU_K_CAP, CPU_MAX_COLS,
-    CPU_QUERY_TILE, CPU_QUERY_TILE_WIDE,
+    euclidean_topk_rows_cpu_vec, knn_regress_gather, knn_regress_mean, row_sumsq, CPU_K_CAP,
+    CPU_MAX_COLS, CPU_QUERY_TILE, CPU_QUERY_TILE_WIDE,
 };
 use mlrs_kernels::topk::select_k_onepass_indexed;
 use mlrs_kernels::{copy_elem, copy_elem_cpu_chunked, sqrt_elem};
@@ -153,6 +153,169 @@ where
     }
 
     Ok(DeviceArray::from_raw(out_handle, n_query))
+}
+
+/// Gather the `k` neighbor targets per query row under an arbitrary WEIGHTING
+/// and a MULTI-OUTPUT target (KNN-REG-PARAMS), returning the `n_query ×
+/// n_outputs` device-resident predictions.
+///
+/// This is the general form of [`knn_regress_mean_gather`], which stays the
+/// dispatch target for the `weights='uniform'`, single-output DEFAULT: that
+/// kernel's inner loop carries no weight term and no output stride, and it is
+/// the shape every KNN perf number in the repo was measured on. Adding the
+/// generality to it instead would have put a branch and a multiply in the hot
+/// path of the common case to serve the uncommon ones.
+///
+/// - `y_train` is the fitted `n_train × n_outputs` row-major target matrix.
+/// - `idx` / `dist` are the `n_query × k` row-major neighbor indices and their
+///   TRUE distances from the selection stage. `dist` MUST be the actual metric
+///   distance, not the order-preserving square: `weights='distance'` weights by
+///   `1/d`, which is not invariant under a monotone reparameterisation the way
+///   the neighbor SELECTION is. The caller is responsible for having applied the
+///   boundary sqrt (`top_k(sqrt=true)` on the Euclidean path).
+/// - `weighted` selects `1/d` (`true`) or the uniform mean (`false`). `dist` is
+///   still a required binding when `false` — the kernel never reads it there.
+/// - Geometry is validated BEFORE any launch (ASVS V5); a violation returns
+///   [`PrimError::ShapeMismatch`].
+/// - The result is acquired from `pool` and stays device-resident (D-05).
+///
+/// The `oob` read-back carries the same WR-02 defence as
+/// [`knn_regress_mean_gather`]: a neighbor index outside `[0, n_train)`
+/// contributes nothing in-kernel AND flags its row, so a corruption in the
+/// producing selection kernel surfaces as a typed error instead of a
+/// plausible-looking wrong prediction.
+#[allow(clippy::too_many_arguments)]
+pub fn knn_regress_gather_weighted<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    y_train: &DeviceArray<ActiveRuntime, F>,
+    idx: &DeviceArray<ActiveRuntime, u32>,
+    dist: &DeviceArray<ActiveRuntime, F>,
+    n_query: usize,
+    k: usize,
+    n_train: usize,
+    n_outputs: usize,
+    weighted: bool,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    // --- ASVS V5: validate every geometry the launch derives its bounds from
+    //     BEFORE the unsafe launch. ---
+    if k < 1 || n_query < 1 || n_outputs < 1 || n_train < 1 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "k",
+            rows: n_query,
+            cols: k,
+            len: idx.len(),
+        });
+    }
+    let idx_len = n_query.checked_mul(k).ok_or(PrimError::Overflow {
+        operand: "knn_regress_gather.idx",
+        lhs: n_query,
+        rhs: k,
+    })?;
+    if idx.len() != idx_len {
+        return Err(PrimError::ShapeMismatch {
+            operand: "idx",
+            rows: n_query,
+            cols: k,
+            len: idx.len(),
+        });
+    }
+    // The weighting reads `dist` element-for-element alongside `idx`, so a
+    // short distance buffer is an out-of-bounds device read, not a wrong
+    // number — check it with the same force as `idx`.
+    if dist.len() != idx_len {
+        return Err(PrimError::ShapeMismatch {
+            operand: "dist",
+            rows: n_query,
+            cols: k,
+            len: dist.len(),
+        });
+    }
+    let y_len = n_train.checked_mul(n_outputs).ok_or(PrimError::Overflow {
+        operand: "knn_regress_gather.y_train",
+        lhs: n_train,
+        rhs: n_outputs,
+    })?;
+    if y_train.len() != y_len {
+        return Err(PrimError::ShapeMismatch {
+            operand: "y_train",
+            rows: n_train,
+            cols: n_outputs,
+            len: y_train.len(),
+        });
+    }
+    // The scalars are cast to u32 for the launch; reject an overflowing
+    // dimension so the cast cannot silently truncate into a bad bound (WR-03).
+    // `n_train * n_outputs` is the largest index the kernel forms, so it is
+    // checked too, not just the factors.
+    for (operand, dim) in [
+        ("n_query", n_query),
+        ("k", k),
+        ("n_train", n_train),
+        ("n_outputs", n_outputs),
+        ("y_train", y_len),
+    ] {
+        if dim > u32::MAX as usize {
+            return Err(PrimError::ShapeMismatch {
+                operand,
+                rows: dim,
+                cols: 0,
+                len: u32::MAX as usize,
+            });
+        }
+    }
+
+    let out_len = n_query.checked_mul(n_outputs).ok_or(PrimError::Overflow {
+        operand: "knn_regress_gather.out",
+        lhs: n_query,
+        rhs: n_outputs,
+    })?;
+    let out_handle = pool.acquire(out_len * size_of::<F>());
+    let oob_handle = pool.acquire(n_query * size_of::<u32>());
+    let client = pool.client().clone();
+    let (count, dim) = super::launch_dims_1d(n_query, capability::gather_launch_width());
+
+    // SAFETY: lengths are the validated element counts carried by the arrays
+    // (the kernel additionally bounds-checks `q < n_query` and `t < n_train`),
+    // NEVER raw caller geometry.
+    let y_arg = unsafe { ArrayArg::from_raw_parts(y_train.handle().clone(), y_train.len()) };
+    let idx_arg = unsafe { ArrayArg::from_raw_parts(idx.handle().clone(), idx.len()) };
+    let dist_arg = unsafe { ArrayArg::from_raw_parts(dist.handle().clone(), dist.len()) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
+    let oob_arg = unsafe { ArrayArg::from_raw_parts(oob_handle.clone(), n_query) };
+
+    knn_regress_gather::launch::<F, ActiveRuntime>(
+        &client,
+        count,
+        dim,
+        y_arg,
+        idx_arg,
+        dist_arg,
+        out_arg,
+        oob_arg,
+        n_query as u32,
+        k as u32,
+        n_train as u32,
+        n_outputs as u32,
+        if weighted { 1u32 } else { 0u32 },
+    );
+
+    let oob = DeviceArray::<ActiveRuntime, u32>::from_raw(oob_handle, n_query);
+    let flags = oob.to_host(pool);
+    oob.release_into(pool);
+    if let Some(row) = flags.iter().position(|&f| f != 0) {
+        DeviceArray::<ActiveRuntime, F>::from_raw(out_handle, out_len).release_into(pool);
+        return Err(PrimError::ShapeMismatch {
+            operand: "knn.train_idx",
+            rows: row,
+            cols: k,
+            len: n_train,
+        });
+    }
+
+    Ok(DeviceArray::from_raw(out_handle, out_len))
 }
 
 /// DEVICE-TO-DEVICE duplicate of `src` into a fresh pool-owned buffer.
