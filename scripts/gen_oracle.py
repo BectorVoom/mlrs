@@ -3063,6 +3063,207 @@ def gen_spectral_embedding(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# LARGE SpectralEmbedding fixtures (SPECTRAL-PERF-CPU) — the Lanczos branch
+# ---------------------------------------------------------------------------
+# The host pipeline routes `n_samples <= DENSE_N (512)` to a dense `sym_eig` and
+# everything above it to a thick-restart Lanczos. Every fixture above is n=12,
+# so the Lanczos arm had NO sklearn oracle at all. These two fixtures sit well
+# above the threshold (800 / 700) and pin BOTH affinity families on it.
+#
+# Two properties are VERIFIED before a fixture is written (a violation of either
+# makes a per-element value comparison meaningless, so both are hard asserts):
+#
+#   1. the affinity graph is CONNECTED — `_graph_is_connected`, the same
+#      predicate whose failure makes sklearn warn. A disconnected graph gives
+#      the normalized Laplacian a zero eigenvalue of multiplicity = #components,
+#      and the kept eigenvectors are then an arbitrary basis of that null space.
+#   2. the kept part of the spectrum is NON-DEGENERATE — every consecutive gap
+#      among `λ_0 … λ_nev` (INCLUDING the boundary gap `λ_{nev-1} → λ_nev`, which
+#      is what makes the retained subspace itself well defined) exceeds
+#      `SE_LARGE_MIN_GAP`. Two eigenvalues within ~1e-6 would leave the pair
+#      defined only up to a rotation and ARPACK's choice inside it would be
+#      unreproducible by any other solver.
+#
+# The gaps that hold for the committed parameters are printed by
+# `_spectral_spectrum_report` at generation time and recorded in the Rust test.
+
+# kNN case: 800 samples in 8 features. `centers=3, cluster_std=8.0` deliberately
+# OVERLAPS the blobs — three tight, well-separated blobs would give the kNN graph
+# three components (verified: cluster_std=2.5 is disconnected at every k tried),
+# and this is the spectral analogue of the well-separated-clusters requirement
+# running the OTHER way.
+SE_LARGE_N, SE_LARGE_D, SE_LARGE_COMPONENTS = 800, 8, 3
+SE_LARGE_CENTERS, SE_LARGE_STD = 3, 8.0
+SE_LARGE_N_NEIGHBORS = 15
+# rbf case: 700 samples in 6 features, `gamma=None → 1/n_features`. A dense
+# Gaussian kernel is strictly positive, so the graph is connected by
+# construction; the assert still runs, since that is a property of the DATA.
+SE_LARGE_RBF_N, SE_LARGE_RBF_D, SE_LARGE_RBF_COMPONENTS = 700, 6, 2
+# Minimum admissible consecutive eigenvalue gap over the kept spectrum. Six
+# orders of magnitude above the ~1e-6 degeneracy floor the brief names, so a
+# small perturbation of the data cannot silently turn the fixture degenerate.
+SE_LARGE_MIN_GAP = 1e-3
+
+
+def _spectral_spectrum_report(affinity, nev, label):
+    """Connectivity + eigenvalue-gap gate for a large spectral fixture.
+
+    ``affinity`` is the sklearn-side affinity (sparse or dense, EXACTLY what
+    ``SpectralEmbedding`` builds internally). Forms the same normalized
+    Laplacian ``_spectral_embedding`` decomposes — ``csgraph.laplacian(A,
+    normed=True)`` followed by sklearn's ``_set_diag(L, 1)`` — takes its dense
+    spectrum with scipy, prints the smallest eigenvalues and their gaps, and
+    ASSERTS the fixture is usable for a per-element value comparison. Returns
+    the smallest ``nev + 2`` eigenvalues so the caller can commit them.
+    """
+    from scipy.sparse.csgraph import laplacian as csgraph_laplacian
+    from scipy.linalg import eigvalsh
+    from sklearn.manifold._spectral_embedding import _graph_is_connected
+
+    connected = _graph_is_connected(affinity)
+    dense = affinity.toarray() if hasattr(affinity, "toarray") else np.asarray(affinity)
+    lap = csgraph_laplacian(dense, normed=True)
+    # sklearn's `_set_diag(laplacian, 1, norm_laplacian)` — unconditional, so it
+    # overrides scipy's `1 - isolated` on a zero-degree node.
+    np.fill_diagonal(lap, 1.0)
+    w = eigvalsh(lap)
+    gaps = np.diff(w[: nev + 1])
+    print(f"  {label}: connected={connected}")
+    print(f"  {label}: smallest {nev + 2} eigs = "
+          f"{np.array2string(w[: nev + 2], precision=8)}")
+    print(f"  {label}: gaps over the kept spectrum = "
+          f"{np.array2string(gaps, precision=8)}")
+    assert connected, (
+        f"{label}: affinity graph is DISCONNECTED — the zero eigenvalue is "
+        "degenerate and the embedding is not reproducible; raise n_neighbors "
+        "or spread the data"
+    )
+    assert gaps.min() > SE_LARGE_MIN_GAP, (
+        f"{label}: smallest kept eigenvalue gap {gaps.min():.3e} <= "
+        f"{SE_LARGE_MIN_GAP:.0e} — the retained eigenspace is (near-)degenerate "
+        "and a per-element oracle comparison would be meaningless"
+    )
+    return w[: nev + 2]
+
+
+def gen_spectral_embedding_large(seed: int = SEED, dtype=np.float64) -> str:
+    """Large-`n` kNN SpectralEmbedding fixture (SPECTRAL-PERF-CPU).
+
+    ``n_samples=800 > DENSE_N=512``, so the host pipeline solves this one with
+    the THICK-RESTART LANCZOS arm rather than the dense ``sym_eig`` every other
+    spectral fixture exercises. ``affinity='nearest_neighbors'`` with an
+    EXPLICIT ``n_neighbors=SE_LARGE_N_NEIGHBORS`` chosen so the graph is
+    connected (the ``None`` default would resolve to ``80`` here, which is a far
+    denser graph and defeats the point of a sparse oracle).
+
+    Stores row-major ``X``, sklearn's ``embedding_`` (``n × 3``), the neighbor
+    count, the resolved shape, and the smallest Laplacian eigenvalues (the
+    verified non-degenerate spectrum, for provenance). Returns the path.
+    """
+    from sklearn.datasets import make_blobs
+    from sklearn.manifold import SpectralEmbedding
+    from sklearn.neighbors import kneighbors_graph
+
+    n, d, k = SE_LARGE_N, SE_LARGE_D, SE_LARGE_N_NEIGHBORS
+    x, _ = make_blobs(
+        n_samples=n,
+        n_features=d,
+        centers=SE_LARGE_CENTERS,
+        cluster_std=SE_LARGE_STD,
+        random_state=seed,
+    )
+
+    # The affinity sklearn builds internally for `nearest_neighbors`:
+    # `kneighbors_graph(X, k, include_self=True)` symmetrized as `0.5*(A + Aᵀ)`.
+    aff = kneighbors_graph(x, k, include_self=True)
+    aff = 0.5 * (aff + aff.T)
+    # drop_first=True → the estimator asks for n_components + 1 eigenvectors.
+    nev = SE_LARGE_COMPONENTS + 1
+    eigs = _spectral_spectrum_report(aff, nev, "spectral_embedding_large (knn)")
+
+    se = SpectralEmbedding(
+        n_components=SE_LARGE_COMPONENTS,
+        affinity="nearest_neighbors",
+        n_neighbors=k,
+        random_state=seed,
+    )
+    embedding = se.fit_transform(x)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"spectral_embedding_large_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        embedding=c(embedding),
+        n_neighbors=c([k]),
+        shape=c([n, d]),
+        n_components=c([SE_LARGE_COMPONENTS]),
+        eigs=c(eigs),
+    )
+    return out_path
+
+
+def gen_spectral_embedding_large_rbf(seed: int = SEED, dtype=np.float64) -> str:
+    """Large-`n` rbf SpectralEmbedding fixture (SPECTRAL-PERF-CPU).
+
+    The DENSE-affinity twin of :func:`gen_spectral_embedding_large`:
+    ``n_samples=700 > DENSE_N=512`` so the Lanczos arm runs, but here it drives a
+    dense `n × n` operator instead of a CSR one, which is a different matvec
+    path. ``gamma=None`` is left UNSET on the estimator so sklearn resolves it to
+    ``1/n_features`` itself (D-04) — the committed ``gamma`` array records the
+    value that resolution must produce.
+
+    Plain Gaussian data (not blobs): three tight blobs would put the smallest
+    non-trivial eigenvalues within ~1e-3 of each other, which is exactly the
+    near-degeneracy this fixture must avoid. Returns the path.
+    """
+    from sklearn.manifold import SpectralEmbedding
+    from sklearn.metrics.pairwise import rbf_kernel
+
+    n, d = SE_LARGE_RBF_N, SE_LARGE_RBF_D
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((n, d))
+    gamma = 1.0 / d  # D-04: gamma=None → 1/n_features, resolved at fit.
+
+    aff = rbf_kernel(x, gamma=gamma)
+    nev = SE_LARGE_RBF_COMPONENTS + 1
+    eigs = _spectral_spectrum_report(aff, nev, "spectral_embedding_large (rbf)")
+
+    se = SpectralEmbedding(
+        n_components=SE_LARGE_RBF_COMPONENTS,
+        affinity="rbf",
+        random_state=seed,
+    )
+    embedding = se.fit_transform(x)
+    assert se.gamma_ == gamma, "sklearn must resolve gamma=None to 1/n_features"
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"spectral_embedding_large_rbf_{dtype_tag}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        embedding=c(embedding),
+        gamma=c([gamma]),
+        shape=c([n, d]),
+        n_components=c([SE_LARGE_RBF_COMPONENTS]),
+        eigs=c(eigs),
+    )
+    return out_path
+
+
 def gen_spectral_clustering(seed: int = SEED, dtype=np.float32) -> str:
     """Generate one SpectralClustering fixture (SPECTRAL-02, D-01/D-10).
 
@@ -5050,6 +5251,12 @@ def main() -> None:
         print(f"wrote {gen_spectral_embedding(dtype=dtype, degenerate=False)}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_spectral_embedding(dtype=dtype, degenerate=True)}")
+    # SpectralEmbedding LANCZOS arm (SPECTRAL-PERF-CPU): n_samples above the
+    # host pipeline's DENSE_N=512 dense/iterative threshold, one sparse (kNN)
+    # and one dense (rbf) affinity. f64 only — the Lanczos arm is a host f64
+    # pipeline and the fixtures gate its sklearn parity, not a dtype band.
+    print(f"wrote {gen_spectral_embedding_large(dtype=np.float64)}")
+    print(f"wrote {gen_spectral_embedding_large_rbf(dtype=np.float64)}")
     # SpectralClustering (SPECTRAL-02): default-constructor labels on a
     # well-separated fixture (D-01/D-10) — exact labels up to permutation.
     for dtype in (np.float32, np.float64):
