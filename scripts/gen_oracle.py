@@ -3319,6 +3319,58 @@ def gen_linear_svc(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+def gen_linear_svc_multiclass(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate one MULTICLASS LinearSVC fixture (one-vs-rest).
+
+    The 3-class twin of :func:`gen_linear_svc`. sklearn's ``LinearSVC`` fits
+    ``n_classes`` independent one-vs-rest sub-problems through liblinear and
+    stacks them, so ``coef_`` is ``(3, n_features)`` and ``intercept_`` is
+    ``(3,)`` — the asymmetry against the binary fixture (``(1, d)`` / ``(1,)``)
+    is exactly what the estimator has to reproduce, which is why this is a
+    SEPARATE fixture rather than a wider ``n_classes`` on the existing one.
+
+    Also stores ``decision`` (the ``(n_query, 3)`` decision function), because
+    the argmax that turns it into a label is where a transposed or mis-strided
+    ``coef_`` would still produce plausible-looking labels.
+    """
+    from sklearn.svm import LinearSVC
+
+    _, x, y, xq = _sgd_blobs(seed, n_classes=3)
+
+    clf = LinearSVC(
+        loss="squared_hinge",
+        penalty="l2",
+        C=SVM_C,
+        dual="auto",
+        intercept_scaling=1.0,
+        fit_intercept=True,
+        max_iter=SVM_MAX_ITER,
+        tol=1e-4,
+        random_state=seed,
+    ).fit(x, y)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"linear_svc_multiclass_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(
+        out_path,
+        X=c(x),
+        Xq=c(xq),
+        y=c(y),
+        classes=c(clf.classes_),
+        coef=c(clf.coef_),
+        intercept=c(clf.intercept_),
+        decision=c(clf.decision_function(xq)),
+        predict=c(clf.predict(xq)),
+    )
+    return out_path
+
+
 def gen_linear_svr(seed: int = SEED, dtype=np.float32) -> str:
     """Generate one LinearSVR fixture (SGDSVM-04).
 
@@ -5071,6 +5123,9 @@ def main() -> None:
     # LinearSVC (SGDSVM-03): squared_hinge, dual='auto'→primal, intercept_scaling.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_linear_svc(dtype=dtype)}")
+    # LinearSVC one-vs-rest multiclass: (n_classes, d) coef_ + decision_function.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_linear_svc_multiclass(dtype=dtype)}")
     # LinearSVR (SGDSVM-04): squared_epsilon_insensitive + epsilon.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_linear_svr(dtype=dtype)}")

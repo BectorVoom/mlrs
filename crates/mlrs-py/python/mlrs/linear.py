@@ -780,13 +780,41 @@ class LinearSVC(ClassifierMixin, MlrsBase):
         out = self._mlrs_obj.predict_labels(xa, rows, cols)
         return self._to_output(out, (rows,), X, np.int32)
 
+    def decision_function(self, X):
+        """Signed distance to the separating hyperplane(s).
+
+        ``(n_samples,)`` for a binary fit and ``(n_samples, n_classes)`` for the
+        one-vs-rest multiclass fit — sklearn's ``LinearSVC`` shape rule, the same
+        asymmetry ``coef_`` has.
+        """
+        xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
+        out = self._mlrs_obj.decision_function(xa, rows, cols)
+        k = self._mlrs_obj.n_coef_rows()
+        shape = (rows,) if k == 1 else (rows, k)
+        return self._to_output(out, shape, X, self._np_float())
+
     @property
     def coef_(self):
+        """``(1, n_features)`` binary / ``(n_classes, n_features)`` multiclass.
+
+        sklearn keeps the leading axis even in the binary case, where there is a
+        single hyperplane — so the row count comes from the Rust side rather than
+        from ``len(classes_)``, which would be wrong for binary (2 classes, but
+        1 row).
+        """
+        self._check_fitted()
+        k = self._mlrs_obj.n_coef_rows()
         return self._to_output(
-            self._suffixed("coef")(), (-1,), None, self._np_float()
+            self._suffixed("coef")(), (k, -1), None, self._np_float()
         )
 
     @property
     def intercept_(self):
+        """``(1,)`` binary / ``(n_classes,)`` multiclass — one per ``coef_`` row."""
         self._check_fitted()
-        return getattr(self._mlrs_obj, "intercept" + self._suffix())()
+        return self._to_output(
+            getattr(self._mlrs_obj, "intercept" + self._suffix())(),
+            (-1,),
+            None,
+            self._np_float(),
+        )

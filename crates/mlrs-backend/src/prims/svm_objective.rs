@@ -354,6 +354,30 @@ where
         }
     }
 
+    /// Point the evaluator at a NEW per-sample target vector, keeping the design
+    /// and (on cpu) the worker pool it already owns.
+    ///
+    /// This is what makes a one-vs-rest multiclass fit cost one design instead
+    /// of `n_classes` of them. Every OvR sub-problem minimizes the same
+    /// objective over the SAME `n × d` matrix and differs only in which samples
+    /// carry `+1` — so re-running `new` per class would re-copy the design (or
+    /// re-upload it) and re-spawn the pool `n_classes` times for nothing.
+    ///
+    /// Errors with [`PrimError::ShapeMismatch`] if `targets` is not length `n`,
+    /// leaving the evaluator on its previous targets rather than half-updated.
+    pub fn set_targets(&mut self, targets: Vec<f64>) -> Result<(), PrimError> {
+        if targets.len() != self.n {
+            return Err(PrimError::ShapeMismatch {
+                operand: "targets",
+                rows: self.n,
+                cols: 1,
+                len: targets.len(),
+            });
+        }
+        self.targets = targets;
+        Ok(())
+    }
+
     /// The augmented weight length the caller's `w` must have.
     pub fn d_aug(&self) -> usize {
         self.d_aug

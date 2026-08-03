@@ -78,6 +78,11 @@ pub struct LinearSVC<F, S = Unfit> {
     classes_: Vec<i64>,
     /// Feature count inferred at `fit`.
     n_features: usize,
+    /// Rows in `coef_`: ONE for a binary fit, `classes_.len()` for a one-vs-rest
+    /// multiclass fit — sklearn's `coef_` shape rule (`(1, d)` when binary,
+    /// `(n_classes, d)` otherwise), stored explicitly so `predict` does not have
+    /// to re-derive it from `classes_.len()` and get the binary case wrong.
+    n_coef_rows: usize,
     /// Fitted coefficients (device-resident), `None` until `fit`.
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (device-resident), `None` until `fit`.
@@ -132,7 +137,15 @@ where
         &self.classes_
     }
 
-    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
+    /// Rows in [`coef`](Self::coef): `1` for a binary fit, `n_classes` for a
+    /// one-vs-rest multiclass fit (sklearn's `coef_` shape rule). The flat
+    /// `coef` buffer is this many rows of `n_features`, row-major.
+    pub fn n_coef_rows(&self) -> usize {
+        self.n_coef_rows
+    }
+
+    /// Host copy of the fitted `coef_`, `n_coef_rows × n_features` row-major
+    /// (so length `n_features` for the binary fit). `Some` by
     /// construction on the `Fitted` state, so no `NotFitted` branch is needed
     /// (the compile-time typestate replaces the runtime guard, D-03).
     pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
@@ -142,13 +155,23 @@ where
             .to_host(pool)
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
-    /// the `Fitted` state (D-03).
+    /// Host copy of the fitted `intercept_`'s FIRST entry. Kept for the binary
+    /// fit, where sklearn's `intercept_` is a single value; use
+    /// [`intercepts`](Self::intercepts) for the one-vs-rest vector.
     pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
         self.intercept_
             .as_ref()
             .expect("intercept_ is Some by construction on LinearSVC<F, Fitted>")
             .to_host(pool)[0]
+    }
+
+    /// Host copy of the fitted `intercept_`, length
+    /// [`n_coef_rows`](Self::n_coef_rows) — one per solved sub-problem.
+    pub fn intercepts(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on LinearSVC<F, Fitted>")
+            .to_host(pool)
     }
 
     /// `predict_labels` for a test matrix still in the CALLER'S memory — the
@@ -190,24 +213,173 @@ where
                 rhs: self.n_features,
             }));
         }
-        let pred = predict_linear_from_host(
-            self.coef_.as_ref(),
-            self.intercept_.as_ref(),
-            &self.predict_mirror,
-            "linear_svc",
-            pool,
-            x,
-            shape,
-        )?;
-        if !pred.operand_finite {
+        // The BINARY fit keeps the shared single-output matvec verbatim: it is
+        // the tuned path the dense regressors use, and a one-row `coef_` is
+        // exactly its operand. Only the one-vs-rest fit needs the wider form.
+        if self.n_coef_rows == 1 {
+            let pred = predict_linear_from_host(
+                self.coef_.as_ref(),
+                self.intercept_.as_ref(),
+                &self.predict_mirror,
+                "linear_svc",
+                pool,
+                x,
+                shape,
+            )?;
+            if !pred.operand_finite {
+                return Ok(HostLabels {
+                    values: Vec::new(),
+                    operand_finite: false,
+                });
+            }
+            return Ok(HostLabels {
+                values: self.labels_from_margins(&pred.values),
+                operand_finite: true,
+            });
+        }
+
+        let (decision, operand_finite) = self.decision_host(pool, x, shape);
+        if !operand_finite {
             return Ok(HostLabels {
                 values: Vec::new(),
                 operand_finite: false,
             });
         }
         Ok(HostLabels {
-            values: self.labels_from_margins(&pred.values),
+            values: self.labels_from_decision(&decision),
             operand_finite: true,
+        })
+    }
+
+    /// The one-vs-rest decision function `X·coefᵀ + intercept`, `n_query × K`
+    /// row-major, plus the operand-finiteness verdict — computed on the host in
+    /// ONE pass over `x`.
+    ///
+    /// Deliberately not `K` calls to the single-output matvec. Each row of `x`
+    /// is needed by all `K` class weight vectors, so computing them together
+    /// reads the design ONCE with the row still in L1, where looping the
+    /// single-output path would stream the whole `n × d` matrix `K` times and
+    /// re-scan it for finiteness `K` times. That is the same fusion argument
+    /// `SvmObjective`'s host pass makes, and it is why this small amount of
+    /// arithmetic is written here rather than reusing the narrower prim.
+    ///
+    /// `coef_`/`intercept_` are read to host on every call rather than through
+    /// the `OnceLock` mirror: the mirror's shape is a single `(Vec<F>, F)` pair,
+    /// which cannot hold `K` rows, and the read is `K·(d+1)` elements against an
+    /// `n·d` pass.
+    fn decision_host(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> (Vec<F>, bool) {
+        let (n_query, n_features) = shape;
+        let k = self.n_coef_rows;
+        let coef = self
+            .coef_
+            .as_ref()
+            .expect("coef_ is Some by construction on LinearSVC<F, Fitted>")
+            .to_host(pool);
+        let bias = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on LinearSVC<F, Fitted>")
+            .to_host(pool);
+
+        let mut decision = vec![f64_to_host::<F>(0.0); n_query * k];
+        let mut finite = true;
+        for r in 0..n_query {
+            let row = &x[r * n_features..(r + 1) * n_features];
+            for (j, out) in decision[r * k..(r + 1) * k].iter_mut().enumerate() {
+                let w = &coef[j * n_features..(j + 1) * n_features];
+                let mut acc = host_to_f64(bias[j]);
+                for (xv, wv) in row.iter().zip(w) {
+                    let xf = host_to_f64(*xv);
+                    // Fused with the arithmetic rather than a separate scan —
+                    // `linear_predict_host`'s contract, for the same reason.
+                    finite &= xf.is_finite();
+                    acc += xf * host_to_f64(*wv);
+                }
+                // Narrowed to `F` HERE, once, so `predict`'s argmax and
+                // `decision_function`'s output are the SAME numbers — a tie
+                // broken differently by the two would violate sklearn's
+                // `predict == argmax(decision_function)` invariant.
+                *out = f64_to_host::<F>(acc);
+            }
+        }
+        (decision, finite)
+    }
+
+    /// Map an `n_query × K` one-vs-rest decision matrix to class ids: the
+    /// argmax column of each row, through `classes_`.
+    ///
+    /// The scan is strict-`>`, so a tie goes to the LOWEST class index — the
+    /// `numpy.argmax` rule sklearn's `predict` inherits.
+    fn labels_from_decision(&self, decision: &[F]) -> Vec<i32> {
+        let k = self.n_coef_rows;
+        decision
+            .chunks_exact(k)
+            .map(|row| {
+                let mut best = 0usize;
+                let mut best_v = host_to_f64(row[0]);
+                for (j, &v) in row.iter().enumerate().skip(1) {
+                    let v = host_to_f64(v);
+                    if v > best_v {
+                        best_v = v;
+                        best = j;
+                    }
+                }
+                self.classes_[best] as i32
+            })
+            .collect()
+    }
+
+    /// The decision function for a test matrix still in the CALLER'S memory —
+    /// sklearn's `decision_function`.
+    ///
+    /// Length `n_query` for a binary fit (the raw signed margin) and
+    /// `n_query × K` row-major for the one-vs-rest fit, matching sklearn's
+    /// `(n_samples,)` / `(n_samples, n_classes)` shapes.
+    ///
+    /// The BINARY arm goes through the very same
+    /// [`predict_linear_from_host`] call `predict_labels_from_host` uses, so
+    /// `predict` and `sign(decision_function)` cannot disagree at a boundary
+    /// point through a different summation order.
+    pub fn decision_from_host(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        shape: (usize, usize),
+    ) -> Result<HostDecision<F>, AlgoError> {
+        let (_, n_features) = shape;
+        if n_features != self.n_features {
+            return Err(AlgoError::Prim(PrimError::DimMismatch {
+                dim: "n_features",
+                lhs: n_features,
+                rhs: self.n_features,
+            }));
+        }
+        if self.n_coef_rows == 1 {
+            let pred = predict_linear_from_host(
+                self.coef_.as_ref(),
+                self.intercept_.as_ref(),
+                &self.predict_mirror,
+                "linear_svc",
+                pool,
+                x,
+                shape,
+            )?;
+            return Ok(HostDecision {
+                values: pred.values,
+                n_columns: 1,
+                operand_finite: pred.operand_finite,
+            });
+        }
+        let (values, operand_finite) = self.decision_host(pool, x, shape);
+        Ok(HostDecision {
+            values: if operand_finite { values } else { Vec::new() },
+            n_columns: self.n_coef_rows,
+            operand_finite,
         })
     }
 
@@ -239,6 +411,23 @@ where
 pub struct HostLabels {
     /// The length-`n_query` predicted class ids, drawn from `classes_`.
     pub values: Vec<i32>,
+    /// `false` if ANY element of `x` was NaN or ±infinity.
+    pub operand_finite: bool,
+}
+
+/// What [`LinearSVC::decision_from_host`] produces: the decision values, how
+/// many columns they carry, and whether every element of the operand was finite.
+///
+/// `n_columns` is `1` for a binary fit and `n_classes` for the one-vs-rest fit,
+/// so the caller reshapes without having to re-derive sklearn's asymmetric
+/// shape rule. `values` is EMPTY when `operand_finite` is `false`, the
+/// [`HostLabels`] / `HostPrediction` contract.
+#[derive(Debug, Clone)]
+pub struct HostDecision<F> {
+    /// `n_query · n_columns` values, row-major.
+    pub values: Vec<F>,
+    /// Columns per row: `1` binary, `n_classes` one-vs-rest.
+    pub n_columns: usize,
     /// `false` if ANY element of `x` was NaN or ±infinity.
     pub operand_finite: bool,
 }
@@ -372,6 +561,7 @@ impl LinearSVCBuilder {
             intercept_scaling: self.intercept_scaling,
             classes_: Vec::new(),
             n_features: 0,
+            n_coef_rows: 0,
             coef_: None,
             intercept_: None,
             predict_mirror: HostMirror::new(),
@@ -498,11 +688,13 @@ where
         let mut classes_: Vec<i64> = raw_labels.clone();
         classes_.sort_unstable();
         classes_.dedup();
-        if classes_.len() != 2 {
+        if classes_.len() < 2 {
+            // sklearn's own wording for the degenerate single-class fit.
             return Err(AlgoError::InvalidLabels {
                 estimator: "linear_svc",
                 reason: format!(
-                    "binary classifier needs exactly 2 classes, found {}",
+                    "this solver needs samples of at least 2 classes in the data, \
+                     but the data contains only {} class",
                     classes_.len()
                 ),
             });
@@ -523,30 +715,56 @@ where
                 });
             }
         }
-        // classes_[0] → −1, classes_[1] → +1 (sklearn maps the higher class to +1).
-        let yp: Vec<f64> = raw_labels
-            .iter()
-            .map(|&l| if l == classes_[1] { 1.0 } else { -1.0 })
-            .collect();
+
+        // --- Pitfall 4 / sklearn's OvR shape rule. A BINARY target is ONE solve
+        //     with `classes_[1] → +1` (sklearn maps the higher class to +1) and a
+        //     `(1, d)` `coef_`. Three or more classes are `n_classes` INDEPENDENT
+        //     one-vs-rest solves — class `j` against all others — stacked into a
+        //     `(n_classes, d)` `coef_`, which is exactly what
+        //     `sklearn.svm.LinearSVC` does (liblinear's `train` loops the same
+        //     way). The binary case is deliberately NOT expressed as two OvR
+        //     solves: that would double the work and return a `(2, d)` `coef_`
+        //     sklearn does not produce. ---
+        let n_classes = classes_.len();
+        let binary = n_classes == 2;
+        let targets: Vec<Vec<f64>> = if binary {
+            vec![raw_labels
+                .iter()
+                .map(|&l| if l == classes_[1] { 1.0 } else { -1.0 })
+                .collect()]
+        } else {
+            classes_
+                .iter()
+                .map(|&cls| {
+                    raw_labels
+                        .iter()
+                        .map(|&l| if l == cls { 1.0 } else { -1.0 })
+                        .collect()
+                })
+                .collect()
+        };
+        let target_refs: Vec<&[f64]> = targets.iter().map(|t| t.as_slice()).collect();
+        let n_coef_rows = target_refs.len();
 
         // --- D-07: resolve dual='auto' INTERNALLY (never a builder knob). For the
         //     squared-hinge primal we always solve the primal (its optimum equals
         //     the dual's); the flag is computed only for fidelity to sklearn's
         //     resolution rule (and would route a sparse/dual path in a future
         //     extension). n_samples >= n_features → primal here. ---
-        let _dual = n_samples < n_features; // false for the Phase-10 fixtures.
+        let _dual = n_samples < n_features;
 
         // --- The L2-regularized squared-hinge primal, minimized by L-BFGS over the
         //     synthetic-feature-augmented design (Pitfall 5 intercept). The data
         //     term carries `C`; the regularizer is the plain ½‖w‖² (synthetic
         //     column included). The per-sample margin loss/grad is squared-hinge:
-        //       z = 1 − yᵢ·mᵢ ;  ℓ = max(0, z)² ;  dℓ/dmᵢ = −2·yᵢ·max(0, z). ---
+        //       z = 1 − yᵢ·mᵢ ;  ℓ = max(0, z)² ;  dℓ/dmᵢ = −2·yᵢ·max(0, z).
+        //     All `n_coef_rows` solves share ONE design and ONE worker pool. ---
         // IN-03: `self.c` is already `f64`; use it directly (no identity cast).
         let c = self.c;
-        let (coef, intercept) = svm_lbfgs_fit::<F>(
+        let (coef, intercept) = svm_lbfgs_fit_ovr::<F>(
             pool,
             design,
-            &yp,
+            &target_refs,
             n_samples,
             n_features,
             c,
@@ -573,6 +791,7 @@ where
             intercept_scaling: self.intercept_scaling,
             classes_,
             n_features,
+            n_coef_rows,
             coef_: Some(coef),
             intercept_: Some(intercept),
             predict_mirror: HostMirror::new(),
@@ -612,6 +831,20 @@ where
         // are `Some` by construction on the `Fitted` state (the compile-time
         // typestate replaces the old runtime `NotFitted` guard, D-03), so the
         // shared path's `NotFitted` arm is unreachable from here.
+        //
+        // The one-vs-rest fit has a `K`-row `coef_`, which that single-output
+        // prim cannot express, so it goes through the host decision instead —
+        // the same terminal `LogisticRegression::predict_labels` uses, and for
+        // the same reason (the argmax is host arithmetic over a small `n × K`).
+        if self.n_coef_rows > 1 {
+            let x_host = x.to_host(pool);
+            let (decision, _) = self.decision_host(pool, &x_host, shape);
+            return Ok(DeviceArray::from_host(
+                pool,
+                &self.labels_from_decision(&decision),
+            ));
+        }
+
         let raw = predict_linear(
             self.coef_.as_ref(),
             self.intercept_.as_ref(),
@@ -679,21 +912,154 @@ pub(crate) fn svm_lbfgs_fit<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    // One target vector is the degenerate case of the one-vs-rest loop.
+    svm_lbfgs_fit_ovr::<F>(
+        pool,
+        x,
+        std::slice::from_ref(&targets),
+        n_samples,
+        n_features,
+        c,
+        intercept_scaling,
+        fit_intercept,
+        max_iter,
+        gtol,
+        estimator,
+        margin_loss,
+    )
+}
+
+/// The multi-target form: solve the SAME primal once per entry of `targets`,
+/// over ONE shared design.
+///
+/// This is what a one-vs-rest multiclass `LinearSVC` needs. Every OvR
+/// sub-problem minimizes the identical objective over the identical `n × d`
+/// matrix and differs only in which samples carry `+1`, so the design is
+/// prepared ONCE and re-pointed at each target vector via
+/// [`SvmObjective::set_targets`]. On cpu that shares the host slab AND the
+/// worker pool across all `n_classes` solves — building a fresh
+/// [`SvmObjective`] per class would instead re-copy the design and re-spawn the
+/// pool every time, which is the cost the pool exists to remove.
+///
+/// Returns `(coef, intercept)` with `coef` the `n_targets × n_features`
+/// row-major (target-major) stack of solutions and `intercept` length
+/// `n_targets` — the `LogisticRegression` K×d layout. For a single target that
+/// is exactly the old `(length n_features, length 1)` pair, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn svm_lbfgs_fit_ovr<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: SvmDesign<'_, F>,
+    targets: &[&[f64]],
+    n_samples: usize,
+    n_features: usize,
+    c: f64,
+    intercept_scaling: f64,
+    fit_intercept: bool,
+    max_iter: usize,
+    gtol: f64,
+    estimator: &'static str,
+    margin_loss: impl Fn(f64, f64) -> (f64, f64) + Sync,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    AlgoError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    debug_assert!(!targets.is_empty(), "at least one target vector is required");
+
     // The design in the form the active backend evaluates against, prepared ONCE
-    // and reused by every L-BFGS iteration and line-search step (the
-    // bounded-allocation iterative-solver shape, 05-11). `d_aug` counts the
-    // synthetic intercept column when there is one (Pitfall 5).
-    let objective = SvmObjective::<F>::new(
+    // and reused by every solve, every L-BFGS iteration and every line-search
+    // step (the bounded-allocation iterative-solver shape, 05-11). `d_aug` counts
+    // the synthetic intercept column when there is one (Pitfall 5).
+    let mut objective = SvmObjective::<F>::new(
         pool,
         x,
         (n_samples, n_features),
-        targets.to_vec(),
+        targets[0].to_vec(),
         intercept_scaling,
         fit_intercept,
     )
     .map_err(AlgoError::Prim)?;
     let d_aug = objective.d_aug();
 
+    let mut coef_host: Vec<F> = Vec::with_capacity(targets.len() * n_features);
+    let mut intercept_host: Vec<F> = Vec::with_capacity(targets.len());
+
+    for (t_idx, t) in targets.iter().enumerate() {
+        // Solve 0 was already pointed at its targets by `new`; re-pointing costs
+        // only the `Vec` move, and never rebuilds the design or the pool.
+        if t_idx > 0 {
+            if let Err(e) = objective.set_targets(t.to_vec()) {
+                objective.release_into(pool);
+                return Err(AlgoError::Prim(e));
+            }
+        }
+
+        let result = match svm_solve_one(
+            &objective,
+            pool,
+            d_aug,
+            c,
+            max_iter,
+            gtol,
+            estimator,
+            n_samples,
+            n_features,
+            &margin_loss,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                objective.release_into(pool);
+                return Err(e);
+            }
+        };
+
+        // Recover this target's coef row (first n_features augmented weights) and
+        // intercept = intercept_scaling · w_last (Pitfall 5).
+        coef_host.extend(result[..n_features].iter().map(|&v| f64_to_host::<F>(v)));
+        intercept_host.push(f64_to_host::<F>(if fit_intercept {
+            intercept_scaling * result[n_features]
+        } else {
+            0.0
+        }));
+    }
+
+    let coef_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &coef_host);
+    let intercept_dev: DeviceArray<ActiveRuntime, F> =
+        DeviceArray::from_host(pool, &intercept_host);
+
+    objective.release_into(pool);
+    Ok((coef_dev, intercept_dev))
+}
+
+/// ONE L-BFGS solve of the primal at the objective's CURRENT targets, returning
+/// the augmented weight vector.
+///
+/// Split out of [`svm_lbfgs_fit_ovr`] so the one-vs-rest loop runs the identical
+/// solver per class rather than a second copy of it — the convergence policy
+/// below (the dtype precision floor, the line-search-breakdown rejection) is
+/// subtle enough that having it in two places would be a latent divergence.
+#[allow(clippy::too_many_arguments)]
+fn svm_solve_one<F, L>(
+    objective: &SvmObjective<'_, F>,
+    pool: &mut BufferPool<ActiveRuntime>,
+    d_aug: usize,
+    c: f64,
+    max_iter: usize,
+    gtol: f64,
+    estimator: &'static str,
+    n_samples: usize,
+    n_features: usize,
+    margin_loss: &L,
+) -> Result<Vec<f64>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+    L: mlrs_backend::prims::svm_objective::MarginLoss,
+{
     // L-BFGS over the augmented weight vector w (length d_aug). The closure is
     // evaluated every iteration + per line-search step; an evaluation failure is
     // captured (never panics across the boundary) and surfaced after the solve.
@@ -705,7 +1071,7 @@ where
         if prim_err.is_some() {
             return (f64::MAX, vec![0.0f64; d_aug]);
         }
-        let ev = match objective.eval(pool, w, &margin_loss) {
+        let ev = match objective.eval(pool, w, margin_loss) {
             Ok(ev) => ev,
             Err(e) => {
                 prim_err = Some(e);
@@ -768,7 +1134,6 @@ where
         );
     }
     if let Some(e) = prim_err {
-        objective.release_into(pool);
         return Err(AlgoError::Prim(e));
     }
 
@@ -780,30 +1145,12 @@ where
     let broke = result.stop_reason == LbfgsStopReason::LineSearchFailed && !residual_ok;
     let hit_cap = result.iters >= max_iter && !result.converged && !residual_ok;
     if hit_cap || broke {
-        objective.release_into(pool);
         return Err(AlgoError::NotConverged {
             estimator,
             max_iter,
         });
     }
-
-    // Recover coef_ (first n_features augmented weights) and
-    // intercept_ = intercept_scaling · w_last (Pitfall 5).
-    let coef_host: Vec<F> = result.x[..n_features]
-        .iter()
-        .map(|&v| f64_to_host::<F>(v))
-        .collect();
-    let intercept = if fit_intercept {
-        intercept_scaling * result.x[n_features]
-    } else {
-        0.0
-    };
-    let coef_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &coef_host);
-    let intercept_dev: DeviceArray<ActiveRuntime, F> =
-        DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)]);
-
-    objective.release_into(pool);
-    Ok((coef_dev, intercept_dev))
+    Ok(result.x)
 }
 
 /// Machine epsilon of `F` (f32 / f64) as `f64`, for the convex-minimum residual

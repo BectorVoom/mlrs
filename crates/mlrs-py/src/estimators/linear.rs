@@ -2029,6 +2029,54 @@ impl PyLinearSVC {
         }
     }
 
+    /// `decision_function(x)` → a **pyarrow** float array of `rows·K` values
+    /// (row-major), `K = n_coef_rows`. Shares `predict_labels`' host ingress and
+    /// its NaN/inf ownership: the shim passes `ensure_all_finite=False`, so the
+    /// rejection is reproduced here via [`nonfinite_input_err`].
+    fn decision_function<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let xa = capsule_to_array(x)?;
+        enum Out {
+            F32(Vec<f32>),
+            F64(Vec<f64>),
+        }
+        let out = py.detach(|| -> PyResult<Out> {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyLinearSVC::F32(est) => {
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let d = est
+                        .decision_from_host(&mut pool, xh, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    if !d.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float32"));
+                    }
+                    Ok(Out::F32(d.values))
+                }
+                AnyLinearSVC::F64(est) => {
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let d = est
+                        .decision_from_host(&mut pool, xh, (rows, cols))
+                        .map_err(algo_err_to_py)?;
+                    if !d.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float64"));
+                    }
+                    Ok(Out::F64(d.values))
+                }
+                _ => Err(not_fitted("linear_svc", "decision_function")),
+            }
+        })?;
+        match out {
+            Out::F32(v) => f32_vec_to_pyarrow(py, v),
+            Out::F64(v) => f64_vec_to_pyarrow(py, v),
+        }
+    }
+
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
@@ -2043,18 +2091,29 @@ impl PyLinearSVC {
             _ => Err(not_fitted("linear_svc", "coef_ (f64)")),
         }
     }
-    fn intercept_f32(&self) -> PyResult<f32> {
+    fn intercept_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearSVC::F32(e) => Ok(e.intercept(&pool)),
+            AnyLinearSVC::F32(e) => Ok(e.intercepts(&pool)),
             _ => Err(not_fitted("linear_svc", "intercept_ (f32)")),
         }
     }
-    fn intercept_f64(&self) -> PyResult<f64> {
+    fn intercept_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyLinearSVC::F64(e) => Ok(e.intercept(&pool)),
+            AnyLinearSVC::F64(e) => Ok(e.intercepts(&pool)),
             _ => Err(not_fitted("linear_svc", "intercept_ (f64)")),
+        }
+    }
+
+    /// Rows in `coef_`: `1` for a binary fit, `n_classes` for the one-vs-rest
+    /// multiclass fit — sklearn's `coef_` shape rule. The shim reshapes the flat
+    /// `coef_*` buffer with this.
+    fn n_coef_rows(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnyLinearSVC::F32(e) => Ok(e.n_coef_rows()),
+            AnyLinearSVC::F64(e) => Ok(e.n_coef_rows()),
+            _ => Err(not_fitted("linear_svc", "n_coef_rows")),
         }
     }
     fn is_fitted(&self) -> bool {
