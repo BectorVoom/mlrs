@@ -39,6 +39,7 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::multinomial_nb::{
     decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
     validate_non_negative_counts,
@@ -193,13 +194,53 @@ where
     None
 }
 
+/// The WEIGHTED twin of [`count_chunk_binarized`]: `table[c · n_features + j] +=
+/// w_i · (x[i,j] > threshold)`.
+///
+/// Separate from the unweighted arm because the table has to be `f64` once a
+/// weight can be fractional — the `u32` counters are what make the common
+/// unweighted path half the accumulator traffic AND exact, so they are kept
+/// rather than folded into one generic body.
+fn count_chunk_binarized_weighted<F>(
+    chunk: &[F],
+    class_of_row: &[usize],
+    weights: &[f64],
+    n_features: usize,
+    threshold: f64,
+    flat_base: usize,
+    table: &mut [f64],
+) -> Option<(usize, f64)>
+where
+    F: Float + CubeElement + Pod,
+{
+    for (r, (row, &c)) in chunk
+        .chunks_exact(n_features)
+        .zip(class_of_row.iter())
+        .enumerate()
+    {
+        let w = weights[r];
+        let acc = &mut table[c * n_features..(c + 1) * n_features];
+        for (j, (&xv, a)) in row.iter().zip(acc.iter_mut()).enumerate() {
+            let xf = host_to_f64(xv);
+            if !xf.is_finite() || xf < 0.0 {
+                return Some((flat_base + r * n_features + j, xf));
+            }
+            if xf > threshold {
+                *a += w;
+            }
+        }
+    }
+    None
+}
+
 /// The `binarize = None` twin of [`count_chunk_binarized`]: the input is assumed
 /// already binary, so the raw value is summed (sklearn's `binarize=None` feeds
 /// `X` to the count GEMM unchanged). Accumulates in `f64` because a pass-through
-/// value need not be an integer.
+/// value need not be an integer. `weights` is `None` for an unweighted fit.
 fn count_chunk_raw<F>(
     chunk: &[F],
     class_of_row: &[usize],
+    weights: Option<&[f64]>,
     n_features: usize,
     flat_base: usize,
     table: &mut [f64],
@@ -212,13 +253,14 @@ where
         .zip(class_of_row.iter())
         .enumerate()
     {
+        let w = weights.map_or(1.0, |w| w[r]);
         let acc = &mut table[c * n_features..(c + 1) * n_features];
         for (j, (&xv, a)) in row.iter().zip(acc.iter_mut()).enumerate() {
             let xf = host_to_f64(xv);
             if !xf.is_finite() || xf < 0.0 {
                 return Some((flat_base + r * n_features + j, xf));
             }
-            *a += xf;
+            *a += w * xf;
         }
     }
     None
@@ -333,6 +375,7 @@ where
         x: &[F],
         y: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<BernoulliNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
@@ -351,7 +394,7 @@ where
                 len: y.len(),
             }));
         }
-        self.fit_host(pool, x, y, shape)
+        self.fit_host(pool, x, y, shape, sample_weight)
     }
 
     /// The shared host fit body behind [`Fit::fit`] and
@@ -383,8 +426,13 @@ where
         x_host: &[F],
         y_host: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<BernoulliNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
+
+        // Weights are a pure ARGUMENT check (length, finite, non-negative, not
+        // all zero) — cheapest and most basic, so it runs first.
+        let sw = validate_sample_weight::<F>("bernoulli_nb", sample_weight, n_samples)?;
 
         // Labels first: the previous body decoded `classes_` BEFORE it scanned
         // `X`, so a fit with both a bad label and a bad feature value reports the
@@ -411,18 +459,29 @@ where
 
         // One worker's share of the sweep, returning its private count table and
         // the first invalid element it saw (flat index + value).
-        let run = |chunk: &[F], cls: &[usize], flat_base: usize| -> (Vec<f64>, Option<(usize, f64)>) {
-            match binarize {
-                Some(t) => {
+        let run = |chunk: &[F], cls: &[usize], w: Option<&[f64]>, flat_base: usize| -> (Vec<f64>, Option<(usize, f64)>) {
+            match (binarize, w) {
+                // The unweighted threshold arm keeps the EXACT `u32` counters:
+                // half the accumulator traffic of an `f64` table, and an
+                // occurrence count is an integer by construction.
+                (Some(t), None) => {
                     let mut table = vec![0u32; table_len];
                     let bad = count_chunk_binarized::<F>(
                         chunk, cls, n_features, t, flat_base, &mut table,
                     );
                     (table.iter().map(|&v| f64::from(v)).collect(), bad)
                 }
-                None => {
+                (Some(t), Some(w)) => {
                     let mut table = vec![0.0f64; table_len];
-                    let bad = count_chunk_raw::<F>(chunk, cls, n_features, flat_base, &mut table);
+                    let bad = count_chunk_binarized_weighted::<F>(
+                        chunk, cls, w, n_features, t, flat_base, &mut table,
+                    );
+                    (table, bad)
+                }
+                (None, w) => {
+                    let mut table = vec![0.0f64; table_len];
+                    let bad =
+                        count_chunk_raw::<F>(chunk, cls, w, n_features, flat_base, &mut table);
                     (table, bad)
                 }
             }
@@ -434,7 +493,7 @@ where
         // `u32::MAX` rows by `chunk_rows`) even at one worker.
         let parts: Vec<(Vec<f64>, Option<(usize, f64)>)> =
             if workers == 1 && n_samples <= u32::MAX as usize {
-                vec![run(x_host, &class_of_row, 0)]
+                vec![run(x_host, &class_of_row, sw.as_deref(), 0)]
             } else {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = x_host
@@ -443,7 +502,12 @@ where
                         .enumerate()
                         .map(|(ci, (chunk, cls))| {
                             let run = &run;
-                            scope.spawn(move || run(chunk, cls, ci * elems_per))
+                            // The weight slice is chunked the same way as the
+                            // rows, so a worker indexes it LOCALLY.
+                            let w = sw
+                                .as_deref()
+                                .map(|w| &w[ci * rows_per..ci * rows_per + cls.len()]);
+                            scope.spawn(move || run(chunk, cls, w, ci * elems_per))
                         })
                         .collect();
                     handles
@@ -472,9 +536,12 @@ where
             }
         }
 
+        // class_count_[c] = Σ_{i : y_i = c} w_i (the plain row count when
+        // unweighted) — sklearn's weighted `class_count_`, and the `+ 2·alpha`
+        // denominator below.
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
-        for &c in &class_of_row {
-            class_count_[c] += 1.0;
+        for (i, &c) in class_of_row.iter().enumerate() {
+            class_count_[c] += sw.as_deref().map_or(1.0, |w| w[i]);
         }
 
         // --- feature_log_prob_[c,j] = log((count+alpha)/(class_count[c]+2·alpha))
@@ -561,7 +628,7 @@ where
         // the upload these two reads undo.
         let x_host = x.to_host(pool);
         let y_host = y.to_host(pool);
-        self.fit_host(pool, &x_host, &y_host, shape)
+        self.fit_host(pool, &x_host, &y_host, shape, None)
     }
 }
 

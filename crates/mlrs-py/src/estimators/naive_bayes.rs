@@ -370,6 +370,12 @@ impl PyGaussianNB {
     /// Fit on `x` (`rows × cols`, row-major) + label vector `y`. The builder
     /// validates the data-independent params (`build()` → `ValueError`, D-09)
     /// BEFORE the device launch; GIL released (PY-03); f64 guarded (D-04).
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -377,9 +383,11 @@ impl PyGaussianNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (var_smoothing, priors) = match &self.inner {
             AnyGaussianNB::Unfit {
@@ -402,13 +410,17 @@ impl PyGaussianNB {
                 FloatDtype::F32 => {
                     let xh = host_slice_f32(as_f32(&xa)?)?;
                     let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = GaussianNB::<f32>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyGaussianNB::F32(fitted))
                 }
@@ -416,13 +428,17 @@ impl PyGaussianNB {
                     crate::capability::guard_f64()?;
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = GaussianNB::<f64>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyGaussianNB::F64(fitted))
                 }
@@ -522,6 +538,12 @@ impl PyMultinomialNB {
 
     /// Fit on `x` (already-dense `rows × cols`, row-major — sparse densified at
     /// ingress, NB-02) + label vector `y`.
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -529,9 +551,11 @@ impl PyMultinomialNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, fit_prior, class_prior) = match &self.inner {
             AnyMultinomialNB::Unfit {
@@ -556,6 +580,10 @@ impl PyMultinomialNB {
                 FloatDtype::F32 => {
                     let xh = host_slice_f32(as_f32(&xa)?)?;
                     let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = MultinomialNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -564,7 +592,7 @@ impl PyMultinomialNB {
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyMultinomialNB::F32(fitted))
                 }
@@ -572,6 +600,10 @@ impl PyMultinomialNB {
                     crate::capability::guard_f64()?;
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = MultinomialNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -580,7 +612,7 @@ impl PyMultinomialNB {
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyMultinomialNB::F64(fitted))
                 }
@@ -674,6 +706,12 @@ impl PyBernoulliNB {
         }
     }
 
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -681,9 +719,11 @@ impl PyBernoulliNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, binarize, fit_prior, class_prior) = match &self.inner {
             AnyBernoulliNB::Unfit {
@@ -711,6 +751,10 @@ impl PyBernoulliNB {
                 FloatDtype::F32 => {
                     let xh = host_slice_f32(as_f32(&xa)?)?;
                     let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = BernoulliNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -720,7 +764,7 @@ impl PyBernoulliNB {
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyBernoulliNB::F32(fitted))
                 }
@@ -728,6 +772,10 @@ impl PyBernoulliNB {
                     crate::capability::guard_f64()?;
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = BernoulliNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -737,7 +785,7 @@ impl PyBernoulliNB {
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyBernoulliNB::F64(fitted))
                 }
@@ -831,6 +879,12 @@ impl PyComplementNB {
         }
     }
 
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -838,9 +892,11 @@ impl PyComplementNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, fit_prior, class_prior, norm) = match &self.inner {
             AnyComplementNB::Unfit {
@@ -866,6 +922,10 @@ impl PyComplementNB {
                 FloatDtype::F32 => {
                     let xh = host_slice_f32(as_f32(&xa)?)?;
                     let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = ComplementNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -875,7 +935,7 @@ impl PyComplementNB {
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyComplementNB::F32(fitted))
                 }
@@ -883,6 +943,10 @@ impl PyComplementNB {
                     crate::capability::guard_f64()?;
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = ComplementNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -892,7 +956,7 @@ impl PyComplementNB {
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyComplementNB::F64(fitted))
                 }
@@ -1039,6 +1103,12 @@ impl PyCategoricalNB {
         })
     }
 
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -1046,9 +1116,11 @@ impl PyCategoricalNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, fit_prior, class_prior, min_categories) = match &self.inner {
             AnyCategoricalNB::Unfit {
@@ -1079,6 +1151,10 @@ impl PyCategoricalNB {
                 FloatDtype::F32 => {
                     let xh = host_slice_f32(as_f32(&xa)?)?;
                     let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = CategoricalNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -1088,7 +1164,7 @@ impl PyCategoricalNB {
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(xh, yh, (rows, cols))
+                        .fit_from_host_slice(xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyCategoricalNB::F32(fitted))
                 }
@@ -1096,6 +1172,10 @@ impl PyCategoricalNB {
                     crate::capability::guard_f64()?;
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = CategoricalNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -1105,7 +1185,7 @@ impl PyCategoricalNB {
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = est
-                        .fit_from_host_slice(xh, yh, (rows, cols))
+                        .fit_from_host_slice(xh, yh, (rows, cols), swh)
                         .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyCategoricalNB::F64(fitted))
                 }

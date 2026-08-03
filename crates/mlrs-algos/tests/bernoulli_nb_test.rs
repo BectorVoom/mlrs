@@ -416,7 +416,7 @@ fn worker_count_does_not_change_the_fit() {
         let est = BernoulliNB::<f64>::builder()
             .build::<f64>()
             .expect("builds")
-            .fit_from_host_slice(&mut pool, &x, &y, (n, d))
+            .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
             .expect("serial fit");
         fitted_tables(est, &pool)
     };
@@ -427,7 +427,7 @@ fn worker_count_does_not_change_the_fit() {
             let est = BernoulliNB::<f64>::builder()
                 .build::<f64>()
                 .expect("builds")
-                .fit_from_host_slice(&mut pool, &x, &y, (n, d))
+                .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
                 .expect("chunked fit");
             fitted_tables(est, &pool)
         };
@@ -462,7 +462,7 @@ fn parallel_counts_match_serial_reference() {
     let fitted = BernoulliNB::<f64>::builder()
         .build::<f64>()
         .expect("builds")
-        .fit_from_host_slice(&mut pool, &x, &y, (n, d))
+        .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
         .expect("chunked fit succeeds");
     let flp = fitted.feature_log_prob_delta(&pool).expect("fitted");
 
@@ -523,7 +523,7 @@ fn host_slice_fit_matches_device_fit() {
     let via_host = BernoulliNB::<f64>::builder()
         .build::<f64>()
         .expect("builds")
-        .fit_from_host_slice(&mut pool, &x, &y, (n, d))
+        .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
         .expect("host-slice fit");
     let host_tables = fitted_tables(via_host, &pool);
 
@@ -555,7 +555,7 @@ fn fit_rejects_nonfinite_input() {
         let got = BernoulliNB::<f64>::builder()
             .build::<f64>()
             .expect("builds")
-            .fit_from_host_slice(&mut pool, &x, &y, (2, 2))
+            .fit_from_host_slice(&mut pool, &x, &y, (2, 2), None)
             .err();
         assert!(
             matches!(got, Some(AlgoError::InvalidLabels { .. })),
@@ -583,7 +583,7 @@ fn rejection_reports_first_offender_regardless_of_chunking() {
     let got = BernoulliNB::<f64>::builder()
         .build::<f64>()
         .expect("builds")
-        .fit_from_host_slice(&mut pool, &x, &y, (n, d))
+        .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
         .err();
     match got {
         Some(AlgoError::InvalidLabels { reason, .. }) => assert!(
@@ -613,11 +613,156 @@ fn host_slice_fit_guards_geometry() {
         let got = BernoulliNB::<f64>::builder()
             .build::<f64>()
             .expect("builds")
-            .fit_from_host_slice(&mut pool, xs, ys, shape)
+            .fit_from_host_slice(&mut pool, xs, ys, shape, None)
             .err();
         assert!(
             matches!(got, Some(AlgoError::Prim(_))),
             "{label} must be a geometry PrimError, got {got:?}"
         );
     }
+}
+
+// ===========================================================================
+// sample_weight (the fit parameter sklearn's `fit(X, y, sample_weight=None)`
+// carries). The contract is stated by sklearn's own
+// `check_sample_weight_equivalence_on_dense_data`: an INTEGER weight must be
+// indistinguishable from repeating that row that many times, and a zero weight
+// from dropping it. That is what these gates check, plus the rejections.
+// ===========================================================================
+
+/// Repeat row `i` of `(x, y)` `w[i]` times — the reference a weighted fit must
+/// reproduce.
+fn repeat_rows(
+    x: &[f64],
+    y: &[f64],
+    w: &[f64],
+    d: usize,
+) -> (Vec<f64>, Vec<f64>, usize) {
+    let mut xr = Vec::new();
+    let mut yr = Vec::new();
+    for (i, &wi) in w.iter().enumerate() {
+        for _ in 0..(wi as usize) {
+            xr.extend_from_slice(&x[i * d..(i + 1) * d]);
+            yr.push(y[i]);
+        }
+    }
+    let n = yr.len();
+    (xr, yr, n)
+}
+
+/// Deterministic integer weights (including ZEROS, so the drop-a-row case is
+/// covered) over [`par_dataset`], cycling `0,1,2,3` so every class sees each.
+fn int_weights(n: usize) -> Vec<f64> {
+    (0..n).map(|i| (i % 4) as f64).collect()
+}
+
+/// An integer-weighted fit equals the fit on the sample-REPEATED design, and a
+/// zero weight drops its row. This is sklearn's own sample-weight contract.
+#[test]
+fn weighted_fit_equals_repeated_fit() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
+    if capability::skip_f64_with_log() {
+        println!("bernoulli_nb sample_weight f64 backend={backend}: SKIPPED (no f64 support)");
+        return;
+    }
+    let (x, y, n, d, _c) = par_dataset();
+    let w = int_weights(n);
+    let (xr, yr, nr) = repeat_rows(&x, &y, &w, d);
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let weighted = BernoulliNB::<f64>::builder()
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&mut pool, &x, &y, (n, d), Some(&w))
+        .expect("weighted fit");
+    let repeated = BernoulliNB::<f64>::builder()
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&mut pool, &xr, &yr, (nr, d), None)
+        .expect("repeated fit");
+    let (wc, wprior, wflp) = fitted_tables(weighted, &pool);
+    let (rc, rprior, rflp) = fitted_tables(repeated, &pool);
+    assert_eq!(wc, rc, "classes_ diverged");
+    assert_band(&wprior, &rprior, 1e-12, "class_log_prior_ weighted vs repeated");
+    assert_band(&wflp, &rflp, 1e-12, "feature_log_prob_ weighted vs repeated");
+}
+
+/// An all-ones `sample_weight` is the unweighted fit. Guards the weighted arm
+/// against an off-by-one in the per-worker weight slicing, which a
+/// uniform-weight fit would otherwise hide.
+#[test]
+fn all_ones_weight_equals_unweighted() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
+    if capability::skip_f64_with_log() {
+        println!("bernoulli_nb ones-weight f64 backend={backend}: SKIPPED (no f64 support)");
+        return;
+    }
+    let (x, y, n, d, _c) = par_dataset();
+    let ones = vec![1.0f64; n];
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let weighted = BernoulliNB::<f64>::builder()
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&mut pool, &x, &y, (n, d), Some(&ones))
+        .expect("ones-weighted fit");
+    let plain = BernoulliNB::<f64>::builder()
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
+        .expect("unweighted fit");
+    let (wc, wprior, wflp) = fitted_tables(weighted, &pool);
+    let (pc, pprior, pflp) = fitted_tables(plain, &pool);
+    assert_eq!(wc, pc, "classes_ diverged");
+    assert_band(&wprior, &pprior, 1e-12, "class_log_prior_ ones vs unweighted");
+    assert_band(&wflp, &pflp, 1e-12, "feature_log_prob_ ones vs unweighted");
+}
+
+/// The three rejections sklearn's `_check_sample_weight` performs: a length
+/// mismatch (which is also how a 2-D `sample_weight` arrives, ravelled, from the
+/// Python shim), a non-finite or negative entry, and an ALL-ZERO vector —
+/// the last carrying a message that mentions both "weight" and "zero", which is
+/// what `check_all_zero_sample_weights_error` greps for.
+#[test]
+fn fit_rejects_bad_sample_weight() {
+    let (x, y, n, d, _c) = par_dataset();
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let build = || BernoulliNB::<f64>::builder().build::<f64>().expect("builds");
+
+    let short = vec![1.0f64; n - 1];
+    assert!(
+        matches!(
+            build().fit_from_host_slice(&mut pool, &x, &y, (n, d), Some(&short)).err(),
+            Some(AlgoError::Prim(_))
+        ),
+        "a length-mismatched sample_weight must be a geometry PrimError"
+    );
+
+    for (label, bad) in [("NaN", f64::NAN), ("+inf", f64::INFINITY), ("negative", -1.0)] {
+        let mut w = vec![1.0f64; n];
+        w[3] = bad;
+        assert!(
+            matches!(
+                build().fit_from_host_slice(&mut pool, &x, &y, (n, d), Some(&w)).err(),
+                Some(AlgoError::InvalidSampleWeight { index: 3, .. })
+            ),
+            "a {label} sample_weight must be InvalidSampleWeight at index 3"
+        );
+    }
+
+    let zeros = vec![0.0f64; n];
+    let err = build().fit_from_host_slice(&mut pool, &x, &y, (n, d), Some(&zeros)).err();
+    assert!(
+        matches!(err, Some(AlgoError::ZeroSampleWeightSum { .. })),
+        "an all-zero sample_weight must be ZeroSampleWeightSum, got {err:?}"
+    );
+    let msg = format!("{}", err.expect("rejected"));
+    assert!(
+        msg.contains("weight") && msg.contains("zero"),
+        "the all-zero message must mention both 'weight' and 'zero' \
+         (check_all_zero_sample_weights_error greps for it): {msg}"
+    );
 }

@@ -440,71 +440,128 @@ impl HostScanCheck {
     }
 }
 
+/// What [`class_grouped_stats_host`] should compute — grouped into a struct
+/// because the four call sites differ along three independent axes and a
+/// positional `bool, bool, bool` argument list at each of them would be
+/// unreadable.
+#[derive(Clone, Copy)]
+pub(crate) struct StatsRequest {
+    /// Per-element validation, fused into the accumulate loop.
+    pub check: HostScanCheck,
+    /// Also accumulate the per-class `Σ w x²` (GaussianNB's second sufficient
+    /// statistic — free here, a whole second traversal if asked for separately).
+    pub sumsq: bool,
+    /// Also accumulate the UNWEIGHTED whole-column `Σ x` / `Σ x²` (length
+    /// `n_features`).
+    ///
+    /// Only GaussianNB needs this, and only when weights are present: its
+    /// `epsilon_` is `var_smoothing · max_j Var(X[:,j])` over the UNWEIGHTED
+    /// design (sklearn computes it before it ever looks at `sample_weight`), and
+    /// once the per-class totals carry weights the unweighted column variance is
+    /// no longer recoverable from them. Unweighted, the caller reduces
+    /// [`ClassGroupedStats::sum`] over `c` instead and leaves this off.
+    pub global_unweighted: bool,
+    /// The caller's `MLRS_*_WORKERS` override key (see [`host_workers`]).
+    pub env_key: &'static str,
+}
+
 /// The per-class column statistics [`class_grouped_stats_host`] returns, flat
 /// `n_classes × n_features` row-major (`[c * n_features + j]`).
+///
+/// With `weights = Some(w)` every per-class accumulator carries `w_i` as a
+/// factor: `sum` is `Σ w x`, `sumsq` is `Σ w x²`, and [`Self::class_weight`] is
+/// `Σ w` — which is exactly sklearn's weighted `class_count_`. Unweighted,
+/// `class_weight[c]` is the plain row count.
 pub(crate) struct ClassGroupedStats {
-    /// `sum[c * n_features + j] = Σ_{i : class_of_row[i] == c} x[i][j]`.
+    /// `sum[c * n_features + j] = Σ_{i : class_of_row[i] == c} w_i · x[i][j]`.
     pub sum: Vec<f64>,
-    /// The matching `Σ x[i][j]²`, EMPTY when the caller did not ask for it.
+    /// The matching `Σ w_i · x[i][j]²`, EMPTY when the caller did not ask.
     pub sumsq: Vec<f64>,
+    /// `class_weight[c] = Σ_{i : class_of_row[i] == c} w_i` — sklearn's
+    /// `class_count_` (the plain row count when unweighted).
+    pub class_weight: Vec<f64>,
+    /// UNWEIGHTED whole-column `Σ x` (length `n_features`), EMPTY unless
+    /// [`StatsRequest::global_unweighted`].
+    pub global_sum: Vec<f64>,
+    /// UNWEIGHTED whole-column `Σ x²` (length `n_features`), EMPTY unless
+    /// [`StatsRequest::global_unweighted`].
+    pub global_sumsq: Vec<f64>,
     /// Flat index (in the whole matrix) and value of the first element that
     /// failed the [`HostScanCheck`], in ROW-MAJOR order — independent of how the
     /// rows were split across workers. `None` when every element passed.
     pub first_invalid: Option<(usize, f64)>,
 }
 
-/// One worker's share of the sweep: validate + accumulate `sum` (and `sumsq`
-/// when non-empty) for every row of `chunk`.
+/// One worker's private accumulators.
+struct ChunkAcc {
+    sum: Vec<f64>,
+    sumsq: Vec<f64>,
+    class_weight: Vec<f64>,
+    global_sum: Vec<f64>,
+    global_sumsq: Vec<f64>,
+    first_invalid: Option<(usize, f64)>,
+}
+
+/// One worker's share of the sweep: validate + accumulate every requested
+/// statistic for every row of `chunk`.
 ///
-/// `want_sumsq` is hoisted OUT of the inner loop so the common sum-only case
-/// (the three discrete variants) does not pay a branch per element.
+/// The three optional accumulators are hoisted OUT of the inner loop as `bool`s
+/// the branch predictor sees once per row, so the common case (sum only,
+/// unweighted) costs one add per element and nothing else.
 fn stats_chunk<F>(
     chunk: &[F],
     class_of_row: &[usize],
+    weights: Option<&[f64]>,
     n_features: usize,
     check: HostScanCheck,
     flat_base: usize,
-    sum: &mut [f64],
-    sumsq: &mut [f64],
-) -> Option<(usize, f64)>
-where
+    acc: &mut ChunkAcc,
+) where
     F: Float + CubeElement + Pod,
 {
-    let want_sumsq = !sumsq.is_empty();
+    let want_sumsq = !acc.sumsq.is_empty();
+    let want_global = !acc.global_sum.is_empty();
     for (r, (row, &c)) in chunk
         .chunks_exact(n_features)
         .zip(class_of_row.iter())
         .enumerate()
     {
+        let w = weights.map_or(1.0, |w| w[r]);
+        acc.class_weight[c] += w;
+        // A zero-weight row contributes nothing to any per-class accumulator,
+        // but it still has to be VALIDATED (sklearn's `check_array` scans the
+        // whole matrix regardless of the weights) and it still counts toward the
+        // unweighted global column totals. So the loop runs either way.
         let base = c * n_features;
-        if want_sumsq {
-            let s = &mut sum[base..base + n_features];
-            let q = &mut sumsq[base..base + n_features];
-            for (j, ((&xv, sa), qa)) in row.iter().zip(s.iter_mut()).zip(q.iter_mut()).enumerate() {
-                let xf = host_to_f64(xv);
-                if check.rejects(xf) {
-                    return Some((flat_base + r * n_features + j, xf));
-                }
-                *sa += xf;
-                *qa += xf * xf;
+        for (j, &xv) in row.iter().enumerate() {
+            let xf = host_to_f64(xv);
+            if check.rejects(xf) {
+                acc.first_invalid = Some((flat_base + r * n_features + j, xf));
+                return;
             }
-        } else {
-            let s = &mut sum[base..base + n_features];
-            for (j, (&xv, sa)) in row.iter().zip(s.iter_mut()).enumerate() {
-                let xf = host_to_f64(xv);
-                if check.rejects(xf) {
-                    return Some((flat_base + r * n_features + j, xf));
-                }
-                *sa += xf;
+            let wx = w * xf;
+            acc.sum[base + j] += wx;
+            if want_sumsq {
+                acc.sumsq[base + j] += wx * xf;
+            }
+            if want_global {
+                acc.global_sum[j] += xf;
+                acc.global_sumsq[j] += xf * xf;
             }
         }
     }
-    None
 }
 
-/// `out.sum[c, j] = Σ_{i : class_of_row[i] == c} x[i][j]` (plus `out.sumsq` when
-/// `want_sumsq`), computed in ONE row-major sweep over the HOST design matrix,
-/// chunked over rows across a scoped worker pool.
+/// `out.sum[c, j] = Σ_{i : class_of_row[i] == c} w_i · x[i][j]` (plus the other
+/// statistics [`StatsRequest`] asks for), computed in ONE row-major sweep over
+/// the HOST design matrix, chunked over rows across a scoped worker pool.
+///
+/// `weights` is the validated `sample_weight`, host f64, length `n_samples`
+/// (`None` = every weight 1). It multiplies each row's contribution to every
+/// per-class accumulator, which is exactly what sklearn's
+/// `Y *= sample_weight.T` before `feature_count_ += Y.T @ X` does — so
+/// [`ClassGroupedStats::sum`] IS sklearn's weighted `feature_count_` and
+/// [`ClassGroupedStats::class_weight`] its weighted `class_count_`.
 ///
 /// ## Why this replaced the device GATHER (PERF, NB-FIT-CPU)
 ///
@@ -522,24 +579,22 @@ where
 /// validation in for free. `sum` and `sumsq` come out of the SAME pass, so
 /// GaussianNB's two GATHERs become one traversal.
 ///
-/// Each worker accumulates into a private table and the driver sums them, so the
+/// Each worker accumulates into private tables and the driver sums them, so the
 /// sweep is lock-free; a table too large to replicate (`n_classes · n_features >
 /// PAR_TABLE_MAX_ENTRIES`) drops to the serial arm rather than allocating a copy
-/// per core. `env_key` names the caller's `MLRS_*_WORKERS` override (see
-/// [`host_workers`]); forcing it to `1` pins the serial arm, which is what makes
-/// a serial-vs-parallel agreement test possible.
+/// per core. Forcing `req.env_key` to `1` pins the serial arm, which is what
+/// makes a serial-vs-parallel agreement test possible.
 ///
 /// A class with no rows contributes an all-zero row, matching the GATHER.
-/// Callers guard geometry themselves; this asserts only the invariant the
+/// Callers guard geometry themselves; this asserts only the invariants the
 /// indexing depends on.
 pub(crate) fn class_grouped_stats_host<F>(
     x: &[F],
     shape: (usize, usize),
     class_of_row: &[usize],
+    weights: Option<&[f64]>,
     n_classes: usize,
-    check: HostScanCheck,
-    want_sumsq: bool,
-    env_key: &'static str,
+    req: StatsRequest,
 ) -> ClassGroupedStats
 where
     F: Float + CubeElement + Pod,
@@ -551,35 +606,41 @@ where
         "class_grouped_stats_host: class_of_row length {} != n_samples {n_samples}",
         class_of_row.len()
     );
+    if let Some(w) = weights {
+        assert_eq!(
+            w.len(),
+            n_samples,
+            "class_grouped_stats_host: weights length {} != n_samples {n_samples}",
+            w.len()
+        );
+    }
     let table_len = n_classes * n_features;
     let workers = if table_len > PAR_TABLE_MAX_ENTRIES {
         1
     } else {
-        host_workers(env_key, n_samples * n_features)
+        host_workers(req.env_key, n_samples * n_features)
     };
     let rows_per = chunk_rows(n_samples, workers);
     let elems_per = rows_per * n_features;
-    let sq_len = if want_sumsq { table_len } else { 0 };
+    let sq_len = if req.sumsq { table_len } else { 0 };
+    let glob_len = if req.global_unweighted { n_features } else { 0 };
 
-    // One worker's share, returning its private tables and the first invalid
-    // element it saw (flat index + value).
-    let run = |chunk: &[F], cls: &[usize], flat_base: usize| {
-        let mut sum = vec![0.0f64; table_len];
-        let mut sumsq = vec![0.0f64; sq_len];
-        let bad = stats_chunk::<F>(
-            chunk,
-            cls,
-            n_features,
-            check,
-            flat_base,
-            &mut sum,
-            &mut sumsq,
-        );
-        (sum, sumsq, bad)
+    // One worker's share, returning its private accumulators.
+    let run = |chunk: &[F], cls: &[usize], w: Option<&[f64]>, flat_base: usize| {
+        let mut acc = ChunkAcc {
+            sum: vec![0.0; table_len],
+            sumsq: vec![0.0; sq_len],
+            class_weight: vec![0.0; n_classes],
+            global_sum: vec![0.0; glob_len],
+            global_sumsq: vec![0.0; glob_len],
+            first_invalid: None,
+        };
+        stats_chunk::<F>(chunk, cls, w, n_features, req.check, flat_base, &mut acc);
+        acc
     };
 
-    let parts: Vec<(Vec<f64>, Vec<f64>, Option<(usize, f64)>)> = if workers == 1 {
-        vec![run(x, class_of_row, 0)]
+    let parts: Vec<ChunkAcc> = if workers == 1 {
+        vec![run(x, class_of_row, weights, 0)]
     } else {
         std::thread::scope(|scope| {
             let handles: Vec<_> = x
@@ -588,7 +649,10 @@ where
                 .enumerate()
                 .map(|(ci, (chunk, cls))| {
                     let run = &run;
-                    scope.spawn(move || run(chunk, cls, ci * elems_per))
+                    // The weight slice is chunked the same way as the rows, so a
+                    // worker indexes it with its LOCAL row index.
+                    let w = weights.map(|w| &w[ci * rows_per..ci * rows_per + cls.len()]);
+                    scope.spawn(move || run(chunk, cls, w, ci * elems_per))
                 })
                 .collect();
             handles
@@ -602,22 +666,33 @@ where
     // the caller's error message does not depend on the machine's core count.
     let first_invalid = parts
         .iter()
-        .filter_map(|(_, _, e)| *e)
+        .filter_map(|p| p.first_invalid)
         .min_by(|(a, _), (b, _)| a.cmp(b));
 
-    let mut sum = vec![0.0f64; table_len];
-    let mut sumsq = vec![0.0f64; sq_len];
-    for (s, q, _) in &parts {
-        for (acc, &v) in sum.iter_mut().zip(s.iter()) {
-            *acc += v;
-        }
-        for (acc, &v) in sumsq.iter_mut().zip(q.iter()) {
-            *acc += v;
-        }
-    }
-    ClassGroupedStats {
-        sum,
-        sumsq,
+    let mut out = ClassGroupedStats {
+        sum: vec![0.0; table_len],
+        sumsq: vec![0.0; sq_len],
+        class_weight: vec![0.0; n_classes],
+        global_sum: vec![0.0; glob_len],
+        global_sumsq: vec![0.0; glob_len],
         first_invalid,
+    };
+    for p in &parts {
+        for (a, &v) in out.sum.iter_mut().zip(p.sum.iter()) {
+            *a += v;
+        }
+        for (a, &v) in out.sumsq.iter_mut().zip(p.sumsq.iter()) {
+            *a += v;
+        }
+        for (a, &v) in out.class_weight.iter_mut().zip(p.class_weight.iter()) {
+            *a += v;
+        }
+        for (a, &v) in out.global_sum.iter_mut().zip(p.global_sum.iter()) {
+            *a += v;
+        }
+        for (a, &v) in out.global_sumsq.iter_mut().zip(p.global_sumsq.iter()) {
+            *a += v;
+        }
     }
+    out
 }

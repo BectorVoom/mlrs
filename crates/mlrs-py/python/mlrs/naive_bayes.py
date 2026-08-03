@@ -61,7 +61,13 @@ class GaussianNB(_BaseNB):
         self.priors = priors
         self.output_type = output_type
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
+        # ``sample_weight`` (optional, length n_samples) weights each row's
+        # contribution to the per-class counts, matching sklearn's
+        # ``Y *= sample_weight.T``. It rides the same 1-D float ingress as ``y``
+        # and is validated in RUST (length, finite, non-negative, not all zero
+        # -- ``linear/ridge.rs::validate_sample_weight``), so a bad weight
+        # raises the same ``ValueError`` class sklearn raises.
         # ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the
         # Rust fit's fused count sweep reads every element of ``X`` anyway, so it
         # reports the same verdict from that sweep and the PyO3 arm raises
@@ -71,9 +77,15 @@ class GaussianNB(_BaseNB):
         # keeps its scan: it is 1-D and the label decode has no equivalent
         # hand-off.
         xa, rows, cols = self._normalize(X, ensure_all_finite=False)
-        ya = self._normalize_y(y, dtype=self._x_float(xa))
+        dtype = self._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
         obj = self._ext().GaussianNB(self.var_smoothing, self.priors)
-        obj.fit(xa, ya, rows, cols)
+        obj.fit(xa, ya, rows, cols, swa)
         self._store_fit(obj, cols)
         return self
 
@@ -102,7 +114,13 @@ class MultinomialNB(_BaseNB):
         self.class_prior = class_prior
         self.output_type = output_type
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
+        # ``sample_weight`` (optional, length n_samples) weights each row's
+        # contribution to the per-class counts, matching sklearn's
+        # ``Y *= sample_weight.T``. It rides the same 1-D float ingress as ``y``
+        # and is validated in RUST (length, finite, non-negative, not all zero
+        # -- ``linear/ridge.rs::validate_sample_weight``), so a bad weight
+        # raises the same ``ValueError`` class sklearn raises.
         # ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the
         # Rust fit's fused count sweep reads every element of ``X`` anyway, so it
         # reports the same verdict from that sweep and the PyO3 arm raises
@@ -112,11 +130,17 @@ class MultinomialNB(_BaseNB):
         # keeps its scan: it is 1-D and the label decode has no equivalent
         # hand-off.
         xa, rows, cols = self._normalize(X, ensure_all_finite=False)
-        ya = self._normalize_y(y, dtype=GaussianNB._x_float(xa))
+        dtype = GaussianNB._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
         obj = self._ext().MultinomialNB(
             self.alpha, self.force_alpha, self.fit_prior, self.class_prior
         )
-        obj.fit(xa, ya, rows, cols)
+        obj.fit(xa, ya, rows, cols, swa)
         self._store_fit(obj, cols)
         return self
 
@@ -144,7 +168,13 @@ class BernoulliNB(_BaseNB):
         self.class_prior = class_prior
         self.output_type = output_type
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
+        # ``sample_weight`` (optional, length n_samples) weights each row's
+        # contribution to the per-class counts, matching sklearn's
+        # ``Y *= sample_weight.T``. It rides the same 1-D float ingress as ``y``
+        # and is validated in RUST (length, finite, non-negative, not all zero
+        # -- ``linear/ridge.rs::validate_sample_weight``), so a bad weight
+        # raises the same ``ValueError`` class sklearn raises.
         # ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the
         # Rust fit's fused count sweep reads every element of ``X`` anyway (it
         # has to — every value is thresholded into a per-class count), so it
@@ -156,7 +186,13 @@ class BernoulliNB(_BaseNB):
         # single-pass. ``y`` keeps its scan: it is 1-D and the label decode has
         # no equivalent hand-off.
         xa, rows, cols = self._normalize(X, ensure_all_finite=False)
-        ya = self._normalize_y(y, dtype=GaussianNB._x_float(xa))
+        dtype = GaussianNB._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
         obj = self._ext().BernoulliNB(
             self.alpha,
             self.force_alpha,
@@ -164,7 +200,7 @@ class BernoulliNB(_BaseNB):
             self.fit_prior,
             self.class_prior,
         )
-        obj.fit(xa, ya, rows, cols)
+        obj.fit(xa, ya, rows, cols, swa)
         self._store_fit(obj, cols)
         return self
 
@@ -192,7 +228,13 @@ class ComplementNB(_BaseNB):
         self.norm = norm
         self.output_type = output_type
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
+        # ``sample_weight`` (optional, length n_samples) weights each row's
+        # contribution to the per-class counts, matching sklearn's
+        # ``Y *= sample_weight.T``. It rides the same 1-D float ingress as ``y``
+        # and is validated in RUST (length, finite, non-negative, not all zero
+        # -- ``linear/ridge.rs::validate_sample_weight``), so a bad weight
+        # raises the same ``ValueError`` class sklearn raises.
         # ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the
         # Rust fit's fused count sweep reads every element of ``X`` anyway, so it
         # reports the same verdict from that sweep and the PyO3 arm raises
@@ -202,7 +244,13 @@ class ComplementNB(_BaseNB):
         # keeps its scan: it is 1-D and the label decode has no equivalent
         # hand-off.
         xa, rows, cols = self._normalize(X, ensure_all_finite=False)
-        ya = self._normalize_y(y, dtype=GaussianNB._x_float(xa))
+        dtype = GaussianNB._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
         obj = self._ext().ComplementNB(
             self.alpha,
             self.force_alpha,
@@ -210,7 +258,7 @@ class ComplementNB(_BaseNB):
             self.class_prior,
             self.norm,
         )
-        obj.fit(xa, ya, rows, cols)
+        obj.fit(xa, ya, rows, cols, swa)
         self._store_fit(obj, cols)
         return self
 
@@ -239,7 +287,13 @@ class CategoricalNB(_BaseNB):
         self.min_categories = min_categories
         self.output_type = output_type
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
+        # ``sample_weight`` (optional, length n_samples) weights each row's
+        # contribution to the per-class counts, matching sklearn's
+        # ``Y *= sample_weight.T``. It rides the same 1-D float ingress as ``y``
+        # and is validated in RUST (length, finite, non-negative, not all zero
+        # -- ``linear/ridge.rs::validate_sample_weight``), so a bad weight
+        # raises the same ``ValueError`` class sklearn raises.
         # ``ensure_all_finite=False`` does NOT skip the NaN/inf rejection: the
         # Rust fit's validation pass reads every element of ``X`` anyway (it has
         # to — a category index must be a non-negative integer), so it reports
@@ -251,7 +305,13 @@ class CategoricalNB(_BaseNB):
         # row-major. ``y`` keeps its scan: it is 1-D and the label decode has no
         # equivalent hand-off.
         xa, rows, cols = self._normalize(X, ensure_all_finite=False)
-        ya = self._normalize_y(y, dtype=GaussianNB._x_float(xa))
+        dtype = GaussianNB._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
         obj = self._ext().CategoricalNB(
             self.alpha,
             self.force_alpha,
@@ -259,6 +319,6 @@ class CategoricalNB(_BaseNB):
             self.class_prior,
             self.min_categories,
         )
-        obj.fit(xa, ya, rows, cols)
+        obj.fit(xa, ya, rows, cols, swa)
         self._store_fit(obj, cols)
         return self

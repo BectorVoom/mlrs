@@ -31,9 +31,10 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
-    ClassGroupedStats, HostScanCheck, NB_LABEL_INT_TOL,
+    ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL,
 };
 // Phase 16 (D-02 shape-B trait-swap): the pre-existing builder is UNTOUCHED; the
 // estimator gains the `<F, S = Unfit>` state param and migrates from the legacy
@@ -221,6 +222,7 @@ where
         x: &[F],
         y: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<GaussianNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
@@ -239,7 +241,7 @@ where
                 len: y.len(),
             }));
         }
-        self.fit_host(pool, x, y, shape)
+        self.fit_host(pool, x, y, shape, sample_weight)
     }
 
     /// The shared host fit body behind [`Fit::fit`] and
@@ -269,8 +271,14 @@ where
         x_host: &[F],
         y_host: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<GaussianNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
+
+        // Weights are a pure ARGUMENT check (length, finite, non-negative, not
+        // all zero) — cheapest and most basic, so it runs before the label
+        // decode and the data sweep.
+        let sw = validate_sample_weight::<F>("gaussian_nb", sample_weight, n_samples)?;
         // --- Pitfall 4: host distinct-sorted classes_ (no class-count
         //     restriction; GaussianNB is multiclass). Integer labels only. ---
         let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
@@ -315,15 +323,28 @@ where
         let ClassGroupedStats {
             sum: sums,
             sumsq: sumsqs,
+            class_weight: class_count_,
+            global_sum,
+            global_sumsq,
             first_invalid,
         } = class_grouped_stats_host::<F>(
             x_host,
             shape,
             &class_of_row,
+            sw.as_deref(),
             n_classes,
-            HostScanCheck::Finite,
-            true,
-            WORKERS_ENV,
+            StatsRequest {
+                check: HostScanCheck::Finite,
+                sumsq: true,
+                // `epsilon_` is the UNWEIGHTED max column variance (sklearn
+                // computes it before it looks at `sample_weight` at all), so
+                // once the per-class totals carry weights it can no longer be
+                // reduced out of them — ask the sweep for the unweighted column
+                // totals as well. Unweighted, they ARE the per-class totals
+                // summed over `c`, so the extra accumulators are skipped.
+                global_unweighted: sw.is_some(),
+                env_key: WORKERS_ENV,
+            },
         );
         if let Some((_, v)) = first_invalid {
             return Err(AlgoError::InvalidLabels {
@@ -332,19 +353,22 @@ where
             });
         }
 
-        // class_count_[c] = #rows of class c (every observed class has >= 1).
-        let mut class_count_: Vec<f64> = vec![0.0; n_classes];
-        for &c in &class_of_row {
-            class_count_[c] += 1.0;
-        }
-
-        // theta_[c,j] = sum/n_c ; var_[c,j] = sumsq/n_c − theta_² (population,
-        // ddof=0). epsilon_ is added below (a single global floor).
+        // theta_[c,j] = Σwx/Σw ; var_[c,j] = Σwx²/Σw − theta_² (population,
+        // ddof=0). `class_count_[c]` is Σw (the plain row count when
+        // unweighted), matching sklearn's weighted `class_count_`. epsilon_ is
+        // added below (a single global floor).
         let mut theta: Vec<f64> = vec![0.0; n_classes * n_features];
         let mut var: Vec<f64> = vec![0.0; n_classes * n_features];
         for c in 0..n_classes {
             let n_c = class_count_[c];
-            debug_assert!(n_c > 0.0, "every observed class has at least one sample");
+            // sklearn's `_update_mean_variance` returns the INITIAL (all-zero)
+            // mean and variance when the incoming weight mass is ~0
+            // (`np.isclose(n_new, 0.0)`, i.e. |n_new| <= 1e-8), rather than
+            // dividing by it. A class can only reach that here by having every
+            // one of its rows weighted out; unweighted, `n_c >= 1` always.
+            if n_c.abs() <= 1e-8 {
+                continue;
+            }
             for j in 0..n_features {
                 let mean = sums[c * n_features + j] / n_c;
                 let raw_var = sumsqs[c * n_features + j] / n_c - mean * mean;
@@ -368,12 +392,20 @@ where
         let n = n_samples as f64;
         let mut max_col_var = 0.0f64;
         for j in 0..n_features {
-            let mut s = 0.0f64;
-            let mut ss = 0.0f64;
-            for c in 0..n_classes {
-                s += sums[c * n_features + j];
-                ss += sumsqs[c * n_features + j];
-            }
+            // Unweighted: the whole-column totals ARE the per-class totals
+            // summed over `c`. Weighted: those carry `w`, so the sweep handed
+            // back separate unweighted column totals for exactly this.
+            let (s, ss) = if global_sum.is_empty() {
+                let mut s = 0.0f64;
+                let mut ss = 0.0f64;
+                for c in 0..n_classes {
+                    s += sums[c * n_features + j];
+                    ss += sumsqs[c * n_features + j];
+                }
+                (s, ss)
+            } else {
+                (global_sum[j], global_sumsq[j])
+            };
             let mean = s / n;
             let col_var = (ss / n - mean * mean).max(0.0);
             if col_var > max_col_var {
@@ -484,7 +516,7 @@ where
         // once and run the same body `fit_from_host_slice` runs.
         let x_host = x.to_host(pool);
         let y_host = y.to_host(pool);
-        self.fit_host(pool, &x_host, &y_host, shape)
+        self.fit_host(pool, &x_host, &y_host, shape, None)
     }
 }
 

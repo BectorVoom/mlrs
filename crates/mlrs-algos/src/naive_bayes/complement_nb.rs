@@ -37,13 +37,14 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::multinomial_nb::{
     decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
     validate_non_negative_counts,
 };
 use crate::naive_bayes::nb_common::{
     argmin_decode, class_grouped_stats_host, log_sum_exp_normalize, ClassGroupedStats,
-    HostScanCheck,
+    HostScanCheck, StatsRequest,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -231,6 +232,7 @@ where
         x: &[F],
         y: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<ComplementNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
@@ -249,7 +251,7 @@ where
                 len: y.len(),
             }));
         }
-        self.fit_host(pool, x, y, shape)
+        self.fit_host(pool, x, y, shape, sample_weight)
     }
 
     /// The shared host fit body behind [`Fit::fit`] and
@@ -275,8 +277,14 @@ where
         x_host: &[F],
         y_host: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<ComplementNB<F, Fitted>, AlgoError> {
-        let (_n_samples, n_features) = shape;
+        let (n_samples, n_features) = shape;
+
+        // Weights are a pure ARGUMENT check (length, finite, non-negative, not
+        // all zero) — cheapest and most basic, so it runs before the label
+        // decode and the data sweep.
+        let sw = validate_sample_weight::<F>("complement_nb", sample_weight, n_samples)?;
 
         // ORDER NOTE: the count sweep below needs `class_of_row`, so the label
         // decode now runs BEFORE the X validation that used to be its own pass.
@@ -291,16 +299,21 @@ where
         // silently).
         let ClassGroupedStats {
             sum: feature_count,
+            class_weight: class_count_,
             first_invalid,
             ..
         } = class_grouped_stats_host::<F>(
             x_host,
             shape,
             &class_of_row,
+            sw.as_deref(),
             n_classes,
-            HostScanCheck::NonNegative,
-            false,
-            WORKERS_ENV,
+            StatsRequest {
+                check: HostScanCheck::NonNegative,
+                sumsq: false,
+                global_unweighted: false,
+                env_key: WORKERS_ENV,
+            },
         );
         if let Some((_, v)) = first_invalid {
             return Err(AlgoError::InvalidLabels {
@@ -309,10 +322,6 @@ where
             });
         }
 
-        let mut class_count_: Vec<f64> = vec![0.0; n_classes];
-        for &c in &class_of_row {
-            class_count_[c] += 1.0;
-        }
 
         // --- ComplementNB weights (Pitfall 6 — DIFFERENT formula from
         //     MultinomialNB; do NOT copy it). feature_all_[j] = Σ_c count[c,j];
@@ -416,7 +425,7 @@ where
         // once and run the same body `fit_from_host_slice` runs.
         let x_host = x.to_host(pool);
         let y_host = y.to_host(pool);
-        self.fit_host(pool, &x_host, &y_host, shape)
+        self.fit_host(pool, &x_host, &y_host, shape, None)
     }
 }
 

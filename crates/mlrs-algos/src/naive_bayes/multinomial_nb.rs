@@ -33,9 +33,10 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
-    ClassGroupedStats, HostScanCheck, NB_LABEL_INT_TOL,
+    ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -218,6 +219,7 @@ where
         x: &[F],
         y: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<MultinomialNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
@@ -236,7 +238,7 @@ where
                 len: y.len(),
             }));
         }
-        self.fit_host(pool, x, y, shape)
+        self.fit_host(pool, x, y, shape, sample_weight)
     }
 
     /// The shared host fit body behind [`Fit::fit`] and
@@ -262,8 +264,14 @@ where
         x_host: &[F],
         y_host: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<MultinomialNB<F, Fitted>, AlgoError> {
-        let (_n_samples, n_features) = shape;
+        let (n_samples, n_features) = shape;
+
+        // Weights are a pure ARGUMENT check (length, finite, non-negative, not
+        // all zero) — cheapest and most basic, so it runs before the label
+        // decode and the data sweep.
+        let sw = validate_sample_weight::<F>("multinomial_nb", sample_weight, n_samples)?;
 
         // --- host distinct-sorted classes_ (multiclass, integer labels only, i32
         //     range guarded — predicted labels are emitted as i32, WR-02).
@@ -288,16 +296,21 @@ where
         //     NaN feature_log_prob_. ---
         let ClassGroupedStats {
             sum: feature_count,
+            class_weight: class_count_,
             first_invalid,
             ..
         } = class_grouped_stats_host::<F>(
             x_host,
             shape,
             &class_of_row,
+            sw.as_deref(),
             n_classes,
-            HostScanCheck::NonNegative,
-            false,
-            WORKERS_ENV,
+            StatsRequest {
+                check: HostScanCheck::NonNegative,
+                sumsq: false,
+                global_unweighted: false,
+                env_key: WORKERS_ENV,
+            },
         );
         if let Some((_, v)) = first_invalid {
             return Err(AlgoError::InvalidLabels {
@@ -307,10 +320,6 @@ where
         }
 
         // class_count_[c] = #rows of class c.
-        let mut class_count_: Vec<f64> = vec![0.0; n_classes];
-        for &c in &class_of_row {
-            class_count_[c] += 1.0;
-        }
 
         // --- feature_log_prob_[c,j] = log((count[c,j] + alpha) /
         //     (Σ_j count[c,j] + alpha·n_features)) (Pitfall 4: the denominator
@@ -389,7 +398,7 @@ where
         // the upload these two reads undo.
         let x_host = x.to_host(pool);
         let y_host = y.to_host(pool);
-        self.fit_host(pool, &x_host, &y_host, shape)
+        self.fit_host(pool, &x_host, &y_host, shape, None)
     }
 }
 

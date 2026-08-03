@@ -515,7 +515,7 @@ where
         //     vector is a geometry error; a negative or non-finite weight would
         //     make `√w` NaN in the rescale and silently poison every downstream
         //     reduction, so it is rejected as a typed error instead. ---
-        let sw64: Option<Vec<f64>> = validate_sample_weight::<F>(sample_weight, n_samples)?;
+        let sw64: Option<Vec<f64>> = validate_sample_weight::<F>("ridge", sample_weight, n_samples)?;
 
         let resolved = self.solver.resolve(self.positive);
 
@@ -878,7 +878,7 @@ where
                 len: y.len(),
             }));
         }
-        let sw64 = validate_sample_weight::<F>(sample_weight, n_samples)?;
+        let sw64 = validate_sample_weight::<F>("ridge", sample_weight, n_samples)?;
 
         let profile = std::env::var("RIDGE_PROFILE").is_ok();
         let lap0 = std::time::Instant::now();
@@ -999,6 +999,7 @@ fn drain_profile_probe<F>(
 /// rescale zeroes the whole design and the penalized solve would hand back the
 /// all-zero coefficient vector as though it were an answer).
 pub(crate) fn validate_sample_weight<F>(
+    estimator: &'static str,
     sample_weight: Option<&[F]>,
     n_samples: usize,
 ) -> Result<Option<Vec<f64>>, AlgoError>
@@ -1019,13 +1020,13 @@ where
     let sw: Vec<f64> = sw.iter().map(|&v| host_to_f64(v)).collect();
     if let Some(bad) = sw.iter().position(|v| !v.is_finite() || *v < 0.0) {
         return Err(AlgoError::InvalidSampleWeight {
-            estimator: "ridge",
+            estimator,
             index: bad,
             value: sw[bad],
         });
     }
     if sw.iter().all(|&v| v == 0.0) {
-        return Err(AlgoError::ZeroSampleWeightSum { estimator: "ridge" });
+        return Err(AlgoError::ZeroSampleWeightSum { estimator });
     }
     Ok(Some(sw))
 }

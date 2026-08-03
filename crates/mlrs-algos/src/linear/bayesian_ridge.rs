@@ -384,7 +384,7 @@ where
                 len: y.len(),
             }));
         }
-        let sw64 = validate_sample_weight::<F>(sample_weight, n_samples)?;
+        let sw64 = validate_sample_weight::<F>("bayesian_ridge", sample_weight, n_samples)?;
 
         let profile = std::env::var("BAYES_PROFILE").is_ok();
         let lap0 = std::time::Instant::now();

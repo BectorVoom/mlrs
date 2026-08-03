@@ -38,6 +38,7 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::multinomial_nb::{
     decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
 };
@@ -328,6 +329,39 @@ fn count_chunk<F>(
     }
 }
 
+/// The WEIGHTED twin of [`count_chunk`]: `table[c · total + off[j] + k] += w_i`.
+///
+/// Separate from the unweighted arm because the table has to be `f64` once a
+/// weight can be fractional — the `u32` counters are what make the common
+/// unweighted path half the table traffic AND exact, so they are kept rather
+/// than folded into one generic body. This mirrors sklearn's
+/// `np.bincount(X_feature[mask], weights=Y[mask, j])`, whose `weights` are the
+/// one-hot column scaled by `sample_weight`.
+fn count_chunk_weighted<F>(
+    chunk: &[F],
+    class_of_row: &[usize],
+    weights: &[f64],
+    n_features: usize,
+    off: &[usize],
+    total: usize,
+    table: &mut [f64],
+) where
+    F: Float + CubeElement + Pod,
+{
+    for (r, (row, &c)) in chunk
+        .chunks_exact(n_features)
+        .zip(class_of_row.iter())
+        .enumerate()
+    {
+        let w = weights[r];
+        let base = c * total;
+        for (&xv, &o) in row.iter().zip(off.iter()) {
+            let k = host_to_f64(xv).round() as u32 as usize;
+            table[base + o + k] += w;
+        }
+    }
+}
+
 impl<F> CategoricalNB<F, Unfit>
 where
     F: Float + CubeElement + Pod,
@@ -350,6 +384,7 @@ where
         x: &[F],
         y: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<CategoricalNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
@@ -368,7 +403,7 @@ where
                 len: y.len(),
             }));
         }
-        self.fit_host(x, y, shape)
+        self.fit_host(x, y, shape, sample_weight)
     }
 
     /// The shared host fit body behind [`Fit::fit`] and
@@ -399,8 +434,13 @@ where
         x_host: &[F],
         y_host: &[F],
         shape: (usize, usize),
+        sample_weight: Option<&[F]>,
     ) -> Result<CategoricalNB<F, Fitted>, AlgoError> {
         let (n_samples, n_features) = shape;
+
+        // Weights are a pure ARGUMENT check (length, finite, non-negative, not
+        // all zero) — cheapest and most basic, so it runs first.
+        let sw = validate_sample_weight::<F>("categorical_nb", sample_weight, n_samples)?;
         // WR-08: `force_alpha` is fitted-config provenance (D-06 clip already
         // applied at build()); it is now exposed via the `force_alpha()` accessor
         // so the field is genuinely used (the prior `let _ = self.force_alpha;`
@@ -459,10 +499,13 @@ where
         let (classes_, class_of_row, n_classes) =
             decode_classes_host::<F>("categorical_nb", y_host)?;
 
-        // class_count_[c] = #rows of class c (every observed class has >= 1).
+        // class_count_[c] = Σ_{i : y_i = c} w_i — the plain row count when
+        // unweighted (every observed class has >= 1 row), sklearn's weighted
+        // `class_count_` otherwise, and the `+ alpha·n_categories_j`
+        // denominator below.
         let mut class_count_: Vec<f64> = vec![0.0; n_classes];
-        for &c in &class_of_row {
-            class_count_[c] += 1.0;
+        for (i, &c) in class_of_row.iter().enumerate() {
+            class_count_[c] += sw.as_deref().map_or(1.0, |w| w[i]);
         }
 
         // --- Per-feature observed_max + the MinCategories padding (D-04, Pitfall 7):
@@ -513,20 +556,41 @@ where
 
         let mut counts: Vec<f64> = vec![0.0; table_len];
         {
-            let mut accumulate = |table: &[u32]| {
+            // Two accumulators, one per table width — plain `fn`s rather than
+            // closures so they do not both hold a mutable borrow of `counts`
+            // for the whole block (E0499).
+            fn accumulate(counts: &mut [f64], table: &[u32]) {
                 for (acc, &v) in counts.iter_mut().zip(table.iter()) {
-                    *acc += v as f64;
+                    *acc += f64::from(v);
                 }
-            };
+            }
+            fn accumulate_w(counts: &mut [f64], table: &[f64]) {
+                for (acc, &v) in counts.iter_mut().zip(table.iter()) {
+                    *acc += v;
+                }
+            }
             // The `n_samples <= u32::MAX` arm is not about parallelism: a single
             // table over MORE rows than that could overflow its `u32` counters,
             // so such a fit takes the chunked branch (whose chunks are capped at
             // `u32::MAX` rows by `chunk_rows`) even at one worker.
             if count_workers == 1 && n_samples <= u32::MAX as usize {
-                let mut table = vec![0u32; table_len];
-                count_chunk::<F>(x_host, &class_of_row, n_features, &off, total, &mut table);
-                accumulate(&table);
-            } else {
+                match sw.as_deref() {
+                    None => {
+                        let mut table = vec![0u32; table_len];
+                        count_chunk::<F>(
+                            x_host, &class_of_row, n_features, &off, total, &mut table,
+                        );
+                        accumulate(&mut counts, &table);
+                    }
+                    Some(w) => {
+                        let mut table = vec![0.0f64; table_len];
+                        count_chunk_weighted::<F>(
+                            x_host, &class_of_row, w, n_features, &off, total, &mut table,
+                        );
+                        accumulate_w(&mut counts, &table);
+                    }
+                }
+            } else if sw.is_none() {
                 let tables: Vec<Vec<u32>> = std::thread::scope(|scope| {
                     let handles: Vec<_> = x_host
                         .chunks(count_elems_per)
@@ -548,7 +612,37 @@ where
                         .collect()
                 });
                 for table in &tables {
-                    accumulate(table);
+                    accumulate(&mut counts, table);
+                }
+            } else {
+                let sw_ref = sw.as_deref().expect("weighted arm");
+                let tables: Vec<Vec<f64>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = x_host
+                        .chunks(count_elems_per)
+                        .zip(class_of_row.chunks(count_rows_per))
+                        .enumerate()
+                        .map(|(ci, (chunk, cls))| {
+                            let off = &off;
+                            // The weight slice is chunked the same way as the
+                            // rows, so a worker indexes it LOCALLY.
+                            let w = &sw_ref
+                                [ci * count_rows_per..ci * count_rows_per + cls.len()];
+                            scope.spawn(move || {
+                                let mut table = vec![0.0f64; table_len];
+                                count_chunk_weighted::<F>(
+                                    chunk, cls, w, n_features, off, total, &mut table,
+                                );
+                                table
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("categorical_nb: pass-2 worker panicked"))
+                        .collect()
+                });
+                for table in &tables {
+                    accumulate_w(&mut counts, table);
                 }
             }
         }
@@ -638,7 +732,7 @@ where
         // operands back once and run the SAME body as `fit_from_host_slice`.
         let x_host = x.to_host(pool);
         let y_host = y.to_host(pool);
-        self.fit_host(&x_host, &y_host, shape)
+        self.fit_host(&x_host, &y_host, shape, None)
     }
 }
 
