@@ -1047,9 +1047,15 @@ pub enum BuildError {
     /// of that interval — the hyperpriors admit `0`, the initial values and
     /// `tol` do not — and a variant per parameter would be six variants saying
     /// the same thing. Rejected at `build()` (data-INDEPENDENT, the D-08 split).
+    ///
+    /// Despite the name it is the GENERIC named-scalar-bound rejection, and
+    /// `SpectralClustering` reuses it for the `pairwise_kernels` extras it
+    /// forwards (`degree >= 0`, `coef0` finite) for the same reason: the bound
+    /// differs per parameter and the rendered message already names both.
     #[error("estimator '{estimator}': {param} = {value} is invalid (must be finite and {bound})")]
     InvalidHyperprior {
-        /// Which estimator's builder rejected the value (`"bayesian_ridge"`).
+        /// Which estimator's builder rejected the value (e.g.
+        /// `"bayesian_ridge"` / `"spectral_clustering"`).
         estimator: &'static str,
         /// The sklearn parameter name, so the message names what the caller set.
         param: &'static str,

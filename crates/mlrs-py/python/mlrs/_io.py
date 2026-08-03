@@ -23,9 +23,28 @@ around every ``_mlrs`` delegate:
 pure-Python layer is importable and unit-testable before ``maturin develop``.
 """
 
+import inspect
+
 import numpy as np
 import pyarrow as pa
 from sklearn.utils import check_array
+
+
+# ``check_array``'s finiteness keyword was renamed ``force_all_finite`` ->
+# ``ensure_all_finite`` in sklearn 1.6, and the old name was REMOVED in 1.9.
+# Resolve it once from the signature rather than with a ``try/except TypeError``
+# around the call: ``check_array`` raises ``TypeError`` for legitimate reasons of
+# its own (a dtype it cannot handle is the case sklearn's own
+# ``check_dtype_object`` estimator check exercises), and catching that in order to
+# retry with the other keyword REPLACED the real, informative error with
+# "check_array() got an unexpected keyword argument 'force_all_finite'" on every
+# mlrs estimator. Probing the signature keeps the compatibility shim without
+# putting an exception handler in front of real errors.
+_FINITE_KW = (
+    "ensure_all_finite"
+    if "ensure_all_finite" in inspect.signature(check_array).parameters
+    else "force_all_finite"
+)
 
 # The narrowed output_type set (D-03): mlrs mirrors numpy and pyarrow only,
 # unlike cuML's wider cudf/cupy/numba set.
@@ -90,24 +109,13 @@ def normalize_X(X, *, dtype=None, ensure_all_finite=True):
     """
     if dtype is None:
         dtype = pick_dtype(X)
-    # check_array(force_all_finite is renamed ensure_all_finite in sklearn>=1.6;
-    # pass ensure_all_finite for forward compat, fall back for older sklearn).
-    try:
-        arr = check_array(
-            X,
-            ensure_all_finite=ensure_all_finite,
-            ensure_2d=True,
-            dtype=dtype,
-            copy=False,
-        )
-    except TypeError:  # pragma: no cover - pre-1.6 sklearn fallback
-        arr = check_array(
-            X,
-            force_all_finite=ensure_all_finite,
-            ensure_2d=True,
-            dtype=dtype,
-            copy=False,
-        )
+    arr = check_array(
+        X,
+        ensure_2d=True,
+        dtype=dtype,
+        copy=False,
+        **{_FINITE_KW: ensure_all_finite},
+    )
     rows, cols = int(arr.shape[0]), int(arr.shape[1])
     # FRESH contiguous row-major buffer — never a slice of a larger array.
     flat = np.ascontiguousarray(arr, dtype=dtype).ravel(order="C")
@@ -128,24 +136,13 @@ def normalize_y(y, *, dtype):
     run sklearn ``check_array(ensure_all_finite=True, ensure_2d=False)`` so a
     NaN/Inf ``y`` raises the same sklearn-standard ``ValueError`` as ``X`` does.
     """
-    # check_array(force_all_finite is renamed ensure_all_finite in sklearn>=1.6;
-    # pass ensure_all_finite for forward compat, fall back for older sklearn).
-    try:
-        checked = check_array(
-            y,
-            ensure_all_finite=True,
-            ensure_2d=False,
-            dtype=dtype,
-            copy=False,
-        )
-    except TypeError:  # pragma: no cover - pre-1.6 sklearn fallback
-        checked = check_array(
-            y,
-            force_all_finite=True,
-            ensure_2d=False,
-            dtype=dtype,
-            copy=False,
-        )
+    checked = check_array(
+        y,
+        ensure_2d=False,
+        dtype=dtype,
+        copy=False,
+        **{_FINITE_KW: True},
+    )
     arr = np.ascontiguousarray(checked, dtype=dtype).ravel(order="C")
     return pa.array(arr, type=_arrow_float_type(dtype))
 

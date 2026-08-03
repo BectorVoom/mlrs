@@ -19,6 +19,14 @@
 //!   - `reject_oversize` — `n_samples > 64` → `AlgoError::NSamplesExceedsMaxDim`
 //!     BEFORE any device work (D-06): a live `fit(n=65)` rejection.
 //!
+//! SPECTRAL-PERF-CPU adds the LANCZOS-arm cases. Everything above runs at n=12,
+//! entirely on the dense `sym_eig` route, so the thick-restart Lanczos the host
+//! pipeline uses above `spectral_host::DENSE_N` had no oracle at all:
+//!   - `spectral_embedding_large_knn` — n=800, sparse kNN affinity, f64 strict.
+//!   - `spectral_embedding_large_rbf` — n=700, dense rbf affinity, f64 strict.
+//!   - `lanczos_matches_dense` — the two solvers on the SAME Laplacian at
+//!     `n = DENSE_N + 8`, agreeing to ~1e-8 (solver isolation, no sklearn).
+//!
 //! f64 carries the `skip_f64_with_log` gate verbatim; f32 runs at the documented
 //! `SE_F32_BAND` (~1e-4, Pitfall 7). Per AGENTS.md §2 tests live in
 //! `crates/mlrs-algos/tests/`.
@@ -29,7 +37,6 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::cluster::SpectralEmbedding;
-use mlrs_algos::error::AlgoError;
 use mlrs_algos::typestate::Fit;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -76,7 +83,7 @@ fn f64_to<F: Pod>(v: f64) -> F {
 
 /// Fit a `SpectralEmbedding` of the requested affinity on the fixture's `X` and
 /// return the host `embedding_` (row-major `n × n_components`).
-fn fit_embedding<F>(case: &OracleCase, affinity: &str, n_neighbors: usize) -> Vec<f64>
+fn fit_embedding<F>(case: &OracleCase, affinity: &str, n_neighbors: Option<usize>) -> Vec<f64>
 where
     F: Float + CubeElement + Pod,
 {
@@ -220,7 +227,7 @@ fn spectral_embedding() {
     }
     let case = load_npz(fixture("spectral_embedding_f64_seed42.npz"))
         .expect("load spectral_embedding_f64");
-    let got = fit_embedding::<f64>(&case, "rbf", 0);
+    let got = fit_embedding::<f64>(&case, "rbf", None);
     let max_abs = assert_close_sign_aligned(
         &got,
         case.expect_f64("embedding"),
@@ -241,7 +248,7 @@ fn spectral_embedding_f32() {
     capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
     let case = load_npz(fixture("spectral_embedding_f32_seed42.npz"))
         .expect("load spectral_embedding_f32");
-    let got = fit_embedding::<f32>(&case, "rbf", 0);
+    let got = fit_embedding::<f32>(&case, "rbf", None);
     let max_abs = assert_close_sign_aligned(
         &got,
         case.expect_f64("embedding"),
@@ -275,7 +282,7 @@ fn knn_affinity() {
     let case = load_npz(fixture("spectral_embedding_f64_seed42.npz"))
         .expect("load spectral_embedding_f64");
     let n_neighbors = case.expect_f64("n_neighbors")[0] as usize;
-    let got = fit_embedding::<f64>(&case, "nearest_neighbors", n_neighbors);
+    let got = fit_embedding::<f64>(&case, "nearest_neighbors", Some(n_neighbors));
     let max_abs = assert_close_sign_aligned(
         &got,
         case.expect_f64("embedding_knn"),
@@ -302,7 +309,7 @@ fn subspace() {
     }
     let case = load_npz(fixture("spectral_embedding_degenerate_f64_seed42.npz"))
         .expect("load spectral_embedding_degenerate_f64");
-    let got = fit_embedding::<f64>(&case, "rbf", 0);
+    let got = fit_embedding::<f64>(&case, "rbf", None);
     let expected = case.expect_f64("embedding");
     let mismatch = subspace_mismatch(&got, expected, N_SAMPLES, N_COMPONENTS);
     println!("spectral_embedding subspace f64 mismatch (1 - σ_min) = {mismatch:e}");
@@ -313,51 +320,487 @@ fn subspace() {
     );
 }
 
-/// 9-SE-04: `n_samples > 64` is rejected with `AlgoError::NSamplesExceedsMaxDim`
-/// BEFORE any device work (D-06). A live `fit(n=65)` must return the typed
-/// spectral-cap error without any affinity / Laplacian / eig launch.
+/// 9-SE-04 (REPLACED by SPECTRAL-PERF-CPU): `n_samples = 65` used to be rejected
+/// with `AlgoError::NSamplesExceedsMaxDim`, because the dense cyclic-Jacobi `eig`
+/// kernel stages `MAX_DIM x MAX_DIM` shared memory and so caps `n <= 64`. The
+/// host pipeline has no such cap, and this test is the live proof: the SAME
+/// `fit(n = 65)` that the old assertion required to fail must now SUCCEED and
+/// return a finite `n x n_components` embedding.
+///
+/// The geometry is a 1-D lattice with a distinct coordinate per sample, so the
+/// kNN graph is a connected path and the spectrum is non-degenerate.
 #[test]
-fn reject_oversize() {
+fn large_n_is_no_longer_capped() {
     let _ = env_logger::builder().is_test(true).try_init();
+    if capability::skip_f64_with_log() {
+        return;
+    }
     let client = runtime::active_client();
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
-    // 65 samples > MAX_DIM (64). The buffer is the minimal n×d the geometry guard
-    // accepts; the cap guard fires FIRST so no device kernel runs.
     let n = 65usize;
-    let d = 3usize;
-    let x_host: Vec<f64> = vec![0.0; n * d];
+    let d = 1usize;
+    let x_host: Vec<f64> = (0..n).map(|i| i as f64).collect();
     let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
 
     let se = SpectralEmbedding::<f64>::builder()
         .n_components(N_COMPONENTS)
-        .affinity("rbf".to_string())
-        .gamma(None)
-        .n_neighbors(0)
+        .affinity("nearest_neighbors".to_string())
+        .n_neighbors(Some(5))
         .build::<f64>()
         .expect("SpectralEmbedding build with valid hyperparameters");
-    let err = match se.fit(&mut pool, &x_dev, None, (n, d)) {
-        Ok(_) => panic!("fit(n=65) must reject before any device work"),
-        Err(e) => e,
-    };
+    let fitted = se
+        .fit(&mut pool, &x_dev, None, (n, d))
+        .expect("fit(n = 65) must succeed now that the MAX_DIM cap is gone");
 
-    let msg = err.to_string();
-    match err {
-        AlgoError::NSamplesExceedsMaxDim {
-            estimator,
-            n_samples,
-            max,
-        } => {
-            assert_eq!(estimator, "spectral_embedding");
-            assert_eq!(n_samples, 65);
-            assert_eq!(max, 64);
-            assert!(
-                msg.contains("65") && msg.contains("64") && msg.contains("MAX_DIM"),
-                "NSamplesExceedsMaxDim message must name n_samples + the cap: {msg}"
-            );
-        }
-        other => panic!("expected NSamplesExceedsMaxDim, got {other:?}"),
+    let emb = fitted.embedding(&pool);
+    assert_eq!(emb.len(), n * N_COMPONENTS, "embedding_ must be n x n_components");
+    assert!(
+        emb.iter().all(|v| v.is_finite()),
+        "embedding_ must be finite"
+    );
+    // A path graph is connected, so the Laplacian has exactly one zero
+    // eigenvalue and the kept (non-trivial) columns cannot be constant.
+    assert_eq!(fitted.n_graph_components(), 1, "the path graph is connected");
+    for c in 0..N_COMPONENTS {
+        let col: Vec<f64> = (0..n).map(|i| emb[i * N_COMPONENTS + c]).collect();
+        let lo = col.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            hi - lo > 1e-9,
+            "embedding column {c} is constant — the solver returned a trivial vector"
+        );
     }
+}
+
+/// SPECTRAL-PERF-CPU: sklearn resolves `n_neighbors=None` to
+/// `max(int(n_samples / 10), 1)` — TRUNCATING division, floored at 1. The
+/// pre-rewrite implementation hard-coded `10`, so it built a DIFFERENT graph from
+/// sklearn's on every input with `n_samples != 100`. Pin the resolution rule.
+#[test]
+fn n_neighbors_none_resolves_like_sklearn() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    for (n, expect) in [(6usize, 1usize), (40, 4), (100, 10), (255, 25)] {
+        let x_host: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_host);
+        let se = SpectralEmbedding::<f64>::builder()
+            .n_components(1)
+            .build::<f64>()
+            .expect("default SpectralEmbedding build");
+        let fitted = se
+            .fit(&mut pool, &x_dev, None, (n, 1))
+            .expect("fit with the default n_neighbors");
+        assert_eq!(
+            fitted.n_neighbors_(),
+            Some(expect),
+            "n_neighbors_ for n_samples = {n} must be max(n/10, 1) = {expect}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SPECTRAL-PERF-CPU — the LANCZOS arm (n_samples > spectral_host::DENSE_N)
+// ---------------------------------------------------------------------------
+//
+// Every fixture above is n=12, i.e. entirely on the dense `sym_eig` route. The
+// three tests below are the first coverage of the thick-restart Lanczos arm:
+// two sklearn value-matches (one sparse kNN affinity, one dense rbf one) and a
+// direct dense-vs-Lanczos equivalence check on a SINGLE shared operator.
+//
+// Both fixtures were generated only after `scripts/gen_oracle.py` verified, and
+// asserted, that (a) the affinity graph is CONNECTED and (b) every consecutive
+// gap over the kept part of the Laplacian spectrum exceeds 1e-3 — without both,
+// the retained eigenspace is defined only up to a rotation and a per-element
+// comparison against sklearn is meaningless. The verified spectra are committed
+// in each fixture's `eigs` array and re-checked here.
+
+/// `spectral_embedding_large_f64.npz` geometry (gen_oracle.py `SE_LARGE_*`).
+const LARGE_N: usize = 800;
+const LARGE_D: usize = 8;
+const LARGE_COMPONENTS: usize = 3;
+
+/// `spectral_embedding_large_rbf_f64.npz` geometry (gen_oracle.py
+/// `SE_LARGE_RBF_*`).
+const LARGE_RBF_N: usize = 700;
+const LARGE_RBF_D: usize = 6;
+const LARGE_RBF_COMPONENTS: usize = 2;
+
+/// Smallest consecutive eigenvalue gap `gen_oracle.py` accepted over the kept
+/// spectrum (`SE_LARGE_MIN_GAP`). Re-asserted from the committed `eigs` so a
+/// regenerated fixture that quietly went degenerate fails HERE, loudly, instead
+/// of producing a mysterious value mismatch.
+const LARGE_MIN_GAP: f64 = 1e-3;
+
+/// Fit a `SpectralEmbedding` on a fixture of arbitrary geometry and return the
+/// host `embedding_` (row-major `n × n_components`).
+///
+/// Uses [`SpectralEmbedding::fit_from_host_slice`] — the no-upload arm the
+/// estimator's own `host_fit_applicable` always selects — rather than the
+/// `DeviceArray` `Fit::fit` the small fixtures above use; both funnel into the
+/// same `fit_host_core`, and at n=800 there is no reason to pay the round trip.
+fn fit_embedding_shaped(
+    case: &OracleCase,
+    affinity: &str,
+    n_neighbors: Option<usize>,
+    shape: (usize, usize),
+    n_components: usize,
+) -> Vec<f64> {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_host: Vec<f64> = case.expect_f64("X").to_vec();
+    assert_eq!(
+        x_host.len(),
+        shape.0 * shape.1,
+        "fixture X must be {} x {}",
+        shape.0,
+        shape.1
+    );
+
+    let se = SpectralEmbedding::<f64>::builder()
+        .n_components(n_components)
+        .affinity(affinity.to_string())
+        // gamma=None → 1/n_features at fit (D-04); the kNN path ignores it.
+        .gamma(None)
+        .n_neighbors(n_neighbors)
+        .build::<f64>()
+        .expect("SpectralEmbedding build with valid hyperparameters");
+    let se = se
+        .fit_from_host_slice(&mut pool, &x_host, shape)
+        .expect("SpectralEmbedding::fit_from_host_slice on a valid shape");
+
+    assert_eq!(
+        se.n_graph_components(),
+        1,
+        "the fixture's affinity graph must be connected (gen_oracle.py asserts \
+         it too) — a disconnected graph makes the kept eigenspace ambiguous"
+    );
+    se.embedding(&pool)
+}
+
+/// Assert the committed Laplacian spectrum is non-degenerate over the kept
+/// range, i.e. that the fixture is still a valid per-element oracle. Returns the
+/// smallest observed gap for the printed record.
+fn assert_spectrum_separated(eigs: &[f64], nev: usize, what: &str) -> f64 {
+    assert!(
+        eigs.len() >= nev + 1,
+        "{what}: fixture must commit at least nev+1 = {} eigenvalues, got {}",
+        nev + 1,
+        eigs.len()
+    );
+    let mut min_gap = f64::INFINITY;
+    for r in 0..nev {
+        let gap = eigs[r + 1] - eigs[r];
+        min_gap = min_gap.min(gap);
+    }
+    assert!(
+        min_gap > LARGE_MIN_GAP,
+        "{what}: smallest kept eigenvalue gap {min_gap:e} <= {LARGE_MIN_GAP:e} — \
+         the retained eigenspace is (near-)degenerate and this fixture cannot be \
+         value-matched element by element"
+    );
+    min_gap
+}
+
+/// SPECTRAL-PERF-CPU: the LANCZOS arm reproduces sklearn on a SPARSE kNN
+/// affinity. `n_samples = 800 > DENSE_N = 512`, so `smallest_laplacian_vectors`
+/// routes to `lanczos_largest`, not to the dense `sym_eig` every other spectral
+/// fixture exercises. f64 strict `F64_TOL`.
+#[test]
+fn spectral_embedding_large_knn() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
+    if capability::skip_f64_with_log() {
+        println!("spectral_embedding_large knn f64 backend={backend}: SKIPPED (no f64 support)");
+        return;
+    }
+    assert!(
+        LARGE_N > mlrs_algos::cluster::spectral_host::DENSE_N,
+        "the large kNN fixture must sit ABOVE the dense/Lanczos threshold"
+    );
+    let case = load_npz(fixture("spectral_embedding_large_f64.npz"))
+        .expect("load spectral_embedding_large_f64");
+
+    // drop_first=True → the solver is asked for n_components + 1 eigenvectors.
+    let nev = LARGE_COMPONENTS + 1;
+    let min_gap = assert_spectrum_separated(
+        case.expect_f64("eigs"),
+        nev,
+        "spectral_embedding_large knn",
+    );
+
+    let n_neighbors = case.expect_f64("n_neighbors")[0] as usize;
+    let got = fit_embedding_shaped(
+        &case,
+        "nearest_neighbors",
+        Some(n_neighbors),
+        (LARGE_N, LARGE_D),
+        LARGE_COMPONENTS,
+    );
+    let max_abs = assert_close_sign_aligned(
+        &got,
+        case.expect_f64("embedding"),
+        LARGE_N,
+        LARGE_COMPONENTS,
+        &F64_TOL,
+        "spectral_embedding_large knn f64",
+    );
+    println!(
+        "spectral_embedding_large knn f64 (n={LARGE_N}, k={n_neighbors}, Lanczos) \
+         max_abs_err = {max_abs:e}, min eigenvalue gap = {min_gap:e}"
+    );
+}
+
+/// SPECTRAL-PERF-CPU: the LANCZOS arm reproduces sklearn on a DENSE rbf
+/// affinity — the same solver, but driving the dense matvec rather than the CSR
+/// one. `n_samples = 700 > DENSE_N = 512`; `gamma=None → 1/n_features` (D-04).
+#[test]
+fn spectral_embedding_large_rbf() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
+    if capability::skip_f64_with_log() {
+        println!("spectral_embedding_large rbf f64 backend={backend}: SKIPPED (no f64 support)");
+        return;
+    }
+    assert!(
+        LARGE_RBF_N > mlrs_algos::cluster::spectral_host::DENSE_N,
+        "the large rbf fixture must sit ABOVE the dense/Lanczos threshold"
+    );
+    let case = load_npz(fixture("spectral_embedding_large_rbf_f64.npz"))
+        .expect("load spectral_embedding_large_rbf_f64");
+
+    let nev = LARGE_RBF_COMPONENTS + 1;
+    let min_gap = assert_spectrum_separated(
+        case.expect_f64("eigs"),
+        nev,
+        "spectral_embedding_large rbf",
+    );
+
+    let got = fit_embedding_shaped(
+        &case,
+        "rbf",
+        None,
+        (LARGE_RBF_N, LARGE_RBF_D),
+        LARGE_RBF_COMPONENTS,
+    );
+    let max_abs = assert_close_sign_aligned(
+        &got,
+        case.expect_f64("embedding"),
+        LARGE_RBF_N,
+        LARGE_RBF_COMPONENTS,
+        &F64_TOL,
+        "spectral_embedding_large rbf f64",
+    );
+    println!(
+        "spectral_embedding_large rbf f64 (n={LARGE_RBF_N}, gamma=1/{LARGE_RBF_D}, \
+         Lanczos) max_abs_err = {max_abs:e}, min eigenvalue gap = {min_gap:e}"
+    );
+}
+
+/// SPECTRAL-PERF-CPU: the two solvers agree on the SAME operator.
+///
+/// The sklearn value tests above check the whole pipeline end to end; this one
+/// isolates the solver. It builds ONE `NormAdj` at `n = DENSE_N + 8` — just past
+/// the routing threshold, so it is exactly the regime where the choice flips —
+/// and hands its Laplacian to BOTH arms:
+///
+/// - the dense route: `sym_eig(dense_laplacian)`, taking the `nev` SMALLEST
+///   eigenpairs (columns `n-1-r`, since `sym_eig` is descending);
+/// - the iterative route: `lanczos_largest`, whose `nev` largest eigenvectors of
+///   `S = 2I − L` are those same eigenvectors.
+///
+/// Agreement to ~1e-8 is far tighter than the 1e-5 oracle band, and any real
+/// defect in the restart, the arrow coupling, or the reorthogonalization shows
+/// up here as a per-vector disagreement rather than as a diffuse end-to-end
+/// error. The dense eigenvalues also gate the comparison: a degenerate pair
+/// would make it vacuous, so the gaps are asserted first.
+#[test]
+fn lanczos_matches_dense() {
+    use mlrs_algos::cluster::spectral_affinity::{build_affinity, AffinityKind};
+    use mlrs_algos::cluster::spectral_host::{lanczos_largest, NormAdj, DENSE_N};
+    use mlrs_algos::linear::sym_eig::sym_eig;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    if capability::skip_f64_with_log() {
+        return;
+    }
+
+    // Just past the threshold, so the operator is the smallest one the Lanczos
+    // arm ever actually sees in production.
+    let n = DENSE_N + 8;
+    let d = 4usize;
+    let nev = 4usize;
+    let k = 10usize;
+
+    // Deterministic pseudo-random cloud (the SplitMix64 mixer, so the test owns
+    // its data and needs no fixture). A generic cloud in 4-D at k=10 gives a
+    // connected graph with a well-separated low spectrum, which the eigenvalue
+    // assertions below verify rather than assume.
+    let mut s: u64 = 0x5EED_1234_ABCD_0001;
+    let mut x = vec![0.0f64; n * d];
+    for v in x.iter_mut() {
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        *v = ((z >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+    }
+
+    let aff = build_affinity(&AffinityKind::NearestNeighbors, &x, n, d, k);
+    let op = NormAdj::new(aff, n);
+
+    // --- dense arm ---
+    let l = op.dense_laplacian();
+    let (w, v) = sym_eig(&l, n);
+    // `sym_eig` is DESCENDING, so the r-th SMALLEST eigenvalue is `w[n-1-r]`.
+    let small: Vec<f64> = (0..=nev).map(|r| w[n - 1 - r]).collect();
+    let mut min_gap = f64::INFINITY;
+    for r in 0..nev {
+        min_gap = min_gap.min(small[r + 1] - small[r]);
+    }
+    println!(
+        "lanczos_matches_dense: n={n}, smallest {} eigenvalues = {:?}",
+        nev + 1,
+        small
+    );
+    assert!(
+        min_gap > 1e-4,
+        "the test operator's low spectrum is (near-)degenerate (min gap \
+         {min_gap:e}) — the eigenvectors would be defined only up to a rotation \
+         and this comparison would be vacuous"
+    );
+
+    // --- iterative arm ---
+    let got = lanczos_largest(&op, nev, 0);
+    assert_eq!(got.len(), nev * n, "lanczos_largest returns nev columns of n");
+
+    let mut max_abs = 0.0f64;
+    for r in 0..nev {
+        let c = n - 1 - r;
+        // Each eigenvector is defined up to a global sign; align on the dot
+        // product before comparing, as the embedding tests do per column.
+        let mut dot = 0.0f64;
+        for i in 0..n {
+            dot += got[r * n + i] * v[i * n + c];
+        }
+        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+        for i in 0..n {
+            let g = sign * got[r * n + i];
+            let e = v[i * n + c];
+            assert!(g.is_finite(), "lanczos eigenvector {r} entry {i} is not finite");
+            max_abs = max_abs.max((g - e).abs());
+        }
+    }
+    println!(
+        "lanczos_matches_dense: max |lanczos - dense| over {nev} eigenvectors = \
+         {max_abs:e} (min eigenvalue gap {min_gap:e})"
+    );
+    assert!(
+        max_abs <= 1e-8,
+        "the Lanczos arm disagrees with the dense sym_eig on the SAME Laplacian \
+         by {max_abs:e} (> 1e-8) — the two solvers must return the same \
+         eigenvectors, so this is a solver defect, not a tolerance question"
+    );
+}
+
+/// SPECTRAL-PERF-CPU: the dense/Lanczos equivalence across the WHOLE range the
+/// routing constant could plausibly be set to.
+///
+/// `lanczos_matches_dense` pins one order just past the threshold. This sweeps
+/// `n = 65 … 300` — the band that used to take the dense arm, before it was
+/// measured at 4.6x slower than Lanczos already at `n = 120` and `DENSE_N` was
+/// lowered to 64. Lowering that constant is only free if the two arms agree
+/// everywhere in the band it gave up, so this test is the evidence for the
+/// constant's value, not merely a smoke check. The upper end stops at 300
+/// because the DENSE arm is `O(n³)` in an unoptimized test build — the same
+/// sweep run to `n = 511` agrees to 2.0e-14 but costs ~70 s of the run, and the
+/// band above 300 is already covered by the two large sklearn oracles (n=700
+/// rbf, n=800 kNN), which exercise the Lanczos arm directly.
+///
+/// Both arms are driven through the ONE public entry point
+/// [`smallest_laplacian_vectors`], with `MLRS_SPECTRAL_DENSE_N` forced via the
+/// thread-local `abflag` override. That is deliberate: forcing through the real
+/// dispatcher is what makes the test exercise the routing rather than two
+/// hand-called solvers, and the thread-local override (rather than
+/// `std::env::set_var`) is what keeps a sibling test from silently forcing the
+/// same knob and turning this into a comparison of one arm against itself.
+#[test]
+fn lanczos_matches_dense_across_orders() {
+    use mlrs_algos::cluster::spectral_affinity::{build_affinity, AffinityKind};
+    use mlrs_algos::cluster::spectral_host::{smallest_laplacian_vectors, NormAdj};
+
+    let _ = env_logger::builder().is_test(true).try_init();
+    if capability::skip_f64_with_log() {
+        return;
+    }
+
+    let mut worst = 0.0f64;
+    for &(n, d, nev) in &[
+        (65usize, 4usize, 3usize),
+        (100, 5, 4),
+        (128, 8, 3),
+        (200, 8, 3),
+        (300, 10, 5),
+    ] {
+        let mut s: u64 = 0xA5A5_0000_1234_5678 ^ (n as u64);
+        let mut x = vec![0.0f64; n * d];
+        for v in x.iter_mut() {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            *v = ((z >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+        }
+        let k = (n / 10).max(2);
+        let aff = build_affinity(&AffinityKind::NearestNeighbors, &x, n, d, k);
+        // A disconnected graph has one zero eigenvalue per component, which makes
+        // the kept eigenvectors arbitrary within a degenerate null space and the
+        // comparison below vacuous. Assert connectivity rather than hope for it.
+        assert_eq!(
+            mlrs_algos::cluster::spectral_host::connected_components(&aff, n),
+            1,
+            "n={n}: the test graph must be connected for an elementwise \
+             eigenvector comparison to mean anything"
+        );
+        let op = NormAdj::new(aff, n);
+
+        let dense = {
+            let _g = mlrs_backend::abflag::force("MLRS_SPECTRAL_DENSE_N", "100000");
+            smallest_laplacian_vectors(&op, nev, 0)
+        };
+        let lanczos = {
+            let _g = mlrs_backend::abflag::force("MLRS_SPECTRAL_DENSE_N", "0");
+            smallest_laplacian_vectors(&op, nev, 0)
+        };
+
+        let mut max_abs = 0.0f64;
+        for r in 0..nev {
+            let (a, b) = (&dense[r * n..(r + 1) * n], &lanczos[r * n..(r + 1) * n]);
+            let dot: f64 = a.iter().zip(b.iter()).map(|(p, q)| p * q).sum();
+            let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+            for (p, q) in a.iter().zip(b.iter()) {
+                max_abs = max_abs.max((p - sign * q).abs());
+            }
+        }
+        println!("lanczos_matches_dense n={n} d={d} nev={nev}: max_abs_err = {max_abs:e}");
+        assert!(
+            max_abs <= 1e-8,
+            "n={n}: the dense and Lanczos arms disagree by {max_abs:e} (> 1e-8) — \
+             DENSE_N cannot be lowered past this order"
+        );
+        worst = worst.max(max_abs);
+    }
+    println!("lanczos_matches_dense_across_orders: worst = {worst:e}");
 }
 
 /// BLDR-01: `SpectralEmbedding::new()` (the single-source defaults) equals

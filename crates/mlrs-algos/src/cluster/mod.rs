@@ -44,6 +44,13 @@ pub mod kmeans;
 // `drop_first` param) + the `host_to_f64`/`f64_to_host` bytemuck pair, formerly
 // duplicated verbatim across spectral_embedding / spectral_clustering.
 pub(crate) mod spectral;
+// SPECTRAL-PERF-CPU — the host (CPU) spectral solver shared by both estimators:
+// a sparse kNN affinity that is never densified, the scipy/sklearn normalized
+// Laplacian, and a thick-restart Lanczos for just the smallest `n_components + 1`
+// eigenpairs. This is what lifts the `n_samples <= 64` dense-Jacobi cap off the
+// whole spectral family.
+pub mod spectral_affinity;
+pub mod spectral_host;
 pub mod spectral_clustering;
 pub mod spectral_embedding;
 

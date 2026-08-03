@@ -7,6 +7,8 @@ Rust ``seed`` only at the ``_mlrs`` boundary inside ``fit``. DBSCAN has NO
 standalone ``predict`` (algos D-08) — only ``fit`` + ``labels_``.
 """
 
+import warnings
+
 import numpy as np
 from sklearn.base import ClusterMixin, TransformerMixin
 
@@ -171,44 +173,90 @@ class AgglomerativeClustering(ClusterMixin, MlrsBase):
 class SpectralClustering(ClusterMixin, MlrsBase):
     """Spectral clustering (SPECTRAL-02).
 
-    sklearn ``random_state`` is stored verbatim and mapped to the Rust ``seed``
-    only at the ``_mlrs`` boundary inside ``fit`` (``None`` -> a fixed default
-    seed). No standalone ``predict`` — labels-only (``fit`` + ``labels_``).
-    Defaults mirror ``PySpectralClustering`` ``#[new]`` at spectral.rs:313-314.
+    Mirrors ``sklearn.cluster.SpectralClustering``'s parameter surface. Labels
+    match sklearn up to a permutation of the label ids, which is inherent to
+    clustering — score with ``adjusted_rand_score``, never by comparing ids.
+
+    ``ClusterMixin`` supplies ``fit_predict``. There is no standalone
+    ``predict``: like sklearn's, this estimator is transductive.
+
+    ``kernel_params`` is deliberately not exposed. sklearn overwrites
+    ``params["gamma"|"degree"|"coef0"]`` from the estimator's own attributes for
+    any non-callable affinity and then calls ``pairwise_kernels`` with
+    ``filter_params=True``, which drops every key outside those three — so for a
+    string affinity the parameter is provably a no-op, and callable affinities
+    are out of scope here.
     """
 
     def __init__(
         self,
         n_clusters=8,
+        *,
+        eigen_solver=None,
         n_components=None,
-        affinity="rbf",
-        gamma=1.0,
-        n_neighbors=10,
         random_state=None,
+        n_init=10,
+        gamma=1.0,
+        affinity="rbf",
+        n_neighbors=10,
+        eigen_tol="auto",
+        assign_labels="kmeans",
+        degree=3,
+        coef0=1,
+        n_jobs=None,
+        verbose=False,
         output_type="input",
     ):
         self.n_clusters = n_clusters
+        self.eigen_solver = eigen_solver
         self.n_components = n_components
-        self.affinity = affinity
-        self.gamma = gamma
-        self.n_neighbors = n_neighbors
         self.random_state = random_state
+        self.n_init = n_init
+        self.gamma = gamma
+        self.affinity = affinity
+        self.n_neighbors = n_neighbors
+        self.eigen_tol = eigen_tol
+        self.assign_labels = assign_labels
+        self.degree = degree
+        self.coef0 = coef0
+        self.n_jobs = n_jobs
+        self.verbose = verbose
         self.output_type = output_type
 
     def fit(self, X, y=None):
         xa, rows, cols = self._normalize(X)
-        seed = 0 if self.random_state is None else int(self.random_state)
+        # sklearn's ``eigen_tol`` is a ``float | "auto"`` union; the Rust side
+        # takes one type, so "auto" maps to None here rather than being
+        # re-parsed from a PyAny across the boundary.
+        tol = None if self.eigen_tol == "auto" else self.eigen_tol
+        seed = None if self.random_state is None else int(self.random_state)
         obj = self._ext().SpectralClustering(
             self.n_clusters,
+            self.eigen_solver,
             self.n_components,
-            self.affinity,
-            self.gamma,
-            self.n_neighbors,
             seed,
+            self.n_init,
+            self.gamma,
+            self.affinity,
+            self.n_neighbors,
+            tol,
+            self.assign_labels,
+            float(self.degree),
+            float(self.coef0),
+            self.n_jobs,
+            bool(self.verbose),
         )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
         self._post_fit(cols)
+        self._n_rows = rows
+        # sklearn emits this from ``_spectral_embedding`` and then changes
+        # nothing at all; reproduce the warning and its advisory-only nature.
+        if obj.n_graph_components() > 1:
+            warnings.warn(
+                "Graph is not fully connected, spectral embedding may not "
+                "work as expected."
+            )
         return self
 
     @property
@@ -216,39 +264,110 @@ class SpectralClustering(ClusterMixin, MlrsBase):
         self._check_fitted()
         return self._to_output(self._mlrs_obj.labels_(), (-1,), None, np.int32)
 
+    @property
+    def affinity_matrix_(self):
+        """The fitted affinity graph.
+
+        A ``scipy.sparse.csr_matrix`` for the kNN affinities and a dense
+        ``numpy`` array for the kernel / precomputed ones — the same split
+        sklearn produces, and the reason the kNN path can be fitted at sample
+        counts where an ``n x n`` dense matrix would not fit in memory.
+        """
+        self._check_fitted()
+        csr = self._mlrs_obj.affinity_matrix_csr()
+        n = self._n_rows
+        if csr is not None:
+            from scipy.sparse import csr_matrix
+
+            indptr, indices, data = csr
+            return csr_matrix(
+                (
+                    np.asarray(data, dtype=np.float64),
+                    np.asarray(indices, dtype=np.int32),
+                    np.asarray(indptr, dtype=np.int32),
+                ),
+                shape=(n, n),
+            )
+        dense = self._mlrs_obj.affinity_matrix_dense()
+        return np.asarray(dense, dtype=np.float64).reshape(n, n)
+
 
 class SpectralEmbedding(TransformerMixin, MlrsBase):
     """Spectral embedding / Laplacian eigenmaps (SPECTRAL-01).
 
-    sklearn's ``SpectralEmbedding`` supports ``fit`` + ``fit_transform`` only
-    (no out-of-sample ``transform``); the embedding is materialized via the
-    ``embedding_`` fitted attribute. Defaults mirror ``PySpectralEmbedding``
-    ``#[new]`` at spectral.rs:121-122.
+    Mirrors ``sklearn.manifold.SpectralEmbedding``'s full parameter surface.
+    sklearn's estimator is transductive: it exposes ``fit`` + ``fit_transform``
+    + ``embedding_`` and deliberately NO out-of-sample ``transform``, and
+    neither does this.
+
+    Two sklearn behaviors are worth calling out because the pre-rewrite shim got
+    them wrong:
+
+    * ``n_neighbors=None`` resolves to ``max(n_samples // 10, 1)`` at fit —
+      truncating division, floored at 1. It is NOT a constant 10, so the graph
+      this builds now differs from what the old shim built on any input with
+      ``n_samples != 100``. Read the resolved value back from ``n_neighbors_``.
+    * ``gamma=None`` resolves to ``1 / n_features``, and ``gamma=0`` is legal
+      (sklearn's constraint is left-closed); only a negative or non-finite
+      ``gamma`` is rejected.
+
+    There is no longer any cap on ``n_samples``: the former implementation ran a
+    dense ``n x n`` Jacobi eigendecomposition on the device, which capped
+    ``n_samples <= 64``.
     """
 
     def __init__(
         self,
         n_components=2,
+        *,
         affinity="nearest_neighbors",
         gamma=None,
-        n_neighbors=10,
+        random_state=None,
+        eigen_solver=None,
+        eigen_tol="auto",
+        n_neighbors=None,
+        n_jobs=None,
         output_type="input",
     ):
         self.n_components = n_components
         self.affinity = affinity
         self.gamma = gamma
+        self.random_state = random_state
+        self.eigen_solver = eigen_solver
+        self.eigen_tol = eigen_tol
         self.n_neighbors = n_neighbors
+        self.n_jobs = n_jobs
         self.output_type = output_type
 
     def fit(self, X, y=None):
         xa, rows, cols = self._normalize(X)
+        # sklearn's ``eigen_tol`` is a ``float | "auto"`` union; the Rust side
+        # takes one type, so "auto" is mapped to None here rather than being
+        # re-parsed from a PyAny across the boundary.
+        tol = None if self.eigen_tol == "auto" else self.eigen_tol
+        seed = None if self.random_state is None else int(self.random_state)
         obj = self._ext().SpectralEmbedding(
-            self.n_components, self.affinity, self.gamma, self.n_neighbors
+            self.n_components,
+            self.affinity,
+            self.gamma,
+            seed,
+            self.eigen_solver,
+            tol,
+            self.n_neighbors,
+            self.n_jobs,
         )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
         self._post_fit(cols)
         self._n_rows = rows
+        # sklearn emits this from ``_spectral_embedding`` and then changes
+        # nothing at all; reproduce the warning, and the fact that it is
+        # advisory only.
+        if obj.n_graph_components() > 1:
+            warnings.warn(
+                "Graph is not fully connected, spectral embedding may not "
+                "work as expected."
+            )
         return self
 
     def fit_transform(self, X, y=None):
@@ -261,6 +380,60 @@ class SpectralEmbedding(TransformerMixin, MlrsBase):
         return self._to_output(
             out, (-1, self.n_components), None, self._np_float()
         )
+
+    @property
+    def affinity_matrix_(self):
+        """The fitted affinity graph.
+
+        Returns a ``scipy.sparse.csr_matrix`` for the kNN affinities and a dense
+        ``numpy`` array for the kernel / precomputed ones — the same split
+        sklearn produces, and the reason the kNN path can be fitted at sample
+        counts where an ``n x n`` dense matrix would not fit in memory.
+        """
+        self._check_fitted()
+        csr = self._mlrs_obj.affinity_matrix_csr()
+        n = self._n_rows
+        if csr is not None:
+            from scipy.sparse import csr_matrix
+
+            indptr, indices, data = csr
+            return csr_matrix(
+                (
+                    np.asarray(data, dtype=np.float64),
+                    np.asarray(indices, dtype=np.int32),
+                    np.asarray(indptr, dtype=np.int32),
+                ),
+                shape=(n, n),
+            )
+        dense = self._mlrs_obj.affinity_matrix_dense()
+        return np.asarray(dense, dtype=np.float64).reshape(n, n)
+
+    @property
+    def n_neighbors_(self):
+        """The resolved neighbor count. sklearn sets this attribute only on the
+        ``nearest_neighbors`` branch, so it raises ``AttributeError`` for the
+        other affinities exactly as sklearn does."""
+        self._check_fitted()
+        v = self._mlrs_obj.n_neighbors_resolved()
+        if v is None:
+            raise AttributeError(
+                "'SpectralEmbedding' object has no attribute 'n_neighbors_' "
+                f"(affinity={self.affinity!r} does not build a kNN graph)"
+            )
+        return int(v)
+
+    @property
+    def gamma_(self):
+        """The resolved kernel coefficient. Set only on a kernel affinity,
+        matching sklearn's attribute presence."""
+        self._check_fitted()
+        v = self._mlrs_obj.gamma_resolved()
+        if v is None:
+            raise AttributeError(
+                "'SpectralEmbedding' object has no attribute 'gamma_' "
+                f"(affinity={self.affinity!r} is not a kernel)"
+            )
+        return float(v)
 
 
 class HDBSCAN(ClusterMixin, MlrsBase):
