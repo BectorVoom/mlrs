@@ -24,7 +24,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_backend::capability::{self, FloatKind};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::svm_objective::{SvmEval, SvmObjective};
+use mlrs_backend::prims::svm_objective::{SvmDesign, SvmEval, SvmObjective};
 use mlrs_backend::runtime::{self, ActiveRuntime};
 use mlrs_core::{f64_to_host, PrimError};
 
@@ -145,7 +145,7 @@ where
 
     let obj = SvmObjective::<F>::new(
         &mut pool,
-        &x_dev,
+        SvmDesign::Device(&x_dev),
         (n, d),
         targets.to_vec(),
         intercept_scaling,
@@ -419,6 +419,121 @@ fn multi_worker_split_matches_reference_f32() {
     );
 }
 
+/// The evaluator is built ONCE per fit and evaluated 25-40 times — and on the
+/// cpu arm those evaluations now run on a PERSISTENT worker pool, so every
+/// dispatch after the first reuses threads that are parked on a barrier rather
+/// than freshly spawned.
+///
+/// That reuse is exactly what the single-evaluation cases above cannot see: a
+/// stale published task, a barrier epoch that fails to advance, or a partial
+/// accumulator that is not reset would all produce a CORRECT first evaluation
+/// and a wrong second one. This drives one objective through a sequence of
+/// distinct `w` values — sized to fan out ([`MULTI_N`]) — and checks EVERY
+/// evaluation against the direct reference, so a stale-dispatch bug fails here
+/// instead of silently corrupting an L-BFGS line search.
+///
+/// The `w` sequence is deliberately varied in sign and scale so the fraction of
+/// samples with a non-zero subgradient (the branch the fused pass skips) is
+/// different on each pass.
+#[test]
+fn repeated_evaluations_reuse_the_pool_correctly() {
+    let (n, d) = (MULTI_N, MULTI_D);
+    let d_aug = d + 1;
+    let x = uniform_pm1(4243, n * d);
+    let targets = pm1_targets(4457, n);
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_host: Vec<f32> = x.iter().map(|&v| f64_to_host::<f32>(v)).collect();
+    let obj = SvmObjective::<f32>::new(
+        &mut pool,
+        SvmDesign::Host(&x_host),
+        (n, d),
+        targets.clone(),
+        1.5,
+        true,
+    )
+    .expect("valid geometry");
+
+    for (pass, scale) in [0.0f64, 1.0, -0.25, 8.0, 1e-3, -3.0].iter().enumerate() {
+        let w: Vec<f64> = uniform_pm1(97 + pass as u64, d_aug)
+            .iter()
+            .map(|v| v * scale)
+            .collect();
+        let (want_loss, want_xtg) =
+            objective_ref(&x, n, d, &w, &targets, 1.5, true, squared_hinge);
+        let got = obj
+            .eval(&mut pool, &w, &(squared_hinge as fn(f64, f64) -> (f64, f64)))
+            .expect("eval accepts a d_aug-length w");
+        assert_rel(
+            got.data_loss,
+            want_loss,
+            1e-4,
+            &format!("pass {pass}: data_loss"),
+        );
+        assert_rel_slice(&got.xtg, &want_xtg, 1e-4, &format!("pass {pass}: xtg"));
+    }
+    obj.release_into(&mut pool);
+}
+
+/// The two design forms are the SAME operand: [`SvmDesign::Host`] exists only
+/// to skip copies the caller has already paid for, so an evaluation over a
+/// borrowed host slab must agree with one over the uploaded `DeviceArray`
+/// EXACTLY — not merely within a band. A divergence here would mean the
+/// no-upload ingress had changed the arithmetic rather than just the plumbing.
+#[test]
+fn host_and_device_designs_evaluate_identically() {
+    let (n, d) = (MULTI_N, MULTI_D);
+    let x = uniform_pm1(5051, n * d);
+    let targets = pm1_targets(5077, n);
+    let w = uniform_pm1(5099, d + 1);
+    let loss = squared_hinge as fn(f64, f64) -> (f64, f64);
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_host: Vec<f32> = x.iter().map(|&v| f64_to_host::<f32>(v)).collect();
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
+
+    let from_dev = {
+        let o = SvmObjective::<f32>::new(
+            &mut pool,
+            SvmDesign::Device(&x_dev),
+            (n, d),
+            targets.clone(),
+            1.5,
+            true,
+        )
+        .expect("valid geometry");
+        let ev = o.eval(&mut pool, &w, &loss).expect("valid w");
+        o.release_into(&mut pool);
+        ev
+    };
+    let from_host = {
+        let o = SvmObjective::<f32>::new(
+            &mut pool,
+            SvmDesign::Host(&x_host),
+            (n, d),
+            targets,
+            1.5,
+            true,
+        )
+        .expect("valid geometry");
+        let ev = o.eval(&mut pool, &w, &loss).expect("valid w");
+        o.release_into(&mut pool);
+        ev
+    };
+    x_dev.release_into(&mut pool);
+
+    assert_eq!(
+        from_host.data_loss, from_dev.data_loss,
+        "the host-slice ingress must not change the summed loss by even one ULP"
+    );
+    assert_eq!(
+        from_host.xtg, from_dev.xtg,
+        "the host-slice ingress must not change the gradient by even one ULP"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Geometry rejection (ASVS V5): a malformed shape is a typed error BEFORE any
 // allocation or launch, never an out-of-bounds read.
@@ -429,7 +544,7 @@ fn new_with<F>(
     n: usize,
     d: usize,
     targets: usize,
-) -> Result<SvmObjective<F>, PrimError>
+) -> Result<usize, PrimError>
 where
     F: Float + CubeElement + Pod,
 {
@@ -437,7 +552,20 @@ where
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
     let x_host: Vec<F> = vec![f64_to_host::<F>(1.0); x_len.max(1)];
     let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
-    SvmObjective::<F>::new(&mut pool, &x_dev, (n, d), vec![0.0; targets], 1.0, true)
+    // The evaluator borrows `x_dev`, so it cannot leave this frame — the
+    // rejection cases only care about the ERROR, so a successful construction
+    // is reduced to its `d_aug` and released here.
+    let obj = SvmObjective::<F>::new(
+        &mut pool,
+        SvmDesign::Device(&x_dev),
+        (n, d),
+        vec![0.0; targets],
+        1.0,
+        true,
+    )?;
+    let d_aug = obj.d_aug();
+    obj.release_into(&mut pool);
+    Ok(d_aug)
 }
 
 #[test]
@@ -484,7 +612,14 @@ fn rejects_wrong_w_length() {
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
     let x_host: Vec<f32> = vec![1.0; 64];
     let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x_host);
-    let obj = SvmObjective::<f32>::new(&mut pool, &x_dev, (8, 8), vec![1.0; 8], 1.0, true)
+    let obj = SvmObjective::<f32>::new(
+        &mut pool,
+        SvmDesign::Device(&x_dev),
+        (8, 8),
+        vec![1.0; 8],
+        1.0,
+        true,
+    )
         .expect("valid geometry");
     // d_aug is 9 (8 features + the synthetic column); 8 is the classic off-by-one.
     let err = obj.eval(&mut pool, &[0.0; 8], &(squared_hinge as fn(f64, f64) -> (f64, f64)));

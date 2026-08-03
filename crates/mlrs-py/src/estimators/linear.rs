@@ -1864,6 +1864,18 @@ impl PyLinearSVC {
 
     /// Fit on `x` (`rows × cols`) + label vector `y`. Enum strings + builder
     /// validation (`C>0`) → `ValueError` (D-05/D-09); GIL released; f64 guarded.
+    ///
+    /// **No upload on cpu** (SVM-FIT-CPU). Where the L-BFGS objective evaluates
+    /// from host memory anyway ([`svm_host_ingress_preferred`]), the design is
+    /// BORROWED from the Arrow values via [`host_slice_f32`] / [`host_slice_f64`]
+    /// — the same hard-reject bridge validator `validated_f32` runs, minus the
+    /// copy — and handed to `fit_from_host_slice`. Routing it through a
+    /// `DeviceArray` instead costs three full passes over `x` before the first
+    /// of ~30 evaluations (one to upload, two more because `to_host`
+    /// materializes a byte buffer and then a typed one). Real device backends
+    /// keep the upload and the two-GEMM device evaluator.
+    ///
+    /// [`svm_host_ingress_preferred`]: mlrs_backend::prims::svm_objective::svm_host_ingress_preferred
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -1886,12 +1898,12 @@ impl PyLinearSVC {
         };
         let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
         let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
+        let host_ingress =
+            mlrs_backend::prims::svm_objective::svm_host_ingress_preferred();
         let fitted = py.detach(|| -> PyResult<AnyLinearSVC> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
                     let est = LinearSVC::<f32>::builder()
                         .loss(loss)
                         .penalty(penalty)
@@ -1902,14 +1914,23 @@ impl PyLinearSVC {
                         .tol(tol)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if host_ingress {
+                        est.fit_from_host_slice(
+                            &mut pool,
+                            host_slice_f32(as_f32(&xa)?)?,
+                            host_slice_f32(as_f32(&ya)?)?,
+                            (rows, cols),
+                        )
+                    } else {
+                        let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                        let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                    }
+                    .map_err(algo_err_to_py)?;
                     Ok(AnyLinearSVC::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
                     let est = LinearSVC::<f64>::builder()
                         .loss(loss)
                         .penalty(penalty)
@@ -1920,8 +1941,19 @@ impl PyLinearSVC {
                         .tol(tol)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if host_ingress {
+                        est.fit_from_host_slice(
+                            &mut pool,
+                            host_slice_f64(as_f64(&xa)?)?,
+                            host_slice_f64(as_f64(&ya)?)?,
+                            (rows, cols),
+                        )
+                    } else {
+                        let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                        let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                    }
+                    .map_err(algo_err_to_py)?;
                     Ok(AnyLinearSVC::F64(fitted))
                 }
             }
@@ -2109,6 +2141,9 @@ impl PyLinearSVR {
 
     /// Fit on `x` (`rows × cols`) + target `y`. Enum strings + builder validation
     /// (`C>0`, `epsilon>=0`) → `ValueError` (D-05/D-09); GIL released; f64 guarded.
+    ///
+    /// **No upload on cpu** — the `PyLinearSVC::fit` note applies verbatim; both
+    /// SVMs share one objective and one solver.
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -2131,12 +2166,12 @@ impl PyLinearSVR {
         };
         let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
         let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
+        let host_ingress =
+            mlrs_backend::prims::svm_objective::svm_host_ingress_preferred();
         let fitted = py.detach(|| -> PyResult<AnyLinearSVR> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
                     let est = LinearSVR::<f32>::builder()
                         .loss(loss)
                         .penalty(penalty)
@@ -2148,14 +2183,23 @@ impl PyLinearSVR {
                         .tol(tol)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if host_ingress {
+                        est.fit_from_host_slice(
+                            &mut pool,
+                            host_slice_f32(as_f32(&xa)?)?,
+                            host_slice_f32(as_f32(&ya)?)?,
+                            (rows, cols),
+                        )
+                    } else {
+                        let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                        let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                    }
+                    .map_err(algo_err_to_py)?;
                     Ok(AnyLinearSVR::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
                     let est = LinearSVR::<f64>::builder()
                         .loss(loss)
                         .penalty(penalty)
@@ -2167,8 +2211,19 @@ impl PyLinearSVR {
                         .tol(tol)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if host_ingress {
+                        est.fit_from_host_slice(
+                            &mut pool,
+                            host_slice_f64(as_f64(&xa)?)?,
+                            host_slice_f64(as_f64(&ya)?)?,
+                            (rows, cols),
+                        )
+                    } else {
+                        let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                        let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                    }
+                    .map_err(algo_err_to_py)?;
                     Ok(AnyLinearSVR::F64(fitted))
                 }
             }

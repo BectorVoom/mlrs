@@ -51,7 +51,7 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::lbfgs::{lbfgs_minimize, LbfgsStopReason, LBFGS_FTOL, LBFGS_MAXLS};
 use mlrs_backend::prims::linear_predict::HostMirror;
-use mlrs_backend::prims::svm_objective::SvmObjective;
+use mlrs_backend::prims::svm_objective::{SvmDesign, SvmObjective};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -393,7 +393,7 @@ where
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<LinearSVC<F, Fitted>, AlgoError> {
-        let (n_samples, n_features) = shape;
+        let (n_samples, _) = shape;
 
         // --- T-10-04-02 / ASVS V5: data-DEPENDENT geometry guard BEFORE any
         //     launch (the data-INDEPENDENT params were validated at build()). ---
@@ -410,12 +410,79 @@ where
                 len: y.len(),
             }));
         }
+        let y_host = y.to_host(pool);
+        self.fit_core(pool, SvmDesign::Device(x), &y_host, shape)
+    }
+}
+
+impl<F> LinearSVC<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// [`Fit::fit`] over HOST slices — the no-upload ingress for the backend
+    /// whose solve reads the design from host memory anyway (cpu).
+    ///
+    /// `x` is the `n × d` row-major design and `y` the length-`n` raw label
+    /// vector, both borrowed from the caller (at the Python boundary, the Arrow
+    /// values themselves). The fitted `coef_`/`intercept_` are still
+    /// device-resident, so the returned estimator is indistinguishable from one
+    /// produced by [`Fit::fit`] — only the ingress differs.
+    ///
+    /// The saving is not incidental. `Fit::fit`'s operand has already been
+    /// uploaded by the caller (`DeviceArray::from_host` copies the slab TWICE)
+    /// and the cpu objective then reads it straight back
+    /// (`to_host`, a third pass) — three full passes over `n·d` elements before
+    /// the first evaluation, on a fit whose whole solve is ~30 passes. This
+    /// entry point makes it zero. The `mbsgd_classifier::fit_from_host_slice`
+    /// precedent, and the SAME estimator: the solve is bit-identical, because
+    /// [`SvmObjective`] reads exactly the same values either way.
+    pub fn fit_from_host_slice(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        y: &[F],
+        shape: (usize, usize),
+    ) -> Result<LinearSVC<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+
+        // --- The slice twin of the D-08 geometry guard: `validate_geometry`
+        //     reads a DeviceArray's length, which we do not have here. ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        self.fit_core(pool, SvmDesign::Host(x), y, shape)
+    }
+
+    /// The fit itself, shared by both ingresses (D-03): label validation +
+    /// ±1 encoding, then the L-BFGS primal solve over whichever design form the
+    /// caller had. Geometry is already validated by the caller — the two
+    /// ingresses check it against different operand types.
+    fn fit_core(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        design: SvmDesign<'_, F>,
+        y_host: &[F],
+        shape: (usize, usize),
+    ) -> Result<LinearSVC<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
 
         // --- Pitfall 4: distinct-sorted classes_ (logistic.rs precedent), binary
         //     ±1 remap for the margin loss. A non-binary target is out of scope for
         //     the linear-SVM binary classifier (sklearn LinearSVC is OvR multiclass;
         //     Phase-10 scope is binary — A6). ---
-        let y_host = y.to_host(pool);
         let mut raw_labels: Vec<i64> = Vec::with_capacity(n_samples);
         for &yv in y_host.iter() {
             let lf = host_to_f64(yv);
@@ -478,7 +545,7 @@ where
         let c = self.c;
         let (coef, intercept) = svm_lbfgs_fit::<F>(
             pool,
-            x,
+            design,
             &yp,
             n_samples,
             n_features,
@@ -591,7 +658,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn svm_lbfgs_fit<F>(
     pool: &mut BufferPool<ActiveRuntime>,
-    x: &DeviceArray<ActiveRuntime, F>,
+    x: SvmDesign<'_, F>,
     targets: &[f64],
     n_samples: usize,
     n_features: usize,
@@ -631,7 +698,10 @@ where
     // evaluated every iteration + per line-search step; an evaluation failure is
     // captured (never panics across the boundary) and surfaced after the solve.
     let mut prim_err: Option<PrimError> = None;
+    let mut probe_evals: usize = 0;
+    let probe_t0 = std::time::Instant::now();
     let closure = |w: &[f64]| -> (f64, Vec<f64>) {
+        probe_evals += 1;
         if prim_err.is_some() {
             return (f64::MAX, vec![0.0f64; d_aug]);
         }
@@ -680,6 +750,23 @@ where
     // rather than gtol=0 (which can never fire).
     let gtol = gtol.max(1e-12);
     let result = lbfgs_minimize(x0, closure, gtol, LBFGS_FTOL, LBFGS_MAXLS, max_iter)?;
+    // `MLRS_SVM_PROBE=1` prints the solve's shape — evaluation count, stop
+    // reason, residual gradient and wall time. The evaluation count is what
+    // separates "the objective pass is slow" from "the solver is taking more
+    // steps", and the two call for opposite fixes; the module docs' timing
+    // tables were all read off this. Through `abflag` rather than `std::env`
+    // so a test can force it without an environ data race.
+    if mlrs_backend::abflag::is_on("MLRS_SVM_PROBE") {
+        eprintln!(
+            "[svm probe] {estimator} n={n_samples} d={n_features} evals={probe_evals} \
+             iters={} stop={:?} max_grad={:.3e} loss={:.9e} solve={:.2}ms",
+            result.iters,
+            result.stop_reason,
+            result.max_grad,
+            result.loss,
+            probe_t0.elapsed().as_secs_f64() * 1e3,
+        );
+    }
     if let Some(e) = prim_err {
         objective.release_into(pool);
         return Err(AlgoError::Prim(e));

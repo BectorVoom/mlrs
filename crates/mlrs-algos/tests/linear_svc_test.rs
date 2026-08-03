@@ -150,6 +150,116 @@ where
     (coef, intercept, labels)
 }
 
+/// `fit_from_host_slice` is the SAME fit, only reached without uploading the
+/// design (SVM-FIT-CPU). It exists purely to skip copies, so it must produce a
+/// BIT-IDENTICAL model — not one within the oracle band, which would hide a
+/// real divergence behind a tolerance the device path already needs.
+///
+/// Both ingresses are run on the same fixture and their `coef_`/`intercept_`
+/// compared exactly. `Vec<F>` has no float band to hide behind: `assert_eq!`
+/// on the raw fitted values is the whole check.
+fn host_slice_fit_matches_device_fit<F>(case: &OracleCase)
+where
+    F: Float + CubeElement + Pod,
+{
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_host: Vec<F> = case.expect_f64("X").iter().map(|&v| f64_to::<F>(v)).collect();
+    let y_host: Vec<F> = case.expect_f64("y").iter().map(|&v| f64_to::<F>(v)).collect();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
+    let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
+
+    let build = || {
+        LinearSVC::<F>::builder()
+            .loss(Loss::SquaredHinge)
+            .penalty(Penalty::L2)
+            .c(SVM_C)
+            .intercept_scaling(SVM_INTERCEPT_SCALING)
+            .fit_intercept(true)
+            .max_iter(SVM_MAX_ITER)
+            .tol(1e-4)
+            .build::<F>()
+            .expect("LinearSVC builds with valid hyperparameters")
+    };
+
+    let via_device = build()
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("device-ingress fit");
+    let via_host = build()
+        .fit_from_host_slice(&mut pool, &x_host, &y_host, (N_SAMPLES, N_FEATURES))
+        .expect("host-slice fit");
+
+    assert_eq!(
+        via_host.coef(&pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+        via_device.coef(&pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+        "the no-upload ingress must not change coef_ by even one ULP"
+    );
+    assert_eq!(
+        host_to_f64(via_host.intercept(&pool)),
+        host_to_f64(via_device.intercept(&pool)),
+        "the no-upload ingress must not change intercept_ by even one ULP"
+    );
+    assert_eq!(
+        via_host.classes(),
+        via_device.classes(),
+        "both ingresses infer the same classes_"
+    );
+}
+
+#[test]
+fn host_slice_fit_matches_device_fit_f32() {
+    let case = load_npz(fixture("linear_svc_f32_seed42.npz")).expect("load linear_svc_f32");
+    host_slice_fit_matches_device_fit::<f32>(&case);
+}
+
+#[test]
+fn host_slice_fit_matches_device_fit_f64() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let case = load_npz(fixture("linear_svc_f64_seed42.npz")).expect("load linear_svc_f64");
+    host_slice_fit_matches_device_fit::<f64>(&case);
+}
+
+/// A host-slice fit rejects a malformed geometry with the SAME typed error the
+/// device ingress raises, rather than reading out of bounds (ASVS V5). The
+/// slice path cannot reuse `validate_geometry` (it has no `DeviceArray` length
+/// to read), so its guard is written separately and needs its own gate.
+#[test]
+fn host_slice_fit_rejects_bad_geometry() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x = vec![1.0f32; 40];
+    let y = vec![1.0f32; 10];
+    let build = || {
+        LinearSVC::<f32>::builder()
+            .build::<f32>()
+            .expect("defaults build")
+    };
+    // x.len() disagrees with (n, d).
+    assert!(
+        build()
+            .fit_from_host_slice(&mut pool, &x, &y, (10, 5))
+            .is_err(),
+        "a design whose length disagrees with (n, d) is rejected"
+    );
+    // y is not one-per-sample.
+    assert!(
+        build()
+            .fit_from_host_slice(&mut pool, &x, &y[..4], (10, 4))
+            .is_err(),
+        "a target vector that is not one-per-sample is rejected"
+    );
+    // zero dims.
+    assert!(
+        build()
+            .fit_from_host_slice(&mut pool, &x, &y, (0, 4))
+            .is_err(),
+        "a zero-row design is rejected"
+    );
+}
+
 /// HARD GATE: predict labels match sklearn EXACTLY (integers, no band), f32.
 #[test]
 fn exact_labels_f32() {

@@ -45,9 +45,35 @@
 //!
 //! [`SvmObjective::eval`]'s cpu arm therefore does the whole evaluation on the
 //! host, compiled into this crate at the release profile's `-O3` where it
-//! auto-vectorizes, split across [`host_units`] scoped threads (the
-//! `linear_predict_host` precedent, with its own knee — see
-//! [`SVM_ELEMS_PER_UNIT`]).
+//! auto-vectorizes, split across [`host_units`] workers.
+//!
+//! ## Why the workers are a PERSISTENT pool, not per-evaluation threads
+//! The first version of that host arm fanned out with `std::thread::scope`
+//! INSIDE `eval`. That is the right shape for a `predict`, which makes exactly
+//! one pass — and the wrong one here, because a fit calls `eval` 25-40 times
+//! (once per L-BFGS iteration and per line-search step) and every one of those
+//! calls was re-spawning the whole pool. The spawn is not a fixed small cost
+//! either: it is tens of microseconds per worker when a core is free and
+//! unbounded when one is not, so a wider split made it worse rather than
+//! better and the whole arm collapsed on a machine with other work on it.
+//!
+//! The evaluator now owns a [`WorkerPool`] for the LIFETIME OF THE SOLVE:
+//! threads are spawned once in [`SvmObjective::new`] and each evaluation costs
+//! two barrier crossings instead of `units` thread spawns. Measured on a
+//! 16-core Zen5, f32, `LinearSVC.fit` wall-clock (min over 27 fits in separate
+//! processes, quiet machine):
+//!
+//! | n × d | per-eval spawn | persistent pool |
+//! |---|---|---|
+//! | 1 000 × 16 | 0.318 ms | **0.181 ms** |
+//! | 10 000 × 16 | 1.558 ms | **0.836 ms** |
+//! | 10 000 × 64 | 3.688 ms | **1.622 ms** |
+//! | 100 000 × 16 | 9.595 ms | **4.337 ms** |
+//! | 50 000 × 64 | 11.141 ms | **4.977 ms** |
+//! | 200 000 × 64 | 62.587 ms | **43.061 ms** |
+//!
+//! scikit-learn's liblinear on the same rungs: 0.617 / 4.593 / 14.445 / 119.9 /
+//! 205.4 / 993.8 ms.
 //!
 //! ## One fused pass, and no augmented copy
 //! The host arm also removes two things the device arm cannot:
@@ -83,6 +109,9 @@
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+#[cfg(not(feature = "cpu"))]
+use std::marker::PhantomData;
+
 use mlrs_core::PrimError;
 // Both conversions are device-arm-only: the cpu arm's fused pass is
 // monomorphized on the concrete `f32`/`f64` element and never round-trips a
@@ -91,6 +120,8 @@ use mlrs_core::PrimError;
 use mlrs_core::{f64_to_host, host_to_f64};
 
 use crate::device_array::DeviceArray;
+#[cfg(feature = "cpu")]
+use crate::prims::host_pool::{Shared, WorkerPool};
 use crate::pool::BufferPool;
 use crate::runtime::ActiveRuntime;
 
@@ -128,15 +159,82 @@ pub struct SvmEval {
     pub xtg: Vec<f64>,
 }
 
+/// Whether [`SvmDesign::Host`] is the CHEAPER operand form on this backend.
+///
+/// True exactly where the objective evaluates from host memory (cpu), which is
+/// where handing the caller's slab over directly removes three full passes over
+/// it. On the device backends the design has to reach the GEMM operand anyway,
+/// so a host slab would only be copied an extra time on its way there — those
+/// callers should keep uploading and pass [`SvmDesign::Device`]. The
+/// [`sgd_host_available`](crate::prims::sgd::sgd_host_available) precedent.
+///
+/// Both forms are always ACCEPTED; this only says which one to prefer.
+pub fn svm_host_ingress_preferred() -> bool {
+    cfg!(feature = "cpu")
+}
+
+/// Where the design the evaluator reads comes from.
+///
+/// The solve is identical either way; what differs is how many times the
+/// `n × d` slab is copied before the first evaluation. A caller that already
+/// HAS the design in host memory — the Arrow buffer at the PyO3 boundary — can
+/// hand it over directly instead of uploading it to a [`DeviceArray`] the cpu
+/// arm would immediately read straight back (the no-upload host-slice ingress,
+/// `mbsgd_classifier::fit_from_host_slice` precedent). On the cpu backend that
+/// removes THREE full passes over the design (`from_host` copies twice,
+/// `to_host` once) from every fit.
+pub enum SvmDesign<'a, F> {
+    /// Device-resident, `n × d` row-major — the [`Fit`](crate) trait's operand.
+    Device(&'a DeviceArray<ActiveRuntime, F>),
+    /// Host-resident, `n × d` row-major — the caller's own buffer.
+    Host(&'a [F]),
+}
+
+impl<F: Float + CubeElement + Pod> SvmDesign<'_, F> {
+    /// Element count, whichever form this is.
+    fn len(&self) -> usize {
+        match self {
+            SvmDesign::Device(x) => x.len(),
+            SvmDesign::Host(x) => x.len(),
+        }
+    }
+}
+
+/// The cpu arm's design: the caller's own buffer when it was already host
+/// resident, an owned copy only when it had to be pulled off the device.
+///
+/// A `Cow` would say the same thing but demands `[F]: ToOwned` — a `Clone`
+/// bound this evaluator otherwise never needs — on the struct and on every
+/// signature that names it.
+#[cfg(feature = "cpu")]
+enum HostDesign<'a, F> {
+    /// The caller's slab, read in place (the no-upload ingress).
+    Borrowed(&'a [F]),
+    /// Pulled off the device because that is where the caller had it.
+    Owned(Vec<F>),
+}
+
+#[cfg(feature = "cpu")]
+impl<F> HostDesign<'_, F> {
+    #[inline]
+    fn as_slice(&self) -> &[F] {
+        match self {
+            HostDesign::Borrowed(s) => s,
+            HostDesign::Owned(v) => v,
+        }
+    }
+}
+
 /// The design matrix in whatever form the active backend evaluates against,
 /// prepared ONCE per `fit` and reused by every L-BFGS iteration and line-search
 /// step (the bounded-allocation iterative-solver shape, 05-11).
 ///
-/// - **cpu**: the host `n × d` slab, read in place. No augmented copy, no
-///   device operand, no launch (module docs).
+/// - **cpu**: the host `n × d` slab, read in place (borrowed outright when the
+///   caller supplied [`SvmDesign::Host`]), plus the [`WorkerPool`] the fused
+///   pass runs on.
 /// - **wgpu / cuda / rocm**: the device-resident `n × d_aug` augmented design
 ///   the two GEMMs read.
-pub struct SvmObjective<F> {
+pub struct SvmObjective<'a, F> {
     /// Sample count.
     n: usize,
     /// UNaugmented feature count. cpu arm only: the device arms materialize the
@@ -154,19 +252,29 @@ pub struct SvmObjective<F> {
     /// length `n`, host-resident because the loss is evaluated on the host on
     /// every backend.
     targets: Vec<f64>,
-    /// cpu arm: the design read in place, unaugmented.
+    /// cpu arm: the design read in place, unaugmented — BORROWED from the
+    /// caller when it was already host-resident, owned only when it had to be
+    /// pulled off the device.
     #[cfg(feature = "cpu")]
-    x_host: Vec<F>,
+    x_host: HostDesign<'a, F>,
+    /// cpu arm: the threads the fused pass is split across, spawned ONCE for
+    /// the whole solve. `None` below the parallel knee ([`SVM_ELEMS_PER_UNIT`]),
+    /// where the pass runs inline on the calling thread.
+    #[cfg(feature = "cpu")]
+    workers: Option<WorkerPool>,
     /// device arms: the augmented `n × d_aug` design both GEMMs read.
     #[cfg(not(feature = "cpu"))]
     x_aug: DeviceArray<ActiveRuntime, F>,
+    /// Binds `'a` on the device arms, which borrow nothing.
+    #[cfg(not(feature = "cpu"))]
+    _borrow: PhantomData<&'a [F]>,
 }
 
-impl<F> SvmObjective<F>
+impl<'a, F> SvmObjective<'a, F>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Prepare the evaluator for an `n × d` row-major device-resident design.
+    /// Prepare the evaluator for an `n × d` row-major design.
     ///
     /// `targets` is length `n`. `fit_intercept` appends the synthetic
     /// `intercept_scaling` column (Pitfall 5) — materialized into the device
@@ -176,7 +284,7 @@ where
     /// `targets.len() == n`, both dims non-zero.
     pub fn new(
         pool: &mut BufferPool<ActiveRuntime>,
-        x: &DeviceArray<ActiveRuntime, F>,
+        x: SvmDesign<'a, F>,
         (n, d): (usize, usize),
         targets: Vec<f64>,
         intercept_scaling: f64,
@@ -202,20 +310,32 @@ where
 
         #[cfg(feature = "cpu")]
         {
+            let x_host = match x {
+                SvmDesign::Host(slab) => HostDesign::Borrowed(slab),
+                SvmDesign::Device(dev) => HostDesign::Owned(dev.to_host(pool)),
+            };
+            // Spawned ONCE for the whole solve, not once per evaluation: the
+            // L-BFGS driver calls `eval` 25-40 times and `std::thread` setup
+            // dominated every one of them (see [`SVM_ELEMS_PER_UNIT`]).
+            let units = host_units(n * d).min(n.max(1));
             Ok(Self {
                 n,
                 d,
                 d_aug,
                 intercept_scaling,
                 targets,
-                x_host: x.to_host(pool),
+                x_host,
+                workers: (units > 1).then(|| WorkerPool::new(units)),
             })
         }
         #[cfg(not(feature = "cpu"))]
         {
             // The device arms feed `prims::gemm`, which reads one contiguous
             // operand — so the synthetic column has to be materialized here.
-            let x_host = x.to_host(pool);
+            let x_host: Vec<F> = match x {
+                SvmDesign::Device(dev) => dev.to_host(pool),
+                SvmDesign::Host(slab) => slab.to_vec(),
+            };
             let _ = intercept_scaling;
             let mut aug: Vec<F> = vec![f64_to_host::<F>(0.0); n * d_aug];
             for r in 0..n {
@@ -229,6 +349,7 @@ where
                 d_aug,
                 targets,
                 x_aug: DeviceArray::from_host(pool, &aug),
+                _borrow: PhantomData,
             })
         }
     }
@@ -289,7 +410,7 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "cpu")]
-impl<F> SvmObjective<F>
+impl<F> SvmObjective<'_, F>
 where
     F: Float + CubeElement + Pod,
 {
@@ -309,7 +430,7 @@ where
     }
 
     fn eval_host_typed<T: HostElem, L: MarginLoss>(&self, w: &[f64], loss: &L) -> SvmEval {
-        let x: &[T] = bytemuck::cast_slice(&self.x_host);
+        let x: &[T] = bytemuck::cast_slice(self.x_host.as_slice());
         let (n, d, d_aug) = (self.n, self.d, self.d_aug);
         // The synthetic column contributes a CONSTANT `intercept_scaling·w[d]`
         // to every margin, so it is hoisted out of the row loop entirely.
@@ -320,35 +441,40 @@ where
         };
         let wd = &w[..d];
 
-        let units = host_units(n * d).min(n.max(1));
-        if units <= 1 {
+        let Some(workers) = self.workers.as_ref() else {
             let mut acc = Accum::new(d, d_aug, scale);
             acc.rows(x, wd, bias, &self.targets, loss);
             return acc.finish();
-        }
+        };
 
-        // Contiguous row chunks: thread `i` owns rows `[i·rows, i·rows + k)`,
-        // so its design slab and its target run are both unbroken ranges.
+        // Contiguous row chunks: unit `u` owns rows `[u·rows, u·rows + k)`, so
+        // its design slab and its target run are both unbroken ranges.
+        let units = workers.units();
         let rows = n.div_ceil(units);
-        let partials: Vec<Accum> = std::thread::scope(|scope| {
-            let handles: Vec<_> = self
-                .targets
-                .chunks(rows)
-                .enumerate()
-                .map(|(i, tchunk)| {
-                    let slab = &x[i * rows * d..(i * rows + tchunk.len()) * d];
-                    scope.spawn(move || {
-                        let mut acc = Accum::new(d, d_aug, scale);
-                        acc.rows(slab, wd, bias, tchunk, loss);
-                        acc
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("svm objective row worker panicked"))
-                .collect()
-        });
+        let mut partials: Vec<Accum> = (0..units)
+            .map(|_| Accum::new(d, d_aug, scale))
+            .collect();
+        {
+            // SAFETY (`Shared`'s contract): unit `u` is the only writer of
+            // `partials[u]` within the pass, and `run` does not return until
+            // every unit has finished — the barrier release is what publishes
+            // the writes to the reducing thread below.
+            let slots = Shared::new(&mut partials);
+            // Bound out of `self` rather than captured through it: the pool is
+            // deliberately `!Sync` (one driver per pool), so a closure holding
+            // `&self` — which owns the pool — could not itself be `Sync` and so
+            // could not be dispatched. The pass needs only the targets.
+            let targets = &self.targets;
+            workers.run(&|u: usize| {
+                let lo = (u * rows).min(n);
+                let hi = (lo + rows).min(n);
+                if lo == hi {
+                    return;
+                }
+                let acc = unsafe { &mut slots.get_mut()[u] };
+                acc.rows(&x[lo * d..hi * d], wd, bias, &targets[lo..hi], loss);
+            });
+        }
 
         let mut total = Accum::new(d, d_aug, scale);
         for p in partials {
@@ -454,48 +580,60 @@ trait HostElem: Pod + Copy + Send + Sync {
     fn axpy(acc: &mut [f64], row: &[Self], g: f64);
 }
 
-/// Design elements one worker thread must be given before spawning it pays,
-/// and the reason it is EIGHT TIMES smaller than `linear_predict`'s otherwise
-/// identical knee (`1 << 18`).
+/// Design elements one worker must be given before splitting the pass pays.
 ///
-/// A `predict` is ONE streaming pass, so its sizing is a pure spawn-cost
-/// amortization: give a thread enough bytes that `std::thread` setup disappears
-/// against DRAM bandwidth. A `fit` re-reads the SAME design 20–100 times (once
-/// per L-BFGS iteration and line-search step), so the dominant effect is
-/// instead whether each worker's slab stays resident in its core's private L2
-/// between evaluations. Splitting more finely than the spawn cost alone would
-/// justify buys cache residency that a coarser split gives up.
+/// This constant was originally `1 << 16`, and that value was a SPAWN-cost
+/// amortization: with a fresh `std::thread` per worker per evaluation, a
+/// worker had to be handed enough bytes for its setup to disappear against
+/// DRAM bandwidth, and splitting more finely than that lost outright.
 ///
-/// That shows up as a large, superlinear cliff rather than a gentle slope.
-/// `LinearSVR.fit` wall-clock on a 16-core Zen5, best of 9, by forced knee:
+/// The persistent [`WorkerPool`] (module docs) removes that cost, so the
+/// break-even moved down with it — what a worker must now cover is only two
+/// barrier crossings, which are microseconds. Re-measured with the pool in
+/// place, `LinearSVC.fit` wall-clock on a 16-core Zen5, f32, min over 21 fits
+/// in separate processes on a quiet machine:
 ///
-/// | n × d (dtype) | `1<<18` | `1<<17` | `1<<16` | `1<<15` | `1<<14` |
-/// |---|---|---|---|---|---|
-/// | 10 000 × 64 (f32) | 10.8 ms | 3.90 ms | **3.56 ms** | 3.89 ms | 3.84 ms |
-/// | 10 000 × 64 (f64) | 8.71 ms | — | **4.11 ms** | 4.48 ms | 4.65 ms |
-/// | 50 000 × 16 (f32) | 6.79 ms | 4.61 ms | 5.25 ms | 5.58 ms | 5.39 ms |
-/// | 100 000 × 16 (f32) | 8.61 ms | 9.05 ms | 8.35 ms | 8.53 ms | 8.38 ms |
-/// | 1 000 × 16 (f32) | 0.36 ms | 0.40 ms | 0.23 ms | 0.34 ms | 0.39 ms |
+/// | n × d | `1<<11` | `1<<12` | `1<<13` | `1<<14` | `1<<15` | `1<<16` |
+/// |---|---|---|---|---|---|---|
+/// | 1 000 × 16 | 0.194 | 0.242 | 0.180 | 0.193 | 0.182 | 0.184 |
+/// | 5 000 × 16 | 0.538 | 0.573 | 0.449 | 0.465 | 0.695 | — |
+/// | 10 000 × 16 | 0.718 | 0.723 | 0.837 | 0.640 | 0.714 | 1.159 |
+/// | 10 000 × 64 | 1.642 | 1.214 | 1.903 | 1.450 | 1.271 | 1.328 |
+/// | 50 000 × 16 | 2.066 | 2.000 | 2.084 | 2.029 | 2.769 | — |
+/// | 100 000 × 16 | 4.263 | 4.211 | 4.299 | 4.314 | 4.309 | 4.330 |
+/// | 50 000 × 64 | 4.826 | 4.914 | 4.932 | 4.991 | 5.033 | 4.845 |
 ///
-/// At `10 000 × 64` the coarse knee leaves each of 2 threads a 1.3 MiB slab
-/// that spills L2 on every one of the 27 evaluations; at `1<<16` the same work
-/// splits 9 ways into ~285 KiB slabs that stay resident, and the fit is 3×
-/// faster. Below `1<<16` the curve is flat — the split is already fine enough —
-/// while the small end (`1 000 × 16`, and the `1 000`-row rungs generally) sits
-/// under one unit at every candidate, so its spread is run-to-run noise on an
-/// identical single-threaded path, not a knee effect. `1 << 16` is the smallest
-/// value that captures the cliff without fanning small fits out needlessly.
+/// The curve is FLAT from `1<<11` to `1<<15` — the spread within a row there is
+/// run-to-run noise with no trend — and only the old `1<<16` is distinguishable,
+/// costing 31 % at `10 000 × 16` because it holds that fit to two workers when
+/// the machine has sixteen. `1 << 14` sits in the middle of the flat region with
+/// margin on both sides, so it is neither at the noisy small edge nor near the
+/// value that is measurably wrong.
+///
+/// Note this only bounds units from BELOW-the-work side. The upper bound is
+/// [`crate::capability::cpu_launch_units`], and on the largest rungs (where the
+/// pass is DRAM-bound) the two bounds meet: at `200 000 × 128` the fit is 157 ms
+/// on one worker, 88 ms on two, 86 ms on four and 96 ms on sixteen — bandwidth
+/// saturates well before the core count does, so extra workers past ~4 buy
+/// nothing and eventually cost a little. That residual is under 10 % and is left
+/// alone rather than fitted with a second constant.
 #[cfg(feature = "cpu")]
-const SVM_ELEMS_PER_UNIT: usize = 1 << 16;
+const SVM_ELEMS_PER_UNIT: usize = 1 << 14;
 
 /// Worker threads to split `elems` design elements across — see
 /// [`SVM_ELEMS_PER_UNIT`]. Never more than the machine offers
 /// ([`crate::capability::cpu_launch_units`], which `MLRS_CPU_UNITS` overrides
 /// for A/B), never fewer than one.
+///
+/// `MLRS_SVM_ELEMS_PER_UNIT` overrides the knee itself for on-target A/B
+/// (through [`crate::abflag`], never a raw `std::env::var` — see its docs).
 #[cfg(feature = "cpu")]
 fn host_units(elems: usize) -> usize {
-    (elems / SVM_ELEMS_PER_UNIT)
-        .clamp(1, crate::capability::cpu_launch_units().max(1) as usize)
+    let knee = crate::abflag::var("MLRS_SVM_ELEMS_PER_UNIT")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(SVM_ELEMS_PER_UNIT);
+    (elems / knee).clamp(1, crate::capability::cpu_launch_units().max(1) as usize)
 }
 
 /// Independent accumulators the dot product is split across — the natural SIMD
@@ -571,7 +709,7 @@ impl HostElem for f32 {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(feature = "cpu"))]
-impl<F> SvmObjective<F>
+impl<F> SvmObjective<'_, F>
 where
     F: Float + CubeElement + Pod,
 {
