@@ -52,16 +52,21 @@ use mlrs_algos::naive_bayes::nb_common::accuracy_score;
 // Phase 16 (D-01/D-02): all five NB estimators are migrated to the typestate
 // surface. The shared predict-surface free functions call `predict_labels` /
 // `predict_proba` / `predict_log_proba` via these typestate accessor traits on the
-// `Fitted`-tagged arm; the fit arms build the `Unfit` estimator and call the
-// consuming-self `TypestateFit::fit`. This file is fully on the typestate surface.
+// `Fitted`-tagged arm. The `Fit` trait itself is NOT imported: every NB fit is
+// host-side (NB-FIT-CPU), so all five fit arms call the estimator's inherent
+// consuming-self `fit_from_host_slice` instead of `TypestateFit::fit` — same
+// body, without the `DeviceArray` round trip.
 use mlrs_algos::typestate::{
-    Fit as TypestateFit, PredictLabels as TypestatePredictLabels,
-    PredictLogProba as TypestatePredictLogProba, PredictProba as TypestatePredictProba,
+    PredictLabels as TypestatePredictLabels, PredictLogProba as TypestatePredictLogProba,
+    PredictProba as TypestatePredictProba,
 };
 
-use crate::errors::{algo_err_to_py, build_err_to_py, dtype_mismatch, not_fitted};
+use crate::errors::{
+    algo_err_to_py, build_err_to_py, dtype_mismatch, nonfinite_input_err, not_fitted,
+};
 use crate::ingress::{
-    as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype,
+    as_f32, as_f64, capsule_to_array, float_dtype, host_slice_f32, host_slice_f64, validated_f32,
+    validated_f64, FloatDtype,
 };
 
 // ===========================================================================
@@ -365,6 +370,12 @@ impl PyGaussianNB {
     /// Fit on `x` (`rows × cols`, row-major) + label vector `y`. The builder
     /// validates the data-independent params (`build()` → `ValueError`, D-09)
     /// BEFORE the device launch; GIL released (PY-03); f64 guarded (D-04).
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -372,9 +383,11 @@ impl PyGaussianNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (var_smoothing, priors) = match &self.inner {
             AnyGaussianNB::Unfit {
@@ -383,32 +396,50 @@ impl PyGaussianNB {
             } => (*var_smoothing, priors.clone()),
             _ => return Err(not_fitted("gaussian_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm (NB-FIT-CPU): this fit reads every element of `X`
+        // and `y` on the host and touches the device only to upload the small
+        // fitted operand, so routing the OPERANDS through a `DeviceArray` bought
+        // a `from_host` copy in and a `to_host` copy straight back out and
+        // nothing else. `host_slice_*` runs the SAME hard-reject bridge
+        // validation (`validate_f32`/`validate_f64`: no nulls, no sliced/offset
+        // views) and BORROWS the Arrow values instead. See `nb_host_fit_err` for
+        // where `check_array`'s finite scan went.
         let fitted = py.detach(|| -> PyResult<AnyGaussianNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = GaussianNB::<f32>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyGaussianNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = GaussianNB::<f64>::builder()
                         .var_smoothing(var_smoothing)
                         .priors(priors)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyGaussianNB::F64(fitted))
                 }
             }
@@ -507,6 +538,12 @@ impl PyMultinomialNB {
 
     /// Fit on `x` (already-dense `rows × cols`, row-major — sparse densified at
     /// ingress, NB-02) + label vector `y`.
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -514,9 +551,11 @@ impl PyMultinomialNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, fit_prior, class_prior) = match &self.inner {
             AnyMultinomialNB::Unfit {
@@ -527,12 +566,24 @@ impl PyMultinomialNB {
             } => (*alpha, *force_alpha, *fit_prior, class_prior.clone()),
             _ => return Err(not_fitted("multinomial_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm (NB-FIT-CPU): this fit reads every element of `X`
+        // and `y` on the host and touches the device only to upload the small
+        // fitted operand, so routing the OPERANDS through a `DeviceArray` bought
+        // a `from_host` copy in and a `to_host` copy straight back out and
+        // nothing else. `host_slice_*` runs the SAME hard-reject bridge
+        // validation (`validate_f32`/`validate_f64`: no nulls, no sliced/offset
+        // views) and BORROWS the Arrow values instead. See `nb_host_fit_err` for
+        // where `check_array`'s finite scan went.
         let fitted = py.detach(|| -> PyResult<AnyMultinomialNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = MultinomialNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -540,14 +591,19 @@ impl PyMultinomialNB {
                         .class_prior(class_prior)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyMultinomialNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = MultinomialNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -555,8 +611,9 @@ impl PyMultinomialNB {
                         .class_prior(class_prior)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyMultinomialNB::F64(fitted))
                 }
             }
@@ -649,6 +706,12 @@ impl PyBernoulliNB {
         }
     }
 
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -656,9 +719,11 @@ impl PyBernoulliNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, binarize, fit_prior, class_prior) = match &self.inner {
             AnyBernoulliNB::Unfit {
@@ -670,12 +735,26 @@ impl PyBernoulliNB {
             } => (*alpha, *force_alpha, *binarize, *fit_prior, class_prior.clone()),
             _ => return Err(not_fitted("bernoulli_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm: a `BernoulliNB` fit reads every element of `X` and
+        // `y` on the host (validate + threshold + count in one sweep) and touches
+        // the device only to upload the tiny `n_classes × n_features` predict
+        // operand, so routing the OPERANDS through a `DeviceArray` bought a
+        // `from_host` copy in and a `to_host` copy straight back out and nothing
+        // else. `host_slice_*` runs the SAME hard-reject bridge validation
+        // (`validate_f32`/`validate_f64`: no nulls, no sliced/offset views) and
+        // BORROWS the Arrow values instead. The pool handle is still taken — the
+        // fitted operand upload needs it (`CategoricalNB`, whose fitted tables are
+        // host-side, takes none).
         let fitted = py.detach(|| -> PyResult<AnyBernoulliNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = BernoulliNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -684,14 +763,19 @@ impl PyBernoulliNB {
                         .class_prior(class_prior)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyBernoulliNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = BernoulliNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -700,8 +784,9 @@ impl PyBernoulliNB {
                         .class_prior(class_prior)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyBernoulliNB::F64(fitted))
                 }
             }
@@ -794,6 +879,12 @@ impl PyComplementNB {
         }
     }
 
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -801,9 +892,11 @@ impl PyComplementNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, fit_prior, class_prior, norm) = match &self.inner {
             AnyComplementNB::Unfit {
@@ -815,12 +908,24 @@ impl PyComplementNB {
             } => (*alpha, *force_alpha, *fit_prior, class_prior.clone(), *norm),
             _ => return Err(not_fitted("complement_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm (NB-FIT-CPU): this fit reads every element of `X`
+        // and `y` on the host and touches the device only to upload the small
+        // fitted operand, so routing the OPERANDS through a `DeviceArray` bought
+        // a `from_host` copy in and a `to_host` copy straight back out and
+        // nothing else. `host_slice_*` runs the SAME hard-reject bridge
+        // validation (`validate_f32`/`validate_f64`: no nulls, no sliced/offset
+        // views) and BORROWS the Arrow values instead. See `nb_host_fit_err` for
+        // where `check_array`'s finite scan went.
         let fitted = py.detach(|| -> PyResult<AnyComplementNB> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = ComplementNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -829,14 +934,19 @@ impl PyComplementNB {
                         .norm(norm)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyComplementNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = ComplementNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -845,8 +955,9 @@ impl PyComplementNB {
                         .norm(norm)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyComplementNB::F64(fitted))
                 }
             }
@@ -888,6 +999,34 @@ impl PyComplementNB {
 // CategoricalNB — sklearn-named: alpha / force_alpha / fit_prior / class_prior /
 // min_categories (None | int | list → MinCategories::{Infer,Uniform,PerFeature}).
 // ===========================================================================
+
+/// Map a host-slice NB fit failure to Python, OWNING the NaN/inf rejection that
+/// `check_array` used to perform on that path.
+///
+/// `mlrs.naive_bayes.CategoricalNB.fit` and `.BernoulliNB.fit` pass
+/// `ensure_all_finite=False` because the Rust fit already reads every element of
+/// `X` and rejects a non-finite one — CategoricalNB in its pass-1 scan (`NaN`
+/// fails the integer test, `±inf` the range test), BernoulliNB in the fused
+/// count sweep (`!xf.is_finite()`). It relocates the check, it does not drop it:
+/// on ANY rejection this re-scans the operand for a non-finite value and, if one
+/// is present, raises `check_array`'s exact `ValueError` via
+/// [`nonfinite_input_err`] instead of mlrs' own message — so a NaN in `X`
+/// reports "Input contains NaN." exactly as before. That re-scan runs ONLY on
+/// the rejection path, where the input is already being thrown away, so it costs
+/// nothing on a successful fit.
+///
+/// The precedence also matches `check_array`, which scans the WHOLE matrix: a
+/// matrix holding both a NaN and (earlier) a negative value still reports the
+/// NaN, because the non-finite verdict is taken first here too.
+fn nb_host_fit_err<T>(err: mlrs_algos::error::AlgoError, xh: &[T], dtype: &str) -> PyErr
+where
+    T: Copy + Into<f64>,
+{
+    if xh.iter().any(|v| !(*v).into().is_finite()) {
+        return nonfinite_input_err(xh, dtype);
+    }
+    algo_err_to_py(err)
+}
 
 /// sklearn-compatible `CategoricalNB`.
 #[pyclass(name = "CategoricalNB")]
@@ -964,6 +1103,12 @@ impl PyCategoricalNB {
         })
     }
 
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// fit that consumes it is a host pass anyway. It weights each row's
+    /// contribution to the per-class counts, exactly as sklearn's
+    /// `Y *= sample_weight.T` does.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -971,9 +1116,11 @@ impl PyCategoricalNB {
         y: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let (alpha, force_alpha, fit_prior, class_prior, min_categories) = match &self.inner {
             AnyCategoricalNB::Unfit {
@@ -991,12 +1138,23 @@ impl PyCategoricalNB {
             ),
             _ => return Err(not_fitted("categorical_nb", "re-fit")),
         };
+        // NO-UPLOAD fit arm: `CategoricalNB`'s fit is entirely host-side (it
+        // validates + tabulates the categorical encoding into ragged host-f64
+        // tables — no device kernel), so routing the operands through a
+        // `DeviceArray` bought a `from_host` copy in and a `to_host` copy straight
+        // back out and nothing else. `host_slice_*` runs the SAME hard-reject
+        // bridge validation (`validate_f32`/`validate_f64`: no nulls, no
+        // sliced/offset views) and BORROWS the Arrow values instead. This is the
+        // `Ridge::fit_from_host_slice` precedent — no pool handle is taken at all.
         let fitted = py.detach(|| -> PyResult<AnyCategoricalNB> {
-            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     let est = CategoricalNB::<f32>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -1005,14 +1163,19 @@ impl PyCategoricalNB {
                         .min_categories(min_categories)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float32"))?;
                     Ok(AnyCategoricalNB::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let swh = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let est = CategoricalNB::<f64>::builder()
                         .alpha(alpha)
                         .force_alpha(force_alpha)
@@ -1021,8 +1184,9 @@ impl PyCategoricalNB {
                         .min_categories(min_categories)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_from_host_slice(xh, yh, (rows, cols), swh)
+                        .map_err(|e| nb_host_fit_err(e, xh, "float64"))?;
                     Ok(AnyCategoricalNB::F64(fitted))
                 }
             }

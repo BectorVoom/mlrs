@@ -66,6 +66,7 @@ def test_all_shims_importable(name):
 def test_family_mixins_composed():
     assert isinstance(mlrs.LinearRegression(), RegressorMixin)
     assert isinstance(mlrs.Ridge(), RegressorMixin)
+    assert isinstance(mlrs.BayesianRidge(), RegressorMixin)
     assert isinstance(mlrs.Lasso(), RegressorMixin)
     assert isinstance(mlrs.ElasticNet(), RegressorMixin)
     assert isinstance(mlrs.KNeighborsRegressor(), RegressorMixin)
@@ -181,6 +182,7 @@ def test_nearest_neighbors_has_no_predict_but_has_kneighbors():
     [
         ("LinearRegression", "coef_"),
         ("Ridge", "coef_"),
+        ("BayesianRidge", "coef_"),
         ("Lasso", "coef_"),
         ("ElasticNet", "coef_"),
         ("LogisticRegression", "coef_"),

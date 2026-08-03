@@ -172,6 +172,158 @@ def test_ridge_params_oracle(fixture, case, kwargs, use_sw, expect_solver):
         assert (np.asarray(est.coef_) >= -atol).all()
 
 
+# --- BayesianRidge (LINEAR-06) --------------------------------------------- #
+#
+# (case name, ctor kwargs, use_sample_weight, wide?) — mirrors
+# `gen_oracle.py::gen_bayesian_ridge`'s `cases` list one-for-one.
+BAYES_CASES = [
+    ("default", {}, False, False),
+    ("noint", {"fit_intercept": False}, False, False),
+    ("maxiter1", {"max_iter": 1}, False, False),
+    ("maxiter5", {"max_iter": 5}, False, False),
+    ("tol_tight", {"tol": 1e-8, "max_iter": 1000}, False, False),
+    ("tol_loose", {"tol": 1e-1}, False, False),
+    ("priors", {"alpha_1": 1.0, "alpha_2": 5.0, "lambda_1": 50.0, "lambda_2": 1.0}, False, False),
+    ("priors_zero", {"alpha_1": 0.0, "alpha_2": 0.0, "lambda_1": 0.0, "lambda_2": 0.0}, False, False),
+    ("init", {"alpha_init": 2.5, "lambda_init": 0.1}, False, False),
+    ("init_alpha_only", {"alpha_init": 10.0}, False, False),
+    ("score", {"compute_score": True}, False, False),
+    ("score_maxiter3", {"compute_score": True, "max_iter": 3}, False, False),
+    ("score_noint", {"compute_score": True, "fit_intercept": False}, False, False),
+    ("sw", {}, True, False),
+    ("sw_noint", {"fit_intercept": False}, True, False),
+    ("sw_score", {"compute_score": True}, True, False),
+    ("wide", {}, False, True),
+    ("wide_noint", {"fit_intercept": False}, False, True),
+    ("wide_score", {"compute_score": True}, False, True),
+]
+
+BAYES_IDS = [
+    f"{fx}-{case}"
+    for fx in ("bayesian_ridge_f32_seed42", "bayesian_ridge_f64_seed42")
+    for case, _, _, _ in BAYES_CASES
+]
+
+
+@pytest.mark.parametrize(
+    "fixture,case,kwargs,use_sw,wide",
+    [
+        (fx, case, kwargs, use_sw, wide)
+        for fx in ("bayesian_ridge_f32_seed42", "bayesian_ridge_f64_seed42")
+        for case, kwargs, use_sw, wide in BAYES_CASES
+    ],
+    ids=BAYES_IDS,
+)
+def test_bayesian_ridge_oracle(fixture, case, kwargs, use_sw, wide):
+    """PY-01: every sklearn BayesianRidge parameter matches through the shim.
+
+    Gates SIX fitted attributes per case, not just ``coef_``: a wrong evidence
+    update that lands on a similar penalty would still reproduce ``coef_`` to a
+    few digits while missing ``alpha_``, ``lambda_`` and ``n_iter_``.
+
+    ``alpha_`` / ``lambda_`` / ``sigma_`` / ``scores_`` are compared at the
+    DESIGN's tolerance even though the fixture stores them as f64: both engines
+    accumulate them in f64, so the storage width is not what limits agreement —
+    the f32 design's input bytes are.
+
+    Skips per fixture dtype (not via the blanket ``requires_f64`` marker) for the
+    reason ``test_ridge_params_oracle`` documents.
+    """
+    if dtype_of(fixture) == np.float64 and not mlrs.backend_supports_f64():
+        pytest.skip("backend does not support f64")
+    d = np.load(fixture_path(fixture))
+    x, y = (d["X_wide"], d["y_wide"]) if wide else (d["X"], d["y"])
+
+    est = mlrs.BayesianRidge(**kwargs)
+    est.fit(x, y, sample_weight=d["sample_weight"] if use_sw else None)
+
+    # abs-OR-rel (`|got - exp| <= atol + rtol*|exp|`), the same rule
+    # `bayesian_ridge_test.rs::assert_close` applies and the one the project
+    # contract states. The other cases in this file can use a pure ABSOLUTE
+    # tolerance because `coef_`/`intercept_` are O(1); `alpha_` is not — in the
+    # interpolating `wide` regime it is ~5e5, where a 1e-5 absolute bound is
+    # three orders tighter than f64 can represent a difference at all.
+    atol = _atol(fixture)
+    close = lambda got, want: np.allclose(  # noqa: E731
+        np.ravel(np.asarray(got, dtype=np.float64)),
+        np.ravel(np.asarray(want, dtype=np.float64)),
+        atol=atol,
+        rtol=atol,
+    )
+    assert close(est.coef_, d[f"coef_{case}"]), "coef_"
+    assert close(est.intercept_, d[f"intercept_{case}"]), "intercept_"
+    assert close(est.alpha_, d[f"alpha_{case}"]), "alpha_"
+    assert close(est.lambda_, d[f"lambda_{case}"]), "lambda_"
+    assert close(est.sigma_, d[f"sigma_{case}"]), "sigma_"
+    assert est.n_iter_ == int(d[f"n_iter_{case}"][0]), "n_iter_"
+
+    # `sigma_` is square and `X_scale_` is all ones whatever the fit.
+    n_features = x.shape[1]
+    assert np.asarray(est.sigma_).shape == (n_features, n_features)
+    assert np.allclose(np.asarray(est.X_scale_), 1.0)
+
+    if kwargs.get("compute_score"):
+        # sklearn appends one score per iteration PLUS a final post-loop one.
+        assert len(est.scores_) == est.n_iter_ + 1
+        assert close(est.scores_, d[f"scores_{case}"]), "scores_"
+    else:
+        # sklearn leaves the attribute unset without `compute_score`; the shim
+        # spells that as None.
+        assert est.scores_ is None
+
+
+@pytest.mark.parametrize(
+    "fixture", ("bayesian_ridge_f32_seed42", "bayesian_ridge_f64_seed42")
+)
+def test_bayesian_ridge_predict_std_oracle(fixture):
+    """``predict(X, return_std=True)`` on HELD-OUT rows.
+
+    The only place ``sigma_`` becomes an observable rather than a stored
+    attribute — and the only place sklearn centers ``X`` by ``X_offset_``, which
+    a naive transcription of the formula gets wrong.
+    """
+    if dtype_of(fixture) == np.float64 and not mlrs.backend_supports_f64():
+        pytest.skip("backend does not support f64")
+    d = np.load(fixture_path(fixture))
+    est = mlrs.BayesianRidge().fit(d["X"], d["y"])
+    mean, std = est.predict(d["X_test"], return_std=True)
+
+    atol = _atol(fixture)
+    assert np.allclose(np.ravel(mean), np.ravel(d["pred_default"]), atol=atol, rtol=0.0)
+    assert np.allclose(
+        np.ravel(np.asarray(std, dtype=np.float64)),
+        np.ravel(d["predstd_default"]),
+        atol=atol,
+        rtol=0.0,
+    )
+    # `return_std=False` (the default) returns the mean ALONE, not a 1-tuple.
+    assert np.allclose(np.ravel(est.predict(d["X_test"])), np.ravel(mean), atol=atol, rtol=0.0)
+
+
+def test_bayesian_ridge_rejects_bad_params():
+    """sklearn's `_parameter_constraints` rejections, through the shim."""
+    import pytest as _pytest
+
+    for kwargs in (
+        {"max_iter": 0},
+        {"tol": 0.0},          # closed="neither" — unlike Ridge, 0 is rejected
+        {"tol": -1e-3},
+        {"alpha_1": -1.0},
+        {"alpha_2": -1.0},
+        {"lambda_1": -1.0},
+        {"lambda_2": -1.0},
+        {"alpha_init": -1.0},
+        {"lambda_init": -1.0},
+    ):
+        with _pytest.raises(Exception):
+            mlrs.BayesianRidge(**kwargs).fit(np.eye(4, 3), np.arange(4.0))
+
+    # The boundary values sklearn ACCEPTS (`closed="left"` on the hyperpriors).
+    mlrs.BayesianRidge(
+        alpha_1=0.0, alpha_2=0.0, lambda_1=0.0, lambda_2=0.0
+    ).fit(np.eye(4, 3), np.arange(4.0))
+
+
 def test_ridge_rejects_bad_params():
     """The sklearn ``ValueError``s Ridge raises for invalid parameter combos.
 

@@ -2236,6 +2236,180 @@ def gen_ridge_params(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# --- BayesianRidge FULL parameter surface (LINEAR-06) ---------------------- #
+# Two geometries, because sklearn's `_update_coef_` and `_log_marginal_likelihood`
+# each branch on `n_samples > n_features` and its `sigma_` uses a FULL-matrix SVD
+# only in the wide case. TALL is the ordinary regime; WIDE is rank-deficient by
+# construction (rank == n_samples), which is what exercises the zero-padded
+# `eigen_vals_full` and the null-space directions that survive only in `sigma_`.
+BAYES_TALL_N_SAMPLES, BAYES_TALL_N_FEATURES = 60, 8
+BAYES_WIDE_N_SAMPLES, BAYES_WIDE_N_FEATURES = 6, 10
+# Rows held out of the fit, for `predict` and `predict(return_std=True)`.
+BAYES_N_TEST = 7
+
+
+def gen_bayesian_ridge(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the BayesianRidge full-parameter-surface fixture (LINEAR-06).
+
+    Covers every ``sklearn.linear_model.BayesianRidge`` ctor parameter that
+    changes the fit — ``max_iter``, ``tol``, the four Gamma hyperpriors
+    ``alpha_1``/``alpha_2``/``lambda_1``/``lambda_2``, ``alpha_init``,
+    ``lambda_init``, ``compute_score``, ``fit_intercept`` — plus
+    ``fit(..., sample_weight=...)`` and both `n_samples ≶ n_features`
+    branches. ``copy_X`` and ``verbose`` are excluded on purpose: neither can
+    change the result (``copy_X`` only controls whether sklearn centers in place,
+    ``verbose`` only prints).
+
+    Each case ships every fitted attribute the estimator exposes:
+    ``coef_`` / ``intercept_`` / ``alpha_`` / ``lambda_`` / ``sigma_`` /
+    ``n_iter_``, plus ``scores_`` for the ``compute_score`` cases and the
+    held-out ``predict`` mean and ``return_std=True`` deviation for the default
+    case. Gating ``alpha_``/``lambda_``/``n_iter_`` — not just ``coef_`` — is
+    what makes this a test of the EVIDENCE ITERATION rather than of a ridge
+    solve at some penalty: a wrong update rule that happens to converge to a
+    similar penalty would still miss the iteration count and the precisions.
+
+    The reference is fitted on the design AFTER the round-trip through the
+    fixture dtype, so an f32 fixture's reference is the answer for the exact
+    bytes the test feeds back in.
+
+    Requires ``scikit-learn==1.9.0``.
+    """
+    from sklearn.linear_model import BayesianRidge
+
+    rng = np.random.default_rng(seed + 106)
+
+    def design(n, d):
+        # Round-trip through the fixture dtype BEFORE fitting (see docstring).
+        x = rng.standard_normal((n, d)).astype(dtype).astype(np.float64)
+        w = rng.standard_normal(d)
+        # Noise at 0.5 (not 0.1): with a near-perfect fit the evidence ratio
+        # `lambda_/alpha_` lands orders of magnitude below the Gram's spectrum,
+        # every case collapses onto the OLS solution, and the hyperprior cases
+        # stop being distinguishable from the default (the premise assert below
+        # catches exactly that).
+        y = (x @ w + 0.5 + 0.5 * rng.standard_normal(n)).astype(dtype).astype(np.float64)
+        return x, y
+
+    nt, dt_ = BAYES_TALL_N_SAMPLES, BAYES_TALL_N_FEATURES
+    nw, dw = BAYES_WIDE_N_SAMPLES, BAYES_WIDE_N_FEATURES
+    x, y = design(nt, dt_)
+    xw, yw = design(nw, dw)
+    xtest = rng.standard_normal((BAYES_N_TEST, dt_)).astype(dtype).astype(np.float64)
+    # Strictly-positive, non-uniform weights so the weighted cases genuinely
+    # differ from the unweighted ones.
+    sw = rng.uniform(0.25, 3.0, size=nt).astype(dtype).astype(np.float64)
+
+    # (case name, ctor kwargs, use_sample_weight, wide?)
+    cases = [
+        # --- defaults, and the intercept switch ------------------------------ #
+        ("default", dict(), False, False),
+        ("noint", dict(fit_intercept=False), False, False),
+        # --- the convergence knobs. `max_iter=1` cannot reach the `iter_ != 0`
+        #     convergence test at all, so it pins the non-converged path; the
+        #     tight/loose tol pair pins `n_iter_` from both sides. ----------- #
+        ("maxiter1", dict(max_iter=1), False, False),
+        ("maxiter5", dict(max_iter=5), False, False),
+        ("tol_tight", dict(tol=1e-8, max_iter=1000), False, False),
+        ("tol_loose", dict(tol=1e-1), False, False),
+        # --- the four Gamma hyperpriors, moved far off 1e-6 so they BITE ---- #
+        ("priors", dict(alpha_1=1.0, alpha_2=5.0, lambda_1=50.0, lambda_2=1.0), False, False),
+        ("priors_zero", dict(alpha_1=0.0, alpha_2=0.0, lambda_1=0.0, lambda_2=0.0), False, False),
+        # --- explicit initial precisions (skips sklearn's 1/(var(y)+eps)) --- #
+        ("init", dict(alpha_init=2.5, lambda_init=0.1), False, False),
+        ("init_alpha_only", dict(alpha_init=10.0), False, False),
+        # --- compute_score: the log-marginal-likelihood trace ---------------- #
+        ("score", dict(compute_score=True), False, False),
+        ("score_maxiter3", dict(compute_score=True, max_iter=3), False, False),
+        ("score_noint", dict(compute_score=True, fit_intercept=False), False, False),
+        # --- sample_weight (sklearn's `sw_sum` enters BOTH the alpha update
+        #     and the log marginal likelihood, so it is scored too) ---------- #
+        ("sw", dict(), True, False),
+        ("sw_noint", dict(fit_intercept=False), True, False),
+        ("sw_score", dict(compute_score=True), True, False),
+        # --- n_samples < n_features: the `U`-branch posterior mean, the padded
+        #     `logdet_sigma`, and the full-basis `sigma_` ------------------- #
+        ("wide", dict(), False, True),
+        ("wide_noint", dict(fit_intercept=False), False, True),
+        ("wide_score", dict(compute_score=True), False, True),
+    ]
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    out = {
+        "X": c(x),
+        "y": c(y),
+        "sample_weight": c(sw),
+        "X_test": c(xtest),
+        "X_wide": c(xw),
+        "y_wide": c(yw),
+    }
+    for name, kwargs, use_sw, wide in cases:
+        xx, yy = (xw, yw) if wide else (x, y)
+        est = BayesianRidge(**kwargs)
+        est.fit(xx, yy, sample_weight=sw if use_sw else None)
+        out[f"coef_{name}"] = c(est.coef_)
+        out[f"intercept_{name}"] = c([est.intercept_])
+        # The precisions and the score trace are compared in f64 whatever the
+        # design's dtype: they are scalars derived from an f64 accumulation on
+        # both sides, and rounding them to f32 would hide a real drift in the
+        # evidence iteration behind the storage format.
+        out[f"alpha_{name}"] = np.asarray([est.alpha_], dtype=np.float64)
+        out[f"lambda_{name}"] = np.asarray([est.lambda_], dtype=np.float64)
+        out[f"sigma_{name}"] = np.asarray(est.sigma_, dtype=np.float64).ravel()
+        # Every array in an oracle .npz must be float32/float64 (the loader's
+        # contract), so the iteration count ships as a float and the reader
+        # casts it back.
+        out[f"n_iter_{name}"] = np.asarray([float(est.n_iter_)], dtype=np.float64)
+        if kwargs.get("compute_score"):
+            out[f"scores_{name}"] = np.asarray(est.scores_, dtype=np.float64)
+
+    # Held-out prediction for the default case, mean AND predictive std, so the
+    # `sigma_` gate is not purely an attribute compare — `predict(return_std)` is
+    # the only consumer that turns `sigma_` back into an observable.
+    est = BayesianRidge().fit(x, y)
+    mean, std = est.predict(xtest, return_std=True)
+    out["pred_default"] = c(mean)
+    out["predstd_default"] = np.asarray(std, dtype=np.float64)
+
+    # --- Premises asserted HERE (at generation) so a sklearn upgrade that
+    #     breaks one is caught in this script rather than showing up as an
+    #     unexplained Rust failure. ---
+    assert out["n_iter_maxiter1"][0] == 1.0, "max_iter=1 must report n_iter_ == 1"
+    assert out["n_iter_tol_loose"][0] < out["n_iter_tol_tight"][0], (
+        "gen_bayesian_ridge: the loose-tol case did not stop earlier than the "
+        "tight-tol one, so `tol` is not being exercised — reseed the fixture"
+    )
+    assert out["n_iter_default"][0] > 1, (
+        "gen_bayesian_ridge: the default case converged in ONE iteration, so the "
+        "evidence loop is untested — reseed the fixture"
+    )
+    assert len(out["scores_score"]) == int(out["n_iter_score"][0]) + 1, (
+        "gen_bayesian_ridge: scores_ is not n_iter_ + 1 long — sklearn's "
+        "trailing post-loop score append has changed shape"
+    )
+    assert not np.allclose(out["coef_default"], out["coef_priors"], atol=1e-6), (
+        "gen_bayesian_ridge: the Gamma hyperpriors did not change the fit, so "
+        "alpha_1/alpha_2/lambda_1/lambda_2 are not exercised"
+    )
+    assert not np.allclose(out["coef_default"], out["coef_sw"], atol=1e-6), (
+        "gen_bayesian_ridge: sample_weight did not change the fit"
+    )
+    assert np.linalg.matrix_rank(xw) == nw, (
+        "gen_bayesian_ridge: the wide design is not rank-deficient, so the "
+        "n_samples < n_features branch is not exercised"
+    )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"bayesian_ridge_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
 def gen_pca(seed: int = SEED, dtype=np.float32, shape=PCA_TALL,
             n_components: int = PCA_N_COMPONENTS_TALL, kind: str = "tall") -> str:
     """Generate one seeded PCA fixture (DECOMP-01, sklearn svd_solver='full').
@@ -4730,6 +4904,10 @@ def main() -> None:
     # without `fit_intercept` / `positive` / `sample_weight`.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_ridge_params(dtype=dtype)}")
+    # BayesianRidge FULL parameter surface (LINEAR-06): the evidence iteration,
+    # both n_samples <=> n_features branches, hyperpriors, inits, scores, weights.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_bayesian_ridge(dtype=dtype)}")
     # PCA (DECOMP-01): tall (m>n) + wide (n_features>n_samples); svd_solver=full.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_pca(dtype=dtype, shape=PCA_TALL, n_components=PCA_N_COMPONENTS_TALL, kind='tall')}")

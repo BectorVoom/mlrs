@@ -43,6 +43,10 @@ def _estimators():
     return [
         mlrs.LinearRegression(),
         mlrs.Ridge(),
+        # BayesianRidge: `max_iter` is the evidence-iteration cap, and the
+        # loop converges in single digits on the harness's tiny fixtures, so
+        # the class default needs no shrinking (unlike MBSGD/RF/HGB below).
+        mlrs.BayesianRidge(),
         mlrs.Lasso(),
         mlrs.ElasticNet(),
         mlrs.LogisticRegression(),
@@ -199,6 +203,11 @@ _EXPECTED = {
             )
         },
     ),
+    # BayesianRidge also has `max_iter`, but unlike Ridge it ALWAYS reports an
+    # `n_iter_` (sklearn sets it unconditionally to `iter_ + 1`), so
+    # `check_non_transformer_estimators_n_iter` genuinely passes and is NOT
+    # carved out here.
+    "BayesianRidge": _merge(_COMMON, _SUPERVISED),
     "Lasso": _merge(_COMMON, _SUPERVISED, _N_ITER),
     "ElasticNet": _merge(_COMMON, _SUPERVISED, _N_ITER),
     # LogisticRegression's y (like every supervised estimator's) now goes

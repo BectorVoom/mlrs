@@ -1036,4 +1036,26 @@ pub enum BuildError {
         /// The offending solver name.
         solver: &'static str,
     },
+
+    /// A scalar hyperparameter fell outside the half-line sklearn's
+    /// `Interval(Real, 0, None, ...)` constraint allows.
+    ///
+    /// Carries the parameter NAME and the bound as text because the estimators
+    /// that raise it (`BayesianRidge`'s four Gamma hyperpriors `alpha_1` /
+    /// `alpha_2` / `lambda_1` / `lambda_2`, its two optional initial values
+    /// `alpha_init` / `lambda_init`, and its `tol`) split across BOTH closures
+    /// of that interval — the hyperpriors admit `0`, the initial values and
+    /// `tol` do not — and a variant per parameter would be six variants saying
+    /// the same thing. Rejected at `build()` (data-INDEPENDENT, the D-08 split).
+    #[error("estimator '{estimator}': {param} = {value} is invalid (must be finite and {bound})")]
+    InvalidHyperprior {
+        /// Which estimator's builder rejected the value (`"bayesian_ridge"`).
+        estimator: &'static str,
+        /// The sklearn parameter name, so the message names what the caller set.
+        param: &'static str,
+        /// The offending value.
+        value: f64,
+        /// The violated bound, rendered into the message (`">= 0"` / `"> 0"`).
+        bound: &'static str,
+    },
 }

@@ -216,7 +216,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::timeseries::{PyAutoArima, PyArima};
     use estimators::linear::{
         PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
-        PyLogisticRegression, PyMBSGDClassifier, PyMBSGDRegressor, PyRidge,
+        PyBayesianRidge, PyLogisticRegression, PyMBSGDClassifier, PyMBSGDRegressor, PyRidge,
     };
     use estimators::manifold::{PyTSNE, PyUMAP};
     use estimators::naive_bayes::{
@@ -231,6 +231,9 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::spectral::{PySpectralClustering, PySpectralEmbedding};
     m.add_class::<PyLinearRegression>()?;
     m.add_class::<PyRidge>()?;
+    // BayesianRidge (LINEAR-06): the evidence-maximized sibling of Ridge —
+    // the penalty is FITTED, not a hyperparameter.
+    m.add_class::<PyBayesianRidge>()?;
     m.add_class::<PyLasso>()?;
     m.add_class::<PyElasticNet>()?;
     m.add_class::<PyLogisticRegression>()?;

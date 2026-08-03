@@ -39,6 +39,22 @@ EXPECTED_PARAMS = {
         "random_state": None,
         "output_type": "input",
     },
+    # BayesianRidge carries sklearn's FULL signature (max_iter .. verbose).
+    "BayesianRidge": {
+        "max_iter": 300,
+        "tol": 1e-3,
+        "alpha_1": 1e-6,
+        "alpha_2": 1e-6,
+        "lambda_1": 1e-6,
+        "lambda_2": 1e-6,
+        "alpha_init": None,
+        "lambda_init": None,
+        "compute_score": False,
+        "fit_intercept": True,
+        "copy_X": True,
+        "verbose": False,
+        "output_type": "input",
+    },
     "Lasso": {
         "alpha": 1.0,
         "fit_intercept": True,
@@ -324,6 +340,7 @@ EXPECTED_PARAMS = {
 SET_PARAM = {
     "LinearRegression": ("fit_intercept", False),
     "Ridge": ("alpha", 2.0),
+    "BayesianRidge": ("max_iter", 50),
     "Lasso": ("alpha", 2.0),
     "ElasticNet": ("l1_ratio", 0.25),
     "LogisticRegression": ("C", 2.0),

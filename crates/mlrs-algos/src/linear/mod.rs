@@ -28,12 +28,23 @@
 //!   1e-5; `coef_` looser secondary — Pitfall 5 gauge freedom). Added by plan
 //!   **05-10**. Deliberately NOT the coordinate-descent solver above (D-03).
 //!
+//! - `BayesianRidge` (LINEAR-06) — **evidence maximization** (MacKay 1992) over
+//!   the ONE-TIME symmetric eigendecomposition of the Gram
+//!   ([`sym_eig`], a Householder+QL reduction, NOT the cold-path Jacobi sweep
+//!   `ridge_solvers` carries). Deliberately not unified with `Ridge`: the
+//!   penalty here is not a hyperparameter but a fitted quantity, re-estimated
+//!   each iteration alongside the noise precision. The whole iteration runs in
+//!   the eigenbasis at `O(d)` per step — including the residual `‖y − Xw‖²`,
+//!   which sklearn recomputes with an `O(n·d)` pass — so `n_samples` leaves the
+//!   loop entirely. Added by plan **06-01**.
+//!
 //! The estimator plans UNCOMMENT/add their own `pub mod <estimator>;` line here
 //! and create the matching file; they do NOT edit `lib.rs` (owned by 04-01),
 //! keeping the estimator plans file-disjoint and parallel-safe.
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+pub mod bayesian_ridge;
 pub mod coordinate_descent;
 pub mod elastic_net;
 pub mod lasso;
@@ -41,6 +52,7 @@ pub mod linear_regression;
 pub mod logistic;
 pub mod ridge;
 pub mod ridge_solvers;
+pub mod sym_eig;
 
 // Phase-10 SGD / linear-SVM (SGDSVM-01..04). This index lands the shared
 // `sgd_config` (typed Loss/Penalty/LearningRate enums + `SgdConfig` lowering

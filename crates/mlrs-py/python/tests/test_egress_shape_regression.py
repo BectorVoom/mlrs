@@ -308,3 +308,94 @@ def test_svc_predict_nonfinite_error_precedes_feature_count_error():
     bad[4, 3] = np.nan
     with pytest.raises(ValueError, match="Input contains NaN"):
         fitted.predict(bad)
+
+
+# --------------------------------------------------------------------------- #
+# CATNB-FIT-CPU: CategoricalNB.fit is the first FIT (not predict) to relocate
+# check_array's finite scan into the Rust pass that already reads every element
+# --------------------------------------------------------------------------- #
+
+
+def _categorical_input(rows=64, cols=3, n_cat=4, seed=0):
+    """Integer-coded categories + a 3-class target, as float64."""
+    rng = np.random.default_rng(seed)
+    X = rng.integers(0, n_cat, size=(rows, cols)).astype(np.float64)
+    y = rng.integers(0, 3, size=rows).astype(np.float64)
+    return X, y
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_categorical_nb_fit_rejects_nonfinite_X(bad_value):
+    """`CategoricalNB.fit` reports NaN/inf with ``check_array``'s exact message.
+
+    The shim passes ``ensure_all_finite=False`` because the Rust fit's
+    validation pass already reads every element of `X` (a category index has to
+    be a non-negative integer), so the scan is RELOCATED, not dropped:
+    ``estimators/naive_bayes.rs::categorical_fit_err`` re-scans the rejected
+    operand and raises the identical ``ValueError``. Without that hand-off a NaN
+    would round to category ``0`` and silently poison the fitted table, which is
+    exactly the failure this test exists to catch.
+    """
+    X, y = _categorical_input()
+    X[7, 1] = bad_value
+    expected = (
+        "Input contains NaN" if np.isnan(bad_value) else "Input contains infinity"
+    )
+    with pytest.raises(ValueError, match=expected):
+        mlrs.naive_bayes.CategoricalNB().fit(X, y)
+
+
+def test_categorical_nb_fit_nonfinite_precedes_invalid_category():
+    """A NaN wins over an (earlier) invalid category, as ``check_array`` does.
+
+    ``check_array`` scans the WHOLE matrix before any estimator-level validation
+    runs, so a matrix holding both reports the non-finite value. The relocated
+    scan keeps that precedence: the Rust fit rejects on whichever it meets
+    first, and the PyO3 arm then re-scans and upgrades the verdict to the
+    non-finite message.
+    """
+    X, y = _categorical_input()
+    X[0, 0] = -1.0  # invalid category, EARLIER in row-major order
+    X[60, 2] = np.nan
+    with pytest.raises(ValueError, match="Input contains NaN"):
+        mlrs.naive_bayes.CategoricalNB().fit(X, y)
+
+
+def test_categorical_nb_fit_still_reports_invalid_categories():
+    """A FINITE but invalid category keeps mlrs' own message (no scan upgrade)."""
+    X, y = _categorical_input()
+    X[3, 2] = -1.0
+    with pytest.raises(ValueError, match="non-negative integers"):
+        mlrs.naive_bayes.CategoricalNB().fit(X, y)
+
+    X, y = _categorical_input()
+    X[3, 2] = 0.5
+    with pytest.raises(ValueError, match="non-negative integers"):
+        mlrs.naive_bayes.CategoricalNB().fit(X, y)
+
+
+def test_categorical_nb_fit_matches_sklearn_after_rewrite():
+    """The row-major two-pass fit still reproduces sklearn's fitted tables.
+
+    A shape wide enough (``n·d`` past the parallel threshold, ragged per-feature
+    category counts) that both passes run CHUNKED across the worker pool — the
+    end-to-end gate that the no-upload host-slice arm plus the flat
+    offset-indexed tabulation did not perturb the numbers.
+    """
+    sklearn_nb = pytest.importorskip("sklearn.naive_bayes")
+
+    rng = np.random.default_rng(11)
+    n, d = 20_000, 9
+    X = np.column_stack([rng.integers(0, j + 2, size=n) for j in range(d)])
+    y = rng.integers(0, 4, size=n)
+
+    got = mlrs.naive_bayes.CategoricalNB().fit(X, y)
+    want = sklearn_nb.CategoricalNB().fit(X, y)
+
+    np.testing.assert_array_equal(got.predict(X[:256]), want.predict(X[:256]))
+    np.testing.assert_allclose(
+        got.predict_log_proba(X[:256]),
+        want.predict_log_proba(X[:256]),
+        atol=1e-5,
+        rtol=1e-5,
+    )
