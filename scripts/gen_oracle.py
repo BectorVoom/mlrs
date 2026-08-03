@@ -4853,6 +4853,176 @@ def gen_tsne(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# --- Preprocessing scalers (PREP-01, Phase 24) ----------------------------- #
+# Every design matrix pins one CONSTANT (or all-zero, for MaxAbsScaler) column
+# so the fixture also exercises the degenerate zero-scale gate
+# (`_handle_zeros_in_scale` — a constant column's scale/range/IQR must become
+# `1`, never divide by `0`). `n=60, d=5` mirrors the other small closed-form
+# estimator fixtures (PCA tall etc).
+
+
+def gen_standard_scaler(seed: int = SEED, dtype=np.float32) -> str:
+    """`StandardScaler` fixture (PREP-01): mean_/var_/scale_ + transform +
+    inverse_transform, column 2 held constant (zero-variance gate)."""
+    from sklearn.preprocessing import StandardScaler
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((60, 5))
+    x[:, 2] = 3.0
+    est = StandardScaler().fit(x)
+    transformed = est.transform(x)
+    inv = est.inverse_transform(transformed)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"standard_scaler_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        mean_=c(est.mean_),
+        var_=c(est.var_),
+        scale_=c(est.scale_),
+        transform=c(transformed),
+        inverse=c(inv),
+    )
+    return out_path
+
+
+def gen_min_max_scaler(seed: int = SEED, dtype=np.float32) -> str:
+    """`MinMaxScaler` fixture (PREP-01, `feature_range=(-2, 3)`): data_min_/
+    data_max_/scale_/min_ + transform + inverse_transform, column 2 constant."""
+    from sklearn.preprocessing import MinMaxScaler
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((60, 5))
+    x[:, 2] = -1.5
+    feature_range = (-2.0, 3.0)
+    est = MinMaxScaler(feature_range=feature_range).fit(x)
+    transformed = est.transform(x)
+    inv = est.inverse_transform(transformed)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"min_max_scaler_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        feature_range=c(feature_range),
+        data_min_=c(est.data_min_),
+        data_max_=c(est.data_max_),
+        scale_=c(est.scale_),
+        min_=c(est.min_),
+        transform=c(transformed),
+        inverse=c(inv),
+    )
+    return out_path
+
+
+def gen_max_abs_scaler(seed: int = SEED, dtype=np.float32) -> str:
+    """`MaxAbsScaler` fixture (PREP-01): max_abs_/scale_ + transform +
+    inverse_transform, column 2 all-zero (zero-scale gate)."""
+    from sklearn.preprocessing import MaxAbsScaler
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((60, 5))
+    x[:, 2] = 0.0
+    est = MaxAbsScaler().fit(x)
+    transformed = est.transform(x)
+    inv = est.inverse_transform(transformed)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"max_abs_scaler_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        max_abs_=c(est.max_abs_),
+        scale_=c(est.scale_),
+        transform=c(transformed),
+        inverse=c(inv),
+    )
+    return out_path
+
+
+def gen_robust_scaler(seed: int = SEED, dtype=np.float32) -> str:
+    """`RobustScaler` fixture (PREP-01, default `quantile_range=(25, 75)`):
+    center_/scale_ + transform + inverse_transform, column 2 constant."""
+    from sklearn.preprocessing import RobustScaler
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((60, 5))
+    x[:, 2] = 4.0
+    est = RobustScaler().fit(x)
+    transformed = est.transform(x)
+    inv = est.inverse_transform(transformed)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"robust_scaler_{dtype_tag}_seed{seed}.npz")
+    np.savez(
+        out_path,
+        X=c(x),
+        center_=c(est.center_),
+        scale_=c(est.scale_),
+        transform=c(transformed),
+        inverse=c(inv),
+    )
+    return out_path
+
+
+def gen_normalizer(seed: int = SEED, dtype=np.float32, norm: str = "l2") -> str:
+    """`Normalizer` fixture (PREP-01, `norm` in `{'l1', 'l2', 'max'}`): row 0
+    forced all-zero (zero-norm gate — the row must transform unchanged)."""
+    from sklearn.preprocessing import Normalizer
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((60, 5))
+    x[0, :] = 0.0
+    transformed = Normalizer(norm=norm).fit_transform(x)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"normalizer_{norm}_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, X=c(x), transform=c(transformed))
+    return out_path
+
+
+def gen_binarizer(seed: int = SEED, dtype=np.float32) -> str:
+    """`Binarizer` fixture (PREP-01, `threshold=0.5`), including exact-threshold
+    entries (sklearn's `>` is STRICT — a tie must binarize to 0)."""
+    from sklearn.preprocessing import Binarizer
+
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((60, 5))
+    x[1, :] = 0.5  # exactly the threshold: must binarize to 0 (strict '>')
+    threshold = 0.5
+    transformed = Binarizer(threshold=threshold).fit_transform(x)
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"binarizer_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, X=c(x), threshold=c([threshold]), transform=c(transformed))
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -5136,6 +5306,21 @@ def main() -> None:
     print(f"wrote {gen_metrics_classification_degenerate()}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_metrics_regression(dtype=dtype)}")
+
+    # ---- Preprocessing scaler fixtures (PREP-01, Phase 24) ----
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_standard_scaler(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_min_max_scaler(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_max_abs_scaler(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_robust_scaler(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        for norm in ("l1", "l2", "max"):
+            print(f"wrote {gen_normalizer(dtype=dtype, norm=norm)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_binarizer(dtype=dtype)}")
 
 
 if __name__ == "__main__":

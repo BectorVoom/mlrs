@@ -37,6 +37,7 @@ pub mod linear;
 pub mod manifold;
 pub mod naive_bayes;
 pub mod neighbors;
+pub mod preprocessing;
 pub mod projection;
 pub mod spectral;
 pub mod timeseries;

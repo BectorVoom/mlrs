@@ -91,6 +91,15 @@ def _estimators():
         # tiny fixtures (not the class default). --------------------------- #
         mlrs.HistGradientBoostingClassifier(max_iter=10),
         mlrs.HistGradientBoostingRegressor(max_iter=10),
+        # --- PREP-01 (Phase 24): the six preprocessing scalers. Every one is
+        # an unsupervised, dense-float-only transformer like PCA/TruncatedSVD
+        # above. ------------------------------------------------------------ #
+        mlrs.StandardScaler(),
+        mlrs.MinMaxScaler(),
+        mlrs.MaxAbsScaler(),
+        mlrs.RobustScaler(),
+        mlrs.Normalizer(),
+        mlrs.Binarizer(),
     ]
 
 
@@ -178,6 +187,16 @@ def _merge(*dicts):
     for d in dicts:
         out.update(d)
     return out
+
+
+# PREP-01's six scalers are the simplest transformers in the shim (a single
+# elementwise/column map, no extra ingress branching), and empirically (a real
+# sweep run) they pass `check_dtype_object` / `check_estimator_sparse_tag` /
+# `check_estimator_sparse_array` / `check_estimator_sparse_matrix` outright —
+# unlike the rest of `_COMMON`'s estimators, xfailing those here would XPASS
+# and falsely advertise unsupported behavior. Only the non-picklable fitted
+# state (shared by every mlrs estimator) genuinely fails.
+_PREP01 = {"check_estimators_pickle": _COMMON["check_estimators_pickle"]}
 
 
 # Per-estimator-CLASS expected-failure maps. The callable below dispatches on
@@ -282,6 +301,14 @@ _EXPECTED = {
         _COMMON, _SUPERVISED, _CLASSIFIER, _N_ITER, _FIT2D_1SAMPLE
     ),
     "HistGradientBoostingRegressor": _merge(_COMMON, _SUPERVISED, _N_ITER),
+    # --- PREP-01 (Phase 24): unsupervised transformers; see `_PREP01`'s
+    # comment for why this is narrower than `_COMMON`. ------------------------
+    "StandardScaler": _merge(_PREP01),
+    "MinMaxScaler": _merge(_PREP01),
+    "MaxAbsScaler": _merge(_PREP01),
+    "RobustScaler": _merge(_PREP01),
+    "Normalizer": _merge(_PREP01),
+    "Binarizer": _merge(_PREP01),
 }
 
 

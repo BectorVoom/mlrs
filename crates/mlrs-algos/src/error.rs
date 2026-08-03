@@ -1058,4 +1058,21 @@ pub enum BuildError {
         /// The violated bound, rendered into the message (`">= 0"` / `"> 0"`).
         bound: &'static str,
     },
+
+    /// A two-ended range hyperparameter had its bounds out of order or outside
+    /// its valid domain — `MinMaxScaler(feature_range=(min, max))` requires
+    /// `min < max`; `RobustScaler(quantile_range=(q_min, q_max))` additionally
+    /// requires both endpoints in `[0, 100]`. Rejected at `build()`
+    /// (data-INDEPENDENT).
+    #[error("estimator '{estimator}': {param} = ({min}, {max}) is invalid")]
+    InvalidRange {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The sklearn parameter name (`"feature_range"` / `"quantile_range"`).
+        param: &'static str,
+        /// The offending lower bound.
+        min: f64,
+        /// The offending upper bound.
+        max: f64,
+    },
 }

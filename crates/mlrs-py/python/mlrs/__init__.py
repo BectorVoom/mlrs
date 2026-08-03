@@ -63,6 +63,14 @@ from .neighbors import (
     KNeighborsRegressor,
     NearestNeighbors,
 )
+from .preprocessing import (
+    Binarizer,
+    MaxAbsScaler,
+    MinMaxScaler,
+    Normalizer,
+    RobustScaler,
+    StandardScaler,
+)
 from .random_projection import (
     GaussianRandomProjection,
     SparseRandomProjection,
@@ -128,6 +136,12 @@ __all__ = [
     "johnson_lindenstrauss_min_dim",
     "ARIMA",
     "AutoARIMA",
+    "StandardScaler",
+    "MinMaxScaler",
+    "MaxAbsScaler",
+    "RobustScaler",
+    "Normalizer",
+    "Binarizer",
     "backend_supports_f64",
 ]
 
