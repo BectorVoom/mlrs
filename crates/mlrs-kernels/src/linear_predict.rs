@@ -216,3 +216,213 @@ pub fn linear_predict_bias_shared<F: Float + CubeElement>(
         }
     }
 }
+
+/// `BayesianRidge::predict(X, return_std=True)`'s second return value, fused
+/// into one device launch:
+///
+/// ```text
+/// x̃ᵢ     = xᵢ − X_offset_
+/// std[i] = √( x̃ᵢ·Σ·x̃ᵢᵀ + 1/α )
+/// ```
+///
+/// ## The quadratic form is evaluated as a SUM OF SQUARES, not as `x̃ᵀΣx̃`
+/// `Σ = V·diag(1/(α·λⱼ + λ_prec))·Vᵀ` is symmetric positive definite (every
+/// `α·λⱼ + λ_prec` is strictly positive: `λⱼ ≥ 0` for a Gram and `λ_prec > 0`),
+/// so it factors as `Σ = M·Mᵀ` with `M = V·diag(1/√(α·λⱼ + λ_prec))` and
+///
+/// ```text
+/// x̃·Σ·x̃ᵀ = ‖Mᵀ·x̃‖² = Σⱼ (mⱼ·x̃)²
+/// ```
+///
+/// The host passes `mt`, which is `Mᵀ` stored ROW-MAJOR, so `mⱼ` is the
+/// contiguous run `mt[j·d .. j·d + d]`. That form cannot go negative — the
+/// direct `x̃ᵀ(Σx̃)` differences two quantities of mixed sign and needs a
+/// `.max(0.0)` before the `sqrt`, which on the device would be a silent NaN
+/// instead of a host-side clamp.
+///
+/// ## A 4×4 REGISTER TILE, because the scalar form is load-bound
+/// One `(row, j)` pair at a time issues two loads (`x[i·d+k]`, `mt[j·d+k]`) per
+/// multiply-add — 0.33 FMA per load counting the `offset` read. Measured on a
+/// Tesla P100 that ran at **9.2 G multiply-adds/s**, about 1% of the card's
+/// `f64` peak, and lost to scikit-learn's OpenBLAS GEMM on the CPU beside it
+/// (712 ms vs 284 ms at `d = 256`, 100 000 rows). Nothing about a kernel that
+/// starved for operands is fixed by launch shape.
+///
+/// Each unit therefore owns **4 rows × 4 `j` directions**. Inside the `k` loop
+/// it loads 4 `x` values, 4 `mt` values and one `offset`, and does 16
+/// multiply-adds with them — `1.8` FMA per load, a ~5× improvement in arithmetic
+/// intensity. The reuse is two-way and that is the point: blocking only over `j`
+/// would cut the `x` traffic but leave `mt` re-read once per row, and blocking
+/// only over rows would do the reverse. This is the same `4 × 4` register tile
+/// [`crate::gram::gram_xty_blocked`] uses, and for the same reason.
+///
+/// No `SharedMemory` and no `sync_cube`: the tile lives entirely in registers
+/// (~28 `f64` accumulators and operands per unit), so the kernel stays free of
+/// barriers and of the shared-memory budget that caps the Gram kernels' `d`.
+///
+/// ## Shape, tails and precision
+/// One unit per ROW TILE, `ntiles = ⌈n/4⌉`, bounds-checked so the
+/// ceiling-division launch may over-provision safely (T-0203-01). The final
+/// tile's out-of-range rows are CLAMPED to `n − 1` rather than branched on: they
+/// then compute a duplicate of the last row's value and simply are not written
+/// back, which keeps the inner loop free of divergence. `d` not divisible by 4
+/// is handled by a scalar `j` tail after the tiled loop.
+///
+/// Accumulation is in `F`, matching [`linear_predict_bias`]: the summands of
+/// `q` are all non-negative (no cancellation) and the inner `mⱼ·x̃` runs over the
+/// fitted feature count, so an `f32` sum stays inside the 1e-5 oracle contract.
+/// `noise = 1/α` is a scalar `F` by value (A6, like [`scale`]'s `factor`).
+///
+/// ## `tile0`: why this kernel is launched in slices
+/// The unit handles GLOBAL tile `tile0 + ABSOLUTE_POS`, so the caller can cover
+/// `n` rows with several bounded launches instead of one unbounded one. That is
+/// a WATCHDOG guard, not a tiling optimization: this is the crate's first kernel
+/// whose single-launch cost grows as `n·d²`, and a display-driving GPU cancels
+/// any submission that overruns the compositor's timeout. See
+/// `crate::prims::linear_predict::STD_MACS_PER_LAUNCH` for the budget, and
+/// `use_host_std` for why wgpu does not take this kernel at all.
+///
+/// [`scale`]: crate::elementwise::scale
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn bayes_predict_std<F: Float + CubeElement>(
+    x: &Array<F>,
+    offset: &Array<F>,
+    mt: &Array<F>,
+    out: &mut Array<F>,
+    tile0: u32,
+    ntiles: u32,
+    n: u32,
+    d: u32,
+    noise: F,
+) {
+    let t = ABSOLUTE_POS + tile0 as usize;
+    if t < ntiles as usize {
+        let i0 = (t as u32) * 4u32;
+
+        // Clamp the tile's four row ids into range. The clamped lanes recompute
+        // the last row and are not written back below.
+        let r0 = i0;
+        let mut r1 = i0 + 1u32;
+        let mut r2 = i0 + 2u32;
+        let mut r3 = i0 + 3u32;
+        if r1 >= n {
+            r1 = n - 1u32;
+        }
+        if r2 >= n {
+            r2 = n - 1u32;
+        }
+        if r3 >= n {
+            r3 = n - 1u32;
+        }
+        let b0 = (r0 * d) as usize;
+        let b1 = (r1 * d) as usize;
+        let b2 = (r2 * d) as usize;
+        let b3 = (r3 * d) as usize;
+
+        let zero = F::new(0.0_f32);
+        let mut q0 = zero;
+        let mut q1 = zero;
+        let mut q2 = zero;
+        let mut q3 = zero;
+
+        // --- The 4 (rows) × 4 (j) tiled body. ---
+        let mut j = 0u32;
+        while j + 4u32 <= d {
+            let m0 = (j * d) as usize;
+            let m1 = m0 + d as usize;
+            let m2 = m1 + d as usize;
+            let m3 = m2 + d as usize;
+
+            let mut a00 = zero;
+            let mut a01 = zero;
+            let mut a02 = zero;
+            let mut a03 = zero;
+            let mut a10 = zero;
+            let mut a11 = zero;
+            let mut a12 = zero;
+            let mut a13 = zero;
+            let mut a20 = zero;
+            let mut a21 = zero;
+            let mut a22 = zero;
+            let mut a23 = zero;
+            let mut a30 = zero;
+            let mut a31 = zero;
+            let mut a32 = zero;
+            let mut a33 = zero;
+
+            let mut k = 0u32;
+            while k < d {
+                let kk = k as usize;
+                let o = offset[kk];
+                let x0 = x[b0 + kk] - o;
+                let x1 = x[b1 + kk] - o;
+                let x2 = x[b2 + kk] - o;
+                let x3 = x[b3 + kk] - o;
+                let y0 = mt[m0 + kk];
+                let y1 = mt[m1 + kk];
+                let y2 = mt[m2 + kk];
+                let y3 = mt[m3 + kk];
+                a00 += x0 * y0;
+                a01 += x0 * y1;
+                a02 += x0 * y2;
+                a03 += x0 * y3;
+                a10 += x1 * y0;
+                a11 += x1 * y1;
+                a12 += x1 * y2;
+                a13 += x1 * y3;
+                a20 += x2 * y0;
+                a21 += x2 * y1;
+                a22 += x2 * y2;
+                a23 += x2 * y3;
+                a30 += x3 * y0;
+                a31 += x3 * y1;
+                a32 += x3 * y2;
+                a33 += x3 * y3;
+                k += 1u32;
+            }
+
+            q0 += a00 * a00 + a01 * a01 + a02 * a02 + a03 * a03;
+            q1 += a10 * a10 + a11 * a11 + a12 * a12 + a13 * a13;
+            q2 += a20 * a20 + a21 * a21 + a22 * a22 + a23 * a23;
+            q3 += a30 * a30 + a31 * a31 + a32 * a32 + a33 * a33;
+            j += 4u32;
+        }
+
+        // --- Scalar `j` tail (`d % 4 != 0`), at most three directions. ---
+        while j < d {
+            let m = (j * d) as usize;
+            let mut a0 = zero;
+            let mut a1 = zero;
+            let mut a2 = zero;
+            let mut a3 = zero;
+            let mut k = 0u32;
+            while k < d {
+                let kk = k as usize;
+                let o = offset[kk];
+                let y = mt[m + kk];
+                a0 += (x[b0 + kk] - o) * y;
+                a1 += (x[b1 + kk] - o) * y;
+                a2 += (x[b2 + kk] - o) * y;
+                a3 += (x[b3 + kk] - o) * y;
+                k += 1u32;
+            }
+            q0 += a0 * a0;
+            q1 += a1 * a1;
+            q2 += a2 * a2;
+            q3 += a3 * a3;
+            j += 1u32;
+        }
+
+        out[r0 as usize] = F::sqrt(q0 + noise);
+        if i0 + 1u32 < n {
+            out[r1 as usize] = F::sqrt(q1 + noise);
+        }
+        if i0 + 2u32 < n {
+            out[r2 as usize] = F::sqrt(q2 + noise);
+        }
+        if i0 + 3u32 < n {
+            out[r3 as usize] = F::sqrt(q3 + noise);
+        }
+    }
+}

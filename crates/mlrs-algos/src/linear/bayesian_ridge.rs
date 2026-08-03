@@ -92,31 +92,42 @@
 //! than undone afterwards (`gram_host`'s module docs), so the `1e-5` oracle gate
 //! holds on both float widths.
 //!
-//! ## Device residency and the two ingress paths (D-03)
+//! ## Device residency and the two ingress paths (D-03, BAYES-GPU)
 //! Fitted `coef_`/`intercept_` are device-resident [`DeviceArray`]s exactly as
 //! `Ridge`'s are, so `predict` shares the fused [`linear_predict`] kernel and the
 //! host-ingress [`predict_linear_from_host`] route with the other four dense
 //! linear regressors. `sigma_`/`scores_` are host `f64` — they are read at the
-//! Python boundary and never feed a kernel.
+//! Python boundary, and `sigma_`'s FACTOR (see [`posterior_sigma_sqrt_t`]) is
+//! what the `return_std` kernel consumes.
 //!
-//! `fit` itself has two ingress paths, chosen by
+//! `fit` has two ingress paths, chosen by
 //! [`BayesianRidge::host_fit_applicable`] before any upload:
 //!
 //! | | [`Fit::fit`] (device) | [`BayesianRidge::fit_from_host_slice`] |
 //! |---|---|---|
-//! | design upload | `n·d`, then read straight back | none |
-//! | centering + Gram / `Xᵀy` | one parallel `f64` host pass | the same pass |
+//! | design upload | `n·d` | none |
+//! | centering + Gram / `Xᵀy` | `f64` on the DEVICE, `d² + d` read back | one parallel `f64` host pass |
 //! | eig + loop + `sigma_` | host | host |
 //!
-//! Everything after ingress is host-side, and deliberately so on two counts.
-//! The ITERATION is `O(d)` of arithmetic per step over a length-`d` vector, so a
-//! launch per iteration would be the launch-overhead pathology `sgd_solve`,
-//! HDBSCAN's core scan and UMAP's per-epoch layout each became host arms to
-//! escape. The GRAM is host-side for a different and stricter reason — the
-//! residual identity amplifies its error by `yᵀy/sse`, so it must be accumulated
-//! in `f64` whatever the estimator's `F`, which `gram_xty` (accumulating at `F`)
-//! does not do. [`BayesianRidge::fit_with_sample_weight`] documents the
-//! measurement that settled it.
+//! The `O(n·d²)` reduction is the only stage that moves, and that is the whole
+//! design. The two stages that stay on the host stay there for two different
+//! and equally deliberate reasons:
+//!
+//! - The ITERATION is `O(d)` of arithmetic per step over a length-`d` vector, so
+//!   a launch per iteration would be the launch-overhead pathology `sgd_solve`,
+//!   HDBSCAN's core scan and UMAP's per-epoch layout each became host arms to
+//!   escape.
+//! - The EIGENDECOMPOSITION is `O(d³)` and independent of `n`. It was the
+//!   estimator's second cost after the Gram until [`sym_eig`] was moved to a
+//!   transposed working layout — measured `172 ms → 18 ms` at `d = 256`, a 9.6×
+//!   cut from re-indexing alone, which puts it back an order of magnitude below
+//!   the reduction and leaves the Gram as the thing worth offloading.
+//!
+//! What the device arm may NOT do is accumulate at `F`: the residual identity
+//! amplifies the Gram's error by `yᵀy/sse` (see [`update_coef`]), so an `f32`
+//! design is widened ON THE DEVICE and the whole assembly runs at `f64`.
+//! `prims::normal_eq` documents the arm; the measurement that forced the `f64`
+//! rule is in [`BayesianRidge::fit_with_sample_weight`].
 //!
 //! ## `copy_X` is accepted and is a genuine no-op here
 //! As in `Ridge`: sklearn's `copy_X` exists because `_preprocess_data` can
@@ -132,10 +143,15 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable};
-use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
+use mlrs_backend::prims::gram_host::centered_gram_xty;
+use mlrs_backend::prims::linear_predict::{
+    bayes_predict_std, bayes_predict_std_from_host, linear_predict, HostMirror, HostPrediction,
+};
+use mlrs_backend::prims::normal_eq::{
+    centered_gram_xty_device, device_fit_preferred, device_gram_applicable,
+};
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::elastic_net::predict_linear_from_host;
@@ -203,6 +219,13 @@ pub struct BayesianRidge<F, S = Unfit> {
     /// row-major. Host-resident — it is read at the Python boundary and by
     /// [`BayesianRidge::predict_std_from_host`], never by a kernel.
     sigma_: Option<Vec<f64>>,
+    /// `Mᵀ` row-major (`d × d`), where `Σ = M·Mᵀ` — the factor
+    /// [`predict_std`](BayesianRidge::predict_std) evaluates the predictive
+    /// variance through instead of `sigma_` itself (see
+    /// [`posterior_sigma_sqrt_t`]). Derived from the SAME spectrum and
+    /// eigenvectors `sigma_` is, at no extra asymptotic cost, and stored rather
+    /// than re-derived because `predict` must not depend on fit-time scratch.
+    sigma_sqrt_t_: Option<Vec<f64>>,
     /// sklearn's `scores_`: the log marginal likelihood per iteration plus one
     /// final value. Empty unless `compute_score`.
     scores_: Vec<f64>,
@@ -254,6 +277,7 @@ where
             alpha_: 0.0,
             lambda_: 0.0,
             sigma_: None,
+            sigma_sqrt_t_: None,
             scores_: Vec::new(),
             n_iter_: 0,
             x_offset_: Vec::new(),
@@ -306,26 +330,28 @@ where
             && self.verbose == other.verbose
     }
 
-    /// Would the host-slice ingress ([`BayesianRidge::fit_from_host_slice`])
-    /// avoid work for this shape?
+    /// Should `fit` take the host-slice ingress
+    /// ([`BayesianRidge::fit_from_host_slice`]) rather than uploading and going
+    /// through [`Fit::fit`]?
     ///
-    /// Unlike `Ridge`'s namesake this is purely an INGRESS hint, not a
-    /// correctness gate: both `fit` entry points form the normal equations
-    /// through the same `f64` host sweep (see
-    /// [`BayesianRidge::fit_with_sample_weight`] for why the Gram cannot be
-    /// formed on-device here), so they differ only in whether the design makes a
-    /// round trip through device memory first. `fit_from_host_slice` therefore
-    /// accepts ANY shape — there is no configuration it can answer wrongly.
+    /// This is purely an INGRESS hint, never a correctness gate: BOTH entry
+    /// points produce the same fit to rounding — the device arm accumulates its
+    /// Gram in `f64` exactly as the host sweep does (`prims::normal_eq` module
+    /// docs), and everything after the reduction is literally the same code. So
+    /// `fit_from_host_slice` accepts ANY shape and there is no configuration
+    /// this predicate can answer wrongly; it can only answer it slowly.
     ///
     /// Callers still branch on it because the two entry points take DIFFERENT
     /// operand types (host slice vs [`DeviceArray`]), and that choice has to be
-    /// made before ingress: on the host route the design is never uploaded at
-    /// all. `true` on the cpu backend, and below the fixed-dispatch-cost floor
-    /// on every backend (`prims::gram_host::gram_host_applicable`).
+    /// made before ingress — on the host route the design is never uploaded at
+    /// all. `true` on the cpu backend, on any adapter that cannot accumulate in
+    /// `f64`, and below the work floor where the upload cannot pay for itself
+    /// (`prims::normal_eq::device_fit_preferred`, which explains why that floor
+    /// is much higher here than for `Ridge`).
     ///
     /// `shape` is `(n_samples, n_features)`.
     pub fn host_fit_applicable(&self, shape: (usize, usize)) -> bool {
-        gram_host_applicable(shape.0, shape.1)
+        !device_fit_preferred::<F>(shape.0, shape.1)
     }
 
     /// [`Fit::fit`] over HOST slices — the no-upload, no-launch ingress.
@@ -481,6 +507,7 @@ where
 
         let lap = std::time::Instant::now();
         let sigma = posterior_sigma(&lambdas, &v, d, k, fit.alpha, fit.lambda);
+        let sigma_sqrt_t = posterior_sigma_sqrt_t(&lambdas, &v, d, k, fit.alpha, fit.lambda);
         let t_sigma = if profile {
             lap.elapsed().as_secs_f64()
         } else {
@@ -530,6 +557,7 @@ where
             alpha_: fit.alpha,
             lambda_: fit.lambda,
             sigma_: Some(sigma),
+            sigma_sqrt_t_: Some(sigma_sqrt_t),
             scores_: fit.scores,
             n_iter_: fit.n_iter,
             x_offset_: x_mean,
@@ -931,6 +959,67 @@ fn posterior_sigma(
     sigma
 }
 
+/// `Mᵀ` row-major, where `M = V·diag(1/√(α·λⱼ + λ_prec))` factors the posterior
+/// covariance as `Σ = M·Mᵀ` — the form `predict(X, return_std=True)` evaluates
+/// its quadratic form through.
+///
+/// ## Why a factor rather than `sigma_` itself
+/// `Σ = Σⱼ vⱼvⱼᵀ/(α·λⱼ + λ_prec)` is symmetric POSITIVE DEFINITE: `λⱼ ≥ 0` for a
+/// Gram (after [`clamp_numerical_rank`], exactly `0` in the null directions) and
+/// `λ_prec > 0`, so every denominator is strictly positive and the square root
+/// is real for every direction. Writing `M = V·diag(1/√·)` gives
+/// `M·Mᵀ = V·diag(1/·)·Vᵀ = Σ` term for term, and hence
+///
+/// ```text
+/// x̃·Σ·x̃ᵀ = ‖Mᵀ·x̃‖² = Σⱼ (mⱼ·x̃)²
+/// ```
+///
+/// which is a SUM OF SQUARES. The direct form `x̃·(Σ·x̃)` is a difference of
+/// products of mixed sign and can come out negative under cancellation — the
+/// reason the pre-existing host path clamped with `.max(0.0)` before its `sqrt`.
+/// Through the factor there is nothing to clamp: the quantity is non-negative by
+/// construction. The device kernel gets the same guarantee, which matters more
+/// there — a negative under a `sqrt` on the device is a silent NaN in the output
+/// rather than a host-side clamp.
+///
+/// The layout is the TRANSPOSE, `mt[j·d + i] = M[i][j]`, so `mⱼ` is contiguous.
+/// Both consumers walk `j` in the outer loop and `i` in the inner one, so this
+/// is the layout in which every read is sequential — see
+/// [`mlrs_kernels::linear_predict::bayes_predict_std`] for what that buys on the
+/// device.
+///
+/// `k` enters exactly as it does in [`posterior_sigma`]: the point past which
+/// `λⱼ` is forced to EXACTLY zero, matching the zero-padding of sklearn's
+/// `eigen_vals_full`. A zero denominator (only reachable if `λ_prec` itself
+/// underflows to `0` in a null direction) yields a zero row, which is
+/// [`posterior_sigma`]'s behaviour for the same case.
+///
+/// `O(d²)` — negligible beside the `O(d³)` [`posterior_sigma`] it runs
+/// alongside.
+fn posterior_sigma_sqrt_t(
+    lambdas: &[f64],
+    v: &[f64],
+    d: usize,
+    k: usize,
+    alpha: f64,
+    lambda: f64,
+) -> Vec<f64> {
+    let mut mt = vec![0.0f64; d * d];
+    for j in 0..d {
+        let ev = if j < k { lambdas[j] } else { 0.0 };
+        let denom = alpha * ev + lambda;
+        if !(denom > 0.0) {
+            continue;
+        }
+        let scale = 1.0 / denom.sqrt();
+        let row = &mut mt[j * d..(j + 1) * d];
+        for (i, slot) in row.iter_mut().enumerate() {
+            *slot = v[i * d + j] * scale;
+        }
+    }
+    mt
+}
+
 /// The lower-triangle rows of [`posterior_sigma`]'s output for one band,
 /// written into `out` whose row 0 IS global row `r0`.
 fn sigma_rows(scaled: &[f64], v: &[f64], d: usize, r0: usize, out: &mut [f64]) {
@@ -1223,6 +1312,7 @@ impl BayesianRidgeBuilder {
             alpha_: 0.0,
             lambda_: 0.0,
             sigma_: None,
+            sigma_sqrt_t_: None,
             scores_: Vec::new(),
             n_iter_: 0,
             x_offset_: Vec::new(),
@@ -1337,16 +1427,58 @@ where
     /// evaluated in that frame. With `fit_intercept = false` the offset is zeros
     /// and the subtraction is a no-op, exactly as in sklearn.
     ///
-    /// Reads the caller's buffer in place. `predict` itself is a separate call
-    /// because sklearn returns the mean whether or not `return_std` is set, so
-    /// the common path must not pay for this quadratic form.
+    /// `predict` itself is a separate call because sklearn returns the mean
+    /// whether or not `return_std` is set, so the common path must not pay for
+    /// this quadratic form.
+    ///
+    /// ## Where the work runs
+    /// The quadratic form is `O(n·d²)` — a factor `d` more arithmetic than the
+    /// mean — while the operand is the same `n·d`. That ratio is why this is the
+    /// dense-linear predict path with the most to gain from the device, and
+    /// [`bayes_predict_std_from_host`] routes it accordingly: the cpu backend
+    /// reads the caller's buffer in place across
+    /// [`cpu_launch_units`](mlrs_backend::capability::cpu_launch_units) scoped
+    /// threads, every device backend uploads once and runs the fused
+    /// [`bayes_predict_std`] kernel. Both arms evaluate the SAME sum-of-squares
+    /// form through the covariance factor (see [`posterior_sigma_sqrt_t`]), so
+    /// the routing cannot change the answer.
     pub fn predict_std_from_host(
         &self,
+        pool: &mut BufferPool<ActiveRuntime>,
         x: &[F],
         shape: (usize, usize),
     ) -> Result<Vec<f64>, AlgoError> {
         let (n_samples, n_features) = shape;
-        let sigma = self.sigma();
+        let mt = self.check_std_state(n_features)?;
+        Ok(bayes_predict_std_from_host::<F>(
+            pool,
+            x,
+            &self.x_offset_,
+            mt,
+            1.0 / self.alpha_,
+            (n_samples, n_features),
+        )?)
+    }
+
+    /// [`predict_std_from_host`](BayesianRidge::predict_std_from_host) for a
+    /// test matrix that is already DEVICE-resident — the `return_std` twin of
+    /// [`Predict::predict`], and like it the result stays on the device (D-05).
+    ///
+    /// The fitted `X_offset_` and the covariance factor are host `f64` (they are
+    /// read at the Python boundary and are `O(d²)`, not `O(n·d)`), so they are
+    /// narrowed to `F` and uploaded per call. That is `d² + d` elements against
+    /// the `n·d²` multiply-adds the launch then does — the same order the
+    /// launch's own fixed cost sits at, and it keeps `predict` free of fit-time
+    /// device state that would have to be kept alive and pool-managed for the
+    /// estimator's whole lifetime.
+    pub fn predict_std(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        let (n_samples, n_features) = shape;
+        let mt = self.check_std_state(n_features)?;
         if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
             return Err(AlgoError::Prim(PrimError::ShapeMismatch {
                 operand: "x",
@@ -1355,41 +1487,51 @@ where
                 len: x.len(),
             }));
         }
-        if sigma.len() != n_features * n_features {
+
+        let off: Vec<F> = self.x_offset_.iter().map(|v| f64_to_host::<F>(*v)).collect();
+        let mt_f: Vec<F> = mt.iter().map(|v| f64_to_host::<F>(*v)).collect();
+        let off_dev = DeviceArray::from_host(pool, &off);
+        let mt_dev = DeviceArray::from_host(pool, &mt_f);
+        let out = bayes_predict_std::<F>(
+            pool,
+            x,
+            &off_dev,
+            &mt_dev,
+            (n_samples, n_features),
+            f64_to_host::<F>(1.0 / self.alpha_),
+        );
+        off_dev.release_into(pool);
+        mt_dev.release_into(pool);
+        Ok(out?)
+    }
+
+    /// The fitted state both `predict_std` ingresses need, checked against the
+    /// test design's feature count exactly once: returns the covariance factor
+    /// `Mᵀ` ([`posterior_sigma_sqrt_t`]) on success.
+    ///
+    /// `X_offset_` is checked alongside it because the two are consumed
+    /// together and a mismatch in either is the same caller error — a test
+    /// matrix whose feature count disagrees with the fit.
+    fn check_std_state(&self, n_features: usize) -> Result<&[f64], AlgoError> {
+        let mt = self
+            .sigma_sqrt_t_
+            .as_ref()
+            .expect("sigma_sqrt_t_ is Some by construction on BayesianRidge<F, Fitted>");
+        if mt.len() != n_features * n_features {
             return Err(AlgoError::Prim(PrimError::DimMismatch {
                 dim: "n_features",
-                lhs: (sigma.len() as f64).sqrt() as usize,
+                lhs: (mt.len() as f64).sqrt() as usize,
                 rhs: n_features,
             }));
         }
-
-        let noise = 1.0 / self.alpha_;
-        let d = n_features;
-        if self.x_offset_.len() != d {
+        if self.x_offset_.len() != n_features {
             return Err(AlgoError::Prim(PrimError::DimMismatch {
                 dim: "n_features",
                 lhs: self.x_offset_.len(),
-                rhs: d,
+                rhs: n_features,
             }));
         }
-        let mut out = vec![0.0f64; n_samples];
-        // `Σ·x̃ᵢ` then `x̃ᵢ·(Σ·x̃ᵢ)`: `O(d²)` per row against `O(d³)` for anything
-        // that materializes a product matrix, and `sigma` is read row-major.
-        let mut xc = vec![0.0f64; d];
-        let mut sx = vec![0.0f64; d];
-        for (i, o) in out.iter_mut().enumerate() {
-            let row = &x[i * d..(i + 1) * d];
-            for (j, c) in xc.iter_mut().enumerate() {
-                *c = host_to_f64(row[j]) - self.x_offset_[j];
-            }
-            for (j, s) in sx.iter_mut().enumerate() {
-                let srow = &sigma[j * d..(j + 1) * d];
-                *s = srow.iter().zip(xc.iter()).map(|(a, b)| a * b).sum();
-            }
-            let q: f64 = sx.iter().zip(xc.iter()).map(|(a, b)| a * b).sum();
-            *o = (q + noise).max(0.0).sqrt();
-        }
-        Ok(out)
+        Ok(mt)
     }
 }
 
@@ -1418,13 +1560,13 @@ where
 {
     /// `fit` with sklearn's `sample_weight`, over a DEVICE-resident design.
     ///
-    /// Reads the design back and delegates to [`BayesianRidge::fit_from_host_slice`],
-    /// so the normal equations are formed by the SAME `f64` host sweep on every
-    /// backend and at every float width. That is a deliberate departure from
-    /// `Ridge`, which forms its Gram on-device — see below for why this
-    /// estimator cannot.
+    /// Forms the normal equations ON THE DEVICE where the backend can
+    /// ([`device_gram_applicable`]) and reads back only the `d² + d` scalars the
+    /// rest of the fit consumes; otherwise reads the design back and delegates
+    /// to [`BayesianRidge::fit_from_host_slice`]. Either way the reduction runs
+    /// in `f64`, which is the invariant this estimator cannot trade away.
     ///
-    /// ## Why the Gram is not formed on-device here
+    /// ## Why the Gram must be `f64` even when the design is not
     /// `gram_xty` accumulates in the estimator's own float width `F`. For
     /// `Ridge` that is fine: its Gram feeds a Cholesky solve, which is
     /// backward-stable, so an `f32` Gram gives an `f32`-accurate `coef_`.
@@ -1437,19 +1579,20 @@ where
     /// next iteration's shrinkage, and the error compounds over the loop.
     ///
     /// Measured on the `6 × 10` wide fixture with `fit_intercept=False`, where
-    /// the model explains all but `~3e-4` of the target variance: the `f64` host
-    /// Gram reproduced sklearn's `coef_`, `alpha_` and `n_iter_` EXACTLY, while
-    /// the `f32` device Gram returned `alpha_ = 762` against sklearn's `254` and
-    /// stopped two iterations late. That is a 3× error in a fitted attribute
-    /// from a Gram that was itself accurate to `1e-7` — the amplification, not
-    /// the Gram.
+    /// the model explains all but `~3e-4` of the target variance: an `f64` Gram
+    /// reproduced sklearn's `coef_`, `alpha_` and `n_iter_` EXACTLY, while an
+    /// `f32` one returned `alpha_ = 762` against sklearn's `254` and stopped two
+    /// iterations late. That is a 3× error in a fitted attribute from a Gram
+    /// that was itself accurate to `1e-7` — the amplification, not the Gram.
     ///
-    /// So the `O(n·d²)` sweep runs on the host in `f64` regardless of `F`, and
-    /// the price is one `O(n·d)` read-back on this path (which it already paid
-    /// for the target). Correctness over throughput is the project's stated
-    /// order of precedence, and the cpu backend — the one this estimator's perf
-    /// work targets — never takes this path at all: it is routed to
-    /// `fit_from_host_slice` before ingress and uploads nothing.
+    /// That measurement is why the device arm was originally refused outright,
+    /// and it is not repealed here — it is SATISFIED. `prims::normal_eq` widens
+    /// a narrower design on the device
+    /// ([`widen_elem`](mlrs_kernels::elementwise::widen_elem)) and runs the
+    /// whole assembly at `f64`, so the two arms differ only in summation order.
+    /// The refusal now falls where it belongs: on an adapter that cannot do
+    /// `f64` at all, where [`device_gram_applicable`] returns `false` and this
+    /// path reads the design back exactly as it used to.
     ///
     /// `sample_weight` is a length-`n_samples` host slice of NON-NEGATIVE finite
     /// weights. It changes the fit in two places, both sklearn-faithful: the
@@ -1464,7 +1607,7 @@ where
         shape: (usize, usize),
         sample_weight: Option<&[F]>,
     ) -> Result<BayesianRidge<F, Fitted>, AlgoError> {
-        let (n_samples, _) = shape;
+        let (n_samples, n_features) = shape;
 
         // --- ASVS V5: data-DEPENDENT geometry guard BEFORE any read-back (the
         //     data-INDEPENDENT hyperparameter checks ran at build(), D-08). ---
@@ -1482,9 +1625,51 @@ where
             }));
         }
 
-        let x_host = x.to_host(pool);
+        // --- The DEVICE arm: form the normal equations where the design already
+        //     is, and read back only the `d² + d` scalars the rest of the fit
+        //     consumes. `device_gram_applicable` is a capability gate as much as
+        //     a perf one — it refuses any backend that cannot accumulate in
+        //     `f64`, which is the property this estimator's Gram cannot do
+        //     without (see this function's docs). ---
+        if !device_gram_applicable::<F>(n_features) {
+            let x_host = x.to_host(pool);
+            let y_host = y.to_host(pool);
+            return self.fit_host_core(pool, &x_host, &y_host, shape, sample_weight);
+        }
+
+        let sw64 = validate_sample_weight::<F>("bayesian_ridge", sample_weight, n_samples)?;
+        let profile = std::env::var("BAYES_PROFILE").is_ok();
+        let lap0 = std::time::Instant::now();
+
+        let (x_mean, y_mean, gram, xty) = centered_gram_xty_device::<F>(
+            pool,
+            x,
+            y,
+            n_samples,
+            n_features,
+            sw64.as_deref(),
+            self.fit_intercept,
+        )?;
+
+        // The two target scalars stay on the host. They are `O(n)` over the
+        // length-`n` TARGET — `1/d` of the design that just stayed on the
+        // device — so the read-back this costs is a rounding error against the
+        // `O(n·d)` one the arm exists to remove, and doing it here keeps ONE
+        // implementation of sklearn's two subtly different `y` moments
+        // ([`y_moments`]) rather than a device twin that could drift from it.
         let y_host = y.to_host(pool);
-        self.fit_host_core(pool, &x_host, &y_host, shape, sample_weight)
+        let (y_var, yty) = y_moments::<F>(&y_host, n_samples, y_mean, sw64.as_deref());
+        let sw_sum = sw64.as_deref().map_or(n_samples as f64, |w| w.iter().sum());
+        let t_gram = if profile {
+            lap0.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+
+        self.finish_fit(
+            pool, gram, xty, yty, y_var, sw_sum, x_mean, y_mean, n_samples, n_features, profile,
+            t_gram,
+        )
     }
 }
 

@@ -2606,9 +2606,10 @@ impl PyBayesianRidge {
         let xa = capsule_to_array(x)?;
         let out = py.detach(|| -> PyResult<Vec<f64>> {
             let xh = host_slice_f32(as_f32(&xa)?)?;
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyBayesianRidge::F32(est) => est
-                    .predict_std_from_host(xh, (rows, cols))
+                    .predict_std_from_host(&mut pool, xh, (rows, cols))
                     .map_err(algo_err_to_py),
                 _ => Err(not_fitted("bayesian_ridge", "predict std (f32 path)")),
             }
@@ -2619,9 +2620,10 @@ impl PyBayesianRidge {
         let xa = capsule_to_array(x)?;
         let out = py.detach(|| -> PyResult<Vec<f64>> {
             let xh = host_slice_f64(as_f64(&xa)?)?;
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyBayesianRidge::F64(est) => est
-                    .predict_std_from_host(xh, (rows, cols))
+                    .predict_std_from_host(&mut pool, xh, (rows, cols))
                     .map_err(algo_err_to_py),
                 _ => Err(not_fitted("bayesian_ridge", "predict std (f64 path)")),
             }

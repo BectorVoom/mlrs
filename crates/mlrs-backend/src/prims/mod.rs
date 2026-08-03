@@ -28,6 +28,12 @@ pub mod gram;
 // backend where `center_columns` falls back to the per-column-round-trip
 // `column_reduce` and every launch costs an OS thread spawn.
 pub mod gram_host;
+// DEVICE arm of the same normal-equations formation, pinned to `f64`
+// accumulation whatever the estimator's own width (BAYES-GPU). `gram`'s Gram
+// accumulates in the element type, which `BayesianRidge`'s residual identity
+// cannot tolerate; this module widens on the device and keeps the whole
+// reduction there, so the design never round-trips to the host.
+pub mod normal_eq;
 // Phase-7 prim stubs (Wave-0 scaffold owns these registrations; plans 07-02
 // (rng) / 07-03 (incremental_svd) fill their own file body — file-disjoint,
 // parallel-safe). Each is an empty compiling module until its plan adds the
