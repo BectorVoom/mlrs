@@ -124,8 +124,19 @@ class Ridge(RegressorMixin, MlrsBase):
         return int(check_random_state(self.random_state).randint(0, 2**32 - 1))
 
     def fit(self, X, y, sample_weight=None):
+        """``y`` may be a 1-D length-``n_samples`` target (the ORIGINAL,
+        full-eight-solver contract, unchanged) or a 2-D ``n_samples ×
+        n_targets`` array (RIDGE-MULTI-TARGET) — matching sklearn's own
+        single-vs-multi-output ``Ridge`` split. Multi-target ``y`` is currently
+        supported only for the DEFAULT solver (``auto``/``cholesky`` with
+        ``positive=False``); every other ``solver``/``positive`` combination
+        raises the same typed rejection the Rust side raises, rather than
+        silently mis-fitting.
+        """
         xa, rows, cols = self._normalize(X)
         dtype = LinearRegression._x_float(xa)
+        y_arr = np.asarray(y)
+        n_targets = int(y_arr.shape[1]) if y_arr.ndim == 2 and y_arr.shape[1] > 1 else 1
         ya = self._normalize_y(y, dtype=dtype)
         swa = None if sample_weight is None else self._normalize_y(sample_weight, dtype=dtype)
         obj = self._ext().Ridge(
@@ -138,16 +149,30 @@ class Ridge(RegressorMixin, MlrsBase):
             self.positive,
             self._seed(),
         )
-        obj.fit(xa, ya, rows, cols, swa)
+        obj.fit(xa, ya, rows, cols, swa, n_targets)
         self._mlrs_obj = obj
+        self._n_targets_ = n_targets
         self._post_fit(cols)
         return self
 
     def predict(self, X):
+        if getattr(self, "_n_targets_", 1) > 1:
+            xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
+            out = self._suffixed("predict_multi")(xa, rows, cols)
+            return self._to_output(
+                out, (rows, self._n_targets_), X, self._np_float()
+            )
         return _dense_linear_predict(self, X)
 
     @property
     def coef_(self):
+        if getattr(self, "_n_targets_", 1) > 1:
+            # Rust returns `n_features x n_targets` row-major; sklearn's
+            # multi-output `coef_` is `(n_targets, n_features)`.
+            d, t = self.n_features_in_, self._n_targets_
+            flat = self._suffixed("coef_multi")()
+            arr = self._to_output(flat, (d, t), None, self._np_float())
+            return arr.T
         return self._to_output(
             self._suffixed("coef")(), (-1,), None, self._np_float()
         )
@@ -155,6 +180,10 @@ class Ridge(RegressorMixin, MlrsBase):
     @property
     def intercept_(self):
         self._check_fitted()
+        if getattr(self, "_n_targets_", 1) > 1:
+            return self._to_output(
+                self._suffixed("intercept_multi")(), (-1,), None, self._np_float()
+            )
         return getattr(self._mlrs_obj, "intercept" + self._suffix())()
 
     @property

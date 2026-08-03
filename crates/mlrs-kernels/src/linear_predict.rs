@@ -68,6 +68,56 @@ pub fn linear_predict_bias<F: Float + CubeElement>(
     }
 }
 
+/// Multi-target fused linear-model inference (RIDGE-MULTI-TARGET):
+/// `out[r,t] = Σ_c x[r,c]·coef[c,t] + bias[t]`, `coef` row-major `n × k` and
+/// `bias` length `k` (one intercept per target).
+///
+/// One unit per output ROW (`r < m`), same as [`linear_predict_bias`]; the unit
+/// loops over its `k` targets and, for each, re-walks the row's `n` features.
+/// This re-reads `x[r,·]` from global memory `k` times instead of caching it in
+/// registers across targets — `k` (fitted target count) is small in every
+/// realistic multi-output regression (a handful to a few dozen columns) and `n`
+/// is already capped at `GRAM_EIG_MAX_FEATURES = 64`, so the row a warp
+/// re-reads is short and stays hot in L1/L2 across the `k` passes. Caching the
+/// row in a per-unit scratch buffer (mirroring [`linear_predict_bias_shared`]'s
+/// staged tile) is a real lever for large `k` and is deliberately NOT taken here
+/// — CubeCL local arrays need a comptime bound and `k` is a runtime value, so
+/// caching would need either a `SharedMemory` staging scheme (barriers, adapter
+/// SLM budget checks — the `linear_predict_bias_shared` precedent) or a capped
+/// fixed-size local array; both are follow-up work, not required for
+/// correctness or for beating a host matvec, which is what this kernel exists
+/// to do.
+///
+/// ## cubecl-cpu MLIR safety
+/// GATHER-only, same as [`linear_predict_bias`]: no `SharedMemory`, no atomics,
+/// nested ascending `while` scans over `F` accumulators. Safe on every backend.
+#[cube(launch)]
+pub fn linear_predict_bias_multi<F: Float + CubeElement>(
+    x: &Array<F>,
+    coef: &Array<F>,
+    bias: &Array<F>,
+    out: &mut Array<F>,
+    m: u32,
+    n: u32,
+    k: u32,
+) {
+    let r = ABSOLUTE_POS;
+    if r < m as usize {
+        let base = r * n as usize;
+        let mut t = 0u32;
+        while t < k {
+            let mut acc = F::new(0.0_f32);
+            let mut c = 0u32;
+            while c < n {
+                acc += x[base + c as usize] * coef[(c * k + t) as usize];
+                c += 1u32;
+            }
+            out[r * k as usize + t as usize] = acc + bias[t as usize];
+            t += 1u32;
+        }
+    }
+}
+
 /// Rows per cube for the coalesced [`linear_predict_bias_shared`] tile. Also the
 /// cube's thread count (`CubeDim.x`), so each thread finalizes exactly one row.
 /// Kept `64` (2 warps) to match the `gram_xty_shared` 64-thread cube that wins
