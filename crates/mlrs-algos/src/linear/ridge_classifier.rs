@@ -81,6 +81,44 @@
 //! is where those two effects are traded against the upload; the cpu backend
 //! never takes the device arm at all.
 //!
+//! ## Measured on a Colab Tesla T4 (RIDGECLF-CUDA, f32, min-of-15, upload
+//! ## INSIDE the timer, BOTH arms forced)
+//!
+//! `fit`, device arm against this crate's own host arm on the same VM:
+//!
+//! | shape | `k` | host | device | |
+//! |---|---|---|---|---|
+//! | 10 000 × 16 | 2 | 1.55 ms | 1.49 ms | 1.04× |
+//! | 10 000 × 64 | 3 | 8.98 | 4.45 | 2.02× |
+//! | 100 000 × 16 | 3 | 15.2 | 9.90 | 1.53× |
+//! | 100 000 × 16 | 26 | 63.0 | 24.1 | 2.62× |
+//! | 100 000 × 64 | 3 | 81.4 | 36.8 | 2.21× |
+//! | 100 000 × 64 | 10 | 138 | 42.3 | 3.27× |
+//! | 100 000 × 64 | 26 | 267 | 55.3 | **4.83×** |
+//! | 100 000 × 128 | 10 | 365 | 120 | 3.04× |
+//! | 100 000 × 128 | 26 | 629 | 109 | **5.78×** |
+//! | 100 000 × 256 | 10 | 1144 | 346 | 3.31× |
+//! | 100 000 × 256 | 26 | 1696 | 368 | **4.61×** |
+//!
+//! The device arm wins at EVERY rung, and the margin grows with `K` exactly as
+//! the shared-Gram design predicts: the host arm's `O(n·d·K)` `XᵀY` term costs
+//! it 267 ms at `K = 26` against 81 ms at `K = 3` (`d = 64`), where the device
+//! arm moves 36.8 → 55.3 ms for the same change. That difference IS the point
+//! of forming the Gram once.
+//!
+//! **Read the ratio carefully.** That host column is the same code the cpu
+//! backend runs, but on Colab's 2-vCPU Xeon @2GHz. The RIDGE-DEFAULT-CUDA
+//! campaign measured the 16-thread dev box at roughly 4× that on the same host
+//! arm, so against THAT cpu these ratios shrink by about 4× — which would leave
+//! the device arm winning at the high-`K`/high-`d` rungs (≈1.2–1.4× at
+//! `K = 26`) and LOSING at `K ≤ 3`. That extrapolation has not been measured
+//! and is not a claim; the honest headline is the same-machine comparison
+//! above, and `d = 256, K = 26` is where a device fit is most clearly worth it
+//! on any host.
+//!
+//! `predict` is a narrower win and is gated accordingly — see
+//! [`RIDGECLF_DEVICE_PREDICT_MIN_TARGETS`] for that table.
+//!
 //! ## `class_weight` (sklearn's `compute_sample_weight`, reproduced)
 //! `class_weight='balanced'` sets `weight[c] = n_samples / (n_classes ·
 //! count[c])` from the RAW (unweighted) label counts — sklearn's
@@ -1444,40 +1482,58 @@ where
         #[cfg(not(feature = "cpu"))]
         {
             self.n_targets_ >= RIDGECLF_DEVICE_PREDICT_MIN_TARGETS
+                && self.n_features_ <= RIDGECLF_DEVICE_PREDICT_MAX_FEATURES
         }
     }
 }
 
 /// `n_targets` at or above which [`RidgeClassifier::device_predict_applicable`]
-/// sends a host-resident query through the fused DEVICE predict.
+/// sends a host-resident query through the fused DEVICE predict — paired with
+/// [`RIDGECLF_DEVICE_PREDICT_MAX_FEATURES`], which caps the same gate on `d`.
 ///
-/// ## Where `16` comes from — a measurement, not a guess
-/// `ridge_predict_device_vs_host_perf_test.rs` swept `Ridge`'s multi-target
-/// device predict against this crate's host matvec on a Kaggle P100. That
-/// kernel is [`linear_predict_multi`] — the same kernel family this one
-/// extends, on the same hardware class — and the sweep found:
+/// ## Both values are a T4 measurement, not an inference
+/// `ridge_classifier_cuda_perf_test.rs` on a Colab Tesla T4, min-of-15, f32,
+/// `n_query = 100 000`, upload INSIDE the timer, device ÷ host:
 ///
-/// | `n_targets` | device ÷ host |
-/// |---|---|
-/// | 1 | **0.04–0.10×** (a 10–23× loss, every shape tried) |
-/// | 4 | 0.33–0.5× (a 2–3× loss) |
-/// | 16 | 1.1–1.5× (a win, two data points, close to a wash at `d = 64`) |
+/// | `d` | `k = 2` | `k = 3` | `k = 5` | `k = 10` | `k = 26` |
+/// |---|---|---|---|---|---|
+/// | 16 | 0.60× | 1.22× | | | **6.31×** |
+/// | 64 | | 0.66× | **1.52×** | **1.99×** | **3.35×** |
+/// | 128 | | | | **1.20×** | **2.01×** |
+/// | 256 | | | | 0.63× | 1.42× |
 ///
-/// So the crossover for the SCORES kernel sits between 4 and 16, and 16 is the
-/// first swept point where it is not a loss. [`linear_predict_labels`] is
-/// strictly better than that kernel at the same `n_targets` — identical
-/// compute, no `m × k` intermediate, and an egress of `m` `i32`s instead of
-/// `m · k` floats — so `16` is a bound the fused kernel can only beat.
+/// `k ≥ 5 AND d ≤ 128` is the largest rectangle containing NO measured loss:
+/// every one of its six rungs wins, by 1.20–6.31×. Two wins are deliberately
+/// left outside it — `(16, 3)` at 1.22× and `(256, 26)` at 1.42× — because a
+/// rung immediately adjacent to each LOSES (`(64, 3)` at 0.66×, `(256, 10)` at
+/// 0.63×), and shipping a gate that straddles a measured regression to capture
+/// a 1.2–1.4× win is the wrong trade.
 ///
-/// It is deliberately NOT lowered on that argument alone. The P100 numbers at
-/// `k = 16` were called "too thin to gate a dispatch threshold on" when they
-/// were taken, and this codebase has been burned before by shipping a gate
-/// derived from one adapter's sweep (see the `mlrs-feedback-verify-on-target-hardware`
-/// project memory). `MLRS_RIDGECLF_PREDICT_DEVICE=1`/`=0` forces either arm at
-/// any shape, and `scripts/colab_ridge_classifier.py` §E runs exactly that
-/// A/B — lowering this constant is what that sweep is for.
+/// ## Why the gate needs `d` at all
+/// A first-principles model says it should not: the device moves `m·d` bytes
+/// and does `m·d·k` MACs, the host does `m·d·k` MACs, so the ratio is
+/// `k / (a + b·k)` with `d` cancelling. The `d = 256` row is where that model
+/// breaks, and it breaks for a reason this codebase has measured before — the
+/// design upload's effective throughput DEGRADES as the operand grows (0.33
+/// GB/s at 102 MiB against 0.81 at 6.4 MiB, `mlrs-ridge-positive-cuda`), which
+/// is a per-call allocation cost rather than a link rate. So `a` grows with
+/// `d` and the cancellation fails at exactly the widest shapes.
+///
+/// Both rungs on the `d = 256` row reproduced across two independent sweeps
+/// (0.62× / 0.63× at `k = 10`), so this is not sampling noise.
+///
+/// `MLRS_RIDGECLF_PREDICT_DEVICE=1`/`=0` forces either arm at any shape;
+/// `scripts/colab_ridge_classifier.py` §E runs that A/B, which is how these two
+/// constants should be re-placed on a different adapter. They are calibrated on
+/// ONE GPU (see the `mlrs-feedback-verify-on-target-hardware` project memory).
 #[cfg_attr(feature = "cpu", allow(dead_code))]
-const RIDGECLF_DEVICE_PREDICT_MIN_TARGETS: usize = 16;
+const RIDGECLF_DEVICE_PREDICT_MIN_TARGETS: usize = 5;
+
+/// `n_features` above which the fused device predict LOSES to the host matvec
+/// regardless of `n_targets` — see [`RIDGECLF_DEVICE_PREDICT_MIN_TARGETS`] for
+/// the T4 table both constants come from.
+#[cfg_attr(feature = "cpu", allow(dead_code))]
+const RIDGECLF_DEVICE_PREDICT_MAX_FEATURES: usize = 128;
 
 impl<F> PredictLabels<F> for RidgeClassifier<F, Fitted>
 where
