@@ -114,8 +114,8 @@ pub use gbt::{
 };
 pub use jacobi_eig::{jacobi_eig_sweep, MAX_DIM};
 pub use linear_predict::{
-    linear_predict_bias, linear_predict_bias_shared, PREDICT_MAX_FEATURES,
-    PREDICT_ROWS_PER_BLOCK, PREDICT_SHARED_ELEMS, PREDICT_SHARED_MIN_FEATURES,
+    linear_predict_bias, linear_predict_bias_multi, linear_predict_bias_shared,
+    PREDICT_MAX_FEATURES, PREDICT_ROWS_PER_BLOCK, PREDICT_SHARED_ELEMS, PREDICT_SHARED_MIN_FEATURES,
 };
 pub use jacobi_svd::{jacobi_svd_sweep, MAX_COLS, MAX_ROWS};
 pub use nnls::{ridge_intercept, ridge_nnls_cd, NNLS_MAX_DIM};

@@ -180,6 +180,54 @@ fn dense_predict_f64<'py, E: DensePredictHost<f64>>(
     f64_vec_to_pyarrow(py, out)
 }
 
+/// Multi-target twin of [`dense_predict_f32`] (RIDGE-MULTI-TARGET): returns an
+/// `m × n_targets` row-major **pyarrow** float array. Ridge-only — the shared
+/// [`DensePredictHost`] trait (and the four OTHER dense linear regressors that
+/// implement it) stays single-target, so this is a free function over the
+/// concrete `Ridge<f32, AlgoFitted>` rather than a trait method.
+fn dense_predict_multi_f32<'py>(
+    py: Python<'py>,
+    x: &Bound<'_, PyAny>,
+    (rows, cols): (usize, usize),
+    est: &Ridge<f32, AlgoFitted>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let xa = capsule_to_array(x)?;
+    let out = py.detach(|| -> PyResult<Vec<f32>> {
+        let mut pool = crate::lock_pool();
+        let xh = host_slice_f32(as_f32(&xa)?)?;
+        let pred = est
+            .predict_multi_from_host(&mut pool, xh, (rows, cols))
+            .map_err(algo_err_to_py)?;
+        if !pred.operand_finite {
+            return Err(nonfinite_input_err(xh, "float32"));
+        }
+        Ok(pred.values)
+    })?;
+    f32_vec_to_pyarrow(py, out)
+}
+
+/// f64 twin of [`dense_predict_multi_f32`].
+fn dense_predict_multi_f64<'py>(
+    py: Python<'py>,
+    x: &Bound<'_, PyAny>,
+    (rows, cols): (usize, usize),
+    est: &Ridge<f64, AlgoFitted>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let xa = capsule_to_array(x)?;
+    let out = py.detach(|| -> PyResult<Vec<f64>> {
+        let mut pool = crate::lock_pool();
+        let xh = host_slice_f64(as_f64(&xa)?)?;
+        let pred = est
+            .predict_multi_from_host(&mut pool, xh, (rows, cols))
+            .map_err(algo_err_to_py)?;
+        if !pred.operand_finite {
+            return Err(nonfinite_input_err(xh, "float64"));
+        }
+        Ok(pred.values)
+    })?;
+    f64_vec_to_pyarrow(py, out)
+}
+
 // ---------------------------------------------------------------------------
 // LinearRegression — Fit + Predict; coef_ / intercept_
 // ---------------------------------------------------------------------------
@@ -511,6 +559,30 @@ macro_rules! ridge_fit_dispatch {
     }};
 }
 
+/// Multi-target twin of [`ridge_fit_dispatch`] (RIDGE-MULTI-TARGET): `$ya` is
+/// `rows × n_targets` row-major (already ravelled that way by the Python
+/// shim's `_normalize_y`, which accepts 2-D input via `check_array(ensure_2d=
+/// False)`). Always takes the DEVICE ingress —
+/// [`Ridge::fit_multi_target_with_sample_weight`] has no host-slice twin of
+/// [`Ridge::fit_from_host_slice`] (fit-side perf is not this feature's target;
+/// see that method's Rust doc comment for why).
+macro_rules! ridge_fit_multi_dispatch {
+    ($float:ty, $p:expr, $xa:expr, $ya:expr, $swa:expr, $rows:expr, $cols:expr, $n_targets:expr,
+     $pool:expr, $as:ident, $host_slice:ident, $validated:ident) => {{
+        let est = ridge_build!($float, $p);
+        let sw = match $swa.as_ref() {
+            Some(a) => Some($host_slice($as(a)?)?),
+            None => None,
+        };
+        let xd = $validated($as(&$xa)?, &mut $pool)?;
+        let yd = $validated($as(&$ya)?, &mut $pool)?;
+        est.fit_multi_target_with_sample_weight(
+            &mut $pool, &xd, &yd, ($rows, $cols), $n_targets, sw,
+        )
+        .map_err(algo_err_to_py)?
+    }};
+}
+
 #[pymethods]
 impl PyRidge {
     /// `Ridge(alpha=1.0, fit_intercept=True, copy_X=True, max_iter=None,
@@ -555,13 +627,22 @@ impl PyRidge {
         }
     }
 
-    /// `fit(X, y, rows, cols, sample_weight=None)`.
+    /// `fit(X, y, rows, cols, sample_weight=None, n_targets=1)`.
     ///
     /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
     /// dtype as `X` — it is borrowed as a host slice (never uploaded), because
     /// the weighted preprocessing that consumes it is a host pass anyway
     /// (`ridge.rs::preprocess`).
-    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
+    ///
+    /// `n_targets` (RIDGE-MULTI-TARGET): `1` (the default) is the ORIGINAL
+    /// single-target entry point, unchanged — `y` is length `rows`. `> 1` means
+    /// `y` is `rows × n_targets` row-major (the Python shim's `_normalize_y`
+    /// already ravels a 2-D `y` that way) and routes to
+    /// [`Ridge::fit_multi_target_with_sample_weight`], which currently accepts
+    /// it only for the default `cholesky`/`auto` (`positive=False`) solver —
+    /// any other solver with `n_targets > 1` surfaces a typed
+    /// `UnsupportedCapability` error rather than guessing.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None, n_targets = 1))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -570,6 +651,7 @@ impl PyRidge {
         rows: usize,
         cols: usize,
         sample_weight: Option<&Bound<'_, PyAny>>,
+        n_targets: usize,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
@@ -581,20 +663,34 @@ impl PyRidge {
                 let mut pool = crate::lock_pool();
                 match dt {
                     FloatDtype::F32 => {
-                        let fitted = ridge_fit_dispatch!(
-                            f32, p, xa, ya, swa, rows, cols, pool,
-                            as_f32, host_slice_f32, validated_f32
-                        );
+                        let fitted = if n_targets <= 1 {
+                            ridge_fit_dispatch!(
+                                f32, p, xa, ya, swa, rows, cols, pool,
+                                as_f32, host_slice_f32, validated_f32
+                            )
+                        } else {
+                            ridge_fit_multi_dispatch!(
+                                f32, p, xa, ya, swa, rows, cols, n_targets, pool,
+                                as_f32, host_slice_f32, validated_f32
+                            )
+                        };
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
                         Ok((AnyRidge::F32(fitted), n_iter, used))
                     }
                     FloatDtype::F64 => {
                         crate::capability::guard_f64()?;
-                        let fitted = ridge_fit_dispatch!(
-                            f64, p, xa, ya, swa, rows, cols, pool,
-                            as_f64, host_slice_f64, validated_f64
-                        );
+                        let fitted = if n_targets <= 1 {
+                            ridge_fit_dispatch!(
+                                f64, p, xa, ya, swa, rows, cols, pool,
+                                as_f64, host_slice_f64, validated_f64
+                            )
+                        } else {
+                            ridge_fit_multi_dispatch!(
+                                f64, p, xa, ya, swa, rows, cols, n_targets, pool,
+                                as_f64, host_slice_f64, validated_f64
+                            )
+                        };
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
                         Ok((AnyRidge::F64(fitted), n_iter, used))
@@ -661,6 +757,57 @@ impl PyRidge {
             _ => Err(not_fitted("ridge", "intercept_ (f64)")),
         }
     }
+
+    // -- multi-target (RIDGE-MULTI-TARGET) --------------------------------- //
+
+    /// `predict(x)` for a multi-target fit → an `m × n_targets` row-major
+    /// **pyarrow** float array. Shared body: [`dense_predict_multi_f32`].
+    fn predict_multi_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyRidge::F32(est) => dense_predict_multi_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("ridge", "predict (f32 multi-target path)")),
+        }
+    }
+    fn predict_multi_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyRidge::F64(est) => dense_predict_multi_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("ridge", "predict (f64 multi-target path)")),
+        }
+    }
+
+    /// Flat `n_features × n_targets` row-major `coef_` (the Python shim
+    /// reshapes and transposes to sklearn's `(n_targets, n_features)`).
+    fn coef_multi_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F32(e) => Ok(e.coef_multi(&pool)),
+            _ => Err(not_fitted("ridge", "coef_ (f32 multi-target)")),
+        }
+    }
+    fn coef_multi_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F64(e) => Ok(e.coef_multi(&pool)),
+            _ => Err(not_fitted("ridge", "coef_ (f64 multi-target)")),
+        }
+    }
+
+    /// Length-`n_targets` `intercept_`.
+    fn intercept_multi_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F32(e) => Ok(e.intercept_multi(&pool)),
+            _ => Err(not_fitted("ridge", "intercept_ (f32 multi-target)")),
+        }
+    }
+    fn intercept_multi_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F64(e) => Ok(e.intercept_multi(&pool)),
+            _ => Err(not_fitted("ridge", "intercept_ (f64 multi-target)")),
+        }
+    }
+
     fn is_fitted(&self) -> bool {
         !matches!(self.inner, AnyRidge::Unfit { .. })
     }
