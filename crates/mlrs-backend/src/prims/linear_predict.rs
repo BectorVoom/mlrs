@@ -84,7 +84,7 @@ use mlrs_core::PrimError;
 use mlrs_kernels::colmean::MAX_GRID_DIM;
 use mlrs_kernels::{
     linear_predict_bias, linear_predict_bias_multi, linear_predict_bias_shared,
-    PREDICT_ROWS_PER_BLOCK,
+    linear_predict_classify, PREDICT_ROWS_PER_BLOCK,
 };
 // The shared-tile winning-band bounds are only consulted by `use_shared_predict`'s
 // wgpu arm (the ONE backend where the kernel measurably wins — module docs
@@ -208,6 +208,76 @@ where
     );
 
     Ok(DeviceArray::from_raw(out_handle, m * k))
+}
+
+/// Fused decision + label kernel (RIDGECLF-CUDA): `X · coefᵀ + bias`, its
+/// `argmax` (or, for `k == 1`, its STRICT sign), and the `classes_` lookup, all
+/// in ONE launch — a length-`m` device-resident `i32` label array.
+///
+/// `coef` is row-major `n × k` (FEATURE-major, the fit's native layout), `bias`
+/// length `k`, and `classes` the `i32` label table: length 2 for a binary fit
+/// (`k == 1`, `[negative_class, positive_class]`) and length `k` for a
+/// multiclass one.
+///
+/// ## Why this is not `linear_predict_multi` followed by an argmax pass
+/// The `m × k` score matrix would exist only to be collapsed to `m` integers.
+/// Fusing removes that allocation, its write and its re-read, and shrinks the
+/// EGRESS by a factor of `k` (plus the `f32`→`i32` width): a 26-class,
+/// 100 000-row `predict` returns 400 KB of labels instead of 10.4 MB of scores.
+/// Since `predict` is `O(m·n)` of compute over an `O(m·n)` transfer — the one
+/// linear-model operation whose compute-to-transfer ratio a GPU cannot improve
+/// — the egress is the only side of the bus this can shrink, and `k` targets is
+/// the only reason the compute side is worth `k`× more here than in the
+/// single-target `Ridge` predict that measured 10–23× SLOWER than its own host
+/// arm on a P100.
+///
+/// Callers that need the SCORES themselves (`decision_function`) use
+/// [`linear_predict_multi`]; this is `predict` only.
+pub fn linear_predict_labels<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    coef: &DeviceArray<ActiveRuntime, F>,
+    bias: &DeviceArray<ActiveRuntime, F>,
+    classes: &DeviceArray<ActiveRuntime, i32>,
+    (m, n): (usize, usize),
+    k: usize,
+) -> Result<DeviceArray<ActiveRuntime, i32>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry_multi(x.len(), (m, n), coef.len(), bias.len(), k)?;
+    // The binary arm indexes `classes[0]`/`classes[1]`; the multiclass arm
+    // indexes `classes[t]` for `t < k`. Both are checked BEFORE the launch so a
+    // short table is a typed error, never an out-of-bounds device read.
+    let needed = if k == 1 { 2 } else { k };
+    if classes.len() != needed {
+        return Err(PrimError::ShapeMismatch {
+            operand: "linear_predict_labels.classes",
+            rows: needed,
+            cols: 1,
+            len: classes.len(),
+        });
+    }
+
+    let out_handle = pool.acquire(m * size_of::<i32>());
+    let client = pool.client().clone();
+
+    // SAFETY: every element count below is validated immediately above; the
+    // kernel bounds-checks `r < m` and reads only `x[r*n + c]` for `c < n`,
+    // `coef[c*k + t]` / `bias[t]` for `t < k`, and `classes` within `needed`.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let coef_arg = unsafe { ArrayArg::from_raw_parts(coef.handle().clone(), coef.len()) };
+    let bias_arg = unsafe { ArrayArg::from_raw_parts(bias.handle().clone(), bias.len()) };
+    let cls_arg = unsafe { ArrayArg::from_raw_parts(classes.handle().clone(), classes.len()) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), m) };
+
+    let (ccount, cdim) = super::launch_dims_1d_folded(m, crate::capability::gather_launch_width());
+    linear_predict_classify::launch::<F, ActiveRuntime>(
+        &client, ccount, cdim, x_arg, coef_arg, bias_arg, cls_arg, out_arg, m as u32, n as u32,
+        k as u32,
+    );
+
+    Ok(DeviceArray::from_raw(out_handle, m))
 }
 
 /// Multi-target twin of [`linear_predict_host`]: `out[r,t] = Σ_c x[r,c]·coef[c,t]

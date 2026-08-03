@@ -33,6 +33,7 @@ use mlrs_algos::typestate::{
     Fit as TypestateFit, Fitted as AlgoFitted, Predict as TypestatePredict,
     PredictLabels as TypestatePredictLabels, PredictProba as TypestatePredictProba,
 };
+use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::linear_predict::HostPrediction;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -1104,6 +1105,16 @@ impl PyRidgeClassifier {
 
     /// `predict(x)` → a length-`rows` **pyarrow** `int32` array of class ids
     /// (the `PyLinearSVC::predict_labels` no-upload / no-list precedent).
+    ///
+    /// TWO arms, chosen by `RidgeClassifier::device_predict_applicable`
+    /// (RIDGECLF-CUDA): the no-upload HOST matvec — which is what the cpu
+    /// backend and every low-cardinality fit take — or the fused DEVICE
+    /// classify kernel, which computes the decision function, its `argmax` and
+    /// the `classes_` lookup in one launch and brings back `rows` `i32`s rather
+    /// than `rows × n_targets` floats. The device arm has to scan the query for
+    /// NaN/±inf separately (the host arm folds that check into the matvec pass
+    /// it is already making), which is the one thing it pays for the crossing
+    /// beyond the upload itself.
     fn predict_labels<'py>(
         &self,
         py: Python<'py>,
@@ -1113,10 +1124,21 @@ impl PyRidgeClassifier {
     ) -> PyResult<Bound<'py, PyAny>> {
         let xa = capsule_to_array(x)?;
         let out = py.detach(|| -> PyResult<Vec<i32>> {
-            let pool = crate::lock_pool();
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyRidgeClassifier::F32(est) => {
                     let xh = host_slice_f32(as_f32(&xa)?)?;
+                    if est.device_predict_applicable() {
+                        if xh.iter().any(|v| !v.is_finite()) {
+                            return Err(nonfinite_input_err(xh, "float32"));
+                        }
+                        let xd = DeviceArray::from_host(&mut pool, xh);
+                        let labels = est
+                            .predict_labels_device(&mut pool, &xd, (rows, cols))
+                            .map_err(algo_err_to_py)?;
+                        xd.release_into(&mut pool);
+                        return Ok(labels.to_host_metered(&mut pool));
+                    }
                     let pred = est.predict_labels_from_host(&pool, xh, (rows, cols)).map_err(algo_err_to_py)?;
                     if !pred.operand_finite {
                         return Err(nonfinite_input_err(xh, "float32"));
@@ -1125,6 +1147,17 @@ impl PyRidgeClassifier {
                 }
                 AnyRidgeClassifier::F64(est) => {
                     let xh = host_slice_f64(as_f64(&xa)?)?;
+                    if est.device_predict_applicable() {
+                        if xh.iter().any(|v| !v.is_finite()) {
+                            return Err(nonfinite_input_err(xh, "float64"));
+                        }
+                        let xd = DeviceArray::from_host(&mut pool, xh);
+                        let labels = est
+                            .predict_labels_device(&mut pool, &xd, (rows, cols))
+                            .map_err(algo_err_to_py)?;
+                        xd.release_into(&mut pool);
+                        return Ok(labels.to_host_metered(&mut pool));
+                    }
                     let pred = est.predict_labels_from_host(&pool, xh, (rows, cols)).map_err(algo_err_to_py)?;
                     if !pred.operand_finite {
                         return Err(nonfinite_input_err(xh, "float64"));
@@ -1140,6 +1173,18 @@ impl PyRidgeClassifier {
     /// `decision_function(x)` → row-major `rows × n_targets` **pyarrow** float
     /// array (binary squeezes to `n_targets == 1` at the Python shim, mirroring
     /// sklearn's own squeeze).
+    ///
+    /// Stays on the HOST arm on every backend, where `predict` above routes to
+    /// the device kernel above a `n_targets` threshold. The asymmetry is not an
+    /// oversight: the two effects that let a device `predict` pay back its
+    /// upload are `k`× the compute AND `k`× less egress (`rows` `i32` labels
+    /// instead of `rows × k` floats), and `decision_function` gets only the
+    /// first of them — it has to return the full score matrix by definition.
+    /// That leaves it with the same profile as `Ridge::predict_multi_from_host`,
+    /// which measured a 2–3× LOSS at `n_targets = 4` on a P100. The device
+    /// path exists and is gated by tests
+    /// (`RidgeClassifier::decision_function_device`); it is not the default
+    /// here because nothing has measured it winning.
     fn decision_function_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         let xa = capsule_to_array(x)?;
         let out = py.detach(|| -> PyResult<Vec<f32>> {

@@ -32,26 +32,54 @@
 //! the whole point of a dedicated `RidgeClassifier` rather than a thin
 //! `Ridge`-in-a-loop Python wrapper.
 //!
-//! ## Two entry points, mirroring `Ridge` exactly (D-02)
+//! ## Three fit routes (D-02)
 //! - [`RidgeClassifier::fit_from_host_slice`] — the no-upload HOST arm, used
 //!   when [`RidgeClassifier::host_fit_applicable`] is true: `solver` resolves
 //!   to `cholesky` (the `positive=False` default) or `lbfgs`
 //!   (`positive=True`), AND [`gram_host_applicable`] holds for the shape
 //!   (unconditionally true on the cpu backend — `gram_host.rs`'s module docs).
-//!   This is the path `RidgeClassifier()` on cpu actually takes, and it is the
-//!   one this module optimizes: shared Gram, per-column Cholesky solve (with
-//!   sklearn's `LinAlgError → svd` retry, uniform across columns because the
-//!   Gram is shared) or per-column non-negative coordinate descent.
-//! - [`RidgeClassifier::fit_with_sample_weight`] — the DEVICE-array arm, used
-//!   for every other `(solver, backend)` combination. It delegates to the
-//!   FULLY-VALIDATED single-output [`Ridge`] estimator once per target column,
-//!   which is what gives this estimator its complete 8-solver parameter
-//!   surface without re-deriving `svd`/`sparse_cg`/`lsqr`/`sag`/`saga` for
-//!   multi-output from scratch. The shared-Gram optimization above does not
-//!   apply here (those solvers do not share a single factorable normal
-//!   matrix across a device upload), so this arm is correct-by-delegation
-//!   rather than independently perf-tuned — acceptable because it is reached
-//!   only by an explicit non-default `solver=` choice or a non-cpu backend.
+//!   This is the path `RidgeClassifier()` on cpu actually takes: shared Gram,
+//!   per-column Cholesky solve (with sklearn's `LinAlgError → svd` retry,
+//!   uniform across columns because the Gram is shared) or per-column
+//!   non-negative coordinate descent.
+//! - [`RidgeClassifier::fit_device_normal_equations`] — the FUSED, fully
+//!   device-resident arm (RIDGECLF-CUDA), used for those same two solvers
+//!   wherever the host arm does not apply, i.e. on cuda / rocm / wgpu above the
+//!   dispatch-cost floor. It is the device twin of the host arm's shape, and it
+//!   is the same idea one layer down: `column_means_multi` → `gram_xty_multi`
+//!   (Gram formed ONCE with the centering fused into the accumulation, all `K`
+//!   `Xᵀy` columns in one further pass) → ONE multi-RHS `cholesky_solve_reg`
+//!   with `α` added in-kernel → `ridge_intercept_multi_device`. Nothing crosses
+//!   the bus between the design upload and `coef_`.
+//! - [`RidgeClassifier::fit_with_sample_weight`]'s DELEGATION route — every
+//!   other solver. It calls the FULLY-VALIDATED single-output [`Ridge`]
+//!   estimator once per target column, which is what gives this estimator its
+//!   complete 8-solver parameter surface without re-deriving
+//!   `svd`/`sparse_cg`/`lsqr`/`sag`/`saga` for multi-output from scratch. The
+//!   shared-Gram optimization does not apply there (those solvers do not all
+//!   consume a single factorable normal matrix), so it is
+//!   correct-by-delegation rather than independently perf-tuned — acceptable
+//!   because it is reached only by an explicit non-default `solver=`.
+//!
+//! ## `predict` on device, and why a classifier can win where `Ridge` could not
+//! [`RidgeClassifier::predict_labels_device`] runs the whole prediction in ONE
+//! `linear_predict_labels` launch: the decision function, its `argmax` (or
+//! strict sign for a binary fit) and the `classes_` lookup, without ever
+//! materializing the `m × K` score matrix.
+//!
+//! That fusion is not cosmetic. `Ridge`'s single-target device `predict`
+//! measured **10–23× SLOWER** than this crate's own host matvec on a Kaggle
+//! P100 (`ridge_predict_device_vs_host_perf_test.rs`), for a reason that
+//! generalizes past one adapter: `predict` is `O(m·d)` of compute over the SAME
+//! `O(m·d)` transfer that `fit` also pays, a strictly worse
+//! compute-to-transfer ratio than `fit`'s `O(m·d²)`, so the GPU never gets
+//! `fit`'s chance to pay the upload back. A `RidgeClassifier` changes exactly
+//! two things about that arithmetic, and both scale with `K`: the compute
+//! becomes `O(m·d·K)` over an unchanged transfer, and the fused kernel shrinks
+//! the EGRESS from `m·K` floats to `m` `i32`s (a 26-class, 100 000-row query
+//! returns 400 KB instead of 10.4 MB). [`RidgeClassifier::device_predict_applicable`]
+//! is where those two effects are traded against the upload; the cpu backend
+//! never takes the device arm at all.
 //!
 //! ## `class_weight` (sklearn's `compute_sample_weight`, reproduced)
 //! `class_weight='balanced'` sets `weight[c] = n_samples / (n_classes ·
@@ -87,7 +115,11 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::cholesky::{cholesky_solve_reg, CHOLESKY_MAX_DIM};
+use mlrs_backend::prims::gram::{center_scale, column_means_multi, gram_xty_multi, transpose};
 use mlrs_backend::prims::gram_host::{centered_gram_multi_xty, gram_host_applicable};
+use mlrs_backend::prims::linear_predict::{linear_predict_labels, linear_predict_multi};
+use mlrs_backend::prims::nnls::ridge_intercept_multi_device;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
@@ -157,6 +189,23 @@ pub struct RidgeClassifier<F, S = Unfit> {
     /// Fitted coefficients, device-resident, row-major `n_targets_ ×
     /// n_features_`. `None` until `fit`.
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// The SAME coefficients transposed — row-major `n_features_ × n_targets_`
+    /// (FEATURE-major), device-resident. `None` until `fit`.
+    ///
+    /// Not redundant storage for its own sake: this is the layout the fused
+    /// device kernels take (`cholesky_solve_reg` emits it for `rhs = k`,
+    /// `linear_predict_bias_multi` and `linear_predict_classify` both index
+    /// `coef[c·k + t]`), while `coef_` above is sklearn's `coef_` attribute
+    /// layout. `n_features · n_targets` is a few thousand floats — one
+    /// [`transpose`] launch on the fit path, against a per-`predict` transpose
+    /// or a strided (uncoalesced) kernel read on every query row.
+    coef_t_: Option<DeviceArray<ActiveRuntime, F>>,
+    /// `classes_` as a device-resident `i32` table, so the fused classify
+    /// kernel can map its `argmax`/sign straight to the training label without
+    /// a host round-trip. Length `classes_.len()` — which is `2` for a binary
+    /// fit (where `n_targets_ == 1`) and `n_targets_` for a multiclass one,
+    /// exactly what `linear_predict_labels` validates. `None` until `fit`.
+    classes_dev_: Option<DeviceArray<ActiveRuntime, i32>>,
     /// Fitted intercepts, device-resident, length `n_targets_`. `None` until
     /// `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
@@ -203,6 +252,8 @@ where
             n_targets_: 0,
             n_features_: 0,
             coef_: None,
+            coef_t_: None,
+            classes_dev_: None,
             intercept_: None,
             n_iter_: None,
             solver_: None,
@@ -360,6 +411,8 @@ where
 
         let coef_f: Vec<F> = coef.iter().map(|&v| f64_to_host::<F>(v)).collect();
         let intercept_f: Vec<F> = intercept.iter().map(|&v| f64_to_host::<F>(v)).collect();
+        let (coef_dev, coef_t_dev, classes_dev) =
+            stage_fitted_state::<F>(pool, &coef_f, &classes_, n_targets, n_features);
 
         Ok(RidgeClassifier {
             alpha: self.alpha,
@@ -374,7 +427,9 @@ where
             classes_,
             n_targets_: n_targets,
             n_features_: n_features,
-            coef_: Some(DeviceArray::from_host(pool, &coef_f)),
+            coef_: Some(coef_dev),
+            coef_t_: Some(coef_t_dev),
+            classes_dev_: Some(classes_dev),
             intercept_: Some(DeviceArray::from_host(pool, &intercept_f)),
             n_iter_: None,
             solver_: Some(solver_used),
@@ -383,12 +438,44 @@ where
         })
     }
 
+    /// Does the FUSED, fully device-resident fit arm
+    /// ([`RidgeClassifier::fit_device_normal_equations`]) apply to this
+    /// configuration?
+    ///
+    /// `true` for the two NORMAL-EQUATIONS solvers — `cholesky` (the
+    /// `positive = false` default) and `lbfgs` (`positive = true`) — which are
+    /// exactly the solvers that read only `XᵀX` / `XᵀY` and never the design
+    /// itself, so a single shared Gram serves every target column. Every other
+    /// `solver` keeps the per-target [`Ridge`] delegation loop, which is what
+    /// gives this estimator its complete eight-solver surface without
+    /// re-deriving `svd`/`sparse_cg`/`lsqr`/`sag`/`saga` for multi-output.
+    ///
+    /// This does NOT consult the shape: unlike the host arm's
+    /// [`gram_host_applicable`] floor, there is no size below which the fused
+    /// arm is the wrong choice *relative to the delegation loop* — the
+    /// delegation loop forms the same Gram `n_targets` times over, so the fused
+    /// arm dominates it at every shape. The host-vs-device decision is made one
+    /// level up, by [`RidgeClassifier::host_fit_applicable`].
+    pub fn device_fit_applicable(&self) -> bool {
+        matches!(
+            self.solver.resolve(self.positive),
+            RidgeSolver::Cholesky | RidgeSolver::Lbfgs
+        )
+    }
+
     /// The DEVICE-array fit arm — every `(solver, backend)` combination
-    /// [`RidgeClassifier::fit_from_host_slice`] does not cover. Delegates to
-    /// the fully-featured [`Ridge`] estimator once per target column (see the
-    /// module docs for why this is correct — the columns are mathematically
-    /// independent — and why it is NOT perf-specialized the way the host arm
-    /// is).
+    /// [`RidgeClassifier::fit_from_host_slice`] does not cover.
+    ///
+    /// TWO routes, split by [`RidgeClassifier::device_fit_applicable`]:
+    ///
+    /// - the two NORMAL-EQUATIONS solvers take
+    ///   [`RidgeClassifier::fit_device_normal_equations`] — one shared Gram,
+    ///   one multi-RHS solve, no host round-trip;
+    /// - everything else delegates to the fully-featured [`Ridge`] estimator
+    ///   once per target column (correct because the columns are
+    ///   mathematically independent — see the module docs — and deliberately
+    ///   NOT perf-specialized, since it is reached only by an explicit
+    ///   non-default `solver=`).
     ///
     /// `y` carries the RAW class labels (float-encoded), exactly like
     /// [`RidgeClassifier::fit_from_host_slice`]'s `y_labels`.
@@ -421,10 +508,35 @@ where
         let n_targets = if n_classes == 2 { 1 } else { n_classes };
         let combined64 =
             combined_sample_weight::<F>(&self.class_weight, &classes_, &class_idx, sample_weight, n_samples)?;
+        let y_targets = encode_targets::<F>(&class_idx, n_targets);
+
+        // --- The fused arm: form the shared Gram and all `n_targets` `Xᵀy`
+        //     columns ONCE on device, solve them in ONE multi-RHS launch, and
+        //     recover the intercepts on device too. `y_targets` is the only
+        //     thing that has to be uploaded (the design is already resident),
+        //     and it is `n · n_targets` values against the design's `n · d`. ---
+        if self.device_fit_applicable() {
+            let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y_targets);
+            let fitted = self.fit_device_normal_equations(
+                pool,
+                x,
+                &y_dev,
+                classes_,
+                n_samples,
+                n_features,
+                n_targets,
+                combined64.as_deref(),
+            );
+            y_dev.release_into(pool);
+            return fitted;
+        }
+
+        // Only the DELEGATION route needs the weights narrowed to `F` (the
+        // fused arm consumed the `f64` form directly), so the conversion lives
+        // below the early return rather than above it.
         let combined_f: Option<Vec<F>> = combined64
             .as_ref()
             .map(|v| v.iter().map(|&w| f64_to_host::<F>(w)).collect());
-        let y_targets = encode_targets::<F>(&class_idx, n_targets);
 
         let mut coef_flat: Vec<F> = Vec::with_capacity(n_targets * n_features);
         let mut intercept_flat: Vec<F> = Vec::with_capacity(n_targets);
@@ -460,6 +572,9 @@ where
             None
         };
 
+        let (coef_dev, coef_t_dev, classes_dev) =
+            stage_fitted_state::<F>(pool, &coef_flat, &classes_, n_targets, n_features);
+
         Ok(RidgeClassifier {
             alpha: self.alpha,
             fit_intercept: self.fit_intercept,
@@ -473,7 +588,9 @@ where
             classes_,
             n_targets_: n_targets,
             n_features_: n_features,
-            coef_: Some(DeviceArray::from_host(pool, &coef_flat)),
+            coef_: Some(coef_dev),
+            coef_t_: Some(coef_t_dev),
+            classes_dev_: Some(classes_dev),
             intercept_: Some(DeviceArray::from_host(pool, &intercept_flat)),
             n_iter_,
             solver_: solver_used,
@@ -481,6 +598,408 @@ where
             _state: PhantomData,
         })
     }
+
+    /// The FUSED, fully device-resident normal-equations fit (RIDGECLF-CUDA) —
+    /// the arm this estimator exists for on a GPU backend.
+    ///
+    /// `y_multi` is the `n × n_targets` row-major `{−1, +1}` target matrix
+    /// already on the device; `weights` is the COMBINED
+    /// `class_weight × sample_weight` vector (`None` for the unweighted
+    /// default), still on the host because that is where it was built.
+    ///
+    /// ## What crosses the bus: nothing
+    ///
+    /// | phase | what runs | host round-trips |
+    /// |---|---|---|
+    /// | column means (`x̄`, `ȳ` — weighted or not) | [`column_means_multi`] | none |
+    /// | `XᵀX` (`d × d`) + `XᵀY` (`d × k`) | [`gram_xty_multi`], centering FUSED into the accumulation | none |
+    /// | solve `(XᵀX + αI)·W = XᵀY` | ONE multi-RHS [`cholesky_solve_reg`] launch, `α` added in-kernel | none |
+    /// | `intercept_[t] = ȳ_t − x̄·W[·,t]` | [`ridge_intercept_multi_device`] | none |
+    /// | `coef_` in sklearn's `k × d` layout | one [`transpose`] launch | none |
+    ///
+    /// Against the [`Ridge`]-per-target delegation loop it replaces, this is a
+    /// factor of `n_targets` less Gram work (`O(n·d² + n·d·k)` against
+    /// `O(n·d²·k)`), `n_targets` fewer design uploads on the paths that upload,
+    /// and `4·n_targets` fewer blocking read-backs.
+    ///
+    /// ## Three places it still touches the host, and why each is bounded
+    /// 1. `positive = true` reads the `d² + d·k` normal equations back and runs
+    ///    [`ridge_solvers::nonnegative_cd`] per target. The device NNLS prim
+    ///    ([`mlrs_backend::prims::nnls::ridge_nnls`]) is single-RHS and cannot
+    ///    slice a target column out of the feature-major `XᵀY`, and the
+    ///    constrained solve converges in a handful of sweeps over a `d × d`
+    ///    matrix — so what would be gained is bounded by a quantity INDEPENDENT
+    ///    of `n_samples`, which is the same contract `Ridge`'s `sparse_cg` arm
+    ///    documents. The `O(n·d²)` reduction, which IS the fit, still runs on
+    ///    device.
+    /// 2. An order the device factorization cannot take — `d` past
+    ///    [`CHOLESKY_MAX_DIM`], or an adapter whose shared-memory budget the
+    ///    wide arm does not fit — falls back to the same read-back-and-solve
+    ///    route instead of failing.
+    /// 3. sklearn's `except LinAlgError: solver = "svd"` retry: a non-SPD pivot
+    ///    re-solves the SAME read-back equations through
+    ///    [`ridge_solvers::cholesky_ridge`] in `f64` and, if that fails too,
+    ///    [`ridge_solvers::gram_eig_ridge`], reporting `solver_ = "svd"` exactly
+    ///    as both `Ridge` arms do. (The `f64` retry is not redundant with the
+    ///    device failure it follows: a Gram that has no `F`-precision Cholesky
+    ///    can still have an `f64` one, and taking it keeps this arm's
+    ///    `solver_` agreeing with the host arm's on the same data.)
+    ///
+    /// ## Why the Gram is NOT threaded through the factorization's `out`
+    /// `Ridge` passes its Gram buffer as `cholesky_solve_reg`'s working output
+    /// so the factor overwrites it in place (D-11 gate 2, no parallel `d²`
+    /// allocation). This does not, deliberately. Both host fallbacks above need
+    /// to READ the Gram after the device solve has been attempted, and threading
+    /// it consumes the allocation whether the call succeeds or not — so the
+    /// alternative is re-forming an `O(n·d²)` reduction to recover a `d²` buffer.
+    /// At `d = 256` that trades 256 KiB of transient device memory against a
+    /// second full pass over a design that is three orders of magnitude larger.
+    #[allow(clippy::too_many_arguments)]
+    fn fit_device_normal_equations(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y_multi: &DeviceArray<ActiveRuntime, F>,
+        classes_: Vec<i64>,
+        n_samples: usize,
+        n_features: usize,
+        n_targets: usize,
+        weights: Option<&[f64]>,
+    ) -> Result<RidgeClassifier<F, Fitted>, AlgoError> {
+        let alpha64 = host_to_f64(self.alpha);
+        let d = n_features;
+        let k = n_targets;
+
+        let NormalEquations {
+            xmean,
+            ymean,
+            gram,
+            xty,
+        } = self.form_normal_equations(pool, x, y_multi, n_samples, d, k, weights)?;
+
+        // --- Solve. `coef` comes back FEATURE-major (`d × k`), which is both
+        //     what the multi-RHS Cholesky emits and what the fused predict
+        //     kernels want. ---
+        let device_cholesky = !self.positive && d <= CHOLESKY_MAX_DIM;
+        let solved = if device_cholesky {
+            match cholesky_solve_reg::<F>(pool, &gram, &xty, d, k, alpha64, None) {
+                Ok(coef) => Some(coef),
+                // A non-SPD pivot is sklearn's `except LinAlgError` (the
+                // trigger depends only on `X`/`α`, never on which target column
+                // is being solved, so it is uniform across all `k` of them);
+                // `NotSquare` is an order this adapter's factorization cannot
+                // take. Both fall through to the host route below rather than
+                // failing the fit. Anything else is a real geometry bug and is
+                // propagated.
+                Err(PrimError::NotPositiveDefinite { .. }) | Err(PrimError::NotSquare { .. }) => {
+                    None
+                }
+                Err(e) => {
+                    gram.release_into(pool);
+                    xty.release_into(pool);
+                    xmean.release_into(pool);
+                    ymean.release_into(pool);
+                    return Err(AlgoError::Prim(e));
+                }
+            }
+        } else {
+            None
+        };
+
+        let (coef_dk, solver_used) = match solved {
+            Some(coef) => {
+                gram.release_into(pool);
+                xty.release_into(pool);
+                (coef, RidgeSolver::Cholesky)
+            }
+            // The host route: `positive = true`, an order the device
+            // factorization cannot take, or its singular-Gram retry. All three
+            // read back the SAME `d² + d·k` normal equations — a quantity
+            // INDEPENDENT of `n_samples`, which is what makes this bounded (the
+            // `Ridge::host_gram` contract).
+            None => {
+                let gram_h = to_f64(&gram.to_host(pool));
+                let xty_h = to_f64(&xty.to_host(pool));
+                gram.release_into(pool);
+                xty.release_into(pool);
+                let route = if self.positive {
+                    SolveRoute::NonNegative
+                } else {
+                    SolveRoute::Cholesky
+                };
+                solve_multi_host::<F>(
+                    pool,
+                    &gram_h,
+                    &xty_h,
+                    d,
+                    k,
+                    alpha64,
+                    route,
+                    self.tol,
+                    self.max_iter,
+                )
+            }
+        };
+
+        // --- intercept_[t] = ȳ_t − x̄·coef[·,t], on device (D-05: α is NOT
+        //     applied here and neither is the `positive` bound — sklearn
+        //     constrains only `coef_`). `fit_intercept = false` never launches
+        //     it: the means are all-zero by construction there, so the answer
+        //     is the zero vector and a launch would only confirm it. ---
+        let intercept_dev = if self.fit_intercept {
+            ridge_intercept_multi_device::<F>(pool, &xmean, &ymean, &coef_dk, d, k)?
+        } else {
+            DeviceArray::from_host(pool, &vec![f64_to_host::<F>(0.0); k])
+        };
+        xmean.release_into(pool);
+        ymean.release_into(pool);
+
+        let coef_kd = transpose::<F>(pool, &coef_dk, d, k)?;
+        let classes_dev: DeviceArray<ActiveRuntime, i32> =
+            DeviceArray::from_host(pool, &classes_as_i32(&classes_));
+
+        Ok(RidgeClassifier {
+            alpha: self.alpha,
+            fit_intercept: self.fit_intercept,
+            copy_x: self.copy_x,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            class_weight: self.class_weight,
+            solver: self.solver,
+            positive: self.positive,
+            random_state: self.random_state,
+            classes_,
+            n_targets_: k,
+            n_features_: d,
+            coef_: Some(coef_kd),
+            coef_t_: Some(coef_dk),
+            classes_dev_: Some(classes_dev),
+            intercept_: Some(intercept_dev),
+            // sklearn leaves `n_iter_` unset for BOTH normal-equations solvers
+            // (the module-doc table in `ridge.rs`).
+            n_iter_: None,
+            solver_: Some(solver_used),
+            predict_mirror: OnceLock::new(),
+            _state: PhantomData,
+        })
+    }
+
+    /// Form `(x̄, ȳ, XᵀX, XᵀY)` on device for
+    /// [`RidgeClassifier::fit_device_normal_equations`], honouring
+    /// `fit_intercept` and the combined sample weights.
+    ///
+    /// THREE regimes, matching sklearn's `_preprocess_data` + `_rescale_data`
+    /// split:
+    ///
+    /// - **unweighted, `fit_intercept`** — the fused route: only the column
+    ///   means are formed, and the subtraction happens inside the accumulation
+    ///   kernel, so the `n × d` centered design is never materialized.
+    /// - **unweighted, no intercept** — the raw normal equations of `x`/`y`,
+    ///   with all-zero means kept so the intercept recovery and the retry path
+    ///   have the same operand shapes on every route.
+    /// - **weighted** — `√w` multiplies the OPERANDS, not the accumulator, so
+    ///   it cannot fuse: the weighted means are formed first
+    ///   ([`column_means_multi`]'s `weights` arm), then [`center_scale`] writes
+    ///   the `√w`-scaled centered design and targets, and the RAW normal
+    ///   equations of those are formed. This is the one route that allocates an
+    ///   `n × d` intermediate — and it still never leaves the device, where
+    ///   `Ridge`'s weighted arm reads the whole design back to the host to do
+    ///   the same thing.
+    #[allow(clippy::too_many_arguments)]
+    fn form_normal_equations(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        y_multi: &DeviceArray<ActiveRuntime, F>,
+        n: usize,
+        d: usize,
+        k: usize,
+        weights: Option<&[f64]>,
+    ) -> Result<NormalEquations<F>, AlgoError> {
+        let zero = f64_to_host::<F>(0.0);
+
+        let Some(w) = weights else {
+            let (xmean, ymean) = if self.fit_intercept {
+                column_means_multi::<F>(pool, x, y_multi, n, d, k, None)?
+            } else {
+                (
+                    DeviceArray::from_host(pool, &vec![zero; d]),
+                    DeviceArray::from_host(pool, &vec![zero; k]),
+                )
+            };
+            let means = self.fit_intercept.then_some((&xmean, &ymean));
+            let (gram, xty) = gram_xty_multi::<F>(pool, x, y_multi, means, n, d, k)?;
+            return Ok(NormalEquations {
+                xmean,
+                ymean,
+                gram,
+                xty,
+            });
+        };
+
+        // The `sqrt` runs on the HOST, over `n` values the caller already holds
+        // there — one cheap pass, and it keeps the kernel off the `f64`
+        // transcendental path some wgpu adapters lack entirely.
+        let w_f: Vec<F> = w.iter().map(|&v| f64_to_host::<F>(v)).collect();
+        let sqrt_w_f: Vec<F> = w.iter().map(|&v| f64_to_host::<F>(v.sqrt())).collect();
+        let w_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &w_f);
+        let sqrt_w_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &sqrt_w_f);
+
+        let (xmean, ymean) = if self.fit_intercept {
+            column_means_multi::<F>(pool, x, y_multi, n, d, k, Some(&w_dev))?
+        } else {
+            (
+                DeviceArray::from_host(pool, &vec![zero; d]),
+                DeviceArray::from_host(pool, &vec![zero; k]),
+            )
+        };
+        w_dev.release_into(pool);
+
+        let xw = center_scale::<F>(pool, x, &xmean, &sqrt_w_dev, n, d)?;
+        let yw = center_scale::<F>(pool, y_multi, &ymean, &sqrt_w_dev, n, k)?;
+        sqrt_w_dev.release_into(pool);
+
+        let (gram, xty) = gram_xty_multi::<F>(pool, &xw, &yw, None, n, d, k)?;
+        xw.release_into(pool);
+        yw.release_into(pool);
+
+        Ok(NormalEquations {
+            xmean,
+            ymean,
+            gram,
+            xty,
+        })
+    }
+}
+
+/// The device-resident normal equations of a multi-target fit, plus the means
+/// the intercept recovery needs — what
+/// [`RidgeClassifier::form_normal_equations`] returns.
+struct NormalEquations<F> {
+    /// Column means of the design (length `d`); all-zero when
+    /// `fit_intercept = false`.
+    xmean: DeviceArray<ActiveRuntime, F>,
+    /// Column means of the `{−1, +1}` targets (length `k`); all-zero when
+    /// `fit_intercept = false`.
+    ymean: DeviceArray<ActiveRuntime, F>,
+    /// `XᵀX` (`d × d` row-major).
+    gram: DeviceArray<ActiveRuntime, F>,
+    /// `XᵀY` (`d × k` row-major — FEATURE-major).
+    xty: DeviceArray<ActiveRuntime, F>,
+}
+
+/// Which host solver [`solve_multi_host`] runs for every target column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SolveRoute {
+    /// `positive = false`: [`ridge_solvers::cholesky_ridge`], with sklearn's
+    /// `LinAlgError → svd` retry through [`ridge_solvers::gram_eig_ridge`].
+    Cholesky,
+    /// `positive = true`: [`ridge_solvers::nonnegative_cd`].
+    NonNegative,
+}
+
+/// Solve `(gram + αI)·W = xty` for all `k` targets on the HOST, returning the
+/// coefficients as a device-resident `d × k` (FEATURE-major) buffer — the
+/// layout the device solve produces — plus the solver sklearn would report.
+///
+/// `xty` is `d × k` row-major, so target `t`'s right-hand side is the stride-`k`
+/// column `xty[i·k + t]`. The Gram is SHARED across every column (it does not
+/// depend on `y`), so a singular-Gram fallback either fires for all `k` targets
+/// or for none — which is why `solver_` is one value, not `k` of them.
+#[allow(clippy::too_many_arguments)]
+fn solve_multi_host<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    gram: &[f64],
+    xty: &[f64],
+    d: usize,
+    k: usize,
+    alpha: f64,
+    route: SolveRoute,
+    tol: f64,
+    max_iter: Option<usize>,
+) -> (DeviceArray<ActiveRuntime, F>, RidgeSolver)
+where
+    F: Float + CubeElement + Pod,
+{
+    let mut coef_dk = vec![0.0f64; d * k];
+    let mut used = match route {
+        SolveRoute::Cholesky => RidgeSolver::Cholesky,
+        SolveRoute::NonNegative => RidgeSolver::Lbfgs,
+    };
+    for t in 0..k {
+        let xty_t: Vec<f64> = (0..d).map(|i| xty[i * k + t]).collect();
+        let w = match route {
+            SolveRoute::NonNegative => {
+                ridge_solvers::nonnegative_cd(gram, &xty_t, d, alpha, tol, max_iter).0
+            }
+            SolveRoute::Cholesky => match ridge_solvers::cholesky_ridge(gram, &xty_t, d, alpha) {
+                Some(w) => w,
+                None => {
+                    used = RidgeSolver::Svd;
+                    ridge_solvers::gram_eig_ridge(gram, &xty_t, d, alpha)
+                }
+            },
+        };
+        for (i, &v) in w.iter().enumerate() {
+            coef_dk[i * k + t] = v;
+        }
+    }
+    let host: Vec<F> = coef_dk.iter().map(|&v| f64_to_host::<F>(v)).collect();
+    (DeviceArray::from_host(pool, &host), used)
+}
+
+/// Widen a device read-back to `f64` for a host solver.
+fn to_f64<F>(v: &[F]) -> Vec<f64>
+where
+    F: Float + CubeElement + Pod,
+{
+    v.iter().map(|&x| host_to_f64(x)).collect()
+}
+
+/// `classes_` as the `i32` table [`linear_predict_labels`] indexes: length 2
+/// for a binary fit (`[negative, positive]`) and length `n_classes` for a
+/// multiclass one — which is the same thing, since `classes_` IS that table in
+/// both cases.
+///
+/// The narrowing matches every other classifier's label egress in this
+/// codebase (`predict_labels` returns `i32`), so a label outside `i32` was
+/// already unrepresentable before reaching here.
+fn classes_as_i32(classes: &[i64]) -> Vec<i32> {
+    classes.iter().map(|&c| c as i32).collect()
+}
+
+/// Stage a host-solved `coef_` onto the device in BOTH layouts the estimator
+/// keeps, plus the `i32` `classes_` table.
+///
+/// Returns `(coef_ (k × d), coef_t_ (d × k), classes_dev_)`. The transpose runs
+/// on the host here because the coefficients are already there — the device
+/// [`transpose`] prim exists for the arm where they are not.
+fn stage_fitted_state<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    coef_kd: &[F],
+    classes: &[i64],
+    k: usize,
+    d: usize,
+) -> (
+    DeviceArray<ActiveRuntime, F>,
+    DeviceArray<ActiveRuntime, F>,
+    DeviceArray<ActiveRuntime, i32>,
+)
+where
+    F: Float + CubeElement + Pod,
+{
+    debug_assert_eq!(coef_kd.len(), k * d);
+    let mut coef_dk: Vec<F> = vec![f64_to_host::<F>(0.0); d * k];
+    for t in 0..k {
+        for c in 0..d {
+            coef_dk[c * k + t] = coef_kd[t * d + c];
+        }
+    }
+    (
+        DeviceArray::from_host(pool, coef_kd),
+        DeviceArray::from_host(pool, &coef_dk),
+        DeviceArray::from_host(pool, &classes_as_i32(classes)),
+    )
 }
 
 impl<F> Default for RidgeClassifier<F, Unfit>
@@ -626,6 +1145,8 @@ impl RidgeClassifierBuilder {
             n_targets_: 0,
             n_features_: 0,
             coef_: None,
+            coef_t_: None,
+            classes_dev_: None,
             intercept_: None,
             n_iter_: None,
             solver_: None,
@@ -781,26 +1302,200 @@ where
             operand_finite: scores.operand_finite,
         })
     }
+
+    /// Validate a query `x` against the fitted geometry — the guard both
+    /// device ingresses share, byte-identical to
+    /// [`RidgeClassifier::decision_function_from_host`]'s.
+    fn check_query(
+        &self,
+        x_len: usize,
+        (n_samples, n_features): (usize, usize),
+    ) -> Result<(), AlgoError> {
+        if n_samples == 0 || n_features == 0 || x_len != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x_len,
+            }));
+        }
+        if n_features != self.n_features_ {
+            return Err(AlgoError::Prim(PrimError::DimMismatch {
+                dim: "n_features",
+                lhs: n_features,
+                rhs: self.n_features_,
+            }));
+        }
+        Ok(())
+    }
+
+    /// `decision_function` from a DEVICE-resident `x` — the `n_samples ×
+    /// n_targets` row-major scores, device-resident, in ONE fused
+    /// [`linear_predict_multi`] launch.
+    ///
+    /// The scores' finiteness is NOT reported here (unlike the host twin): a
+    /// device-resident operand reached the device through the PyO3 ingress
+    /// validator, which already rejects NaN/±inf.
+    pub fn decision_function_device(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
+        self.check_query(x.len(), shape)?;
+        let coef_t = self
+            .coef_t_
+            .as_ref()
+            .expect("coef_t_ is Some by construction on RidgeClassifier<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on RidgeClassifier<F, Fitted>");
+        Ok(linear_predict_multi::<F>(
+            pool,
+            x,
+            coef_t,
+            intercept,
+            shape,
+            self.n_targets_,
+        )?)
+    }
+
+    /// `predict` from a DEVICE-resident `x` — the length-`n_samples` `i32`
+    /// class labels, device-resident, in ONE fused
+    /// [`linear_predict_labels`] launch that computes the decision function,
+    /// takes its `argmax` (or STRICT sign for a binary fit) and maps the
+    /// winner through `classes_` without ever materializing the scores.
+    ///
+    /// This is the on-device `predict` (RIDGECLF-CUDA). Its host twin is
+    /// [`RidgeClassifier::predict_labels_from_host`]; which one a caller should
+    /// take is [`RidgeClassifier::device_predict_applicable`].
+    pub fn predict_labels_device(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
+        self.check_query(x.len(), shape)?;
+        let coef_t = self
+            .coef_t_
+            .as_ref()
+            .expect("coef_t_ is Some by construction on RidgeClassifier<F, Fitted>");
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on RidgeClassifier<F, Fitted>");
+        let classes = self
+            .classes_dev_
+            .as_ref()
+            .expect("classes_dev_ is Some by construction on RidgeClassifier<F, Fitted>");
+        Ok(linear_predict_labels::<F>(
+            pool,
+            x,
+            coef_t,
+            intercept,
+            classes,
+            shape,
+            self.n_targets_,
+        )?)
+    }
+
+    /// Should a caller holding a HOST-resident query take
+    /// [`RidgeClassifier::predict_labels_device`] (uploading `x`) rather than
+    /// [`RidgeClassifier::predict_labels_from_host`]?
+    ///
+    /// `false` on the **cpu** backend, always: "device" memory IS host memory
+    /// there, so the upload is a pure `memcpy` of the whole query and the
+    /// cubecl launch spawns one OS thread per unit at `-O0`
+    /// (`prims::linear_predict`'s module docs, §"The cpu backend does NOT take
+    /// either kernel").
+    ///
+    /// On the device backends the answer is a MEASURED threshold on
+    /// `n_targets`, and the reason it is not simply "always" is the finding
+    /// this estimator inherits from `Ridge`: a single-target device predict
+    /// measured 10–23× SLOWER than the same crate's host matvec on a P100,
+    /// because `predict` is `O(m·d)` of compute over an `O(m·d)` transfer — the
+    /// one linear-model operation whose compute-to-transfer ratio a GPU cannot
+    /// improve. A `RidgeClassifier` changes that ratio in exactly two ways, and
+    /// both scale with `n_targets`: the compute becomes `O(m·d·k)` over the
+    /// same transfer, and the fused classify kernel shrinks the EGRESS from
+    /// `m·k` floats to `m` `i32`s.
+    ///
+    /// [`RIDGECLF_DEVICE_PREDICT_MIN_TARGETS`] is where those two effects
+    /// overtake the upload — see that constant for the P100 sweep it comes
+    /// from. `MLRS_RIDGECLF_PREDICT_DEVICE=1`/`=0` forces either arm at any
+    /// shape, which is how the threshold is A/B'd on a new backend
+    /// (`ridge_classifier_cuda_perf_test.rs`).
+    ///
+    /// Note the asymmetry with the `PredictLabels` trait impl below, which
+    /// takes the device kernel UNCONDITIONALLY: an `x` that is already
+    /// device-resident has no upload left to amortize, so the gate only
+    /// concerns callers whose query starts on the host.
+    pub fn device_predict_applicable(&self) -> bool {
+        match mlrs_backend::abflag::var("MLRS_RIDGECLF_PREDICT_DEVICE").as_deref() {
+            Some("0") => return false,
+            Some(_) => return true,
+            None => {}
+        }
+        #[cfg(feature = "cpu")]
+        {
+            false
+        }
+        #[cfg(not(feature = "cpu"))]
+        {
+            self.n_targets_ >= RIDGECLF_DEVICE_PREDICT_MIN_TARGETS
+        }
+    }
 }
+
+/// `n_targets` at or above which [`RidgeClassifier::device_predict_applicable`]
+/// sends a host-resident query through the fused DEVICE predict.
+///
+/// ## Where `16` comes from — a measurement, not a guess
+/// `ridge_predict_device_vs_host_perf_test.rs` swept `Ridge`'s multi-target
+/// device predict against this crate's host matvec on a Kaggle P100. That
+/// kernel is [`linear_predict_multi`] — the same kernel family this one
+/// extends, on the same hardware class — and the sweep found:
+///
+/// | `n_targets` | device ÷ host |
+/// |---|---|
+/// | 1 | **0.04–0.10×** (a 10–23× loss, every shape tried) |
+/// | 4 | 0.33–0.5× (a 2–3× loss) |
+/// | 16 | 1.1–1.5× (a win, two data points, close to a wash at `d = 64`) |
+///
+/// So the crossover for the SCORES kernel sits between 4 and 16, and 16 is the
+/// first swept point where it is not a loss. [`linear_predict_labels`] is
+/// strictly better than that kernel at the same `n_targets` — identical
+/// compute, no `m × k` intermediate, and an egress of `m` `i32`s instead of
+/// `m · k` floats — so `16` is a bound the fused kernel can only beat.
+///
+/// It is deliberately NOT lowered on that argument alone. The P100 numbers at
+/// `k = 16` were called "too thin to gate a dispatch threshold on" when they
+/// were taken, and this codebase has been burned before by shipping a gate
+/// derived from one adapter's sweep (see the `mlrs-feedback-verify-on-target-hardware`
+/// project memory). `MLRS_RIDGECLF_PREDICT_DEVICE=1`/`=0` forces either arm at
+/// any shape, and `scripts/colab_ridge_classifier.py` §E runs exactly that
+/// A/B — lowering this constant is what that sweep is for.
+#[cfg_attr(feature = "cpu", allow(dead_code))]
+const RIDGECLF_DEVICE_PREDICT_MIN_TARGETS: usize = 16;
 
 impl<F> PredictLabels<F> for RidgeClassifier<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
-    /// The DEVICE-array trait surface: reads `x` back to the host (labels-scale
-    /// output, not the perf-critical path — see
-    /// [`RidgeClassifier::predict_labels_from_host`] for the no-upload cpu
-    /// ingress the PyO3 boundary actually uses) and reuses the same host
-    /// decision logic.
+    /// The DEVICE-array trait surface — [`RidgeClassifier::predict_labels_device`]
+    /// verbatim. An `x` that is ALREADY device-resident has no upload left to
+    /// amortize, so the fused kernel is unconditionally the right arm here; the
+    /// [`RidgeClassifier::device_predict_applicable`] gate exists for the
+    /// callers whose query starts on the host and would have to pay for the
+    /// crossing.
     fn predict_labels(
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &DeviceArray<ActiveRuntime, F>,
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
-        let x_host = x.to_host(pool);
-        let pred = self.predict_labels_from_host(pool, &x_host, shape)?;
-        Ok(DeviceArray::from_host(pool, &pred.labels))
+        self.predict_labels_device(pool, x, shape)
     }
 }
 

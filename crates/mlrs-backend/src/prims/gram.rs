@@ -41,9 +41,10 @@ use cubecl::prelude::*;
 use mlrs_core::PrimError;
 use mlrs_core::f64_to_host;
 use mlrs_kernels::gram::{
-    col_sums_blocked, col_sums_reduce, gram_xty_blocked, gram_xty_reduce_partials, gram_xty_shared,
-    gram_xty_shared_tiled, gram_xty_tiled, GRAM_BLK, GRAM_CHUNK_ROWS, GRAM_REG_TILE,
-    GRAM_SHARED_UNITS, GRAM_TILE,
+    center_scale_rows, col_sums_blocked, col_sums_reduce, gram_xty_blocked,
+    gram_xty_reduce_partials, gram_xty_shared, gram_xty_shared_tiled, gram_xty_tiled, transpose_2d,
+    xty_multi_blocked, xty_multi_reduce, GRAM_BLK, GRAM_CHUNK_ROWS, GRAM_REG_TILE,
+    GRAM_SHARED_UNITS, GRAM_TILE, XTY_MULTI_MAX_TARGETS,
 };
 
 use crate::device_array::DeviceArray;
@@ -209,21 +210,92 @@ where
         return Ok((xm, ym));
     }
 
+    column_means_multi::<F>(pool, x, y, n, d, 1, None)
+}
+
+/// Multi-target twin of [`column_means`]: the column means of the `n × d`
+/// row-major `x` and the `k` column means of the `n × k` row-major `y`,
+/// optionally WEIGHTED — `(x̄` length `d`, `ȳ` length `k`)`, device-resident.
+///
+/// `weights` is sklearn's `sample_weight` (already multiplied by any
+/// `class_weight`), device-resident and length `n`. `Some` switches both means
+/// to `Σwᵢ·vᵢ / Σwᵢ` (`_preprocess_data`'s `np.average(..., weights=sw)`), with
+/// `Σw` folded ON-DEVICE, so the weighted arm needs no host round-trip either —
+/// where `Ridge`'s weighted arm reads the whole `n × d` design back to compute
+/// exactly these means.
+///
+/// `k = 1, weights = None` is what [`column_means`] delegates to, and is
+/// bit-for-bit the pre-generalization pass.
+///
+/// This does NOT defer to `center_columns` on the non-fused paths the way
+/// [`column_means`] does: it has no centered copy to discard (there is no fused
+/// Gram pass to pair it with — see [`gram_xty_multi`]) and both `col_sums`
+/// kernels are GATHER-only, so running them everywhere is correct on every
+/// backend and strictly less work than centering twice.
+pub fn column_means_multi<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    y: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+    k: usize,
+    weights: Option<&DeviceArray<ActiveRuntime, F>>,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    PrimError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry_multi(x.len(), (n, d), y.len(), k)?;
+    if let Some(w) = weights {
+        if w.len() != n {
+            return Err(PrimError::ShapeMismatch {
+                operand: "gram.sample_weight",
+                rows: n,
+                cols: 1,
+                len: w.len(),
+            });
+        }
+    }
+
     let (nb, rpb) = row_blocking(n, d);
     let psum_len = nb * d;
+    let pysum_len = nb * k;
     let psum = pool.acquire(psum_len * size_of::<F>());
-    let pysum = pool.acquire(nb * size_of::<F>());
+    let pysum = pool.acquire(pysum_len * size_of::<F>());
+    // The `weighted == 0` arm never indexes `w`/`pwsum`, but a launch still
+    // needs real buffers to bind: one element each, never read on that arm.
+    let pwsum_len = if weights.is_some() { nb } else { 1 };
+    let pwsum = pool.acquire(pwsum_len * size_of::<F>());
     let xmean = pool.acquire(d * size_of::<F>());
-    let ymean = pool.acquire(size_of::<F>());
+    let ymean = pool.acquire(k * size_of::<F>());
+
+    let dummy_w: Option<DeviceArray<ActiveRuntime, F>> = if weights.is_none() {
+        Some(DeviceArray::from_host(pool, &[f64_to_host::<F>(0.0)]))
+    } else {
+        None
+    };
+    let w_ref = match (weights, &dummy_w) {
+        (Some(w), _) => w,
+        (None, Some(dw)) => dw,
+        (None, None) => unreachable!("dummy_w is Some whenever weights is None"),
+    };
+    let weighted = u32::from(weights.is_some());
     let client = pool.client().clone();
 
     // SAFETY: validated element counts (above); the kernel bounds-checks the
-    // cube id against `nblocks`, clamps each block's row range to `n`, and
-    // walks columns only while `c < d`.
+    // cube id against `nblocks`, clamps each block's row range to `n`, and walks
+    // columns only while `c < d` / targets while `j < k`.
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
     let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+    let w_arg = unsafe { ArrayArg::from_raw_parts(w_ref.handle().clone(), w_ref.len()) };
     let ps_arg = unsafe { ArrayArg::from_raw_parts(psum.clone(), psum_len) };
-    let py_arg = unsafe { ArrayArg::from_raw_parts(pysum.clone(), nb) };
+    let py_arg = unsafe { ArrayArg::from_raw_parts(pysum.clone(), pysum_len) };
+    let pw_arg = unsafe { ArrayArg::from_raw_parts(pwsum.clone(), pwsum_len) };
     let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
     col_sums_blocked::launch::<F, ActiveRuntime>(
         &client,
@@ -231,41 +303,386 @@ where
         cd,
         x_arg,
         y_arg,
+        w_arg,
         ps_arg,
         py_arg,
+        pw_arg,
         n as u32,
         d as u32,
+        k as u32,
         nb as u32,
         rpb as u32,
+        weighted,
     );
 
     let ps_arg2 = unsafe { ArrayArg::from_raw_parts(psum.clone(), psum_len) };
-    let py_arg2 = unsafe { ArrayArg::from_raw_parts(pysum.clone(), nb) };
+    let py_arg2 = unsafe { ArrayArg::from_raw_parts(pysum.clone(), pysum_len) };
+    let pw_arg2 = unsafe { ArrayArg::from_raw_parts(pwsum.clone(), pwsum_len) };
     let xm_arg = unsafe { ArrayArg::from_raw_parts(xmean.clone(), d) };
-    let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.clone(), 1) };
-    let (c2, d2) = super::launch_dims_1d_folded(d, crate::capability::gather_launch_width());
+    let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.clone(), k) };
+    // The fold covers BOTH outputs, so it is launched over `max(d, k)`: a `k`
+    // wider than `d` would otherwise leave the tail target means unwritten.
+    let (c2, d2) = super::launch_dims_1d_folded(d.max(k), crate::capability::gather_launch_width());
     col_sums_reduce::launch::<F, ActiveRuntime>(
         &client,
         c2,
         d2,
         ps_arg2,
         py_arg2,
+        pw_arg2,
         xm_arg,
         ym_arg,
         d as u32,
+        k as u32,
         nb as u32,
         f64_to_host::<F>(1.0 / n as f64),
+        weighted,
     );
 
     pool.release(psum, psum_len * size_of::<F>());
-    pool.release(pysum, nb * size_of::<F>());
+    pool.release(pysum, pysum_len * size_of::<F>());
+    pool.release(pwsum, pwsum_len * size_of::<F>());
+    if let Some(dw) = dummy_w {
+        dw.release_into(pool);
+    }
 
     Ok((
         DeviceArray::from_raw(xmean, d),
-        DeviceArray::from_raw(ymean, 1),
+        DeviceArray::from_raw(ymean, k),
     ))
 }
 
+/// The normal equations of a MULTI-TARGET fit: `gram = XᵀX` (`d × d`) and
+/// `xty = XᵀY` (`d × k` row-major, i.e. FEATURE-major), both device-resident,
+/// with the centering fused wherever the single-target path fuses it.
+///
+/// `means` is the `(x̄, ȳ)` pair [`column_means_multi`] produces (`ȳ` length
+/// `k`). `None` forms the RAW normal equations of `x`/`y` as given — which is
+/// what the WEIGHTED arm wants, having pre-applied both the centering and the
+/// `√w` scale through [`center_scale`].
+///
+/// ## The Gram is formed ONCE, and the `k` `Xᵀy` columns in one extra pass
+/// This is the whole reason a `RidgeClassifier` is not a `Ridge`-per-class
+/// loop: `XᵀX` does not depend on `y`, so `k` independent single-target fits
+/// re-walk the design's `O(n·d²)` reduction `k` times for zero mathematical
+/// benefit. Here the Gram runs on the SAME (bitwise unchanged) kernel the
+/// single-target path uses, and [`xty_multi_blocked`] adds all `k` target
+/// columns in one further `O(n·d·k)` pass — so the fit costs
+/// `O(n·d² + n·d·k)`, not `O(n·d²·k)`.
+///
+/// ## Why the `Xᵀy` the Gram launch produces is discarded for `k > 1`
+/// The three Gram kernels carry a single-target `Xᵀy` on whichever units
+/// already hold the column in registers. Widening that to `k` runtime targets
+/// would need `4·k` live registers per unit, which CubeCL cannot express and a
+/// GPU could not hold — hence the separate pass, which costs one extra
+/// `O(n·d)` read against the Gram's `O(n·d²)` of work. The `y` operand bound to
+/// the Gram launch is a length-`n` prefix VIEW of the `n × k` target matrix, so
+/// its `Xᵀy` output is meaningless; `gram` itself never reads `y` at any point,
+/// so the discarded column changes nothing about the value this returns.
+/// `k == 1` keeps that output and runs no second pass at all — a binary
+/// `RidgeClassifier` is byte-for-byte the shipped `Ridge` formation.
+#[allow(clippy::type_complexity)]
+pub fn gram_xty_multi<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    y: &DeviceArray<ActiveRuntime, F>,
+    means: Option<(
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    )>,
+    n: usize,
+    d: usize,
+    k: usize,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    ),
+    PrimError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry_multi(x.len(), (n, d), y.len(), k)?;
+    if let Some((xm, ym)) = means {
+        if xm.len() != d || ym.len() != k {
+            return Err(PrimError::ShapeMismatch {
+                operand: "gram.xmean",
+                rows: d,
+                cols: k,
+                len: xm.len(),
+            });
+        }
+    }
+
+    if k == 1 {
+        return match means {
+            Some(m) => gram_xty_centered::<F>(pool, x, y, m, n, d),
+            None => gram_xty::<F>(pool, x, y, n, d),
+        };
+    }
+
+    let y_view = DeviceArray::<ActiveRuntime, F>::from_raw(y.handle().clone(), n);
+    let (gram, junk_xty) = match means {
+        Some((xm, ym)) => {
+            let ym_view = DeviceArray::<ActiveRuntime, F>::from_raw(ym.handle().clone(), 1);
+            let out = gram_xty_centered::<F>(pool, x, &y_view, (xm, &ym_view), n, d);
+            drop(ym_view);
+            out?
+        }
+        None => gram_xty::<F>(pool, x, &y_view, n, d)?,
+    };
+    drop(y_view);
+    junk_xty.release_into(pool);
+
+    let xty = xty_multi::<F>(pool, x, y, means, n, d, k)?;
+    Ok((gram, xty))
+}
+
+/// `XᵀY` (`d × k` row-major) of the centered design against the centered
+/// targets — [`gram_xty_multi`]'s second pass.
+///
+/// Blocked independently of the Gram (its partial is `nblocks · d · k`, not
+/// `nblocks · d²`) and chunked over targets in windows of
+/// [`XTY_MULTI_MAX_TARGETS`] so the kernel's per-unit accumulator stays a
+/// comptime-sized register array. Every realistic class count is ONE window.
+fn xty_multi<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    y: &DeviceArray<ActiveRuntime, F>,
+    means: Option<(
+        &DeviceArray<ActiveRuntime, F>,
+        &DeviceArray<ActiveRuntime, F>,
+    )>,
+    n: usize,
+    d: usize,
+    k: usize,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    // The RAW `XᵀY` is the fused kernel with all-zero means — one `d + k`
+    // element buffer instead of a second kernel (the `gram_xty_blocked_impl`
+    // precedent).
+    let zeros: Option<(
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, F>,
+    )> = if means.is_none() {
+        let z = f64_to_host::<F>(0.0);
+        Some((
+            DeviceArray::from_host(pool, &vec![z; d]),
+            DeviceArray::from_host(pool, &vec![z; k]),
+        ))
+    } else {
+        None
+    };
+    let (xmean, ymean) = match (&means, &zeros) {
+        (Some((xm, ym)), _) => (*xm, *ym),
+        (None, Some((xm, ym))) => (xm, ym),
+        (None, None) => unreachable!("zeros is Some whenever means is None"),
+    };
+
+    let (nb, rpb) = row_blocking_multi(n, d, k);
+    let dk = d * k;
+    let pxty_len = nb * dk;
+    let pxty = pool.acquire(pxty_len * size_of::<F>());
+    let xty = pool.acquire(dk * size_of::<F>());
+    let client = pool.client().clone();
+
+    let mut t0 = 0usize;
+    while t0 < k {
+        let tcount = (k - t0).min(XTY_MULTI_MAX_TARGETS as usize);
+        // SAFETY: validated element counts (caller); the kernel bounds-checks
+        // the cube id against `nblocks`, clamps its row range to `n`, walks
+        // columns while `c < d` and targets while `j < tcount ≤ k − t0`.
+        let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+        let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+        let xm_arg = unsafe { ArrayArg::from_raw_parts(xmean.handle().clone(), d) };
+        let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.handle().clone(), k) };
+        let px_arg = unsafe { ArrayArg::from_raw_parts(pxty.clone(), pxty_len) };
+        let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
+        xty_multi_blocked::launch::<F, ActiveRuntime>(
+            &client,
+            cc,
+            cd,
+            x_arg,
+            y_arg,
+            xm_arg,
+            ym_arg,
+            px_arg,
+            n as u32,
+            d as u32,
+            k as u32,
+            t0 as u32,
+            tcount as u32,
+            nb as u32,
+            rpb as u32,
+        );
+        t0 += tcount;
+    }
+
+    let px_arg2 = unsafe { ArrayArg::from_raw_parts(pxty.clone(), pxty_len) };
+    let xt_arg = unsafe { ArrayArg::from_raw_parts(xty.clone(), dk) };
+    let (c2, d2) = super::launch_dims_1d_folded(dk, crate::capability::gather_launch_width());
+    xty_multi_reduce::launch::<F, ActiveRuntime>(
+        &client, c2, d2, px_arg2, xt_arg, dk as u32, nb as u32,
+    );
+
+    pool.release(pxty, pxty_len * size_of::<F>());
+    if let Some((xm, ym)) = zeros {
+        xm.release_into(pool);
+        ym.release_into(pool);
+    }
+    Ok(DeviceArray::from_raw(xty, dk))
+}
+
+/// `out[r,c] = √wᵣ · (x[r,c] − mean[c])` for an `n × d` row-major `x`, in ONE
+/// device pass — sklearn's `_preprocess_data` centering composed with
+/// `_rescale_data`'s `√w` row scale.
+///
+/// `sqrt_w` is the length-`n` ALREADY-square-rooted weight vector: the caller
+/// holds the weights on the host, where the `sqrt` is one cheap pass and stays
+/// off the `f64` transcendental path some wgpu adapters lack (see the
+/// `mlrs-wgpu-f64-eig-broken` finding).
+///
+/// The weighted fit arm cannot fuse its centering into the Gram accumulation
+/// the way the unweighted one does — `√w` multiplies the OPERANDS, so it has to
+/// exist before the reduction — which is exactly the `n × d` materialization
+/// [`gram_xty_multi`]'s `means` route avoids. It is still strictly better than
+/// the host preprocessing pass it replaces (`Ridge::preprocess`'s weighted
+/// arm): the design never leaves the device.
+pub fn center_scale<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    mean: &DeviceArray<ActiveRuntime, F>,
+    sqrt_w: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if n == 0 || d == 0 || x.len() != n * d {
+        return Err(PrimError::ShapeMismatch {
+            operand: "center_scale.x",
+            rows: n,
+            cols: d,
+            len: x.len(),
+        });
+    }
+    if mean.len() != d || sqrt_w.len() != n {
+        return Err(PrimError::ShapeMismatch {
+            operand: "center_scale.mean",
+            rows: d,
+            cols: 1,
+            len: mean.len(),
+        });
+    }
+
+    let len = n * d;
+    let out = pool.acquire(len * size_of::<F>());
+    let client = pool.client().clone();
+
+    // SAFETY: validated element counts above; the kernel guards `idx < n*d` and
+    // derives `r < n` / `c < d` from it.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), len) };
+    let m_arg = unsafe { ArrayArg::from_raw_parts(mean.handle().clone(), d) };
+    let w_arg = unsafe { ArrayArg::from_raw_parts(sqrt_w.handle().clone(), n) };
+    let o_arg = unsafe { ArrayArg::from_raw_parts(out.clone(), len) };
+    let (cc, cd) = super::launch_dims_1d_folded(len, crate::capability::gather_launch_width());
+    center_scale_rows::launch::<F, ActiveRuntime>(
+        &client, cc, cd, x_arg, m_arg, w_arg, o_arg, n as u32, d as u32,
+    );
+    Ok(DeviceArray::from_raw(out, len))
+}
+
+/// Transpose a `rows × cols` row-major device matrix into its `cols × rows`
+/// row-major twin, in one launch and with no host round-trip.
+///
+/// `RidgeClassifier`'s device fit produces `coef` FEATURE-major (`d × k`, the
+/// layout `cholesky_solve_reg` returns and `linear_predict_bias_multi` /
+/// `linear_predict_classify` consume) while sklearn's `coef_` attribute is
+/// `k × d`. Both are device-resident (D-03) and `d · k` is a few thousand
+/// elements, so this replaces a blocking read-back + host transpose +
+/// re-upload in the middle of an otherwise round-trip-free fit.
+pub fn transpose<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    src: &DeviceArray<ActiveRuntime, F>,
+    rows: usize,
+    cols: usize,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if rows == 0 || cols == 0 || src.len() != rows * cols {
+        return Err(PrimError::ShapeMismatch {
+            operand: "transpose.src",
+            rows,
+            cols,
+            len: src.len(),
+        });
+    }
+    let len = rows * cols;
+    let out = pool.acquire(len * size_of::<F>());
+    let client = pool.client().clone();
+
+    // SAFETY: validated element counts above; the kernel guards `idx < len` and
+    // writes `dst[j*rows + i]` with `i < rows`, `j < cols`.
+    let s_arg = unsafe { ArrayArg::from_raw_parts(src.handle().clone(), len) };
+    let d_arg = unsafe { ArrayArg::from_raw_parts(out.clone(), len) };
+    let (cc, cd) = super::launch_dims_1d_folded(len, crate::capability::gather_launch_width());
+    transpose_2d::launch::<F, ActiveRuntime>(
+        &client,
+        cc,
+        cd,
+        s_arg,
+        d_arg,
+        rows as u32,
+        cols as u32,
+    );
+    Ok(DeviceArray::from_raw(out, len))
+}
+
+/// `(nblocks, rows_per_block)` for the [`xty_multi_blocked`] pass.
+///
+/// Deliberately NOT [`row_blocking`]: that cap is sized for a `nblocks · d²`
+/// partial, and this pass's is `nblocks · d · k`. Sharing it would let a small
+/// `d` with a large `k` allocate a partial buffer far past the ~8 M-element
+/// budget every other row-blocked prim here respects (`d = 8, k = 32,
+/// n = 10⁷` would ask for 32 M elements).
+fn row_blocking_multi(n: usize, d: usize, k: usize) -> (usize, usize) {
+    let nb_cap = ((8usize << 20) / (d * k).max(1)).max(1);
+    let nb = n.div_ceil(256).clamp(1, nb_cap);
+    let rpb = n.div_ceil(nb);
+    (n.div_ceil(rpb), rpb)
+}
+
+/// [`validate_geometry`] for a `k`-target `y`: `x` is `n × d` row-major, `y` is
+/// `n × k` row-major. All three dims non-zero.
+fn validate_geometry_multi(
+    x_len: usize,
+    (n, d): (usize, usize),
+    y_len: usize,
+    k: usize,
+) -> Result<(), PrimError> {
+    if n == 0 || d == 0 || n.checked_mul(d).map(|v| v != x_len).unwrap_or(true) {
+        return Err(PrimError::ShapeMismatch {
+            operand: "x",
+            rows: n,
+            cols: d,
+            len: x_len,
+        });
+    }
+    if k == 0 || n.checked_mul(k).map(|v| v != y_len).unwrap_or(true) {
+        return Err(PrimError::ShapeMismatch {
+            operand: "y",
+            rows: n,
+            cols: k,
+            len: y_len,
+        });
+    }
+    Ok(())
+}
 
 /// Why [`column_means`] does NOT get its own, wider row blocking.
 ///
