@@ -90,7 +90,7 @@ pub use cholesky::cholesky_solve;
 // index-identity self-drop GATHER. Plan 13-02 owns this re-export (file-disjoint,
 // single-owner) alongside the kernel bodies in `distance.rs`.
 pub use distance::{
-    chebyshev_dist, euclidean_sq_dist, euclidean_sq_dist_rb, euclidean_sq_dist_rb4,
+    chebyshev_dist, cosine_dist, euclidean_sq_dist, euclidean_sq_dist_rb, euclidean_sq_dist_rb4,
     euclidean_sq_dist_tiled,
     manhattan_dist,
     minkowski_dist, self_drop_gather,

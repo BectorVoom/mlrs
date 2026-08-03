@@ -806,6 +806,137 @@ def gen_knn(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# KNeighborsRegressor full-parameter oracle (KNN-REG-PARAMS). Larger than
+# `gen_knn`'s 30x3 blob because the parameter surface needs shapes that blob
+# cannot express: a second target column (multi-output) and a query that
+# COINCIDES with a training point (the `weights='distance'` 1/0 branch).
+KNN_REG_N_TRAIN, KNN_REG_N_QUERY, KNN_REG_N_FEATURES = 40, 12, 4
+KNN_REG_K = 5
+KNN_REG_N_OUTPUTS = 2
+# Non-degenerate Minkowski exponent — p != 1, 2, inf, so it exercises the
+# general `minkowski_dist` kernel rather than one of the collapsed fast paths.
+KNN_REG_P = 3.0
+# Query rows overwritten with an exact copy of a TRAIN row. `weights='distance'`
+# then divides by zero for those rows and must take sklearn's indicator branch
+# (coincident neighbours weight 1, all others 0) instead of producing NaN. Two
+# rows so the case is not a single-row accident, and a train row that is itself
+# duplicated (see `_knn_reg_data`) so a row can have TWO zero-distance
+# neighbours — the case where "use the nearest" and "use all the zeros" differ.
+KNN_REG_COINCIDENT_QUERIES = (3, 9)
+
+
+def _knn_reg_data(seed: int):
+    """The shared `(X, Xq, y, y_multi)` design for the KNN-regressor fixtures.
+
+    Train points are spread widely with a per-row offset so pairwise distances
+    are distinct (Pitfall 8 — a tie would make the oracle's neighbour choice
+    ambiguous), EXCEPT for one deliberately duplicated pair, and two query rows
+    are exact copies of train rows so the zero-distance weighting branch is
+    reachable. All rows are shifted positive before the cosine cases so no row
+    is near-zero-norm, where cosine distance is numerically meaningless and
+    sklearn and mlrs would legitimately disagree.
+    """
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((KNN_REG_N_TRAIN, KNN_REG_N_FEATURES)) * 3.0
+    x += np.arange(KNN_REG_N_TRAIN)[:, None] * 0.01
+    # Push every row off the origin: cosine distance is undefined at zero norm
+    # and unstable near it.
+    x += 5.0
+    # One duplicated TRAIN pair, so a coincident query has two zero-distance
+    # neighbours rather than one.
+    x[7] = x[2]
+
+    xq = rng.standard_normal((KNN_REG_N_QUERY, KNN_REG_N_FEATURES)) * 3.0 + 5.0
+    for i, q in enumerate(KNN_REG_COINCIDENT_QUERIES):
+        xq[q] = x[2 if i == 0 else 15]
+
+    y = x @ rng.standard_normal(KNN_REG_N_FEATURES) + 0.5
+    y_multi = np.column_stack(
+        [y, x @ rng.standard_normal(KNN_REG_N_FEATURES) - 1.25]
+    )
+    return x, xq, y, y_multi
+
+
+def gen_knn_regressor_params(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the KNeighborsRegressor full-parameter oracle (KNN-REG-PARAMS).
+
+    One fixture, every hyperparameter combination the DEVICE path serves, all
+    from `sklearn.neighbors.KNeighborsRegressor(algorithm='brute', ...)`:
+
+      * `weights` in {uniform, distance}
+      * `metric` in {euclidean, manhattan, chebyshev, minkowski(p=3), cosine}
+      * a multi-output target under both weightings
+
+    Array names are `predict_<metric>_<weights>`, plus
+    `predict_multi_<weights>` for the 2-column target and
+    `distances_manhattan` / `indices_manhattan` for the `kneighbors` surface
+    under a NON-default metric (the one place a metric bug could hide behind a
+    correct `predict`).
+
+    The callable-`weights` and callable-`metric` paths are deliberately NOT
+    stored here: they are host-side reimplementations of sklearn's own host
+    code, so a committed oracle would only pin numpy against numpy. The Python
+    tests exercise them against a live sklearn instead, which is the comparison
+    that can actually fail.
+    """
+    from sklearn.neighbors import KNeighborsRegressor
+
+    x, xq, y, y_multi = _knn_reg_data(seed)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {
+        "X": c(x),
+        "Xq": c(xq),
+        "y": c(y),
+        "y_multi": c(y_multi),
+        "k": c([KNN_REG_K]),
+        "p": c([KNN_REG_P]),
+    }
+
+    metrics = {
+        "euclidean": dict(metric="euclidean"),
+        "manhattan": dict(metric="manhattan"),
+        "chebyshev": dict(metric="chebyshev"),
+        "minkowski": dict(metric="minkowski", p=KNN_REG_P),
+        "cosine": dict(metric="cosine"),
+    }
+    for name, kw in metrics.items():
+        for weights in ("uniform", "distance"):
+            reg = KNeighborsRegressor(
+                n_neighbors=KNN_REG_K,
+                algorithm="brute",
+                weights=weights,
+                **kw,
+            ).fit(x, y)
+            out[f"predict_{name}_{weights}"] = c(reg.predict(xq))
+
+    for weights in ("uniform", "distance"):
+        reg = KNeighborsRegressor(
+            n_neighbors=KNN_REG_K,
+            algorithm="brute",
+            weights=weights,
+            metric="euclidean",
+        ).fit(x, y_multi)
+        out[f"predict_multi_{weights}"] = c(reg.predict(xq))
+
+    nn = KNeighborsRegressor(
+        n_neighbors=KNN_REG_K, algorithm="brute", metric="manhattan"
+    ).fit(x, y)
+    dist, idx = nn.kneighbors(xq)
+    out["distances_manhattan"] = c(dist)
+    out["indices_manhattan"] = c(idx)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"knn_reg_params_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
 # Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05). The fixed Minkowski-p
 # test exponent (p != 1, 2 so it is a genuine non-degenerate Minkowski case that
 # the general direct kernel — not a special-cased L1/L2 fast path — must satisfy).
@@ -4751,6 +4882,11 @@ def main() -> None:
     # regressor; distinct distances (Pitfall 8).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_knn(dtype=dtype)}")
+    # KNeighborsRegressor full parameter surface (KNN-REG-PARAMS): every
+    # weights x metric combination the device path serves, plus a multi-output
+    # target and a coincident query (the weights='distance' 1/0 branch).
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_knn_regressor_params(dtype=dtype)}")
     # Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05): the full fixed
     # metric set (euclidean, manhattan, cosine, chebyshev, minkowski-p) × {f32
     # (rocm gate), f64 (cpu gate)}, each carrying a DUPLICATE-POINT train row

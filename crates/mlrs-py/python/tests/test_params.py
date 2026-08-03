@@ -73,7 +73,19 @@ EXPECTED_PARAMS = {
     "TruncatedSVD": {"n_components": 2, "output_type": "input"},
     "NearestNeighbors": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
     "KNeighborsClassifier": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
-    "KNeighborsRegressor": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
+    # KNN-REG-PARAMS: the regressor carries sklearn's FULL parameter surface,
+    # unlike its two older siblings above.
+    "KNeighborsRegressor": {
+        "n_neighbors": 5,
+        "output_type": "input",
+        "weights": "uniform",
+        "algorithm": "auto",
+        "leaf_size": 30,
+        "p": 2,
+        "metric": "minkowski",
+        "metric_params": None,
+        "n_jobs": None,
+    },
     # PCA requires an explicit n_components — constructed with n_components=2.
     "PCA": {"n_components": 2, "output_type": "input"},
     # --- pre-existing shims that were not in the original ALL_12 matrix (now
