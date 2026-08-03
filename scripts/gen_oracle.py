@@ -2367,6 +2367,149 @@ def gen_ridge_params(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# --- RidgeClassifier FULL parameter surface (LINEAR-07) -------------------- #
+
+
+def gen_ridge_classifier(seed: int = SEED, dtype=np.float32, multiclass: bool = False) -> str:
+    """Generate the RidgeClassifier full-parameter-surface fixture (LINEAR-07).
+
+    Covers every ``sklearn.linear_model.RidgeClassifier`` ctor parameter that
+    changes the fit — the ``solver`` family (via the shared ``Ridge`` normal
+    equations), ``fit_intercept``, ``positive``, ``class_weight`` (``None`` /
+    ``'balanced'`` / a PARTIAL dict, to exercise the "class absent from the
+    dict keeps weight 1.0" default-fill) and ``fit(..., sample_weight=...)`` —
+    for both a binary (2-class) and multiclass (3-class) target, reusing the
+    tight ``tol``/``max_iter`` from ``gen_ridge_params`` so every iterative
+    solver lands on the SAME converged optimum as ``cholesky``.
+
+    Stores ``coef_<case>`` (``atleast_2d``, so binary is `(1, d)`),
+    ``intercept_<case>``, ``predict_<case>`` and ``decision_<case>``
+    (reshaped to `(n_test, -1)`, so binary is `(n_test, 1)`). Requires
+    ``scikit-learn==1.9.0``.
+    """
+    import warnings
+
+    from sklearn.exceptions import ConvergenceWarning
+    from sklearn.linear_model import RidgeClassifier
+
+    n_classes = 3 if multiclass else 2
+    n, d = (90, 6) if multiclass else (60, 5)
+    n_test_per_class = 4
+    rng = np.random.default_rng(seed + 133)
+    centers = rng.standard_normal((n_classes, d)) * 4.0
+    per = n // n_classes
+    x = np.vstack(
+        [centers[k] + rng.standard_normal((per, d)) for k in range(n_classes)]
+    ).astype(dtype).astype(np.float64)
+    y = np.concatenate([np.full(per, k) for k in range(n_classes)])
+    n = x.shape[0]
+    xq = np.vstack(
+        [centers[k] + rng.standard_normal((n_test_per_class, d)) for k in range(n_classes)]
+    ).astype(dtype).astype(np.float64)
+
+    # Strictly-positive, non-uniform weights (the `gen_ridge_params` precedent)
+    # so the weighted cases genuinely differ from the unweighted ones.
+    sw = rng.uniform(0.25, 3.0, size=n).astype(dtype).astype(np.float64)
+    # A PARTIAL dict — only class 0 is named — to exercise sklearn's
+    # "classes absent from class_weight keep weight 1.0" fill rule.
+    cw_partial = {0: 2.5}
+
+    common = dict(alpha=RIDGE_PARAMS_ALPHA, tol=RIDGE_PARAMS_TOL, max_iter=RIDGE_PARAMS_MAX_ITER)
+    # (case name, ctor kwargs, use_sample_weight)
+    cases = [
+        ("auto", dict(solver="auto"), False),
+        ("cholesky", dict(solver="cholesky"), False),
+        ("svd", dict(solver="svd"), False),
+        ("lsqr", dict(solver="lsqr"), False),
+        ("sparse_cg", dict(solver="sparse_cg"), False),
+        ("sag", dict(solver="sag", random_state=0), False),
+        ("saga", dict(solver="saga", random_state=0), False),
+        ("lbfgs_pos", dict(solver="lbfgs", positive=True), False),
+        ("cholesky_noint", dict(solver="cholesky", fit_intercept=False), False),
+        ("cholesky_balanced", dict(solver="cholesky", class_weight="balanced"), False),
+        ("cholesky_dict_partial", dict(solver="cholesky", class_weight=cw_partial), False),
+        ("cholesky_sw", dict(solver="cholesky"), True),
+        ("cholesky_sw_balanced", dict(solver="cholesky", class_weight="balanced"), True),
+    ]
+
+    def c(arr):
+        # `ascontiguousarray` BEFORE the dtype cast: sklearn's multi-target
+        # `RidgeClassifier.coef_` is `Ridge`'s `linalg.solve(...).T`, an
+        # F-CONTIGUOUS view (`.astype`'s default `order='K'` preserves that
+        # layout), and `np.savez` records the array's OWN memory order in the
+        # `.npy` header. The Rust loader (`npyz`) reads the flat byte buffer
+        # assuming row-major, so a Fortran-ordered array round-trips
+        # TRANSPOSED — this bites `coef_`, not the 1-D arrays, which is why no
+        # earlier generator needed it.
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {"X": c(x), "Xq": c(xq), "y": c(y), "sample_weight": c(sw)}
+    solver_names = []
+    coefs = {}
+    for name, kwargs, use_sw in cases:
+        est = RidgeClassifier(**{**common, **kwargs})
+        with warnings.catch_warnings():
+            # A ConvergenceWarning here would mean the reference itself is not
+            # at the optimum — turn it into an error so a bad fixture cannot be
+            # committed silently.
+            warnings.simplefilter("error", ConvergenceWarning)
+            est.fit(x, y, sample_weight=sw if use_sw else None)
+        coef2d = np.atleast_2d(est.coef_)
+        out[f"coef_{name}"] = c(coef2d)
+        out[f"intercept_{name}"] = c(np.atleast_1d(est.intercept_))
+        out[f"predict_{name}"] = c(est.predict(xq))
+        out[f"decision_{name}"] = c(est.decision_function(xq).reshape(len(xq), -1))
+        solver_names.append(f"{name}={est.solver_}")
+        coefs[name] = coef2d.astype(np.float64)
+
+    # Every unweighted, intercept-fitting, unconstrained solver must agree with
+    # `cholesky` — the premise of the whole fixture (the `gen_ridge_params`
+    # precedent, now over the multi-output `{-1,+1}` target).
+    ref = coefs["cholesky"]
+    for name in ("auto", "svd", "lsqr", "sparse_cg", "sag", "saga"):
+        assert np.allclose(coefs[name], ref, atol=1e-7, rtol=1e-7), (
+            f"gen_ridge_classifier: solver '{name}' disagrees with 'cholesky' "
+            f"({coefs[name]} vs {ref})"
+        )
+    assert (coefs["lbfgs_pos"] >= 0).all(), "positive fit produced a negative coef_"
+    assert (ref < 0).any(), (
+        "gen_ridge_classifier: the unconstrained solution is already all-positive, "
+        "so `positive=True` is not exercised — reseed the fixture"
+    )
+
+    expected_resolution = {
+        "auto": "cholesky",
+        "cholesky": "cholesky",
+        "svd": "svd",
+        "lsqr": "lsqr",
+        "sparse_cg": "sparse_cg",
+        "sag": "sag",
+        "saga": "saga",
+        "lbfgs_pos": "lbfgs",
+    }
+    resolved = dict(pair.split("=", 1) for pair in solver_names)
+    for case, want in expected_resolution.items():
+        assert resolved[case] == want, (
+            f"gen_ridge_classifier: sklearn resolved solver_ for '{case}' to "
+            f"'{resolved[case]}', expected '{want}'"
+        )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    kind = "multi" if multiclass else "binary"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"ridge_classifier_{kind}_{dtype_tag}_seed{seed}.npz")
+    out["alpha"] = c([RIDGE_PARAMS_ALPHA])
+    # Every array in an oracle .npz must be float32/float64 (the loader's
+    # contract), so max_iter/n_classes ship as floats and the reader casts back.
+    out["tol"] = np.asarray([RIDGE_PARAMS_TOL], dtype=np.float64)
+    out["max_iter"] = np.asarray([float(RIDGE_PARAMS_MAX_ITER)], dtype=np.float64)
+    out["n_classes"] = np.asarray([float(n_classes)], dtype=np.float64)
+    out["cw_partial_label"] = np.asarray([float(next(iter(cw_partial)))], dtype=np.float64)
+    out["cw_partial_weight"] = np.asarray([float(next(iter(cw_partial.values())))], dtype=np.float64)
+    np.savez(out_path, **out)
+    return out_path
+
+
 # --- BayesianRidge FULL parameter surface (LINEAR-06) ---------------------- #
 # Two geometries, because sklearn's `_update_coef_` and `_log_marginal_likelihood`
 # each branch on `n_samples > n_features` and its `sigma_` uses a FULL-matrix SVD
@@ -5236,6 +5379,11 @@ def main() -> None:
     # without `fit_intercept` / `positive` / `sample_weight`.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_ridge_params(dtype=dtype)}")
+    # RidgeClassifier FULL parameter surface (LINEAR-07): binary + multiclass,
+    # every solver, class_weight, positive, sample_weight.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_ridge_classifier(dtype=dtype, multiclass=False)}")
+        print(f"wrote {gen_ridge_classifier(dtype=dtype, multiclass=True)}")
     # BayesianRidge FULL parameter surface (LINEAR-06): the evidence iteration,
     # both n_samples <=> n_features branches, hyperpriors, inits, scores, weights.
     for dtype in (np.float32, np.float64):

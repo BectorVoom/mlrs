@@ -19,7 +19,7 @@ use mlrs_py::estimators::cluster::{PyDBSCAN, PyKMeans};
 use mlrs_py::estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
 use mlrs_py::estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
 use mlrs_py::estimators::linear::{
-    PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge,
+    PyElasticNet, PyLasso, PyLinearRegression, PyLogisticRegression, PyRidge, PyRidgeClassifier,
 };
 use mlrs_py::estimators::naive_bayes::{
     PyBernoulliNB, PyCategoricalNB, PyComplementNB, PyGaussianNB, PyMultinomialNB,
@@ -37,6 +37,7 @@ fn all_twelve_estimators_construct_unfit() {
     // linear_model (5)
     assert!(PyLinearRegression::unfit_default().is_unfit(), "LinearRegression");
     assert!(PyRidge::unfit_default().is_unfit(), "Ridge");
+    assert!(PyRidgeClassifier::unfit_default().is_unfit(), "RidgeClassifier");
     assert!(PyLasso::unfit_default().is_unfit(), "Lasso");
     assert!(PyElasticNet::unfit_default().is_unfit(), "ElasticNet");
     assert!(PyLogisticRegression::unfit_default().is_unfit(), "LogisticRegression");

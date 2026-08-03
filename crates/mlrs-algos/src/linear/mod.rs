@@ -51,6 +51,7 @@ pub mod lasso;
 pub mod linear_regression;
 pub mod logistic;
 pub mod ridge;
+pub mod ridge_classifier;
 pub mod ridge_solvers;
 pub mod sym_eig;
 
