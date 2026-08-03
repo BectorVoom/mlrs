@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
-use mlrs_algos::neighbors::classifier::KNeighborsClassifier;
+use mlrs_algos::neighbors::classifier::{prepare_labels, KNeighborsClassifier};
 use mlrs_algos::typestate::{Fit, PredictLabels, PredictProba};
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -186,4 +186,89 @@ fn knn_classifier_predict_proba_match_sklearn_f64() {
         return;
     }
     check_classifier::<f64>("knn_f64_seed42.npz");
+}
+
+/// KNN-REG-FIT: `fit_owned` + `prepare_labels` reproduce the borrowing
+/// `Fit::fit` exactly.
+///
+/// The split exists so a caller holding the labels on the HOST can skip the
+/// device round-trip `Fit::fit` is forced into (it takes `y` as a
+/// `DeviceArray` and immediately reads it back). This pins that the shortcut
+/// computes the same thing — including `classes_`, which is what makes a
+/// non-contiguous target round-trip through `predict` (CR-03).
+#[test]
+fn fit_owned_matches_borrowing_fit() {
+    let case = load_npz(fixture("knn_f64_seed42.npz")).expect("load knn_f64");
+    let x: Vec<f64> = fixture_vec::<f64>(&case, "X");
+    let xq: Vec<f64> = fixture_vec::<f64>(&case, "Xq");
+    let y: Vec<f64> = fixture_vec::<f64>(&case, "y_class");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let xq_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &xq);
+    let build = || {
+        KNeighborsClassifier::<f64>::builder()
+            .n_neighbors(KNN_K)
+            .build::<f64>()
+            .expect("build")
+    };
+
+    let borrowed = {
+        let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+        let y_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y);
+        let est = build()
+            .fit(&mut pool, &x_dev, Some(&y_dev), (KNN_N_TRAIN, KNN_N_FEATURES))
+            .expect("borrowing fit");
+        x_dev.release_into(&mut pool);
+        y_dev.release_into(&mut pool);
+        est
+    };
+    let owned = {
+        // The host-label path: `y` never reaches the device at all.
+        let labels = prepare_labels::<f64>(&y, KNN_N_TRAIN).expect("prepare labels");
+        let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+        build()
+            .fit_owned(&mut pool, x_dev, labels, (KNN_N_TRAIN, KNN_N_FEATURES))
+            .expect("owning fit")
+    };
+
+    assert_eq!(borrowed.classes(), owned.classes());
+    assert_eq!(borrowed.n_classes(), owned.n_classes());
+
+    let mut preds = Vec::new();
+    for est in [&borrowed, &owned] {
+        let p = est
+            .predict_labels(&mut pool, &xq_dev, (KNN_N_QUERY, KNN_N_FEATURES))
+            .expect("predict_labels");
+        preds.push(p.to_host(&pool));
+        p.release_into(&mut pool);
+    }
+    assert_eq!(preds[0], preds[1], "predicted labels must agree");
+}
+
+/// WR-02: `prepare_labels` rejects a label that is not a finite, integer-valued
+/// i32. Without this a NaN target silently becomes class `0` under the
+/// saturating cast, producing a wrong class with no error at all.
+#[test]
+fn prepare_labels_rejects_invalid_labels() {
+    for bad in [f64::NAN, f64::INFINITY, 0.5, 3e18] {
+        let mut y = vec![0.0f64; KNN_N_TRAIN];
+        y[3] = bad;
+        assert!(
+            prepare_labels::<f64>(&y, KNN_N_TRAIN).is_err(),
+            "label {bad} must be rejected"
+        );
+    }
+}
+
+/// CR-03: `classes_` is the DISTINCT SORTED raw labels, and each sample is
+/// remapped to its POSITION in that list — not to the raw label itself. A
+/// `max + 1` width over a non-contiguous target would leave a structurally-zero
+/// column that argmax can still pick, returning a class that never existed.
+#[test]
+fn prepare_labels_densely_remaps_a_non_contiguous_target() {
+    let y: Vec<f64> = vec![7.0, 0.0, 2.0, 7.0, 0.0];
+    let labels = prepare_labels::<f64>(&y, 5).expect("prepare labels");
+    assert_eq!(labels.classes(), &[0, 2, 7]);
+    assert_eq!(labels.n_classes(), 3);
 }

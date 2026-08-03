@@ -5,11 +5,19 @@
 //! the latter `i32`) — it has NO `predict`. `KNeighborsClassifier` adds
 //! [`PredictLabels`] (i32 votes) + [`PredictProba`]; `KNeighborsRegressor` adds
 //! [`Predict`] (continuous mean). All neighbor indices are `i32` at egress (D-06).
+//!
+//! All three DEFER their training-matrix upload from `fit` to the first query
+//! (KNN-REG-FIT). Brute-force k-NN builds nothing at `fit`, so an eager upload
+//! is a copy sklearn never makes — see [`PyKNeighborsRegressor`] for the
+//! rationale and the measurement. Consequently none of them uses the borrowing
+//! [`mlrs_algos::typestate::Fit`]: each core estimator's `fit_owned` takes the
+//! device buffer by value, which also removes the `device_copy` that the
+//! borrowing form is obliged to make.
 
 use arrow::array::ArrayRef;
 use pyo3::prelude::*;
 
-use mlrs_algos::neighbors::classifier::KNeighborsClassifier;
+use mlrs_algos::neighbors::classifier::{prepare_labels, KNeighborsClassifier, PreparedLabels};
 use mlrs_algos::neighbors::nearest::NearestNeighbors;
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
 use mlrs_algos::neighbors::{Metric, Weights};
@@ -19,7 +27,7 @@ use mlrs_algos::neighbors::{Metric, Weights};
 // (the typestate module-doc warns against globbing the fit/predict/kneighbors
 // method-name collisions; aliasing + UFCS resolves it).
 use mlrs_algos::typestate::{
-    Fit as TypestateFit, KNeighbors as TypestateKNeighbors, Predict as TypestatePredict,
+    KNeighbors as TypestateKNeighbors, Predict as TypestatePredict,
     PredictLabels as TypestatePredictLabels, PredictProba as TypestatePredictProba,
 };
 
@@ -41,22 +49,95 @@ crate::any_estimator_typestate! {
     unfit: { n_neighbors: usize },
 }
 
+/// A validated training matrix that has NOT been uploaded to the device yet.
+///
+/// The unsupervised twin of [`PendingFit`] — see that type and
+/// [`PyKNeighborsRegressor`] for the rationale, which applies verbatim: a
+/// brute-force neighbour index has nothing to build at `fit`, so the upload
+/// belongs to the first query.
+struct NnPendingFit {
+    x: ArrayRef,
+    rows: usize,
+    cols: usize,
+    dt: FloatDtype,
+}
+
 /// sklearn-compatible `NearestNeighbors` (unsupervised neighbor index).
 #[pyclass(name = "NearestNeighbors")]
 pub struct PyNearestNeighbors {
     inner: AnyNearestNeighbors,
+    /// WR-02: the hyperparameter lives on the WRAPPER, not in the `Unfit` enum
+    /// payload. After a `fit` the enum is in a fitted (or pending) arm and that
+    /// payload is gone, so a second `fit` on the same object — which is what
+    /// every `clone`-and-refit path does — would silently fall back to the
+    /// default.
+    n_neighbors: usize,
+    /// `Some` between `fit` and the first query — see [`NnPendingFit`].
+    pending: Option<NnPendingFit>,
 }
 
 impl PyNearestNeighbors {
     /// Rust-callable default constructor for the smoke test. See
     /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
     pub fn unfit_default() -> Self {
-        Self { inner: AnyNearestNeighbors::Unfit { n_neighbors: 5 } }
+        Self {
+            inner: AnyNearestNeighbors::Unfit { n_neighbors: 5 },
+            n_neighbors: 5,
+            pending: None,
+        }
     }
 
     /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
     pub fn is_unfit(&self) -> bool {
-        matches!(self.inner, AnyNearestNeighbors::Unfit { .. })
+        self.pending.is_none() && matches!(self.inner, AnyNearestNeighbors::Unfit { .. })
+    }
+
+    /// Upload a deferred `fit`'s training matrix and build the fitted core
+    /// estimator. Idempotent, so every query method can call it unconditionally.
+    fn materialize(&mut self, py: Python<'_>) -> PyResult<()> {
+        let Some(p) = self.pending.take() else {
+            return Ok(());
+        };
+        let n_neighbors = self.n_neighbors;
+        let built = py.detach(|| -> PyResult<AnyNearestNeighbors> {
+            let mut pool = crate::lock_pool();
+            match p.dt {
+                FloatDtype::F32 => {
+                    let est = NearestNeighbors::<f32>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let xd = DeviceArray::from_host(&mut pool, host_slice_f32(as_f32(&p.x)?)?);
+                    Ok(AnyNearestNeighbors::F32(
+                        est.fit_owned(&mut pool, xd, (p.rows, p.cols))
+                            .map_err(algo_err_to_py)?,
+                    ))
+                }
+                FloatDtype::F64 => {
+                    let est = NearestNeighbors::<f64>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let xd = DeviceArray::from_host(&mut pool, host_slice_f64(as_f64(&p.x)?)?);
+                    Ok(AnyNearestNeighbors::F64(
+                        est.fit_owned(&mut pool, xd, (p.rows, p.cols))
+                            .map_err(algo_err_to_py)?,
+                    ))
+                }
+            }
+        });
+        // Restore the pending data on failure, or the estimator would report
+        // `NotFittedError` for what was really an upload/geometry error.
+        match built {
+            Ok(f) => {
+                self.inner = f;
+                Ok(())
+            }
+            Err(e) => {
+                self.pending = Some(p);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -68,51 +149,60 @@ impl PyNearestNeighbors {
     fn new(n_neighbors: usize) -> Self {
         Self {
             inner: AnyNearestNeighbors::Unfit { n_neighbors },
+            n_neighbors,
+            pending: None,
         }
     }
 
-    /// Fit (store training matrix). Unsupervised — no `y`. GIL released (PY-03);
-    /// f64 guarded on an f64-incapable backend (D-04).
+    /// Fit (validate + store the training matrix). Unsupervised — no `y`. GIL
+    /// released (PY-03); f64 guarded on an f64-incapable backend (D-04).
+    ///
+    /// Validation only — the device upload is deferred to the first
+    /// `kneighbors` (KNN-REG-FIT; see [`PyKNeighborsRegressor`] for the
+    /// measurement). The NaN/inf rejection moved here from numpy's
+    /// `check_array` along with it, so the shim passes `ensure_all_finite=False`
+    /// and [`nonfinite_input_err`] reproduces `check_array`'s exact message.
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let n_neighbors = match &self.inner {
-            AnyNearestNeighbors::Unfit { n_neighbors } => *n_neighbors,
-            _ => 5,
-        };
-        let fitted = py.detach(|| -> PyResult<AnyNearestNeighbors> {
-            let mut pool = crate::lock_pool();
+        if matches!(dt, FloatDtype::F64) {
+            crate::capability::guard_f64()?;
+        }
+        let n_neighbors = self.n_neighbors;
+        py.detach(|| -> PyResult<()> {
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let est = NearestNeighbors::<f32>::builder()
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    if !all_finite_f32(xh) {
+                        return Err(nonfinite_input_err(xh, "float32"));
+                    }
+                    NearestNeighbors::<f32>::builder()
                         .n_neighbors(n_neighbors)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyNearestNeighbors::F32(fitted))
                 }
                 FloatDtype::F64 => {
-                    crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let est = NearestNeighbors::<f64>::builder()
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    if !all_finite_f64(xh) {
+                        return Err(nonfinite_input_err(xh, "float64"));
+                    }
+                    NearestNeighbors::<f64>::builder()
                         .n_neighbors(n_neighbors)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyNearestNeighbors::F64(fitted))
                 }
             }
+            Ok(())
         })?;
-        self.inner = fitted;
+        self.inner = AnyNearestNeighbors::Unfit { n_neighbors };
+        self.pending = Some(NnPendingFit { x: xa, rows, cols, dt });
         Ok(())
     }
 
     /// `kneighbors(x, k)` → `(distances, indices)` each `rows × k` row-major; the
     /// distances are `f32`, the indices `i32` (D-06).
-    fn kneighbors_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize, k: usize) -> PyResult<(Vec<f32>, Vec<i32>)> {
+    fn kneighbors_f32(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize, k: usize) -> PyResult<(Vec<f32>, Vec<i32>)> {
+        self.materialize(py)?;
         let xa = capsule_to_array(x)?;
         py.detach(|| {
             let mut pool = crate::lock_pool();
@@ -127,7 +217,8 @@ impl PyNearestNeighbors {
             }
         })
     }
-    fn kneighbors_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize, k: usize) -> PyResult<(Vec<f64>, Vec<i32>)> {
+    fn kneighbors_f64(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize, k: usize) -> PyResult<(Vec<f64>, Vec<i32>)> {
+        self.materialize(py)?;
         let xa = capsule_to_array(x)?;
         py.detach(|| {
             let mut pool = crate::lock_pool();
@@ -142,10 +233,21 @@ impl PyNearestNeighbors {
             }
         })
     }
+    /// A DEFERRED fit counts as fitted: the training data is validated and held,
+    /// only its upload is outstanding.
     fn is_fitted(&self) -> bool {
-        !matches!(self.inner, AnyNearestNeighbors::Unfit { .. })
+        self.pending.is_some() || !matches!(self.inner, AnyNearestNeighbors::Unfit { .. })
     }
+    /// The fitted float dtype — known from the pending array before the upload,
+    /// because the shim reads it (via `_suffix`) to pick which `kneighbors_*` to
+    /// call and so must not itself force materialization.
     fn dtype(&self) -> Option<&'static str> {
+        if let Some(p) = &self.pending {
+            return Some(match p.dt {
+                FloatDtype::F32 => "f32",
+                FloatDtype::F64 => "f64",
+            });
+        }
         match &self.inner {
             AnyNearestNeighbors::Unfit { .. } => None,
             AnyNearestNeighbors::F32(_) => Some("f32"),
@@ -164,22 +266,98 @@ crate::any_estimator_typestate! {
     unfit: { n_neighbors: usize },
 }
 
+/// A validated training set whose MATRIX has not been uploaded yet.
+///
+/// The labels are NOT deferred with it. They are prepared eagerly, for two
+/// reasons: the work is `O(n_train)` over a label vector rather than over the
+/// `n_train x n_features` matrix, so it is not what makes `fit` expensive; and
+/// sklearn's `classes_` must be readable the instant `fit` returns, so deferring
+/// it would force materialization on the very next line the shim executes.
+struct ClfPendingFit {
+    x: ArrayRef,
+    labels: PreparedLabels,
+    rows: usize,
+    cols: usize,
+    dt: FloatDtype,
+}
+
 /// sklearn-compatible `KNeighborsClassifier` (majority neighbor vote).
 #[pyclass(name = "KNeighborsClassifier")]
 pub struct PyKNeighborsClassifier {
     inner: AnyKNeighborsClassifier,
+    /// WR-02: see [`PyNearestNeighbors::n_neighbors`].
+    n_neighbors: usize,
+    /// `Some` between `fit` and the first query — see [`ClfPendingFit`].
+    pending: Option<ClfPendingFit>,
 }
 
 impl PyKNeighborsClassifier {
     /// Rust-callable default constructor for the smoke test. See
     /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
     pub fn unfit_default() -> Self {
-        Self { inner: AnyKNeighborsClassifier::Unfit { n_neighbors: 5 } }
+        Self {
+            inner: AnyKNeighborsClassifier::Unfit { n_neighbors: 5 },
+            n_neighbors: 5,
+            pending: None,
+        }
     }
 
     /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
     pub fn is_unfit(&self) -> bool {
-        matches!(self.inner, AnyKNeighborsClassifier::Unfit { .. })
+        self.pending.is_none() && matches!(self.inner, AnyKNeighborsClassifier::Unfit { .. })
+    }
+
+    /// Upload a deferred `fit`'s training matrix and build the fitted core
+    /// estimator. Idempotent, so every query method can call it unconditionally.
+    fn materialize(&mut self, py: Python<'_>) -> PyResult<()> {
+        let Some(p) = self.pending.take() else {
+            return Ok(());
+        };
+        let n_neighbors = self.n_neighbors;
+        let shape = (p.rows, p.cols);
+        // `fit_owned` CONSUMES the labels, but a failure has to leave the
+        // estimator exactly as it found it (see the restore below), so it gets a
+        // clone. That is two `Vec<i32>` of length `n_train`; next to the matrix
+        // upload happening in the same call it is free, and it buys a failure
+        // path that needs no ownership plumbing at all.
+        let labels = p.labels.clone();
+        let built = py.detach(|| -> PyResult<AnyKNeighborsClassifier> {
+            let mut pool = crate::lock_pool();
+            match p.dt {
+                FloatDtype::F32 => {
+                    let est = KNeighborsClassifier::<f32>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f32>()
+                        .map_err(build_err_to_py)?;
+                    let xd = DeviceArray::from_host(&mut pool, host_slice_f32(as_f32(&p.x)?)?);
+                    Ok(AnyKNeighborsClassifier::F32(
+                        est.fit_owned(&mut pool, xd, labels, shape)
+                            .map_err(algo_err_to_py)?,
+                    ))
+                }
+                FloatDtype::F64 => {
+                    let est = KNeighborsClassifier::<f64>::builder()
+                        .n_neighbors(n_neighbors)
+                        .build::<f64>()
+                        .map_err(build_err_to_py)?;
+                    let xd = DeviceArray::from_host(&mut pool, host_slice_f64(as_f64(&p.x)?)?);
+                    Ok(AnyKNeighborsClassifier::F64(
+                        est.fit_owned(&mut pool, xd, labels, shape)
+                            .map_err(algo_err_to_py)?,
+                    ))
+                }
+            }
+        });
+        match built {
+            Ok(f) => {
+                self.inner = f;
+                Ok(())
+            }
+            Err(e) => {
+                self.pending = Some(p);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -191,9 +369,18 @@ impl PyKNeighborsClassifier {
     fn new(n_neighbors: usize) -> Self {
         Self {
             inner: AnyKNeighborsClassifier::Unfit { n_neighbors },
+            n_neighbors,
+            pending: None,
         }
     }
 
+    /// Fit (validate + prepare labels + store the training matrix).
+    ///
+    /// Validation and label preparation only — the matrix upload is deferred to
+    /// the first query (KNN-REG-FIT; see [`PyKNeighborsRegressor`] for the
+    /// measurement). `y` is never uploaded AT ALL: the vote gather works on host
+    /// `i32` class indices, so the old path's `y` upload existed only to be read
+    /// straight back by the core's `y.to_host`.
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -205,44 +392,48 @@ impl PyKNeighborsClassifier {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
         let dt = float_dtype(&xa)?;
-        let n_neighbors = match &self.inner {
-            AnyKNeighborsClassifier::Unfit { n_neighbors } => *n_neighbors,
-            _ => 5,
-        };
-        let fitted = py.detach(|| -> PyResult<AnyKNeighborsClassifier> {
-            let mut pool = crate::lock_pool();
+        if matches!(dt, FloatDtype::F64) {
+            crate::capability::guard_f64()?;
+        }
+        let n_neighbors = self.n_neighbors;
+        let labels = py.detach(|| -> PyResult<PreparedLabels> {
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
-                    let est = KNeighborsClassifier::<f32>::builder()
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    if !all_finite_f32(xh) {
+                        return Err(nonfinite_input_err(xh, "float32"));
+                    }
+                    KNeighborsClassifier::<f32>::builder()
                         .n_neighbors(n_neighbors)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyKNeighborsClassifier::F32(fitted))
+                    // `prepare_labels` rejects a non-finite label itself (with
+                    // the InvalidLabels wording), so no `all_finite` pass on `y`.
+                    prepare_labels::<f32>(host_slice_f32(as_f32(&ya)?)?, rows)
+                        .map_err(algo_err_to_py)
                 }
                 FloatDtype::F64 => {
-                    crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
-                    let est = KNeighborsClassifier::<f64>::builder()
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    if !all_finite_f64(xh) {
+                        return Err(nonfinite_input_err(xh, "float64"));
+                    }
+                    KNeighborsClassifier::<f64>::builder()
                         .n_neighbors(n_neighbors)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
-                    Ok(AnyKNeighborsClassifier::F64(fitted))
+                    prepare_labels::<f64>(host_slice_f64(as_f64(&ya)?)?, rows)
+                        .map_err(algo_err_to_py)
                 }
             }
         })?;
-        self.inner = fitted;
+        self.inner = AnyKNeighborsClassifier::Unfit { n_neighbors };
+        self.pending = Some(ClfPendingFit { x: xa, labels, rows, cols, dt });
         Ok(())
     }
 
     /// `predict(x)` → length-`rows` host `Vec<i32>` class labels (D-06).
-    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
+    fn predict_labels(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
+        self.materialize(py)?;
         let xa = capsule_to_array(x)?;
         py.detach(|| {
             let mut pool = crate::lock_pool();
@@ -261,7 +452,8 @@ impl PyKNeighborsClassifier {
     }
 
     /// `predict_proba(x)` → `rows × n_classes` host floats (neighbor-vote fractions).
-    fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_proba_f32(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+        self.materialize(py)?;
         let xa = capsule_to_array(x)?;
         py.detach(|| {
             let mut pool = crate::lock_pool();
@@ -274,7 +466,8 @@ impl PyKNeighborsClassifier {
             }
         })
     }
-    fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_proba_f64(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+        self.materialize(py)?;
         let xa = capsule_to_array(x)?;
         py.detach(|| {
             let mut pool = crate::lock_pool();
@@ -289,7 +482,14 @@ impl PyKNeighborsClassifier {
     }
 
     /// Number of classes inferred at fit (errors before fit).
+    ///
+    /// Answered from the PENDING labels when the upload has not happened yet —
+    /// they were prepared eagerly precisely so this and `classes_` need no
+    /// device work (see [`ClfPendingFit`]).
     fn n_classes(&self) -> PyResult<usize> {
+        if let Some(p) = &self.pending {
+            return Ok(p.labels.n_classes());
+        }
         match &self.inner {
             AnyKNeighborsClassifier::F32(e) => Ok(e.n_classes()),
             AnyKNeighborsClassifier::F64(e) => Ok(e.n_classes()),
@@ -299,7 +499,14 @@ impl PyKNeighborsClassifier {
     /// The DISTINCT sorted training labels (`classes_`). The shim MUST use these
     /// rather than a fabricated `0..n_classes` range so a non-contiguous target
     /// (e.g. `{0, 2}`) round-trips through `predict` (WR-01).
+    ///
+    /// The shim reads this on the line after `fit` returns, so it must be
+    /// answerable from the pending labels — otherwise it would force the upload
+    /// immediately and the deferral would buy nothing.
     fn classes_(&self) -> PyResult<Vec<i64>> {
+        if let Some(p) = &self.pending {
+            return Ok(p.labels.classes().iter().map(|&c| c as i64).collect());
+        }
         match &self.inner {
             AnyKNeighborsClassifier::F32(e) => {
                 Ok(e.classes().iter().map(|&c| c as i64).collect())
@@ -310,10 +517,21 @@ impl PyKNeighborsClassifier {
             _ => Err(not_fitted("kneighbors_classifier", "classes_")),
         }
     }
+    /// A DEFERRED fit counts as fitted: the training data is validated and held,
+    /// only its upload is outstanding.
     fn is_fitted(&self) -> bool {
-        !matches!(self.inner, AnyKNeighborsClassifier::Unfit { .. })
+        self.pending.is_some() || !matches!(self.inner, AnyKNeighborsClassifier::Unfit { .. })
     }
+    /// The fitted float dtype — known from the pending array before the upload,
+    /// because the shim reads it (via `_suffix`) to pick which `predict_proba_*`
+    /// to call and so must not itself force materialization.
     fn dtype(&self) -> Option<&'static str> {
+        if let Some(p) = &self.pending {
+            return Some(match p.dt {
+                FloatDtype::F32 => "f32",
+                FloatDtype::F64 => "f64",
+            });
+        }
         match &self.inner {
             AnyKNeighborsClassifier::Unfit { .. } => None,
             AnyKNeighborsClassifier::F32(_) => Some("f32"),

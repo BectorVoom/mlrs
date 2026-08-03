@@ -45,7 +45,9 @@ class NearestNeighbors(MlrsBase):
 
     def fit(self, X, y=None):
         _check_algorithm(self.algorithm)
-        xa, rows, cols = self._normalize(X)
+        # `ensure_all_finite=False` RELOCATES the NaN/inf rejection into the
+        # Rust `fit`, it does not drop it — see `KNeighborsRegressor.fit`.
+        xa, rows, cols = self._normalize(X, ensure_all_finite=False)
         obj = self._ext().NearestNeighbors(self.n_neighbors)
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
@@ -80,8 +82,14 @@ class KNeighborsClassifier(ClassifierMixin, MlrsBase):
 
     def fit(self, X, y):
         _check_algorithm(self.algorithm)
-        xa, rows, cols = self._normalize(X)
-        ya = self._normalize_y(y, dtype=self._x_float(xa))
+        # `ensure_all_finite=False` RELOCATES the NaN/inf rejection into the
+        # Rust `fit`, it does not drop it — see `KNeighborsRegressor.fit`. For
+        # `y` the Rust label preparation rejects a non-finite label as part of
+        # the integer-validity check it was already making.
+        xa, rows, cols = self._normalize(X, ensure_all_finite=False)
+        ya = self._normalize_y(
+            y, dtype=self._x_float(xa), ensure_all_finite=False
+        )
         obj = self._ext().KNeighborsClassifier(self.n_neighbors)
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj

@@ -233,3 +233,93 @@ fn nearest_neighbors_rejects_bad_k() {
         Ok(_) => panic!("k>n_train must be rejected before launch, got Ok"),
     }
 }
+
+/// KNN-REG-FIT: `fit_owned` and the borrowing `Fit::fit` produce the SAME
+/// neighbours.
+///
+/// They differ only in how the training matrix got onto the device — one
+/// copies, the other adopts — so a divergence would mean the ownership path
+/// stored something different (a wrong shape, or an aliased buffer). The
+/// borrowing arm deliberately RELEASES its input afterwards: that is the
+/// sequence which would corrupt a handle-aliasing implementation, because the
+/// next `acquire` of that size hands the freed buffer straight back.
+#[test]
+fn fit_owned_matches_borrowing_fit() {
+    let case = load_npz(fixture("knn_f64_seed42.npz")).expect("load knn_f64");
+    let x: Vec<f64> = fixture_vec::<f64>(&case, "X");
+    let xq: Vec<f64> = fixture_vec::<f64>(&case, "Xq");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let xq_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &xq);
+    let build = || {
+        NearestNeighbors::<f64>::builder()
+            .n_neighbors(KNN_K)
+            .build::<f64>()
+            .expect("build")
+    };
+
+    let borrowed = {
+        let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+        let est = build()
+            .fit(&mut pool, &x_dev, None, (KNN_N_TRAIN, KNN_N_FEATURES))
+            .expect("borrowing fit");
+        x_dev.release_into(&mut pool);
+        est
+    };
+    let owned = {
+        let x_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+        build()
+            .fit_owned(&mut pool, x_dev, (KNN_N_TRAIN, KNN_N_FEATURES))
+            .expect("owning fit")
+    };
+    assert_eq!(borrowed.train_shape(), owned.train_shape());
+
+    let mut results = Vec::new();
+    for est in [&borrowed, &owned] {
+        let (d, i) = est
+            .kneighbors(&mut pool, &xq_dev, (KNN_N_QUERY, KNN_N_FEATURES), KNN_K)
+            .expect("kneighbors");
+        let dh: Vec<f64> = d.to_host(&pool).iter().map(|&v| host_to_f64(v)).collect();
+        let ih: Vec<i32> = i.to_host(&pool);
+        d.release_into(&mut pool);
+        i.release_into(&mut pool);
+        results.push((dh, ih));
+    }
+    assert_eq!(results[0].1, results[1].1, "neighbour indices must agree");
+    for (a, b) in results[0].0.iter().zip(&results[1].0) {
+        assert!((a - b).abs() <= DIST_TOL, "distances must agree: {a} vs {b}");
+    }
+}
+
+/// A rejected `fit_owned` must RELEASE the matrix it was handed — the caller
+/// has already given it up, so nothing else can, and leaking it would raise the
+/// pool's `live_bytes` permanently (the FOUND-05 conservation property).
+///
+/// The operand is built with `pool.acquire` + `from_raw` rather than
+/// `from_host`, because `from_host` releases its metering handle immediately
+/// and so contributes nothing to `live_bytes` — a leak could not be observed
+/// through one.
+#[test]
+fn fit_owned_releases_the_matrix_on_rejection() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let before = pool.stats().live_bytes;
+
+    let len = KNN_N_TRAIN * KNN_N_FEATURES;
+    let x_dev: DeviceArray<ActiveRuntime, f64> =
+        DeviceArray::from_raw(pool.acquire(len * size_of::<f64>()), len);
+    assert!(pool.stats().live_bytes > before);
+
+    // A shape that does not match the buffer length is rejected.
+    let err = NearestNeighbors::<f64>::builder()
+        .build::<f64>()
+        .expect("build")
+        .fit_owned(&mut pool, x_dev, (KNN_N_TRAIN + 1, KNN_N_FEATURES));
+    assert!(err.is_err(), "a mismatched shape must be rejected");
+    assert_eq!(
+        pool.stats().live_bytes,
+        before,
+        "fit_owned must return the matrix to the pool when it rejects it"
+    );
+}

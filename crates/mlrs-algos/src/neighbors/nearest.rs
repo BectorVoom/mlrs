@@ -128,6 +128,37 @@ where
     pub fn n_neighbors(&self) -> usize {
         self.n_neighbors
     }
+
+    /// Fit by TAKING OWNERSHIP of an already-device-resident training matrix —
+    /// the zero-copy sibling of [`Fit::fit`] (KNN-REG-FIT).
+    ///
+    /// Same validation, same fitted state; `x` arrives BY VALUE, so the
+    /// estimator adopts the caller's buffer instead of duplicating it. See
+    /// [`KNeighborsRegressor::fit_owned`](crate::neighbors::regressor::KNeighborsRegressor::fit_owned)
+    /// for why the borrowing form has to copy and why a caller that uploaded
+    /// the operand purely to hand it over does not.
+    ///
+    /// On validation failure `x` is released back into `pool` — the caller has
+    /// already given it up, so nothing else can, and leaking it would raise the
+    /// pool's `live_bytes` permanently (the FOUND-05 conservation property the
+    /// D-10 memory gate asserts on).
+    pub fn fit_owned(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<NearestNeighbors<F, Fitted>, AlgoError> {
+        if let Err(e) = validate_geometry(&x, shape) {
+            x.release_into(pool);
+            return Err(e);
+        }
+        Ok(NearestNeighbors {
+            n_neighbors: self.n_neighbors,
+            x_train_: Some(x),
+            train_shape_: Some(shape),
+            _state: PhantomData,
+        })
+    }
 }
 
 impl<F> Default for NearestNeighbors<F, Unfit>
@@ -226,7 +257,6 @@ where
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<NearestNeighbors<F, Fitted>, AlgoError> {
-        let (n_train, n_features) = shape;
         validate_geometry(x, shape)?;
 
         // Take device-resident ownership of the training matrix (D-03) with a
@@ -249,12 +279,10 @@ where
         // owned, so releasing the fit input is safe again.
         let x_dev: DeviceArray<ActiveRuntime, F> = device_copy::<F>(pool, x);
 
-        Ok(NearestNeighbors {
-            n_neighbors: self.n_neighbors,
-            x_train_: Some(x_dev),
-            train_shape_: Some((n_train, n_features)),
-            _state: PhantomData,
-        })
+        // The owning path owns the single definition of how fitted state is
+        // assembled, so the two entry points can differ only in how the buffer
+        // got there.
+        self.fit_owned(pool, x_dev, shape)
     }
 }
 
