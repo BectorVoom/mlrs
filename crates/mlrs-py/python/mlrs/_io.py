@@ -122,7 +122,7 @@ def normalize_X(X, *, dtype=None, ensure_all_finite=True):
     return pa.array(flat, type=_arrow_float_type(dtype)), rows, cols
 
 
-def normalize_y(y, *, dtype):
+def normalize_y(y, *, dtype, ensure_all_finite=True):
     """Normalize a 1-D target ``y`` to a fresh-contiguous pyarrow float array.
 
     Used by the supervised wrappers (LinearRegression/Ridge/.../KNNReg/Clf). The
@@ -135,13 +135,20 @@ def normalize_y(y, *, dtype):
     un-checked ``y`` would upload poisoned targets to the device silently. We
     run sklearn ``check_array(ensure_all_finite=True, ensure_2d=False)`` so a
     NaN/Inf ``y`` raises the same sklearn-standard ``ValueError`` as ``X`` does.
+
+    ``ensure_all_finite=False`` MOVES that rejection into the Rust call rather
+    than dropping it — the mirror of :func:`normalize_X`'s flag, for a caller
+    whose Rust path already reads every element of ``y`` and reports the same
+    verdict from the pass it was already making
+    (``errors.rs::nonfinite_input_err`` reproduces ``check_array``'s exact
+    message). Only pass ``False`` from such a caller.
     """
     checked = check_array(
         y,
         ensure_2d=False,
         dtype=dtype,
         copy=False,
-        **{_FINITE_KW: True},
+        **{_FINITE_KW: ensure_all_finite},
     )
     arr = np.ascontiguousarray(checked, dtype=dtype).ravel(order="C")
     return pa.array(arr, type=_arrow_float_type(dtype))
