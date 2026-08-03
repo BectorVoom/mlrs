@@ -598,7 +598,7 @@ fn bayesian_ridge_predict_and_std_f64() {
     );
 
     let std = fitted
-        .predict_std_from_host(&xt, (N_TEST, TALL.1))
+        .predict_std_from_host(&mut pool, &xt, (N_TEST, TALL.1))
         .expect("predict_std_from_host");
     assert_close(
         &std,
@@ -752,4 +752,262 @@ fn bayesian_ridge_rejects_bad_geometry() {
     assert!(BayesianRidge::<f64>::new()
         .fit_from_host_slice(&mut pool, &x, &y, (4, 3), Some(&bad_sw))
         .is_err());
+}
+
+// ==================== BAYES-GPU — the device arms ====================
+
+/// The device Gram arm must actually be REACHABLE on this backend, or every
+/// agreement test below silently compares the host arm against itself.
+///
+/// This is the vacuity guard the `mlrs-ridge-positive-cuda` campaign learned to
+/// write: forcing an A/B knob past a gate that has already refused the
+/// configuration produces a green test that exercises one arm twice. So this
+/// asserts the gate's verdict directly, against what the backend can do:
+///
+/// - **cpu** → `false`, unconditionally. The arm is a GPU-shaped reduction and
+///   the host sweep is the right code there.
+/// - **any backend WITH f64** → `true` at the fixture's feature counts, which
+///   are far below the fused-Gram cap.
+/// - **a backend WITHOUT f64** → `false`. `BayesianRidge`'s Gram must be
+///   accumulated in `f64`, so this is a correctness refusal, not a perf one, and
+///   the estimator falls back to the host sweep rather than losing precision.
+#[test]
+fn bayesian_ridge_device_gram_arm_is_reachable() {
+    use mlrs_backend::prims::normal_eq::device_gram_applicable;
+
+    let backend = capability::active_backend_name();
+    let advertised = capability::feature_enabled(capability::FloatKind::F64);
+    let runnable = capability::f64_device_kernels_available();
+    let got = device_gram_applicable::<f64>(TALL.1);
+    let want = backend != "cpu" && runnable;
+    assert_eq!(
+        got, want,
+        "device_gram_applicable(d={}) on backend={backend} \
+         (f64 advertised={advertised}, runnable={runnable}) must be {want}, got \
+         {got} — if this fails the device/host agreement tests are vacuous",
+        TALL.1
+    );
+    // Printed rather than asserted: the two flags DISAGREEING is the expected
+    // state on cuda (`capability::f64_device_kernels_available` documents why),
+    // and the log line is how a reader of CI output sees which one drove the
+    // verdict on the machine that ran.
+    println!(
+        "bayes device gram arm backend={backend} f64_advertised={advertised} \
+         f64_runnable={runnable} applicable={got}"
+    );
+}
+
+/// The device Gram arm and the host sweep must agree on EVERY fitted attribute,
+/// for EVERY case in [`CASES`] — the full sklearn parameter surface.
+///
+/// The two arms are switched with `MLRS_BAYES_GRAM_DEVICE` through the SAME
+/// entry point ([`BayesianRidge::fit_with_sample_weight`]), so nothing but the
+/// normal-equations formation differs: the eigendecomposition, the evidence
+/// loop, `sigma_` and the intercept are literally the same code on both sides.
+/// Any disagreement is therefore in the reduction, which is exactly what this
+/// gates.
+///
+/// Six attributes are compared, not just `coef_`, for the reason the module docs
+/// give: a Gram that is wrong in a way the shrinkage partly absorbs still
+/// reproduces `coef_` to a few digits while missing `alpha_`, `sigma_` and the
+/// iteration count.
+///
+/// `n_iter_` is compared for EQUALITY rather than for closeness. It is the
+/// integer output of a `Σ|Δcoef| < tol` test, so an arm that drifts enough to
+/// stop one iteration early is solving a different problem — and would still
+/// pass a tolerance-based comparison of everything else.
+fn device_gram_agrees<F>(case: &OracleCase, tol: &Tolerance, label: &str)
+where
+    F: Float + CubeElement + Pod,
+{
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    for spec in CASES {
+        let (x, y, sw_all, shape) = case_data::<F>(case, spec);
+        let sw = spec.sample_weight.then_some(sw_all.as_slice());
+        let xd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x);
+        let yd: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y);
+
+        let mut fits = Vec::new();
+        for arm in ["1", "0"] {
+            let _guard = mlrs_backend::abflag::force("MLRS_BAYES_GRAM_DEVICE", arm);
+            fits.push(
+                build_case::<F>(spec)
+                    .fit_with_sample_weight(&mut pool, &xd, Some(&yd), shape, sw)
+                    .unwrap_or_else(|e| {
+                        panic!("case '{}' must fit (gram_device={arm}): {e}", spec.name)
+                    }),
+            );
+        }
+        let (dev, host) = (&fits[0], &fits[1]);
+        let n = spec.name;
+        let stol = scalar_tol(tol);
+
+        assert_eq!(
+            dev.n_iter(),
+            host.n_iter(),
+            "{label} [{n}] n_iter_: device={} host={}",
+            dev.n_iter(),
+            host.n_iter()
+        );
+        let dcoef: Vec<f64> = dev.coef(&pool).iter().map(|&v| host_to_f64(v)).collect();
+        let hcoef: Vec<f64> = host.coef(&pool).iter().map(|&v| host_to_f64(v)).collect();
+        assert_close(&dcoef, &hcoef, tol, &format!("{label} [{n}] coef_"));
+        assert_close(
+            &[host_to_f64(dev.intercept(&pool))],
+            &[host_to_f64(host.intercept(&pool))],
+            tol,
+            &format!("{label} [{n}] intercept_"),
+        );
+        assert_close(
+            &[dev.alpha(), dev.lambda()],
+            &[host.alpha(), host.lambda()],
+            &stol,
+            &format!("{label} [{n}] precisions"),
+        );
+        assert_close(
+            dev.sigma(),
+            host.sigma(),
+            &stol,
+            &format!("{label} [{n}] sigma_"),
+        );
+        assert_close(
+            dev.x_offset(),
+            host.x_offset(),
+            &stol,
+            &format!("{label} [{n}] X_offset_"),
+        );
+        assert_close(
+            dev.scores(),
+            host.scores(),
+            &stol,
+            &format!("{label} [{n}] scores_"),
+        );
+    }
+}
+
+/// The device Gram arm vs the host sweep, `f64` — the arm's native width, where
+/// the Gram kernels already accumulate in `f64` and no widening happens.
+#[test]
+fn bayesian_ridge_device_gram_agrees_f64() {
+    let backend = capability::active_backend_name();
+    if !capability::f64_device_kernels_available() {
+        println!("bayes device gram f64 backend={backend}: SKIPPED (no f64 on this adapter)");
+        return;
+    }
+    let case = load_npz(fixture("bayesian_ridge_f64_seed42.npz")).expect("load bayes f64");
+    device_gram_agrees::<f64>(&case, &F64_TOL, "device-vs-host gram f64");
+}
+
+/// The device Gram arm vs the host sweep, `f32` — which is where the WIDENING
+/// kernel is under test.
+///
+/// This is the case the arm exists to get right. An `f32` design whose Gram were
+/// accumulated at `f32` would reproduce `coef_` and fail on `alpha_`; here both
+/// arms widen to `f64` first (the device one on-device via
+/// `elementwise::widen_elem`, the host one in its element read), so they must
+/// agree to the same tolerance the `f64` pair does. A regression that dropped
+/// the widening would surface as an `alpha_` mismatch on the interpolating wide
+/// fixture, which `CASES` includes.
+#[test]
+fn bayesian_ridge_device_gram_agrees_f32() {
+    let backend = capability::active_backend_name();
+    if !capability::f64_device_kernels_available() {
+        println!("bayes device gram f32 backend={backend}: SKIPPED (arm needs f64 on the adapter)");
+        return;
+    }
+    let case = load_npz(fixture("bayesian_ridge_f32_seed42.npz")).expect("load bayes f32");
+    device_gram_agrees::<f32>(&case, &F32_TOL, "device-vs-host gram f32");
+}
+
+/// `predict(X, return_std=True)`: the fused device kernel, the host sweep, and
+/// sklearn must all agree.
+///
+/// Three-way rather than two-way on purpose. The two mlrs arms share the
+/// covariance FACTOR (`posterior_sigma_sqrt_t`), so comparing them to each other
+/// alone would not catch a wrong factor — it would be wrong identically on both
+/// sides. The sklearn leg pins the factor itself; the arm-vs-arm leg pins the
+/// kernel against the host code.
+///
+/// The device leg is reached on the cpu backend too, by forcing
+/// `MLRS_BAYES_STD_HOST=0` — so this kernel is gated on every backend the suite
+/// runs, not only where a GPU happens to be the default.
+#[test]
+fn bayesian_ridge_predict_std_arms_agree_f64() {
+    let backend = capability::active_backend_name();
+    if !capability::f64_device_kernels_available() {
+        println!("bayes predict_std arms f64 backend={backend}: SKIPPED (no f64 on this adapter)");
+        return;
+    }
+    let case = load_npz(fixture("bayesian_ridge_f64_seed42.npz")).expect("load bayes f64");
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x: Vec<f64> = case.expect_f64("X").to_vec();
+    let y: Vec<f64> = case.expect_f64("y").to_vec();
+    let xt: Vec<f64> = case.expect_f64("X_test").to_vec();
+    let shape = (N_TEST, TALL.1);
+
+    let xd: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x);
+    let yd: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y);
+    let fitted = BayesianRidge::<f64>::new()
+        .fit(&mut pool, &xd, Some(&yd), TALL)
+        .expect("default fit");
+
+    let want = case.expect_f64("predstd_default");
+
+    for (arm, label) in [("1", "host sweep"), ("0", "device kernel")] {
+        let _guard = mlrs_backend::abflag::force("MLRS_BAYES_STD_HOST", arm);
+        let got = fitted
+            .predict_std_from_host(&mut pool, &xt, shape)
+            .unwrap_or_else(|e| panic!("predict_std ({label}): {e}"));
+        assert_close(&got, want, &F64_TOL, &format!("predict_std {label}"));
+    }
+
+    // The device-RESIDENT entry point (`predict_std`), whose result never
+    // reaches the host until the caller asks — the `return_std` twin of
+    // `Predict::predict`, and the one a device-side consumer would use.
+    let xtd: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &xt);
+    let dev = fitted
+        .predict_std(&mut pool, &xtd, shape)
+        .expect("predict_std (device ingress)");
+    assert_close(
+        &dev.to_host(&pool),
+        want,
+        &F64_TOL,
+        "predict_std device ingress",
+    );
+}
+
+/// `predict_std`'s two arms agree at `f32` too, against the `f32` fixture.
+///
+/// The kernel accumulates in `F`, so this is the leg that pins the claim that an
+/// `f32` sum of `d²` non-negative terms stays inside the oracle contract — the
+/// quantity has no cancellation, unlike the `Σ`-matvec form it replaced.
+#[test]
+fn bayesian_ridge_predict_std_arms_agree_f32() {
+    let case = load_npz(fixture("bayesian_ridge_f32_seed42.npz")).expect("load bayes f32");
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x: Vec<f32> = case.expect_f64("X").iter().map(|&v| v as f32).collect();
+    let y: Vec<f32> = case.expect_f64("y").iter().map(|&v| v as f32).collect();
+    let xt: Vec<f32> = case.expect_f64("X_test").iter().map(|&v| v as f32).collect();
+    let shape = (N_TEST, TALL.1);
+
+    let xd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let yd: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+    let fitted = BayesianRidge::<f32>::new()
+        .fit(&mut pool, &xd, Some(&yd), TALL)
+        .expect("default fit");
+
+    let want = case.expect_f64("predstd_default");
+    for (arm, label) in [("1", "host sweep"), ("0", "device kernel")] {
+        let _guard = mlrs_backend::abflag::force("MLRS_BAYES_STD_HOST", arm);
+        let got = fitted
+            .predict_std_from_host(&mut pool, &xt, shape)
+            .unwrap_or_else(|e| panic!("predict_std f32 ({label}): {e}"));
+        assert_close(&got, want, &scalar_tol(&F32_TOL), &format!("predict_std f32 {label}"));
+    }
 }

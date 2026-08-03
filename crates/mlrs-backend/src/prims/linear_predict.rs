@@ -741,3 +741,411 @@ fn validate_geometry(
     }
     Ok(())
 }
+
+// ==================== BAYES-GPU — predict(X, return_std=True) ====================
+
+/// `BayesianRidge::predict(X, return_std=True)`'s standard deviation, over a
+/// DEVICE-resident test matrix.
+///
+/// ```text
+/// x̃ᵢ     = xᵢ − offset
+/// std[i] = √( ‖Mᵀ·x̃ᵢ‖² + noise )
+/// ```
+///
+/// `mt` is `Mᵀ` row-major (`d × d`), the factor of the posterior covariance
+/// `Σ = M·Mᵀ`; `offset` is `X_offset_` (length `d`, zeros when the model was fit
+/// without an intercept); `noise` is `1/α`. See
+/// [`mlrs_kernels::linear_predict::bayes_predict_std`] for why the quadratic
+/// form is evaluated through the factor rather than through `Σ` directly.
+///
+/// One launch, one output buffer, no read-back — the result stays on the device
+/// (D-05), so a caller that goes on to reduce it never pays a round trip.
+pub fn bayes_predict_std<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    offset: &DeviceArray<ActiveRuntime, F>,
+    mt: &DeviceArray<ActiveRuntime, F>,
+    (n, d): (usize, usize),
+    noise: F,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry(x.len(), (n, d), offset.len(), 1)?;
+    if mt.len() != d * d {
+        return Err(PrimError::ShapeMismatch {
+            operand: "mt",
+            rows: d,
+            cols: d,
+            len: mt.len(),
+        });
+    }
+
+    let out_handle = pool.acquire(n * size_of::<F>());
+    let client = pool.client().clone();
+
+    // Slice the row axis so no single dispatch exceeds `STD_MACS_PER_LAUNCH`
+    // multiply-adds — the watchdog guard the kernel's `row0` parameter exists
+    // for. `chunk` is at least one row, so a `d` large enough to blow the budget
+    // on its own still makes progress (one row per launch) rather than looping
+    // forever on a zero-length slice.
+    // The kernel owns 4 rows per unit, so the launch is over ROW TILES.
+    let ntiles = n.div_ceil(STD_ROWS_PER_UNIT);
+    let chunk = (STD_MACS_PER_LAUNCH / d.saturating_mul(d).saturating_mul(STD_ROWS_PER_UNIT).max(1))
+        .max(1);
+    let mut row0 = 0usize;
+    while row0 < ntiles {
+        let rows = chunk.min(ntiles - row0);
+        // SAFETY: every length is a carried/validated element count; the kernel
+        // bounds-checks `tile0 + ABSOLUTE_POS < ntiles`, clamps its four row
+        // ids to `n - 1`, and reads only `x[i·d + k]`,
+        // `offset[k]` and `mt[j·d + k]` for `j, k < d`, all in range by the
+        // checks above.
+        let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+        let off_arg = unsafe { ArrayArg::from_raw_parts(offset.handle().clone(), offset.len()) };
+        let mt_arg = unsafe { ArrayArg::from_raw_parts(mt.handle().clone(), mt.len()) };
+        let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n) };
+        let (ccount, cdim) =
+            super::launch_dims_1d_folded(rows, crate::capability::gather_launch_width());
+        mlrs_kernels::linear_predict::bayes_predict_std::launch::<F, ActiveRuntime>(
+            &client,
+            ccount,
+            cdim,
+            x_arg,
+            off_arg,
+            mt_arg,
+            out_arg,
+            row0 as u32,
+            ntiles as u32,
+            n as u32,
+            d as u32,
+            noise,
+        );
+        row0 += rows;
+    }
+    Ok(DeviceArray::from_raw(out_handle, n))
+}
+
+/// Multiply-adds one [`bayes_predict_std`] dispatch may cover before the row
+/// axis is split (`2³⁰`, ~1.07 G).
+///
+/// A display-driving GPU cancels any submission that overruns its compositor
+/// timeout, and this is the crate's first kernel whose one-launch cost grows as
+/// `n·d²` — at `d = 256` over 100 000 rows that is 6.5 G multiply-adds in a
+/// single dispatch, which lost the device outright on this environment's wgpu
+/// adapter (see the kernel's docs for the failure). The budget is expressed in
+/// WORK rather than rows so the bound holds at every `d`.
+///
+/// The value is set from the SLOW end, because that is the end where the
+/// consequence is a crash rather than a few lost percent. This environment's
+/// wgpu adapter was measured at **0.72 G multiply-adds/s** on this kernel at
+/// `f64` (`d = 128`, 100 000 rows, 1.64 G MACs in 2.28 s) — consumer integrated
+/// GPUs run `f64` at a small fraction of `f32`, and an unoptimized `f64` path
+/// can be slower still. A first attempt at `2³⁰` was NOT enough there: one
+/// dispatch would have been ~1.5 s, and `d = 256` lost the device again.
+///
+/// `2²⁸` is ~0.37 s per dispatch at that measured rate — inside a typical 2 s
+/// compositor timeout with margin — and ~0.4 ms on the compute card this
+/// estimator targets, so the ~50 µs dispatch cost (measured on a T4) stays
+/// around a tenth of a launch. At the largest ladder rung it is 24 dispatches
+/// over a 6.5 G-MAC problem.
+const STD_MACS_PER_LAUNCH: usize = 1 << 28;
+
+/// Test rows one unit of
+/// [`bayes_predict_std`](mlrs_kernels::linear_predict::bayes_predict_std) owns
+/// — the row extent of its `4 × 4` register tile. The launch is sized in TILES,
+/// so this is the divisor between the two.
+const STD_ROWS_PER_UNIT: usize = 4;
+
+/// [`bayes_predict_std`] for a test matrix that is still on the HOST, routed the
+/// same way [`linear_predict_from_host`] routes the mean.
+///
+/// - **cpu backend** → [`bayes_predict_std_host`], reading the caller's buffer
+///   in place. No upload, no launch, and `f64` throughout.
+/// - **every device backend** → upload, one launch, read back `n` values.
+///
+/// The upload is `n · d` elements against `n · d²` multiply-adds, so the ratio
+/// of transfer to work is `1/d` — this is the predict path where the device arm
+/// has the most room, and the reason it exists: the host arm is `O(n·d²)` of
+/// `f64` FMA and nothing on the host makes that cheaper.
+///
+/// `offset` / `mt` are the host `f64` fitted state; they are narrowed to `F`
+/// for the device arm, which is exact for `F = f64` and rounds once for
+/// `F = f32` — the same narrowing `coef_` already takes at `fit`. The result is
+/// always widened back to `f64`, because sklearn's `return_std` output is
+/// `float64` regardless of the design's dtype.
+pub fn bayes_predict_std_from_host<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &[F],
+    offset: &[f64],
+    mt: &[f64],
+    noise: f64,
+    (n, d): (usize, usize),
+) -> Result<Vec<f64>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if n == 0 || d == 0 || n.checked_mul(d).map(|v| v != x.len()).unwrap_or(true) {
+        return Err(PrimError::ShapeMismatch {
+            operand: "x",
+            rows: n,
+            cols: d,
+            len: x.len(),
+        });
+    }
+    if offset.len() != d {
+        return Err(PrimError::DimMismatch {
+            dim: "n_features",
+            lhs: offset.len(),
+            rhs: d,
+        });
+    }
+    if mt.len() != d * d {
+        return Err(PrimError::ShapeMismatch {
+            operand: "mt",
+            rows: d,
+            cols: d,
+            len: mt.len(),
+        });
+    }
+
+    if use_host_std(d) {
+        return Ok(bayes_predict_std_host(x, offset, mt, noise, (n, d)));
+    }
+
+    let off_f: Vec<F> = offset.iter().map(|v| mlrs_core::f64_to_host::<F>(*v)).collect();
+    let mt_f: Vec<F> = mt.iter().map(|v| mlrs_core::f64_to_host::<F>(*v)).collect();
+    let x_dev = DeviceArray::from_host(pool, x);
+    let off_dev = DeviceArray::from_host(pool, &off_f);
+    let mt_dev = DeviceArray::from_host(pool, &mt_f);
+    let out = bayes_predict_std::<F>(
+        pool,
+        &x_dev,
+        &off_dev,
+        &mt_dev,
+        (n, d),
+        mlrs_core::f64_to_host::<F>(noise),
+    )?;
+    let host = out.to_host_metered(pool);
+    x_dev.release_into(pool);
+    off_dev.release_into(pool);
+    mt_dev.release_into(pool);
+    out.release_into(pool);
+    Ok(host.into_iter().map(mlrs_core::host_to_f64::<F>).collect())
+}
+
+/// Which arm [`bayes_predict_std_from_host`] takes: the host sweep, or upload +
+/// [`bayes_predict_std`].
+///
+/// Two backends take the host arm, for two DIFFERENT measured reasons.
+///
+/// **cpu**, for the reason this module's docs give for the mean: "device" memory
+/// IS host memory there, so the upload is a pure `memcpy` of the whole test
+/// matrix and the launch spawns one OS thread per unit against `-O0` JIT'd code.
+///
+/// **wgpu**, because the kernel is `f64` and consumer integrated GPUs are not.
+/// Measured on this environment's adapter (`n_test = 100 000`, min-of-N):
+///
+/// | `d` | host sweep | device kernel | |
+/// |---|---|---|---|
+/// | 16 | 5.1 ms | 60.6 ms | 0.08× |
+/// | 64 | 24.2 ms | 598 ms | 0.04× |
+/// | 128 | 119 ms | 2 190 ms | 0.05× |
+/// | 256 | — | **device lost** | — |
+///
+/// That is a 12–25× LOSS at every size, and at `d = 256` not a loss but a
+/// crash: the adapter also drives the display, and 6.5 G `f64` multiply-adds at
+/// its measured ~0.72 G MAC/s is ~9 s of GPU time, far past any compositor
+/// timeout. The `STD_MACS_PER_LAUNCH` split bounds each DISPATCH but not the
+/// SUBMISSION — cubecl queues dispatches and flushes them at the read-back, so
+/// the driver still sees one long job — and no dispatch size can make a 9 s
+/// problem fit under a 2 s timer anyway. Routing wgpu to the host sweep is
+/// therefore not a workaround for the crash, it is the faster arm on its own
+/// merits; the crash is just what made the gap impossible to ignore. This is the
+/// same shape of measured, backend-specific routing as
+/// [`use_shared_predict`]'s wgpu gate, with the sign reversed.
+///
+/// cuda and rocm keep the device arm: they are the backends with real `f64`
+/// silicon behind them, and (on cuda) no display watchdog.
+///
+/// `MLRS_BAYES_STD_HOST` overrides the verdict in BOTH directions (`1` forces
+/// the host sweep on a device backend, `0` forces the device arm anywhere), read
+/// through [`crate::abflag`] so the equivalence test can scope it to its own
+/// thread without an environment data race. The device-forcing direction is the
+/// one the test needs: without it, "these two arms agree" would compare the host
+/// arm against ITSELF on cpu and wgpu — passing while gating nothing.
+fn use_host_std(d: usize) -> bool {
+    if let Some(v) = crate::abflag::var("MLRS_BAYES_STD_HOST") {
+        return v != "0";
+    }
+    if matches!(crate::capability::active_backend_name(), "cpu" | "wgpu") {
+        return true;
+    }
+    d < STD_DEVICE_MIN_FEATURES
+}
+
+/// Fitted feature count below which the HOST-INGRESS `predict_std` keeps the
+/// host sweep even on a device backend.
+///
+/// This path uploads, so it pays `O(n·d)` of transfer for `O(n·d²)` of
+/// arithmetic — the same `d`-governed trade as the fit ingress, and on the same
+/// ~0.28 GB/s Kaggle bus (`prims::normal_eq::device_fit_preferred`). Unlike the
+/// fit, it does cross over, because the exponent gap is a full factor of `d`
+/// rather than `d/2` and the register-tiled kernel closed most of the compute
+/// side. Measured on a Tesla P100, `n_test = 100 000`, `f64`, min-of-5, upload
+/// INSIDE the timer:
+///
+/// | `d` | host sweep | device kernel | |
+/// |---|---|---|---|
+/// | 16 | 8.2 ms | 21.6 ms | 0.38× |
+/// | 64 | 130.3 ms | 131.6 ms | 0.99× |
+/// | 128 | 526.6 ms | 412.4 ms | **1.28×** |
+/// | 256 | 2 152.7 ms | 1 328.3 ms | **1.62×** |
+///
+/// `128` rather than `64`: the `d = 64` rung is a dead heat, and a threshold
+/// placed on a tie flips arms on measurement noise while buying nothing.
+///
+/// Note this bound governs ONLY the uploading ingress.
+/// [`BayesianRidge::predict_std`](mlrs_algos) over an already-resident design
+/// does not consult it and always runs the kernel — correctly, since it beat
+/// the host arm at EVERY `d` measured there (11.2× / 11.5× / 12.5× / 3.7×) with
+/// no transfer to amortize.
+///
+/// The crossover is machine-specific in two directions at once: a host with
+/// more cores pushes it up, a bus faster than 0.28 GB/s pulls it down. This
+/// value is the one measured configuration; `MLRS_BAYES_STD_HOST` re-takes the
+/// measurement elsewhere.
+const STD_DEVICE_MIN_FEATURES: usize = 128;
+
+/// [`bayes_predict_std`] entirely on the host, in `f64`, reading the caller's
+/// borrowed `x` in place — the cpu-backend arm.
+///
+/// Rows are split into [`host_units`] CONTIGUOUS chunks over scoped threads,
+/// the same work-proportional sizing (and the same reason for it) as
+/// [`linear_predict_host`]: each worker owns a disjoint run of `out`, so there
+/// is no false sharing, and a batch too small to amortize a fan-out runs on the
+/// calling thread. The work here is `O(n·d²)` rather than the mean's `O(n·d)`,
+/// so the split is sized off `n · d` — the OPERAND, matching `host_units`'
+/// contract — but reaches the core count far sooner in wall-clock terms.
+///
+/// Accumulation is `f64` on every path, including for an `f32` design, because
+/// the caller's `mt`/`offset` are `f64` and widening the design costs nothing
+/// inside a loop that is already FMA-bound.
+pub fn bayes_predict_std_host<F>(
+    x: &[F],
+    offset: &[f64],
+    mt: &[f64],
+    noise: f64,
+    (n, d): (usize, usize),
+) -> Vec<f64>
+where
+    F: Pod + Sync,
+{
+    let mut out = vec![0.0f64; n];
+    let units = host_units(n * d).min(n.max(1));
+    if units <= 1 {
+        std_rows::<F>(x, offset, mt, noise, d, &mut out);
+        return out;
+    }
+    let rows = n.div_ceil(units);
+    std::thread::scope(|scope| {
+        for (u, band) in out.chunks_mut(rows).enumerate() {
+            let slab = &x[u * rows * d..(u * rows + band.len()) * d];
+            scope.spawn(move || std_rows::<F>(slab, offset, mt, noise, d, band));
+        }
+    });
+    out
+}
+
+/// One worker's row band for [`bayes_predict_std_host`]: `out[i] = √(‖Mᵀx̃ᵢ‖² +
+/// noise)` for each row of `x`.
+///
+/// ## Blocked over ROWS, because the naive form is bandwidth-bound
+/// The obvious loop — centre one row, then dot it against all `d` rows of `mt` —
+/// is `O(d²)` of arithmetic per row but also `O(d²)` of TRAFFIC per row, because
+/// it walks the whole `mt` matrix once per test row. At `d = 256` that is 512 KiB
+/// per row, well past any core's private cache, so `mt` is re-streamed from L3 or
+/// DRAM 100 000 times: **51 GB moved to do 13 GFLOP**. Measured on a 4-vCPU VM it
+/// ran at 6.1 GFLOP/s, and scikit-learn's `(X @ sigma_ * X).sum(axis=1)` — a
+/// blocked BLAS GEMM — beat it **8×** on the same machine and the same data.
+///
+/// Rows are therefore processed [`STD_ROW_BLOCK`] at a time: the block's centred
+/// rows (`STD_ROW_BLOCK · d` doubles, 64 KiB at `d = 256`) are materialized once
+/// and stay resident, and each row of `mt` is read ONCE per block instead of
+/// once per row, cutting `mt`'s traffic by `STD_ROW_BLOCK`. The arithmetic is
+/// unchanged — same products, same per-`j` accumulation order — so this is a
+/// scheduling change, not a numerical one.
+///
+/// ## What that actually bought: essentially nothing, and the honest reason
+/// Re-measured on the same VM it is **within noise of the unblocked form**
+/// (2 269 ms vs 2 135 ms raw at `d = 256`, on a run whose `fit` column was
+/// uniformly ~10% slower, so ~3% faster once normalized). The blocking trades
+/// `mt`'s DRAM traffic for `xc`'s: with the `j` loop outside, the block's 64 KiB
+/// of centred rows is re-read `d` times from L2, which is cheaper per byte but
+/// not free. Cutting the total requires blocking BOTH axes with a register tile
+/// — i.e. writing a GEMM, which is exactly what scikit-learn gets for free by
+/// calling OpenBLAS, and why it still leads this arm ~8× at `d = 256`.
+///
+/// It is kept because the traffic argument is sound and the measurement is
+/// neutral-to-slightly-positive, and recorded honestly because the obvious
+/// next reader will otherwise re-derive the same idea and expect the 8×. The
+/// device kernel took the register-tile route instead
+/// ([`mlrs_kernels::linear_predict::bayes_predict_std`]'s `4 × 4` tile).
+///
+/// Centring is hoisted out of the `j` loop for the same reason it was already:
+/// the `d` subtractions are paid once per row rather than once per `(row, j)`.
+fn std_rows<F: Pod + Sync>(x: &[F], offset: &[f64], mt: &[f64], noise: f64, d: usize, out: &mut [f64]) {
+    let wide = |v: F| -> f64 {
+        match size_of::<F>() {
+            4 => *bytemuck::from_bytes::<f32>(bytemuck::bytes_of(&v)) as f64,
+            8 => *bytemuck::from_bytes::<f64>(bytemuck::bytes_of(&v)),
+            other => unreachable!("bayes predict_std is f32/f64 only, got a {other}-byte element"),
+        }
+    };
+    let mut xc = vec![0.0f64; STD_ROW_BLOCK * d];
+    for (blk, qblk) in out.chunks_mut(STD_ROW_BLOCK).enumerate() {
+        let r0 = blk * STD_ROW_BLOCK;
+        let rows = qblk.len();
+
+        // Centre this block's rows once. `xc` is reused across blocks, so the
+        // allocation is per WORKER, not per block.
+        for r in 0..rows {
+            let src = &x[(r0 + r) * d..(r0 + r + 1) * d];
+            let dst = &mut xc[r * d..(r + 1) * d];
+            for (k, slot) in dst.iter_mut().enumerate() {
+                *slot = wide(src[k]) - offset[k];
+            }
+        }
+
+        // `noise` is seeded here rather than added at the end so the block's
+        // accumulators need no second pass.
+        for q in qblk.iter_mut() {
+            *q = noise;
+        }
+        for j in 0..d {
+            let mrow = &mt[j * d..(j + 1) * d];
+            for (r, q) in qblk.iter_mut().enumerate() {
+                let acc: f64 = mrow
+                    .iter()
+                    .zip(xc[r * d..(r + 1) * d].iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                *q += acc * acc;
+            }
+        }
+        for q in qblk.iter_mut() {
+            *q = q.sqrt();
+        }
+    }
+}
+
+/// Test rows [`std_rows`] centres and holds resident while it streams `mt` past
+/// them.
+///
+/// The block's working set is `STD_ROW_BLOCK · d` doubles — 64 KiB at
+/// `d = 256`, 16 KiB at `d = 64` — which is sized to sit in L2 alongside the
+/// `d`-element `mt` row being streamed, not in L1. That is the right target:
+/// the value being bought is `mt`'s DRAM traffic (cut by this factor), and `mt`
+/// is streamed exactly once per block either way, so a bigger block buys less
+/// and less while pushing the centred rows out of cache.
+const STD_ROW_BLOCK: usize = 32;

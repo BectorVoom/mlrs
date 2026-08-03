@@ -294,7 +294,7 @@ where
 /// 256 rows per block is the sizing `gram_xty_shared_impl` established; the cap
 /// keeps the `nblocks · d²` partial buffer inside an ~8 M-element budget
 /// (`prims::kmeans::centroid_sums_shared`'s precedent).
-fn row_blocking(n: usize, d: usize) -> (usize, usize) {
+pub(crate) fn row_blocking(n: usize, d: usize) -> (usize, usize) {
     let nb_cap = ((8usize << 20) / (d * d).max(1)).max(1);
     let nb = n.div_ceil(256).clamp(1, nb_cap);
     let rpb = n.div_ceil(nb);
@@ -537,7 +537,7 @@ fn tile_launch(d: usize) -> (u32, u32) {
 /// device here is the ROW-BLOCK count, not the unit count: at `d = 16` there
 /// are only `16 · 2 = 32` slot groups to hand out, so a wider cube would idle
 /// half of itself either way.
-const BLOCKED_CUBE_DIM: u32 = 64;
+pub(crate) const BLOCKED_CUBE_DIM: u32 = 64;
 
 /// Register-blocked, barrier-free Gram/Xty formation — the default path (see
 /// [`mlrs_kernels::gram::gram_xty_blocked`]). Same row-block sizing and
@@ -813,7 +813,7 @@ fn launch_cubes_64(cubes: usize) -> (CubeCount, CubeDim) {
 
 /// [`launch_cubes_64`] with an explicit cube width, for the register-blocked
 /// path's [`BLOCKED_CUBE_DIM`].
-fn launch_cubes(cubes: usize, dim_x: u32) -> (CubeCount, CubeDim) {
+pub(crate) fn launch_cubes(cubes: usize, dim_x: u32) -> (CubeCount, CubeDim) {
     const MAX_DIM: u32 = 65_535;
     let c = (cubes as u32).max(1);
     let y = c.div_ceil(MAX_DIM);

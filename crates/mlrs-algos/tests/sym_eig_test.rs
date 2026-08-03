@@ -225,3 +225,80 @@ fn sym_eig_clustered_spectrum() {
     }
     assert_decomposition(&a, d, 100.0, "clustered spectrum");
 }
+
+/// A LARGE Gram (`d = 193`), which the small cases above cannot stand in for.
+///
+/// [`sym_eig`] works on the TRANSPOSE of the eigenvector matrix so that every
+/// inner loop of `tred2`/`tql2` runs along a contiguous row instead of striding
+/// by `d` (the `172 ms → 18 ms` measurement at `d = 256` that motivated it).
+/// That rewrite re-indexed the whole EISPACK recurrence and replaced the
+/// eigenvector column swap with a `swap_with_slice` of rows, so it is exactly
+/// the kind of change a `d = 12` fixture cannot gate: the small cases run few
+/// Householder steps, few QL sweeps and almost no reordering, and a
+/// transposition slip in a rarely-taken branch survives them.
+///
+/// `d = 193` is deliberately odd and not a power of two, so the row bands, the
+/// `i - 1` / `i + 1` neighbour indices and the trailing `d - 1` fixups are all
+/// exercised off any convenient alignment. `n = 260` keeps the Gram full-rank
+/// and well conditioned, so the `1e-11` reconstruction and orthonormality
+/// bounds are the same ones every other case is held to — the point is that the
+/// SIZE changes, not the tolerance.
+#[test]
+fn sym_eig_large_full_rank_gram() {
+    let (n, d) = (260usize, 193usize);
+    let mut s = 0x51D_5EED_u64;
+    let x: Vec<f64> = (0..n * d).map(|_| splitmix(&mut s)).collect();
+    let a = gram(&x, n, d, true);
+    let scale = a.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let (lambda, _) = assert_decomposition(&a, d, scale, "large full-rank gram");
+
+    // A centered `260 × 193` Gaussian Gram has rank `d` (one DOF goes to the
+    // centering, and `n − 1 > d`), so every eigenvalue is strictly positive —
+    // a sign flip from a mis-transposed rotation would show up here even if the
+    // reconstruction stayed inside tolerance.
+    assert!(
+        lambda.iter().all(|&l| l > 0.0),
+        "large full-rank gram: a PSD full-rank Gram must have no non-positive \
+         eigenvalue, got min {:e}",
+        lambda.iter().cloned().fold(f64::INFINITY, f64::min)
+    );
+}
+
+/// A large RANK-DEFICIENT Gram (`d = 129`, `n = 40`), the shape
+/// `BayesianRidge`'s wide fixture generalizes to.
+///
+/// Rank deficiency is where a transposition slip does the most damage without
+/// tripping a reconstruction bound: the null directions carry no signal, so `A`
+/// reconstructs fine while the eigenvectors spanning the null space can still be
+/// wrong. `clamp_numerical_rank` then keys off exactly these eigenvalues, so
+/// they have to come back at the accumulation's rounding floor rather than
+/// merely "small".
+#[test]
+fn sym_eig_large_rank_deficient_gram() {
+    let (n, d) = (40usize, 129usize);
+    let mut s = 0xDEFEC7_u64;
+    let x: Vec<f64> = (0..n * d).map(|_| splitmix(&mut s)).collect();
+    let a = gram(&x, n, d, true);
+    let scale = a.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let (lambda, _) = assert_decomposition(&a, d, scale, "large rank-deficient gram");
+
+    // Centering costs one DOF, so the rank is `n − 1 = 39`; the remaining
+    // `d − 39` eigenvalues are structurally zero and must land at the
+    // accumulation floor, not merely near it.
+    let rank = n - 1;
+    let floor = 1e-9 * lambda[0];
+    assert!(
+        lambda[rank - 1] > floor,
+        "large rank-deficient gram: eigenvalue {} of the {rank}-dim range \
+         collapsed to {:e}",
+        rank - 1,
+        lambda[rank - 1]
+    );
+    for (i, &l) in lambda.iter().enumerate().skip(rank) {
+        assert!(
+            l.abs() <= floor,
+            "large rank-deficient gram: null direction {i} came back at {l:e}, \
+             above the {floor:e} floor `clamp_numerical_rank` keys off"
+        );
+    }
+}
