@@ -524,3 +524,79 @@ pub fn dist_combine_clamp<F: Float + CubeElement>(
         out[idx] = d;
     }
 }
+
+/// sklearn's `_preprocess_data` centring and `_rescale_data` row rescale, fused
+/// into ONE pass over a `rows × cols` row-major matrix:
+///
+/// ```text
+/// out[r·cols + c] = (a[r·cols + c] − mean[c]) · scale[r]
+/// ```
+///
+/// Both halves are individually switchable through the `use_mean` / `use_scale`
+/// flags, which are CUBE-UNIFORM `u32`s (every unit reads the same value), so the
+/// branches never diverge within a warp and the kernel lowers to the plain
+/// element map when both are off. That is what lets ONE kernel serve all four
+/// `BayesianRidge` device-fit preprocessing shapes — centre-only, rescale-only,
+/// both, and neither — instead of a family of near-duplicates.
+///
+/// Off flags still require a real (length-1 is enough) buffer for the unused
+/// operand, exactly as [`crate::linear_predict::linear_predict_bias`]'s `bias`
+/// is always a real buffer: a `#[cube(launch)]` signature has no optional
+/// arrays, and a branch that never executes must still type-check.
+///
+/// One unit per element at `ABSOLUTE_POS`, bounds-checked on `tid < a.len()` so
+/// the ceiling-division launch may over-provision safely (T-0203-01). `cols` is
+/// a scalar `u32` by value, following [`center_columns`].
+#[cube(launch)]
+pub fn row_scale_center<F: Float + CubeElement>(
+    a: &Array<F>,
+    mean: &Array<F>,
+    scale: &Array<F>,
+    out: &mut Array<F>,
+    cols: u32,
+    use_mean: u32,
+    use_scale: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < a.len() {
+        let mut v = a[tid];
+        if use_mean == 1u32 {
+            v -= mean[tid % cols as usize];
+        }
+        if use_scale == 1u32 {
+            v *= scale[tid / cols as usize];
+        }
+        out[tid] = v;
+    }
+}
+
+/// Element-wise float-width conversion `out[i] = B::from(in[i])` — the ONLY
+/// kernel in this crate generic over TWO float types.
+///
+/// It exists for `BayesianRidge`'s device fit. That estimator consumes its Gram
+/// through the residual identity `sse = yᵀy − 2wᵀXᵀy + wᵀGw`, whose absolute
+/// error is `~ε·yᵀy` however small `sse` is — so the Gram must be accumulated in
+/// `f64` whatever the design's own width (see
+/// `mlrs_algos::linear::bayesian_ridge`). The Gram kernels accumulate in their
+/// element type, so an `f32` design is WIDENED on the device first and the
+/// whole normal-equation assembly then runs at `f64`. Widening on the device
+/// rather than on the host is the point: the alternative is reading the design
+/// back, which is the round trip the device arm exists to remove.
+///
+/// One unit per element at `ABSOLUTE_POS`, bounds-checked so the
+/// ceiling-division launch may over-provision safely (T-0203-01). The
+/// conversion is the STATIC associated `B::cast_from`, never an instance-form
+/// `.cast()` (Pitfall 7 — the instance form can mis-lower in the `#[cube]` IR).
+///
+/// Narrowing (`f64 → f32`) is well-formed too and rounds to nearest; no caller
+/// needs it today.
+#[cube(launch)]
+pub fn widen_elem<A: Float + CubeElement, B: Float + CubeElement>(
+    input: &Array<A>,
+    output: &mut Array<B>,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        output[tid] = B::cast_from(input[tid]);
+    }
+}

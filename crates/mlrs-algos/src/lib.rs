@@ -65,6 +65,12 @@ pub mod manifold;
 pub mod metrics;
 pub mod naive_bayes;
 pub mod neighbors;
+// The sklearn `preprocessing` scaler family (PREP-01, Phase 24): `StandardScaler`
+// / `MinMaxScaler` / `MaxAbsScaler` / `RobustScaler` / `Normalizer` /
+// `Binarizer`, each `Fit` + `Transform` (`typestate`) over host-computed column
+// (or per-row) statistics — see `preprocessing/mod.rs` for why this stays a host
+// arithmetic pass rather than a new device kernel (the PCA precedent).
+pub mod preprocessing;
 pub mod projection;
 // Time-series estimators (TSA-01, Phase 22): ARIMA / AutoARIMA. HOST-side
 // (a Kalman filter over a tiny per-step state has no useful device

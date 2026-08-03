@@ -226,6 +226,9 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::neighbors::{
         PyKNeighborsClassifier, PyKNeighborsRegressor, PyNearestNeighbors,
     };
+    use estimators::preprocessing::{
+        PyBinarizer, PyMaxAbsScaler, PyMinMaxScaler, PyNormalizer, PyRobustScaler, PyStandardScaler,
+    };
     use estimators::projection::{
         johnson_lindenstrauss_min_dim, PyGaussianRandomProjection, PySparseRandomProjection,
     };
@@ -305,6 +308,15 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // no further estimator additions follow.
     m.add_class::<PyHistGradientBoostingClassifier>()?;
     m.add_class::<PyHistGradientBoostingRegressor>()?;
+
+    // Preprocessing scaler family (PREP-01, Phase 24): StandardScaler /
+    // MinMaxScaler / MaxAbsScaler / RobustScaler / Normalizer / Binarizer.
+    m.add_class::<PyStandardScaler>()?;
+    m.add_class::<PyMinMaxScaler>()?;
+    m.add_class::<PyMaxAbsScaler>()?;
+    m.add_class::<PyRobustScaler>()?;
+    m.add_class::<PyNormalizer>()?;
+    m.add_class::<PyBinarizer>()?;
 
     // The host-only sklearn metrics surface (METR-BIND-01, TASK-15): 11
     // metrics + 3 `_per_class` variants (precision/recall/f1's

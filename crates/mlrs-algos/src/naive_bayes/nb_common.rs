@@ -438,6 +438,33 @@ impl HostScanCheck {
             HostScanCheck::NonNegative => !xf.is_finite() || xf < 0.0,
         }
     }
+
+    /// The same verdict as [`Self::rejects`], re-expressed as an inclusive
+    /// `[lo, hi]` interval so the sweep can fold validity BRANCH-FREE.
+    ///
+    /// `accepts(xf) == (xf >= lo) & (xf <= hi)`, with both bounds loop-invariant.
+    /// This is what lets the accumulate loop vectorize: a `bool` fold over two
+    /// compares has no early exit, whereas the equivalent `if rejects { return }`
+    /// is a data-dependent branch out of the loop body that blocks every
+    /// vectorizer (and mispredicts on real data for the `NonNegative` arm).
+    ///
+    /// The equivalence rests on `hi = f64::MAX` rather than `f64::INFINITY`:
+    /// every FINITE value lies within `±f64::MAX`, while `+inf`, `-inf` and
+    /// `NaN` all fail at least one comparison (`NaN` fails both — every ordering
+    /// comparison against it is false, which is the property
+    /// [`Self::rejects`] is written for too). `-0.0 >= 0.0` holds, so a negative
+    /// zero is accepted by both spellings.
+    ///
+    /// [`Self::rejects`] stays the single source of truth for the REPORTED
+    /// offender: the fold only says a row contains one, and the scalar locate
+    /// pass then finds it with `rejects`.
+    #[inline(always)]
+    fn bounds(self) -> (f64, f64) {
+        match self {
+            HostScanCheck::Finite => (-f64::MAX, f64::MAX),
+            HostScanCheck::NonNegative => (0.0, f64::MAX),
+        }
+    }
 }
 
 /// What [`class_grouped_stats_host`] should compute — grouped into a struct
@@ -505,9 +532,29 @@ struct ChunkAcc {
 /// One worker's share of the sweep: validate + accumulate every requested
 /// statistic for every row of `chunk`.
 ///
-/// The three optional accumulators are hoisted OUT of the inner loop as `bool`s
-/// the branch predictor sees once per row, so the common case (sum only,
-/// unweighted) costs one add per element and nothing else.
+/// ## Why this is written as four monomorphized row loops
+/// The obvious spelling — one loop that tests `want_sumsq` / `want_global` and
+/// `check.rejects(xf)` per element — costs far more than the adds it performs,
+/// for two separate reasons:
+///
+/// 1. **The fused reject is an early `return` out of the inner loop.** A
+///    data-dependent exit is an unconditional vectorization barrier, so the
+///    whole sweep ran one scalar element at a time. It also MISPREDICTS: for
+///    the `NonNegative` arm the predicate reads the data, and BernoulliNB's
+///    `x > threshold` twin (a ~30 %-true branch) measured 2.16x the unweighted
+///    arm's cpu time purely from mispredicts. Validity is now folded
+///    branch-free through [`HostScanCheck::bounds`] and inspected ONCE per row;
+///    only a row that actually contains an offender pays the scalar locate
+///    pass that pins the exact index.
+/// 2. **The optional accumulators were runtime `bool`s.** Perfectly predicted,
+///    but they still sit inside the loop body where they keep LLVM from proving
+///    a fixed store pattern. Hoisting them into `const` generic parameters
+///    gives each of the three live shapes its own straight-line body.
+///
+/// Accumulating a row that turns out to be invalid is deliberate and harmless:
+/// the `NaN` it folds in is discarded with the whole [`ChunkAcc`] the moment
+/// `first_invalid` is set, and paying for it unconditionally is what removes the
+/// branch.
 fn stats_chunk<F>(
     chunk: &[F],
     class_of_row: &[usize],
@@ -519,35 +566,171 @@ fn stats_chunk<F>(
 ) where
     F: Float + CubeElement + Pod,
 {
-    let want_sumsq = !acc.sumsq.is_empty();
-    let want_global = !acc.global_sum.is_empty();
+    // Only three of the four combinations are reachable — `global_unweighted`
+    // is GaussianNB's, and GaussianNB always asks for `sumsq` too — but the
+    // fourth is spelled out rather than `unreachable!()`d so a future caller
+    // cannot turn a request shape into a panic.
+    match (!acc.sumsq.is_empty(), !acc.global_sum.is_empty()) {
+        (false, false) => stats_rows::<F, false, false>(
+            chunk,
+            class_of_row,
+            weights,
+            n_features,
+            check,
+            flat_base,
+            acc,
+        ),
+        (true, false) => stats_rows::<F, true, false>(
+            chunk,
+            class_of_row,
+            weights,
+            n_features,
+            check,
+            flat_base,
+            acc,
+        ),
+        (false, true) => stats_rows::<F, false, true>(
+            chunk,
+            class_of_row,
+            weights,
+            n_features,
+            check,
+            flat_base,
+            acc,
+        ),
+        (true, true) => stats_rows::<F, true, true>(
+            chunk,
+            class_of_row,
+            weights,
+            n_features,
+            check,
+            flat_base,
+            acc,
+        ),
+    }
+}
+
+/// [`stats_chunk`] with the two optional accumulators resolved at COMPILE time.
+///
+/// `SQ` selects the per-class `Σ w x²`; `GLOB` selects the unweighted whole-column
+/// `Σ x` / `Σ x²`. See [`stats_chunk`] for why they are const rather than runtime
+/// flags.
+fn stats_rows<F, const SQ: bool, const GLOB: bool>(
+    chunk: &[F],
+    class_of_row: &[usize],
+    weights: Option<&[f64]>,
+    n_features: usize,
+    check: HostScanCheck,
+    flat_base: usize,
+    acc: &mut ChunkAcc,
+) where
+    F: Float + CubeElement + Pod,
+{
+    // Destructured ONCE: the four accumulators are distinct fields, so this both
+    // proves them disjoint to the borrow checker inside the loop and stops each
+    // iteration re-loading `acc`'s `Vec` pointers through the `&mut`.
+    let ChunkAcc {
+        sum,
+        sumsq,
+        class_weight,
+        global_sum,
+        global_sumsq,
+        first_invalid,
+    } = acc;
+    let (lo, hi) = check.bounds();
+
     for (r, (row, &c)) in chunk
         .chunks_exact(n_features)
         .zip(class_of_row.iter())
         .enumerate()
     {
         let w = weights.map_or(1.0, |w| w[r]);
-        acc.class_weight[c] += w;
+        class_weight[c] += w;
         // A zero-weight row contributes nothing to any per-class accumulator,
         // but it still has to be VALIDATED (sklearn's `check_array` scans the
         // whole matrix regardless of the weights) and it still counts toward the
         // unweighted global column totals. So the loop runs either way.
         let base = c * n_features;
-        for (j, &xv) in row.iter().enumerate() {
-            let xf = host_to_f64(xv);
-            if check.rejects(xf) {
-                acc.first_invalid = Some((flat_base + r * n_features + j, xf));
-                return;
+        // `ok` is folded with `&`, NOT `&&`: the bitwise operator has no
+        // short-circuit, so there is no branch and no early exit in the body.
+        let mut ok = true;
+
+        if GLOB && SQ {
+            // GaussianNB's weighted arm: per-class Σwx / Σwx² AND the unweighted
+            // whole-column Σx / Σx².
+            //
+            // Deliberately TWO three-stream loops rather than one fused
+            // five-stream one. Fusing them reads the row once instead of twice,
+            // which looks like the obvious win — but each row re-creates the
+            // whole zip, and at SMALL `d` that per-row setup is not amortized:
+            // the fused spelling measured a 7 % LOSS at `d = 8` (500 000 × 8)
+            // against the code this replaced, while still winning at `d = 128`.
+            // Split, both loops win at every width. The second read is nearly
+            // free — the row is a few hundred bytes and is still in L1 from the
+            // first loop, whereas the ROW's arrival from DRAM (what this sweep
+            // is actually bound by) is paid once either way.
+            let (sum_row, sq_row) = (
+                &mut sum[base..base + n_features],
+                &mut sumsq[base..base + n_features],
+            );
+            for ((&xv, s), ss) in row
+                .iter()
+                .zip(sum_row.iter_mut())
+                .zip(sq_row.iter_mut())
+            {
+                let xf = host_to_f64(xv);
+                ok &= (xf >= lo) & (xf <= hi);
+                let wx = w * xf;
+                *s += wx;
+                *ss += wx * xf;
             }
-            let wx = w * xf;
-            acc.sum[base + j] += wx;
-            if want_sumsq {
-                acc.sumsq[base + j] += wx * xf;
+            for ((&xv, gs), gss) in row
+                .iter()
+                .zip(global_sum.iter_mut())
+                .zip(global_sumsq.iter_mut())
+            {
+                let xf = host_to_f64(xv);
+                *gs += xf;
+                *gss += xf * xf;
             }
-            if want_global {
-                acc.global_sum[j] += xf;
-                acc.global_sumsq[j] += xf * xf;
+        } else if SQ {
+            let (sum_row, sq_row) = (
+                &mut sum[base..base + n_features],
+                &mut sumsq[base..base + n_features],
+            );
+            for ((&xv, s), ss) in row
+                .iter()
+                .zip(sum_row.iter_mut())
+                .zip(sq_row.iter_mut())
+            {
+                let xf = host_to_f64(xv);
+                ok &= (xf >= lo) & (xf <= hi);
+                let wx = w * xf;
+                *s += wx;
+                *ss += wx * xf;
             }
+        } else {
+            // MultinomialNB / ComplementNB: one multiply-add per element.
+            let sum_row = &mut sum[base..base + n_features];
+            for (&xv, s) in row.iter().zip(sum_row.iter_mut()) {
+                let xf = host_to_f64(xv);
+                ok &= (xf >= lo) & (xf <= hi);
+                *s += w * xf;
+            }
+        }
+
+        if !ok {
+            // Cold: this row holds the first offender in the chunk. Re-walk it
+            // scalar-wise with `rejects` — the single source of truth for the
+            // verdict — to report the exact flat index and value.
+            for (j, &xv) in row.iter().enumerate() {
+                let xf = host_to_f64(xv);
+                if check.rejects(xf) {
+                    *first_invalid = Some((flat_base + r * n_features + j, xf));
+                    return;
+                }
+            }
+            unreachable!("stats_rows: branch-free fold rejected a row `rejects` accepts");
         }
     }
 }
