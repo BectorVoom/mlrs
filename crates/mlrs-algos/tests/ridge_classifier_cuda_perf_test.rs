@@ -247,15 +247,25 @@ const N_QUERY: usize = 100_000;
 #[test]
 #[ignore = "wall-clock probe; run explicitly in release mode"]
 fn ridge_classifier_device_vs_host_ladder() {
-    let client = runtime::active_client();
-    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
     let r = reps();
+
+    // A FRESH pool per rung, not one for the whole ladder.
+    //
+    // `DeviceArray::from_host` goes through `client.create`, which always
+    // allocates, while `release_into` caches into a free-list only `acquire`
+    // can drain (measured and documented in `mlrs-ridge-positive-cuda`) — so
+    // repeated uploads never reuse and live device memory grows per call. One
+    // pool across `reps × CONFIGS` uploads of a 102 MiB design exhausted a
+    // 15 GiB T4 part-way through the ladder. Dropping the pool between rungs
+    // releases the allocations with it, and costs nothing that is timed.
+    let new_pool = || BufferPool::<ActiveRuntime>::new(runtime::active_client());
 
     println!(
         "\nRidgeClassifier FIT — min-of-{r}, f32, upload INSIDE the timer, both arms forced"
     );
     println!("{:>9} {:>5} {:>4} {:>12} {:>12} {:>9}", "n", "d", "k", "host (ms)", "device (ms)", "speedup");
     for &(n, d, k) in CONFIGS {
+        let mut pool = new_pool();
         let (x, y) = make_classification(n, d, k, 42);
         let mut best_dev = f64::INFINITY;
         let mut best_host = f64::INFINITY;
@@ -280,6 +290,7 @@ fn ridge_classifier_device_vs_host_ladder() {
     );
     println!("{:>9} {:>5} {:>4} {:>12} {:>12} {:>9}", "n_fit", "d", "k", "host (ms)", "device (ms)", "speedup");
     for &(n, d, k) in CONFIGS {
+        let mut pool = new_pool();
         let (x, y) = make_classification(n, d, k, 42);
         let (xq, _) = make_classification(N_QUERY, d, k, 4242);
         let est = RidgeClassifier::<f32>::new();
