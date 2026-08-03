@@ -98,7 +98,16 @@ fn fit_device(pool: &mut BufferPool<ActiveRuntime>, x: &[f32], y: &[f32], n: usi
 }
 
 /// One FIT through the shared-Gram HOST arm — the code the cpu backend runs.
+///
+/// `host_fit_applicable` is FALSE on a device backend above `gram_host`'s
+/// fixed dispatch-cost floor, which is every interesting rung of this ladder —
+/// so the arm has to be FORCED for the comparison to exist at all. Without
+/// this the host column reads `inf` at seven of eight rungs and the ratio is
+/// vacuous. The force goes through `abflag`'s thread-local override, never
+/// `std::env::set_var` (an environ data race, and it would leak across the
+/// other tests in the binary).
 fn fit_host(pool: &mut BufferPool<ActiveRuntime>, x: &[f32], y: &[f32], n: usize, d: usize) -> f64 {
+    let _forced = mlrs_backend::abflag::force("MLRS_RIDGE_GRAM_HOST", "1");
     let est = RidgeClassifier::<f32>::new();
     if !est.host_fit_applicable((n, d)) {
         return f64::NAN;
@@ -161,11 +170,15 @@ const CONFIGS: &[(usize, usize, usize)] = &[
     (10_000, 16, 2),
     (10_000, 64, 3),
     (100_000, 16, 3),
+    (100_000, 16, 26),
     (100_000, 64, 3),
+    (100_000, 64, 5),
     (100_000, 64, 10),
     (100_000, 64, 26),
     (100_000, 128, 10),
+    (100_000, 128, 26),
     (100_000, 256, 10),
+    (100_000, 256, 26),
 ];
 
 /// Query rows for the predict ladder. Deliberately LARGE: a sub-millisecond
