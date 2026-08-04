@@ -52,6 +52,7 @@ from .linear import (
     RidgeClassifier,
 )
 from .manifold import TSNE, UMAP
+from .mixture import GaussianMixture
 from .naive_bayes import (
     BernoulliNB,
     CategoricalNB,
@@ -122,6 +123,7 @@ __all__ = [
     "HDBSCAN",
     "AgglomerativeClustering",
     "SpectralClustering",
+    "GaussianMixture",
     "TSNE",
     "SpectralEmbedding",
     "UMAP",

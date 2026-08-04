@@ -295,6 +295,25 @@ EXPECTED_PARAMS = {
         "copy": True,
         "output_type": "input",
     },
+    # GaussianMixture (MIX-01) — sklearn's full ctor surface, including BOTH
+    # string-valued hyperparameters (`covariance_type`, `init_params`).
+    "GaussianMixture": {
+        "n_components": 1,
+        "covariance_type": "full",
+        "tol": 1e-3,
+        "reg_covar": 1e-6,
+        "max_iter": 100,
+        "n_init": 1,
+        "init_params": "kmeans",
+        "weights_init": None,
+        "means_init": None,
+        "precisions_init": None,
+        "random_state": None,
+        "warm_start": False,
+        "verbose": 0,
+        "verbose_interval": 10,
+        "output_type": "input",
+    },
     "SpectralClustering": {
         "n_clusters": 8,
         "n_components": None,
@@ -465,6 +484,7 @@ SET_PARAM = {
     "Normalizer": ("norm", "l1"),
     "Binarizer": ("threshold", 1.0),
     "SpectralClustering": ("n_clusters", 4),
+    "GaussianMixture": ("covariance_type", "diag"),
     "SpectralEmbedding": ("n_components", 3),
     "UMAP": ("n_neighbors", 10),
     "HDBSCAN": ("min_cluster_size", 10),

@@ -30,16 +30,18 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// The pool itself is a cpu-arm construct: on the device backends the passes it
-// would drive run as kernels, and nothing constructs one. `Barrier`/`Shared`
-// are NOT gated — `hgb_host` builds on every backend.
-#[cfg(feature = "cpu")]
+// The pool was originally a cpu-arm construct, gated behind `feature = "cpu"`
+// because on the device backends the passes it drives run as kernels and
+// nothing constructed one. `gmm_host` broke that assumption: the Gaussian
+// mixture EM loop is a HOST algorithm on every backend (its per-iteration
+// passes are far too small and too numerous for a `cubecl` launch, and the
+// `f64` accumulation it needs is not advertised on cuda at all —
+// [[mlrs-cubecl-cuda-f64-not-advertised]]), so it needs the pool wherever it
+// runs. The gate is therefore gone; the module is std-only and builds on
+// every backend.
 use std::cell::UnsafeCell;
-#[cfg(feature = "cpu")]
 use std::panic::AssertUnwindSafe;
-#[cfg(feature = "cpu")]
 use std::marker::PhantomData;
-#[cfg(feature = "cpu")]
 use std::sync::Arc;
 
 /// Sense-reversing barrier with a spin → yield → BLOCK backoff.
@@ -162,7 +164,6 @@ impl Barrier {
     /// [`WorkerPool`]'s `Drop`, which must NOT release a poisoned pool's
     /// workers again — they are already unwinding out of their loop, so the
     /// extra barrier crossing would never complete.
-    #[cfg(feature = "cpu")]
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
     }
@@ -191,7 +192,6 @@ const YIELD_ITERS: u32 = 100_000;
 /// microseconds — long enough that a condvar wake is a rounding error, so a
 /// waiter should hand its core back quickly instead of fighting the run queue
 /// for it. Used by [`WorkerPool`].
-#[cfg(feature = "cpu")]
 pub(crate) const YIELD_ITERS_LONG_PHASE: u32 = 256;
 
 /// A `&mut [T]` shared across the worker pool, whose disjointness is enforced
@@ -260,7 +260,6 @@ impl<T> Shared<T> {
 /// AFTER that same barrier's acquire. The barrier's `Release`/`Acquire` pair is
 /// what makes the write visible; there is no data race because no worker is
 /// running between the two.
-#[cfg(feature = "cpu")]
 #[derive(Clone, Copy)]
 struct RawTask {
     data: *const (),
@@ -270,9 +269,7 @@ struct RawTask {
 // SAFETY: `data` points at a closure the driver keeps alive across the whole
 // pass (it is borrowed for the duration of `WorkerPool::run`), and the closure
 // is required to be `Sync` by `run`'s bound.
-#[cfg(feature = "cpu")]
 unsafe impl Send for RawTask {}
-#[cfg(feature = "cpu")]
 unsafe impl Sync for RawTask {}
 
 /// Call `data` — which is a `*const T` — with the worker's index.
@@ -280,14 +277,12 @@ unsafe impl Sync for RawTask {}
 /// # Safety
 /// `data` must point at a live `T`, and `T` must be the type this stub was
 /// instantiated for.
-#[cfg(feature = "cpu")]
 unsafe fn call_stub<T: Fn(usize) + Sync>(data: *const (), unit: usize) {
     unsafe { (*data.cast::<T>())(unit) }
 }
 
 /// Shared control block: the two barriers, the published pass, and the
 /// shutdown flag.
-#[cfg(feature = "cpu")]
 struct PoolCtl {
     /// Released when a pass is ready to run (or the pool is shutting down).
     start: Barrier,
@@ -303,9 +298,7 @@ struct PoolCtl {
 // SAFETY: `task` is written only by the driver while every worker is blocked on
 // `start`, and read only by workers between `start`'s release and `done`'s —
 // the barriers serialize the two, so the `UnsafeCell` is never aliased.
-#[cfg(feature = "cpu")]
 unsafe impl Sync for PoolCtl {}
-#[cfg(feature = "cpu")]
 unsafe impl Send for PoolCtl {}
 
 /// Worker threads spawned ONCE and reused for many passes.
@@ -320,7 +313,6 @@ unsafe impl Send for PoolCtl {}
 /// re-spawning for each of them is the dominant cost at every size where the
 /// pass itself is not already several milliseconds. With the pool, a pass costs
 /// two barrier crossings (microseconds) regardless of how many times it runs.
-#[cfg(feature = "cpu")]
 pub(crate) struct WorkerPool {
     units: usize,
     ctl: Arc<PoolCtl>,
@@ -337,7 +329,6 @@ pub(crate) struct WorkerPool {
     _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 
-#[cfg(feature = "cpu")]
 impl WorkerPool {
     /// Spawn a pool with `units` participants (the driver plus `units - 1`
     /// threads). `units <= 1` is the inline, thread-free pool.
@@ -418,7 +409,6 @@ impl WorkerPool {
     }
 }
 
-#[cfg(feature = "cpu")]
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         if self.handles.is_empty() {
@@ -437,7 +427,6 @@ impl Drop for WorkerPool {
 }
 
 /// One worker's lifetime: wait for a pass, run its share, report, repeat.
-#[cfg(feature = "cpu")]
 fn worker_loop(ctl: &PoolCtl, unit: usize) {
     loop {
         if !ctl.start.wait() {

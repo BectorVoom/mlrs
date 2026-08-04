@@ -5550,6 +5550,234 @@ def gen_binarizer(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+
+# GaussianMixture oracle geometry (MIX-01). Three WELL-SEPARATED blobs so the
+# likelihood surface has one dominant optimum and every `init_params` route
+# converges to the SAME fixed point — which is what makes an init-by-init
+# comparison meaningful across two different RNGs (D-09: numpy's `Generator`
+# stream is not reproducible from Rust, so the oracle pins the ANSWER, not the
+# path to it).
+GMM_N_SAMPLES, GMM_N_FEATURES, GMM_K = 300, 4, 3
+# A query block, disjoint from the training design, for the scoring surface.
+GMM_N_QUERY = 40
+# The convergence cases run to machine precision so BOTH engines sit on the
+# same stationary point rather than stopping at different places inside
+# sklearn's default `tol = 1e-3` band (which alone permits ~1e-3 parameter
+# disagreement and would make a 1e-5 comparison meaningless).
+GMM_TOL_TIGHT = 1e-12
+GMM_MAX_ITER_TIGHT = 2000
+
+GMM_COV_TYPES = ("full", "tied", "diag", "spherical")
+GMM_INIT_PARAMS = ("kmeans", "k-means++", "random", "random_from_data")
+
+
+def _gmm_design(seed: int, dtype):
+    """The shared GaussianMixture design + query block, dtype-round-tripped."""
+    rng = np.random.default_rng(seed + 909)
+    # The separation is TUNED, not arbitrary. Measured on this design across
+    # `scale in (9, 5, 3.5, 3)`: at 9 the blobs are so distinct that `kmeans`
+    # init converges in 2 iterations and the EM loop is barely exercised; at 3.5
+    # the `full` optimum stops being init-independent (`kmeans` and `random`
+    # land on different local maxima) and the fixture's premise breaks. 5 is the
+    # widest separation that still costs 3-321 iterations depending on the
+    # init — real EM work, one optimum.
+    centers = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [5.0, 5.0, 0.0, 0.0],
+            [-5.0, 10.0 / 3.0, 5.0, -10.0 / 3.0],
+        ]
+    )
+    per = GMM_N_SAMPLES // GMM_K
+    x = np.vstack(
+        [c + 0.9 * rng.standard_normal((per, GMM_N_FEATURES)) for c in centers]
+    )
+    # Round-trip through the fixture dtype BEFORE fitting, so the reference is
+    # the answer for the exact bytes the Rust test reads back.
+    x = x.astype(dtype).astype(np.float64)
+    xq = (
+        centers[rng.integers(0, GMM_K, GMM_N_QUERY)]
+        + 1.2 * rng.standard_normal((GMM_N_QUERY, GMM_N_FEATURES))
+    )
+    xq = xq.astype(dtype).astype(np.float64)
+    return x, xq
+
+
+def _gmm_injected(cov_type: str, seed: int):
+    """A FIXED (weights, means, precisions) init for the exact-parity cases.
+
+    With all three injected there is no RNG anywhere in the fit, so mlrs and
+    sklearn run byte-comparable EM from the same starting point and every fitted
+    attribute — including ``lower_bound_`` and ``n_iter_`` — must agree to 1e-5.
+    These cases are the ones that pin the ALGORITHM; the `init_params` cases pin
+    the initializations.
+    """
+    rng = np.random.default_rng(seed + 4242)
+    k, d = GMM_K, GMM_N_FEATURES
+    weights = np.full(k, 1.0 / k)
+    # Offset from the true centers so EM has real work to do, but close enough
+    # that it lands in the global optimum.
+    means = np.array(
+        [
+            [1.5, -1.0, 0.5, 0.5],
+            [7.0, 8.0, 1.0, -1.0],
+            [-7.5, 5.0, 8.0, -5.0],
+        ]
+    )
+    base = np.eye(d) + 0.15 * rng.standard_normal((d, d))
+    spd = base @ base.T + d * np.eye(d)
+    if cov_type == "full":
+        prec = np.stack([spd * (1.0 + 0.1 * i) for i in range(k)])
+    elif cov_type == "tied":
+        prec = spd
+    elif cov_type == "diag":
+        prec = np.stack([np.diag(spd) * (1.0 + 0.1 * i) for i in range(k)])
+    else:
+        prec = np.array([1.0 + 0.1 * i for i in range(k)])
+    return weights, means, prec
+
+
+def gen_gaussian_mixture(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the GaussianMixture full-parameter-surface fixture (MIX-01).
+
+    Two families of cases, because the estimator has two independently testable
+    halves:
+
+    1. ``{cov}_{init}`` — the 4x4 cross of ``covariance_type`` x
+       ``init_params``, each fitted to machine precision. These pin that mlrs's
+       four covariance parameterizations and four initializations all reach
+       sklearn's optimum, up to the component permutation the init chooses.
+    2. ``inj_{cov}`` — the same four covariance types with ``weights_init`` /
+       ``means_init`` / ``precisions_init`` all supplied, which removes the RNG
+       entirely. These pin the EM ARITHMETIC exactly: ``lower_bound_``,
+       ``n_iter_``, ``converged_``, the scoring surface (``predict`` /
+       ``predict_proba`` / ``score_samples``), and ``bic`` / ``aic``.
+    3. ``reg{n}_{cov}`` — a ``reg_covar`` sweep on the injected init, since
+       ``reg_covar`` is the one numeric hyperparameter that changes the fitted
+       covariance directly rather than through convergence.
+
+    Requires ``scikit-learn==1.9.0``.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    x, xq = _gmm_design(seed, dtype)
+    n, d, k = GMM_N_SAMPLES, GMM_N_FEATURES, GMM_K
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {"X": c(x), "Xq": c(xq)}
+
+    def record(name, est, with_scoring: bool):
+        out[f"weights_{name}"] = c(est.weights_)
+        out[f"means_{name}"] = c(est.means_)
+        out[f"cov_{name}"] = c(np.ravel(est.covariances_))
+        out[f"prec_chol_{name}"] = c(np.ravel(est.precisions_cholesky_))
+        out[f"lower_bound_{name}"] = c([est.lower_bound_])
+        # sklearn's per-iteration bound trace for the WINNING restart (length
+        # `n_iter_`). Recorded for every case: it is the only fitted attribute
+        # that pins the SHAPE of the ascent rather than just its endpoint, so a
+        # convergence rule that lands on the right answer by a different route
+        # fails here and nowhere else.
+        out[f"lower_bounds_{name}"] = c(np.asarray(est.lower_bounds_))
+        out[f"n_iter_{name}"] = c([est.n_iter_])
+        out[f"converged_{name}"] = c([1.0 if est.converged_ else 0.0])
+        out[f"labels_{name}"] = c(est.predict(x))
+        if with_scoring:
+            out[f"predict_{name}"] = c(est.predict(xq))
+            out[f"proba_{name}"] = c(np.ravel(est.predict_proba(xq)))
+            out[f"score_samples_{name}"] = c(est.score_samples(xq))
+            out[f"bic_{name}"] = c([est.bic(xq)])
+            out[f"aic_{name}"] = c([est.aic(xq)])
+            out[f"n_parameters_{name}"] = c([est._n_parameters()])
+
+    # --- family 1: covariance_type x init_params, converged ----------------- #
+    for cov in GMM_COV_TYPES:
+        for init in GMM_INIT_PARAMS:
+            est = GaussianMixture(
+                n_components=k,
+                covariance_type=cov,
+                tol=GMM_TOL_TIGHT,
+                max_iter=GMM_MAX_ITER_TIGHT,
+                n_init=1,
+                init_params=init,
+                random_state=0,
+            ).fit(x)
+            record(f"{cov}_{init.replace('-', '')}", est, with_scoring=False)
+
+    # --- family 2: fully injected init (no RNG anywhere) -------------------- #
+    for cov in GMM_COV_TYPES:
+        w0, m0, p0 = _gmm_injected(cov, seed)
+        out[f"winit_{cov}"] = c(w0)
+        out[f"minit_{cov}"] = c(m0)
+        out[f"pinit_{cov}"] = c(np.ravel(p0))
+        est = GaussianMixture(
+            n_components=k,
+            covariance_type=cov,
+            tol=1e-8,
+            max_iter=200,
+            n_init=1,
+            weights_init=w0,
+            means_init=m0,
+            precisions_init=p0,
+        ).fit(x)
+        record(f"inj_{cov}", est, with_scoring=True)
+
+        # A hard single-iteration case: `max_iter=1` leaves no room for two
+        # engines to converge to the same place by different routes, so it is
+        # the strictest possible test of ONE E-step plus ONE M-step.
+        est1 = GaussianMixture(
+            n_components=k,
+            covariance_type=cov,
+            tol=0.0,
+            max_iter=1,
+            n_init=1,
+            weights_init=w0,
+            means_init=m0,
+            precisions_init=p0,
+        ).fit(x)
+        record(f"iter1_{cov}", est1, with_scoring=False)
+
+    # --- family 3: the reg_covar sweep on the injected init ----------------- #
+    for i, reg in enumerate((1e-6, 1e-2, 1.0)):
+        for cov in GMM_COV_TYPES:
+            w0, m0, p0 = _gmm_injected(cov, seed)
+            est = GaussianMixture(
+                n_components=k,
+                covariance_type=cov,
+                tol=1e-8,
+                max_iter=200,
+                n_init=1,
+                reg_covar=reg,
+                weights_init=w0,
+                means_init=m0,
+                precisions_init=p0,
+            ).fit(x)
+            record(f"reg{i}_{cov}", est, with_scoring=False)
+
+    # Every `init_params` route must land on the SAME optimum (up to a component
+    # permutation) for a given `covariance_type` — that is the premise of family
+    # 1, and it is asserted HERE so a bad fixture cannot be committed silently.
+    for cov in GMM_COV_TYPES:
+        ref = np.sort(out[f"lower_bound_{cov}_kmeans"].astype(np.float64))
+        for init in GMM_INIT_PARAMS:
+            got = out[f"lower_bound_{cov}_{init.replace('-', '')}"].astype(np.float64)
+            assert np.allclose(got, ref, atol=1e-6, rtol=1e-6), (
+                f"gen_gaussian_mixture: covariance_type='{cov}' init_params="
+                f"'{init}' converged to lower_bound {got} but 'kmeans' reached "
+                f"{ref} — the design is not separable enough for an "
+                "init-independent oracle"
+            )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"gaussian_mixture_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -5610,6 +5838,11 @@ def main() -> None:
     # both n_samples <=> n_features branches, hyperpriors, inits, scores, weights.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_bayesian_ridge(dtype=dtype)}")
+    # GaussianMixture FULL parameter surface (MIX-01): the covariance_type x
+    # init_params cross fitted to machine precision, plus fully-injected-init
+    # cases that remove the RNG entirely, plus a reg_covar sweep.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_gaussian_mixture(dtype=dtype)}")
     # PCA (DECOMP-01): tall (m>n) + wide (n_features>n_samples); svd_solver=full.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_pca(dtype=dtype, shape=PCA_TALL, n_components=PCA_N_COMPONENTS_TALL, kind='tall')}")

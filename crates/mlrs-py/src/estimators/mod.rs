@@ -35,6 +35,10 @@ pub mod ensemble;
 pub mod kernel;
 pub mod linear;
 pub mod manifold;
+// Probabilistic mixture models (MIX-01): `GaussianMixture`. The only wrapper
+// family whose fit never uploads on ANY backend — its engine is host-resident
+// by construction (`mlrs_backend::prims::gmm_host`).
+pub mod mixture;
 pub mod naive_bayes;
 pub mod neighbors;
 pub mod preprocessing;
