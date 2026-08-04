@@ -36,7 +36,7 @@ use crate::error::{AlgoError, BuildError};
 use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
-    ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL,
+    ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL, non_negative_x_error,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -313,10 +313,7 @@ where
             },
         );
         if let Some((_, v)) = first_invalid {
-            return Err(AlgoError::InvalidLabels {
-                estimator: "multinomial_nb",
-                reason: format!("input X must be finite and non-negative (got {v})"),
-            });
+            return Err(non_negative_x_error("multinomial_nb", "MultinomialNB", v));
         }
 
         // class_count_[c] = #rows of class c.
@@ -438,7 +435,7 @@ where
         // CR-01 / T-11-02: a negative / NaN query row is equally invalid for the
         // count model — reject it before the GEMM (sklearn rejects at predict too).
         let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        validate_non_negative_counts("multinomial_nb", &x_host)?;
+        validate_non_negative_counts("multinomial_nb", "MultinomialNB", &x_host)?;
         let n_classes = self.classes_.len();
         // raw[i,c] = Σ_j X[i,j] · flp[c,j] = (X @ flp.T)[i,c]. The stored flp buffer
         // is (n_classes, n_features); transb=true reads it as (n_features, n_classes).
@@ -579,14 +576,12 @@ pub(crate) fn validate_discrete_alpha(
 /// count-based fits/predicts reuse it without a base struct (D-03).
 pub(crate) fn validate_non_negative_counts(
     estimator: &'static str,
+    sklearn_name: &str,
     x_host: &[f64],
 ) -> Result<(), AlgoError> {
     for &v in x_host {
         if !v.is_finite() || v < 0.0 {
-            return Err(AlgoError::InvalidLabels {
-                estimator,
-                reason: format!("input X must be finite and non-negative (got {v})"),
-            });
+            return Err(non_negative_x_error(estimator, sklearn_name, v));
         }
     }
     Ok(())

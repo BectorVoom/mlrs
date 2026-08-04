@@ -92,6 +92,10 @@ pub mod hist_gradient_boosting;
 // bit-identically on a persistent worker pool, because `cubecl-cpu` runs one
 // OS thread per unit and the level pipeline is thousands of tiny launches.
 pub(crate) mod hgb_host;
+// The shared host worker-pool primitives (barrier + disjoint-slice handle +
+// the reusable task-dispatch pool) every cpu arm synchronizes on; extracted
+// from `hgb_host`, which was where they were first measured and tuned.
+pub(crate) mod host_pool;
 pub mod eig;
 pub mod gemm;
 pub mod kmeans;

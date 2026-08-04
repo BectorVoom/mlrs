@@ -150,6 +150,281 @@ where
     (coef, intercept, labels)
 }
 
+/// ONE-VS-REST MULTICLASS against the liblinear oracle.
+///
+/// sklearn's `LinearSVC` fits `n_classes` independent one-vs-rest sub-problems
+/// and stacks them, so a 3-class fit has a `(3, d)` `coef_` and a `(3,)`
+/// `intercept_`. Three things are checked, in increasing order of what they can
+/// catch:
+///
+/// 1. the SHAPES — a `(1, d)` binary-style result would fail here first;
+/// 2. the `decision_function` values, row-major `(n_query, 3)`, which is where a
+///    transposed or mis-strided `coef_` shows up. Labels alone would NOT catch
+///    it: a permuted decision matrix still argmaxes to plausible classes;
+/// 3. the predicted LABELS, exactly (integers, no band) — the hard gate.
+fn multiclass_case<F>(case: &OracleCase, band: f64, what: &str)
+where
+    F: Float + CubeElement + Pod,
+{
+    const K: usize = 3;
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_host: Vec<F> = case.expect_f64("X").iter().map(|&v| f64_to::<F>(v)).collect();
+    let y_host: Vec<F> = case.expect_f64("y").iter().map(|&v| f64_to::<F>(v)).collect();
+    let xq_host: Vec<F> = case.expect_f64("Xq").iter().map(|&v| f64_to::<F>(v)).collect();
+    let n_samples = y_host.len();
+    let n_features = x_host.len() / n_samples;
+    let n_query = xq_host.len() / n_features;
+
+    let clf = LinearSVC::<F>::builder()
+        .loss(Loss::SquaredHinge)
+        .penalty(Penalty::L2)
+        .c(SVM_C)
+        .intercept_scaling(SVM_INTERCEPT_SCALING)
+        .fit_intercept(true)
+        .max_iter(SVM_MAX_ITER)
+        .tol(1e-4)
+        .build::<F>()
+        .expect("LinearSVC builds with valid hyperparameters")
+        .fit_from_host_slice(&mut pool, &x_host, &y_host, (n_samples, n_features))
+        .expect("multiclass LinearSVC::fit");
+
+    // 1. shapes.
+    assert_eq!(
+        clf.classes().len(),
+        K,
+        "{what}: three distinct labels give three classes"
+    );
+    assert_eq!(
+        clf.n_coef_rows(),
+        K,
+        "{what}: a multiclass fit stacks ONE coef_ row per class (sklearn's \
+         (n_classes, d)), not the binary single row"
+    );
+    let coef = clf.coef(&pool);
+    assert_eq!(
+        coef.len(),
+        K * n_features,
+        "{what}: coef_ is n_classes x n_features"
+    );
+    assert_eq!(
+        clf.intercepts(&pool).len(),
+        K,
+        "{what}: one intercept per class"
+    );
+
+    // 2. decision_function, row-major (n_query, K).
+    let dec = clf
+        .decision_from_host(&mut pool, &xq_host, (n_query, n_features))
+        .expect("decision_function after fit");
+    assert!(dec.operand_finite, "{what}: the fixture query is finite");
+    assert_eq!(dec.n_columns, K, "{what}: decision has one column per class");
+    let got_dec: Vec<f64> = dec.values.iter().map(|&v| host_to_f64(v)).collect();
+    assert_band(
+        &got_dec,
+        case.expect_f64("decision"),
+        band,
+        &format!("{what} decision_function"),
+    );
+
+    // 3. HARD GATE: the labels match sklearn exactly.
+    let labels = clf
+        .predict_labels_from_host(&mut pool, &xq_host, (n_query, n_features))
+        .expect("predict_labels after fit");
+    let want: Vec<i32> = case
+        .expect_f64("predict")
+        .iter()
+        .map(|&v| v.round() as i32)
+        .collect();
+    assert_eq!(
+        labels.values, want,
+        "{what}: multiclass predict labels match sklearn EXACTLY"
+    );
+}
+
+#[test]
+fn multiclass_oracle_f32() {
+    let case = load_npz(fixture("linear_svc_multiclass_f32_seed42.npz"))
+        .expect("load linear_svc_multiclass_f32");
+    multiclass_case::<f32>(&case, COEF_BAND_F32, "multiclass f32");
+}
+
+#[test]
+fn multiclass_oracle_f64() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let case = load_npz(fixture("linear_svc_multiclass_f64_seed42.npz"))
+        .expect("load linear_svc_multiclass_f64");
+    multiclass_case::<f64>(&case, COEF_BAND_F64, "multiclass f64");
+}
+
+/// The BINARY fit must not have become a 2-class one-vs-rest fit.
+///
+/// sklearn solves a binary target ONCE and reports a `(1, d)` `coef_`; the
+/// obvious way to write the OvR loop — iterate `classes_` unconditionally —
+/// would instead do two solves and report `(2, d)`. That is twice the work AND
+/// a shape sklearn never produces, and every binary oracle assertion would
+/// still pass on `coef_[0]`, so it needs its own gate.
+#[test]
+fn binary_fit_stays_a_single_solve() {
+    let case = load_npz(fixture("linear_svc_f32_seed42.npz")).expect("load linear_svc_f32");
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_host: Vec<f32> = case.expect_f64("X").iter().map(|&v| f64_to::<f32>(v)).collect();
+    let y_host: Vec<f32> = case.expect_f64("y").iter().map(|&v| f64_to::<f32>(v)).collect();
+
+    let clf = LinearSVC::<f32>::builder()
+        .build::<f32>()
+        .expect("defaults build")
+        .fit_from_host_slice(&mut pool, &x_host, &y_host, (N_SAMPLES, N_FEATURES))
+        .expect("binary fit");
+
+    assert_eq!(clf.classes().len(), 2, "the fixture target is binary");
+    assert_eq!(
+        clf.n_coef_rows(),
+        1,
+        "a binary fit is ONE solve with a (1, d) coef_ — not two one-vs-rest rows"
+    );
+    assert_eq!(clf.coef(&pool).len(), N_FEATURES);
+    assert_eq!(clf.intercepts(&pool).len(), 1);
+}
+
+/// A single-class target is rejected, and with sklearn's wording.
+#[test]
+fn single_class_target_is_rejected() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x = vec![1.0f32; 40];
+    let y = vec![1.0f32; 10];
+    // `expect_err` would need `Debug` on the fitted estimator (it holds device
+    // handles and deliberately does not derive it), so the error is taken by
+    // match.
+    let msg = match LinearSVC::<f32>::builder()
+        .build::<f32>()
+        .expect("defaults build")
+        .fit_from_host_slice(&mut pool, &x, &y, (10, 4))
+    {
+        Ok(_) => panic!("a one-class target cannot be fitted"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("at least 2 classes"),
+        "the one-class rejection should say so plainly, got: {msg}"
+    );
+}
+
+/// `fit_from_host_slice` is the SAME fit, only reached without uploading the
+/// design (SVM-FIT-CPU). It exists purely to skip copies, so it must produce a
+/// BIT-IDENTICAL model — not one within the oracle band, which would hide a
+/// real divergence behind a tolerance the device path already needs.
+///
+/// Both ingresses are run on the same fixture and their `coef_`/`intercept_`
+/// compared exactly. `Vec<F>` has no float band to hide behind: `assert_eq!`
+/// on the raw fitted values is the whole check.
+fn host_slice_fit_matches_device_fit<F>(case: &OracleCase)
+where
+    F: Float + CubeElement + Pod,
+{
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let x_host: Vec<F> = case.expect_f64("X").iter().map(|&v| f64_to::<F>(v)).collect();
+    let y_host: Vec<F> = case.expect_f64("y").iter().map(|&v| f64_to::<F>(v)).collect();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &x_host);
+    let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_host);
+
+    let build = || {
+        LinearSVC::<F>::builder()
+            .loss(Loss::SquaredHinge)
+            .penalty(Penalty::L2)
+            .c(SVM_C)
+            .intercept_scaling(SVM_INTERCEPT_SCALING)
+            .fit_intercept(true)
+            .max_iter(SVM_MAX_ITER)
+            .tol(1e-4)
+            .build::<F>()
+            .expect("LinearSVC builds with valid hyperparameters")
+    };
+
+    let via_device = build()
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("device-ingress fit");
+    let via_host = build()
+        .fit_from_host_slice(&mut pool, &x_host, &y_host, (N_SAMPLES, N_FEATURES))
+        .expect("host-slice fit");
+
+    assert_eq!(
+        via_host.coef(&pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+        via_device.coef(&pool).iter().map(|&v| host_to_f64(v)).collect::<Vec<_>>(),
+        "the no-upload ingress must not change coef_ by even one ULP"
+    );
+    assert_eq!(
+        host_to_f64(via_host.intercept(&pool)),
+        host_to_f64(via_device.intercept(&pool)),
+        "the no-upload ingress must not change intercept_ by even one ULP"
+    );
+    assert_eq!(
+        via_host.classes(),
+        via_device.classes(),
+        "both ingresses infer the same classes_"
+    );
+}
+
+#[test]
+fn host_slice_fit_matches_device_fit_f32() {
+    let case = load_npz(fixture("linear_svc_f32_seed42.npz")).expect("load linear_svc_f32");
+    host_slice_fit_matches_device_fit::<f32>(&case);
+}
+
+#[test]
+fn host_slice_fit_matches_device_fit_f64() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let case = load_npz(fixture("linear_svc_f64_seed42.npz")).expect("load linear_svc_f64");
+    host_slice_fit_matches_device_fit::<f64>(&case);
+}
+
+/// A host-slice fit rejects a malformed geometry with the SAME typed error the
+/// device ingress raises, rather than reading out of bounds (ASVS V5). The
+/// slice path cannot reuse `validate_geometry` (it has no `DeviceArray` length
+/// to read), so its guard is written separately and needs its own gate.
+#[test]
+fn host_slice_fit_rejects_bad_geometry() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x = vec![1.0f32; 40];
+    let y = vec![1.0f32; 10];
+    let build = || {
+        LinearSVC::<f32>::builder()
+            .build::<f32>()
+            .expect("defaults build")
+    };
+    // x.len() disagrees with (n, d).
+    assert!(
+        build()
+            .fit_from_host_slice(&mut pool, &x, &y, (10, 5))
+            .is_err(),
+        "a design whose length disagrees with (n, d) is rejected"
+    );
+    // y is not one-per-sample.
+    assert!(
+        build()
+            .fit_from_host_slice(&mut pool, &x, &y[..4], (10, 4))
+            .is_err(),
+        "a target vector that is not one-per-sample is rejected"
+    );
+    // zero dims.
+    assert!(
+        build()
+            .fit_from_host_slice(&mut pool, &x, &y, (0, 4))
+            .is_err(),
+        "a zero-row design is rejected"
+    );
+}
+
 /// HARD GATE: predict labels match sklearn EXACTLY (integers, no band), f32.
 #[test]
 fn exact_labels_f32() {

@@ -42,10 +42,9 @@ use crate::error::{AlgoError, BuildError};
 use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::multinomial_nb::{
     decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
-    validate_non_negative_counts,
 };
 use crate::naive_bayes::nb_common::{
-    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize, PAR_TABLE_MAX_ENTRIES,
+    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize, PAR_TABLE_MAX_ENTRIES, non_negative_x_error,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -154,13 +153,21 @@ const WORKERS_ENV: &str = "MLRS_BERNNB_WORKERS";
 /// every row `i` of the chunk, where `c = class_of_row[i]`.
 ///
 /// Returns the flat index (in the WHOLE matrix — `flat_base` is the chunk's
-/// offset) and value of the first element that is not finite and non-negative,
-/// or `None`. Reporting the flat index lets the parallel driver pick the FIRST
-/// offender in row-major order, so the error message does not depend on the
-/// worker count. The predicate is written `!xf.is_finite() || xf < 0.0` — the
-/// `is_finite` arm is what rejects a `NaN`, for which every ordering comparison
-/// (including `xf > threshold`) is false and which would otherwise be silently
-/// counted as a non-occurrence.
+/// offset) and value of the first NON-FINITE element, or `None`. Reporting the
+/// flat index lets the parallel driver pick the FIRST offender in row-major
+/// order, so the error message does not depend on the worker count. A `NaN` has
+/// to be rejected because every ordering comparison against it (including
+/// `xf > threshold`) is false, so it would otherwise be silently counted as a
+/// non-occurrence.
+///
+/// A NEGATIVE value is NOT an error on this arm. sklearn's `BernoulliNB` does
+/// not call `check_non_negative` — with a threshold, a negative entry is
+/// meaningful input that falls below it and binarizes to 0, exactly like any
+/// other sub-threshold value. Rejecting it made mlrs refuse fits sklearn
+/// accepts (and made `BernoulliNB` the one variant whose declared
+/// `input_tags.positive_only` could not match sklearn's). The unbinarized arm
+/// ([`count_chunk_raw`]) still rejects negatives, because there the values ARE
+/// the counts.
 ///
 /// Counts are `u32`: a count is bounded by the chunk's row count, and
 /// [`chunk_rows`] caps a chunk at `u32::MAX` rows. That halves the accumulator
@@ -184,38 +191,50 @@ where
     {
         let acc = &mut table[c * n_features..(c + 1) * n_features];
         // Validity folds in BRANCH-FREE (`&`, never `&&`) and is inspected once
-        // per row — see [`locate_invalid`]. The `!is_finite() || < 0.0` test is
-        // re-expressed as the equivalent inclusive `[0, f64::MAX]` interval so
-        // both bounds are loop-invariant: every finite non-negative value lies
-        // inside it, while `-inf`, a negative, `+inf` (`> f64::MAX`) and `NaN`
-        // (every ordering comparison against which is false) all fall outside.
+        // per row — see [`locate_invalid`]. The test is an inclusive interval so
+        // both bounds are loop-invariant.
+        //
+        // The interval is `[f64::MIN, f64::MAX]`, i.e. FINITE — not
+        // `[0, f64::MAX]`. A negative value is valid on this arm: sklearn's
+        // `BernoulliNB` never calls `check_non_negative`, and with a threshold a
+        // negative entry is meaningful input that binarizes to 0, no different
+        // from any other sub-threshold value. Only `+inf` (`> MAX`), `-inf`
+        // (`< MIN`) and `NaN` (every ordering comparison against which is false,
+        // so it would otherwise be silently counted as a non-occurrence) fall
+        // outside. The unbinarized arm ([`count_chunk_raw`]) keeps `0.0` as the
+        // lower bound, because there the raw values ARE the counts.
         let mut ok = true;
         for (&xv, a) in row.iter().zip(acc.iter_mut()) {
             let xf = host_to_f64(xv);
-            ok &= (xf >= 0.0) & (xf <= f64::MAX);
+            ok &= (xf >= f64::MIN) & (xf <= f64::MAX);
             *a += u32::from(xf > threshold);
         }
         if !ok {
-            return Some(locate_invalid::<F>(row, flat_base + r * n_features));
+            return Some(locate_invalid::<F>(row, flat_base + r * n_features, f64::MIN));
         }
     }
     None
 }
 
-/// Pin the exact flat index and value of the first element of `row` that is not
-/// finite-and-non-negative, given that the caller's branch-free fold already
-/// established the row contains one. `flat_base` is `row`'s offset in the WHOLE
+/// Pin the exact flat index and value of the first element of `row` outside the
+/// caller's valid interval `[lo, f64::MAX]`, given that the caller's branch-free
+/// fold already established the row contains one. `lo` MUST be the same bound
+/// the fold used, or this walks past the element that actually failed and hits
+/// the `unreachable!`. The binarizing arms pass `f64::MIN` (finite-only: a
+/// negative is valid input there — sklearn's `BernoulliNB` never rejects it, it
+/// just binarizes to 0, see [`count_chunk_binarized`]) and the unbinarized arm
+/// passes `0.0` (the raw values ARE the counts). `flat_base` is `row`'s offset in the WHOLE
 /// matrix, so the reported index is worker-count independent.
 ///
 /// Cold path: it runs at most once per fit, on the row that fails.
 #[inline(never)]
-fn locate_invalid<F>(row: &[F], flat_base: usize) -> (usize, f64)
+fn locate_invalid<F>(row: &[F], flat_base: usize, lo: f64) -> (usize, f64)
 where
     F: Float + CubeElement + Pod,
 {
     for (j, &xv) in row.iter().enumerate() {
         let xf = host_to_f64(xv);
-        if !xf.is_finite() || xf < 0.0 {
+        if !((xf >= lo) & (xf <= f64::MAX)) {
             return (flat_base + j, xf);
         }
     }
@@ -251,7 +270,7 @@ where
         let mut ok = true;
         for (&xv, a) in row.iter().zip(acc.iter_mut()) {
             let xf = host_to_f64(xv);
-            ok &= (xf >= 0.0) & (xf <= f64::MAX);
+            ok &= (xf >= f64::MIN) & (xf <= f64::MAX);
             // A SELECT, not an `if`. The occurrence predicate reads the data, so
             // as a branch it is unpredictable — at BernoulliNB's ~30 % density
             // this one `if` cost the weighted arm 2.16x the unweighted arm's cpu
@@ -260,7 +279,7 @@ where
             *a += if xf > threshold { w } else { 0.0 };
         }
         if !ok {
-            return Some(locate_invalid::<F>(row, flat_base + r * n_features));
+            return Some(locate_invalid::<F>(row, flat_base + r * n_features, f64::MIN));
         }
     }
     None
@@ -295,7 +314,7 @@ where
             *a += w * xf;
         }
         if !ok {
-            return Some(locate_invalid::<F>(row, flat_base + r * n_features));
+            return Some(locate_invalid::<F>(row, flat_base + r * n_features, 0.0));
         }
     }
     None
@@ -559,10 +578,7 @@ where
             .filter_map(|(_, e)| *e)
             .min_by(|(a, _), (b, _)| a.cmp(b))
         {
-            return Err(AlgoError::InvalidLabels {
-                estimator: "bernoulli_nb",
-                reason: format!("input X must be finite and non-negative (got {xf})"),
-            });
+            return Err(non_negative_x_error("bernoulli_nb", "BernoulliNB", xf));
         }
         let mut feature_count: Vec<f64> = vec![0.0; table_len];
         for (table, _) in &parts {
@@ -708,9 +724,17 @@ where
 
         // Binarize the query the same way as fit BEFORE the GEMM.
         let mut xq_bin: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        // CR-01 / T-11-02: a negative / NaN query row is equally invalid — reject it
-        // before binarization + the GEMM (sklearn rejects at predict too).
-        validate_non_negative_counts("bernoulli_nb", &xq_bin)?;
+        // CR-01 / T-11-02: a NaN query entry is invalid — every ordering
+        // comparison against it is false, so it would binarize to a silent 0.
+        // A NEGATIVE entry is only invalid on the `binarize = None` arm, where
+        // the raw values ARE the counts; with a threshold it binarizes to 0
+        // exactly as sklearn's BernoulliNB does. Same rule as the fit sweep.
+        if let Some(&bad) = xq_bin
+            .iter()
+            .find(|&&v| !v.is_finite() || (self.binarize.is_none() && v < 0.0))
+        {
+            return Err(non_negative_x_error("bernoulli_nb", "BernoulliNB", bad));
+        }
         binarize_host(&mut xq_bin, self.binarize);
         let xq_bin_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(
             pool,

@@ -36,6 +36,7 @@ use mlrs_core::{host_to_f64, PrimError};
 use crate::error::{AlgoError, BuildError};
 use crate::linear::elastic_net::{predict_linear, predict_linear_from_host};
 use crate::linear::linear_svc::svm_lbfgs_fit;
+use mlrs_backend::prims::svm_objective::SvmDesign;
 use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
@@ -308,7 +309,7 @@ where
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<LinearSVR<F, Fitted>, AlgoError> {
-        let (n_samples, n_features) = shape;
+        let (n_samples, _) = shape;
 
         // --- T-10-04-02 / ASVS V5: data-DEPENDENT geometry guard BEFORE any
         //     launch (the data-INDEPENDENT params were validated at build()). ---
@@ -325,6 +326,63 @@ where
                 len: y.len(),
             }));
         }
+        let y_host = y.to_host(pool);
+        self.fit_core(pool, SvmDesign::Device(x), &y_host, shape)
+    }
+}
+
+impl<F> LinearSVR<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// [`Fit::fit`] over HOST slices — the no-upload ingress, the twin of
+    /// [`LinearSVC::fit_from_host_slice`](crate::linear::linear_svc::LinearSVC::fit_from_host_slice)
+    /// and sharing its reasoning verbatim: the cpu objective reads the design
+    /// from host memory, so uploading it first costs three full passes over
+    /// `n·d` elements for nothing.
+    ///
+    /// `x` is the `n × d` row-major design and `y` the length-`n` regression
+    /// target, both borrowed from the caller. The solve is bit-identical to
+    /// [`Fit::fit`]'s.
+    pub fn fit_from_host_slice(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        y: &[F],
+        shape: (usize, usize),
+    ) -> Result<LinearSVR<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+
+        // --- The slice twin of the D-08 geometry guard: `validate_geometry`
+        //     reads a DeviceArray's length, which we do not have here. ---
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+        self.fit_core(pool, SvmDesign::Host(x), y, shape)
+    }
+
+    /// The solve itself, shared by both ingresses (D-03).
+    fn fit_core(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        design: SvmDesign<'_, F>,
+        y_host: &[F],
+        shape: (usize, usize),
+    ) -> Result<LinearSVR<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
 
         // The regression targets are the per-sample `y` (no ±1 remap — SVR is a
         // regressor). Reuse the SHARED svm_lbfgs_fit with the squared-eps-insensitive
@@ -334,14 +392,13 @@ where
         //   ∂r/∂m = −1. viol = max(0,|r|−ε). ℓ = viol². dℓ/dm = 2·viol·∂viol/∂m.
         //   ∂viol/∂m = sign(r)·∂|r|/∂r·∂r/∂m... when viol>0: ∂|r|/∂r = sign(r),
         //   ∂r/∂m = −1, so ∂viol/∂m = −sign(r). Hence dℓ/dm = −2·sign(r)·viol.
-        let targets = y.to_host(pool);
-        let targets_f64: Vec<f64> = targets.iter().map(|&v| host_to_f64(v)).collect();
+        let targets_f64: Vec<f64> = y_host.iter().map(|&v| host_to_f64(v)).collect();
         // IN-03: `self.c` is already `f64`; use it directly (no identity cast).
         let c = self.c;
         let eps = self.config.epsilon;
         let (coef, intercept) = svm_lbfgs_fit::<F>(
             pool,
-            x,
+            design,
             &targets_f64,
             n_samples,
             n_features,

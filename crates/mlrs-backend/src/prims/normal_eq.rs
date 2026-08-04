@@ -421,6 +421,16 @@ fn scale_center(
 /// has already gated `fused_centering_available` through
 /// [`device_gram_applicable`], so the unfused fallback that function carries is
 /// unreachable here.
+///
+/// `col_sums_blocked`/`col_sums_reduce` gained a device-side WEIGHTED arm and a
+/// multi-TARGET `k` (`crate::prims::gram::column_means`'s weighted/multi-target
+/// fit); this caller wants neither — the scale here is a HOST-supplied `inv`
+/// (module docs, constraint 2: sklearn's `_rescale_data`-style `1/Σw`, already
+/// folded by the caller) rather than a device weight vector, and there is
+/// exactly one target column (`y`). So this always launches the `weighted = 0,
+/// k = 1` arm: a length-1 dummy `w`/`pwsum` buffer that the kernel's
+/// `weighted == 0` branch never indexes (see `column_means`'s identical dummy),
+/// and `k = 1` matches the single `ymean` slot this function already allocates.
 fn column_sums_scaled(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, f64>,
@@ -432,10 +442,18 @@ fn column_sums_scaled(
     DeviceArray<ActiveRuntime, f64>,
     DeviceArray<ActiveRuntime, f64>,
 ) {
+    const K: usize = 1;
     let (nb, rpb) = row_blocking(n, d);
     let psum_len = nb * d;
+    let pysum_len = nb * K;
     let psum = pool.acquire(psum_len * 8);
-    let pysum = pool.acquire(nb * 8);
+    let pysum = pool.acquire(pysum_len * 8);
+    // `weighted == 0` never indexes `w`/`pwsum`, but the launch still needs a
+    // real buffer to bind — one element, never read on this arm (the
+    // `column_means` precedent).
+    let pwsum_len = 1;
+    let pwsum = pool.acquire(pwsum_len * 8);
+    let dummy_w: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(pool, &[0.0f64]);
     let xmean = pool.acquire(d * 8);
     let ymean = pool.acquire(8);
     let client = pool.client().clone();
@@ -445,27 +463,63 @@ fn column_sums_scaled(
     // columns only while `c < d` (the `column_means` launch, verbatim).
     let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
     let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+    let w_arg = unsafe { ArrayArg::from_raw_parts(dummy_w.handle().clone(), dummy_w.len()) };
     let ps_arg = unsafe { ArrayArg::from_raw_parts(psum.clone(), psum_len) };
-    let py_arg = unsafe { ArrayArg::from_raw_parts(pysum.clone(), nb) };
+    let py_arg = unsafe { ArrayArg::from_raw_parts(pysum.clone(), pysum_len) };
+    let pw_arg = unsafe { ArrayArg::from_raw_parts(pwsum.clone(), pwsum_len) };
     let (cc, cd) = launch_cubes(nb, BLOCKED_CUBE_DIM);
     col_sums_blocked::launch::<f64, ActiveRuntime>(
-        &client, cc, cd, x_arg, y_arg, ps_arg, py_arg, n as u32, d as u32, nb as u32, rpb as u32,
+        &client,
+        cc,
+        cd,
+        x_arg,
+        y_arg,
+        w_arg,
+        ps_arg,
+        py_arg,
+        pw_arg,
+        n as u32,
+        d as u32,
+        K as u32,
+        nb as u32,
+        rpb as u32,
+        0, // weighted
     );
 
     let ps_arg2 = unsafe { ArrayArg::from_raw_parts(psum.clone(), psum_len) };
-    let py_arg2 = unsafe { ArrayArg::from_raw_parts(pysum.clone(), nb) };
+    let py_arg2 = unsafe { ArrayArg::from_raw_parts(pysum.clone(), pysum_len) };
+    let pw_arg2 = unsafe { ArrayArg::from_raw_parts(pwsum.clone(), pwsum_len) };
     let xm_arg = unsafe { ArrayArg::from_raw_parts(xmean.clone(), d) };
-    let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.clone(), 1) };
-    let (c2, d2) = super::launch_dims_1d_folded(d, crate::capability::gather_launch_width());
+    let ym_arg = unsafe { ArrayArg::from_raw_parts(ymean.clone(), K) };
+    // `d.max(k)`, the `column_means` rule (a `k` wider than `d` would otherwise
+    // leave the tail target means unwritten) — here `k = 1 <= d` always, so this
+    // is just `d`, but written the general way so a future `k > 1` here does not
+    // silently truncate.
+    let (c2, d2) =
+        super::launch_dims_1d_folded(d.max(K), crate::capability::gather_launch_width());
     col_sums_reduce::launch::<f64, ActiveRuntime>(
-        &client, c2, d2, ps_arg2, py_arg2, xm_arg, ym_arg, d as u32, nb as u32, inv,
+        &client,
+        c2,
+        d2,
+        ps_arg2,
+        py_arg2,
+        pw_arg2,
+        xm_arg,
+        ym_arg,
+        d as u32,
+        K as u32,
+        nb as u32,
+        inv,
+        0, // weighted
     );
 
     pool.release(psum, psum_len * 8);
-    pool.release(pysum, nb * 8);
+    pool.release(pysum, pysum_len * 8);
+    pool.release(pwsum, pwsum_len * 8);
+    dummy_w.release_into(pool);
     (
         DeviceArray::from_raw(xmean, d),
-        DeviceArray::from_raw(ymean, 1),
+        DeviceArray::from_raw(ymean, K),
     )
 }
 

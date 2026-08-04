@@ -543,7 +543,7 @@ fn fit_rejects_nonfinite_input() {
             .fit_from_host_slice(&mut pool, &x, &y, (2, 2), None)
             .err();
         assert!(
-            matches!(got, Some(AlgoError::InvalidLabels { .. })),
+            matches!(got, Some(AlgoError::InvalidFeatureInput { .. })),
             "a {label} feature value must be rejected, got {got:?}"
         );
     }
@@ -571,11 +571,11 @@ fn rejection_reports_first_offender_regardless_of_chunking() {
         .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
         .err();
     match got {
-        Some(AlgoError::InvalidLabels { reason, .. }) => assert!(
+        Some(AlgoError::InvalidFeatureInput { reason, .. }) => assert!(
             reason.contains("-3"),
             "must report the EARLIEST offender at flat index {early}, got: {reason}"
         ),
-        other => panic!("expected InvalidLabels, got {other:?}"),
+        other => panic!("expected InvalidFeatureInput, got {other:?}"),
     }
 }
 

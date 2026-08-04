@@ -558,7 +558,7 @@ fn fit_rejects_nonfinite_input() {
             .fit_from_host_slice(&mut pool, &x, &y, (2, 2), None)
             .err();
         assert!(
-            matches!(got, Some(AlgoError::InvalidLabels { .. })),
+            matches!(got, Some(AlgoError::InvalidFeatureInput { .. })),
             "a {label} feature value must be rejected, got {got:?}"
         );
     }
@@ -573,9 +573,12 @@ fn rejection_reports_first_offender_regardless_of_chunking() {
     let (mut x, y, n, d, _c) = par_dataset();
     // Two invalid values, deliberately far apart so they land in DIFFERENT row
     // chunks on any plausible worker count.
+    // BOTH must be non-finite: a NEGATIVE value is no longer an offender on the
+    // binarizing arm (it thresholds to 0, exactly as sklearn's BernoulliNB does
+    // — see `count_chunk_binarized`), so using one here would test nothing.
     let early = 7 * d + 1;
     let late = (n - 5) * d + 2;
-    x[early] = -3.0;
+    x[early] = f64::NAN;
     x[late] = f64::INFINITY;
 
     let client = runtime::active_client();
@@ -586,12 +589,55 @@ fn rejection_reports_first_offender_regardless_of_chunking() {
         .fit_from_host_slice(&mut pool, &x, &y, (n, d), None)
         .err();
     match got {
-        Some(AlgoError::InvalidLabels { reason, .. }) => assert!(
-            reason.contains("-3"),
-            "must report the EARLIEST offender (-3 at flat index {early}), got: {reason}"
+        Some(AlgoError::InvalidFeatureInput { reason, .. }) => assert!(
+            reason.contains("NaN"),
+            "must report the EARLIEST offender (NaN at flat index {early}), got: {reason}"
         ),
-        other => panic!("expected InvalidLabels, got {other:?}"),
+        other => panic!("expected InvalidFeatureInput, got {other:?}"),
     }
+}
+
+/// A NEGATIVE feature value is VALID when a binarize threshold is set, and
+/// invalid only without one — sklearn's rule, which mlrs previously did not
+/// follow.
+///
+/// `sklearn.naive_bayes.BernoulliNB` never calls `check_non_negative`: with a
+/// threshold, `-3` is simply a value below it and binarizes to `0`, no
+/// different from `0.5` below a threshold of `1`. mlrs used to reject it, which
+/// refused fits sklearn accepts and made `BernoulliNB` the one discrete variant
+/// whose `input_tags.positive_only` could not be declared truthfully.
+///
+/// The `binarize = None` arm is the genuine exception and keeps the guard: with
+/// no threshold the raw values ARE the counts (sklearn assumes a
+/// already-binary X there), so a negative one would poison `feature_count_`.
+#[test]
+fn negative_features_are_valid_when_binarizing() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let y: Vec<f64> = vec![0.0, 1.0, 0.0, 1.0];
+    let x: Vec<f64> = vec![-3.0, 1.0, 0.5, -0.25, 1.0, -1.0, -2.0, 2.0];
+
+    // Default binarize = Some(0.0): accepted.
+    let fitted = BernoulliNB::<f64>::builder()
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&mut pool, &x, &y, (4, 2), None);
+    assert!(
+        fitted.is_ok(),
+        "a negative feature value binarizes to 0 and must be accepted, got {:?}",
+        fitted.err()
+    );
+
+    // binarize = None: the raw values are the counts, so a negative is rejected.
+    let unbinarized = BernoulliNB::<f64>::builder()
+        .binarize(None)
+        .build::<f64>()
+        .expect("builds")
+        .fit_from_host_slice(&mut pool, &x, &y, (4, 2), None);
+    assert!(
+        matches!(unbinarized.err(), Some(AlgoError::InvalidFeatureInput { .. })),
+        "without a threshold the values ARE counts, so a negative must be rejected"
+    );
 }
 
 /// The host-slice arm carries the slice twin of the `validate_geometry` guard:

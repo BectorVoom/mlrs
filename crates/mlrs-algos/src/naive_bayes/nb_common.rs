@@ -47,6 +47,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use crate::error::AlgoError;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
@@ -60,6 +61,37 @@ use mlrs_core::{host_to_f64, PrimError};
 /// `MultinomialNB` / `CategoricalNB` label decode + the categorical category
 /// index check) stay consistent if the tolerance is ever tuned.
 pub const NB_LABEL_INT_TOL: f64 = 1e-6;
+
+/// The count-based variants' `X`-domain rejection, worded the way scikit-learn
+/// words it.
+///
+/// `MultinomialNB`/`ComplementNB`/`CategoricalNB` read `X` as occurrence counts
+/// and call `check_non_negative` on it, which raises
+/// `"Negative values in data passed to {name} (input X)"`. sklearn's
+/// `check_positive_only_tag_during_fit` asserts on that exact phrase, and more
+/// importantly a user who catches sklearn's message should catch ours — so the
+/// phrase is reproduced verbatim and the offending value appended, rather than
+/// invented afresh.
+///
+/// A NON-FINITE entry gets its own wording: it is a different fault with a
+/// different sklearn message (`check_array`'s "Input contains NaN"), and the
+/// Python shim's `check_array` normally rejects it before Rust ever sees it, so
+/// this arm is the defence-in-depth path rather than the expected one.
+///
+/// `sklearn_name` is the sklearn CLASS name (`"MultinomialNB"`), not the
+/// snake-case estimator id — the message is the user-facing one.
+pub(crate) fn non_negative_x_error(
+    estimator: &'static str,
+    sklearn_name: &str,
+    v: f64,
+) -> AlgoError {
+    let reason = if v.is_finite() {
+        format!("Negative values in data passed to {sklearn_name} (input X) (got {v})")
+    } else {
+        format!("Input X contains an infinity or a value too large for its dtype (got {v})")
+    };
+    AlgoError::InvalidFeatureInput { estimator, reason }
+}
 
 /// Below this many `n_samples · n_features` elements a chunked host fit pass
 /// stays single-threaded: spawning a scoped worker costs ~30 µs, which dwarfs a
