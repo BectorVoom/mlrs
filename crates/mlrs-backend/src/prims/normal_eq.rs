@@ -44,7 +44,16 @@
 //! then folds), which moves the result by `~ε` — orders below the `1e-5` oracle
 //! contract. `bayesian_ridge_test.rs`'s host/device agreement test is the gate.
 //!
-//! Tests live in `crates/mlrs-backend/tests/` and
+//! Note what that gate does NOT cover: it is reached through
+//! [`device_gram_applicable`], which is `false` on the cpu backend, so under
+//! `--features cpu` both of its arms are the host sweep and the device path
+//! here never runs at all. `normal_eq_test.rs` calls
+//! [`centered_gram_xty_device`] directly for exactly that reason — it is what
+//! keeps this module's launch sites executable in cpu CI rather than only
+//! type-checked, which is the gap a stale `col_sums_*` argument list slipped
+//! through.
+//!
+//! Tests live in `crates/mlrs-backend/tests/normal_eq_test.rs` and
 //! `crates/mlrs-algos/tests/bayesian_ridge_test.rs` (AGENTS.md §2).
 
 use bytemuck::Pod;

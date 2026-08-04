@@ -1,0 +1,93 @@
+======================================================================
+mlrs RidgeClassifier on-device (fit + predict) CUDA probe -- run 4
+commit : 2ab6f593ba27a006b9f0c4c0982fe0e23259a3a0
+         2ab6f59 Give each perf-ladder rung its own BufferPool
+gpu    : Tesla T4, 15360 MiB, 580.82.07
+cpu    : Model name:  Intel(R) Xeon(R) CPU @ 2.00GHz (2 threads)
+======================================================================
+
+Transcribed from the Colab session before it was reclaimed by Google
+mid-session (the usual hazard — see scripts/colab_ridge_classifier.py). The
+run is verbatim; only the cubecl/cargo progress lines around it are dropped.
+
+----- A. correctness -----
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.84s
+  (ridge_classifier_device_test — device/host arm equivalence)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.12s
+  (ridge_classifier_test — the sklearn oracle suite; the f64 cases SELF-SKIP on
+   cuda, `supports_type(F64)` is false there — see the
+   mlrs-cubecl-cuda-f64-not-advertised note, unrelated to this change)
+
+----- B. fit + predict ladders, both arms forced (min-of-15) -----
+
+RidgeClassifier FIT — min-of-15, f32, upload INSIDE the timer, both arms forced
+        n     d    k    host (ms)  device (ms)   speedup
+    10000    16    2        1.552        1.488     1.04x
+    10000    64    3        8.976        4.448     2.02x
+   100000    16    3       15.162        9.900     1.53x
+   100000    16   26       62.965       24.069     2.62x
+   100000    64    3       81.397       36.797     2.21x
+   100000    64    5      162.683       37.437     4.35x
+   100000    64   10      138.286       42.336     3.27x
+   100000    64   26      266.625       55.255     4.83x
+   100000   128   10      364.602      120.075     3.04x
+   100000   128   26      629.079      108.849     5.78x
+   100000   256   10     1143.974      345.856     3.31x
+   100000   256   26     1695.676      367.504     4.61x
+
+  (The 100000x64 k=5 host figure, 162.7 ms, sits ABOVE its own k=10 neighbour
+   at 138.3 — a min-of-15 on a 2-vCPU shared VM still has that much spread on
+   the host arm. The device column does not show it: 37.4 vs 42.3. Treat the
+   host numbers as +/-20% and the trend, not any single rung, as the result.)
+
+RidgeClassifier PREDICT — min-of-15, f32, n_query=100000, upload INSIDE the timer
+    n_fit     d    k    host (ms)  device (ms)   speedup
+    10000    16    2        3.110        5.180     0.60x
+    10000    64    3       18.967       29.460     0.64x
+   100000    16    3        6.474        5.308     1.22x
+   100000    16   26       48.923        7.759     6.31x
+   100000    64    3       19.741       29.948     0.66x
+   100000    64    5       45.247       29.733     1.52x
+   100000    64   10       63.189       31.763     1.99x
+   100000    64   26      141.463       42.167     3.35x
+   100000   128   10      107.688       89.459     1.20x
+   100000   128   26      267.413      133.018     2.01x
+   100000   256   10      211.036      335.230     0.63x
+   100000   256   26      527.083      370.995     1.42x
+
+    (n=100000 d=16 k=26: 1/100000 near-tie label disagreements, all verified
+     within f32 rounding — the device kernel accumulates each class score in F,
+     the host widens to f64, so two classes within f32 rounding can order
+     differently. Every such row is checked against the host's own f64 scores.)
+
+test ridge_classifier_device_vs_host_ladder ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 153.65s
+
+======================================================================
+VERDICT
+======================================================================
+
+FIT: the fused device arm wins at every rung, 1.04x-5.78x, and the margin grows
+with n_classes exactly as the shared-Gram design predicts — at d=64 the host
+arm goes 81 -> 267 ms from k=3 to k=26 (its O(n*d*K) XtY term) while the device
+arm goes 36.8 -> 55.3. Forming the Gram ONCE is what that difference measures.
+
+PREDICT: wins in a k>=5, d<=128 rectangle (1.20x-6.31x, six rungs, no loss),
+loses outside it. That is the shipped dispatch gate. This is the first predict
+in the codebase where a device arm beats the host matvec at all — single-target
+Ridge predict measured 10-23x SLOWER on a P100 — and the two things that
+changed are both linear in K: K times the compute over the same transfer, and
+a fused argmax that shrinks the egress from m*k floats to m i32 labels.
+
+CAVEAT, and it is not small: the host column is the same code the cpu backend
+runs, but on Colab's 2-vCPU Xeon @2GHz. RIDGE-DEFAULT-CUDA measured the
+16-thread dev box at roughly 4x that on the same host arm. Divided by 4, the
+device fit would win ~1.2-1.4x at k=26 and LOSE at k<=3. That division is an
+extrapolation, not a measurement, and the local ladder
+
+    cargo test -p mlrs-algos --release --features cpu \
+      --test ridge_classifier_cuda_perf_test -- --ignored --nocapture
+
+is what would replace it with one. It was not run for this log: the dev box was
+saturated by a co-tenant job (load average 250-370 throughout), and a loaded
+box has inverted an mlrs-vs-sklearn verdict in this project before.
