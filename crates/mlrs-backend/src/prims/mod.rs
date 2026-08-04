@@ -28,6 +28,12 @@ pub mod gram;
 // backend where `center_columns` falls back to the per-column-round-trip
 // `column_reduce` and every launch costs an OS thread spawn.
 pub mod gram_host;
+// The parallel host Gaussian-mixture EM engine (MIX-01). Unlike the other
+// `*_host` prims this one is not a cpu-arm twin of a device kernel — it is the
+// WHOLE algorithm on every backend, because the EM loop is launch-bound,
+// `f64`-bound, and has an `O(k·d³)` serial factorization tail. See its module
+// docs for the three structural wins over sklearn's own implementation.
+pub mod gmm_host;
 // DEVICE arm of the same normal-equations formation, pinned to `f64`
 // accumulation whatever the estimator's own width (BAYES-GPU). `gram`'s Gram
 // accumulates in the element type, which `BayesianRidge`'s residual identity
@@ -96,6 +102,13 @@ pub(crate) mod hgb_host;
 // the reusable task-dispatch pool) every cpu arm synchronizes on; extracted
 // from `hgb_host`, which was where they were first measured and tuned.
 pub(crate) mod host_pool;
+// Huber-regression primal objective evaluator (HUBER-01): the margin matvec,
+// the inlier/outlier classification against `ε·σ`, the three scalar reductions
+// the `σ` derivative needs, and the `X̃ᵀg` gradient — all out of ONE fused pass
+// where scikit-learn's NumPy form walks the design five times and fancy-index
+// COPIES it twice per evaluation. Same cpu-host / device-GEMM split as
+// `svm_objective`, and the same reason for it.
+pub mod huber_objective;
 pub mod eig;
 pub mod gemm;
 pub mod kmeans;

@@ -16,27 +16,103 @@ from .base import MlrsBase
 
 
 class KMeans(ClusterMixin, MlrsBase):
-    """Lloyd's k-means, k-means++ init (CLUSTER-01).
+    """k-means clustering with sklearn's full parameter set (CLUSTER-01).
 
-    ``init='k-means++'`` is the only supported value in v1; ``random_state`` is
-    mapped to the Rust ``seed`` inside ``fit`` (``None`` -> a fixed default seed).
+    Every ``sklearn.cluster.KMeans`` ctor parameter is supported:
+
+    ``init``
+        ``'k-means++'``, ``'random'``, an array-like of shape
+        ``(n_clusters, n_features)``, or a callable
+        ``init(X, k, random_state=...)``. The array and callable forms are
+        resolved HERE (a callable is evaluated once, at ``fit``) and passed
+        down as an explicit init array, which is exactly how sklearn's
+        ``_init_centroids`` treats them.
+    ``n_init``
+        ``'auto'`` or a positive int. ``'auto'`` resolves as sklearn does:
+        1 for ``k-means++`` / an explicit init, 10 for ``'random'``.
+    ``algorithm``
+        ``'lloyd'`` or ``'elkan'``. Elkan is an exact triangle-inequality
+        acceleration — it returns the same fit as Lloyd, faster on
+        well-separated data, at the cost of an ``n x k`` bounds matrix.
+    ``verbose`` / ``copy_x``
+        Accepted for signature compatibility. mlrs never prints from the
+        library and never writes into the caller's ``X``, so neither has an
+        observable effect.
+    ``random_state``
+        ``None`` maps to a fixed default seed, so a default-constructed fit is
+        reproducible (sklearn's ``None`` draws from the global numpy RNG).
+
+    Fitted attributes: ``cluster_centers_``, ``labels_``, ``inertia_``,
+    ``n_iter_``.
     """
 
     def __init__(
         self,
         n_clusters=8,
         init="k-means++",
+        n_init="auto",
         max_iter=300,
         tol=1e-4,
+        verbose=0,
         random_state=None,
+        copy_x=True,
+        algorithm="lloyd",
         output_type="input",
     ):
+        # sklearn-faithful: store every ctor arg VERBATIM (no validation, no
+        # normalization) so ``get_params()``/``clone()`` round-trip exactly.
         self.n_clusters = n_clusters
         self.init = init
+        self.n_init = n_init
         self.max_iter = max_iter
         self.tol = tol
+        self.verbose = verbose
         self.random_state = random_state
+        self.copy_x = copy_x
+        self.algorithm = algorithm
         self.output_type = output_type
+
+    def _resolve_init(self, X, rows, cols):
+        """Split sklearn's polymorphic ``init`` into ``(init_str, init_array)``.
+
+        The string strategies pass straight through; an array-like or callable
+        becomes a flat row-major ``list[float]`` of length ``k * n_features``,
+        which is what ``PyKMeans`` takes as ``init_array`` (and which wins over
+        the string, mirroring ``_init_centroids``' own precedence).
+        """
+        init = self.init
+        if isinstance(init, str):
+            return init, None
+
+        if callable(init):
+            # sklearn calls ``init(X, k, random_state=rs)``. Pass a numpy
+            # RandomState seeded from ``random_state`` so a user callable that
+            # actually uses it stays reproducible.
+            rs = np.random.RandomState(
+                0 if self.random_state is None else int(self.random_state)
+            )
+            centers = init(X, self.n_clusters, random_state=rs)
+        else:
+            centers = init
+
+        arr = np.ascontiguousarray(centers, dtype=np.float64)
+        if arr.shape != (self.n_clusters, cols):
+            raise ValueError(
+                f"init has shape {arr.shape}, expected "
+                f"({self.n_clusters}, {cols})"
+            )
+        return "k-means++", arr.ravel().tolist()
+
+    def _resolve_n_init(self):
+        """``'auto'`` -> ``None`` (the extension's 'auto'); an int passes through."""
+        n_init = self.n_init
+        if isinstance(n_init, str):
+            if n_init != "auto":
+                raise ValueError(
+                    f"unknown n_init {n_init!r} (the only legal string is 'auto')"
+                )
+            return None
+        return int(n_init)
 
     def fit(self, X, y=None):
         xa, rows, cols = self._normalize(X)
@@ -45,7 +121,19 @@ class KMeans(ClusterMixin, MlrsBase):
         # value would fail with an opaque OverflowError. int() coercion mirrors
         # SpectralClustering.fit; None stays None (PyKMeans maps it to a default).
         seed = None if self.random_state is None else int(self.random_state)
-        obj = self._ext().KMeans(self.n_clusters, self.max_iter, self.tol, seed)
+        init_str, init_array = self._resolve_init(X, rows, cols)
+        obj = self._ext().KMeans(
+            self.n_clusters,
+            init_str,
+            init_array,
+            self._resolve_n_init(),
+            self.max_iter,
+            self.tol,
+            bool(self.verbose),
+            seed,
+            bool(self.copy_x),
+            self.algorithm,
+        )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
         self._post_fit(cols)
@@ -72,6 +160,26 @@ class KMeans(ClusterMixin, MlrsBase):
     def inertia_(self):
         self._check_fitted()
         return getattr(self._mlrs_obj, "inertia" + self._suffix())()
+
+    @property
+    def n_iter_(self):
+        """Iterations run by the restart that WON the ``n_init`` selection."""
+        self._check_fitted()
+        return self._mlrs_obj.n_iter_()
+
+    @property
+    def _algorithm(self):
+        """The algorithm that actually ran (``'elkan'`` degrades to ``'lloyd'``
+        at ``n_clusters == 1``). Private, matching sklearn's own spelling."""
+        self._check_fitted()
+        return self._mlrs_obj.algorithm_used()
+
+    @property
+    def _n_init(self):
+        """The restart count that actually ran, after ``'auto'`` resolution and
+        the explicit-init override. Private, matching sklearn's spelling."""
+        self._check_fitted()
+        return self._mlrs_obj.n_init_used()
 
 
 class DBSCAN(ClusterMixin, MlrsBase):

@@ -762,3 +762,198 @@ pub fn col_sqdiff_blocked<F: Float + CubeElement>(
         psumsq[tid] = acc;
     }
 }
+
+// ===========================================================================
+// Elkan (`algorithm='elkan'`) — triangle-inequality bound kernels
+//
+// Elkan is an EXACT acceleration of the Lloyd assignment, not a different
+// answer: from the same init it visits the same sequence of centers as
+// `dist_direct_2d` + `argmin_dist_rows`, but skips the `(sample, center)`
+// distances the triangle inequality proves cannot win. It carries, per sample,
+// an UPPER bound `u[i]` on the distance to its assigned center and `k` LOWER
+// bounds `l[i, c]` on the distance to every center, plus the `k × k` matrix of
+// HALF center-center distances `chd` and `dnc[c] = min_{j != c} chd[c, j]`
+// (both host-computed from the tiny `k × d` center mirror and uploaded).
+//
+// Bounds are TRUE Euclidean distances, not squared — the triangle inequality
+// does not hold under squaring. `dist_direct_2d`'s staging matrix is squared,
+// so [`elkan_seed_bounds`] takes the square root once at init.
+// ===========================================================================
+
+/// Seed Elkan's bounds from a FULL `n × k` squared-distance staging matrix
+/// (produced by [`dist_direct_2d_c4`] against the initial centers).
+///
+/// One unit per row `i`: square-root each of the `k` staged distances into
+/// `lower[i, c]`, and keep the smallest with the same STRICT `<` compare as
+/// [`argmin_dist_rows`] (lowest-index tie-break, D-02) into `labels[i]` /
+/// `upper[i]`.
+///
+/// sklearn's `init_bounds_dense` SKIPS the centers its own `chd` pruning
+/// excludes, leaving those `lower[i, c]` at `0`. Computing them all instead is
+/// still correct — and strictly better: a TIGHTER valid lower bound can only
+/// prune more, never less, and the fitted result is identical either way.
+/// Reusing the already-tuned staging kernel also avoids a nested `k × d` loop
+/// at init (the wgpu/naga pathology documented on [`dist_direct_2d`]).
+#[cube(launch)]
+pub fn elkan_seed_bounds<F: Float + CubeElement>(
+    dmat: &Array<F>,
+    labels: &mut Array<u32>,
+    upper: &mut Array<F>,
+    lower: &mut Array<F>,
+    n: u32,
+    k: u32,
+) {
+    let i = ABSOLUTE_POS;
+    if i < n as usize {
+        let base = (i as u32) * k;
+        let mut best = F::new(0.0_f32);
+        let mut best_c = 0u32;
+        let mut c = 0u32;
+        while c < k {
+            let v = F::sqrt(dmat[(base + c) as usize]);
+            lower[(base + c) as usize] = v;
+            if c == 0u32 {
+                best = v;
+            } else if v < best {
+                best = v;
+                best_c = c;
+            }
+            c += 1u32;
+        }
+        labels[i] = best_c;
+        upper[i] = best;
+    }
+}
+
+/// Elkan's bound-pruned assignment step — a line-for-line port of sklearn's
+/// `_update_chunk_dense` (`_k_means_elkan.pyx`) with one unit per sample.
+///
+/// For row `i` with current label `c` and upper bound `u`:
+/// 1. If `dnc[c] >= u` NO center can beat `c` (half the distance to the
+///    nearest other center already exceeds the upper bound) — the row is
+///    untouched, and NO `d`-length distance loop runs. This is the whole point
+///    of Elkan: once the centers settle, almost every row takes this branch.
+/// 2. Otherwise scan the `k` centers; center `j` is a candidate only when
+///    `u > l[i, j]` AND `u > chd[c, j]`. The first candidate TIGHTENS `u` to
+///    the exact distance `‖x_i − centers_c‖` (once per row, `bounds_tight`);
+///    if the test still holds, the exact `‖x_i − centers_j‖` is computed,
+///    stored in `l[i, j]`, and adopted when it is smaller.
+///
+/// Labels are read from `labels_in` and written to `labels_out` (never
+/// in-place) so the caller can keep the previous labeling for the Lloyd loop's
+/// STRICT `array_equal` convergence break — the same swapped-buffer shape the
+/// `argmin_dist_rows` path uses. `upper` / `lower` ARE updated in place: they
+/// are Elkan's carried state, not per-iteration outputs.
+///
+/// This kernel is intrinsically a data-DEPENDENT nested `k × d` loop — the
+/// pruning cannot be staged into a dense matrix without doing exactly the work
+/// it exists to skip — so unlike the Lloyd path it cannot be split into two
+/// short-loop kernels. GATHER only: no `SharedMemory`, no atomic, no infinity
+/// sentinel (cubecl-cpu MLIR safe).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn elkan_assign<F: Float + CubeElement>(
+    x: &Array<F>,
+    centers: &Array<F>,
+    chd: &Array<F>,
+    dnc: &Array<F>,
+    labels_in: &Array<u32>,
+    labels_out: &mut Array<u32>,
+    upper: &mut Array<F>,
+    lower: &mut Array<F>,
+    n: u32,
+    d: u32,
+    k: u32,
+) {
+    let i = ABSOLUTE_POS;
+    if i < n as usize {
+        let iu = i as u32;
+        let mut label = labels_in[i];
+        let mut ub = upper[i];
+        // sklearn: `if not distance_next_center[label] >= upper_bound`.
+        if dnc[label as usize] < ub {
+            let xbase = iu * d;
+            let lbase = iu * k;
+            let mut tight = false;
+            let mut j = 0u32;
+            while j < k {
+                if j != label
+                    && ub > lower[(lbase + j) as usize]
+                    && ub > chd[(label * k + j) as usize]
+                {
+                    if !tight {
+                        // Recompute the EXACT distance to the currently
+                        // assigned center, tightening `ub` (once per row).
+                        let cb = label * d;
+                        let mut acc = F::new(0.0_f32);
+                        let mut t = 0u32;
+                        while t < d {
+                            let df = x[(xbase + t) as usize] - centers[(cb + t) as usize];
+                            acc += df * df;
+                            t += 1u32;
+                        }
+                        ub = F::sqrt(acc);
+                        lower[(lbase + label) as usize] = ub;
+                        tight = true;
+                    }
+                    // sklearn re-tests with `or` here (not `and`) — kept
+                    // verbatim so the pruning decisions match exactly.
+                    if ub > lower[(lbase + j) as usize] || ub > chd[(label * k + j) as usize] {
+                        let cb2 = j * d;
+                        let mut acc2 = F::new(0.0_f32);
+                        let mut t2 = 0u32;
+                        while t2 < d {
+                            let df2 = x[(xbase + t2) as usize] - centers[(cb2 + t2) as usize];
+                            acc2 += df2 * df2;
+                            t2 += 1u32;
+                        }
+                        let dj = F::sqrt(acc2);
+                        lower[(lbase + j) as usize] = dj;
+                        if dj < ub {
+                            label = j;
+                            ub = dj;
+                        }
+                    }
+                }
+                j += 1u32;
+            }
+            upper[i] = ub;
+        }
+        labels_out[i] = label;
+    }
+}
+
+/// Relax Elkan's bounds after the centers move (sklearn's post-`elkan_iter`
+/// fix-up): the assigned center moved by `cshift[labels[i]]`, so the upper
+/// bound grows by that much; every center `j` moved by `cshift[j]`, so each
+/// lower bound shrinks by that much, clamped at `0`.
+///
+/// One unit per row, a single ascending `k`-loop (short-loop shape). `cshift`
+/// is a TRUE Euclidean shift `‖new_c − old_c‖`, matching the bounds' units.
+#[cube(launch)]
+pub fn elkan_update_bounds<F: Float + CubeElement>(
+    cshift: &Array<F>,
+    labels: &Array<u32>,
+    upper: &mut Array<F>,
+    lower: &mut Array<F>,
+    n: u32,
+    k: u32,
+) {
+    let i = ABSOLUTE_POS;
+    if i < n as usize {
+        upper[i] += cshift[labels[i] as usize];
+        let lbase = (i as u32) * k;
+        let zero = F::new(0.0_f32);
+        let mut j = 0u32;
+        while j < k {
+            let idx = (lbase + j) as usize;
+            let v = lower[idx] - cshift[j as usize];
+            if v < zero {
+                lower[idx] = zero;
+            } else {
+                lower[idx] = v;
+            }
+            j += 1u32;
+        }
+    }
+}

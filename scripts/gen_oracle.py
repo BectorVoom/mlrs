@@ -32,6 +32,7 @@ arrives with the Phase-4 estimator fixtures).
 from __future__ import annotations
 
 import os
+import warnings
 
 import numpy as np
 
@@ -2682,6 +2683,431 @@ def gen_bayesian_ridge(seed: int = SEED, dtype=np.float32) -> str:
     )
     np.savez(out_path, **out)
     return out_path
+
+
+# --- HuberRegressor FULL parameter surface (HUBER-01) ---------------------- #
+# One geometry is enough: unlike BayesianRidge, nothing in the Huber solve
+# branches on `n_samples <=> n_features`. What DOES have to be engineered into
+# the design is the outlier structure — a fixture with no gross outliers makes
+# every `epsilon` collapse onto the same least-squares answer and stops testing
+# the estimator at all (the premise asserts below catch exactly that).
+HUBER_N_SAMPLES, HUBER_N_FEATURES = 240, 6
+HUBER_N_TEST = 9
+# Fraction of rows given a large additive shock in `y`. 8 % is enough that the
+# default epsilon=1.35 classifies a double-digit number of samples as outliers
+# while the quadratic core still has most of the data.
+HUBER_OUTLIER_FRAC = 0.08
+
+
+def _huber_objective(params, x, y, epsilon, alpha, sample_weight):
+    """sklearn's Huber objective at `params = [coef…, intercept, sigma]`.
+
+    The layout here ALWAYS carries an intercept slot, even for a
+    ``fit_intercept=False`` fit where sklearn pins ``intercept_ = 0.0``: a zero
+    intercept contributes nothing to either the residuals or the penalty, so one
+    layout serves both and the caller never has to branch.
+
+    Duplicated here (rather than imported from ``sklearn.linear_model._huber``)
+    because the fixture stores the loss as a GATE the Rust test compares against,
+    and that gate has to keep meaning the same thing if sklearn refactors its
+    private helper. It is the formula from the class docstring, and the premise
+    assert below pins it against ``_huber_loss_and_gradient`` at generation time.
+    """
+    d = x.shape[1]
+    w = params[:d]
+    intercept = params[d]
+    sigma = params[-1]
+    r = y - x @ w - intercept
+    a = np.abs(r)
+    outlier = a > epsilon * sigma
+    sw = sample_weight
+    loss = sigma * np.sum(sw)
+    loss += np.sum(sw[~outlier] * r[~outlier] ** 2) / sigma
+    loss += 2.0 * epsilon * np.sum(sw[outlier] * a[outlier])
+    loss -= sigma * epsilon**2 * np.sum(sw[outlier])
+    loss += alpha * float(w @ w)
+    return loss
+
+
+def gen_huber(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the HuberRegressor full-parameter-surface fixture (HUBER-01).
+
+    Covers every ``sklearn.linear_model.HuberRegressor`` ctor parameter —
+    ``epsilon``, ``max_iter``, ``alpha``, ``warm_start``, ``fit_intercept``,
+    ``tol`` — plus ``fit(..., sample_weight=...)``. sklearn's Huber has NO
+    string-valued parameter (every one is a float, an int or a bool), which the
+    premise assert below PINS: if a future sklearn adds one (a ``solver=``, say),
+    the generator fails here rather than the parameter silently going untested.
+
+    ## The three case families, and why the split is forced
+    scikit-learn hands the objective to ``scipy.optimize.minimize(method=
+    "L-BFGS-B")`` passing ``tol`` as ``gtol`` but leaving ``factr`` at its
+    ``1e7`` default, so every fit actually stops on the RELATIVE-f criterion
+    ``Δf/max(|f|,1) ≤ 1e7·eps ≈ 2.2e-9`` — before the gradient test can fire.
+    Two measured consequences drive this fixture's design:
+
+    1. sklearn's returned parameters sit ~1e-6 … 6e-6 (ABSOLUTE) from the true
+       minimizer, and ``tol`` cannot move that: sweeping it from 1e-5 to 1e-12
+       leaves ``n_iter_`` and every attribute bit-identical. mlrs deliberately
+       solves tighter (``ftol = 64·eps``), so the parameter agreement is bounded
+       below by sklearn's own residual. ``huber_max_param_residual`` ships that
+       measured residual so the Rust band is justified by a number rather than
+       chosen, and the assert below fails if a scipy/sklearn upgrade grows it.
+    2. A fit truncated by ``max_iter`` stops MID-TRAJECTORY, and two different
+       L-BFGS implementations (scipy's Moré-Thuente line search vs the 05-06
+       strong-Wolfe primitive) do not pass through the same intermediate points.
+       Those cases are therefore CONTROL-FLOW cases: the fixture ships their
+       ``n_iter_`` and their achieved loss, and the Rust test gates the cap and
+       the loss ordering, NOT the coefficients.
+
+    So: ``value`` cases (converged — every parameter that changes WHAT is
+    optimized), ``ctrl`` cases (``max_iter``/``tol`` truncation — properties
+    only), and the ``warm`` pair (two successive fits of one warm-started
+    estimator).
+
+    Every case ships ``coef_``/``intercept_``/``scale_``/``n_iter_``/
+    ``outliers_`` plus ``loss_*``, the objective value sklearn ACHIEVED — the
+    gate that is well-posed regardless of where either solver stopped.
+
+    The reference is fitted on the design AFTER the round-trip through the
+    fixture dtype, so an f32 fixture's reference is the answer for the exact
+    bytes the test feeds back in.
+
+    Requires ``scikit-learn==1.9.0``.
+    """
+    from sklearn.linear_model import HuberRegressor
+    from sklearn.linear_model._huber import _huber_loss_and_gradient
+    from sklearn.utils._param_validation import StrOptions
+
+    rng = np.random.default_rng(seed + 135)
+    n, d = HUBER_N_SAMPLES, HUBER_N_FEATURES
+
+    # Round-trip through the fixture dtype BEFORE fitting (see docstring).
+    x = rng.standard_normal((n, d)).astype(dtype).astype(np.float64)
+    true_coef = rng.standard_normal(d)
+    y = x @ true_coef + 1.5 + 0.4 * rng.standard_normal(n)
+    # Gross outliers: a heavy one-sided-ish shock on a minority of rows. This is
+    # the whole point of the estimator, and without it `epsilon` is inert.
+    n_out = int(round(HUBER_OUTLIER_FRAC * n))
+    out_idx = rng.choice(n, size=n_out, replace=False)
+    y[out_idx] += 25.0 * rng.standard_normal(n_out) + 15.0
+    y = y.astype(dtype).astype(np.float64)
+    x_test = rng.standard_normal((HUBER_N_TEST, d)).astype(dtype).astype(np.float64)
+    # Strictly-positive, non-uniform weights so the weighted cases genuinely
+    # differ from the unweighted ones.
+    sw = rng.uniform(0.25, 3.0, size=n).astype(dtype).astype(np.float64)
+    ones = np.ones(n)
+
+    # (case name, ctor kwargs, use_sample_weight)
+    #
+    # CONVERGED value cases — max_iter is raised to 1000 everywhere so the stop
+    # is sklearn's `factr` plateau (i.e. the optimum) rather than the cap, which
+    # is what makes a coefficient comparison well-posed at all.
+    value_cases = [
+        ("default", dict(), False),
+        ("noint", dict(fit_intercept=False), False),
+        # --- epsilon: the outlier cut-off on the SCALED residual. 1.05 sits just
+        #     inside sklearn's `[1, inf)` bound (most robust NON-degenerate
+        #     setting — see the `eps1` control case for why exactly 1.0 is not
+        #     one); 10.0 pushes every sample into the quadratic core, i.e. onto
+        #     plain least squares with a fitted scale. --------------------- #
+        ("eps105", dict(epsilon=1.05), False),
+        ("eps2", dict(epsilon=2.5), False),
+        ("eps10", dict(epsilon=10.0), False),
+        ("eps105_noint", dict(epsilon=1.05, fit_intercept=False), False),
+        # --- alpha: the `alpha·‖w‖²` ridge penalty (NOT ½α‖w‖²). 0 is the
+        #     unpenalized objective; 100 shrinks the coefficients visibly. ---- #
+        ("alpha0", dict(alpha=0.0), False),
+        ("alpha1", dict(alpha=1.0), False),
+        ("alpha100", dict(alpha=100.0), False),
+        # --- tol: sklearn's `factr` binds first, so a TIGHT tol is inert. It is
+        #     included precisely to pin that (the assert below fails if a
+        #     sklearn upgrade ever makes gtol the binding stop again). -------- #
+        ("tol_tight", dict(tol=1e-12), False),
+        # --- sample_weight: enters every term, including `σ·Σswᵢ`. ---------- #
+        ("sw", dict(), True),
+        ("sw_noint", dict(fit_intercept=False), True),
+        ("sw_eps105", dict(epsilon=1.05), True),
+        ("sw_alpha1", dict(alpha=1.0), True),
+    ]
+    # CONTROL-FLOW cases — truncated mid-trajectory, so properties only.
+    #
+    # `eps1` is here rather than in `value_cases` for a MATHEMATICAL reason, not
+    # a numerical one. At exactly `epsilon = 1` the scale stops being
+    # identifiable: once every sample is an outlier the objective reduces to
+    #   σ·Σsw + Σ 2·|rᵢ|·swᵢ − σ·Σsw  =  2·Σ swᵢ|rᵢ|,
+    # i.e. weighted least-ABSOLUTE-deviations with σ cancelling out exactly, and
+    # `∂L/∂σ ≡ 0` along the whole ray. sklearn accepts `epsilon = 1` (its
+    # constraint is the closed `[1, ∞)`) and duly returns `scale_ = 0` after a
+    # long badly-scaled descent, ~4.6e-4 from its own optimum. The COEFFICIENTS
+    # are still uniquely determined (LAD + ridge), so this case is gated on the
+    # objective value and on `scale_ → 0`, never on parameter agreement.
+    ctrl_cases = [
+        ("maxiter0", dict(max_iter=0), False),
+        ("maxiter1", dict(max_iter=1), False),
+        ("maxiter5", dict(max_iter=5), False),
+        ("tol_loose", dict(tol=5.0), False),
+        ("eps1", dict(epsilon=1.0, max_iter=1000), False),
+    ]
+
+    def c(arr):
+        return np.asarray(arr).astype(dtype)
+
+    out = {
+        "X": c(x),
+        "y": c(y),
+        "sample_weight": c(sw),
+        "X_test": c(x_test),
+    }
+
+    def record(name, est, kwargs, use_sw):
+        weights = sw if use_sw else ones
+        params = np.concatenate([est.coef_, [est.intercept_, est.scale_]])
+        eps_k = kwargs.get("epsilon", 1.35)
+        alpha_k = kwargs.get("alpha", 1e-4)
+        fi_k = kwargs.get("fit_intercept", True)
+        out[f"coef_{name}"] = c(est.coef_)
+        out[f"intercept_{name}"] = c([est.intercept_])
+        # The scale, the loss and the iteration count are compared in f64
+        # whatever the design's dtype: the solve accumulates in f64 on both
+        # sides, and rounding them to f32 would hide real drift behind the
+        # storage format (the `bayesian_ridge` precision precedent).
+        out[f"scale_{name}"] = np.asarray([est.scale_], dtype=np.float64)
+        out[f"n_iter_{name}"] = np.asarray([float(est.n_iter_)], dtype=np.float64)
+        out[f"outliers_{name}"] = est.outliers_.astype(np.float64)
+        # `params` is `[coef…, intercept, sigma]` — sklearn's own packing, and
+        # what a warm start seeds from.
+        packed = np.concatenate([est.coef_, [est.intercept_]]) if fi_k else est.coef_
+        out[f"params_{name}"] = np.concatenate([packed, [est.scale_]]).astype(np.float64)
+        out[f"loss_{name}"] = np.asarray(
+            [_huber_objective(params, x, y, eps_k, alpha_k, weights)],
+            dtype=np.float64,
+        )
+        return params, eps_k, alpha_k, fi_k
+
+    residuals = []
+    for name, kwargs, use_sw in value_cases:
+        kw = dict(max_iter=1000)
+        kw.update(kwargs)
+        est = HuberRegressor(**kw)
+        est.fit(x, y, sample_weight=sw if use_sw else None)
+        params, eps_k, alpha_k, fi_k = record(name, est, kw, use_sw)
+        out[f"pred_{name}"] = c(est.predict(x_test))
+        # How far sklearn's own stop leaves it from the true minimizer: refit the
+        # SAME objective with scipy driven to machine precision and measure. This
+        # is the number the Rust band has to cover.
+        tight = _huber_tight_optimum(x, y, eps_k, alpha_k, sw if use_sw else ones, fi_k)
+        if not fi_k:
+            # Pad the missing intercept slot with the 0.0 sklearn pins, so the
+            # comparison uses the one `[coef…, intercept, sigma]` layout.
+            tight = np.concatenate([tight[:d], [0.0], tight[d:]])
+        residual = float(np.abs(params - tight).max())
+        # Shipped PER CASE, not just as a maximum: the Rust test DERIVES its
+        # comparison band from this number instead of carrying a hand-chosen
+        # constant, so a case whose conditioning makes sklearn stop further out
+        # (`eps105_noint` is 20x the median here — no intercept plus a tight
+        # epsilon leaves the residuals large and the scale poorly determined)
+        # widens only its own band, and every other case stays tight.
+        out[f"residual_{name}"] = np.asarray([residual], dtype=np.float64)
+        residuals.append(residual)
+
+    for name, kwargs, use_sw in ctrl_cases:
+        with warnings.catch_warnings():
+            # A truncated fit warns ConvergenceWarning by construction — that is
+            # the case being generated, not a problem to surface.
+            warnings.simplefilter("ignore")
+            est = HuberRegressor(**kwargs)
+            est.fit(x, y, sample_weight=sw if use_sw else None)
+        record(name, est, kwargs, use_sw)
+
+    # --- warm_start: two successive fits of ONE estimator. The second starts
+    #     from the first's `[coef_, intercept_, scale_]` instead of the cold
+    #     `[0…, 0, 1]`, so it lands closer to the optimum for the same cap. --- #
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ws = HuberRegressor(warm_start=True, max_iter=5)
+        ws.fit(x, y)
+        out["params_warm1"] = np.concatenate(
+            [ws.coef_, [ws.intercept_, ws.scale_]]
+        ).astype(np.float64)
+        out["loss_warm1"] = np.asarray(
+            [_huber_objective(out["params_warm1"], x, y, 1.35, 1e-4, ones)],
+            dtype=np.float64,
+        )
+        ws.fit(x, y)
+        out["params_warm2"] = np.concatenate(
+            [ws.coef_, [ws.intercept_, ws.scale_]]
+        ).astype(np.float64)
+        out["loss_warm2"] = np.asarray(
+            [_huber_objective(out["params_warm2"], x, y, 1.35, 1e-4, ones)],
+            dtype=np.float64,
+        )
+
+    out["huber_max_param_residual"] = np.asarray([max(residuals)], dtype=np.float64)
+
+    # --- Premises asserted HERE (at generation) so a sklearn upgrade that breaks
+    #     one is caught in this script rather than as an unexplained Rust
+    #     failure. ---
+    assert not any(
+        isinstance(cons, StrOptions)
+        for conss in HuberRegressor._parameter_constraints.values()
+        for cons in conss
+    ), (
+        "gen_huber: sklearn's HuberRegressor grew a STRING-valued parameter. "
+        "The Rust parameter-surface test asserts there are none — add the new "
+        "parameter to `value_cases` and drop it from that assertion"
+    )
+    ref_loss, _ = _huber_loss_and_gradient(
+        np.concatenate([np.zeros(d), [0.0, 1.0]]), x, y, 1.35, 1e-4, ones
+    )
+    assert np.isclose(
+        ref_loss,
+        _huber_objective(np.concatenate([np.zeros(d), [0.0, 1.0]]), x, y, 1.35, 1e-4, ones),
+        rtol=1e-12,
+    ), "gen_huber: the local objective no longer matches sklearn's _huber_loss_and_gradient"
+    n_out_default = int(out["outliers_default"].sum())
+    flagged = out["outliers_default"].astype(bool)
+    # The injected shocks must ALL land in the outlier set (otherwise the design
+    # is not testing the robust branch), and the majority of the clean rows must
+    # NOT (otherwise `epsilon` is effectively zero and every sample is linear).
+    # Note the outlier COUNT is legitimately much larger than the injected
+    # fraction: Huber's fitted `σ` is a robust scale WELL below the residual
+    # standard deviation, so a healthy share of clean Gaussian rows sit beyond
+    # `1.35·σ` too. That is the estimator working, not the fixture misbehaving.
+    assert flagged[out_idx].all(), (
+        "gen_huber: not every injected gross outlier was classified as one — the "
+        "shock magnitude is too small relative to the noise"
+    )
+    clean = np.setdiff1d(np.arange(n), out_idx)
+    assert flagged[clean].mean() < 0.5, (
+        f"gen_huber: {flagged[clean].mean():.0%} of the CLEAN rows are classified "
+        "as outliers, so the quadratic core holds a minority of the data — "
+        "retune the noise level"
+    )
+    assert n_out_default >= 5, (
+        f"gen_huber: only {n_out_default} outliers of {n} — the robust branch is "
+        "barely exercised; retune HUBER_OUTLIER_FRAC"
+    )
+    assert not np.allclose(out["coef_default"], out["coef_eps105"], atol=1e-6), (
+        "gen_huber: epsilon=1.05 did not change the fit, so `epsilon` is not exercised"
+    )
+    assert float(out["scale_eps1"][0]) < 1e-6, (
+        "gen_huber: epsilon=1.0 no longer collapses the scale, so the σ-degeneracy\n"
+        "        documented on the `eps1` control case has changed — re-derive it"
+    )
+    assert int(out["outliers_eps1"].sum()) == n, (
+        "gen_huber: epsilon=1.0 no longer classifies EVERY sample as an outlier, "
+        "which is the premise the σ-degeneracy argument rests on"
+    )
+    assert not np.allclose(out["coef_default"], out["coef_eps10"], atol=1e-6), (
+        "gen_huber: epsilon=10 did not change the fit, so `epsilon` is not exercised"
+    )
+    assert not np.allclose(out["coef_default"], out["coef_alpha100"], atol=1e-6), (
+        "gen_huber: alpha=100 did not shrink the fit, so `alpha` is not exercised"
+    )
+    assert not np.allclose(out["coef_default"], out["coef_sw"], atol=1e-6), (
+        "gen_huber: sample_weight did not change the fit"
+    )
+    assert np.allclose(out["coef_default"], out["coef_tol_tight"], atol=0, rtol=0), (
+        "gen_huber: a 1e-12 tol changed the fit, so scipy's `factr` is no longer "
+        "the binding stop — re-derive the module docs' stopping analysis in "
+        "`huber.rs` and the Rust band below"
+    )
+    assert out["n_iter_maxiter0"][0] == 0.0 and out["n_iter_maxiter1"][0] == 1.0, (
+        "gen_huber: max_iter=0/1 no longer report n_iter_ 0/1"
+    )
+    assert out["loss_maxiter5"][0] > out["loss_default"][0], (
+        "gen_huber: the max_iter=5 fit is not worse than the converged one, so "
+        "the truncation is not being exercised"
+    )
+    assert out["loss_warm2"][0] < out["loss_warm1"][0], (
+        "gen_huber: the warm-started second fit did not improve on the first, so "
+        "`warm_start` is not being exercised"
+    )
+    # A CEILING, not the band: the per-case `residual_*` entries are what the
+    # Rust bands are derived from. This assert only catches a wholesale
+    # regression in scipy/sklearn's stopping — at which point the module-doc
+    # analysis in `huber.rs` needs rewriting, not just a wider tolerance.
+    assert out["huber_max_param_residual"][0] < 1e-3, (
+        "gen_huber: sklearn's own distance from the true optimum grew past 1e-3 "
+        f"({out['huber_max_param_residual'][0]:.3e}) — the Rust band in "
+        "huber_test.rs was sized against this and must be re-derived"
+    )
+    # The outlier mask is compared for EXACT equality in Rust, so no sample may
+    # sit within a hair of the `ε·σ` boundary where a 1e-6 parameter wobble could
+    # flip it.
+    stability = []
+    for name, kwargs, _use_sw in value_cases:
+        eps_k = kwargs.get("epsilon", 1.35)
+        resid = np.abs(
+            y
+            - x @ out[f"coef_{name}"].astype(np.float64)
+            - float(out[f"intercept_{name}"][0])
+        )
+        margin = np.abs(resid - float(out[f"scale_{name}"][0]) * eps_k)
+        # How far a sample's `|rᵢ| − ε·σ` can move when the parameters move by
+        # the measured solver gap `R`: the residual shifts by at most
+        # `R·‖xᵢ‖₁ + R` (coefficients + intercept) and the threshold by `ε·R`.
+        # Four times that is the safety factor; a fixture whose closest sample
+        # sits inside it cannot support an EXACT `outliers_` comparison.
+        gap = float(out[f"residual_{name}"][0])
+        flip_bound = 4.0 * gap * (np.abs(x).sum(axis=1).max() + 1.0 + eps_k)
+        # Rather than assert this everywhere and reseed until it holds, the
+        # verdict is SHIPPED: the Rust test compares `outliers_` for exact
+        # equality only where the fixture can prove no sample is within reach of
+        # the solver gap. `eps105_noint` is the one case that fails it — with no
+        # intercept to absorb the offset its residuals are large, its scale is
+        # poorly determined, and sklearn's own stop is 20x further out than
+        # elsewhere — so its mask is gated on the outlier COUNT instead, and its
+        # coefficients still carry the full value gate.
+        stable = bool(margin.min() > flip_bound)
+        out[f"outliers_stable_{name}"] = np.asarray([float(stable)], dtype=np.float64)
+        stability.append((name, stable, float(margin.min()), float(flip_bound)))
+
+    n_stable = sum(1 for _n, ok, _m, _b in stability if ok)
+    assert n_stable >= len(value_cases) - 1, (
+        "gen_huber: more than one value case has an unstable outlier mask "
+        f"({[n for n, ok, _m, _b in stability if not ok]}) — the fixture's "
+        "conditioning has drifted and the exact `outliers_` gate has lost most "
+        "of its coverage; reseed"
+    )
+    assert bool(out["outliers_stable_default"][0]), (
+        "gen_huber: even the DEFAULT case cannot support an exact outliers_ gate"
+    )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"huber_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, **out)
+    return out_path
+
+
+def _huber_tight_optimum(x, y, epsilon, alpha, sample_weight, fit_intercept):
+    """The Huber minimizer driven to machine precision, for the residual probe.
+
+    sklearn cannot produce this itself — its `factr` is not reachable through
+    the public API — so the probe calls scipy directly with the same objective
+    and a tolerance six orders tighter.
+    """
+    from scipy import optimize
+    from sklearn.linear_model._huber import _huber_loss_and_gradient
+
+    d = x.shape[1]
+    n_params = d + 2 if fit_intercept else d + 1
+    p0 = np.zeros(n_params)
+    p0[-1] = 1.0
+    bounds = np.tile([-np.inf, np.inf], (n_params, 1))
+    bounds[-1][0] = np.finfo(np.float64).eps * 10
+    res = optimize.minimize(
+        _huber_loss_and_gradient,
+        p0,
+        method="L-BFGS-B",
+        jac=True,
+        args=(x, y, epsilon, alpha, sample_weight),
+        bounds=bounds,
+        options={"maxiter": 100000, "gtol": 1e-14, "ftol": 1e-18},
+    )
+    return res.x
 
 
 def gen_pca(seed: int = SEED, dtype=np.float32, shape=PCA_TALL,
@@ -5550,6 +5976,234 @@ def gen_binarizer(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+
+# GaussianMixture oracle geometry (MIX-01). Three WELL-SEPARATED blobs so the
+# likelihood surface has one dominant optimum and every `init_params` route
+# converges to the SAME fixed point — which is what makes an init-by-init
+# comparison meaningful across two different RNGs (D-09: numpy's `Generator`
+# stream is not reproducible from Rust, so the oracle pins the ANSWER, not the
+# path to it).
+GMM_N_SAMPLES, GMM_N_FEATURES, GMM_K = 300, 4, 3
+# A query block, disjoint from the training design, for the scoring surface.
+GMM_N_QUERY = 40
+# The convergence cases run to machine precision so BOTH engines sit on the
+# same stationary point rather than stopping at different places inside
+# sklearn's default `tol = 1e-3` band (which alone permits ~1e-3 parameter
+# disagreement and would make a 1e-5 comparison meaningless).
+GMM_TOL_TIGHT = 1e-12
+GMM_MAX_ITER_TIGHT = 2000
+
+GMM_COV_TYPES = ("full", "tied", "diag", "spherical")
+GMM_INIT_PARAMS = ("kmeans", "k-means++", "random", "random_from_data")
+
+
+def _gmm_design(seed: int, dtype):
+    """The shared GaussianMixture design + query block, dtype-round-tripped."""
+    rng = np.random.default_rng(seed + 909)
+    # The separation is TUNED, not arbitrary. Measured on this design across
+    # `scale in (9, 5, 3.5, 3)`: at 9 the blobs are so distinct that `kmeans`
+    # init converges in 2 iterations and the EM loop is barely exercised; at 3.5
+    # the `full` optimum stops being init-independent (`kmeans` and `random`
+    # land on different local maxima) and the fixture's premise breaks. 5 is the
+    # widest separation that still costs 3-321 iterations depending on the
+    # init — real EM work, one optimum.
+    centers = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [5.0, 5.0, 0.0, 0.0],
+            [-5.0, 10.0 / 3.0, 5.0, -10.0 / 3.0],
+        ]
+    )
+    per = GMM_N_SAMPLES // GMM_K
+    x = np.vstack(
+        [c + 0.9 * rng.standard_normal((per, GMM_N_FEATURES)) for c in centers]
+    )
+    # Round-trip through the fixture dtype BEFORE fitting, so the reference is
+    # the answer for the exact bytes the Rust test reads back.
+    x = x.astype(dtype).astype(np.float64)
+    xq = (
+        centers[rng.integers(0, GMM_K, GMM_N_QUERY)]
+        + 1.2 * rng.standard_normal((GMM_N_QUERY, GMM_N_FEATURES))
+    )
+    xq = xq.astype(dtype).astype(np.float64)
+    return x, xq
+
+
+def _gmm_injected(cov_type: str, seed: int):
+    """A FIXED (weights, means, precisions) init for the exact-parity cases.
+
+    With all three injected there is no RNG anywhere in the fit, so mlrs and
+    sklearn run byte-comparable EM from the same starting point and every fitted
+    attribute — including ``lower_bound_`` and ``n_iter_`` — must agree to 1e-5.
+    These cases are the ones that pin the ALGORITHM; the `init_params` cases pin
+    the initializations.
+    """
+    rng = np.random.default_rng(seed + 4242)
+    k, d = GMM_K, GMM_N_FEATURES
+    weights = np.full(k, 1.0 / k)
+    # Offset from the true centers so EM has real work to do, but close enough
+    # that it lands in the global optimum.
+    means = np.array(
+        [
+            [1.5, -1.0, 0.5, 0.5],
+            [7.0, 8.0, 1.0, -1.0],
+            [-7.5, 5.0, 8.0, -5.0],
+        ]
+    )
+    base = np.eye(d) + 0.15 * rng.standard_normal((d, d))
+    spd = base @ base.T + d * np.eye(d)
+    if cov_type == "full":
+        prec = np.stack([spd * (1.0 + 0.1 * i) for i in range(k)])
+    elif cov_type == "tied":
+        prec = spd
+    elif cov_type == "diag":
+        prec = np.stack([np.diag(spd) * (1.0 + 0.1 * i) for i in range(k)])
+    else:
+        prec = np.array([1.0 + 0.1 * i for i in range(k)])
+    return weights, means, prec
+
+
+def gen_gaussian_mixture(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the GaussianMixture full-parameter-surface fixture (MIX-01).
+
+    Two families of cases, because the estimator has two independently testable
+    halves:
+
+    1. ``{cov}_{init}`` — the 4x4 cross of ``covariance_type`` x
+       ``init_params``, each fitted to machine precision. These pin that mlrs's
+       four covariance parameterizations and four initializations all reach
+       sklearn's optimum, up to the component permutation the init chooses.
+    2. ``inj_{cov}`` — the same four covariance types with ``weights_init`` /
+       ``means_init`` / ``precisions_init`` all supplied, which removes the RNG
+       entirely. These pin the EM ARITHMETIC exactly: ``lower_bound_``,
+       ``n_iter_``, ``converged_``, the scoring surface (``predict`` /
+       ``predict_proba`` / ``score_samples``), and ``bic`` / ``aic``.
+    3. ``reg{n}_{cov}`` — a ``reg_covar`` sweep on the injected init, since
+       ``reg_covar`` is the one numeric hyperparameter that changes the fitted
+       covariance directly rather than through convergence.
+
+    Requires ``scikit-learn==1.9.0``.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    x, xq = _gmm_design(seed, dtype)
+    n, d, k = GMM_N_SAMPLES, GMM_N_FEATURES, GMM_K
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {"X": c(x), "Xq": c(xq)}
+
+    def record(name, est, with_scoring: bool):
+        out[f"weights_{name}"] = c(est.weights_)
+        out[f"means_{name}"] = c(est.means_)
+        out[f"cov_{name}"] = c(np.ravel(est.covariances_))
+        out[f"prec_chol_{name}"] = c(np.ravel(est.precisions_cholesky_))
+        out[f"lower_bound_{name}"] = c([est.lower_bound_])
+        # sklearn's per-iteration bound trace for the WINNING restart (length
+        # `n_iter_`). Recorded for every case: it is the only fitted attribute
+        # that pins the SHAPE of the ascent rather than just its endpoint, so a
+        # convergence rule that lands on the right answer by a different route
+        # fails here and nowhere else.
+        out[f"lower_bounds_{name}"] = c(np.asarray(est.lower_bounds_))
+        out[f"n_iter_{name}"] = c([est.n_iter_])
+        out[f"converged_{name}"] = c([1.0 if est.converged_ else 0.0])
+        out[f"labels_{name}"] = c(est.predict(x))
+        if with_scoring:
+            out[f"predict_{name}"] = c(est.predict(xq))
+            out[f"proba_{name}"] = c(np.ravel(est.predict_proba(xq)))
+            out[f"score_samples_{name}"] = c(est.score_samples(xq))
+            out[f"bic_{name}"] = c([est.bic(xq)])
+            out[f"aic_{name}"] = c([est.aic(xq)])
+            out[f"n_parameters_{name}"] = c([est._n_parameters()])
+
+    # --- family 1: covariance_type x init_params, converged ----------------- #
+    for cov in GMM_COV_TYPES:
+        for init in GMM_INIT_PARAMS:
+            est = GaussianMixture(
+                n_components=k,
+                covariance_type=cov,
+                tol=GMM_TOL_TIGHT,
+                max_iter=GMM_MAX_ITER_TIGHT,
+                n_init=1,
+                init_params=init,
+                random_state=0,
+            ).fit(x)
+            record(f"{cov}_{init.replace('-', '')}", est, with_scoring=False)
+
+    # --- family 2: fully injected init (no RNG anywhere) -------------------- #
+    for cov in GMM_COV_TYPES:
+        w0, m0, p0 = _gmm_injected(cov, seed)
+        out[f"winit_{cov}"] = c(w0)
+        out[f"minit_{cov}"] = c(m0)
+        out[f"pinit_{cov}"] = c(np.ravel(p0))
+        est = GaussianMixture(
+            n_components=k,
+            covariance_type=cov,
+            tol=1e-8,
+            max_iter=200,
+            n_init=1,
+            weights_init=w0,
+            means_init=m0,
+            precisions_init=p0,
+        ).fit(x)
+        record(f"inj_{cov}", est, with_scoring=True)
+
+        # A hard single-iteration case: `max_iter=1` leaves no room for two
+        # engines to converge to the same place by different routes, so it is
+        # the strictest possible test of ONE E-step plus ONE M-step.
+        est1 = GaussianMixture(
+            n_components=k,
+            covariance_type=cov,
+            tol=0.0,
+            max_iter=1,
+            n_init=1,
+            weights_init=w0,
+            means_init=m0,
+            precisions_init=p0,
+        ).fit(x)
+        record(f"iter1_{cov}", est1, with_scoring=False)
+
+    # --- family 3: the reg_covar sweep on the injected init ----------------- #
+    for i, reg in enumerate((1e-6, 1e-2, 1.0)):
+        for cov in GMM_COV_TYPES:
+            w0, m0, p0 = _gmm_injected(cov, seed)
+            est = GaussianMixture(
+                n_components=k,
+                covariance_type=cov,
+                tol=1e-8,
+                max_iter=200,
+                n_init=1,
+                reg_covar=reg,
+                weights_init=w0,
+                means_init=m0,
+                precisions_init=p0,
+            ).fit(x)
+            record(f"reg{i}_{cov}", est, with_scoring=False)
+
+    # Every `init_params` route must land on the SAME optimum (up to a component
+    # permutation) for a given `covariance_type` — that is the premise of family
+    # 1, and it is asserted HERE so a bad fixture cannot be committed silently.
+    for cov in GMM_COV_TYPES:
+        ref = np.sort(out[f"lower_bound_{cov}_kmeans"].astype(np.float64))
+        for init in GMM_INIT_PARAMS:
+            got = out[f"lower_bound_{cov}_{init.replace('-', '')}"].astype(np.float64)
+            assert np.allclose(got, ref, atol=1e-6, rtol=1e-6), (
+                f"gen_gaussian_mixture: covariance_type='{cov}' init_params="
+                f"'{init}' converged to lower_bound {got} but 'kmeans' reached "
+                f"{ref} — the design is not separable enough for an "
+                "init-independent oracle"
+            )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"gaussian_mixture_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -5610,6 +6264,16 @@ def main() -> None:
     # both n_samples <=> n_features branches, hyperpriors, inits, scores, weights.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_bayesian_ridge(dtype=dtype)}")
+    # HuberRegressor FULL parameter surface (HUBER-01): epsilon/alpha/tol/
+    # fit_intercept/sample_weight converged value cases, the max_iter & loose-tol
+    # control-flow cases, and the warm_start pair.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_huber(dtype=dtype)}")
+    # GaussianMixture FULL parameter surface (MIX-01): the covariance_type x
+    # init_params cross fitted to machine precision, plus fully-injected-init
+    # cases that remove the RNG entirely, plus a reg_covar sweep.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_gaussian_mixture(dtype=dtype)}")
     # PCA (DECOMP-01): tall (m>n) + wide (n_features>n_samples); svd_solver=full.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_pca(dtype=dtype, shape=PCA_TALL, n_components=PCA_N_COMPONENTS_TALL, kind='tall')}")

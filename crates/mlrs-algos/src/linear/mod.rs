@@ -38,6 +38,16 @@
 //!   which sklearn recomputes with an `O(n·d)` pass — so `n_samples` leaves the
 //!   loop entirely. Added by plan **06-01**.
 //!
+//! - `HuberRegressor` (HUBER-01) — **L-BFGS over `[w, c, σ]`** with a `σ > 0`
+//!   barrier, minimizing the jointly-convex perspective form of the Huber loss.
+//!   Deliberately NOT unified with `LinearSVR`, whose squared-epsilon-insensitive
+//!   primal has a FIXED tube width: here the scale is a fitted parameter, so the
+//!   per-sample loss is not a function of the margin alone and the objective
+//!   needs three extra `O(n)` reductions per evaluation for `∂L/∂σ` (its own
+//!   [`huber_objective`](mlrs_backend::prims::huber_objective) prim, sharing the
+//!   `svm_objective` cpu-host/device-GEMM split but not its evaluator). Added by
+//!   plan **HUBER-01**.
+//!
 //! The estimator plans UNCOMMENT/add their own `pub mod <estimator>;` line here
 //! and create the matching file; they do NOT edit `lib.rs` (owned by 04-01),
 //! keeping the estimator plans file-disjoint and parallel-safe.
@@ -46,6 +56,7 @@
 
 pub mod bayesian_ridge;
 pub mod coordinate_descent;
+pub mod huber;
 pub mod elastic_net;
 pub mod lasso;
 pub mod linear_regression;

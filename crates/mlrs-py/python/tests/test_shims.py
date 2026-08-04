@@ -198,6 +198,10 @@ def test_nearest_neighbors_has_no_predict_but_has_kneighbors():
         ("MBSGDRegressor", "coef_"),
         ("KernelRidge", "dual_coef_"),
         ("SpectralClustering", "labels_"),
+        # --- MIX-01. ------------------------------------------------------- #
+        ("GaussianMixture", "means_"),
+        ("GaussianMixture", "covariances_"),
+        ("GaussianMixture", "lower_bound_"),
         ("SpectralEmbedding", "embedding_"),
         ("HDBSCAN", "labels_"),
         ("HDBSCAN", "probabilities_"),

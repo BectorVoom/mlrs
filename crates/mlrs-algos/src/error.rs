@@ -327,6 +327,25 @@ pub enum AlgoError {
         kernel: String,
     },
 
+    /// `GaussianMixture` was given an injected initial parameter
+    /// (`weights_init` / `means_init` / `precisions_init`) whose CONTENT is
+    /// invalid — a weight outside `[0, 1]`, a weight vector that does not sum to
+    /// one, or a non-finite entry (MIX-01). The data-INDEPENDENT half of this
+    /// check cannot be done at `build()` because the required LENGTH depends on
+    /// `n_features` (the D-08 split), so the whole content check lives here.
+    /// Mirrors sklearn's `_check_weights` / `_check_means` / `_check_precisions`
+    /// `ValueError`s.
+    #[error("estimator '{estimator}': {param} is invalid — {reason}")]
+    InvalidMixtureInit {
+        /// Which estimator rejected the value (always `"gaussian_mixture"`).
+        estimator: &'static str,
+        /// Which injected parameter was rejected (`"weights_init"` /
+        /// `"means_init"` / `"precisions_init"`).
+        param: &'static str,
+        /// The content-validity reason.
+        reason: String,
+    },
+
     /// An iterative solver (coordinate descent for Lasso/ElasticNet, L-BFGS for
     /// LogisticRegression) failed to reach its convergence tolerance within the
     /// `max_iter` cap. Surfaced as a typed error rather than silently returning a
@@ -609,6 +628,36 @@ pub enum BuildError {
     #[error("unknown loss '{value}'")]
     UnknownLoss {
         /// The unrecognised loss name the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `init` string was supplied (the enum-parse failure
+    /// folded into `BuildError`, D-09). Mirrors sklearn's `StrOptions`
+    /// rejection for `KMeans(init=...)`, whose only string values are
+    /// `'k-means++'` and `'random'` (an explicit `k × d` array is the third,
+    /// non-string form).
+    #[error("unknown init '{value}'")]
+    UnknownInit {
+        /// The unrecognised init name the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `n_init` string was supplied. sklearn's `n_init`
+    /// constraint is `StrOptions({'auto'}) | Interval(Integral, 1, None)`, so
+    /// `'auto'` is the ONLY legal string; every other string is rejected here
+    /// rather than silently treated as a count.
+    #[error("unknown n_init '{value}' (the only legal string is 'auto')")]
+    UnknownNInit {
+        /// The unrecognised `n_init` string the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `algorithm` string was supplied (the enum-parse failure
+    /// folded into `BuildError`, D-09). Mirrors sklearn's `StrOptions`
+    /// rejection for `KMeans(algorithm=...)` (`'lloyd'` / `'elkan'`).
+    #[error("unknown algorithm '{value}'")]
+    UnknownAlgorithm {
+        /// The unrecognised algorithm name the caller supplied.
         value: String,
     },
 
@@ -1017,6 +1066,39 @@ pub enum BuildError {
         estimator: &'static str,
         /// The offending stopping tolerance.
         tol: f64,
+    },
+
+    /// An unrecognised `covariance_type` string was supplied to
+    /// `GaussianMixture` (MIX-01). Mirrors sklearn's `StrOptions({'full',
+    /// 'tied', 'diag', 'spherical'})` rejection. This is its OWN variant rather
+    /// than a reuse of [`BuildError::UnknownInit`] because `covariance_type`
+    /// selects the model's parameterization — a typo silently changing which
+    /// family is fitted is exactly what the typed rejection prevents.
+    #[error(
+        "unknown covariance_type '{value}' \
+         (must be one of 'full', 'tied', 'diag', 'spherical')"
+    )]
+    UnknownCovarianceType {
+        /// The unrecognised covariance parameterization the caller supplied.
+        value: String,
+    },
+
+    /// `GaussianMixture` was given a negative or non-finite `reg_covar`
+    /// (MIX-01). The regularization is ADDED to the covariance diagonal to keep
+    /// it positive definite, so a negative value works against the very
+    /// invariant it exists to maintain; sklearn's constraint is
+    /// `Interval(Real, 0.0, None, closed="left")`. Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split).
+    #[error(
+        "estimator '{estimator}': reg_covar = {reg_covar} is invalid \
+         (must be finite and >= 0)"
+    )]
+    InvalidRegCovar {
+        /// Which estimator's builder rejected the value (always
+        /// `"gaussian_mixture"`).
+        estimator: &'static str,
+        /// The offending covariance regularization.
+        reg_covar: f64,
     },
 
     /// An unrecognised `solver` string was supplied (the

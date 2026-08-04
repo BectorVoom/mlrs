@@ -63,6 +63,12 @@ pub mod manifold;
 // `metrics::classification` / `metrics::regression` free functions
 // (TASK-03..14).
 pub mod metrics;
+// Probabilistic mixture models (MIX-01): `GaussianMixture` over all four
+// sklearn `covariance_type` parameterizations. The compute engine is
+// `mlrs_backend::prims::gmm_host` — host-resident on EVERY backend, because the
+// EM loop is launch-bound, `f64`-bound, and has a serial `O(k·d³)`
+// factorization tail (see that module's docs).
+pub mod mixture;
 pub mod naive_bayes;
 pub mod neighbors;
 // The sklearn `preprocessing` scaler family (PREP-01, Phase 24): `StandardScaler`

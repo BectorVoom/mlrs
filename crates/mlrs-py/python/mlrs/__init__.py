@@ -48,10 +48,12 @@ from .linear import (
     MBSGDClassifier,
     MBSGDRegressor,
     BayesianRidge,
+    HuberRegressor,
     Ridge,
     RidgeClassifier,
 )
 from .manifold import TSNE, UMAP
+from .mixture import GaussianMixture
 from .naive_bayes import (
     BernoulliNB,
     CategoricalNB,
@@ -98,6 +100,7 @@ __all__ = [
     "Ridge",
     "RidgeClassifier",
     "BayesianRidge",
+    "HuberRegressor",
     "Lasso",
     "ElasticNet",
     "LogisticRegression",
@@ -122,6 +125,7 @@ __all__ = [
     "HDBSCAN",
     "AgglomerativeClustering",
     "SpectralClustering",
+    "GaussianMixture",
     "TSNE",
     "SpectralEmbedding",
     "UMAP",
