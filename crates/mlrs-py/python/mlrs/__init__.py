@@ -48,6 +48,7 @@ from .linear import (
     MBSGDClassifier,
     MBSGDRegressor,
     BayesianRidge,
+    HuberRegressor,
     Ridge,
     RidgeClassifier,
 )
@@ -99,6 +100,7 @@ __all__ = [
     "Ridge",
     "RidgeClassifier",
     "BayesianRidge",
+    "HuberRegressor",
     "Lasso",
     "ElasticNet",
     "LogisticRegression",

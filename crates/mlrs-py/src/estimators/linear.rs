@@ -12,6 +12,7 @@ use pyo3::prelude::*;
 
 use mlrs_algos::linear::bayesian_ridge::BayesianRidge;
 use mlrs_algos::linear::elastic_net::ElasticNet;
+use mlrs_algos::linear::huber::HuberRegressor;
 use mlrs_algos::linear::lasso::Lasso;
 use mlrs_algos::linear::linear_regression::LinearRegression;
 use mlrs_algos::linear::linear_svc::LinearSVC;
@@ -110,6 +111,9 @@ impl_dense_predict_host!(
     ElasticNet,
     LinearSVR,
     BayesianRidge,
+    // `HuberRegressor` predicts through the same `X·coef_ + intercept_` matvec
+    // as the rest — the robustness lives entirely in `fit`.
+    HuberRegressor,
 );
 
 /// The whole `predict` body for a fitted f32 dense linear regressor: borrow the
@@ -3461,6 +3465,336 @@ impl PyBayesianRidge {
             AnyBayesianRidge::Unfit { .. } => None,
             AnyBayesianRidge::F32(_) => Some("f32"),
             AnyBayesianRidge::F64(_) => Some("f64"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HuberRegressor — Fit + Predict; the FULL sklearn parameter surface
+//   epsilon, max_iter, alpha, warm_start, fit_intercept, tol
+//   + fit(..., sample_weight) and the coef_ / intercept_ / scale_ / n_iter_ /
+//     outliers_ fitted attributes
+// ---------------------------------------------------------------------------
+
+crate::any_estimator_typestate! {
+    any:   AnyHuberRegressor,
+    algo:  mlrs_algos::linear::huber::HuberRegressor,
+    unfit: {
+        epsilon: f64,
+        max_iter: usize,
+        alpha: f64,
+        warm_start: bool,
+        fit_intercept: bool,
+        tol: f64,
+    },
+}
+
+/// The verbatim ctor hyperparameters, carried from the `Unfit` arm to `fit`
+/// (WR-02: the wrapper rebuilds from these at every `fit`, so a second `fit` of
+/// the same object works).
+#[derive(Clone, Copy)]
+struct HuberParams {
+    epsilon: f64,
+    max_iter: usize,
+    alpha: f64,
+    warm_start: bool,
+    fit_intercept: bool,
+    tol: f64,
+}
+
+/// sklearn-compatible `HuberRegressor` (robust L2-regularized linear regression).
+#[pyclass(name = "HuberRegressor")]
+pub struct PyHuberRegressor {
+    inner: AnyHuberRegressor,
+    /// The ctor hyperparameters, kept OUTSIDE `inner` because a fitted arm no
+    /// longer carries an `Unfit { .. }` to read them from and `warm_start`
+    /// makes a second `fit` of the same object a supported operation.
+    params: HuberParams,
+    /// Scalar/vector fitted attributes mirrored out of the consumed `Fitted`
+    /// arms at `fit`: a `#[pyclass]` getter cannot reach through the dtype
+    /// dispatch generically, and all of these are `f64`/`bool` on both arms
+    /// anyway (the solve runs in `f64` whatever the design's width).
+    scale: Option<f64>,
+    n_iter: Option<usize>,
+    converged: bool,
+    outliers: Vec<bool>,
+    /// The packed `[coef…, intercept?, σ]` a `warm_start` refit seeds from —
+    /// sklearn's `np.concatenate((self.coef_, [self.intercept_, self.scale_]))`.
+    /// Held HERE rather than read back from `inner` so the seed survives the
+    /// typestate `fit` consuming the previous estimator.
+    warm_params: Vec<f64>,
+}
+
+impl PyHuberRegressor {
+    /// Rust-callable default constructor (smoke test seam).
+    pub fn unfit_default() -> Self {
+        Self::new(1.35, 100, 1e-4, false, true, 1e-5)
+    }
+
+    /// Is this wrapper in the unfit arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyHuberRegressor::Unfit { .. })
+    }
+}
+
+/// Build an unfit `HuberRegressor<F>` from the ctor params, seeding the
+/// warm-start vector when there is one. Monomorphized per float width by the
+/// macro so the six builder setters are written once.
+macro_rules! huber_build {
+    ($float:ty, $p:expr, $seed:expr) => {{
+        let mut b = HuberRegressor::<$float>::builder()
+            .epsilon($p.epsilon)
+            .max_iter($p.max_iter)
+            .alpha($p.alpha)
+            .warm_start($p.warm_start)
+            .fit_intercept($p.fit_intercept)
+            .tol($p.tol);
+        // sklearn seeds the next fit only when `warm_start` is set AND the
+        // estimator already has a `coef_`; an empty seed is the cold start.
+        if $p.warm_start && !$seed.is_empty() {
+            b = b.init_params($seed.clone());
+        }
+        b.build::<$float>().map_err(build_err_to_py)?
+    }};
+}
+
+/// Build the estimator and run whichever `fit` ingress the backend calls for.
+///
+/// The branch has to happen HERE, before ingress, because the two entry points
+/// take different operand types: `fit_from_host_slice` borrows the Arrow values
+/// directly and `fit_with_sample_weight` needs a device upload. On the cpu
+/// backend — where the objective evaluates from host memory anyway — the `n·d`
+/// design is therefore never copied at all, which removes THREE full passes over
+/// it from every fit (`from_host` copies twice, `to_host` once) and, unlike a
+/// one-shot `predict`, that saving is not paid once but avoided on a solve that
+/// re-reads the design a few dozen times.
+macro_rules! huber_fit_dispatch {
+    ($float:ty, $p:expr, $seed:expr, $xa:expr, $ya:expr, $swa:expr, $rows:expr, $cols:expr,
+     $pool:expr, $as:ident, $host_slice:ident, $validated:ident) => {{
+        let est = huber_build!($float, $p, $seed);
+        let sw = match $swa.as_ref() {
+            Some(a) => Some($host_slice($as(a)?)?),
+            None => None,
+        };
+        if mlrs_backend::prims::huber_objective::huber_host_ingress_preferred() {
+            let xh = $host_slice($as(&$xa)?)?;
+            let yh = $host_slice($as(&$ya)?)?;
+            est.fit_from_host_slice(&mut $pool, xh, yh, ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        } else {
+            let xd = $validated($as(&$xa)?, &mut $pool)?;
+            let yd = $validated($as(&$ya)?, &mut $pool)?;
+            est.fit_with_sample_weight(&mut $pool, &xd, Some(&yd), ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        }
+    }};
+}
+
+/// Snapshot the fitted attributes a `#[pyclass]` getter cannot reach through the
+/// dtype dispatch. Written once, invoked on both float arms.
+macro_rules! huber_snapshot {
+    ($fitted:expr) => {{
+        (
+            $fitted.scale(),
+            $fitted.n_iter(),
+            $fitted.converged(),
+            $fitted.outliers().to_vec(),
+            $fitted.warm_start_params().to_vec(),
+        )
+    }};
+}
+
+#[pymethods]
+impl PyHuberRegressor {
+    /// `HuberRegressor(epsilon=1.35, max_iter=100, alpha=0.0001,
+    /// warm_start=False, fit_intercept=True, tol=1e-05)` — sklearn's signature
+    /// one-for-one. Every parameter is a float, an int or a bool; there is no
+    /// string-valued parameter on this estimator.
+    #[new]
+    #[pyo3(signature = (
+        epsilon = 1.35,
+        max_iter = 100,
+        alpha = 1e-4,
+        warm_start = false,
+        fit_intercept = true,
+        tol = 1e-5,
+    ))]
+    fn new(
+        epsilon: f64,
+        max_iter: usize,
+        alpha: f64,
+        warm_start: bool,
+        fit_intercept: bool,
+        tol: f64,
+    ) -> Self {
+        Self {
+            inner: AnyHuberRegressor::Unfit {
+                epsilon,
+                max_iter,
+                alpha,
+                warm_start,
+                fit_intercept,
+                tol,
+            },
+            params: HuberParams {
+                epsilon,
+                max_iter,
+                alpha,
+                warm_start,
+                fit_intercept,
+                tol,
+            },
+            scale: None,
+            n_iter: None,
+            converged: false,
+            outliers: Vec::new(),
+            warm_params: Vec::new(),
+        }
+    }
+
+    /// `fit(X, y, rows, cols, sample_weight=None)`.
+    ///
+    /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
+    /// dtype as `X` — borrowed as a host slice (never uploaded), because the
+    /// objective reads it from the host on every backend.
+    ///
+    /// With `warm_start=True` a second `fit` on the same object seeds from the
+    /// first's `[coef_, intercept_, scale_]`, exactly as sklearn's does. The seed
+    /// lives on the wrapper because the Rust `fit` CONSUMES the estimator.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
+        let dt = float_dtype(&xa)?;
+        let p = self.params;
+        let seed = self.warm_params.clone();
+        type Snapshot = (f64, usize, bool, Vec<bool>, Vec<f64>);
+        let (fitted, snap) = py.detach(|| -> PyResult<(AnyHuberRegressor, Snapshot)> {
+            let mut pool = crate::lock_pool();
+            match dt {
+                FloatDtype::F32 => {
+                    let fitted = huber_fit_dispatch!(
+                        f32, p, seed, xa, ya, swa, rows, cols, pool,
+                        as_f32, host_slice_f32, validated_f32
+                    );
+                    let snap = huber_snapshot!(fitted);
+                    Ok((AnyHuberRegressor::F32(fitted), snap))
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let fitted = huber_fit_dispatch!(
+                        f64, p, seed, xa, ya, swa, rows, cols, pool,
+                        as_f64, host_slice_f64, validated_f64
+                    );
+                    let snap = huber_snapshot!(fitted);
+                    Ok((AnyHuberRegressor::F64(fitted), snap))
+                }
+            }
+        })?;
+        self.inner = fitted;
+        let (scale, n_iter, converged, outliers, warm_params) = snap;
+        self.scale = Some(scale);
+        self.n_iter = Some(n_iter);
+        self.converged = converged;
+        self.outliers = outliers;
+        self.warm_params = warm_params;
+        Ok(())
+    }
+
+    /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shares
+    /// [`dense_predict_f32`] with the other dense linear regressors.
+    fn predict_f32<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyHuberRegressor::F32(est) => dense_predict_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("huber_regressor", "predict (f32 path)")),
+        }
+    }
+    fn predict_f64<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyHuberRegressor::F64(est) => dense_predict_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("huber_regressor", "predict (f64 path)")),
+        }
+    }
+
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHuberRegressor::F32(e) => Ok(e.coef(&pool)),
+            _ => Err(not_fitted("huber_regressor", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHuberRegressor::F64(e) => Ok(e.coef(&pool)),
+            _ => Err(not_fitted("huber_regressor", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<f32> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHuberRegressor::F32(e) => Ok(e.intercept(&pool)),
+            _ => Err(not_fitted("huber_regressor", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<f64> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHuberRegressor::F64(e) => Ok(e.intercept(&pool)),
+            _ => Err(not_fitted("huber_regressor", "intercept_ (f64)")),
+        }
+    }
+
+    /// sklearn's `scale_` — the fitted `σ`. Always `f64`: the joint `(w, σ)`
+    /// iteration accumulates in `f64` whatever the design's width.
+    fn scale(&self) -> Option<f64> {
+        self.scale
+    }
+    /// sklearn's `n_iter_` — L-BFGS iterations, capped at `max_iter`.
+    fn n_iter(&self) -> Option<usize> {
+        self.n_iter
+    }
+    /// Whether the solve met its stopping criterion inside `max_iter`. The shim
+    /// turns a `False` here into sklearn's `ConvergenceWarning`, which is what
+    /// sklearn itself raises (it does NOT error on a hit cap).
+    fn converged(&self) -> bool {
+        self.converged
+    }
+    /// sklearn's `outliers_` — the boolean mask
+    /// `|yᵢ − Xᵢ·coef_ − intercept_| > scale_·epsilon` over the TRAINING rows.
+    fn outliers(&self) -> Vec<bool> {
+        self.outliers.clone()
+    }
+
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyHuberRegressor::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyHuberRegressor::Unfit { .. } => None,
+            AnyHuberRegressor::F32(_) => Some("f32"),
+            AnyHuberRegressor::F64(_) => Some("f64"),
         }
     }
 }

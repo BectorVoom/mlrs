@@ -338,6 +338,129 @@ class RidgeClassifier(ClassifierMixin, MlrsBase):
         return self._mlrs_obj.solver_used()
 
 
+class HuberRegressor(RegressorMixin, MlrsBase):
+    """Robust linear regression with a fitted scale (HUBER-01).
+
+    ``HuberRegressor(epsilon=1.35, max_iter=100, alpha=0.0001,
+    warm_start=False, fit_intercept=True, tol=1e-05)`` — the full
+    ``sklearn.linear_model.HuberRegressor`` parameter surface, including
+    ``fit(X, y, sample_weight=...)`` and the ``coef_`` / ``intercept_`` /
+    ``scale_`` / ``n_iter_`` / ``outliers_`` fitted attributes. Every parameter
+    is a float, an int or a bool — this estimator has no string-valued
+    parameter, so there is no enum to validate at the boundary.
+
+    Unlike :class:`Ridge`, samples whose scaled residual exceeds ``epsilon``
+    contribute LINEARLY rather than quadratically, so a handful of gross
+    outliers move the fit by a bounded amount. The scale ``sigma`` is fitted
+    jointly with the coefficients, which is what makes ``epsilon`` meaningful
+    without rescaling ``y`` — see ``crates/mlrs-algos/src/linear/huber.rs``.
+
+    mlrs solves the objective TIGHTER than scikit-learn does: scikit-learn
+    leaves scipy's ``factr`` at its default, so its fits stop on the relative-f
+    criterion a measured ~1e-6 from the minimizer and ``tol`` cannot move that.
+    Expect agreement at that scale rather than at ``tol``.
+    """
+
+    def __init__(
+        self,
+        epsilon=1.35,
+        max_iter=100,
+        alpha=1e-4,
+        warm_start=False,
+        fit_intercept=True,
+        tol=1e-5,
+        output_type="input",
+    ):
+        self.epsilon = epsilon
+        self.max_iter = max_iter
+        self.alpha = alpha
+        self.warm_start = warm_start
+        self.fit_intercept = fit_intercept
+        self.tol = tol
+        self.output_type = output_type
+
+    def fit(self, X, y, sample_weight=None):
+        xa, rows, cols = self._normalize(X)
+        dtype = LinearRegression._x_float(xa)
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
+        # `warm_start` reuses the PREVIOUS wrapper so the packed
+        # `[coef_, intercept_, scale_]` seed it holds survives — sklearn keeps
+        # the same object and re-reads its own attributes, and the Rust `fit`
+        # consumes the estimator, so the seed has to live on the wrapper.
+        obj = getattr(self, "_mlrs_obj", None)
+        if not (self.warm_start and obj is not None and obj.is_fitted()):
+            obj = self._ext().HuberRegressor(
+                self.epsilon,
+                self.max_iter,
+                self.alpha,
+                self.warm_start,
+                self.fit_intercept,
+                self.tol,
+            )
+        obj.fit(xa, ya, rows, cols, swa)
+        self._mlrs_obj = obj
+        self._post_fit(cols)
+        if not obj.converged():
+            import warnings
+
+            from sklearn.exceptions import ConvergenceWarning
+
+            warnings.warn(
+                "lbfgs failed to converge (max_iter=%d). Increase the number "
+                "of iterations to improve the convergence." % self.max_iter,
+                ConvergenceWarning,
+                stacklevel=2,
+            )
+        return self
+
+    def predict(self, X):
+        return _dense_linear_predict(self, X)
+
+    @property
+    def coef_(self):
+        return self._to_output(
+            self._suffixed("coef")(), (-1,), None, self._np_float()
+        )
+
+    @property
+    def intercept_(self):
+        self._check_fitted()
+        return getattr(self._mlrs_obj, "intercept" + self._suffix())()
+
+    @property
+    def scale_(self):
+        """sklearn's ``scale_``: the fitted ``sigma``.
+
+        Always a Python float — the joint ``(w, sigma)`` iteration runs in
+        ``f64`` whatever the design's storage width, so rounding it to the
+        design dtype would only lose information.
+        """
+        self._check_fitted()
+        return self._mlrs_obj.scale()
+
+    @property
+    def n_iter_(self):
+        """sklearn's ``n_iter_``: L-BFGS iterations, capped at ``max_iter``."""
+        self._check_fitted()
+        return self._mlrs_obj.n_iter()
+
+    @property
+    def outliers_(self):
+        """sklearn's ``outliers_``: the boolean mask
+        ``|y - X @ coef_ - intercept_| > scale_ * epsilon`` over the TRAINING
+        rows.
+        """
+        self._check_fitted()
+        import numpy as np
+
+        return np.asarray(self._mlrs_obj.outliers(), dtype=bool)
+
+
 class BayesianRidge(RegressorMixin, MlrsBase):
     """Bayesian ridge regression with evidence-maximized precisions (LINEAR-06).
 

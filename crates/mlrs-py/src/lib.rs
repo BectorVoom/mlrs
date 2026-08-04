@@ -217,7 +217,8 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::timeseries::{PyAutoArima, PyArima};
     use estimators::linear::{
         PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
-        PyBayesianRidge, PyLogisticRegression, PyMBSGDClassifier, PyMBSGDRegressor, PyRidge,
+        PyBayesianRidge, PyHuberRegressor, PyLogisticRegression, PyMBSGDClassifier,
+        PyMBSGDRegressor, PyRidge,
         PyRidgeClassifier,
     };
     use estimators::manifold::{PyTSNE, PyUMAP};
@@ -242,6 +243,10 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // BayesianRidge (LINEAR-06): the evidence-maximized sibling of Ridge —
     // the penalty is FITTED, not a hyperparameter.
     m.add_class::<PyBayesianRidge>()?;
+    // HuberRegressor (HUBER-01): the robust sibling of Ridge — the same
+    // `X·coef_ + intercept_` prediction, an L-BFGS fit over `[w, c, σ]` that
+    // bounds each outlier's influence instead of squaring it.
+    m.add_class::<PyHuberRegressor>()?;
     m.add_class::<PyLasso>()?;
     m.add_class::<PyElasticNet>()?;
     m.add_class::<PyLogisticRegression>()?;

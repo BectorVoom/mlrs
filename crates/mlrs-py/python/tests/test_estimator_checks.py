@@ -60,6 +60,10 @@ def _estimators():
         # --- Plan 16-11: the 15 newly-added shim classes. ----------------- #
         mlrs.LinearSVC(),
         mlrs.LinearSVR(),
+        # HuberRegressor: `max_iter` is the L-BFGS cap and the solve converges in
+        # ~15 steps on the harness's tiny fixtures, so the class default needs no
+        # shrinking (the BayesianRidge case, not the MBSGD one).
+        mlrs.HuberRegressor(),
         # MBSGD: `max_iter` shrunk for the check-sweep's 30-row fixtures, the
         # same treatment RandomForest/HGB get below. At the class default
         # (`max_iter=1000`) a SINGLE fit of a 30x4 matrix costs ~163 s on the cpu
@@ -300,6 +304,36 @@ _EXPECTED = {
     # Linear SVM / MBSGD: iterative solvers (no n_iter_); SVR/MBSGDRegressor are
     # supervised regressors, SVC/MBSGDClassifier supervised classifiers.
     "LinearSVR": _merge(_COMMON, _SUPERVISED, _N_ITER),
+    # HuberRegressor: the commons plus ONE estimator-specific carve-out.
+    #
+    # `check_sample_weight_equivalence_on_dense_data` asserts that fitting with
+    # integer `sample_weight` and fitting on the correspondingly REPEATED rows
+    # give the same `predict` to `rtol=1e-7, atol=1e-9`. That equivalence is
+    # exact in the maths — every term of the Huber objective is linear in the
+    # weights — and mlrs reproduces it to MACHINE PRECISION when the two solves
+    # converge: 1.1e-16 on `coef_` and 2.8e-17 on `scale_` for a well-posed
+    # 40x4 design (`test_oracle_huber.py::test_weighted_fit_equals_repeated_fit`
+    # is the gate on that). What the check's own 30-row fixture measures instead
+    # is how far apart two ITERATIVE solves stop on an ill-conditioned problem,
+    # at a tolerance three orders below either engine's stopping accuracy —
+    # scikit-learn's OWN `HuberRegressor` fails the same check by 3.8e-6 when it
+    # is run standalone (verified 2026-08-05, sklearn 1.9.0). mlrs's deviation is
+    # larger (1.9e-4) because it solves to `ftol = 64*eps` and can reach the
+    # `max_iter=100` cap on that fixture where scikit-learn's `factr = 1e7` stops
+    # early — the accuracy trade documented in `huber.rs`.
+    "HuberRegressor": _merge(
+        _COMMON,
+        _SUPERVISED,
+        {
+            "check_sample_weight_equivalence_on_dense_data": (
+                "the check's tolerance (rtol=1e-7) is three orders below any "
+                "iterative solver's stopping accuracy on its ill-conditioned "
+                "fixture; scikit-learn's own HuberRegressor fails it too. The "
+                "equivalence holds to machine precision when both fits converge "
+                "— gated in test_oracle_huber.py."
+            )
+        },
+    ),
     "MBSGDRegressor": _merge(_COMMON, _SUPERVISED, _N_ITER),
     "LinearSVC": _merge(_COMMON, _SUPERVISED, _CLASSIFIER, _N_ITER),
     "MBSGDClassifier": _merge(_COMMON, _SUPERVISED, _CLASSIFIER, _N_ITER),

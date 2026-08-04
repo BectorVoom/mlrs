@@ -102,6 +102,13 @@ pub(crate) mod hgb_host;
 // the reusable task-dispatch pool) every cpu arm synchronizes on; extracted
 // from `hgb_host`, which was where they were first measured and tuned.
 pub(crate) mod host_pool;
+// Huber-regression primal objective evaluator (HUBER-01): the margin matvec,
+// the inlier/outlier classification against `ε·σ`, the three scalar reductions
+// the `σ` derivative needs, and the `X̃ᵀg` gradient — all out of ONE fused pass
+// where scikit-learn's NumPy form walks the design five times and fancy-index
+// COPIES it twice per evaluation. Same cpu-host / device-GEMM split as
+// `svm_objective`, and the same reason for it.
+pub mod huber_objective;
 pub mod eig;
 pub mod gemm;
 pub mod kmeans;
