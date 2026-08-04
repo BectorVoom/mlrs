@@ -378,16 +378,48 @@ def test_categorical_nb_fit_nonfinite_precedes_invalid_category():
 
 
 def test_categorical_nb_fit_still_reports_invalid_categories():
-    """A FINITE but invalid category keeps mlrs' own message (no scan upgrade)."""
+    """A FINITE but invalid category keeps mlrs' own message (no scan upgrade).
+
+    "Invalid" now means what it means to sklearn: still negative AFTER the
+    ``dtype="int"`` cast. sklearn truncates toward zero and only then calls
+    ``check_non_negative``, so ``-1.0`` is rejected but ``-0.5`` (which
+    truncates to category 0) is not — and the message reproduces sklearn's
+    ``check_non_negative`` wording so a caller matching on sklearn's text also
+    matches ours.
+    """
     X, y = _categorical_input()
     X[3, 2] = -1.0
-    with pytest.raises(ValueError, match="non-negative integers"):
+    with pytest.raises(ValueError, match="Negative values in data"):
         mlrs.naive_bayes.CategoricalNB().fit(X, y)
+
+
+def test_categorical_nb_fit_truncates_fractional_categories_like_sklearn():
+    """A FRACTIONAL category is truncated toward zero, not rejected.
+
+    sklearn validates ``CategoricalNB``'s X with ``dtype="int"``, which casts
+    rather than rejects, so ``0.5`` is category 0 and ``2.7`` is category 2.
+    mlrs used to reject any non-integer, which was stricter than sklearn on
+    input sklearn accepts silently.
+
+    Asserted against sklearn itself rather than against a hard-coded
+    expectation: the point is that the two agree, and pinning our own numbers
+    here would not notice if sklearn's cast were something other than
+    truncation.
+    """
+    from sklearn.naive_bayes import CategoricalNB as SkCategoricalNB
 
     X, y = _categorical_input()
     X[3, 2] = 0.5
-    with pytest.raises(ValueError, match="non-negative integers"):
-        mlrs.naive_bayes.CategoricalNB().fit(X, y)
+    X[7, 1] = 2.7
+    X[9, 0] = -0.5  # truncates to 0 -> accepted, unlike -1.0 above
+
+    got = mlrs.naive_bayes.CategoricalNB().fit(X, y)
+    want = SkCategoricalNB().fit(X, y)
+    np.testing.assert_array_equal(
+        np.asarray(got.predict(X)),
+        want.predict(X),
+        err_msg="a fractional categorical fit must agree with sklearn's cast",
+    )
 
 
 def test_categorical_nb_fit_matches_sklearn_after_rewrite():

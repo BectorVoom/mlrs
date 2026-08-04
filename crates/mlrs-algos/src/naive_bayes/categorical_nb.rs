@@ -43,7 +43,7 @@ use crate::naive_bayes::multinomial_nb::{
     decode_classes_host, resolve_class_log_prior, validate_discrete_alpha,
 };
 use crate::naive_bayes::nb_common::{
-    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize, NB_LABEL_INT_TOL,
+    argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize,
     PAR_TABLE_MAX_ENTRIES,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
@@ -270,16 +270,27 @@ const WORKERS_ENV: &str = "MLRS_CATNB_WORKERS";
 ///
 /// Returns `(per_feature_max, first_invalid)`, where `first_invalid` is the flat
 /// index (in the WHOLE matrix — `flat_base` is the chunk's offset) and value of
-/// the first element that is not a non-negative integer within
-/// [`NB_LABEL_INT_TOL`] / is beyond [`MAX_CATEGORY`]. Reporting the flat index
-/// lets the parallel driver pick the FIRST offender in row-major order, so the
-/// error message does not depend on the worker count.
+/// the first element that is not a valid category index. Reporting the flat
+/// index lets the parallel driver pick the FIRST offender in row-major order, so
+/// the error message does not depend on the worker count.
 ///
-/// The integer test is written as `!(diff <= tol)` rather than `diff > tol` so a
-/// `NaN` — for which EVERY comparison is false — is REJECTED rather than silently
-/// rounding to category `0`. That is what lets the PyO3 fit arm relocate
-/// `check_array`'s finite scan into this pass (`ensure_all_finite=False`):
-/// `+inf`/`-inf` already fail the `> MAX_CATEGORY` / `< 0.0` arms.
+/// ## A fractional value is TRUNCATED, not rejected
+/// sklearn's `CategoricalNB` validates `X` with `dtype="int"`, which CASTS —
+/// `numpy` truncates toward zero — and only then calls `check_non_negative` on
+/// the result. So sklearn reads `1.7` as category `1` and `-0.5` as category
+/// `0`, and rejects only values that are still negative AFTER truncation.
+///
+/// mlrs previously rejected any non-integer outright. That was stricter than
+/// sklearn on inputs sklearn accepts silently, and it made every check that
+/// fits `CategoricalNB` on a continuous fixture fail. This now reproduces
+/// sklearn's cast exactly, so `trunc` (toward zero) — NOT `round`, which would
+/// read `1.7` as category `2` where sklearn reads `1`.
+///
+/// A `NaN` is still REJECTED: the test is written `!(xt >= 0.0)` rather than
+/// `xt < 0.0` so a `NaN` — for which EVERY comparison is false — cannot slip
+/// through to become category `0`. That is what lets the PyO3 fit arm relocate
+/// `check_array`'s finite scan into this pass (`ensure_all_finite=False`);
+/// `±inf` fail the `>= 0.0` / `> MAX_CATEGORY` arms.
 fn scan_chunk<F>(chunk: &[F], n_features: usize, flat_base: usize) -> (Vec<u32>, Option<(usize, f64)>)
 where
     F: Float + CubeElement + Pod,
@@ -288,11 +299,11 @@ where
     for (r, row) in chunk.chunks_exact(n_features).enumerate() {
         for (j, (&xv, m)) in row.iter().zip(fmax.iter_mut()).enumerate() {
             let xf = host_to_f64(xv);
-            let xr = xf.round();
-            if !((xr - xf).abs() <= NB_LABEL_INT_TOL) || xr < 0.0 || xr > MAX_CATEGORY {
+            let xt = xf.trunc();
+            if !(xt >= 0.0) || xt > MAX_CATEGORY {
                 return (fmax, Some((flat_base + r * n_features + j, xf)));
             }
-            let k = xr as u32;
+            let k = xt as u32;
             if k > *m {
                 *m = k;
             }
@@ -323,7 +334,8 @@ fn count_chunk<F>(
     for (row, &c) in chunk.chunks_exact(n_features).zip(class_of_row.iter()) {
         let base = c * total;
         for (&xv, &o) in row.iter().zip(off.iter()) {
-            let k = host_to_f64(xv).round() as u32 as usize;
+            // `trunc`, matching the scan's sklearn-equivalent cast.
+            let k = host_to_f64(xv).trunc() as u32 as usize;
             table[base + o + k] += 1;
         }
     }
@@ -356,7 +368,8 @@ fn count_chunk_weighted<F>(
         let w = weights[r];
         let base = c * total;
         for (&xv, &o) in row.iter().zip(off.iter()) {
-            let k = host_to_f64(xv).round() as u32 as usize;
+            // `trunc`, matching the scan's sklearn-equivalent cast.
+            let k = host_to_f64(xv).trunc() as u32 as usize;
             table[base + o + k] += w;
         }
     }
@@ -482,7 +495,9 @@ where
         {
             return Err(AlgoError::InvalidCategoricalInput {
                 estimator: "categorical_nb",
-                reason: format!("feature values must be non-negative integers (got {xf})"),
+                reason: format!(
+                    "Negative values in data passed to CategoricalNB (input X) (got {xf})"
+                ),
             });
         }
         let mut observed_max = vec![0u32; n_features];
@@ -796,24 +811,30 @@ where
                     let n_cat_j = n_categories[j];
                     let flp_j = &feature_log_prob[j];
                     let xf = host_to_f64(x_h[r * n_features + j]);
-                    let xr = xf.round();
+                    // The same sklearn cast `fit` uses: `dtype="int"` TRUNCATES
+                    // toward zero, then `check_non_negative` runs on the result
+                    // (see `scan_chunk`). So `1.7` is category 1 and `-0.5` is
+                    // category 0; only a still-negative (or NaN) value is
+                    // rejected. `!(xt >= 0.0)` rather than `xt < 0.0` so a NaN
+                    // cannot slip through as category 0.
+                    let xt = xf.trunc();
                     // WR-06 / T-11-04-02: a predict-time category index that is
-                    // negative, non-integer, or >= n_categories_j is REJECTED with
+                    // negative or >= n_categories_j is REJECTED with
                     // `InvalidCategoricalInput` — matching sklearn (which raises
                     // IndexError/ValueError on an out-of-range category) and the
                     // documented purpose of the error variant. (Previously such a
                     // category was silently mapped to the smoothed log(alpha/denom)
                     // fallback, which diverged from sklearn and contradicted the
                     // variant's own doc.)
-                    if (xr - xf).abs() > NB_LABEL_INT_TOL || xr < 0.0 {
+                    if !(xt >= 0.0) {
                         return Err(AlgoError::InvalidCategoricalInput {
                             estimator: "categorical_nb",
                             reason: format!(
-                                "feature values must be non-negative integers (got {xf} for feature {j})"
+                                "Negative values in data passed to CategoricalNB (input X)                                  (got {xf} for feature {j})"
                             ),
                         });
                     }
-                    let k = xr as usize;
+                    let k = xt as usize;
                     if k >= n_cat_j {
                         return Err(AlgoError::InvalidCategoricalInput {
                             estimator: "categorical_nb",

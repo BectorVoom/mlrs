@@ -362,6 +362,27 @@ pub enum AlgoError {
         reason: String,
     },
 
+    /// A count-based Naive Bayes variant (`MultinomialNB` / `ComplementNB`) was
+    /// given a feature matrix outside its DOMAIN: the model reads `X` as
+    /// occurrence counts, so a negative entry has no meaning and would drive
+    /// `log` of a negative smoothed count.
+    ///
+    /// Distinct from [`AlgoError::InvalidLabels`], which this used to borrow:
+    /// the labels are fine, it is `X` that is invalid, and saying "invalid
+    /// labels" sent readers to the wrong operand.
+    ///
+    /// The `reason` reproduces scikit-learn's own `check_non_negative` wording
+    /// ("Negative values in data passed to {name} (input X)") so a caller
+    /// matching on sklearn's message — including sklearn's own
+    /// `check_positive_only_tag_during_fit` — sees what it expects.
+    #[error("estimator '{estimator}': invalid input X — {reason}")]
+    InvalidFeatureInput {
+        /// Which estimator rejected the matrix (e.g. `"multinomial_nb"`).
+        estimator: &'static str,
+        /// The data-validity reason, in sklearn's wording.
+        reason: String,
+    },
+
     /// `CategoricalNB` (Phase 11) was given a feature matrix that is not a valid
     /// non-negative-INTEGER categorical encoding: a negative value, a non-integer
     /// value, or a predict-time category index that exceeds the per-feature

@@ -52,9 +52,53 @@ class _BaseNB(ClassifierMixin, MlrsBase):
         self._post_fit(cols)
         self.classes_ = np.asarray(obj.classes_(), dtype=np.int32)
 
+    # -- sklearn tags: the family's DOMAIN, declared (RESEARCH §estimator_checks)
+
+    #: Whether this variant rejects negative feature values. sklearn's own NB
+    #: classes set ``input_tags.positive_only`` for exactly the three that call
+    #: ``check_non_negative`` on X (Multinomial / Complement / Categorical) and
+    #: leave it False for Gaussian (unrestricted) and Bernoulli (which binarizes,
+    #: so a negative value is meaningful input, not an error). Subclasses
+    #: override; the default is the unrestricted one.
+    _POSITIVE_ONLY = False
+
+    #: Whether to exempt this variant from ``check_classifiers_train``'s
+    #: ``accuracy > 0.83`` floor. sklearn sets it on the four DISCRETE variants
+    #: and leaves it off for Gaussian, which scores well on that fixture; the
+    #: default here matches the discrete majority and Gaussian overrides back.
+    _POOR_SCORE = True
+
+    def __sklearn_tags__(self):
+        """Declare the two family-wide tags sklearn's own NB classes carry.
+
+        Both were previously left at their defaults, and each silently enrolled
+        the estimator in checks it cannot pass — the same failure mode as an
+        estimator that under-declares any other capability:
+
+        * ``input_tags.positive_only`` tells ``_enforce_estimator_tags_X`` to
+          shift a fixture to be non-negative. Without it the harness feeds
+          negative X to a variant that (correctly, and exactly as sklearn does)
+          rejects it, and every check that fits reports the rejection as a
+          failure.
+        * ``classifier_tags.poor_score`` exempts the estimator from
+          ``check_classifiers_train``'s ``accuracy > 0.83`` floor. Naive Bayes on
+          that check's blob fixture scores ~0.79 — mlrs reproduces sklearn's
+          predictions EXACTLY there, so the floor is a statement about the
+          algorithm, not about this implementation, which is why sklearn sets
+          the tag on all four discrete variants rather than weakening the check.
+        """
+        tags = super().__sklearn_tags__()
+        tags.input_tags.positive_only = self._POSITIVE_ONLY
+        tags.classifier_tags.poor_score = self._POOR_SCORE
+        return tags
+
 
 class GaussianNB(_BaseNB):
     """Gaussian naive Bayes (NB-01). ``GaussianNB(var_smoothing=1e-9, priors=None)``."""
+
+    #: sklearn's GaussianNB carries neither discrete-family tag: it accepts
+    #: negative features and clears the accuracy floor.
+    _POOR_SCORE = False
 
     def __init__(self, var_smoothing=1e-9, priors=None, output_type="input"):
         self.var_smoothing = var_smoothing
@@ -99,6 +143,9 @@ class MultinomialNB(_BaseNB):
 
     ``MultinomialNB(alpha=1.0, force_alpha=True, fit_prior=True, class_prior=None)``.
     """
+
+    #: sklearn's MultinomialNB calls ``check_non_negative`` on X.
+    _POSITIVE_ONLY = True
 
     def __init__(
         self,
@@ -212,6 +259,9 @@ class ComplementNB(_BaseNB):
     norm=False)``.
     """
 
+    #: sklearn's ComplementNB calls ``check_non_negative`` on X.
+    _POSITIVE_ONLY = True
+
     def __init__(
         self,
         alpha=1.0,
@@ -270,6 +320,9 @@ class CategoricalNB(_BaseNB):
     min_categories=None)``. ``min_categories`` is stored verbatim and resolved
     (int / per-feature array / ``None``) by the ``_mlrs`` ctor.
     """
+
+    #: sklearn's CategoricalNB calls ``check_non_negative`` on X.
+    _POSITIVE_ONLY = True
 
     def __init__(
         self,

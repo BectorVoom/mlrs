@@ -44,7 +44,7 @@ use crate::naive_bayes::multinomial_nb::{
 };
 use crate::naive_bayes::nb_common::{
     argmin_decode, class_grouped_stats_host, log_sum_exp_normalize, ClassGroupedStats,
-    HostScanCheck, StatsRequest,
+    HostScanCheck, StatsRequest, non_negative_x_error,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -316,10 +316,7 @@ where
             },
         );
         if let Some((_, v)) = first_invalid {
-            return Err(AlgoError::InvalidLabels {
-                estimator: "complement_nb",
-                reason: format!("input X must be finite and non-negative (got {v})"),
-            });
+            return Err(non_negative_x_error("complement_nb", "ComplementNB", v));
         }
 
 
@@ -466,7 +463,7 @@ where
         // CR-01 / T-11-02: a negative / NaN query row is equally invalid for the
         // count model — reject it before the GEMM (sklearn rejects at predict too).
         let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        validate_non_negative_counts("complement_nb", &x_host)?;
+        validate_non_negative_counts("complement_nb", "ComplementNB", &x_host)?;
         let n_classes = self.classes_.len();
         let raw = gemm::<F>(
             pool,

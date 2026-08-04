@@ -340,14 +340,60 @@ fn fit_rejects_bad_input() {
         "negative categorical value must be InvalidCategoricalInput, got {neg:?}"
     );
 
-    // A non-INTEGER entry (0.5).
-    let x_frac: Vec<f64> = vec![0.0, 1.0, 0.5, 2.0];
-    let x_frac_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_frac);
-    let clf2 = CategoricalNB::<f64>::builder().build::<f64>().expect("builds");
-    let frac = TypestateFit::fit(clf2, &mut pool, &x_frac_dev, Some(&y_dev), (2, 2)).err();
+    // A value that is still negative AFTER truncation is rejected; `-0.5` is
+    // NOT, because it truncates to category 0 (see the fractional test below).
+    let x_small: Vec<f64> = vec![0.0, 1.0, -0.5, 2.0];
+    let x_small_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &x_small);
+    let clf_s = CategoricalNB::<f64>::builder().build::<f64>().expect("builds");
     assert!(
-        matches!(frac, Some(AlgoError::InvalidCategoricalInput { .. })),
-        "non-integer categorical value must be InvalidCategoricalInput, got {frac:?}"
+        TypestateFit::fit(clf_s, &mut pool, &x_small_dev, Some(&y_dev), (2, 2)).is_ok(),
+        "-0.5 truncates to category 0 and must be accepted (sklearn casts with dtype=\"int\")"
+    );
+}
+
+/// A FRACTIONAL feature value is TRUNCATED toward zero, not rejected — and the
+/// resulting model is identical to fitting the truncated values directly.
+///
+/// sklearn validates `CategoricalNB`'s X with `dtype="int"`, which casts
+/// (numpy truncates toward zero) and only then calls `check_non_negative`. So
+/// `1.7` is category 1, and `-0.5` is category 0. mlrs used to reject any
+/// non-integer, which was stricter than sklearn on inputs sklearn accepts
+/// silently — and made every estimator_check that fits this class on a
+/// continuous fixture fail.
+///
+/// Fitting the truncated matrix directly must give the SAME model, which is
+/// what pins the cast as truncation rather than rounding: with `round`, `1.7`
+/// would land in category 2 and the two fits would diverge.
+#[test]
+fn fractional_input_truncates_like_sklearn() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let y_host: Vec<f64> = vec![0.0, 1.0, 0.0, 1.0];
+    let y_dev: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &y_host);
+
+    //           1.7->1  0.2->0 | 2.9->2  1.1->1 | -0.5->0  2.8->2 | 0.4->0  1.9->1
+    let frac: Vec<f64> = vec![1.7, 0.2, 2.9, 1.1, -0.5, 2.8, 0.4, 1.9];
+    let trunc: Vec<f64> = vec![1.0, 0.0, 2.0, 1.0, 0.0, 2.0, 0.0, 1.0];
+
+    let fit_one = |x: &[f64], pool: &mut BufferPool<ActiveRuntime>| {
+        let xd: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(pool, x);
+        let clf = CategoricalNB::<f64>::builder().build::<f64>().expect("builds");
+        let f = TypestateFit::fit(clf, pool, &xd, Some(&y_dev), (4, 2))
+            .expect("a fractional categorical matrix is accepted (truncated)");
+        let cats = f.n_categories().expect("fitted").to_vec();
+        let flp = f.feature_log_prob().expect("fitted").to_vec();
+        (cats, flp)
+    };
+
+    let (cat_f, flp_f) = fit_one(&frac, &mut pool);
+    let (cat_t, flp_t) = fit_one(&trunc, &mut pool);
+    assert_eq!(
+        cat_f, cat_t,
+        "the fractional fit must see the same category counts as the truncated one"
+    );
+    assert_eq!(
+        flp_f, flp_t,
+        "truncating in the caller and letting the fit truncate must give the SAME model"
     );
 }
 
