@@ -92,12 +92,18 @@ EXPECTED_PARAMS = {
         "tol": 1e-4,
         "output_type": "input",
     },
+    # sklearn's FULL KMeans ctor surface (verified against a live
+    # ``SkKMeans().get_params()`` in test_oracle_kmeans_params.py).
     "KMeans": {
         "n_clusters": 8,
         "init": "k-means++",
+        "n_init": "auto",
         "max_iter": 300,
         "tol": 1e-4,
+        "verbose": 0,
         "random_state": None,
+        "copy_x": True,
+        "algorithm": "lloyd",
         "output_type": "input",
     },
     "DBSCAN": {"eps": 0.5, "min_samples": 5, "output_type": "input"},

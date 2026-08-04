@@ -165,3 +165,87 @@ fn kmeanspp_seed_reproducible_f64() {
         "same seed must yield identical k-means++ indices on f64 (seed-reproducibility)"
     );
 }
+
+// ===========================================================================
+// random_sample — sklearn's `init='random'` draw
+// ===========================================================================
+
+/// `random_sample` is UNIFORM without replacement, not merely distinct.
+///
+/// Distinctness alone would be satisfied by a biased draw, and a biased
+/// `init='random'` degrades silently: it still returns `k` valid centers, still
+/// converges, and only shows up as a worse average optimum across restarts —
+/// which no correctness test would catch. The partial Fisher–Yates draw is
+/// therefore checked on BOTH marginals over 300k trials: how often each index
+/// appears anywhere in the sample (`k/n` each), and how often it appears in the
+/// FIRST slot (`1/n` each — the marginal a naive `% n` or a "swap only forward"
+/// bug skews first).
+///
+/// Host-only (no device), so there is no capability gate.
+#[test]
+fn random_sample_draws_uniformly_without_replacement() {
+    use mlrs_backend::prims::kmeans::random_sample;
+
+    const N: usize = 10;
+    const K: usize = 3;
+    const TRIALS: usize = 300_000;
+
+    let mut membership = [0usize; N];
+    let mut first_slot = [0usize; N];
+    for t in 0..TRIALS {
+        let idx = random_sample(N, K, t as u64).expect("random_sample on 1 <= k <= n");
+        assert_eq!(idx.len(), K, "draw {t} returned {} indices", idx.len());
+        let mut seen = [false; N];
+        for (slot, &i) in idx.iter().enumerate() {
+            assert!(i < N, "draw {t} returned out-of-range index {i}");
+            assert!(!seen[i], "draw {t} repeated index {i} — not without replacement");
+            seen[i] = true;
+            membership[i] += 1;
+            if slot == 0 {
+                first_slot[i] += 1;
+            }
+        }
+    }
+
+    // 300k trials puts the sampling error ~0.5%; 2%/3% bands are comfortably
+    // above noise and comfortably below any real bias.
+    let expect_membership = TRIALS as f64 * K as f64 / N as f64;
+    let expect_first = TRIALS as f64 / N as f64;
+    for i in 0..N {
+        let dev_m = (membership[i] as f64 - expect_membership).abs() / expect_membership;
+        let dev_f = (first_slot[i] as f64 - expect_first).abs() / expect_first;
+        assert!(
+            dev_m < 0.02,
+            "index {i} membership rate deviates {:.3}% — biased draw: {membership:?}",
+            dev_m * 100.0
+        );
+        assert!(
+            dev_f < 0.03,
+            "index {i} first-slot rate deviates {:.3}% — biased draw: {first_slot:?}",
+            dev_f * 100.0
+        );
+    }
+
+    // Seed-reproducible (D-09c / T-05-03-03) and seed-sensitive, matching the
+    // kmeanspp_sample contract above.
+    assert_eq!(
+        random_sample(N, K, 7).expect("draw"),
+        random_sample(N, K, 7).expect("draw"),
+        "same seed must reproduce the same draw"
+    );
+    let differ = (0..64u64).any(|s| {
+        random_sample(64, 8, s).expect("draw") != random_sample(64, 8, s + 1).expect("draw")
+    });
+    assert!(differ, "different seeds never differed — the draw ignores the seed");
+
+    // k == n is the degenerate case rejection sampling could not serve; the
+    // partial Fisher–Yates draw returns a full permutation.
+    let full = random_sample(N, N, 3).expect("k == n is legal");
+    let mut sorted = full.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..N).collect::<Vec<_>>(), "k == n must be a permutation");
+
+    // Out-of-range k is a typed error, never a panic across the boundary.
+    assert!(random_sample(N, 0, 0).is_err(), "k = 0 must be rejected");
+    assert!(random_sample(N, N + 1, 0).is_err(), "k > n must be rejected");
+}

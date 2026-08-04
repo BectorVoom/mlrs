@@ -631,6 +631,36 @@ pub enum BuildError {
         value: String,
     },
 
+    /// An unrecognised `init` string was supplied (the enum-parse failure
+    /// folded into `BuildError`, D-09). Mirrors sklearn's `StrOptions`
+    /// rejection for `KMeans(init=...)`, whose only string values are
+    /// `'k-means++'` and `'random'` (an explicit `k × d` array is the third,
+    /// non-string form).
+    #[error("unknown init '{value}'")]
+    UnknownInit {
+        /// The unrecognised init name the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `n_init` string was supplied. sklearn's `n_init`
+    /// constraint is `StrOptions({'auto'}) | Interval(Integral, 1, None)`, so
+    /// `'auto'` is the ONLY legal string; every other string is rejected here
+    /// rather than silently treated as a count.
+    #[error("unknown n_init '{value}' (the only legal string is 'auto')")]
+    UnknownNInit {
+        /// The unrecognised `n_init` string the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `algorithm` string was supplied (the enum-parse failure
+    /// folded into `BuildError`, D-09). Mirrors sklearn's `StrOptions`
+    /// rejection for `KMeans(algorithm=...)` (`'lloyd'` / `'elkan'`).
+    #[error("unknown algorithm '{value}'")]
+    UnknownAlgorithm {
+        /// The unrecognised algorithm name the caller supplied.
+        value: String,
+    },
+
     /// An unrecognised `penalty` string was supplied (the enum-parse failure
     /// folded into `BuildError`, D-09).
     #[error("unknown penalty '{value}'")]

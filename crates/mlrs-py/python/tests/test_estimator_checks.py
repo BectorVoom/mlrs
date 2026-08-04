@@ -284,7 +284,12 @@ _EXPECTED = {
         _N_ITER,
         _FIT2D_1SAMPLE,
     ),
-    "KMeans": _merge(_COMMON, _N_ITER),
+    # NOT _N_ITER: KMeans surfaces sklearn's `n_iter_` (the winning restart's
+    # iteration count) since the full-parameter-surface work, so
+    # `check_non_transformer_estimators_n_iter` genuinely passes. Keeping the
+    # xfail here would let a future regression that dropped `n_iter_` slip
+    # through as a silent xfail instead of a failure.
+    "KMeans": _merge(_COMMON),
     "DBSCAN": _merge(_COMMON),
     "PCA": _merge(_COMMON, _FIT2D_1SAMPLE),
     "TruncatedSVD": _merge(_COMMON, _FIT2D_1SAMPLE),

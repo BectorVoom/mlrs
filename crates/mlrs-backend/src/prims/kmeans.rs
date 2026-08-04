@@ -44,8 +44,9 @@ use mlrs_kernels::dist_combine_clamp;
 use mlrs_kernels::kmeans::{
     argmin_dist_rows, block_sum_f, centroid_reduce_partials, centroid_sumcount,
     centroid_sumcount_blocked, centroid_sumcount_shared, col_sqdiff_blocked, col_sum_blocked,
-    count_blocked, count_reduce, dist_direct_2d, dist_direct_2d_c4, gather_rows_idx, inertia_rows,
-    kmeanspp_mind2, labels_diff_blocked, onehot_from_labels, row_sqnorm,
+    count_blocked, count_reduce, dist_direct_2d, dist_direct_2d_c4, elkan_assign,
+    elkan_seed_bounds, elkan_update_bounds, gather_rows_idx, inertia_rows, kmeanspp_mind2,
+    labels_diff_blocked, onehot_from_labels, row_sqnorm,
 };
 
 use crate::device_array::DeviceArray;
@@ -1493,3 +1494,294 @@ fn launch_dims_2d(rows: usize, cols: usize) -> (CubeCount, CubeDim) {
 // ===========================================================================
 // f32/f64 host bit-cast helpers (promoted to `mlrs_core` — F is f32/f64 only)
 // ===========================================================================
+
+// ===========================================================================
+// Elkan (`algorithm='elkan'`) prims — the bound-pruned assignment path
+//
+// These compose the three `mlrs_kernels::kmeans::elkan_*` kernels into the
+// three steps the estimator's Elkan loop needs: SEED the bounds from the init
+// centers, ASSIGN with pruning, and RELAX the bounds after the centers move.
+// Elkan's carried state (`upper`, `lower`) is CALLER-OWNED so it is allocated
+// once per fit and reused across every iteration and restart — `lower` is the
+// only `O(n · k)` buffer in the whole estimator, so it must never be
+// per-iteration.
+//
+// The bounds are TRUE Euclidean distances (the triangle inequality does not
+// survive squaring), unlike the Lloyd path's squared `dist` buffer.
+// ===========================================================================
+
+/// Validate + launch [`elkan_seed_bounds`]: stage the FULL `n × k` squared
+/// distance matrix against `centers` with the tuned direct kernel, then
+/// square-root it into `lower` while writing the argmin into `labels` /
+/// `upper`.
+///
+/// Deliberately uses the DIRECT staging kernel, never the GEMM expansion: the
+/// expansion's `‖x‖² + ‖c‖² − 2x·c` cancellation can produce a small NEGATIVE
+/// value (clamped to `0` by `dist_combine_clamp`), and a square root of a
+/// clamped-to-zero distance would seed a lower bound that is not merely loose
+/// but WRONG — Elkan would then prune a center that could win.
+pub fn elkan_init_bounds<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    centers: &DeviceArray<ActiveRuntime, F>,
+    labels: &DeviceArray<ActiveRuntime, u32>,
+    upper: &DeviceArray<ActiveRuntime, F>,
+    lower: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+    k: usize,
+) -> Result<(), PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry(x.len(), n, d, k)?;
+    validate_elkan_state(centers, labels, upper, lower, n, d, k)?;
+    guard_u32("n*k", n * k)?;
+
+    let client = pool.client().clone();
+    let dmat_len = n * k;
+    let dmat = pool.acquire(dmat_len * size_of::<F>());
+    // SAFETY: validated element counts; the kernels bounds-check their unit ids.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let c_arg = unsafe { ArrayArg::from_raw_parts(centers.handle().clone(), centers.len()) };
+    let dm_arg = unsafe { ArrayArg::from_raw_parts(dmat.clone(), dmat_len) };
+    let (count1, dim1) = super::launch_dims_1d_folded(n * k.div_ceil(4), super::PERF_TUNED_BLOCK);
+    dist_direct_2d_c4::launch::<F, ActiveRuntime>(
+        &client, count1, dim1, x_arg, c_arg, dm_arg, n as u32, d as u32, k as u32,
+    );
+
+    let dm_arg2 = unsafe { ArrayArg::from_raw_parts(dmat.clone(), dmat_len) };
+    let l_arg = unsafe { ArrayArg::from_raw_parts(labels.handle().clone(), n) };
+    let u_arg = unsafe { ArrayArg::from_raw_parts(upper.handle().clone(), n) };
+    let lo_arg = unsafe { ArrayArg::from_raw_parts(lower.handle().clone(), dmat_len) };
+    let (count2, dim2) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
+    elkan_seed_bounds::launch::<F, ActiveRuntime>(
+        &client, count2, dim2, dm_arg2, l_arg, u_arg, lo_arg, n as u32, k as u32,
+    );
+
+    pool.release(dmat, dmat_len * size_of::<F>());
+    Ok(())
+}
+
+/// Validate + launch [`elkan_assign`]: the bound-pruned assignment of every
+/// row of `x` against `centers`, reading the previous labeling from
+/// `labels_in` and writing the new one to `labels_out` (so the caller keeps
+/// the previous labels for the STRICT `array_equal` convergence break).
+///
+/// `chd` (the `k × k` HALF center-center distances) and `dnc` (`dnc[c] =
+/// min_{j != c} chd[c, j]`) are HOST slices computed from the estimator's tiny
+/// `k × d` center mirror and uploaded here — they change every iteration but
+/// are `O(k²)`, so the upload is a few KB against an `O(n · k · d)` assignment.
+#[allow(clippy::too_many_arguments)]
+pub fn elkan_assign_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    centers: &DeviceArray<ActiveRuntime, F>,
+    chd: &[F],
+    dnc: &[F],
+    labels_in: &DeviceArray<ActiveRuntime, u32>,
+    labels_out: &DeviceArray<ActiveRuntime, u32>,
+    upper: &DeviceArray<ActiveRuntime, F>,
+    lower: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+    k: usize,
+) -> Result<(), PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_geometry(x.len(), n, d, k)?;
+    validate_elkan_state(centers, labels_out, upper, lower, n, d, k)?;
+    if labels_in.len() != n {
+        return Err(PrimError::ShapeMismatch {
+            operand: "labels_in",
+            rows: n,
+            cols: 1,
+            len: labels_in.len(),
+        });
+    }
+    if chd.len() != k * k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "chd",
+            rows: k,
+            cols: k,
+            len: chd.len(),
+        });
+    }
+    if dnc.len() != k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "dnc",
+            rows: k,
+            cols: 1,
+            len: dnc.len(),
+        });
+    }
+    guard_u32("n*k", n * k)?;
+
+    let client = pool.client().clone();
+    let chd_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, chd);
+    let dnc_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, dnc);
+    // SAFETY: validated element counts; the kernel bounds-checks `i < n` and
+    // every index it forms is `< k` (label domain) or `< d` (feature loop).
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let c_arg = unsafe { ArrayArg::from_raw_parts(centers.handle().clone(), centers.len()) };
+    let chd_arg = unsafe { ArrayArg::from_raw_parts(chd_dev.handle().clone(), k * k) };
+    let dnc_arg = unsafe { ArrayArg::from_raw_parts(dnc_dev.handle().clone(), k) };
+    let li_arg = unsafe { ArrayArg::from_raw_parts(labels_in.handle().clone(), n) };
+    let lo_arg = unsafe { ArrayArg::from_raw_parts(labels_out.handle().clone(), n) };
+    let u_arg = unsafe { ArrayArg::from_raw_parts(upper.handle().clone(), n) };
+    let lb_arg = unsafe { ArrayArg::from_raw_parts(lower.handle().clone(), n * k) };
+    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
+    elkan_assign::launch::<F, ActiveRuntime>(
+        &client,
+        count,
+        dim,
+        x_arg,
+        c_arg,
+        chd_arg,
+        dnc_arg,
+        li_arg,
+        lo_arg,
+        u_arg,
+        lb_arg,
+        n as u32,
+        d as u32,
+        k as u32,
+    );
+    chd_dev.release_into(pool);
+    dnc_dev.release_into(pool);
+    Ok(())
+}
+
+/// Validate + launch [`elkan_update_bounds`]: relax the carried bounds after
+/// the centers move by the per-cluster TRUE Euclidean shift `cshift`
+/// (`upper[i] += cshift[labels[i]]`, `lower[i, j] = max(lower[i, j] −
+/// cshift[j], 0)`). `labels` must be the labeling those bounds were written
+/// against.
+pub fn elkan_relax_bounds<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    cshift: &[F],
+    labels: &DeviceArray<ActiveRuntime, u32>,
+    upper: &DeviceArray<ActiveRuntime, F>,
+    lower: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    k: usize,
+) -> Result<(), PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if cshift.len() != k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "cshift",
+            rows: k,
+            cols: 1,
+            len: cshift.len(),
+        });
+    }
+    if labels.len() != n || upper.len() != n {
+        return Err(PrimError::ShapeMismatch {
+            operand: "labels",
+            rows: n,
+            cols: 1,
+            len: labels.len().min(upper.len()),
+        });
+    }
+    if lower.len() != n * k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "lower",
+            rows: n,
+            cols: k,
+            len: lower.len(),
+        });
+    }
+    guard_u32("n", n)?;
+    guard_u32("k", k)?;
+    guard_u32("n*k", n * k)?;
+
+    let client = pool.client().clone();
+    let cs_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, cshift);
+    // SAFETY: validated element counts; the kernel bounds-checks `i < n`.
+    let cs_arg = unsafe { ArrayArg::from_raw_parts(cs_dev.handle().clone(), k) };
+    let l_arg = unsafe { ArrayArg::from_raw_parts(labels.handle().clone(), n) };
+    let u_arg = unsafe { ArrayArg::from_raw_parts(upper.handle().clone(), n) };
+    let lb_arg = unsafe { ArrayArg::from_raw_parts(lower.handle().clone(), n * k) };
+    let (count, dim) = super::launch_dims_1d_folded(n, super::PERF_TUNED_BLOCK);
+    elkan_update_bounds::launch::<F, ActiveRuntime>(
+        &client, count, dim, cs_arg, l_arg, u_arg, lb_arg, n as u32, k as u32,
+    );
+    cs_dev.release_into(pool);
+    Ok(())
+}
+
+/// Shared shape validation for the Elkan carried state (T-05-03-01 / ASVS V5).
+fn validate_elkan_state<F>(
+    centers: &DeviceArray<ActiveRuntime, F>,
+    labels: &DeviceArray<ActiveRuntime, u32>,
+    upper: &DeviceArray<ActiveRuntime, F>,
+    lower: &DeviceArray<ActiveRuntime, F>,
+    n: usize,
+    d: usize,
+    k: usize,
+) -> Result<(), PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if centers.len() != k * d {
+        return Err(PrimError::ShapeMismatch {
+            operand: "centers",
+            rows: k,
+            cols: d,
+            len: centers.len(),
+        });
+    }
+    if labels.len() != n || upper.len() != n {
+        return Err(PrimError::ShapeMismatch {
+            operand: "labels",
+            rows: n,
+            cols: 1,
+            len: labels.len().min(upper.len()),
+        });
+    }
+    if lower.len() != n * k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "lower",
+            rows: n,
+            cols: k,
+            len: lower.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Draw `k` DISTINCT sample indices UNIFORMLY WITHOUT REPLACEMENT — sklearn's
+/// `init='random'` (`random_state.choice(n_samples, size=k, replace=False)`).
+///
+/// Partial Fisher–Yates over a `0..n` index vector: `k` swaps, each picking
+/// uniformly from the remaining tail via the same rejection-sampled
+/// [`SplitMix64::next_below`] `kmeanspp_sample` uses for its first center (a
+/// plain `% n` is biased for `n` not a power of two, CR-02). Unlike rejection
+/// sampling on a `chosen` set this is `O(k)` draws even at `k == n`, where
+/// rejection would not terminate in practice.
+///
+/// Host-only (ASVS V6: the seeded PRNG is a HOST concern — never `OsRng`, never
+/// a device RNG); the caller gathers the chosen rows with
+/// [`gather_rows_device`], so `x` is never read back.
+pub fn random_sample(n: usize, k: usize, seed: u64) -> Result<Vec<usize>, PrimError> {
+    if k < 1 || k > n {
+        return Err(PrimError::ShapeMismatch {
+            operand: "k",
+            rows: 1,
+            cols: k,
+            len: n,
+        });
+    }
+    let mut rng = SplitMix64::new(seed);
+    let mut idx: Vec<usize> = (0..n).collect();
+    for i in 0..k {
+        // Uniform over the untouched tail `i..n`, then swap into slot `i`.
+        let j = i + rng.next_below((n - i) as u64) as usize;
+        idx.swap(i, j);
+    }
+    idx.truncate(k);
+    Ok(idx)
+}

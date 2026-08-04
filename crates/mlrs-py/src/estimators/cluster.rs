@@ -1,8 +1,10 @@
 //! Clustering `#[pyclass]` wrappers (PY-01/PY-02/PY-05): `PyKMeans`, `PyDBSCAN`.
 //!
 //! `KMeans` is `Fit` + [`PredictLabels`] (i32 cluster ids) with the
-//! `cluster_centers_` / `labels_` / `inertia_` fitted surface; its sklearn
-//! `random_state` maps to the Rust `seed` (`None` → a fixed default). `DBSCAN` is
+//! `cluster_centers_` / `labels_` / `inertia_` / `n_iter_` fitted surface and
+//! sklearn's FULL ctor parameter set (`init` / `n_init` / `algorithm` /
+//! `verbose` / `random_state` / `copy_x`); `random_state=None` maps to the
+//! algos layer's deterministic default seed. `DBSCAN` is
 //! `Fit` + the `labels_` fitted attribute only — it has NO standalone `predict`
 //! (algos D-08; sklearn `DBSCAN` likewise exposes only `fit_predict`/`labels_`),
 //! and `eps` stays `f64` regardless of the input float dtype.
@@ -11,7 +13,7 @@ use pyo3::prelude::*;
 
 use mlrs_algos::cluster::dbscan::DBSCAN;
 use mlrs_algos::cluster::hdbscan::{ClusterSelectionMethod, Hdbscan, Metric};
-use mlrs_algos::cluster::kmeans::KMeans;
+use mlrs_algos::cluster::kmeans::{KMeans, KMeansAlgorithm, KMeansInit, NInit};
 // All three cluster wraps in this file (PyKMeans, PyDBSCAN, PyHDBSCAN) are now on
 // the v3 typestate surface (consuming-self `Fit` returning the `Fitted` sibling;
 // `PredictLabels` reads fitted state). The legacy trait glob is
@@ -24,10 +26,6 @@ use mlrs_algos::typestate::PredictLabels as TypestatePredictLabels;
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype};
 
-/// Default seed used when sklearn `random_state` is `None` (the shim passes this
-/// sentinel for `random_state=None`, giving deterministic v1 behavior).
-const DEFAULT_SEED: u64 = 0;
-
 // ---------------------------------------------------------------------------
 // KMeans — Fit + PredictLabels (i32); cluster_centers_, labels_, inertia_
 // ---------------------------------------------------------------------------
@@ -35,20 +33,63 @@ const DEFAULT_SEED: u64 = 0;
 crate::any_estimator_typestate! {
     any:   AnyKMeans,
     algo:  mlrs_algos::cluster::kmeans::KMeans,
-    unfit: { n_clusters: usize, seed: u64, max_iter: usize, tol: f64 },
+    unfit: { n_clusters: usize },
 }
 
-/// sklearn-compatible `KMeans` (Lloyd's algorithm, k-means++ init).
+/// The verbatim sklearn ctor hyperparameters (WR-02: the typestate wrapper
+/// rebuilds a fresh `Unfit` from THESE at every `fit`, so a second `fit` of the
+/// same Python object works — reading them back out of the `Unfit` enum arm
+/// would lose them the moment the first fit consumed it). Mirrors
+/// [`crate::estimators::linear::RidgeParams`]; `init` / `n_init` / `algorithm`
+/// are already parsed into their typed enums (once, at `#[new]`), so an
+/// unrecognised string is rejected at CONSTRUCTION rather than at first fit —
+/// matching sklearn, whose `StrOptions` validation also fires before any work.
+#[derive(Clone)]
+struct KMeansParams {
+    n_clusters: usize,
+    init: KMeansInit<f64>,
+    n_init: NInit,
+    max_iter: usize,
+    tol: f64,
+    verbose: bool,
+    random_state: Option<u64>,
+    copy_x: bool,
+    algorithm: KMeansAlgorithm,
+}
+
+/// sklearn-compatible `KMeans` (Lloyd / Elkan, k-means++ / random / explicit
+/// init).
 #[pyclass(name = "KMeans")]
 pub struct PyKMeans {
     inner: AnyKMeans,
+    /// The ctor hyperparameters, re-read at every `fit` (WR-02).
+    params: KMeansParams,
+    /// sklearn's `n_iter_`, captured at `fit` (the fitted arms are consumed
+    /// into `AnyKMeans` and a `#[pyclass]` getter cannot reach through the
+    /// dtype dispatch generically, so the scalar is mirrored here — the
+    /// `PyRidge::n_iter` idiom).
+    n_iter: Option<usize>,
 }
 
 impl PyKMeans {
     /// Rust-callable default constructor for the smoke test. See
     /// [`crate::estimators::linear::PyLinearRegression::unfit_default`].
     pub fn unfit_default() -> Self {
-        Self { inner: AnyKMeans::Unfit { n_clusters: 8, seed: DEFAULT_SEED, max_iter: 300, tol: 1e-4 } }
+        Self {
+            inner: AnyKMeans::Unfit { n_clusters: 8 },
+            params: KMeansParams {
+                n_clusters: 8,
+                init: KMeansInit::KMeansPlusPlus,
+                n_init: NInit::Auto,
+                max_iter: 300,
+                tol: 1e-4,
+                verbose: false,
+                random_state: None,
+                copy_x: true,
+                algorithm: KMeansAlgorithm::Lloyd,
+            },
+            n_iter: None,
+        }
     }
 
     /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
@@ -57,22 +98,101 @@ impl PyKMeans {
     }
 }
 
+/// Build an unfit `KMeans<F>` from the ctor params. Monomorphized per float
+/// width by the macro (the `ridge_build!` precedent — `mlrs-py` does not depend
+/// on `cubecl`, so it cannot spell the `Float + CubeElement + Pod` bound a
+/// generic `fn` would need), so the nine builder setters are written once.
+macro_rules! kmeans_build {
+    ($float:ty, $p:expr) => {
+        KMeans::<$float>::builder()
+            .n_clusters($p.n_clusters)
+            .init_method($p.init.clone())
+            .n_init($p.n_init)
+            .max_iter($p.max_iter)
+            .tol($p.tol)
+            .verbose($p.verbose)
+            .random_state($p.random_state)
+            .copy_x($p.copy_x)
+            .algorithm($p.algorithm)
+            .build::<$float>()
+            .map_err(build_err_to_py)
+    };
+}
+
 #[pymethods]
 impl PyKMeans {
-    /// `KMeans(n_clusters=8, max_iter=300, tol=1e-4, random_state=None)`. The
-    /// sklearn `random_state` is mapped to the Rust `seed`; `None` → a fixed
-    /// default seed (deterministic v1).
+    /// `KMeans(n_clusters=8, init='k-means++', init_array=None, n_init=None,
+    /// max_iter=300, tol=1e-4, verbose=False, random_state=None, copy_x=True,
+    /// algorithm='lloyd')` — sklearn's full ctor surface.
+    ///
+    /// The shim splits sklearn's polymorphic `init` into TWO arguments because
+    /// PyO3 cannot express "a string, an array, or a callable" as one typed
+    /// parameter: the string strategies arrive in `init`, and an explicit
+    /// array (or the flattened result of a callable, which the shim evaluates)
+    /// arrives in `init_array` — which, when present, WINS. That is exactly
+    /// sklearn's own precedence: `_init_centroids` checks the array form
+    /// before the strings.
+    ///
+    /// `n_init` is `Option<usize>`: `None` is sklearn's `'auto'`. The shim
+    /// still parses the string itself so a bad one (`n_init='ten'`) is
+    /// rejected with the same message the Rust `NInit::try_from` produces.
     #[new]
-    #[pyo3(signature = (n_clusters = 8, max_iter = 300, tol = 1e-4, random_state = None))]
-    fn new(n_clusters: usize, max_iter: usize, tol: f64, random_state: Option<u64>) -> Self {
-        Self {
-            inner: AnyKMeans::Unfit {
-                n_clusters,
-                seed: random_state.unwrap_or(DEFAULT_SEED),
-                max_iter,
-                tol,
-            },
-        }
+    #[pyo3(signature = (
+        n_clusters = 8,
+        init = "k-means++",
+        init_array = None,
+        n_init = None,
+        max_iter = 300,
+        tol = 1e-4,
+        verbose = false,
+        random_state = None,
+        copy_x = true,
+        algorithm = "lloyd",
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        n_clusters: usize,
+        init: &str,
+        init_array: Option<Vec<f64>>,
+        n_init: Option<usize>,
+        max_iter: usize,
+        tol: f64,
+        verbose: bool,
+        random_state: Option<u64>,
+        copy_x: bool,
+        algorithm: &str,
+    ) -> PyResult<Self> {
+        // An explicit array wins over the string (sklearn's precedence); only
+        // when there is none does the `init` string have to parse.
+        let init = match init_array {
+            Some(a) => KMeansInit::Array(a),
+            None => KMeansInit::try_from(init).map_err(build_err_to_py)?,
+        };
+        let n_init = match n_init {
+            Some(v) => NInit::Fixed(v),
+            None => NInit::Auto,
+        };
+        let algorithm = KMeansAlgorithm::try_from(algorithm).map_err(build_err_to_py)?;
+        let params = KMeansParams {
+            n_clusters,
+            init,
+            n_init,
+            max_iter,
+            tol,
+            verbose,
+            random_state,
+            copy_x,
+            algorithm,
+        };
+        // Surface a data-INDEPENDENT rejection (n_init < 1) at CONSTRUCTION,
+        // not at first fit — sklearn's `Interval` validation fires there too.
+        // The probe build is f32 only: the rejection does not depend on `F`.
+        kmeans_build!(f32, params)?;
+        Ok(Self {
+            inner: AnyKMeans::Unfit { n_clusters },
+            params,
+            n_iter: None,
+        })
     }
 
     /// Fit on `x` (`rows × cols`). Unsupervised — no `y`. GIL released (PY-03);
@@ -80,43 +200,31 @@ impl PyKMeans {
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (n_clusters, seed, max_iter, tol) = match &self.inner {
-            AnyKMeans::Unfit { n_clusters, seed, max_iter, tol } => (*n_clusters, *seed, *max_iter, *tol),
-            _ => (8, DEFAULT_SEED, 300, 1e-4),
-        };
-        let fitted = py.detach(|| -> PyResult<AnyKMeans> {
+        let params = self.params.clone();
+        let (fitted, n_iter) = py.detach(|| -> PyResult<(AnyKMeans, usize)> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let est = KMeans::<f32>::builder()
-                        .n_clusters(n_clusters)
-                        .seed(seed)
-                        .max_iter(max_iter)
-                        .tol(tol)
-                        .build::<f32>()
-                        .map_err(build_err_to_py)?;
+                    let est = kmeans_build!(f32, params)?;
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyKMeans::F32(fitted))
+                    let n_iter = fitted.n_iter();
+                    Ok((AnyKMeans::F32(fitted), n_iter))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let est = KMeans::<f64>::builder()
-                        .n_clusters(n_clusters)
-                        .seed(seed)
-                        .max_iter(max_iter)
-                        .tol(tol)
-                        .build::<f64>()
-                        .map_err(build_err_to_py)?;
+                    let est = kmeans_build!(f64, params)?;
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
                         .map_err(algo_err_to_py)?;
-                    Ok(AnyKMeans::F64(fitted))
+                    let n_iter = fitted.n_iter();
+                    Ok((AnyKMeans::F64(fitted), n_iter))
                 }
             }
         })?;
         self.inner = fitted;
+        self.n_iter = Some(n_iter);
         Ok(())
     }
 
@@ -173,6 +281,21 @@ impl PyKMeans {
             AnyKMeans::F64(e) => Ok(e.inertia()),
             _ => Err(not_fitted("kmeans", "inertia_ (f64)")),
         }
+    }
+    /// sklearn's `n_iter_` — the WINNING restart's iteration count.
+    fn n_iter_(&self) -> PyResult<usize> {
+        self.n_iter.ok_or_else(|| not_fitted("kmeans", "n_iter_"))
+    }
+    /// The `algorithm` that actually ran, after the `k == 1` elkan → lloyd
+    /// degradation (mlrs's analogue of `Ridge.solver_`; sklearn keeps this in
+    /// its private `_algorithm`).
+    fn algorithm_used(&self) -> &'static str {
+        self.params.algorithm.resolve(self.params.n_clusters).name()
+    }
+    /// The number of restarts that actually ran, after `n_init='auto'`
+    /// resolution and the explicit-array override (sklearn's `_n_init`).
+    fn n_init_used(&self) -> usize {
+        self.params.n_init.resolve(&self.params.init)
     }
     fn is_fitted(&self) -> bool {
         !matches!(self.inner, AnyKMeans::Unfit { .. })
