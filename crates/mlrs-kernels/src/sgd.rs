@@ -30,12 +30,13 @@
 //!    per-sample sequence the old host loop ran, now single-owner on device.
 //! 5. [`sgd_bias_update`] (single-unit) folds `bias[0] -= eta·inv_b·Σ_i g[i]`
 //!    — the intercept step, kept device-resident.
-//! 6. [`sgd_copy`] (per-element) snapshots `w` into `w_snap` before pass 2 so
-//!    the convergence delta is measured against the pristine start-of-batch
-//!    weights (WR-02) without a host readback.
-//! 7. [`sgd_delta_max`] (single-unit) folds `max_j |w[j] − w_snap[j]|` and
-//!    `max_j |w[j]|` into the running epoch `stats` pair — the host reads the
-//!    2-element `stats` ONCE per epoch for the `tol` gate (not per batch).
+//! 6. [`sgd_loss`] (per-sample) computes the sklearn loss VALUE `loss(p[i],
+//!    y[row_offset+i])` — as opposed to [`sgd_grad`]'s derivative — selected by
+//!    the same by-value `loss_id` (MBSGD-PERF-WGPU: replaces a coefficient-delta
+//!    convergence check with sklearn's own training-loss-plateau one).
+//! 7. [`sgd_sumloss`] (single-unit) folds this batch's `Σ_i loss[i]` into the
+//!    running epoch `sumloss[0]` accumulator — the host reads the 1-element
+//!    `sumloss` ONCE per epoch for the `tol`/`n_iter_no_change` gate.
 //!
 //! ## cubecl-cpu MLIR safety (the primary correctness gate)
 //! The cpu(f64) backend's MLIR lowering rejects shared-memory tiles + mutable
@@ -58,11 +59,11 @@
 use cubecl::prelude::*;
 
 pub use self::sgd_bias_update as sgd_bias_update_kernel;
-pub use self::sgd_copy as sgd_copy_kernel;
-pub use self::sgd_delta_max as sgd_delta_max_kernel;
 pub use self::sgd_grad as sgd_grad_kernel;
 pub use self::sgd_l1_shrink as sgd_l1_shrink_kernel;
+pub use self::sgd_loss as sgd_loss_kernel;
 pub use self::sgd_margin as sgd_margin_kernel;
+pub use self::sgd_sumloss as sgd_sumloss_kernel;
 pub use self::sgd_weight_update as sgd_weight_update_kernel;
 
 /// Pass 1 (per-sample margin): `p[i] = Σ_j x[(row_offset+i)*d + j]·w[j] +
@@ -352,52 +353,112 @@ pub fn sgd_bias_update<F: Float + CubeElement>(
     }
 }
 
-/// Per-element copy `dst[i] = src[i]` (length `n`) — snapshots the
-/// start-of-batch weights into `w_snap` for the WR-02 convergence delta without
-/// a host readback. The proven bare-`ABSOLUTE_POS` per-element map shape.
+/// Per-sample sklearn loss VALUE (as opposed to [`sgd_grad`]'s derivative):
+/// `loss[i] = loss(p[i], y[row_offset+i])`, selected by the by-value
+/// `loss_id` scalar (same table index as [`sgd_grad`]):
+///
+/// | `loss_id` | loss | `loss(p, y)` |
+/// |---|---|---|
+/// | 0 | hinge | `max(0, 1 − p·y)` |
+/// | 1 | log | `log(1 + exp(−p·y))`, clipped like sklearn's `Log.loss` |
+/// | 2 | squared hinge | `max(0, 1 − p·y)²` |
+/// | 3 | squared error | `½·(p − y)²` |
+/// | 4 | ε-insensitive | `max(0, |y−p| − ε)` |
+/// | 5 | squared ε-insensitive | `max(0, |y−p| − ε)²` |
+///
+/// `y` is the FULL length-`n` target; `row_offset` aligns it with the batch's
+/// `p[]`. One unit per sample at `ABSOLUTE_POS` (the proven per-element map
+/// shape); statement-form `if` chains only. The `log` branch computes the
+/// UNCLIPPED `log1p(exp(−z))` value first and OVERWRITES it in the two extreme
+/// regions (`|z| > 18`, sklearn's own clip point) — a transient overflow to
+/// `+inf` in the discarded default is harmless IEEE arithmetic, and this stays
+/// in statement-if form (no `if`-expression in value position, cpu-MLIR-safe).
 #[cube(launch)]
-pub fn sgd_copy<F: Float + CubeElement>(src: &Array<F>, dst: &mut Array<F>, n: u32) {
+pub fn sgd_loss<F: Float + CubeElement>(
+    p: &Array<F>,
+    y: &Array<F>,
+    loss_out: &mut Array<F>,
+    row_offset: u32,
+    b: u32,
+    loss_id: u32,
+    epsilon: F,
+) {
     let i = ABSOLUTE_POS;
-    if i < n as usize {
-        dst[i] = src[i];
+    if i < b as usize {
+        let pi = p[i];
+        let yi = y[row_offset as usize + i];
+        let zero = F::from_int(0i64);
+        let one = F::from_int(1i64);
+        let mut li = zero;
+        if loss_id == 0u32 {
+            // Hinge: max(0, 1 - p*y).
+            let z = one - pi * yi;
+            if z > zero {
+                li = z;
+            }
+        }
+        if loss_id == 1u32 {
+            // Log: log(1 + exp(-p*y)), clipped at |z| = 18 like sklearn.
+            let z = pi * yi;
+            let eighteen = F::new(18.0f32);
+            li = F::exp(zero - z).log1p();
+            if z > eighteen {
+                li = F::exp(zero - z);
+            }
+            if z < zero - eighteen {
+                li = zero - z;
+            }
+        }
+        if loss_id == 2u32 {
+            // Squared hinge: max(0, 1 - p*y)^2.
+            let z = one - pi * yi;
+            if z > zero {
+                li = z * z;
+            }
+        }
+        if loss_id == 3u32 {
+            // Squared error: 0.5*(p-y)^2.
+            let d = pi - yi;
+            li = F::new(0.5f32) * d * d;
+        }
+        if loss_id == 4u32 {
+            // Epsilon-insensitive: max(0, |y-p|-eps).
+            let z = (yi - pi).abs() - epsilon;
+            if z > zero {
+                li = z;
+            }
+        }
+        if loss_id == 5u32 {
+            // Squared epsilon-insensitive: max(0, |y-p|-eps)^2.
+            let z = (yi - pi).abs() - epsilon;
+            if z > zero {
+                li = z * z;
+            }
+        }
+        loss_out[i] = li;
     }
 }
 
-/// Convergence-stat fold (single-unit): folds this batch's
-/// `max_j |w[j] − w_snap[j]|` into `stats[0]` and `max_j |w[j]|` into
-/// `stats[1]` (running epoch maxima — the host zeroes `stats` at epoch start
-/// and reads it ONCE per epoch for the `tol` gate).
+/// Loss-plateau fold (single-unit): folds this batch's `Σ_i loss[i]` into the
+/// running epoch `sumloss[0]` accumulator (the host zeroes `sumloss` at epoch
+/// start and reads it ONCE per epoch for the sklearn `tol`/`n_iter_no_change`
+/// gate — MBSGD-PERF-WGPU).
 ///
 /// Single selecting unit (`CUBE_POS_X`/`UNIT_POS_X == 0` shape, launched
-/// `(1,1,1)/(1,1,1)`); running max via statement-form `if` (no infinity seed —
-/// the accumulators start from the current `stats`, which the host zero-fills);
-/// instance-form `.abs()` (jacobi-proven).
+/// `(1,1,1)/(1,1,1)`); the sum is a forward `while` seeded `F::from_int(0i64)`,
+/// mirroring [`sgd_bias_update`]'s reduction exactly.
 #[cube(launch)]
-pub fn sgd_delta_max<F: Float + CubeElement>(
-    w: &Array<F>,
-    w_snap: &Array<F>,
-    stats: &mut Array<F>,
-    d: u32,
-) {
+pub fn sgd_sumloss<F: Float + CubeElement>(loss: &Array<F>, sumloss: &mut Array<F>, b: u32) {
     let row = CUBE_POS_X;
     if row < 1u32 {
         if UNIT_POS_X == 0u32 {
-            let mut mc = stats[0];
-            let mut wm = stats[1];
-            let mut j = 0u32;
-            while j < d {
-                let c = (w[j as usize] - w_snap[j as usize]).abs();
-                if c > mc {
-                    mc = c;
-                }
-                let a = w[j as usize].abs();
-                if a > wm {
-                    wm = a;
-                }
-                j += 1u32;
+            let mut s = F::from_int(0i64);
+            let mut i = 0u32;
+            while i < b {
+                s += loss[i as usize];
+                i += 1u32;
             }
-            stats[0] = mc;
-            stats[1] = wm;
+            sumloss[0] = sumloss[0] + s;
         }
     }
 }

@@ -1211,7 +1211,7 @@ crate::any_estimator_typestate! {
         loss: String, penalty: String, alpha: f64, l1_ratio: f64,
         fit_intercept: bool, max_iter: usize, tol: f64,
         learning_rate: String, eta0: f64, power_t: f64,
-        batch_size: usize, shuffle: bool, seed: u64,
+        batch_size: usize, shuffle: bool, seed: u64, n_iter_no_change: usize,
     },
 }
 
@@ -1222,7 +1222,7 @@ crate::any_estimator_typestate! {
         loss: String, penalty: String, alpha: f64, l1_ratio: f64,
         fit_intercept: bool, max_iter: usize, tol: f64,
         learning_rate: String, eta0: f64, power_t: f64, epsilon: f64,
-        batch_size: usize, shuffle: bool, seed: u64,
+        batch_size: usize, shuffle: bool, seed: u64, n_iter_no_change: usize,
     },
 }
 
@@ -1278,6 +1278,7 @@ impl PyMBSGDClassifier {
                 batch_size: 1,
                 shuffle: true,
                 seed: 0,
+                n_iter_no_change: 5,
             },
         }
     }
@@ -1292,13 +1293,14 @@ impl PyMBSGDClassifier {
 impl PyMBSGDClassifier {
     /// `MBSGDClassifier(loss="hinge", penalty="l2", alpha=1e-4, l1_ratio=0.15,
     /// fit_intercept=True, max_iter=1000, tol=1e-3, learning_rate="optimal",
-    /// eta0=0.01, power_t=0.5, batch_size=1, shuffle=True, seed=0)`.
+    /// eta0=0.01, power_t=0.5, batch_size=1, shuffle=True, seed=0,
+    /// n_iter_no_change=5)`.
     #[new]
     #[pyo3(signature = (
         loss = "hinge".to_string(), penalty = "l2".to_string(), alpha = 1e-4,
         l1_ratio = 0.15, fit_intercept = true, max_iter = 1000, tol = 1e-3,
         learning_rate = "optimal".to_string(), eta0 = 0.01, power_t = 0.5,
-        batch_size = 1, shuffle = true, seed = 0,
+        batch_size = 1, shuffle = true, seed = 0, n_iter_no_change = 5,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1315,6 +1317,7 @@ impl PyMBSGDClassifier {
         batch_size: usize,
         shuffle: bool,
         seed: u64,
+        n_iter_no_change: usize,
     ) -> Self {
         Self {
             inner: AnyMBSGDClassifier::Unfit {
@@ -1331,6 +1334,7 @@ impl PyMBSGDClassifier {
                 batch_size,
                 shuffle,
                 seed,
+                n_iter_no_change,
             },
         }
     }
@@ -1364,15 +1368,16 @@ impl PyMBSGDClassifier {
         let dt = float_dtype(&xa)?;
         let (
             loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
-            lr_s, eta0, power_t, batch_size, shuffle, seed,
+            lr_s, eta0, power_t, batch_size, shuffle, seed, n_iter_no_change,
         ) = match &self.inner {
             AnyMBSGDClassifier::Unfit {
                 loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
                 learning_rate, eta0, power_t, batch_size, shuffle, seed,
+                n_iter_no_change,
             } => (
                 loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
                 *max_iter, *tol, learning_rate.clone(), *eta0, *power_t,
-                *batch_size, *shuffle, *seed,
+                *batch_size, *shuffle, *seed, *n_iter_no_change,
             ),
             _ => return Err(not_fitted("mbsgd_classifier", "re-fit")),
         };
@@ -1399,6 +1404,7 @@ impl PyMBSGDClassifier {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = if host_ingress {
@@ -1432,6 +1438,7 @@ impl PyMBSGDClassifier {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = if host_ingress {
@@ -1526,18 +1533,28 @@ impl PyMBSGDClassifier {
             _ => Err(not_fitted("mbsgd_classifier", "coef_ (f64)")),
         }
     }
-    fn intercept_f32(&self) -> PyResult<f32> {
+    fn intercept_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F32(e) => Ok(e.intercept(&pool)),
+            AnyMBSGDClassifier::F32(e) => Ok(e.intercepts(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f32)")),
         }
     }
-    fn intercept_f64(&self) -> PyResult<f64> {
+    fn intercept_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F64(e) => Ok(e.intercept(&pool)),
+            AnyMBSGDClassifier::F64(e) => Ok(e.intercepts(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f64)")),
+        }
+    }
+    /// Rows in `coef_`: `1` for a binary fit, `n_classes` for the one-vs-rest
+    /// multiclass fit — sklearn's `coef_` shape rule. The shim reshapes the
+    /// flat `coef_*` buffer with this.
+    fn n_coef_rows(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnyMBSGDClassifier::F32(e) => Ok(e.n_coef_rows()),
+            AnyMBSGDClassifier::F64(e) => Ok(e.n_coef_rows()),
+            _ => Err(not_fitted("mbsgd_classifier", "n_coef_rows")),
         }
     }
     fn is_fitted(&self) -> bool {
@@ -1581,6 +1598,7 @@ impl PyMBSGDRegressor {
                 batch_size: 1,
                 shuffle: true,
                 seed: 0,
+                n_iter_no_change: 5,
             },
         }
     }
@@ -1596,13 +1614,14 @@ impl PyMBSGDRegressor {
     /// `MBSGDRegressor(loss="squared_error", penalty="l2", alpha=1e-4,
     /// l1_ratio=0.15, fit_intercept=True, max_iter=1000, tol=1e-3,
     /// learning_rate="invscaling", eta0=0.01, power_t=0.25, epsilon=0.1,
-    /// batch_size=1, shuffle=True, seed=0)`.
+    /// batch_size=1, shuffle=True, seed=0, n_iter_no_change=5)`.
     #[new]
     #[pyo3(signature = (
         loss = "squared_error".to_string(), penalty = "l2".to_string(), alpha = 1e-4,
         l1_ratio = 0.15, fit_intercept = true, max_iter = 1000, tol = 1e-3,
         learning_rate = "invscaling".to_string(), eta0 = 0.01, power_t = 0.25,
         epsilon = 0.1, batch_size = 1, shuffle = true, seed = 0,
+        n_iter_no_change = 5,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1620,6 +1639,7 @@ impl PyMBSGDRegressor {
         batch_size: usize,
         shuffle: bool,
         seed: u64,
+        n_iter_no_change: usize,
     ) -> Self {
         Self {
             inner: AnyMBSGDRegressor::Unfit {
@@ -1637,6 +1657,7 @@ impl PyMBSGDRegressor {
                 batch_size,
                 shuffle,
                 seed,
+                n_iter_no_change,
             },
         }
     }
@@ -1656,15 +1677,16 @@ impl PyMBSGDRegressor {
         let dt = float_dtype(&xa)?;
         let (
             loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
-            lr_s, eta0, power_t, epsilon, batch_size, shuffle, seed,
+            lr_s, eta0, power_t, epsilon, batch_size, shuffle, seed, n_iter_no_change,
         ) = match &self.inner {
             AnyMBSGDRegressor::Unfit {
                 loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
                 learning_rate, eta0, power_t, epsilon, batch_size, shuffle, seed,
+                n_iter_no_change,
             } => (
                 loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
                 *max_iter, *tol, learning_rate.clone(), *eta0, *power_t, *epsilon,
-                *batch_size, *shuffle, *seed,
+                *batch_size, *shuffle, *seed, *n_iter_no_change,
             ),
             _ => return Err(not_fitted("mbsgd_regressor", "re-fit")),
         };
@@ -1692,6 +1714,7 @@ impl PyMBSGDRegressor {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
@@ -1717,6 +1740,7 @@ impl PyMBSGDRegressor {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))

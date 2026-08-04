@@ -430,6 +430,7 @@ fn default_matches_sklearn() {
     assert_eq!(cfg.power_t, 0.5, "default power_t");
     assert_eq!(cfg.l1_ratio, 0.15, "default l1_ratio");
     assert!(cfg.fit_intercept, "default fit_intercept");
+    assert_eq!(cfg.n_iter_no_change, 5, "default n_iter_no_change");
 }
 
 /// `build()` rejects `alpha < 0` (D-08 validate-at-build) and a regression loss
@@ -534,5 +535,217 @@ fn host_slice_ingress_matches_device_ingress() {
         via_host.intercept(&mut pool).to_bits(),
         via_device.intercept(&mut pool).to_bits(),
         "intercept_ differs by ingress path"
+    );
+}
+
+// ===========================================================================
+// One-vs-rest multiclass (mirrors the LinearSVC OvR precedent).
+// ===========================================================================
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn uniform01(state: &mut u64) -> f64 {
+    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Three well-separated 2-D clusters (centers `(-5,0)`, `(5,0)`, `(0,5)`,
+/// jitter `±0.3`), `n_per_class` samples each, labels `{0, 1, 2}` — far enough
+/// apart that ANY reasonable linear OvR fit recovers them exactly.
+fn three_class_blobs<F>(n_per_class: usize, seed: u64) -> (Vec<F>, Vec<F>)
+where
+    F: Float + CubeElement + Pod,
+{
+    let centers = [(-5.0f64, 0.0f64), (5.0, 0.0), (0.0, 5.0)];
+    let mut s = seed;
+    let mut x = Vec::with_capacity(n_per_class * centers.len() * 2);
+    let mut y = Vec::with_capacity(n_per_class * centers.len());
+    for (label, &(cx, cy)) in centers.iter().enumerate() {
+        for _ in 0..n_per_class {
+            let jx = uniform01(&mut s) * 0.6 - 0.3;
+            let jy = uniform01(&mut s) * 0.6 - 0.3;
+            x.push(f64_to::<F>(cx + jx));
+            x.push(f64_to::<F>(cy + jy));
+            y.push(f64_to::<F>(label as f64));
+        }
+    }
+    (x, y)
+}
+
+fn multiclass_builder() -> mlrs_algos::linear::mbsgd_classifier::MBSGDClassifierBuilder {
+    MBSGDClassifier::<f64>::builder()
+        .loss(Loss::Hinge)
+        .penalty(Penalty::L2)
+        .alpha(SGD_ALPHA)
+        .eta0(SGD_ETA0)
+        .learning_rate(LearningRate::Constant)
+        .max_iter(200)
+        .tol(0.0)
+        .shuffle(false)
+}
+
+/// A 3-class fit gets a `(3, d)` `coef_` / length-3 `intercept_`, and predicts
+/// every training-cluster label correctly (the clusters are separated by
+/// several units; any sane OvR hyperplane recovers them).
+#[test]
+fn multiclass_ovr_fit_and_predict() {
+    let (x, y) = three_class_blobs::<f64>(20, 0xC0FF_EE01);
+    let n = 60;
+    let d = 2;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &x);
+    let y_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &y);
+
+    let clf = multiclass_builder()
+        .build::<f64>()
+        .expect("build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (n, d))
+        .expect("multiclass fit");
+
+    assert_eq!(clf.classes(), &[0, 1, 2], "classes_");
+    assert_eq!(clf.n_coef_rows(), 3, "n_coef_rows == n_classes for OvR");
+    assert_eq!(clf.coef(&pool).len(), 3 * d, "coef_ is (3, d) flattened");
+    assert_eq!(clf.intercepts(&pool).len(), 3, "intercept_ is length 3");
+
+    let labels = clf
+        .predict_labels(&mut pool, &x_dev, (n, d))
+        .expect("predict_labels")
+        .to_host(&pool);
+    for (i, &label) in labels.iter().enumerate() {
+        let expected = (i / 20) as i32;
+        assert_eq!(
+            label, expected,
+            "row {i}: predicted {label}, expected {expected} (well-separated clusters)"
+        );
+    }
+
+    // predict_proba: sklearn's OvR normalization — every row sums to 1.
+    let proba = clf
+        .predict_proba(&mut pool, &x_dev, (n, d))
+        .expect("predict_proba")
+        .to_host(&pool);
+    assert_eq!(proba.len(), n * 3, "predict_proba is (n, 3)");
+    for r in 0..n {
+        let row_sum: f64 = proba[r * 3..(r + 1) * 3].iter().sum();
+        assert!(
+            (row_sum - 1.0).abs() < 1e-9,
+            "row {r}: predict_proba sums to {row_sum}, not 1.0"
+        );
+    }
+}
+
+/// The one-vs-rest fan-out is embarrassingly parallel over independent binary
+/// solves, so the parallel host-slice ingress must produce a BIT-IDENTICAL fit
+/// to the sequential `DeviceArray` ingress — extending
+/// `host_slice_ingress_matches_device_ingress` to the `n_coef_rows > 1` path,
+/// which exercises a completely different code path (threaded workers writing
+/// disjoint row bands vs. a sequential per-class loop).
+#[test]
+fn multiclass_host_slice_matches_device_ingress() {
+    if !mlrs_backend::prims::sgd::sgd_host_available() {
+        println!("host-slice ingress is cpu/wgpu-only: SKIPPED");
+        return;
+    }
+    let (x, y) = three_class_blobs::<f64>(20, 0xC0FF_EE01);
+    let n = 60;
+    let d = 2;
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &x);
+    let y_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &y);
+
+    let via_device = multiclass_builder()
+        .build::<f64>()
+        .expect("build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (n, d))
+        .expect("device-ingress multiclass fit");
+    let via_host = multiclass_builder()
+        .build::<f64>()
+        .expect("build")
+        .fit_from_host_slice(&mut pool, &x, &y, (n, d))
+        .expect("host-slice multiclass fit");
+
+    assert_eq!(via_host.classes(), via_device.classes(), "classes_");
+    assert_eq!(via_host.n_coef_rows(), via_device.n_coef_rows(), "n_coef_rows");
+    let (dc, hc) = (via_device.coef(&pool), via_host.coef(&pool));
+    assert_eq!(dc.len(), hc.len(), "coef_ length");
+    for j in 0..dc.len() {
+        assert_eq!(
+            hc[j].to_bits(),
+            dc[j].to_bits(),
+            "coef_[{j}] differs by ingress path (host={}, device={})",
+            hc[j],
+            dc[j]
+        );
+    }
+    let (di, hi) = (via_device.intercepts(&pool), via_host.intercepts(&pool));
+    for j in 0..di.len() {
+        assert_eq!(
+            hi[j].to_bits(),
+            di[j].to_bits(),
+            "intercept_[{j}] differs by ingress path"
+        );
+    }
+}
+
+/// A BINARY target stays ONE solve, not two degenerate OvR solves — sklearn's
+/// own `coef_` shape rule (`(1, d)`, never `(2, d)`) — using the pinned
+/// oracle fixture so this also re-confirms the existing binary fit is
+/// untouched by the multiclass machinery.
+#[test]
+fn binary_fit_stays_a_single_solve() {
+    let case = load_npz(fixture("mbsgd_classifier_f64_seed42.npz")).expect("load fixture");
+    let x = case.expect_f64("X");
+    let y = case.expect_f64("y");
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, x);
+    let y_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, y);
+
+    let clf = MBSGDClassifier::<f64>::builder()
+        .alpha(SGD_ALPHA)
+        .eta0(SGD_ETA0)
+        .max_iter(SGD_MAX_ITER)
+        .tol(0.0)
+        .learning_rate(LearningRate::Constant)
+        .shuffle(false)
+        .build::<f64>()
+        .expect("build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("binary fit");
+
+    assert_eq!(clf.n_coef_rows(), 1, "binary fit must stay a single solve");
+    assert_eq!(clf.coef(&pool).len(), N_FEATURES, "coef_ is (1, d) flattened");
+    assert_eq!(clf.intercepts(&pool).len(), 1, "intercept_ is length 1");
+}
+
+/// A single-class target is rejected with sklearn's own wording, not the old
+/// "needs exactly 2 classes" message (which would be wrong for a REJECTED
+/// 5-class target too, now that 3+ classes are accepted).
+#[test]
+fn single_class_target_is_rejected() {
+    let x: Vec<f64> = vec![0.0, 1.0, 2.0, 3.0];
+    let y: Vec<f64> = vec![1.0, 1.0];
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let x_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &x);
+    let y_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &y);
+
+    let err = MBSGDClassifier::<f64>::builder()
+        .build::<f64>()
+        .expect("build")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (2, 2))
+        .err();
+    assert!(
+        matches!(err, Some(mlrs_algos::error::AlgoError::InvalidLabels { .. })),
+        "a single-class target must be AlgoError::InvalidLabels, got {err:?}"
     );
 }

@@ -97,7 +97,8 @@ where
 /// Builder for [`MBSGDRegressor`] (D-01). Default field initializers encode the
 /// sklearn `SGDRegressor` defaults (D-03): `loss=squared_error`, `penalty=l2`,
 /// `alpha=1e-4`, `l1_ratio=0.15`, `max_iter=1000`, `tol=1e-3`,
-/// `learning_rate=invscaling`, `eta0=0.01`, `power_t=0.25`, `epsilon=0.1`.
+/// `learning_rate=invscaling`, `eta0=0.01`, `power_t=0.25`, `epsilon=0.1`,
+/// `n_iter_no_change=5`.
 #[derive(Debug, Clone, Copy)]
 pub struct MBSGDRegressorBuilder {
     loss: Loss,
@@ -114,6 +115,7 @@ pub struct MBSGDRegressorBuilder {
     batch_size: usize,
     shuffle: bool,
     seed: u64,
+    n_iter_no_change: usize,
 }
 
 impl Default for MBSGDRegressorBuilder {
@@ -133,6 +135,7 @@ impl Default for MBSGDRegressorBuilder {
             batch_size: 1,
             shuffle: true,
             seed: 0,
+            n_iter_no_change: 5,
         }
     }
 }
@@ -206,6 +209,12 @@ impl MBSGDRegressorBuilder {
     /// Set the RNG seed.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
+        self
+    }
+    /// Set the loss-plateau patience (`tol > 0` only): consecutive
+    /// non-improving epochs before stopping (sklearn `n_iter_no_change`).
+    pub fn n_iter_no_change(mut self, n_iter_no_change: usize) -> Self {
+        self.n_iter_no_change = n_iter_no_change;
         self
     }
 
@@ -290,6 +299,7 @@ impl MBSGDRegressorBuilder {
             batch_size: self.batch_size,
             shuffle: self.shuffle,
             seed: self.seed,
+            n_iter_no_change: self.n_iter_no_change,
         };
         Ok(MBSGDRegressor {
             config,
