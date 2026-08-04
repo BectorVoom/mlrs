@@ -173,6 +173,50 @@ _FIT2D_1SAMPLE = {
 }
 
 
+# UMAP's `transform` is an OUT-OF-SAMPLE PROJECTION, not a replay of the
+# training layout, and that breaks sklearn's transformer contract in four
+# places. This is a property of the ALGORITHM, not of this implementation:
+# `umap-learn` behaves the same way.
+#
+# `fit_transform(X)` optimizes every training point's position jointly by SGD
+# over the fuzzy simplicial set. `transform(X)` freezes that fitted embedding
+# and positions each query against it. Run on the SAME X the two therefore
+# disagree (measured: max|Δ| = 2.4 on a 40x5 fixture) — which is what
+# `check_transformer_general` / `check_transformer_data_not_an_array` compare.
+# The batch optimization also makes a query's final position depend on which
+# other queries share the call, so `transform` is not row-order- or
+# subset-invariant either.
+#
+# NOTE these are NOT declared via `tags.non_deterministic`, even though that
+# tag would suppress all four in one line. mlrs's UMAP IS deterministic —
+# consecutive `fit_transform` runs are BIT-IDENTICAL at a fixed seed and at the
+# default `random_state=None` (verified directly) — so setting that tag would
+# be a false statement about the estimator, the exact class of mis-declaration
+# that put LinearSVC and the NB family in this map to begin with. An xfail with
+# the real reason is the honest encoding.
+_UMAP_TRANSFORM = {
+    "check_transformer_general": (
+        "UMAP's transform is an out-of-sample projection onto the FITTED "
+        "embedding, so it does not reproduce fit_transform's jointly-optimized "
+        "training layout (umap-learn diverges identically)."
+    ),
+    "check_transformer_data_not_an_array": (
+        "same out-of-sample transform divergence as check_transformer_general, "
+        "on the list/not-an-array ingress."
+    ),
+    "check_methods_subset_invariance": (
+        "UMAP positions a batch of queries against the fitted embedding by a "
+        "joint optimization, so a point's coordinates depend on which other "
+        "points share the transform call; a subset is not a restriction of the "
+        "whole."
+    ),
+    "check_methods_sample_order_invariance": (
+        "same batch-joint transform optimization as check_methods_subset_"
+        "invariance: reordering the rows reorders the SGD's edge visits."
+    ),
+}
+
+
 def _merge(*dicts):
     out = {}
     for d in dicts:
@@ -249,7 +293,11 @@ _EXPECTED = {
     "SpectralClustering": _merge(_COMMON),
     "HDBSCAN": _merge(_COMMON),
     "SpectralEmbedding": _merge(_COMMON),
-    "UMAP": _merge(_COMMON),
+    # UMAP: the four out-of-sample transform-contract divergences (see
+    # `_UMAP_TRANSFORM`) plus the shared 1-sample message carve-out — a
+    # 1-sample fit is rejected by the n_components range guard, whose
+    # message names the real constraint rather than sklearn's "1 sample".
+    "UMAP": _merge(_COMMON, _UMAP_TRANSFORM, _FIT2D_1SAMPLE),
     # --- TASK-16 (PY-ENS-05, RF): empirically triaged against a real sweep
     # run (Green-time, not assumed) — see this file's own module docstring
     # ("Criterion 1 says 'relevant', NOT 'all checks pass'"). RandomForest*
