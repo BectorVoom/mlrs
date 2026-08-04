@@ -275,9 +275,25 @@ def test_svc_predict_returns_writable_int32_class_ids(dtype):
 
     # The labels are the sign of the decision function through `classes_` — the
     # gate that a shared-matvec refactor kept the mapping, not just the shape.
-    decision = X.astype(dtype) @ fitted.coef_ + fitted.intercept_
+    #
+    # `coef_` is sklearn's `(1, n_features)` for a binary fit (it keeps the
+    # leading per-hyperplane axis even with a single hyperplane), so the decision
+    # is `X @ coef_.T`, ravelled back to one value per row. Recomputing it here
+    # from the PUBLIC attributes — rather than calling `decision_function` — is
+    # the point: it checks `coef_`/`intercept_` are the numbers a caller would
+    # reconstruct the model from, not just that two mlrs code paths agree.
+    assert fitted.coef_.shape == (1, X.shape[1])
+    assert fitted.intercept_.shape == (1,)
+    decision = (X.astype(dtype) @ fitted.coef_.T).ravel() + fitted.intercept_[0]
     expected = np.where(decision >= 0, 7, 3).astype(np.int32)
     np.testing.assert_array_equal(fitted.predict(X.astype(dtype)), expected)
+    # ...and `decision_function` must agree with that reconstruction.
+    np.testing.assert_allclose(
+        np.asarray(fitted.decision_function(X.astype(dtype))),
+        decision,
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_svc_predict_nonfinite_error_precedes_feature_count_error():
