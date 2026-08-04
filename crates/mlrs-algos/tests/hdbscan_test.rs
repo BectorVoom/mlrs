@@ -45,7 +45,7 @@
 
 use std::path::PathBuf;
 
-use mlrs_algos::cluster::hdbscan::{Hdbscan, Metric};
+use mlrs_algos::cluster::hdbscan::{Algorithm, Hdbscan, Metric};
 use mlrs_algos::error::BuildError;
 use mlrs_backend::capability;
 use mlrs_core::{
@@ -998,6 +998,235 @@ fn build_validation() {
             .is_ok(),
         "Metric::Precomputed must construct"
     );
+
+    // --- HDBS-PARAMS: algorithm / leaf_size / n_jobs -----------------------
+    //
+    // A tree algorithm with a metric that has no tree route is rejected at
+    // build(), matching sklearn 1.9.0's "<metric> is not a valid metric for a
+    // KDTree-based algorithm". Both tree variants, both untraversable metrics.
+    for (algorithm, algo_name) in [
+        (Algorithm::KdTree, "kd_tree"),
+        (Algorithm::BallTree, "ball_tree"),
+    ] {
+        for (metric, metric_name) in [
+            (Metric::Cosine, "cosine"),
+            (Metric::Precomputed, "precomputed"),
+        ] {
+            let bad = Hdbscan::<f64>::builder()
+                .algorithm(algorithm)
+                .metric(metric)
+                .build::<f64>()
+                .err();
+            assert!(
+                matches!(
+                    bad,
+                    Some(BuildError::InvalidAlgorithmMetric { algorithm: a, metric: m, .. })
+                        if a == algo_name && m == metric_name
+                ),
+                "{algo_name} + {metric_name} must be BuildError::InvalidAlgorithmMetric, got {bad:?}"
+            );
+        }
+        // The four axis-aggregate metrics DO have a tree route.
+        for metric in [
+            Metric::Euclidean,
+            Metric::Manhattan,
+            Metric::Chebyshev,
+            Metric::Minkowski { p: 3.0 },
+        ] {
+            assert!(
+                Hdbscan::<f64>::builder()
+                    .algorithm(algorithm)
+                    .metric(metric)
+                    .build::<f64>()
+                    .is_ok(),
+                "{algo_name} + {metric:?} must be accepted"
+            );
+        }
+    }
+    // 'brute' and 'auto' impose no metric restriction at all.
+    for algorithm in [Algorithm::Auto, Algorithm::Brute] {
+        for metric in [Metric::Cosine, Metric::Precomputed] {
+            assert!(
+                Hdbscan::<f64>::builder()
+                    .algorithm(algorithm)
+                    .metric(metric)
+                    .build::<f64>()
+                    .is_ok(),
+                "{algorithm:?} + {metric:?} must be accepted (no tree is built)"
+            );
+        }
+    }
+
+    // leaf_size >= 1 (sklearn's Interval floor). 0 would never terminate the
+    // tree build, so it must not reach the builder's output.
+    let bad_leaf = Hdbscan::<f64>::builder().leaf_size(0).build::<f64>().err();
+    assert!(
+        matches!(
+            bad_leaf,
+            Some(BuildError::InvalidLeafSize { leaf_size, .. }) if leaf_size == 0
+        ),
+        "leaf_size = 0 must be BuildError::InvalidLeafSize, got {bad_leaf:?}"
+    );
+    assert!(
+        Hdbscan::<f64>::builder().leaf_size(1).build::<f64>().is_ok(),
+        "leaf_size = 1 must be accepted"
+    );
+
+    // n_jobs = 0 names no worker count (joblib rejects it too); None, positive
+    // counts and negative joblib offsets are all accepted.
+    let bad_jobs = Hdbscan::<f64>::builder().n_jobs(Some(0)).build::<f64>().err();
+    assert!(
+        matches!(bad_jobs, Some(BuildError::InvalidNJobs { .. })),
+        "n_jobs = Some(0) must be BuildError::InvalidNJobs, got {bad_jobs:?}"
+    );
+    for n_jobs in [None, Some(1), Some(4), Some(-1), Some(-2), Some(-64)] {
+        assert!(
+            Hdbscan::<f64>::builder().n_jobs(n_jobs).build::<f64>().is_ok(),
+            "n_jobs = {n_jobs:?} must be accepted"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HDBS-PARAMS: `algorithm`, `leaf_size` and `n_jobs` are WALL-CLOCK knobs, gated
+// as EXACT equality rather than to a tolerance.
+//
+// The three of them decide, respectively, which candidate pairs a core-distance
+// query may SKIP, how many points a leaf scan covers between box tests, and how
+// the row range is cut across workers. None of them changes how an evaluated
+// pair is computed, so the routes are the same arithmetic on the same numbers
+// and equality is the honest assertion. Gating it that way means a future route
+// that computes distances a second way fails here instead of hiding inside a
+// 1e-5 band.
+//
+// n = 600 > `kdtree`'s 512-row floor DELIBERATELY: below it `Algorithm::Auto`
+// never builds a tree and the comparison would be vacuous.
+// ---------------------------------------------------------------------------
+
+/// The scan-route sweep design: 4 well-separated blobs at `n = 600`, so the
+/// adaptive route genuinely builds a tree and its calibration keeps it.
+fn route_sweep_design(n: usize, d: usize) -> Vec<f64> {
+    let mut x = vec![0.0f64; n * d];
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+    for i in 0..n {
+        let centre = i % 4;
+        for j in 0..d {
+            let base = if j == centre { 40.0 } else { 0.0 };
+            x[i * d + j] = base + next() + i as f64 * 1e-3;
+        }
+    }
+    x
+}
+
+#[test]
+fn algorithm_routes_agree_exactly() {
+    use mlrs_algos::cluster::hdbscan::host_core;
+
+    let (n, d, k) = (600usize, 4usize, 15usize);
+    let x = route_sweep_design(n, d);
+
+    for metric in [
+        Metric::Euclidean,
+        Metric::Manhattan,
+        Metric::Chebyshev,
+        Metric::Minkowski { p: 3.0 },
+    ] {
+        let base = host_core::core_distances_host(&x, n, d, metric, k);
+        // The default route must be doing real work — an all-zero or all-inf
+        // core-distance vector would make every comparison below vacuous.
+        assert!(
+            base.iter().all(|v| v.is_finite() && *v > 0.0),
+            "{metric:?}: baseline core distances must be finite and positive"
+        );
+        for algorithm in [
+            Algorithm::Auto,
+            Algorithm::Brute,
+            Algorithm::KdTree,
+            Algorithm::BallTree,
+        ] {
+            let got = host_core::core_distances_host_with(
+                &x,
+                n,
+                d,
+                metric,
+                k,
+                host_core::ScanOpts {
+                    algorithm,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                got, base,
+                "{metric:?} algorithm={algorithm:?}: core distances must be \
+                 BIT-IDENTICAL to the default route"
+            );
+        }
+    }
+}
+
+#[test]
+fn core_distances_leaf_size_invariant() {
+    use mlrs_algos::cluster::hdbscan::host_core;
+
+    let (n, d, k) = (600usize, 4usize, 15usize);
+    let x = route_sweep_design(n, d);
+    // Forced onto the tree route so `leaf_size` is actually live: on the brute
+    // route it is read by nothing and the sweep would prove nothing.
+    let opts = |leaf_size| host_core::ScanOpts {
+        algorithm: Algorithm::KdTree,
+        leaf_size,
+        ..Default::default()
+    };
+    let base = host_core::core_distances_host_with(&x, n, d, Metric::Euclidean, k, opts(32));
+    for leaf_size in [1usize, 2, 8, 40, 128, 1024, n * 2] {
+        let got =
+            host_core::core_distances_host_with(&x, n, d, Metric::Euclidean, k, opts(leaf_size));
+        assert_eq!(
+            got, base,
+            "leaf_size={leaf_size}: core distances must be BIT-IDENTICAL"
+        );
+    }
+}
+
+#[test]
+fn n_jobs_invariant() {
+    use mlrs_algos::cluster::hdbscan::host_core;
+
+    let (n, d, k) = (600usize, 4usize, 15usize);
+    let x = route_sweep_design(n, d);
+    // Both routes: the row split interacts with the tree route's PER-WORKER
+    // calibration (each block judges the route on its own first rows), so a
+    // different split exercises a different set of calibration decisions —
+    // which must still produce the same values.
+    for algorithm in [Algorithm::Auto, Algorithm::Brute, Algorithm::KdTree] {
+        let opts = |units| host_core::ScanOpts {
+            algorithm,
+            units,
+            ..Default::default()
+        };
+        let base = host_core::core_distances_host_with(
+            &x,
+            n,
+            d,
+            Metric::Euclidean,
+            k,
+            opts(host_core::ALL_UNITS),
+        );
+        for units in [1usize, 2, 3, 5, 8, 16, 64] {
+            let got =
+                host_core::core_distances_host_with(&x, n, d, Metric::Euclidean, k, opts(units));
+            assert_eq!(
+                got, base,
+                "{algorithm:?} units={units}: core distances must be BIT-IDENTICAL"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,9 +1502,9 @@ fn mst_variant_a_distinct_weights() {
         9.0, 6.0, 3.0, 0.0, //
     ];
     // min_samples=1 → core distance = 0th smallest = the self-zero, so MR == d.
-    let core = core_distances_dense(&d, n, 1);
+    let core = core_distances_dense(&d, n, 1, mlrs_algos::cluster::hdbscan::host_core::ALL_UNITS);
     assert_eq!(core, vec![0.0, 0.0, 0.0, 0.0], "core dist with ms=1 is the self-zero");
-    let mr = mutual_reachability_dense(&d, &core, n);
+    let mr = mutual_reachability_dense(&d, &core, n, mlrs_algos::cluster::hdbscan::host_core::ALL_UNITS);
     assert_eq!(mr, d, "MR with zero core distances equals the distance matrix");
 
     let mst = mst_from_mutual_reachability(&mr, n);
@@ -1727,7 +1956,7 @@ fn lazy_outlier_scores_match_eager_pipeline() {
     for v in dense.iter_mut() {
         *v /= alpha;
     }
-    let expected = glosh::hdbscan_outlier_scores(&dense, n, mcs, mcs);
+    let expected = glosh::hdbscan_outlier_scores(&dense, n, mcs, mcs, mlrs_algos::cluster::hdbscan::host_core::ALL_UNITS);
 
     let first = fitted
         .outlier_scores(&pool)

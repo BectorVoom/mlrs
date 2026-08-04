@@ -144,7 +144,7 @@ pub fn outlier_scores(condensed_tree: &[CondensedNode], n_samples: usize) -> Vec
 /// `mutual_reachability`'s `min_points = min(size-1, min_points)`), then the index
 /// `min_samples` selects the `min_samples`-th smallest (0-indexed, self-zero at 0).
 /// On a degenerate tiny input the cap keeps the index in range.
-fn core_distances_hdbscan(dist: &[f64], n: usize, min_samples: usize) -> Vec<f64> {
+fn core_distances_hdbscan(dist: &[f64], n: usize, min_samples: usize, units: usize) -> Vec<f64> {
     debug_assert_eq!(dist.len(), n * n, "dist must be a dense n×n matrix");
     // hdbscan caps min_points to n-1 BEFORE indexing (so index <= n-1).
     let mp = min_samples.min(n.saturating_sub(1));
@@ -153,7 +153,7 @@ fn core_distances_hdbscan(dist: &[f64], n: usize, min_samples: usize) -> Vec<f64
     // index `mp` in O(n) per row, where the full sort this replaces was
     // O(n log n) for a single index. Row-parallel for the same reason the rest of
     // the dense passes are (HDBS-PERF-CPU).
-    super::host_core::par_row_chunks(&mut core, 1, 64, |row0, out| {
+    super::host_core::par_row_chunks_in(&mut core, 1, 64, units, |row0, out| {
         let mut row: Vec<f64> = vec![0.0; n];
         for (r, slot) in out.iter_mut().enumerate() {
             row.copy_from_slice(&dist[(row0 + r) * n..(row0 + r + 1) * n]);
@@ -234,11 +234,16 @@ fn mst_linkage_core(mr: &[f64], n: usize) -> Vec<MstEdge> {
 ///
 /// Returns a `Vec<f64>` of length `n` (each in `[0, 1]`). A `dist` for `n < 2`
 /// yields all-`0.0` (no tree can form).
+///
+/// `units` is the estimator's resolved `n_jobs`
+/// ([`super::host_core::ALL_UNITS`] for every unit the backend reports); it
+/// splits the two dense row passes and cannot move a score.
 pub fn hdbscan_outlier_scores(
     dist: &[f64],
     n: usize,
     min_samples: usize,
     min_cluster_size: usize,
+    units: usize,
 ) -> Vec<f64> {
     debug_assert_eq!(dist.len(), n * n, "dist must be a dense n×n matrix");
     if n < 2 {
@@ -246,11 +251,11 @@ pub fn hdbscan_outlier_scores(
     }
 
     // hdbscan-convention core distance (index `min_samples`, not min_samples-1).
-    let core = core_distances_hdbscan(dist, n, min_samples);
+    let core = core_distances_hdbscan(dist, n, min_samples, units);
     // Mutual reachability `max(core_i, core_j, d_ij)` (dist already /alpha by the
     // caller). Reuse the shared dense builder — the MR formula is identical; only
     // the CORE-distance index differs from the sklearn path.
-    let mr = super::mst::mutual_reachability_dense(dist, &core, n);
+    let mr = super::mst::mutual_reachability_dense(dist, &core, n, units);
     // hdbscan dense Prim (its tie-order), argsort by weight, single linkage.
     let edges = mst_linkage_core(&mr, n);
     let sorted = argsort_by_weight(&edges);

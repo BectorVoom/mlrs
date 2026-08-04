@@ -1381,6 +1381,156 @@ def gen_hdbscan(
 
 
 # ---------------------------------------------------------------------------
+# HDBSCAN string-valued-parameter oracle (HDBS-PARAMS). One fixture carrying a
+# sklearn label vector for EVERY string a user can pass to `metric=`,
+# `algorithm=`, `cluster_selection_method=` and `store_centers=`.
+#
+# Why this is a SEPARATE fixture from `gen_hdbscan`:
+#   * It is the PYTHON-boundary gate. The eleven `metric` strings collapse onto
+#     six `Metric` enum values in Rust (`l2` IS `euclidean`, `cityblock`/`l1` ARE
+#     `manhattan`, `infinity` IS `chebyshev`, `p` IS `minkowski`), so testing all
+#     eleven only means something at the layer that does the resolving — the
+#     shim. Replaying it there catches an alias wired to the wrong enum, which no
+#     Rust-side test can see.
+#   * It needs only sklearn, not the pinned `hdbscan` 0.8.44 GLOSH oracle, so it
+#     regenerates in a plain sklearn-1.9.0 environment.
+#   * n = 600 > `kdtree::KD_MIN_ROWS` (512) DELIBERATELY: below that threshold
+#     `algorithm='auto'` never builds a tree and the four algorithm values would
+#     agree vacuously. At 600 rows `auto` genuinely builds and calibrates one, so
+#     "all four agree" is a real statement about the tree route.
+HDB_PARAMS_N = 600
+HDB_PARAMS_K = 4
+HDB_PARAMS_D = 4
+HDB_PARAMS_MCS = 15
+
+# Every string sklearn accepts for `metric=` that mlrs's distance core supports.
+# Grouped by the enum each resolves to, which is what the shim gate checks.
+HDB_PARAM_METRICS = [
+    "euclidean", "l2",
+    "manhattan", "cityblock", "l1",
+    "chebyshev", "infinity",
+    "minkowski", "p",
+    "cosine",
+    "precomputed",
+]
+HDB_PARAM_ALGORITHMS = ["auto", "brute", "kd_tree", "ball_tree"]
+HDB_PARAM_CSMS = ["eom", "leaf"]
+HDB_PARAM_STORE = ["centroid", "medoid", "both"]
+
+
+def gen_hdbscan_params(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the HDBSCAN string-parameter oracle fixture (HDBS-PARAMS).
+
+    Design: ``HDB_PARAMS_K`` well-separated isotropic blobs in
+    ``HDB_PARAMS_D`` dimensions, plus the per-row 1e-3 offset the other HDBSCAN
+    fixtures use so every MST edge weight is distinct and the labelling is
+    tie-free under any stable rule (Pitfall 1 option 2). Separation is generous
+    (centres on a scaled simplex) so the SAME partition survives every metric —
+    otherwise a metric gate would be testing the fixture's fragility rather than
+    the metric.
+
+    Stores ``X`` (the ``n × d`` design), ``X_precomputed`` (its square Euclidean
+    distance matrix, for the ``precomputed`` metric string) and one float-valued
+    label vector per string value:
+
+      * ``labels_metric_<name>``    — for each of ``HDB_PARAM_METRICS``
+      * ``labels_algorithm_<name>`` — for each of ``HDB_PARAM_ALGORITHMS``
+      * ``labels_csm_<name>``       — for each of ``HDB_PARAM_CSMS``
+      * ``centroids_store`` / ``medoids_store`` — from ``store_centers='both'``
+
+    plus ``minkowski_p`` and ``min_cluster_size`` as 1-element arrays so the
+    replaying test needs no constant duplicated from this file.
+
+    ASSERTS before writing that the design actually clusters (``k`` clusters
+    found, not all-noise) — a fixture that degenerated to all-noise would make
+    every downstream gate pass vacuously.
+
+    Returns the path written.
+    Filename: ``hdbscan_params_{dtype}_seed{seed}.npz``.
+    """
+    from sklearn.cluster import HDBSCAN as SkHDBSCAN
+    from sklearn.metrics import pairwise_distances
+
+    rng = np.random.default_rng(seed)
+    # Centres far enough apart that the partition is metric-independent: a
+    # scaled identity basis keeps every inter-centre distance equal under L1,
+    # L2 and L-inf alike, and the 40x scale dwarfs the 0.5 within-blob spread.
+    centers = 40.0 * np.eye(HDB_PARAMS_K, HDB_PARAMS_D)
+    per = HDB_PARAMS_N // HDB_PARAMS_K
+    x = np.vstack(
+        [c + 0.5 * rng.standard_normal((per, HDB_PARAMS_D)) for c in centers]
+    )
+    # Tie-free MST edges (the `_hdbscan_blob_design` idiom).
+    x = x + np.arange(x.shape[0])[:, None] * 1e-3
+    dist = pairwise_distances(x, metric="euclidean")
+
+    def labels(**over):
+        x_in = over.pop("_x", x)
+        kw = dict(min_cluster_size=HDB_PARAMS_MCS, copy=True)
+        kw.update(over)
+        return SkHDBSCAN(**kw).fit(x_in).labels_
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    save_kw = {
+        "X": c(x),
+        "X_precomputed": c(dist),
+        "minkowski_p": c([HDB_MINKOWSKI_P]),
+        "min_cluster_size": c([HDB_PARAMS_MCS]),
+    }
+
+    for met in HDB_PARAM_METRICS:
+        over = {"metric": met}
+        if met in ("minkowski", "p"):
+            over["metric_params"] = {"p": HDB_MINKOWSKI_P}
+        if met == "precomputed":
+            over["_x"] = dist
+        save_kw[f"labels_metric_{met}"] = c(labels(**over))
+
+    for alg in HDB_PARAM_ALGORITHMS:
+        save_kw[f"labels_algorithm_{alg}"] = c(labels(algorithm=alg))
+
+    for csm in HDB_PARAM_CSMS:
+        save_kw[f"labels_csm_{csm}"] = c(labels(cluster_selection_method=csm))
+
+    fitted = SkHDBSCAN(
+        min_cluster_size=HDB_PARAMS_MCS, copy=True, store_centers="both"
+    ).fit(x)
+    save_kw["centroids_store"] = c(fitted.centroids_)
+    save_kw["medoids_store"] = c(fitted.medoids_)
+
+    # The fixture must actually cluster — an all-noise design would let every
+    # gate below pass without testing anything.
+    base = save_kw["labels_metric_euclidean"].astype(np.int64)
+    found = len(set(base.tolist()) - {-1})
+    assert found == HDB_PARAMS_K, (
+        f"hdbscan params design must yield {HDB_PARAMS_K} clusters, got {found}"
+    )
+    assert save_kw["centroids_store"].shape == (HDB_PARAMS_K, HDB_PARAMS_D), (
+        f"store_centers='both' must yield one centroid row per cluster, got "
+        f"{save_kw['centroids_store'].shape}"
+    )
+    # Every metric string must reproduce that same partition — the separation
+    # above is chosen to guarantee it, and a fixture where it stopped holding
+    # would silently weaken the per-metric gate into "whatever this metric did".
+    for met in HDB_PARAM_METRICS:
+        got = save_kw[f"labels_metric_{met}"].astype(np.int64)
+        assert len(set(got.tolist()) - {-1}) == HDB_PARAMS_K, (
+            f"metric {met!r} did not recover {HDB_PARAMS_K} clusters — the design "
+            f"is no longer metric-independent"
+        )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"hdbscan_params_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **save_kw)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Phase-14 UMAP oracle fixtures (UMAP-01..04, D-02). Per-stage × per-metric
 # committed blobs dumping umap-learn 0.5.12's OWN internals (NEVER recomputed in
 # numpy — RESEARCH Pitfall 6). All arrays are 4/8-byte floats (load_npz
@@ -6338,6 +6488,12 @@ def main() -> None:
     for structure in ("tieheavy", "nested", "allnoise", "single", "tiny"):
         for dtype in (np.float32, np.float64):
             print(f"wrote {gen_hdbscan(dtype=dtype, metric='euclidean', structure=structure)}")
+    # HDBSCAN string-valued-parameter surface (HDBS-PARAMS): one sklearn label
+    # vector per accepted string of `metric` / `algorithm` /
+    # `cluster_selection_method`, plus the `store_centers` blocks. sklearn-only —
+    # no `hdbscan` 0.8.44 needed, so this one regenerates in a plain env.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_hdbscan_params(dtype=dtype)}")
     # ARIMA (TSA-01): AR(2)/MA(1) zero-mean process, statsmodels SARIMAX
     # oracle (fixed-param loglik + MLE fit + forecast).
     print(f"wrote {gen_arima()}")

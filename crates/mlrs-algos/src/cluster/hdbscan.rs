@@ -166,6 +166,94 @@ pub enum ClusterSelectionMethod {
     Leaf,
 }
 
+/// Neighbour-search strategy for the core-distance stage (`algorithm=`,
+/// HDBS-PARAMS). Mirrors sklearn's four `algorithm` strings.
+///
+/// ## This knob cannot change a result
+/// Every variant computes the SAME core distances. The core distance of row `i`
+/// is the `(min_samples-1)`-th smallest distance from `i` to the whole set — a
+/// property of the multiset of distances, not of the order they are enumerated
+/// in. A tree only declines to evaluate pairs whose box lower bound already
+/// exceeds the running `k`-th, so the points it hides are all `>=` a value
+/// already in the list and cannot lower it (see [`kdtree`]'s header for the full
+/// argument). Every evaluated pair goes through the identical accumulator.
+///
+/// So `algorithm` is a pure WALL-CLOCK knob, and the oracle suite gates it as
+/// EXACT equality across all four values rather than to a tolerance
+/// (`hdbscan_test::algorithm_routes_agree_exactly`). That is a far stronger
+/// statement than sklearn can make about its own `algorithm=`, whose brute path
+/// goes through `pairwise_distances` and its tree paths through
+/// `KDTree`/`BallTree` — genuinely different arithmetic that agrees only to
+/// floating-point tolerance.
+///
+/// ## What it costs
+/// MEASURED end-to-end through the Python shim against sklearn 1.9.0 at
+/// `n = 10_000, d = 16`, 8 blobs, min of 3, cpu backend / 16 units
+/// (`scripts/bench_hdbscan_params.py --sweep algorithm`):
+///
+/// ```text
+///   algorithm     auto    brute   kd_tree  ball_tree
+///   sklearn (s)  0.521    1.092    0.517     0.533
+///   mlrs    (s)  0.158    0.214    0.154     0.156
+///   speedup      3.29x    5.10x    3.37x     3.42x
+/// ```
+///
+/// The tree is worth ~26% over the brute scan on this (clustered) data, and
+/// `Auto` lands within noise of the forced tree — the calibration costs
+/// essentially nothing when the tree does pay off, which is the property it was
+/// tuned for (see [`kdtree::brute_is_cheaper`] for the case where it does not).
+/// mlrs is ahead of sklearn on every route.
+///
+/// ## Where it applies
+/// The routes exist on the HOST core-distance scan, which serves the cpu backend
+/// (and any backend that cannot evaluate f64 transcendentals — see
+/// [`host_core::host_core_applicable`]). On a GPU backend the Phase-13
+/// `knn_graph` prim owns this stage and `algorithm` is advisory: the answer is
+/// unchanged either way, so a caller that pins `algorithm` for speed on cpu does
+/// not get a different model on cuda.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Algorithm {
+    /// `'auto'` — build the tree when the geometry warrants it, then let each
+    /// worker's calibration abandon it if it is not pruning on this data. The
+    /// measured default (see [`kdtree::brute_is_cheaper`] for the sweep behind
+    /// it).
+    #[default]
+    Auto,
+    /// `'brute'` — scan every candidate pair; never build a tree.
+    Brute,
+    /// `'kd_tree'` — build the KD-tree and use it unconditionally.
+    KdTree,
+    /// `'ball_tree'` — sklearn's ball-tree route. mlrs serves it from the same
+    /// axis-aligned KD-tree: for the four axis-aggregate metrics a ball tree and
+    /// a KD-tree prune the same candidate set to the same answer, and since the
+    /// route is value-neutral (above) the only difference a separate structure
+    /// could make is wall clock. Building a second tree to lose to the first on
+    /// the metrics mlrs supports would be cost without benefit, so `ball_tree`
+    /// is accepted, honoured as "force the tree", and documented here rather
+    /// than silently ignored.
+    BallTree,
+}
+
+impl Algorithm {
+    /// Does this variant demand the tree traversal unconditionally?
+    pub(crate) fn forces_tree(self) -> bool {
+        matches!(self, Algorithm::KdTree | Algorithm::BallTree)
+    }
+    /// Does this variant forbid the tree entirely?
+    pub(crate) fn forces_brute(self) -> bool {
+        matches!(self, Algorithm::Brute)
+    }
+    /// sklearn's spelling, for error messages.
+    fn as_str(self) -> &'static str {
+        match self {
+            Algorithm::Auto => "auto",
+            Algorithm::Brute => "brute",
+            Algorithm::KdTree => "kd_tree",
+            Algorithm::BallTree => "ball_tree",
+        }
+    }
+}
+
 /// HDBSCAN density-based clustering estimator shell (HDBS-01). Construct via
 /// [`Hdbscan::builder`], then [`Fit::fit`] (which CONSUMES `self`, returning
 /// `Hdbscan<F, Fitted>`). The fitted `labels_` (length `n`, `-1` = noise,
@@ -205,6 +293,38 @@ pub struct Hdbscan<F, S = Unfit> {
     /// (sklearn `allow_single_cluster`); wired in plan 15-04 so the single-cluster
     /// edge case matches sklearn.
     allow_single_cluster: bool,
+    /// Neighbour-search strategy for the core-distance stage (`algorithm`,
+    /// default [`Algorithm::Auto`]). WALL CLOCK ONLY — see [`Algorithm`].
+    algorithm: Algorithm,
+    /// Points per KD-tree leaf (`leaf_size`, default 40 = sklearn's). Read only
+    /// on a tree route; WALL CLOCK ONLY.
+    leaf_size: usize,
+    /// Host worker count (`n_jobs`, default `None`). joblib semantics: a
+    /// positive `k` means exactly `k` workers, a negative counts back from all
+    /// cores (`-1` = all, `-2` = all but one). WALL CLOCK ONLY.
+    ///
+    /// NOTE the deliberate mlrs/sklearn default difference: sklearn's
+    /// `n_jobs=None` means ONE worker (joblib's default), while mlrs resolves it
+    /// to every unit the backend reports. The host passes ARE the fit's cost on
+    /// cpu, so defaulting them to a single core would forfeit the parallelism
+    /// this back-end exists to use. A caller who wants sklearn's literal default
+    /// passes `n_jobs=1`; the value is otherwise honoured verbatim.
+    ///
+    /// MEASURED at `n = 10_000, d = 16`, 8 blobs, min of 7, 16 units
+    /// (`scripts/bench_hdbscan_params.py --sweep n_jobs`):
+    ///
+    /// ```text
+    ///   n_jobs        1      2      4      8     16     -1
+    ///   mlrs (s)   0.373  0.255  0.216  0.179  0.206  0.171
+    ///   vs sklearn 1.40x  2.39x  2.33x  3.11x  3.55x  3.68x
+    /// ```
+    ///
+    /// Scaling is monotone to 8 and flat after it (16 logical units on 8
+    /// physical cores), and mlrs is ahead of sklearn at EVERY worker count —
+    /// including the single-worker row, so the win is the algorithm and not the
+    /// thread count. `-1` resolves to the same worker count as `16`; the two
+    /// rows differ only by run-to-run variance.
+    n_jobs: Option<i32>,
 
     // --- fitted state (None / 0 until fit; Some on Fitted by construction) ---
     /// Fitted labels (length `n`, `-1` = noise), device-resident `i32`. `None`
@@ -273,6 +393,15 @@ where
             max_cluster_size: 0,
             store_centers: None,
             allow_single_cluster: false,
+            algorithm: Algorithm::Auto,
+            // sklearn's `leaf_size=40` verbatim (D-08: this file is the single
+            // source of the sklearn defaults). The in-Rust tree default is 32
+            // (`kdtree::DEFAULT_LEAF_SIZE`) for callers that set none; both
+            // numbers stand because the measured curve is FLAT from ~32 upward
+            // (32 and 40 come out inside run-to-run variance of each other at
+            // n = 10_000, d = 16) — see `DEFAULT_LEAF_SIZE` for the full sweep.
+            leaf_size: 40,
+            n_jobs: None,
             labels_: None,
             probabilities_: None,
             glosh_: None,
@@ -304,6 +433,9 @@ where
             && self.max_cluster_size == other.max_cluster_size
             && self.store_centers == other.store_centers
             && self.allow_single_cluster == other.allow_single_cluster
+            && self.algorithm == other.algorithm
+            && self.leaf_size == other.leaf_size
+            && self.n_jobs == other.n_jobs
     }
 
     /// Decompose this (unfit) estimator back into its builder, copying every
@@ -321,6 +453,9 @@ where
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
             allow_single_cluster: self.allow_single_cluster,
+            algorithm: self.algorithm,
+            leaf_size: self.leaf_size,
+            n_jobs: self.n_jobs,
         }
     }
 
@@ -370,6 +505,9 @@ pub struct HdbscanBuilder {
     max_cluster_size: usize,
     store_centers: Option<StoreCenters>,
     allow_single_cluster: bool,
+    algorithm: Algorithm,
+    leaf_size: usize,
+    n_jobs: Option<i32>,
 }
 
 impl Default for HdbscanBuilder {
@@ -427,6 +565,27 @@ impl HdbscanBuilder {
     /// `allow_single_cluster` (default `false`).
     pub fn allow_single_cluster(mut self, v: bool) -> Self {
         self.allow_single_cluster = v;
+        self
+    }
+    /// Set the core-distance neighbour-search strategy `algorithm` (default
+    /// [`Algorithm::Auto`]). WALL CLOCK ONLY — every value yields identical
+    /// results (see [`Algorithm`]).
+    pub fn algorithm(mut self, v: Algorithm) -> Self {
+        self.algorithm = v;
+        self
+    }
+    /// Set the KD-tree points-per-leaf `leaf_size` (default 40, sklearn's).
+    /// WALL CLOCK ONLY; read only on a tree route.
+    pub fn leaf_size(mut self, v: usize) -> Self {
+        self.leaf_size = v;
+        self
+    }
+    /// Set the host worker count `n_jobs` (default `None` = every unit the
+    /// backend reports — see the field docs for why that differs from sklearn's
+    /// one-worker default). Negative values count back from all cores, joblib
+    /// style. WALL CLOCK ONLY.
+    pub fn n_jobs(mut self, v: Option<i32>) -> Self {
+        self.n_jobs = v;
         self
     }
 
@@ -492,6 +651,41 @@ impl HdbscanBuilder {
                 });
             }
         }
+        // A tree route needs a metric whose distance aggregates monotonely over
+        // the feature axes (that is what makes a box bound a valid lower bound).
+        // Cosine is normalized and precomputed has no feature axes, so neither
+        // can be traversed — sklearn 1.9.0 raises for exactly these two pairs
+        // ("<metric> is not a valid metric for a KDTree-based algorithm"). We
+        // reject at build() rather than fit() because the pair is knowable
+        // without data (the D-08 split).
+        if self.algorithm.forces_tree() {
+            let bad = match self.metric {
+                Metric::Cosine => Some("cosine"),
+                Metric::Precomputed => Some("precomputed"),
+                _ => None,
+            };
+            if let Some(metric) = bad {
+                return Err(BuildError::InvalidAlgorithmMetric {
+                    estimator: "hdbscan",
+                    algorithm: self.algorithm.as_str(),
+                    metric,
+                });
+            }
+        }
+        // leaf_size >= 1 (sklearn's Interval floor): a zero-point leaf would
+        // never terminate the tree build.
+        if self.leaf_size < 1 {
+            return Err(BuildError::InvalidLeafSize {
+                estimator: "hdbscan",
+                leaf_size: self.leaf_size,
+            });
+        }
+        // n_jobs = 0 names no worker count; joblib itself rejects it.
+        if self.n_jobs == Some(0) {
+            return Err(BuildError::InvalidNJobs {
+                estimator: "hdbscan",
+            });
+        }
         let min_samples = Some(self.min_samples.unwrap_or(self.min_cluster_size));
         Ok(Hdbscan {
             min_cluster_size: self.min_cluster_size,
@@ -503,6 +697,9 @@ impl HdbscanBuilder {
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
             allow_single_cluster: self.allow_single_cluster,
+            algorithm: self.algorithm,
+            leaf_size: self.leaf_size,
+            n_jobs: self.n_jobs,
             labels_: None,
             probabilities_: None,
             glosh_: None,
@@ -665,6 +862,9 @@ where
             max_cluster_size: self.max_cluster_size,
             store_centers: self.store_centers,
             allow_single_cluster: self.allow_single_cluster,
+            algorithm: self.algorithm,
+            leaf_size: self.leaf_size,
+            n_jobs: self.n_jobs,
             labels_: Some(labels_dev),
             probabilities_,
             glosh_: Some(glosh_),
@@ -676,6 +876,46 @@ where
             _float: PhantomData,
             _state: PhantomData,
         })
+    }
+}
+
+/// State-GENERIC accessors for the wall-clock knobs.
+///
+/// These live outside the `Unfit`/`Fitted` impls because BOTH need them: `fit`
+/// reads them on the way in, and the lazy [`Hdbscan::outlier_scores`] pass reads
+/// them on the `Fitted` estimator long after `fit` returned — so a caller who set
+/// `n_jobs` gets it honoured on the deferred GLOSH tree too, not just the fit.
+impl<F, S> Hdbscan<F, S> {
+    /// Resolve `n_jobs` into the worker count the host passes cut their rows
+    /// into ([`host_core::ALL_UNITS`] = "every unit the backend reports").
+    ///
+    /// joblib semantics, which sklearn inherits: a positive `k` is exactly `k`
+    /// workers; a negative counts back from all cores, so `-1` is all of them,
+    /// `-2` is all but one, and so on. An offset that reaches zero or below is
+    /// clamped to one worker (joblib does the same rather than erroring —
+    /// `n_jobs=-64` on a 16-core box is one worker, not a failure). `n_jobs=0`
+    /// never reaches here: `build()` rejects it.
+    ///
+    /// `None` resolves to ALL units rather than joblib's one — see the
+    /// [`Self::n_jobs`] field docs for why that default differs deliberately.
+    fn units(&self) -> usize {
+        match self.n_jobs {
+            None => host_core::ALL_UNITS,
+            Some(k) if k > 0 => k as usize,
+            Some(k) => {
+                let all = i64::from(mlrs_backend::capability::cpu_launch_units().max(1));
+                (all + 1 + i64::from(k)).max(1) as usize
+            }
+        }
+    }
+
+    /// The wall-clock knob bundle the host core-distance scan reads.
+    fn scan_opts(&self) -> host_core::ScanOpts {
+        host_core::ScanOpts {
+            algorithm: self.algorithm,
+            leaf_size: self.leaf_size,
+            units: self.units(),
+        }
     }
 }
 
@@ -731,10 +971,10 @@ where
 
         // Core distance = (min_samples-1)-th smallest per row (incl. self-zero).
         let min_samples = self.min_samples.unwrap_or(self.min_cluster_size);
-        let core = mst::core_distances_dense(&dist, n, min_samples);
+        let core = mst::core_distances_dense(&dist, n, min_samples, self.units());
 
         // Dense mutual-reachability + Variant-A Prim's MST → argsort → linkage.
-        let mr = mst::mutual_reachability_dense(&dist, &core, n);
+        let mr = mst::mutual_reachability_dense(&dist, &core, n, self.units());
         let edges = mst::mst_from_mutual_reachability(&mr, n);
         let sorted = mst::argsort_by_weight(&edges);
         Ok(single_linkage::make_single_linkage(&sorted, n))
@@ -804,7 +1044,7 @@ where
         let core_raw: Vec<f64> = if !needs_knn_core {
             Vec::new()
         } else if host_core::host_core_applicable::<F>() {
-            host_core::core_distances_host(x_host, n, p, self.metric, k)
+            host_core::core_distances_host_with(x_host, n, p, self.metric, k, self.scan_opts())
         } else {
             let knn_metric = self.knn_metric();
             let mink_p = match self.metric {
@@ -862,7 +1102,7 @@ where
             // — identical to building MR from the scaled matrix.
             let alpha = self.alpha;
             let dist_scaled: Vec<f64> = dist_dense.iter().map(|&d| d / alpha).collect();
-            let core_scaled = mst::core_distances_dense(&dist_scaled, n, min_samples);
+            let core_scaled = mst::core_distances_dense(&dist_scaled, n, min_samples, self.units());
 
             // On cpu, build the mutual-reachability host-side. The device path
             // below uploads an `n×n` block, launches, and reads it back — three
@@ -872,7 +1112,7 @@ where
             // GLOSH tree already shares it) over the ALREADY-scaled matrix, so the
             // `/alpha` is folded in rather than passed to a kernel.
             if host_core::host_core_applicable::<F>() {
-                let mr = mst::mutual_reachability_dense(&dist_scaled, &core_scaled, n);
+                let mr = mst::mutual_reachability_dense(&dist_scaled, &core_scaled, n, self.units());
                 mst::mst_from_mutual_reachability(&mr, n)
             } else {
                 // Launch the MR GATHER kernel on the device (the dense-cosine
@@ -1044,7 +1284,7 @@ where
                                 cosine_distance_matrix(x, n, p)
                             } else {
                                 let mut d = vec![0.0f64; n * n];
-                                host_core::par_row_chunks(&mut d, n, 64, |row0, out| {
+                                host_core::par_row_chunks_in(&mut d, n, 64, self.units(), |row0, out| {
                                     for (r, row) in out.chunks_mut(n).enumerate() {
                                         for (j, slot) in row.iter_mut().enumerate() {
                                             *slot =
@@ -1060,7 +1300,13 @@ where
                             (dist, n)
                         }
                     };
-                    glosh::hdbscan_outlier_scores(&dist, n, min_samples, self.min_cluster_size)
+                    glosh::hdbscan_outlier_scores(
+                        &dist,
+                        n,
+                        min_samples,
+                        self.min_cluster_size,
+                        self.units(),
+                    )
                         .iter()
                         .map(|&v| f64_to_host::<F>(v))
                         .collect()

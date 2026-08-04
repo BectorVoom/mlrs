@@ -119,6 +119,36 @@ where
     T: Send,
     F: Fn(usize, &mut [T]) + Sync,
 {
+    par_row_chunks_in(out, row_width, min_rows, ALL_UNITS, f)
+}
+
+/// `units` sentinel meaning "every unit the backend reports" — the behaviour
+/// [`par_row_chunks`] had before `n_jobs` existed, and what `n_jobs=None`
+/// resolves to.
+/// `pub` (not `pub(super)`) because the dense-pass entry points that take a
+/// `units` argument — [`super::mst::core_distances_dense`],
+/// [`super::mst::mutual_reachability_dense`],
+/// [`super::glosh::hdbscan_outlier_scores`] — are themselves `pub`, so an
+/// out-of-crate caller needs a name for "however many the backend has".
+pub const ALL_UNITS: usize = 0;
+
+/// [`par_row_chunks`] with an explicit worker count (sklearn `n_jobs`).
+///
+/// `units == ALL_UNITS` uses [`capability::cpu_launch_units`]; any other value is
+/// the exact number of blocks the rows are cut into. Like the unbounded form this
+/// is WALL CLOCK ONLY — every block computes the same rows it would serially, so
+/// no value of `n_jobs` can move a result. (`hdbscan_test::n_jobs_invariant`
+/// gates that as exact equality.)
+pub(super) fn par_row_chunks_in<T, F>(
+    out: &mut [T],
+    row_width: usize,
+    min_rows: usize,
+    units: usize,
+    f: F,
+) where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
     debug_assert!(row_width >= 1, "row_width must be positive");
     debug_assert_eq!(
         out.len() % row_width,
@@ -129,7 +159,11 @@ where
     if rows == 0 {
         return;
     }
-    let units = capability::cpu_launch_units().max(1) as usize;
+    let units = if units == ALL_UNITS {
+        capability::cpu_launch_units().max(1) as usize
+    } else {
+        units
+    };
     let rows_per_chunk = rows.div_ceil(units).max(min_rows);
     if rows_per_chunk >= rows || units == 1 {
         f(0, out);
@@ -217,6 +251,49 @@ impl KSmallest {
 /// owns a contiguous output slice — no locking, no false sharing beyond the chunk
 /// boundary).
 pub fn core_distances_host(x: &[f64], n: usize, p: usize, metric: Metric, k: usize) -> Vec<f64> {
+    core_distances_host_with(x, n, p, metric, k, ScanOpts::default())
+}
+
+/// The estimator-supplied WALL-CLOCK knobs for the host core-distance scan
+/// (sklearn `algorithm=` / `leaf_size=` / `n_jobs=`).
+///
+/// Every field here changes only how the same answer is reached: `algorithm`
+/// picks which candidate pairs are skipped (never which `k` smallest survive),
+/// `leaf_size` picks how many points a leaf scan runs before the next box test,
+/// and `n_jobs` picks how the row range is cut. So the whole struct is
+/// value-neutral by construction, and the oracle suite gates that as EXACT
+/// equality rather than a tolerance
+/// (`hdbscan_test::{algorithm_routes_agree_exactly, core_distances_leaf_size_invariant,
+/// n_jobs_invariant}`).
+#[derive(Debug, Clone, Copy)]
+pub struct ScanOpts {
+    /// sklearn `algorithm=` (`'auto'` keeps the measured adaptive route).
+    pub algorithm: super::Algorithm,
+    /// Points per KD-tree leaf (sklearn `leaf_size=`). Ignored on the brute route.
+    pub leaf_size: usize,
+    /// Worker count, or [`ALL_UNITS`] for "every unit the backend reports".
+    pub units: usize,
+}
+
+impl Default for ScanOpts {
+    fn default() -> Self {
+        Self {
+            algorithm: super::Algorithm::Auto,
+            leaf_size: kdtree::DEFAULT_LEAF_SIZE,
+            units: ALL_UNITS,
+        }
+    }
+}
+
+/// [`core_distances_host`] with explicit [`ScanOpts`].
+pub fn core_distances_host_with(
+    x: &[f64],
+    n: usize,
+    p: usize,
+    metric: Metric,
+    k: usize,
+    opts: ScanOpts,
+) -> Vec<f64> {
     debug_assert_eq!(x.len(), n * p, "x must be a dense n×p matrix");
     debug_assert!(k >= 1 && k <= n, "k must be clamped to 1..=n by the caller");
     let mut core = vec![0.0f64; n];
@@ -224,20 +301,34 @@ pub fn core_distances_host(x: &[f64], n: usize, p: usize, metric: Metric, k: usi
         return core;
     }
 
+    // Resolved HERE, on the calling thread: `abflag` overrides (which
+    // `resolve_route` consults) are THREAD-LOCAL, so a worker spawned below would
+    // not see a test's forced value and would silently re-enable the calibration
+    // the test is trying to switch off.
+    let route = kdtree::resolve_route(
+        opts.algorithm.forces_tree(),
+        opts.algorithm.forces_brute(),
+        n,
+        p,
+    );
+
     // One tree for the whole scan, built BEFORE the row split (it is read-only and
     // shared by every worker). `None` falls through to the brute scan.
-    let tree = if kdtree::kd_applicable(n, p) {
-        Some(kdtree::build_tree(x, n, p))
-    } else {
-        None
+    let tree = match route {
+        kdtree::Route::Brute => None,
+        kdtree::Route::Tree | kdtree::Route::Adaptive => Some(kdtree::build_tree_with_leaf_size(
+            x,
+            n,
+            p,
+            opts.leaf_size,
+        )),
     };
     let tree = tree.as_ref();
-    // Resolved HERE, on the calling thread: `abflag` overrides are THREAD-LOCAL,
-    // so a worker spawned below would not see a test's forced value and would
-    // silently re-enable the calibration the test is trying to switch off.
-    let forced = kdtree::kd_forced();
+    // `Route::Tree` is the user (or the A/B knob) asking for the traversal
+    // unconditionally, so the per-worker calibration must not second-guess it.
+    let forced = route == kdtree::Route::Tree;
 
-    par_row_chunks(&mut core, 1, 64, |row0, out| {
+    par_row_chunks_in(&mut core, 1, 64, opts.units, |row0, out| {
         // The visited count is a probe-only quantity here (the route calibration
         // consumes it inside the block); nothing in `fit` reads it.
         let _ = core_rows(x, n, p, metric, k, row0, out, tree, forced);

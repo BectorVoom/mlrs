@@ -15,9 +15,11 @@
 //! first access); `hdbscan_fit_stage_breakdown` still times it so the deferred
 //! cost stays visible.
 //!
-//! `HDBSCAN_PERF_METRIC` selects the metric (default euclidean) — the Python
-//! shim only exposes euclidean, so the other four are measurable only here.
-//! `HDBSCAN_PERF_MAX_N` caps the ladder.
+//! `HDBSCAN_PERF_METRIC` selects the metric (default euclidean);
+//! `HDBSCAN_PERF_MAX_N` caps the ladder. As of HDBS-PARAMS the Python shim
+//! exposes every metric too, so `scripts/bench_hdbscan_params.py` can sweep them
+//! against sklearn end-to-end — this file remains the way to time a single
+//! STAGE (core distances, MST) without the ingress/egress around it.
 //!
 //! Per AGENTS.md §2 tests live here, never in-source.
 
@@ -183,7 +185,7 @@ fn hdbscan_fit_stage_breakdown() {
         dist
     });
     let _ = stage!("glosh: tree+scores", {
-        glosh::hdbscan_outlier_scores(&dense, n, mcs, mcs)
+        glosh::hdbscan_outlier_scores(&dense, n, mcs, mcs, host_core::ALL_UNITS)
     });
 }
 
@@ -381,5 +383,112 @@ fn hdbscan_mst_units_sweep() {
             }
         }
         println!("{u:>7} | {best:>10.4}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HDBS-PARAMS: the `leaf_size` sweep behind `kdtree::DEFAULT_LEAF_SIZE` and the
+// sklearn-parity `Hdbscan::new` default of 40.
+//
+// A KD-tree leaf is scanned linearly, so `leaf_size` trades traversal
+// bookkeeping (many small leaves → more box tests and `perm` indirection)
+// against wasted distance work (few large leaves → pairs evaluated that a
+// tighter box would have pruned). Both defaults in the tree — 32 in Rust for
+// callers who set none, 40 on the estimator for sklearn parity — are justified
+// only by where this curve is flat.
+//
+// Forced onto the tree route (`MLRS_HDBSCAN_CORE_KD=1`) so the knob is LIVE:
+// on the brute route nothing reads `leaf_size` and the sweep would report a
+// row of identical numbers that looks like "leaf_size is free".
+//
+//   cargo test -p mlrs-algos --release --features cpu \
+//     --test hdbscan_perf_test -- --ignored --nocapture leaf_size
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "wall-clock probe; run explicitly with --ignored --nocapture"]
+fn hdbscan_leaf_size_sweep() {
+    use mlrs_algos::cluster::hdbscan::{host_core, Algorithm};
+
+    let n: usize = std::env::var("HDBSCAN_LEAF_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let mcs: usize = std::env::var("HDBSCAN_LEAF_MCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let dims: Vec<usize> = std::env::var("HDBSCAN_LEAF_DIMS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![4, 8, 16]);
+    let leaves: Vec<usize> = std::env::var("HDBSCAN_LEAF_SIZES")
+        .ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![4, 8, 16, 32, 40, 64, 128, 256]);
+    let reps: usize = std::env::var("HDBSCAN_LEAF_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+
+    println!(
+        "leaf_size sweep: n={n} mcs={mcs} metric={:?} (best of {reps}, tree route FORCED)",
+        perf_metric()
+    );
+    print!("{:>4} |", "d");
+    for ls in &leaves {
+        print!(" {:>9}", format!("ls={ls}"));
+    }
+    println!("  {:>8}", "best");
+
+    for d in dims {
+        let x = make_blobs(n, d, 8, 42);
+        let k = mcs.min(n);
+        let mut times = Vec::with_capacity(leaves.len());
+        // The reference output: every leaf_size must reproduce it EXACTLY, or
+        // the number below is timing a different computation and means nothing.
+        let mut reference: Option<Vec<f64>> = None;
+        for &leaf_size in &leaves {
+            let mut best = f64::INFINITY;
+            let mut out = Vec::new();
+            for _ in 0..reps {
+                let t0 = Instant::now();
+                out = host_core::core_distances_host_with(
+                    &x,
+                    n,
+                    d,
+                    perf_metric(),
+                    k,
+                    host_core::ScanOpts {
+                        algorithm: Algorithm::KdTree,
+                        leaf_size,
+                        units: host_core::ALL_UNITS,
+                    },
+                );
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            match &reference {
+                None => reference = Some(out),
+                Some(r) => assert_eq!(
+                    &out, r,
+                    "d={d} leaf_size={leaf_size}: core distances diverged — the \
+                     timing below would be comparing different computations"
+                ),
+            }
+            times.push(best);
+        }
+        let fastest = times
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| leaves[i])
+            .unwrap_or(0);
+        print!("{d:>4} |");
+        for t in &times {
+            print!(" {t:>9.4}");
+        }
+        let spread = times.iter().cloned().fold(f64::MIN, f64::max)
+            / times.iter().cloned().fold(f64::MAX, f64::min).max(1e-12);
+        println!("  ls={fastest:<5} spread={spread:.2}x");
     }
 }
