@@ -1032,6 +1032,52 @@ pub enum BuildError {
         p: f64,
     },
 
+    /// `HDBSCAN` was given a tree `algorithm` (`kd_tree`/`ball_tree`) together
+    /// with a metric that has no tree route (HDBS-PARAMS). A KD/ball tree prunes
+    /// on per-axis box bounds, which requires a metric that aggregates monotonely
+    /// over the feature axes; `cosine` is normalized (not an axis aggregate) and
+    /// `precomputed` has no feature axes at all, so neither can be traversed.
+    ///
+    /// This mirrors sklearn 1.9.0 exactly, which raises
+    /// `"<metric> is not a valid metric for a KDTree-based algorithm"` for the
+    /// same two combinations. Rejected at `build()` (data-INDEPENDENT, the D-08
+    /// split) — sklearn raises at `fit`, but the pair is knowable without data.
+    #[error(
+        "estimator '{estimator}': metric '{metric}' is not a valid metric for a \
+         {algorithm}-based algorithm (use algorithm='brute' or 'auto')"
+    )]
+    InvalidAlgorithmMetric {
+        /// Which estimator's builder rejected the pair (always `"hdbscan"`).
+        estimator: &'static str,
+        /// The tree algorithm requested (`"kd_tree"` / `"ball_tree"`).
+        algorithm: &'static str,
+        /// The metric that has no tree route (`"cosine"` / `"precomputed"`).
+        metric: &'static str,
+    },
+
+    /// `HDBSCAN` was given a `leaf_size < 1` (HDBS-PARAMS). A leaf must hold at
+    /// least one point or the tree build would never terminate. sklearn's
+    /// `Interval(Integral, 1, None, closed='left')` enforces the same floor.
+    /// Rejected at `build()` (data-INDEPENDENT, the D-08 split).
+    #[error("estimator '{estimator}': leaf_size = {leaf_size} is invalid (must be >= 1)")]
+    InvalidLeafSize {
+        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        estimator: &'static str,
+        /// The offending leaf size.
+        leaf_size: usize,
+    },
+
+    /// `HDBSCAN` was given `n_jobs = 0` (HDBS-PARAMS). joblib reads `n_jobs` as
+    /// "this many workers", with negatives counting back from all cores
+    /// (`-1` = all, `-2` = all but one); `0` names no worker count at all and
+    /// joblib itself raises `ValueError` for it. Rejected at `build()`
+    /// (data-INDEPENDENT, the D-08 split).
+    #[error("estimator '{estimator}': n_jobs = 0 is invalid (use None, a positive count, or a negative joblib offset)")]
+    InvalidNJobs {
+        /// Which estimator's builder rejected the value (always `"hdbscan"`).
+        estimator: &'static str,
+    },
+
     /// An ARIMA order `(p, d, q)` component exceeded the bound `mlrs` enforces
     /// to keep the Kalman-filter state dimension `r = max(p, q+1)` and the
     /// differencing pass tractable (TSA-01). sklearn/statsmodels place no such

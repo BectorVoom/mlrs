@@ -45,11 +45,48 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/hdbscan_test.rs` (AGENTS.md §2).
 
-/// Points per leaf. A leaf is scanned linearly, so this trades traversal
-/// bookkeeping (small leaves) against wasted distance work (large leaves). 32
-/// keeps a leaf's coordinates inside a few cache lines at the `p` that shows up
-/// here (8-64) while amortizing the box tests over enough points.
-const LEAF_SIZE: usize = 32;
+/// Default points per leaf when the caller expresses no preference.
+///
+/// A leaf is scanned linearly, so this trades traversal bookkeeping (small
+/// leaves → more box tests, each `O(p)`, and a deeper descent) against wasted
+/// distance work (large leaves → pairs evaluated that a tighter box would have
+/// pruned).
+///
+/// ## The measured curve
+/// This STAGE only (`hdbscan_perf_test::hdbscan_leaf_size_sweep`, `n = 10_000`,
+/// 8 blobs, tree route forced, min of 3, cpu backend / 16 units) — seconds:
+///
+/// ```text
+///   leaf_size      4      8     16     32     40     64    128    256   spread
+///   d = 4      0.0073 0.0066 0.0046 0.0042 0.0046 0.0044 0.0047 0.0058  1.74x
+///   d = 8      0.0415 0.0326 0.0237 0.0192 0.0179 0.0171 0.0162 0.0174  2.56x
+///   d = 16     0.1592 0.1024 0.0637 0.0482 0.0399 0.0407 0.0385 0.0383  4.15x
+/// ```
+///
+/// and end-to-end through the Python shim at `d = 16`, min of 5
+/// (`scripts/bench_hdbscan_params.py --sweep leaf_size`), where the
+/// leaf_size-independent MST/condense/select stages dilute the same effect:
+///
+/// ```text
+///   leaf_size      4      8     16     32     40     64    128    256
+///   mlrs fit(s) 0.391  0.215  0.176  0.166  0.159  0.161  0.148  0.152
+///   vs sklearn  3.68x  3.96x  3.75x  3.44x  3.30x  3.26x  3.40x  3.44x
+/// ```
+///
+/// Three things come out of it. The curve is FLAT from ~32 upward, and 32 and
+/// 40 are indistinguishable (0.166 against 0.159, inside run-to-run variance) —
+/// which is why both numbers below stand without either being a compromise.
+/// Small leaves cost real time (2.6x end-to-end, 4.2x on this stage, at
+/// `leaf_size = 4`, and the penalty grows with `p`) because the node count goes
+/// as `n / leaf_size` while every internal node pays two `O(p)` box tests, so
+/// the traversal bookkeeping starts to swamp the distance work it exists to
+/// save. And mlrs is ahead of sklearn at EVERY leaf_size, so the knob is a
+/// tuning choice rather than a way to lose.
+///
+/// 32 is kept as the in-Rust default (it also keeps a leaf's coordinates inside
+/// a few cache lines at the `p` that shows up here). `Hdbscan::new` sets 40 for
+/// sklearn parity; the Python shim forwards the user's `leaf_size` verbatim.
+pub(crate) const DEFAULT_LEAF_SIZE: usize = 32;
 
 /// One node of the implicit tree. Leaves have `left == right == NONE`.
 struct Node {
@@ -73,22 +110,36 @@ pub(crate) struct KdTree {
     /// points) prunes far better than the split-plane half-spaces would.
     bounds: Vec<f64>,
     p: usize,
+    /// Points per leaf this tree was built with (sklearn `leaf_size`).
+    leaf_size: usize,
 }
 
 impl KdTree {
-    /// Build the tree over all `n` rows of `x` (`n × p`, row-major).
+    /// Build the tree over all `n` rows of `x` (`n × p`, row-major) with
+    /// `leaf_size` points per leaf.
     ///
     /// Splitting recurses on the axis of widest extent at the node's own median
     /// (`select_nth_unstable_by` — a partition, not a sort), so the tree is
-    /// balanced at depth `log2(n / LEAF_SIZE)` regardless of how the data is
+    /// balanced at depth `log2(n / leaf_size)` regardless of how the data is
     /// ordered on input.
-    pub(crate) fn build(x: &[f64], n: usize, p: usize) -> Self {
+    ///
+    /// `leaf_size` is a pure WALL-CLOCK knob: it changes how many points a leaf
+    /// scan evaluates before the next box test, never which `k` smallest come
+    /// out. Every value therefore yields bit-identical core distances (gated by
+    /// `hdbscan_test::core_distances_leaf_size_invariant`).
+    pub(crate) fn build(x: &[f64], n: usize, p: usize, leaf_size: usize) -> Self {
         debug_assert_eq!(x.len(), n * p, "x must be a dense n×p matrix");
+        // A zero leaf would never terminate the recursion (`hi - lo <= 0` is
+        // false for any non-empty range, and the split would recurse forever on
+        // a 1-point range). The builder validates `leaf_size >= 1`; clamp here
+        // too so a direct caller cannot hang.
+        let leaf_size = leaf_size.max(1);
         let mut tree = Self {
             perm: (0..n as u32).collect(),
-            nodes: Vec::with_capacity(2 * n.div_ceil(LEAF_SIZE) + 1),
-            bounds: Vec::with_capacity(2 * p * (2 * n.div_ceil(LEAF_SIZE) + 1)),
+            nodes: Vec::with_capacity(2 * n.div_ceil(leaf_size) + 1),
+            bounds: Vec::with_capacity(2 * p * (2 * n.div_ceil(leaf_size) + 1)),
             p,
+            leaf_size,
         };
         if n > 0 {
             tree.split(x, 0, n);
@@ -125,7 +176,7 @@ impl KdTree {
             }
         }
 
-        if hi - lo <= LEAF_SIZE {
+        if hi - lo <= self.leaf_size {
             return id;
         }
 
@@ -426,10 +477,70 @@ const BRUTE_RATIO: f64 = 0.5;
 /// ~2× SLOWER), and the calibration turns that into a ≤3% overhead.
 pub(crate) const CALIB_ROWS: usize = 4;
 
-/// Build the tree over all `n` rows.
+/// Build the tree over all `n` rows at the [`DEFAULT_LEAF_SIZE`].
 ///
-/// Exposed for [`super::host_core`], which owns the metric monomorphization and
-/// the row-parallel split.
+/// Exposed for [`super::host_core`] and `manifold::umap_host_knn`, which own the
+/// metric monomorphization and the row-parallel split. Callers that carry a
+/// user-supplied `leaf_size` (HDBSCAN's `leaf_size=`) use
+/// [`build_tree_with_leaf_size`].
 pub(crate) fn build_tree(x: &[f64], n: usize, p: usize) -> KdTree {
-    KdTree::build(x, n, p)
+    KdTree::build(x, n, p, DEFAULT_LEAF_SIZE)
+}
+
+/// Build the tree over all `n` rows with an explicit points-per-leaf.
+pub(crate) fn build_tree_with_leaf_size(x: &[f64], n: usize, p: usize, leaf_size: usize) -> KdTree {
+    KdTree::build(x, n, p, leaf_size)
+}
+
+/// Which neighbour-search route the core-distance scan takes, after both the
+/// user's `algorithm=` and the structural/A-B gates have had their say.
+///
+/// The three routes are WALL-CLOCK ONLY — every one of them evaluates the same
+/// per-pair arithmetic and returns the same `k` smallest (the tree merely skips
+/// pairs that provably cannot enter the list; see this module's header). That
+/// invariant is what lets `algorithm=` be gated by EXACT equality across all
+/// four sklearn values rather than by a tolerance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// Scan every candidate; never build a tree.
+    Brute,
+    /// Build the tree and KEEP it — the per-worker calibration is switched off,
+    /// so the traversal is used even where it does not prune (sklearn's
+    /// `algorithm='kd_tree'` / `'ball_tree'` are likewise unconditional).
+    Tree,
+    /// Build the tree when the geometry warrants it, then let each worker's
+    /// [`CALIB_ROWS`] calibration abandon it if it is not pruning on THIS data
+    /// (sklearn's `algorithm='auto'`).
+    Adaptive,
+}
+
+/// Resolve the route for a `(algorithm, n, p)` triple.
+///
+/// `force_tree` is the caller's `algorithm ∈ {kd_tree, ball_tree}`; `force_brute`
+/// is `algorithm == 'brute'`. Both are USER intent and therefore outrank the
+/// structural [`KD_MIN_ROWS`] gate — a caller that asks for the tree on 100 rows
+/// gets it. `algorithm='auto'` keeps the measured adaptive behaviour.
+///
+/// `MLRS_HDBSCAN_CORE_KD` still overrides everything for on-target A/B (`0`
+/// forces brute, `1` forces the tree), because that knob exists to measure the
+/// two routes against each other on a fixed configuration.
+pub(crate) fn resolve_route(force_tree: bool, force_brute: bool, n: usize, p: usize) -> Route {
+    match mlrs_backend::abflag::var("MLRS_HDBSCAN_CORE_KD").as_deref() {
+        Some("0") => return Route::Brute,
+        Some("1") => return Route::Tree,
+        _ => {}
+    }
+    if force_brute {
+        return Route::Brute;
+    }
+    if force_tree {
+        // An empty input has no rows to build over; the traversal would be a
+        // no-op anyway, so fall through to the (equally empty) brute scan.
+        return if n == 0 { Route::Brute } else { Route::Tree };
+    }
+    if kd_applicable(n, p) {
+        Route::Adaptive
+    } else {
+        Route::Brute
+    }
 }

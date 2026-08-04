@@ -372,14 +372,27 @@ EXPECTED_PARAMS = {
         "b": None,
         "output_type": "input",
     },
+    # HDBS-PARAMS: sklearn's COMPLETE 14-parameter surface, in sklearn's own
+    # declaration order. `max_cluster_size` is `None` (sklearn's spelling of
+    # "unbounded"; the shim maps it to the core's 0 sentinel) and `copy` is
+    # `False` rather than sklearn 1.9's transitional `'warn'` — mlrs never
+    # mutates the caller's array, so it is already in the post-1.10 state and
+    # has nothing to warn about.
     "HDBSCAN": {
         "min_cluster_size": 5,
         "min_samples": None,
         "cluster_selection_epsilon": 0.0,
-        "cluster_selection_method": "eom",
+        "max_cluster_size": None,
         "metric": "euclidean",
+        "metric_params": None,
         "alpha": 1.0,
-        "max_cluster_size": 0,
+        "algorithm": "auto",
+        "leaf_size": 40,
+        "n_jobs": None,
+        "cluster_selection_method": "eom",
+        "allow_single_cluster": False,
+        "store_centers": None,
+        "copy": False,
         "output_type": "input",
     },
     # --- AGGLO-01: AgglomerativeClustering (single-linkage). -------------- #

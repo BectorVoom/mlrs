@@ -547,11 +547,49 @@ class SpectralEmbedding(TransformerMixin, MlrsBase):
 class HDBSCAN(ClusterMixin, MlrsBase):
     """Hierarchical density-based clustering (CLUSTER-03 / SHIM-01 pair).
 
+    Carries ``sklearn.cluster.HDBSCAN``'s COMPLETE constructor surface — all
+    fourteen parameters, in sklearn's order, with sklearn's defaults — so a
+    script written against sklearn runs here unchanged.
+
     ``ClusterMixin`` provides ``fit_predict``; the shim forwards ``fit`` to the
-    ``_mlrs.HDBSCAN`` wrapper and exposes ``labels_`` / ``probabilities_`` /
-    ``outlier_scores_`` (the GLOSH scores surface as ``None`` until the
-    feature-space front-end lands — see 16-10-SUMMARY). Defaults mirror
-    ``PyHDBSCAN`` ``#[new]`` at cluster.rs:375-379.
+    ``_mlrs.HDBSCAN`` wrapper and exposes ``labels_``, ``probabilities_``,
+    ``outlier_scores_`` (a GLOSH score sklearn does not have — see D-07),
+    ``centroids_``, ``medoids_`` and ``n_features_in_``.
+
+    Three parameters are handled HERE rather than at the Rust boundary, because
+    they are Python-shaped rather than algorithmic:
+
+    ``metric_params``
+        sklearn's free-form dict. The only key the mlrs distance core reads is
+        Minkowski's ``p`` (sklearn's ``KDTree`` default of 2 when absent, which
+        makes ``metric='minkowski'`` with no params identical to
+        ``'euclidean'``). Unknown keys are rejected rather than ignored, so a
+        typo'd ``{'P': 3}`` fails loudly instead of silently clustering under a
+        different exponent than the caller asked for.
+
+    ``max_cluster_size``
+        sklearn spells "unbounded" as ``None``; the Rust core spells it ``0``.
+
+    ``copy``
+        sklearn needs this because its brute + ``metric='precomputed'`` path
+        modifies the caller's distance matrix in place (which is why its default
+        is scheduled to flip to ``True`` in 1.10). mlrs NEVER writes to the
+        array it is given — the fit takes its own host copy before scaling by
+        ``alpha`` — so the guarantee ``copy=True`` buys under sklearn holds here
+        unconditionally, on every metric and every algorithm. The parameter is
+        accepted for signature parity and has no effect. It is also not warned
+        about: sklearn's ``FutureWarning`` announces a behaviour change, and
+        mlrs's behaviour is already the post-change one.
+
+    One combination is accepted here that sklearn 1.9.0 rejects:
+    ``algorithm='brute'`` with ``metric='infinity'`` or ``metric='p'``. Those
+    are tree-only spellings of ``chebyshev`` and ``minkowski``; sklearn's
+    ``metric`` validation accepts them and its brute path — which goes through
+    ``pairwise_distances`` — then does not, so the value fails mid-``fit``. mlrs
+    resolves both aliases to the same metric on every route, so it accepts the
+    pair rather than reproducing a gap in someone else's validation. Anything
+    that runs under sklearn still runs here; only the reverse can differ. See
+    ``docs/upstream-sklearn-issues.md`` (SK-001).
     """
 
     def __init__(
@@ -559,20 +597,52 @@ class HDBSCAN(ClusterMixin, MlrsBase):
         min_cluster_size=5,
         min_samples=None,
         cluster_selection_epsilon=0.0,
-        cluster_selection_method="eom",
+        max_cluster_size=None,
         metric="euclidean",
+        metric_params=None,
         alpha=1.0,
-        max_cluster_size=0,
+        algorithm="auto",
+        leaf_size=40,
+        n_jobs=None,
+        cluster_selection_method="eom",
+        allow_single_cluster=False,
+        store_centers=None,
+        copy=False,
         output_type="input",
     ):
         self.min_cluster_size = min_cluster_size
         self.min_samples = min_samples
         self.cluster_selection_epsilon = cluster_selection_epsilon
-        self.cluster_selection_method = cluster_selection_method
-        self.metric = metric
-        self.alpha = alpha
         self.max_cluster_size = max_cluster_size
+        self.metric = metric
+        self.metric_params = metric_params
+        self.alpha = alpha
+        self.algorithm = algorithm
+        self.leaf_size = leaf_size
+        self.n_jobs = n_jobs
+        self.cluster_selection_method = cluster_selection_method
+        self.allow_single_cluster = allow_single_cluster
+        self.store_centers = store_centers
+        self.copy = copy
         self.output_type = output_type
+
+    def _minkowski_p(self):
+        """The Minkowski exponent from ``metric_params`` (sklearn default 2)."""
+        params = self.metric_params
+        if params is None:
+            return 2.0
+        if not isinstance(params, dict):
+            raise TypeError(
+                f"metric_params must be a dict or None, got "
+                f"{type(params).__name__}"
+            )
+        unknown = set(params) - {"p"}
+        if unknown:
+            raise ValueError(
+                f"metric_params keys {sorted(unknown)!r} are not supported; "
+                f"mlrs reads only 'p' (the Minkowski exponent)"
+            )
+        return float(params.get("p", 2.0))
 
     def fit(self, X, y=None):
         xa, rows, cols = self._normalize(X)
@@ -580,10 +650,17 @@ class HDBSCAN(ClusterMixin, MlrsBase):
             self.min_cluster_size,
             self.min_samples,
             self.cluster_selection_epsilon,
-            self.cluster_selection_method,
+            # sklearn's None-is-unbounded → the core's 0-is-unbounded sentinel.
+            0 if self.max_cluster_size is None else self.max_cluster_size,
             self.metric,
+            self._minkowski_p(),
             self.alpha,
-            self.max_cluster_size,
+            self.algorithm,
+            self.leaf_size,
+            self.n_jobs,
+            self.cluster_selection_method,
+            self.allow_single_cluster,
+            self.store_centers,
         )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
@@ -610,3 +687,35 @@ class HDBSCAN(ClusterMixin, MlrsBase):
         if out is None:
             return None
         return self._to_output(out, (-1,), None, self._np_float())
+
+    def _centers(self, name, requested_by):
+        """Shared ``centroids_``/``medoids_`` body.
+
+        Raises ``AttributeError`` — not a bare ``None`` — when ``store_centers``
+        never asked for this block, matching sklearn, where the attribute is
+        simply absent and ``hasattr`` is the documented way to test for it.
+        A fit that ran with the right ``store_centers`` but found no cluster at
+        all yields an empty ``(0, n_features)`` array rather than an error.
+        """
+        self._check_fitted()
+        if self.store_centers not in requested_by:
+            raise AttributeError(
+                f"'HDBSCAN' object has no attribute '{name}_' "
+                f"(store_centers={self.store_centers!r} did not request it)"
+            )
+        out = self._suffixed(name)()
+        if out is None:
+            return self._to_output(
+                [], (0, self.n_features_in_), None, self._np_float()
+            )
+        return self._to_output(
+            out, (-1, self.n_features_in_), None, self._np_float()
+        )
+
+    @property
+    def centroids_(self):
+        return self._centers("centroids", ("centroid", "both"))
+
+    @property
+    def medoids_(self):
+        return self._centers("medoids", ("medoid", "both"))

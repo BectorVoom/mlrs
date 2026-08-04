@@ -705,7 +705,16 @@ pub fn argsort_by_weight(mst: &[MstEdge]) -> Vec<MstEdge> {
 /// range (a caller that resolved `min_samples=None → min_cluster_size` may exceed
 /// `n` on a tiny input; sklearn's `np.partition` would clamp similarly). The dense
 /// matrix is assumed already alpha-scaled by the caller (Variant-A placement).
-pub fn core_distances_dense(dist: &[f64], n: usize, min_samples: usize) -> Vec<f64> {
+///
+/// `units` is the caller's resolved `n_jobs` ([`super::host_core::ALL_UNITS`] for
+/// every unit the backend reports). Row-parallel splitting is value-neutral, so
+/// this is wall clock only.
+pub fn core_distances_dense(
+    dist: &[f64],
+    n: usize,
+    min_samples: usize,
+    units: usize,
+) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
@@ -717,7 +726,7 @@ pub fn core_distances_dense(dist: &[f64], n: usize, min_samples: usize) -> Vec<f
     // full sort this replaces was O(n log n) per row for a single index — the
     // value at `k` is the same either way (equal elements are indistinguishable
     // here, so "unstable" costs nothing), and only that value is read.
-    super::host_core::par_row_chunks(&mut core, 1, 64, |row0, out| {
+    super::host_core::par_row_chunks_in(&mut core, 1, 64, units, |row0, out| {
         let mut row: Vec<f64> = vec![0.0; n];
         for (r, slot) in out.iter_mut().enumerate() {
             let i = row0 + r;
@@ -732,13 +741,21 @@ pub fn core_distances_dense(dist: &[f64], n: usize, min_samples: usize) -> Vec<f
 /// Build the DENSE row-major `n×n` mutual-reachability matrix from an
 /// (alpha-scaled) distance matrix and per-row core distances:
 /// `mr[i*n + j] = max(core[i], core[j], dist[i*n + j])`. The Variant-A input.
-pub fn mutual_reachability_dense(dist: &[f64], core: &[f64], n: usize) -> Vec<f64> {
+///
+/// `units` is the caller's resolved `n_jobs` ([`super::host_core::ALL_UNITS`] for
+/// every unit the backend reports).
+pub fn mutual_reachability_dense(
+    dist: &[f64],
+    core: &[f64],
+    n: usize,
+    units: usize,
+) -> Vec<f64> {
     debug_assert_eq!(dist.len(), n * n);
     debug_assert_eq!(core.len(), n);
     let mut mr = vec![0.0f64; n * n];
     // Row-parallel: each output row depends only on its own input row plus the
     // shared read-only `core`, so the split is value-neutral.
-    super::host_core::par_row_chunks(&mut mr, n, 64, |row0, out| {
+    super::host_core::par_row_chunks_in(&mut mr, n, 64, units, |row0, out| {
         for (r, row) in out.chunks_mut(n).enumerate() {
             let core_i = core[row0 + r];
             let src = &dist[(row0 + r) * n..(row0 + r + 1) * n];

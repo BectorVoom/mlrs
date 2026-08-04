@@ -12,7 +12,9 @@
 use pyo3::prelude::*;
 
 use mlrs_algos::cluster::dbscan::DBSCAN;
-use mlrs_algos::cluster::hdbscan::{ClusterSelectionMethod, Hdbscan, Metric};
+use mlrs_algos::cluster::hdbscan::{
+    Algorithm, ClusterSelectionMethod, Hdbscan, Metric, StoreCenters,
+};
 use mlrs_algos::cluster::kmeans::{KMeans, KMeansAlgorithm, KMeansInit, NInit};
 // All three cluster wraps in this file (PyKMeans, PyDBSCAN, PyHDBSCAN) are now on
 // the v3 typestate surface (consuming-self `Fit` returning the `Fitted` sibling;
@@ -441,16 +443,38 @@ crate::any_estimator_typestate! {
         min_cluster_size: usize, min_samples: Option<usize>,
         cluster_selection_epsilon: f64, cluster_selection_method: String,
         metric: String, alpha: f64, max_cluster_size: usize,
+        minkowski_p: f64, algorithm: String, leaf_size: usize,
+        n_jobs: Option<i32>, allow_single_cluster: bool,
+        store_centers: Option<String>,
     },
 }
 
-/// Parse the sklearn-named `metric` string into the algos [`Metric`] enum. Only
-/// `"euclidean"` carries meaning in the Phase-12 shell.
-fn parse_hdbscan_metric(s: &str) -> PyResult<Metric> {
+/// Parse the sklearn-named `metric` string (plus `minkowski_p`, which the shim
+/// has already pulled out of sklearn's `metric_params` dict) into the algos
+/// [`Metric`] enum.
+///
+/// The alias groups are sklearn's own: `l2` is `euclidean`, `l1`/`cityblock` are
+/// `manhattan`, `infinity` is `chebyshev`, and `p` is `minkowski` — those pairs
+/// name the same distance in `sklearn.neighbors`' metric tables, so accepting
+/// them costs nothing and lets a caller paste an sklearn snippet unchanged.
+///
+/// sklearn's remaining `metric` options (the boolean-vector family —
+/// `braycurtis`, `dice`, `jaccard`, `yule`, … — plus `mahalanobis`,
+/// `seuclidean`, `correlation`, `haversine` and the `pyfunc` escape hatch) are
+/// NOT part of the mlrs distance core, so they are rejected here with the
+/// supported list rather than silently coerced to something else.
+fn parse_hdbscan_metric(s: &str, minkowski_p: f64) -> PyResult<Metric> {
     match s {
-        "euclidean" => Ok(Metric::Euclidean),
+        "euclidean" | "l2" => Ok(Metric::Euclidean),
+        "manhattan" | "cityblock" | "l1" => Ok(Metric::Manhattan),
+        "chebyshev" | "infinity" => Ok(Metric::Chebyshev),
+        "minkowski" | "p" => Ok(Metric::Minkowski { p: minkowski_p }),
+        "cosine" => Ok(Metric::Cosine),
+        "precomputed" => Ok(Metric::Precomputed),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "hdbscan: unsupported metric {other:?}; expected \"euclidean\""
+            "hdbscan: unsupported metric {other:?}; expected one of \"euclidean\", \
+             \"l2\", \"manhattan\", \"cityblock\", \"l1\", \"chebyshev\", \
+             \"infinity\", \"minkowski\", \"p\", \"cosine\", \"precomputed\""
         ))),
     }
 }
@@ -466,6 +490,84 @@ fn parse_cluster_selection_method(s: &str) -> PyResult<ClusterSelectionMethod> {
              expected \"eom\" or \"leaf\""
         ))),
     }
+}
+
+/// Parse the sklearn-named `algorithm` string into the algos [`Algorithm`] enum.
+///
+/// This is a WALL-CLOCK knob only — see [`Algorithm`] for why every value
+/// produces identical labels.
+fn parse_hdbscan_algorithm(s: &str) -> PyResult<Algorithm> {
+    match s {
+        "auto" => Ok(Algorithm::Auto),
+        "brute" => Ok(Algorithm::Brute),
+        "kd_tree" => Ok(Algorithm::KdTree),
+        "ball_tree" => Ok(Algorithm::BallTree),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "hdbscan: unsupported algorithm {other:?}; expected \"auto\", \
+             \"brute\", \"kd_tree\" or \"ball_tree\""
+        ))),
+    }
+}
+
+/// Parse the sklearn-named `store_centers` string (`None` = store neither) into
+/// the algos [`StoreCenters`] enum.
+fn parse_store_centers(s: Option<&str>) -> PyResult<Option<StoreCenters>> {
+    match s {
+        None => Ok(None),
+        Some("centroid") => Ok(Some(StoreCenters::Centroid)),
+        Some("medoid") => Ok(Some(StoreCenters::Medoid)),
+        Some("both") => Ok(Some(StoreCenters::Both)),
+        Some(other) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "hdbscan: unsupported store_centers {other:?}; expected None, \
+             \"centroid\", \"medoid\" or \"both\""
+        ))),
+    }
+}
+
+// NOTE — a deliberate, documented divergence (`docs/upstream-sklearn-issues.md`,
+// SK-001): `algorithm='brute'` with `metric='infinity'` or `metric='p'` is
+// ACCEPTED here, where sklearn 1.9.0 raises.
+//
+// sklearn's `metric` constraint is the UNION of the tree metrics and the
+// pairwise metrics, but its brute path routes through `pairwise_distances`,
+// whose table carries `chebyshev`/`minkowski` and NOT those two tree-only
+// aliases — so four metrics (`infinity`, `p`, `pyfunc`, `sokalmichener`) are
+// accepted by its own validation and then rejected mid-`fit` by a helper,
+// with an error naming `pairwise_distances`' parameter rather than HDBSCAN's.
+// Its `kd_tree`/`ball_tree` paths validate the metric properly and raise a
+// clear message; only `brute` lacks the check, and `algorithm='auto'` hides it
+// by routing those metrics to a tree.
+//
+// This shim originally mirrored the rejection for drop-in parity. That was the
+// wrong call: parity is worth having with sklearn's SEMANTICS, not with a gap
+// in its validation. mlrs has no such asymmetry — `infinity` and `p` resolve to
+// the same `Metric` on every route, and `Algorithm` is value-neutral by
+// construction (see `hdbscan::Algorithm`) — so refusing the pair would have
+// meant inventing a restriction the engine does not have, purely to reproduce
+// someone else's bug. Reported upstream; accepted here.
+//
+// The tree-metric rejections are a different matter and are KEPT (in
+// `HdbscanBuilder::build`): a KD/ball box bound requires a per-axis-monotone
+// distance, so `kd_tree`/`ball_tree` with `cosine`/`precomputed` is a real
+// restriction of the algorithm, not a validation oversight.
+
+/// The ctor hyperparameters, lifted out of the `Unfit` arm so `fit` reads them
+/// once instead of threading a thirteen-element tuple through the dtype match.
+/// Mirrors [`crate::estimators::linear::RidgeClassifierParams`].
+struct HdbscanParams {
+    min_cluster_size: usize,
+    min_samples: Option<usize>,
+    cluster_selection_epsilon: f64,
+    cluster_selection_method: String,
+    metric: String,
+    alpha: f64,
+    max_cluster_size: usize,
+    minkowski_p: f64,
+    algorithm: String,
+    leaf_size: usize,
+    n_jobs: Option<i32>,
+    allow_single_cluster: bool,
+    store_centers: Option<String>,
 }
 
 /// sklearn-compatible `HDBSCAN` (density-based clustering). Labels-only — `fit` +
@@ -490,6 +592,12 @@ impl PyHDBSCAN {
                 metric: "euclidean".to_string(),
                 alpha: 1.0,
                 max_cluster_size: 0,
+                minkowski_p: 2.0,
+                algorithm: "auto".to_string(),
+                leaf_size: 40,
+                n_jobs: None,
+                allow_single_cluster: false,
+                store_centers: None,
             },
         }
     }
@@ -518,24 +626,35 @@ impl PyHDBSCAN {
 
 #[pymethods]
 impl PyHDBSCAN {
-    /// `HDBSCAN(min_cluster_size=5, min_samples=None,
-    /// cluster_selection_epsilon=0.0, cluster_selection_method="eom",
-    /// metric="euclidean", alpha=1.0, max_cluster_size=0)`.
+    /// The full sklearn `HDBSCAN` hyperparameter surface, flattened for the
+    /// boundary: sklearn's `metric_params` dict arrives as the single scalar the
+    /// mlrs metric core reads from it (`minkowski_p`), `max_cluster_size=None`
+    /// arrives as the `0`-means-unbounded sentinel, and `copy` is a pure
+    /// Python-side concern the shim handles before it gets here. Everything else
+    /// keeps sklearn's name, order and default.
     #[new]
     #[pyo3(signature = (
         min_cluster_size = 5, min_samples = None, cluster_selection_epsilon = 0.0,
-        cluster_selection_method = "eom".to_string(), metric = "euclidean".to_string(),
-        alpha = 1.0, max_cluster_size = 0,
+        max_cluster_size = 0, metric = "euclidean".to_string(), minkowski_p = 2.0,
+        alpha = 1.0, algorithm = "auto".to_string(), leaf_size = 40, n_jobs = None,
+        cluster_selection_method = "eom".to_string(), allow_single_cluster = false,
+        store_centers = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         min_cluster_size: usize,
         min_samples: Option<usize>,
         cluster_selection_epsilon: f64,
-        cluster_selection_method: String,
-        metric: String,
-        alpha: f64,
         max_cluster_size: usize,
+        metric: String,
+        minkowski_p: f64,
+        alpha: f64,
+        algorithm: String,
+        leaf_size: usize,
+        n_jobs: Option<i32>,
+        cluster_selection_method: String,
+        allow_single_cluster: bool,
+        store_centers: Option<String>,
     ) -> Self {
         Self {
             inner: AnyHdbscan::Unfit {
@@ -546,6 +665,12 @@ impl PyHDBSCAN {
                 metric,
                 alpha,
                 max_cluster_size,
+                minkowski_p,
+                algorithm,
+                leaf_size,
+                n_jobs,
+                allow_single_cluster,
+                store_centers,
             },
         }
     }
@@ -558,54 +683,73 @@ impl PyHDBSCAN {
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (
-            min_cluster_size, min_samples, cluster_selection_epsilon,
-            csm_s, metric_s, alpha, max_cluster_size,
-        ) = match &self.inner {
+        let p = match &self.inner {
             AnyHdbscan::Unfit {
                 min_cluster_size, min_samples, cluster_selection_epsilon,
                 cluster_selection_method, metric, alpha, max_cluster_size,
-            } => (
-                *min_cluster_size, *min_samples, *cluster_selection_epsilon,
-                cluster_selection_method.clone(), metric.clone(), *alpha,
-                *max_cluster_size,
-            ),
+                minkowski_p, algorithm, leaf_size, n_jobs, allow_single_cluster,
+                store_centers,
+            } => HdbscanParams {
+                min_cluster_size: *min_cluster_size,
+                min_samples: *min_samples,
+                cluster_selection_epsilon: *cluster_selection_epsilon,
+                cluster_selection_method: cluster_selection_method.clone(),
+                metric: metric.clone(),
+                alpha: *alpha,
+                max_cluster_size: *max_cluster_size,
+                minkowski_p: *minkowski_p,
+                algorithm: algorithm.clone(),
+                leaf_size: *leaf_size,
+                n_jobs: *n_jobs,
+                allow_single_cluster: *allow_single_cluster,
+                store_centers: store_centers.clone(),
+            },
             _ => return Err(not_fitted("hdbscan", "re-fit")),
         };
-        // Construction-time enum-string validation (→ ValueError).
-        let cluster_selection_method = parse_cluster_selection_method(&csm_s)?;
-        let metric = parse_hdbscan_metric(&metric_s)?;
+        // Construction-time enum-string validation (→ ValueError), BEFORE the
+        // device upload (T-12-02). Every accepted `metric` string works on every
+        // `algorithm` that has a route for the distance it resolves to — see the
+        // divergence note above `parse_hdbscan_metric` for the one sklearn
+        // rejection deliberately NOT reproduced here.
+        let cluster_selection_method = parse_cluster_selection_method(&p.cluster_selection_method)?;
+        let metric = parse_hdbscan_metric(&p.metric, p.minkowski_p)?;
+        let algorithm = parse_hdbscan_algorithm(&p.algorithm)?;
+        let store_centers = parse_store_centers(p.store_centers.as_deref())?;
+        // One builder chain per dtype arm (the estimator is generic over F, so the
+        // two monomorphizations cannot share a value). `hdbscan_build!` keeps them
+        // from drifting apart as the surface grows.
+        macro_rules! hdbscan_build {
+            ($f:ty) => {
+                Hdbscan::<$f>::builder()
+                    .min_cluster_size(p.min_cluster_size)
+                    .min_samples(p.min_samples)
+                    .cluster_selection_epsilon(p.cluster_selection_epsilon)
+                    .cluster_selection_method(cluster_selection_method)
+                    .metric(metric)
+                    .alpha(p.alpha)
+                    .max_cluster_size(p.max_cluster_size)
+                    .algorithm(algorithm)
+                    .leaf_size(p.leaf_size)
+                    .n_jobs(p.n_jobs)
+                    .allow_single_cluster(p.allow_single_cluster)
+                    .store_centers(store_centers)
+                    .build::<$f>()
+                    .map_err(build_err_to_py)?
+            };
+        }
         let fitted = py.detach(|| -> PyResult<AnyHdbscan> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let est = Hdbscan::<f32>::builder()
-                        .min_cluster_size(min_cluster_size)
-                        .min_samples(min_samples)
-                        .cluster_selection_epsilon(cluster_selection_epsilon)
-                        .cluster_selection_method(cluster_selection_method)
-                        .metric(metric)
-                        .alpha(alpha)
-                        .max_cluster_size(max_cluster_size)
-                        .build::<f32>()
-                        .map_err(build_err_to_py)?;
+                    let est = hdbscan_build!(f32);
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
                     Ok(AnyHdbscan::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let est = Hdbscan::<f64>::builder()
-                        .min_cluster_size(min_cluster_size)
-                        .min_samples(min_samples)
-                        .cluster_selection_epsilon(cluster_selection_epsilon)
-                        .cluster_selection_method(cluster_selection_method)
-                        .metric(metric)
-                        .alpha(alpha)
-                        .max_cluster_size(max_cluster_size)
-                        .build::<f64>()
-                        .map_err(build_err_to_py)?;
+                    let est = hdbscan_build!(f64);
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
                     Ok(AnyHdbscan::F64(fitted))
                 }
@@ -679,6 +823,43 @@ impl PyHDBSCAN {
         match &self.inner {
             AnyHdbscan::F64(e) => Ok(e.outlier_scores(&pool)),
             _ => Err(not_fitted("hdbscan", "outlier_scores_ (f64)")),
+        }
+    }
+
+    /// Fitted cluster `centroids_` (f32 arm) as a FLAT row-major
+    /// `n_clusters × n_features` block — the shim reshapes. `None` unless
+    /// `store_centers` requested centroids AND the fit produced a cluster
+    /// (HDBS-04). The runtime [`not_fitted`] analog on the `Unfit`/wrong-dtype arm.
+    fn centroids_f32(&self) -> PyResult<Option<Vec<f32>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F32(e) => Ok(e.centroids(&pool)),
+            _ => Err(not_fitted("hdbscan", "centroids_ (f32)")),
+        }
+    }
+    /// Fitted cluster `centroids_` (f64 arm) or the [`not_fitted`] analog.
+    fn centroids_f64(&self) -> PyResult<Option<Vec<f64>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F64(e) => Ok(e.centroids(&pool)),
+            _ => Err(not_fitted("hdbscan", "centroids_ (f64)")),
+        }
+    }
+    /// Fitted cluster `medoids_` (f32 arm), same shape and contract as
+    /// [`Self::centroids_f32`].
+    fn medoids_f32(&self) -> PyResult<Option<Vec<f32>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F32(e) => Ok(e.medoids(&pool)),
+            _ => Err(not_fitted("hdbscan", "medoids_ (f32)")),
+        }
+    }
+    /// Fitted cluster `medoids_` (f64 arm) or the [`not_fitted`] analog.
+    fn medoids_f64(&self) -> PyResult<Option<Vec<f64>>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyHdbscan::F64(e) => Ok(e.medoids(&pool)),
+            _ => Err(not_fitted("hdbscan", "medoids_ (f64)")),
         }
     }
 
