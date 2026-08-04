@@ -107,6 +107,9 @@ pub(crate) trait HostFloat:
     fn exp(self) -> Self;
     /// `F::abs` (the instance-form `.abs()` the kernels use).
     fn abs(self) -> Self;
+    /// `F::log1p` — the instance-form `.log1p()` the [`sgd_loss`
+    /// kernel](mlrs_kernels::sgd::sgd_loss) uses for the `Log` loss value.
+    fn log1p(self) -> Self;
     /// Widen to `f64` — the host twin of `host_to_f64`.
     fn to_f64(self) -> f64;
 }
@@ -129,6 +132,10 @@ impl HostFloat for f32 {
     #[inline(always)]
     fn abs(self) -> Self {
         f32::abs(self)
+    }
+    #[inline(always)]
+    fn log1p(self) -> Self {
+        f32::ln_1p(self)
     }
     #[inline(always)]
     fn to_f64(self) -> f64 {
@@ -154,6 +161,10 @@ impl HostFloat for f64 {
     #[inline(always)]
     fn abs(self) -> Self {
         f64::abs(self)
+    }
+    #[inline(always)]
+    fn log1p(self) -> Self {
+        f64::ln_1p(self)
     }
     #[inline(always)]
     fn to_f64(self) -> f64 {

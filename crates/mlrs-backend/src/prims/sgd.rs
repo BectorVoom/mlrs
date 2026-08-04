@@ -30,14 +30,18 @@
 //!
 //! - `x`/`y` stay on device untouched; batches are addressed IN PLACE via a
 //!   `row_offset` kernel scalar (no per-batch slice upload).
-//! - The `tol > 0` convergence gate is tracked on device (`sgd_copy` start-of-
-//!   batch snapshot + `sgd_delta_max` running epoch maxima) and read back as a
-//!   2-scalar `stats` pair ONCE PER EPOCH — the only steady-state readback.
-//!   With `tol == 0` (the pinned-oracle mode) the solve performs ZERO
-//!   readbacks until the caller materializes the fitted state.
-//! - The host `dloss` table ([`dloss`]) is retained as the f64 reference the
-//!   device `sgd_grad` kernel is tested against (and for the `optimal`-schedule
-//!   `t0` probe).
+//! - The `tol > 0` convergence gate (MBSGD-PERF-WGPU) is the sklearn
+//!   training-loss-plateau check, NOT a coefficient delta: `sgd_loss` computes
+//!   the per-sample loss VALUE (as opposed to `sgd_grad`'s derivative) and
+//!   `sgd_sumloss` folds it into a running length-1 `sumloss` epoch
+//!   accumulator, read back ONCE PER EPOCH — the only steady-state readback —
+//!   and compared against a host-carried `best_loss`/`no_improvement_count`
+//!   exactly as sklearn's `_plain_sgd` does. With `tol == 0` (the
+//!   pinned-oracle mode) the solve performs ZERO readbacks until the caller
+//!   materializes the fitted state.
+//! - The host `dloss`/`loss_value` tables ([`dloss`]/[`loss_value`]) are
+//!   retained as the f64 references the device `sgd_grad`/`sgd_loss` kernels
+//!   are tested against (and for the `optimal`-schedule `t0` probe).
 //!
 //! Tests live in `crates/mlrs-backend/tests/sgd_test.rs` (AGENTS.md §2 — never an
 //! in-source `#[cfg(test)] mod tests`).
@@ -48,7 +52,7 @@ use cubecl::prelude::*;
 use mlrs_core::PrimError;
 use mlrs_core::{f64_to_host, host_to_f64};
 use mlrs_kernels::sgd::{
-    sgd_bias_update, sgd_copy, sgd_delta_max, sgd_grad, sgd_l1_shrink, sgd_margin,
+    sgd_bias_update, sgd_grad, sgd_l1_shrink, sgd_loss, sgd_margin, sgd_sumloss,
     sgd_weight_update,
 };
 
@@ -139,6 +143,10 @@ pub struct SgdParams {
     pub max_iter: usize,
     /// Stopping tolerance (`0` ⇒ run all `max_iter` epochs).
     pub tol: f64,
+    /// Consecutive non-improving epochs (`tol > 0` only) before stopping —
+    /// sklearn `n_iter_no_change`. Compared against a per-epoch `sumloss` (the
+    /// sklearn training-loss-plateau check), not the coefficient delta.
+    pub n_iter_no_change: usize,
 }
 
 /// The `sgd_grad` kernel's loss selector for a [`SgdLoss`] (the single source of
@@ -162,7 +170,8 @@ pub fn loss_id(loss: SgdLoss) -> u32 {
 /// [`sgd_solve_host_slice`], which skips the round-trip entirely. On a real
 /// device backend this is `false` and the caller must upload as usual.
 ///
-/// See `prims::sgd_host` for why the cpu backend has a host arm at all.
+/// See `prims::sgd_host` for why the cpu AND wgpu backends have a host arm at
+/// all (cuda/rocm are untested and stay on the device path).
 pub fn sgd_host_available() -> bool {
     super::sgd_host::host_solve_applicable()
 }
@@ -195,12 +204,14 @@ where
     F: Float + CubeElement + Pod,
 {
     let (n, d) = shape;
-    crate::capability::guard_f64_transcendental::<F>("sgd_solve")?;
+    // No device-transcendental guard here: this entry point is host-only by
+    // construction (it never falls back to a device kernel), so it has no
+    // dependency on what the active backend's shader compiler supports.
     validate_geometry(x.len(), y.len(), n, d)?;
     if !sgd_host_available() {
         return Err(PrimError::UnsupportedCapability {
             operand: "sgd_solve_host_slice",
-            capability: "a host-resident SGD solve (this entry point is cpu-only)",
+            capability: "a host-resident SGD solve (this entry point is cpu/wgpu-only)",
         });
     }
     Ok(super::sgd_host::sgd_solve_host::<F>(x, y, n, d, params))
@@ -222,13 +233,15 @@ where
 /// `shuffle=false`): `sgd_margin` → `sgd_grad` (`g[i] = dloss(p_i, y_i)`
 /// clipped ±1e12, on device) → `eta = schedule_eta(t)` (host f64) →
 /// `sgd_weight_update` (gradient step × compounded lazy-L2 factor) → optional
-/// `sgd_l1_shrink` (cumulative-L1, device `q[]`) → optional `sgd_bias_update`.
-/// No host synchronization inside the batch loop. The max-coefficient-change
-/// stopping gate (`tol > 0`) is folded on device (`sgd_copy` + `sgd_delta_max`)
-/// and read ONCE per epoch; with `tol == 0` the solve runs all `max_iter`
-/// epochs readback-free and the iterate is returned as-is (sklearn's `tol=0`
-/// deterministic-epochs contract; the caller maps a non-convergence to its
-/// estimator-level error if it cares).
+/// `sgd_l1_shrink` (cumulative-L1, device `q[]`) → optional `sgd_bias_update`
+/// → optional `sgd_loss` + `sgd_sumloss` (loss-plateau tracking). No host
+/// synchronization inside the batch loop. The training-loss-plateau stopping
+/// gate (`tol > 0`) is folded on device (`sgd_loss` + `sgd_sumloss`) and read
+/// ONCE per epoch against a host `best_loss`/`no_improvement_count`; with
+/// `tol == 0` the solve runs all `max_iter` epochs readback-free and the
+/// iterate is returned as-is (sklearn's `tol=0` deterministic-epochs contract;
+/// the caller maps a non-convergence to its estimator-level error if it
+/// cares).
 #[allow(clippy::too_many_arguments)]
 pub fn sgd_solve<F>(
     pool: &mut BufferPool<ActiveRuntime>,
@@ -248,29 +261,32 @@ where
 {
     let (n, d) = shape;
 
-    // --- Capability guard, ALL LOSSES: the log-loss gradient
-    //     `-y / (1 + exp(y·p))` (`mlrs_kernels::sgd`) is the only branch that
-    //     evaluates a transcendental, but the loss is a RUNTIME switch inside
-    //     ONE kernel — so `F::exp` is compiled into the shader whichever loss is
-    //     selected, and a backend without f64 `exp` fails at SHADER-COMPILE
-    //     time, not at execution. Gating on `params.loss == Log` therefore does
-    //     NOT help: a hinge-loss f64 fit crashes just the same (measured — it is
-    //     what `mbsgd_classifier_test::exact_labels`, a hinge test, was dying
-    //     on). The guard is unconditional at f64 for that reason, not because
-    //     every loss needs the transcendental. ---
-    crate::capability::guard_f64_transcendental::<F>("sgd_solve")?;
-
     // --- Geometry guard (ASVS V5 / T-10-01-02): validate BEFORE any launch so a
     //     malformed shape is a recoverable typed error, not an out-of-bounds
     //     device read. Mirrors cd_solve / laplacian. ---
     validate_geometry(x.len(), y.len(), n, d)?;
 
-    // --- cpu arm (MBSGD-PERF-CPU): the launch-only epoch loop below is
-    //     pathological under cubecl-cpu's one-thread-per-unit mapping — the
-    //     sklearn-equivalent `batch_size == 1` issues ~5 launches per SAMPLE
-    //     for ~2·d FLOP of work. `sgd_host` replays the SAME recurrence, value
-    //     for value, in a scalar host loop. See `sgd_host`'s module docs for
-    //     the bit-identity argument and the measured factor. ---
+    // --- cpu/wgpu host arm (MBSGD-PERF-CPU/WGPU): the launch-only epoch loop
+    //     below is pathological under cubecl-cpu's one-thread-per-unit mapping
+    //     AND under wgpu's per-launch submission/sync cost — the
+    //     sklearn-equivalent `batch_size == 1` issues ~5 launches per SAMPLE for
+    //     ~2·d FLOP of work (measured on the actual wgpu adapter: a trivial
+    //     `n=200, d=8, max_iter=5` fit took several SECONDS wall against ~0.27 s
+    //     of cpu time — blocked on GPU submission, not computing). `sgd_host`
+    //     replays the SAME recurrence, value for value, in a scalar host loop.
+    //     See `sgd_host`'s module docs for the equivalence argument (bit-exact
+    //     on cpu; a tight tolerance on wgpu, see `sgd_host_equivalence_test`)
+    //     and the measured factor.
+    //
+    //     This check runs BEFORE the device f64-transcendental guard below on
+    //     purpose: that guard exists because compiling `F::exp` into a GPU
+    //     shader can fail on an adapter without 64-bit transcendentals, but the
+    //     host arm never touches a device shader — it calls the host libm
+    //     `exp`/`ln`/`tanh` regardless of what the active backend's shader
+    //     compiler supports. Gating the host arm behind that guard would
+    //     needlessly block f64 log-loss (etc.) MBSGD fits on exactly this kind
+    //     of adapter even though the host arm has no dependency on the
+    //     limitation at all. ---
     if super::sgd_host::host_solve_applicable() {
         let x_host = x.to_host(pool);
         let y_host = y.to_host(pool);
@@ -280,6 +296,19 @@ where
             DeviceArray::from_host(pool, &[b]),
         ));
     }
+
+    // --- Capability guard, ALL LOSSES (device arm only, from here on): the
+    //     log-loss gradient `-y / (1 + exp(y·p))` (`mlrs_kernels::sgd`) is the
+    //     only branch that evaluates a transcendental, but the loss is a
+    //     RUNTIME switch inside ONE kernel — so `F::exp` is compiled into the
+    //     shader whichever loss is selected, and a backend without f64 `exp`
+    //     fails at SHADER-COMPILE time, not at execution. Gating on
+    //     `params.loss == Log` therefore does NOT help: a hinge-loss f64 fit
+    //     crashes just the same (measured — it is what
+    //     `mbsgd_classifier_test::exact_labels`, a hinge test, was dying on).
+    //     The guard is unconditional at f64 for that reason, not because every
+    //     loss needs the transcendental. ---
+    crate::capability::guard_f64_transcendental::<F>("sgd_solve")?;
 
     let elem = size_of::<F>();
     let client = pool.client().clone();
@@ -310,12 +339,15 @@ where
     let p_handle = pool.acquire(batch * elem); // margin output, reused.
     let g_handle = pool.acquire(batch * elem); // per-sample gradient, reused.
 
-    // Convergence tracking (tol > 0 only): a start-of-batch weight snapshot
-    // (WR-02 — the delta reflects the FULL per-batch update: gradient + L2 +
-    // L1) and a 2-scalar running-epoch-maxima buffer, both device-resident so
-    // the batch loop stays synchronization-free.
+    // Convergence tracking (tol > 0 only): a length-`batch` per-sample loss
+    // buffer (reused every batch, like `p`/`g`) folded into a running length-1
+    // `sumloss` epoch accumulator — sklearn's training-loss-plateau `tol` /
+    // `n_iter_no_change` stop (MBSGD-PERF-WGPU; replaces a coefficient-delta
+    // check that took far more epochs than sklearn to satisfy on data where
+    // the loss had already plateaued). Both device-resident so the batch loop
+    // stays synchronization-free.
     let track = params.tol > 0.0;
-    let w_snap_handle = if track { Some(pool.acquire(d * elem)) } else { None };
+    let loss_handle = if track { Some(pool.acquire(batch * elem)) } else { None };
 
     // Cumulative-L1 state (L1/ElasticNet with alpha > 0 only): the device
     // per-coordinate applied-penalty `q[]` (sklearn `q`) and the host f64
@@ -335,6 +367,11 @@ where
 
     // `t` counts SAMPLES consumed across epochs (sklearn's schedule clock).
     let mut t: u64 = 1;
+    // sklearn's `best_loss`/`no_improvement_count` (`tol > 0` only) — carried
+    // ACROSS epochs, unlike the per-epoch device buffers below.
+    let mut best_loss = f64::INFINITY;
+    let mut no_improvement_count: usize = 0;
+    let n_iter_no_change = params.n_iter_no_change.max(1);
 
     let cube_block = 256u32;
     let dim = CubeDim {
@@ -347,13 +384,10 @@ where
     let d_count = CubeCount::Static((d as u32).div_ceil(cube_block), 1, 1);
 
     'epochs: for _epoch in 0..max_iter {
-        // Zero the running epoch maxima (max |Δw|, max |w|) on device; read
-        // back ONCE at epoch end (the only steady-state host sync).
-        let stats_dev: Option<DeviceArray<ActiveRuntime, F>> = if track {
-            Some(DeviceArray::from_host(
-                pool,
-                &[f64_to_host::<F>(0.0), f64_to_host::<F>(0.0)],
-            ))
+        // Zero the running epoch `sumloss` accumulator on device; read back
+        // ONCE at epoch end (the only steady-state host sync).
+        let sumloss_dev: Option<DeviceArray<ActiveRuntime, F>> = if track {
+            Some(DeviceArray::from_host(pool, &[f64_to_host::<F>(0.0)]))
         } else {
             None
         };
@@ -385,7 +419,7 @@ where
             //     loss_id — no p[] readback / g[] upload). ---
             sgd_grad::launch::<F, ActiveRuntime>(
                 &client,
-                b_count,
+                b_count.clone(),
                 dim,
                 unsafe { ArrayArg::from_raw_parts(p_handle.clone(), bsz) },
                 unsafe { ArrayArg::from_raw_parts(y.handle().clone(), n) },
@@ -406,18 +440,30 @@ where
                 t0,
             );
 
-            // --- WR-02: snapshot the TRUE start-of-batch weights (BEFORE any
-            //     gradient step or penalty shrink this batch) on device, so the
-            //     convergence delta reflects the FULL per-batch update without
-            //     a host readback. ---
-            if let Some(snap) = &w_snap_handle {
-                sgd_copy::launch::<F, ActiveRuntime>(
+            // --- Loss-plateau tracking (tol > 0 only): the per-sample loss
+            //     VALUE `loss[i] = loss(p_i, y_i)` (distinct from `sgd_grad`'s
+            //     derivative), folded into the running epoch `sumloss` — the
+            //     sklearn training-loss `tol`/`n_iter_no_change` stop. ---
+            if let (Some(loss_h), Some(sumloss)) = (&loss_handle, &sumloss_dev) {
+                sgd_loss::launch::<F, ActiveRuntime>(
                     &client,
-                    d_count.clone(),
+                    b_count.clone(),
                     dim,
-                    unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) },
-                    unsafe { ArrayArg::from_raw_parts(snap.clone(), d) },
-                    d as u32,
+                    unsafe { ArrayArg::from_raw_parts(p_handle.clone(), bsz) },
+                    unsafe { ArrayArg::from_raw_parts(y.handle().clone(), n) },
+                    unsafe { ArrayArg::from_raw_parts(loss_h.clone(), bsz) },
+                    start as u32,
+                    bsz as u32,
+                    lid,
+                    eps_f,
+                );
+                sgd_sumloss::launch::<F, ActiveRuntime>(
+                    &client,
+                    one_count.clone(),
+                    one_dim,
+                    unsafe { ArrayArg::from_raw_parts(loss_h.clone(), bsz) },
+                    unsafe { ArrayArg::from_raw_parts(sumloss.handle().clone(), 1) },
+                    bsz as u32,
                 );
             }
 
@@ -495,36 +541,27 @@ where
                 );
             }
 
-            // --- Convergence bookkeeping (tol > 0 only): fold max |Δw| / max
-            //     |w| into the epoch stats on device — measured against the
-            //     pristine start-of-batch snapshot (WR-02) so the delta
-            //     reflects the FULL update (gradient + L2 + L1). ---
-            if let (Some(snap), Some(stats)) = (&w_snap_handle, &stats_dev) {
-                sgd_delta_max::launch::<F, ActiveRuntime>(
-                    &client,
-                    one_count.clone(),
-                    one_dim,
-                    unsafe { ArrayArg::from_raw_parts(w_dev.handle().clone(), d) },
-                    unsafe { ArrayArg::from_raw_parts(snap.clone(), d) },
-                    unsafe { ArrayArg::from_raw_parts(stats.handle().clone(), 2) },
-                    d as u32,
-                );
-            }
-
             t += bsz as u64;
             start += bsz;
         }
 
-        // sklearn's cheap host stopping gate: max coefficient change vs
-        // tol·scale — ONE 2-scalar readback per epoch (the only steady-state
-        // synchronization; absent entirely when tol == 0).
-        if let Some(stats) = stats_dev {
-            let s_host = stats.to_host(pool);
-            stats.release_into(pool);
-            let max_change = host_to_f64(s_host[0]);
-            let w_max = host_to_f64(s_host[1]);
-            let scale = w_max.max(1.0);
-            if max_change <= params.tol * scale {
+        // sklearn's training-loss-plateau stopping gate: ONE 1-scalar readback
+        // per epoch (the only steady-state synchronization; absent entirely
+        // when tol == 0) against `best_loss`/`no_improvement_count`, carried
+        // across epochs exactly as `_plain_sgd` does.
+        if let Some(sumloss) = sumloss_dev {
+            let s_host = sumloss.to_host(pool);
+            sumloss.release_into(pool);
+            let sumloss64 = host_to_f64(s_host[0]);
+            if sumloss64 > best_loss - params.tol * n as f64 {
+                no_improvement_count += 1;
+            } else {
+                no_improvement_count = 0;
+            }
+            if sumloss64 < best_loss {
+                best_loss = sumloss64;
+            }
+            if no_improvement_count >= n_iter_no_change {
                 break 'epochs;
             }
         }
@@ -533,8 +570,8 @@ where
     // Release the reusable per-batch scratch back to the pool.
     pool.release(p_handle, batch * elem);
     pool.release(g_handle, batch * elem);
-    if let Some(snap) = w_snap_handle {
-        pool.release(snap, d * elem);
+    if let Some(loss_h) = loss_handle {
+        pool.release(loss_h, batch * elem);
     }
     if let Some(q) = q_dev {
         q.release_into(pool);
@@ -587,6 +624,37 @@ pub fn dloss(loss: SgdLoss, p: f64, y: f64, epsilon: f64) -> f64 {
                 0.0
             }
         }
+    }
+}
+
+/// Per-sample loss VALUE `loss(p, y)` (as opposed to [`dloss`]'s derivative) —
+/// sklearn's `_sgd_fast` `Loss.loss` table. The HOST f64 reference for the
+/// device `sgd_loss` kernel (the `sgd_test.rs` kernel-vs-host gate) and for
+/// [`sgd_host::loss_value_t`](super::sgd_host)'s bit-identity argument. Feeds
+/// the sklearn training-loss-plateau `tol`/`n_iter_no_change` stop (replacing
+/// a coefficient-delta check that, unlike sklearn, could take hundreds of
+/// extra epochs to satisfy on data where the loss had already plateaued —
+/// MBSGD-PERF-WGPU). `epsilon` is the epsilon-insensitive margin (ignored by
+/// the other losses). The `Log` clip at `|z| = 18` mirrors sklearn's
+/// `Log.loss` exactly (a `log(1+exp(-z))` without it overflows to `+inf` for a
+/// badly-misclassified sample at typical `f32` magnitudes).
+pub fn loss_value(loss: SgdLoss, p: f64, y: f64, epsilon: f64) -> f64 {
+    match loss {
+        SgdLoss::Hinge => (1.0 - p * y).max(0.0),
+        SgdLoss::SquaredHinge => (1.0 - p * y).max(0.0).powi(2),
+        SgdLoss::Log => {
+            let z = p * y;
+            if z > 18.0 {
+                (-z).exp()
+            } else if z < -18.0 {
+                -z
+            } else {
+                (1.0 + (-z).exp()).ln()
+            }
+        }
+        SgdLoss::SquaredError => 0.5 * (p - y).powi(2),
+        SgdLoss::EpsilonInsensitive => ((p - y).abs() - epsilon).max(0.0),
+        SgdLoss::SquaredEpsilonInsensitive => ((p - y).abs() - epsilon).max(0.0).powi(2),
     }
 }
 

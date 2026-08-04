@@ -418,6 +418,7 @@ fn run_convex_objective<F: Float + CubeElement + bytemuck::Pod>(label: &str, tol
         batch_size: n, // full-batch → deterministic gradient descent.
         max_iter: 4000,
         tol: 0.0, // run all epochs (deterministic).
+        n_iter_no_change: 5,
     };
 
     let (coef, intercept) =
@@ -674,11 +675,11 @@ fn sgd_l1_shrink_matches_host() {
 // tol > 0 early stop — the device-tracked convergence gate.
 // ===========================================================================
 
-/// With `tol > 0` on the convex system, the device-tracked stopping gate
-/// (`sgd_copy` snapshot + `sgd_delta_max` epoch fold + one per-epoch readback)
-/// must fire and still land near the optimum — the early-stop path is
-/// exercised end-to-end (it has no other coverage; the oracle fixtures pin
-/// `tol = 0`).
+/// With `tol > 0` on the convex system, the device-tracked sklearn
+/// training-loss-plateau stopping gate (`sgd_loss` + `sgd_sumloss` + one
+/// per-epoch readback against `best_loss`/`n_iter_no_change`) must fire and
+/// still land near the optimum — the early-stop path is exercised end-to-end
+/// (it has no other coverage; the oracle fixtures pin `tol = 0`).
 #[test]
 fn sgd_tol_early_stop_converges() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -722,6 +723,7 @@ fn sgd_tol_early_stop_converges() {
         batch_size: n,
         max_iter: 4000,
         tol: 1e-7, // small but > 0: the early stop fires near the fixed point.
+        n_iter_no_change: 5,
     };
 
     let (coef, intercept) =

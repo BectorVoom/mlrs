@@ -279,6 +279,9 @@ impl LinearSVRBuilder {
             batch_size: 0,
             shuffle: false,
             seed: 0,
+            // Inert for LinearSVR (L-BFGS never checks this — no `sgd_solve`
+            // loss-plateau stop applies here); kept only for D-06 uniformity.
+            n_iter_no_change: 5,
         };
         Ok(LinearSVR {
             config,
