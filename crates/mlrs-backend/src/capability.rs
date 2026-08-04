@@ -325,3 +325,72 @@ pub fn skip_f64_with_log() -> bool {
     log::warn!("skipping f64 oracle on {backend}: SHADER_F64 / f64 unsupported on this adapter");
     true
 }
+
+/// Can the active backend RUN an `f64` compute kernel — as distinct from
+/// [`feature_enabled(FloatKind::F64)`](feature_enabled), which asks whether it
+/// ADVERTISES the type?
+///
+/// The two questions have the same answer everywhere except CUDA, and there the
+/// difference is load-bearing enough to be worth its own predicate.
+///
+/// ## Why `supports_type` under-reports on cuda
+/// `cubecl-cpp` — the C++ source generator shared by the cuda and rocm backends
+/// — omits `f64` from the type registry it hands the runtime, with this comment
+/// at `cubecl-cpp-0.10.0/src/shared/base.rs:2114`:
+///
+/// ```text
+/// // Causes CUDA_ERROR_INVALID_VALUE for matmul, disabling until that can be
+/// // investigated
+/// //gpu::Elem::Float(gpu::FloatKind::F64),
+/// ```
+///
+/// So the flag is `false` on every CUDA device, including a GP100 whose `f64`
+/// throughput is HALF its `f32` rate — the omission is an upstream workaround
+/// for one operation (matmul), not a statement about the hardware or about
+/// NVRTC, which compiles `double` natively like any other CUDA C++ type.
+///
+/// Reading that flag as "this backend cannot do `f64`" is therefore wrong in a
+/// costly direction: it silently disables every `f64` device arm on the one
+/// class of accelerator with fast double precision.
+///
+/// ## What this predicate promises, and what the caller still owes
+/// `true` means *plain* `f64` kernels — element maps, reductions, register- and
+/// shared-memory tiles — compile and run. It does NOT extend to the operation
+/// upstream actually disabled: a caller whose `f64` path can reach `cubek-matmul`
+/// must keep it off that path itself. `prims::normal_eq` does exactly that by
+/// requiring `gram::fused_centering_available`, which excludes `GramPath::Gemm`
+/// — so its Gram, column sums and widening pass are all hand-written kernels
+/// and none of them emits a matmul.
+///
+/// - **cuda** → `true`. The registry omission is the matmul workaround above.
+/// - **wgpu** → the advertised flag, which there is a GENUINE capability: WGSL
+///   has no `f64` and an adapter without the `SHADER_F64` feature cannot run one
+///   at all.
+/// - **rocm** → the advertised flag. `cubecl-hip` shares the same registry, but
+///   unlike cuda this project has no measurement showing `f64` kernels work
+///   there (the D-07 backend gate is `cpu(f64) + rocm(f32)`), and inferring one
+///   backend's behaviour from another's is the mistake
+///   `mlrs-feedback-verify-on-target-hardware` records. Flip it when someone
+///   runs the agreement suite on a ROCm device.
+/// - **cpu** → the advertised flag; `cubecl-cpu`'s MLIR registry does list
+///   `f64`.
+///
+/// `MLRS_F64_DEVICE=0`/`1` overrides the verdict, read through
+/// [`crate::abflag`] so a test can scope it without an environment data race.
+/// `0` is the escape hatch if a future CUDA/driver combination does reject a
+/// plain `f64` kernel: it puts every caller back on its host arm rather than
+/// failing.
+#[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
+pub fn f64_device_kernels_available() -> bool {
+    if let Some(v) = crate::abflag::var("MLRS_F64_DEVICE") {
+        return v != "0";
+    }
+    #[cfg(feature = "cuda")]
+    {
+        true
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        feature_enabled(FloatKind::F64)
+    }
+}

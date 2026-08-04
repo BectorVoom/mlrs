@@ -190,15 +190,55 @@ where
         .enumerate()
     {
         let acc = &mut table[c * n_features..(c + 1) * n_features];
-        for (j, (&xv, a)) in row.iter().zip(acc.iter_mut()).enumerate() {
+        // Validity folds in BRANCH-FREE (`&`, never `&&`) and is inspected once
+        // per row — see [`locate_invalid`]. The test is an inclusive interval so
+        // both bounds are loop-invariant.
+        //
+        // The interval is `[f64::MIN, f64::MAX]`, i.e. FINITE — not
+        // `[0, f64::MAX]`. A negative value is valid on this arm: sklearn's
+        // `BernoulliNB` never calls `check_non_negative`, and with a threshold a
+        // negative entry is meaningful input that binarizes to 0, no different
+        // from any other sub-threshold value. Only `+inf` (`> MAX`), `-inf`
+        // (`< MIN`) and `NaN` (every ordering comparison against which is false,
+        // so it would otherwise be silently counted as a non-occurrence) fall
+        // outside. The unbinarized arm ([`count_chunk_raw`]) keeps `0.0` as the
+        // lower bound, because there the raw values ARE the counts.
+        let mut ok = true;
+        for (&xv, a) in row.iter().zip(acc.iter_mut()) {
             let xf = host_to_f64(xv);
-            if !xf.is_finite() {
-                return Some((flat_base + r * n_features + j, xf));
-            }
+            ok &= (xf >= f64::MIN) & (xf <= f64::MAX);
             *a += u32::from(xf > threshold);
+        }
+        if !ok {
+            return Some(locate_invalid::<F>(row, flat_base + r * n_features, f64::MIN));
         }
     }
     None
+}
+
+/// Pin the exact flat index and value of the first element of `row` outside the
+/// caller's valid interval `[lo, f64::MAX]`, given that the caller's branch-free
+/// fold already established the row contains one. `lo` MUST be the same bound
+/// the fold used, or this walks past the element that actually failed and hits
+/// the `unreachable!`. The binarizing arms pass `f64::MIN` (finite-only: a
+/// negative is valid input there — sklearn's `BernoulliNB` never rejects it, it
+/// just binarizes to 0, see [`count_chunk_binarized`]) and the unbinarized arm
+/// passes `0.0` (the raw values ARE the counts). `flat_base` is `row`'s offset in the WHOLE
+/// matrix, so the reported index is worker-count independent.
+///
+/// Cold path: it runs at most once per fit, on the row that fails.
+#[inline(never)]
+fn locate_invalid<F>(row: &[F], flat_base: usize, lo: f64) -> (usize, f64)
+where
+    F: Float + CubeElement + Pod,
+{
+    for (j, &xv) in row.iter().enumerate() {
+        let xf = host_to_f64(xv);
+        if !((xf >= lo) & (xf <= f64::MAX)) {
+            return (flat_base + j, xf);
+        }
+    }
+    unreachable!("locate_invalid: branch-free fold rejected an all-valid row")
 }
 
 /// The WEIGHTED twin of [`count_chunk_binarized`]: `table[c · n_features + j] +=
@@ -227,16 +267,19 @@ where
     {
         let w = weights[r];
         let acc = &mut table[c * n_features..(c + 1) * n_features];
-        for (j, (&xv, a)) in row.iter().zip(acc.iter_mut()).enumerate() {
+        let mut ok = true;
+        for (&xv, a) in row.iter().zip(acc.iter_mut()) {
             let xf = host_to_f64(xv);
-            // Non-finite only — a negative binarizes to 0 exactly as sklearn's
-            // BernoulliNB does (see [`count_chunk_binarized`]).
-            if !xf.is_finite() {
-                return Some((flat_base + r * n_features + j, xf));
-            }
-            if xf > threshold {
-                *a += w;
-            }
+            ok &= (xf >= f64::MIN) & (xf <= f64::MAX);
+            // A SELECT, not an `if`. The occurrence predicate reads the data, so
+            // as a branch it is unpredictable — at BernoulliNB's ~30 % density
+            // this one `if` cost the weighted arm 2.16x the unweighted arm's cpu
+            // time, all of it mispredicts. Adding `0.0` on the miss is free by
+            // comparison and lets the loop vectorize.
+            *a += if xf > threshold { w } else { 0.0 };
+        }
+        if !ok {
+            return Some(locate_invalid::<F>(row, flat_base + r * n_features, f64::MIN));
         }
     }
     None
@@ -264,12 +307,14 @@ where
     {
         let w = weights.map_or(1.0, |w| w[r]);
         let acc = &mut table[c * n_features..(c + 1) * n_features];
-        for (j, (&xv, a)) in row.iter().zip(acc.iter_mut()).enumerate() {
+        let mut ok = true;
+        for (&xv, a) in row.iter().zip(acc.iter_mut()) {
             let xf = host_to_f64(xv);
-            if !xf.is_finite() || xf < 0.0 {
-                return Some((flat_base + r * n_features + j, xf));
-            }
+            ok &= (xf >= 0.0) & (xf <= f64::MAX);
             *a += w * xf;
+        }
+        if !ok {
+            return Some(locate_invalid::<F>(row, flat_base + r * n_features, 0.0));
         }
     }
     None

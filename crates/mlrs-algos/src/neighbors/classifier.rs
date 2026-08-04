@@ -131,6 +131,149 @@ where
     pub fn n_neighbors(&self) -> usize {
         self.n_neighbors
     }
+
+    /// Fit from an already-device-resident training matrix taken BY VALUE and
+    /// ALREADY-PREPARED host labels — the zero-copy sibling of [`Fit::fit`]
+    /// (KNN-REG-FIT).
+    ///
+    /// Two separate wins over the borrowing form, both specific to this
+    /// estimator:
+    ///
+    /// * `x` is adopted rather than duplicated (see
+    ///   [`KNeighborsRegressor::fit_owned`](crate::neighbors::regressor::KNeighborsRegressor::fit_owned)
+    ///   for why the borrowing form must copy);
+    /// * `y` never touches the device AT ALL. The classifier's vote gather
+    ///   works on host `i32` class indices, so [`Fit::fit`]'s `DeviceArray` `y`
+    ///   is uploaded by the caller and immediately read back by
+    ///   `y.to_host(pool)` — a full device round-trip whose only product is a
+    ///   host `Vec` the caller already had. Taking [`PreparedLabels`] skips
+    ///   both legs.
+    ///
+    /// On validation failure `x` is released back into `pool` — the caller has
+    /// already given it up, so nothing else can.
+    pub fn fit_owned(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: DeviceArray<ActiveRuntime, F>,
+        labels: PreparedLabels,
+        shape: (usize, usize),
+    ) -> Result<KNeighborsClassifier<F, Fitted>, AlgoError> {
+        let (n_train, _) = shape;
+        if let Err(e) = validate_geometry(&x, shape) {
+            x.release_into(pool);
+            return Err(e);
+        }
+        if labels.y_class.len() != n_train {
+            x.release_into(pool);
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_train,
+                cols: 1,
+                len: labels.y_class.len(),
+            }));
+        }
+        Ok(KNeighborsClassifier {
+            n_neighbors: self.n_neighbors,
+            x_train_: Some(x),
+            train_shape_: Some(shape),
+            n_classes_: labels.classes.len(),
+            classes_: labels.classes,
+            y_class_: Some(labels.y_class),
+            _state: PhantomData,
+        })
+    }
+}
+
+/// Validated training labels, remapped to DENSE class indices (CR-03).
+///
+/// The product of [`prepare_labels`], and the whole of what the classifier
+/// needs from `y`. Split out from `fit` so a caller can derive it from a host
+/// slice — it is `O(n_train)` work over a label vector, not over the
+/// `n_train x n_features` matrix, so it is cheap enough to do eagerly even when
+/// the matrix upload is deferred (`crates/mlrs-py`'s wrapper does exactly that,
+/// because sklearn's `classes_` must be readable the instant `fit` returns).
+#[derive(Clone, Default)]
+pub struct PreparedLabels {
+    /// The DISTINCT sorted raw labels — sklearn's `classes_`.
+    classes: Vec<i32>,
+    /// Per training sample, the POSITION of its raw label in `classes`.
+    y_class: Vec<i32>,
+}
+
+impl PreparedLabels {
+    /// The DISTINCT sorted training labels (`classes_`).
+    pub fn classes(&self) -> &[i32] {
+        &self.classes
+    }
+
+    /// The number of distinct classes.
+    pub fn n_classes(&self) -> usize {
+        self.classes.len()
+    }
+}
+
+/// Validate `y_host` and remap it to dense class indices (CR-03 / WR-02).
+///
+/// `y` arrives as integer-valued `F` (the shared float ingress carries labels
+/// too). Every value must be finite, integer-valued and in `i32` range:
+/// without that check a NaN target silently becomes `0` under the saturating
+/// cast and an out-of-range label saturates, either way producing a wrong class
+/// with no error.
+///
+/// `classes` is the DISTINCT SORTED set of raw labels and each sample is
+/// remapped to its POSITION in it, rather than inferring `n_classes = max + 1`.
+/// A `max+1` width over a non-contiguous target (e.g. `{0, 2}`) creates a
+/// structurally-zero column 1 that argmax can still pick, returning a class id
+/// that never existed in training; sklearn maps votes through `classes_` and
+/// returns the original id. The `class >= n_classes` guard at predict cannot
+/// catch that GAP, so the dense remap here plus the inverse map at predict is
+/// the fix.
+pub fn prepare_labels<F>(y_host: &[F], n_train: usize) -> Result<PreparedLabels, AlgoError>
+where
+    F: Pod,
+{
+    if y_host.len() != n_train {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "y",
+            rows: n_train,
+            cols: 1,
+            len: y_host.len(),
+        }));
+    }
+    let mut raw_class: Vec<i32> = Vec::with_capacity(n_train);
+    for &v in y_host.iter() {
+        let lf = host_to_f64(v);
+        let lr = lf.round();
+        if !lr.is_finite() || (lr - lf).abs() > 1e-6 || i32::try_from(lr as i64).is_err() {
+            return Err(AlgoError::InvalidLabels {
+                estimator: "knn_classifier",
+                reason: format!("labels must be i32-range integers (got {lf})"),
+            });
+        }
+        raw_class.push(lr as i32);
+    }
+    let mut classes: Vec<i32> = raw_class.clone();
+    classes.sort_unstable();
+    classes.dedup();
+    if classes.is_empty() {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "y",
+            rows: n_train,
+            cols: 1,
+            len: y_host.len(),
+        }));
+    }
+    // Dense class index per training sample = position of its raw label in the
+    // sorted `classes` (binary search; `classes` is sorted + deduped).
+    let y_class: Vec<i32> = raw_class
+        .iter()
+        .map(|&l| {
+            classes
+                .binary_search(&l)
+                .expect("every raw label is in classes by construction") as i32
+        })
+        .collect();
+    Ok(PreparedLabels { classes, y_class })
 }
 
 impl<F> Default for KNeighborsClassifier<F, Unfit>
@@ -236,89 +379,25 @@ where
         y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<KNeighborsClassifier<F, Fitted>, AlgoError> {
-        let (n_train, n_features) = shape;
         validate_geometry(x, shape)?;
         let y = y.ok_or(AlgoError::NotFitted {
             estimator: "knn_classifier",
             operation: "fit (requires y)",
         })?;
-        if y.len() != n_train {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "y",
-                rows: n_train,
-                cols: 1,
-                len: y.len(),
-            }));
-        }
 
-        // Gather the integer class labels host-side (they are integer-valued `F`).
-        // CR-03: build `classes_` as the DISTINCT sorted labels and remap each
-        // sample to its DENSE class index (its position in `classes_`), rather
-        // than inferring `n_classes = max+1`. A `max+1` width over a
-        // non-contiguous target (e.g. `{0, 2}`) creates a structurally-zero
-        // column 1 that argmax can still pick, returning a class id that never
-        // existed in training; sklearn maps votes through `classes_` and returns
-        // the original id. The WR-02 `class >= n_classes` guard cannot catch this
-        // GAP, so the fix is the dense remap + inverse map at predict.
+        // The labels are needed on the HOST (the vote gather works on remapped
+        // i32 class indices, not on `F` targets), so this path must read them
+        // back — see `fit_owned`, which callers holding the labels host-side
+        // already should prefer precisely to avoid this round-trip.
         let y_host = y.to_host(pool);
-        // WR-02: validate each label is a finite, integer-valued, i32-range value
-        // before remapping — every sibling classifier guards this. Without it a
-        // NaN target silently becomes 0 (saturating cast) and an out-of-i32 label
-        // saturates, producing a spurious/wrong class with no error.
-        let mut raw_class: Vec<i32> = Vec::with_capacity(n_train);
-        for &v in y_host.iter() {
-            let lf = host_to_f64(v);
-            let lr = lf.round();
-            if !lr.is_finite()
-                || (lr - lf).abs() > 1e-6
-                || i32::try_from(lr as i64).is_err()
-            {
-                return Err(AlgoError::InvalidLabels {
-                    estimator: "knn_classifier",
-                    reason: format!("labels must be i32-range integers (got {lf})"),
-                });
-            }
-            raw_class.push(lr as i32);
-        }
-        let mut classes_: Vec<i32> = raw_class.clone();
-        classes_.sort_unstable();
-        classes_.dedup();
-        if classes_.is_empty() {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "y",
-                rows: n_train,
-                cols: 1,
-                len: y.len(),
-            }));
-        }
-        let n_classes = classes_.len();
-        // Dense class index per training sample = position of its raw label in
-        // the sorted `classes_` (binary search, classes_ is sorted+deduped).
-        let y_class: Vec<i32> = raw_class
-            .iter()
-            .map(|&l| {
-                classes_
-                    .binary_search(&l)
-                    .expect("every raw label is in classes_ by construction") as i32
-            })
-            .collect();
+        let labels = prepare_labels::<F>(&y_host, shape.0)?;
 
         // Take device-resident ownership of the training matrix with a
         // DEVICE-TO-DEVICE copy rather than round-tripping it through the host
         // (KNN-01) — see `nearest.rs::fit` for the full rationale and why a bare
-        // handle clone was NOT ownership. `y_class_` stays host-side here because
-        // the classifier's vote gather works on remapped i32 class indices, not on
-        // `F` targets.
+        // handle clone was NOT ownership.
         let x_dev: DeviceArray<ActiveRuntime, F> = device_copy::<F>(pool, x);
-        Ok(KNeighborsClassifier {
-            n_neighbors: self.n_neighbors,
-            x_train_: Some(x_dev),
-            train_shape_: Some((n_train, n_features)),
-            y_class_: Some(y_class),
-            classes_,
-            n_classes_: n_classes,
-            _state: PhantomData,
-        })
+        self.fit_owned(pool, x_dev, labels, shape)
     }
 }
 

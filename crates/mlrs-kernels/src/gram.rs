@@ -726,17 +726,33 @@ pub fn gram_xty_shared_tiled<F: Float + CubeElement>(
 /// grows (measured 151 ms at `n = 100 000, d = 256`, against 9 ms at `d = 64`
 /// for a quarter of the bytes).
 ///
-/// Unit 0 additionally folds `y` for the target mean.
+/// Units `t < k` additionally fold the `k` TARGET columns of `y` (row-major
+/// `n × k`) for the target means. `k = 1` is the single-target case every
+/// regressor takes, and reduces to unit 0 folding `y[i]` — bit-for-bit the
+/// pre-generalization kernel.
+///
+/// ## `weighted`
+/// `weighted != 0` folds `w[i]·x[i,c]` (and `w[i]·y[i,t]`) instead, and unit 0
+/// additionally folds `Σ w` into `pwsum[b]` so [`col_sums_reduce`] can divide by
+/// the WEIGHT SUM rather than by `n` — sklearn's `_preprocess_data`
+/// `np.average(X, axis=0, weights=sample_weight)`. `weighted == 0` never
+/// touches `w`/`pwsum` at all (the caller passes length-1 dummies), so the
+/// unweighted path is unchanged in both value and traffic.
 #[cube(launch)]
+#[allow(clippy::too_many_arguments)]
 pub fn col_sums_blocked<F: Float + CubeElement>(
     x: &Array<F>,
     y: &Array<F>,
+    w: &Array<F>,
     psum: &mut Array<F>,
     pysum: &mut Array<F>,
+    pwsum: &mut Array<F>,
     n: u32,
     d: u32,
+    k: u32,
     nblocks: u32,
     rows_per_block: u32,
+    weighted: u32,
 ) {
     let b = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as u32;
     if b < nblocks {
@@ -753,59 +769,274 @@ pub fn col_sums_blocked<F: Float + CubeElement>(
             let mut acc = F::new(0.0_f32);
             let mut i = start;
             while i < end {
-                acc += x[(i * d + c) as usize];
+                if weighted == 0u32 {
+                    acc += x[(i * d + c) as usize];
+                } else {
+                    acc += w[i as usize] * x[(i * d + c) as usize];
+                }
                 i += 1u32;
             }
             psum[(b * d + c) as usize] = acc;
             c += stride;
         }
 
-        if t == 0u32 {
+        let mut j = t;
+        while j < k {
             let mut accy = F::new(0.0_f32);
             let mut i = start;
             while i < end {
-                accy += y[i as usize];
+                if weighted == 0u32 {
+                    accy += y[(i * k + j) as usize];
+                } else {
+                    accy += w[i as usize] * y[(i * k + j) as usize];
+                }
                 i += 1u32;
             }
-            pysum[b as usize] = accy;
+            pysum[(b * k + j) as usize] = accy;
+            j += stride;
+        }
+
+        if t == 0u32 {
+            if weighted != 0u32 {
+                let mut accw = F::new(0.0_f32);
+                let mut i = start;
+                while i < end {
+                    accw += w[i as usize];
+                    i += 1u32;
+                }
+                pwsum[b as usize] = accw;
+            }
         }
     }
 }
 
 /// Fold [`col_sums_blocked`]'s partials into the column MEANS — one unit per
-/// output column (`tid < d`), plus unit 0 for the target mean.
+/// output column (`tid < d`), plus units `tid < k` for the `k` target means.
 ///
 /// `inv_n` is `1/n` supplied by the host so the division happens once per
-/// output rather than per partial.
+/// output rather than per partial. On the `weighted` arm the scale is instead
+/// `1/Σw`, folded from `pwsum` here (`nblocks` is small and the fold is
+/// cube-uniform), so the weighted means never need a host round-trip either.
 #[cube(launch)]
+#[allow(clippy::too_many_arguments)]
 pub fn col_sums_reduce<F: Float + CubeElement>(
     psum: &Array<F>,
     pysum: &Array<F>,
+    pwsum: &Array<F>,
     xmean: &mut Array<F>,
     ymean: &mut Array<F>,
     d: u32,
+    k: u32,
     nblocks: u32,
     inv_n: F,
+    weighted: u32,
 ) {
     let tid = ABSOLUTE_POS;
-    if tid < d as usize {
-        let mut acc = F::new(0.0_f32);
-        let mut bl = 0u32;
-        while bl < nblocks {
-            acc += psum[(bl * d + tid as u32) as usize];
-            bl += 1u32;
+    let mut wide = d;
+    if k > d {
+        wide = k;
+    }
+    if tid < wide as usize {
+        let mut inv = inv_n;
+        if weighted != 0u32 {
+            let mut ws = F::new(0.0_f32);
+            let mut bw = 0u32;
+            while bw < nblocks {
+                ws += pwsum[bw as usize];
+                bw += 1u32;
+            }
+            inv = F::new(1.0_f32) / ws;
         }
-        xmean[tid] = acc * inv_n;
 
-        if tid == 0usize {
+        if tid < d as usize {
+            let mut acc = F::new(0.0_f32);
+            let mut bl = 0u32;
+            while bl < nblocks {
+                acc += psum[(bl * d + tid as u32) as usize];
+                bl += 1u32;
+            }
+            xmean[tid] = acc * inv;
+        }
+
+        if tid < k as usize {
             let mut accy = F::new(0.0_f32);
             let mut bl2 = 0u32;
             while bl2 < nblocks {
-                accy += pysum[bl2 as usize];
+                accy += pysum[(bl2 * k + tid as u32) as usize];
                 bl2 += 1u32;
             }
-            ymean[0] = accy * inv_n;
+            ymean[tid] = accy * inv;
         }
+    }
+}
+
+/// Target columns one [`xty_multi_blocked`] launch accumulates — the comptime
+/// size of its per-unit register accumulator. A `k` above this is covered by
+/// chunked launches (the host loops `t0` in steps of this), each of which
+/// re-streams the design; `k ≤ 32` (every realistic `RidgeClassifier` class
+/// count) is ONE pass.
+pub const XTY_MULTI_MAX_TARGETS: u32 = 32;
+
+/// Row-blocked partial `XᵀY` (`d × k`) accumulation of the CENTERED design and
+/// CENTERED targets, without materializing either — the multi-target twin of
+/// [`gram_xty_blocked`]'s `Xty` tail.
+///
+/// ## Why this is a separate pass rather than a `k`-wide `Xty` tail
+/// The Gram kernels carry their `Xᵀy` on whichever units already hold the
+/// relevant column in registers (the diagonal tiles, for
+/// [`gram_xty_shared_tiled`]). Widening that to `k` targets would need `4·k`
+/// live registers per unit at a RUNTIME `k`, which CubeCL cannot express and a
+/// GPU could not hold. A separate pass costs one extra `O(n·d)` read of the
+/// design against the Gram's `O(n·d²)` of work — a factor of `d` less — and
+/// keeps all three Gram kernels bit-for-bit unchanged.
+///
+/// ## Shape
+/// One cube per row block; unit `u` owns the design columns `c ≡ u (mod
+/// CUBE_DIM_X)` and holds `tcount` register accumulators across the whole block,
+/// so each design element is read from global memory EXACTLY ONCE per launch
+/// (`k` re-reads would be the naive slot-per-unit assignment, and `k`× the
+/// traffic). The `k` centered target values a row needs are read by every unit
+/// of the cube in the same step, so they stay in L1.
+///
+/// `pxty` is the `nblocks × d × k` partial [`xty_multi_reduce`] folds; `t0` /
+/// `tcount` select this launch's target window (`tcount ≤`
+/// [`XTY_MULTI_MAX_TARGETS`]).
+///
+/// ## cubecl-cpu MLIR safety
+/// GATHER-only: no `SharedMemory`, no atomics, no barriers — one local register
+/// array and ascending `while` scans.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn xty_multi_blocked<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    xmean: &Array<F>,
+    ymean: &Array<F>,
+    pxty: &mut Array<F>,
+    n: u32,
+    d: u32,
+    k: u32,
+    t0: u32,
+    tcount: u32,
+    nblocks: u32,
+    rows_per_block: u32,
+) {
+    let b = (CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X) as u32;
+    if b < nblocks {
+        let t = UNIT_POS as u32;
+        let stride = CUBE_DIM_X;
+        let start = b * rows_per_block;
+        let mut end = start + rows_per_block;
+        if end > n {
+            end = n;
+        }
+
+        let mut acc = Array::<F>::new(32usize);
+
+        let mut c = t;
+        while c < d {
+            let mc = xmean[c as usize];
+            let mut z = 0u32;
+            while z < tcount {
+                acc[z as usize] = F::new(0.0_f32);
+                z += 1u32;
+            }
+
+            let mut i = start;
+            while i < end {
+                let xv = x[(i * d + c) as usize] - mc;
+                let ybase = i * k + t0;
+                let mut j = 0u32;
+                while j < tcount {
+                    acc[j as usize] += xv * (y[(ybase + j) as usize] - ymean[(t0 + j) as usize]);
+                    j += 1u32;
+                }
+                i += 1u32;
+            }
+
+            let obase = b * d * k + c * k + t0;
+            let mut s = 0u32;
+            while s < tcount {
+                pxty[(obase + s) as usize] = acc[s as usize];
+                s += 1u32;
+            }
+            c += stride;
+        }
+    }
+}
+
+/// Fold [`xty_multi_blocked`]'s `nblocks` partials into the `d × k` row-major
+/// `XᵀY` — one unit per output slot.
+#[cube(launch)]
+pub fn xty_multi_reduce<F: Float + CubeElement>(
+    pxty: &Array<F>,
+    xty: &mut Array<F>,
+    dk: u32,
+    nblocks: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < dk as usize {
+        let mut acc = F::new(0.0_f32);
+        let mut bl = 0u32;
+        while bl < nblocks {
+            acc += pxty[(bl * dk + tid as u32) as usize];
+            bl += 1u32;
+        }
+        xty[tid] = acc;
+    }
+}
+
+/// `out[r,c] = sqrt_w[r] · (x[r,c] − mean[c])` for an `n × d` row-major `x` —
+/// sklearn's `_preprocess_data` centering composed with `_rescale_data`'s `√w`
+/// row scale, in ONE device pass.
+///
+/// The caller supplies `sqrt_w` already square-rooted (the weights arrive as a
+/// host slice, so the `sqrt` costs one host pass over `n` values and keeps the
+/// kernel off the `F::sqrt` transcendental path some wgpu adapters lack for
+/// `f64`). Used only by the WEIGHTED device fit arm, which cannot fuse
+/// centering into the Gram accumulation: the `√w` factor multiplies the
+/// operands, not the accumulator, so it has to exist before the reduction.
+#[cube(launch)]
+pub fn center_scale_rows<F: Float + CubeElement>(
+    x: &Array<F>,
+    mean: &Array<F>,
+    sqrt_w: &Array<F>,
+    out: &mut Array<F>,
+    n: u32,
+    d: u32,
+) {
+    // `n as usize * d as usize`, never `(n * d) as usize`: the design of a
+    // large fit can exceed `u32::MAX` elements, and the narrow multiply would
+    // wrap and silently drop the tail rows.
+    let idx = ABSOLUTE_POS;
+    if idx < n as usize * d as usize {
+        let r = idx as u32 / d;
+        let c = idx as u32 % d;
+        out[idx] = (x[idx] - mean[c as usize]) * sqrt_w[r as usize];
+    }
+}
+
+/// Transpose an `r × c` row-major matrix into a `c × r` row-major one — one
+/// unit per element.
+///
+/// The `RidgeClassifier` device fit produces `coef` in the `d × k`
+/// (feature-major) layout `cholesky_solve_reg` and `linear_predict_bias_multi`
+/// both use, while sklearn's `coef_` attribute is `k × d`. Both live on the
+/// device (D-03), and `d · k` is a few thousand elements at most, so the
+/// conversion is one trivial launch rather than the blocking read-back +
+/// host transpose + re-upload it replaces.
+#[cube(launch)]
+pub fn transpose_2d<F: Float + CubeElement>(
+    src: &Array<F>,
+    dst: &mut Array<F>,
+    rows: u32,
+    cols: u32,
+) {
+    let idx = ABSOLUTE_POS;
+    if idx < rows as usize * cols as usize {
+        let i = idx as u32 / cols;
+        let j = idx as u32 % cols;
+        dst[(j * rows + i) as usize] = src[idx];
     }
 }
 

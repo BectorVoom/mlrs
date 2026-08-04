@@ -172,6 +172,77 @@ pub fn minkowski_dist<F: Float + CubeElement>(
     }
 }
 
+/// Cosine pairwise distance: `out[i*rows_y+j] = 1 − (x_i·y_j) / (‖x_i‖·‖y_j‖)`,
+/// clamped to `[0, 2]` — sklearn's `cosine_distances` (KNN-REG-PARAMS).
+///
+/// # Why the norms are arguments, not recomputed
+/// `‖x_i‖` depends only on `i` and `‖y_j‖` only on `j`, so recomputing them
+/// inside the `(i, j)` loop would triple the feature reads for no reason. The
+/// caller precomputes both with the one-launch
+/// [`row_sumsq`](crate::knn::row_sumsq) GATHER kernel and passes the SUM OF
+/// SQUARES (not the root) — the root is taken once per output element here, so
+/// the feeders stay a plain arithmetic reduction.
+///
+/// # Zero rows (sklearn parity)
+/// sklearn normalises with `preprocessing.normalize`, which leaves an all-zero
+/// row at zero, so its cosine similarity against anything is `0` and the
+/// distance is `1`. A zero norm here therefore yields similarity `0` — NOT a
+/// division by zero — via the statement-form `if denom > 0` guard.
+///
+/// The `[0, 2]` clamp mirrors sklearn's own `np.clip` on the same quantity: the
+/// similarity of two unit vectors is analytically in `[-1, 1]`, but the
+/// floating-point dot/root can leave it a few ulp outside, and a negative
+/// distance would break the `top_k` ordering contract and any `1/d` weighting.
+///
+/// cpu-MLIR contract: per-element 2D launch (`ABSOLUTE_POS_{X,Y}`), bounded
+/// feature loop, `F` accumulators only, STATEMENT-form `if` guards, no
+/// `SharedMemory`, no mutable `bool`, no infinity constant. `F::sqrt` is the
+/// STATIC associated form (the `sqrt_elem` precedent), not the instance one.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn cosine_dist<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    xnorm: &Array<F>,
+    ynorm: &Array<F>,
+    out: &mut Array<F>,
+    rows_x: u32,
+    rows_y: u32,
+    cols: u32,
+) {
+    let i = ABSOLUTE_POS_X;
+    let j = ABSOLUTE_POS_Y;
+    if i < rows_x {
+        if j < rows_y {
+            let xb = i * cols;
+            let yb = j * cols;
+            let mut dot = F::from_int(0i64);
+            let mut kk = 0u32;
+            while kk < cols {
+                dot += x[(xb + kk) as usize] * y[(yb + kk) as usize];
+                kk += 1u32;
+            }
+            let zero = F::from_int(0i64);
+            let one = F::from_int(1i64);
+            let two = F::from_int(2i64);
+            // `‖x‖·‖y‖ = sqrt(‖x‖²·‖y‖²)` — one root instead of two.
+            let denom = F::sqrt(xnorm[i as usize] * ynorm[j as usize]);
+            let mut sim = zero;
+            if denom > zero {
+                sim = dot / denom;
+            }
+            let mut d = one - sim;
+            if d < zero {
+                d = zero;
+            }
+            if d > two {
+                d = two;
+            }
+            out[(i * rows_y + j) as usize] = d;
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Self-drop-by-index-identity GATHER kernel (cpu-MLIR-safe; VALIDATED spike-002).
 //

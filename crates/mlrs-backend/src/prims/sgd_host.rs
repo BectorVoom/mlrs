@@ -52,12 +52,16 @@
 //!   counter rather than accumulating it, matching the kernel's deliberately
 //!   non-loop-carried form ([`sgd_l1_shrink`]);
 //! - the intercept folds `Σ_i g[i]` forward from zero ([`sgd_bias_update`]);
-//! - the convergence stats fold the same strict-`>` running maxima over the
-//!   same start-of-batch snapshot ([`sgd_copy`] + [`sgd_delta_max`]).
+//! - the loss-plateau `tol`/`n_iter_no_change` stop (MBSGD-PERF-WGPU) sums the
+//!   same per-sample loss VALUE table ([`sgd_loss`]) forward from zero within
+//!   a batch ([`sgd_sumloss`]), then carries `best_loss`/`no_improvement_count`
+//!   across epochs exactly as sklearn's `_plain_sgd` does — this REPLACED an
+//!   earlier coefficient-delta check (`sgd_copy` + `sgd_delta_max`, since
+//!   removed) that, unlike sklearn, could take hundreds of extra epochs to
+//!   satisfy on data where the training loss had already plateaued.
 //!
-//! The only freedom taken is in HOW the two convergence maxima are reduced —
-//! `max` is order-independent, unlike the sums — which [`MaxLanes`] uses to
-//! vectorize them. Every summation keeps the kernel's order.
+//! Every summation keeps the kernel's order; [`wide_dot`] is the one
+//! deliberate, opt-in exception (a reassociation, off by default).
 //!
 //! [`sgd_solve`]: super::sgd::sgd_solve
 //! [`SgdParams::batch_size`]: super::sgd::SgdParams::batch_size
@@ -67,8 +71,8 @@
 //! [`sgd_weight_update`]: mlrs_kernels::sgd::sgd_weight_update
 //! [`sgd_l1_shrink`]: mlrs_kernels::sgd::sgd_l1_shrink
 //! [`sgd_bias_update`]: mlrs_kernels::sgd::sgd_bias_update
-//! [`sgd_copy`]: mlrs_kernels::sgd::sgd_copy
-//! [`sgd_delta_max`]: mlrs_kernels::sgd::sgd_delta_max
+//! [`sgd_loss`]: mlrs_kernels::sgd::sgd_loss
+//! [`sgd_sumloss`]: mlrs_kernels::sgd::sgd_sumloss
 //!
 //! Tests live in `crates/mlrs-backend/tests/` (AGENTS.md §2).
 
@@ -80,11 +84,28 @@ use super::sgd::{loss_id, optimal_t0, schedule_eta, SgdParams, SGD_DEFAULT_MAX_I
 
 /// Whether the SGD solve should run on the host arm.
 ///
-/// True on the cpu backend unless `MLRS_SGD_HOST=0` forces the device path
-/// (the A/B knob the equivalence test drives both arms through — read via
-/// [`abflag`](crate::abflag) so a test override stays thread-local).
+/// True on the cpu AND wgpu backends unless `MLRS_SGD_HOST=0` forces the
+/// device path (the A/B knob the equivalence test drives both arms through —
+/// read via [`abflag`](crate::abflag) so a test override stays thread-local).
+///
+/// ## Why wgpu joined cpu (MBSGD-PERF-WGPU)
+/// The per-sample launch count documented in this module's header
+/// (`max_iter · ceil(n/batch) · (2 + fit_intercept + 2·(tol>0) + l1)`) is not a
+/// cpu-thread-per-unit artifact — it is `sgd_solve`'s device-kernel shape,
+/// full stop. On the actual wgpu target (measured, not extrapolated from cpu —
+/// see the verify-on-target-hardware rule) a tiny `n=200, d=8, max_iter=5` fit
+/// (5 000 launches) took multiple SECONDS wall against ~0.27 s of CPU time —
+/// i.e. the process was blocked on GPU submission/sync, not computing. wgpu
+/// has no cheaper way to issue a launch than cpu does here, and `batch_size ==
+/// 1` (the only sklearn-equivalent setting) cannot be widened without changing
+/// the algorithm (see the module docs), so the cpu fix — stop launching,
+/// replay the SAME recurrence on the host — applies verbatim. Only `x`/`y`
+/// (downloaded once) and the fitted `w`/`bias` (uploaded once) cross the
+/// device boundary; cuda/rocm are left on the device path (untestable in this
+/// environment — do not extrapolate this decision onto them without measuring
+/// on that hardware).
 pub(crate) fn host_solve_applicable() -> bool {
-    crate::capability::active_backend_name() == "cpu"
+    matches!(crate::capability::active_backend_name(), "cpu" | "wgpu")
         && crate::abflag::var("MLRS_SGD_HOST")
             .map(|v| v != "0")
             .unwrap_or(true)
@@ -217,6 +238,61 @@ fn dloss_t<T: HostFloat, const LID: u32>(p: T, y: T, epsilon: T) -> T {
     gi
 }
 
+/// The `sgd_loss` kernel's loss-VALUE table, in `F` (as opposed to
+/// [`dloss_t`]'s derivative) — mirrors `mlrs_kernels::sgd::sgd_loss` statement
+/// for statement, including the `Log` branch's "compute the unclipped default,
+/// then overwrite in the two extreme regions" structure (a transient overflow
+/// to `+inf` in the discarded default is harmless IEEE arithmetic on either
+/// arm). The f64 host [`loss_value`](super::sgd::loss_value) is NOT reused,
+/// same reasoning as [`dloss_t`].
+#[inline(always)]
+fn loss_value_t<T: HostFloat, const LID: u32>(p: T, y: T, epsilon: T) -> T {
+    let zero = T::ZERO;
+    let one = T::ONE;
+    let mut li = zero;
+    if LID == 0 {
+        // Hinge: max(0, 1 - p*y).
+        let z = one - p * y;
+        if z > zero {
+            li = z;
+        }
+    } else if LID == 1 {
+        // Log: log(1 + exp(-p*y)), clipped at |z| = 18 like sklearn.
+        let z = p * y;
+        let eighteen = T::lit(18.0);
+        li = (zero - z).exp().log1p();
+        if z > eighteen {
+            li = (zero - z).exp();
+        }
+        if z < zero - eighteen {
+            li = zero - z;
+        }
+    } else if LID == 2 {
+        // Squared hinge: max(0, 1 - p*y)^2.
+        let z = one - p * y;
+        if z > zero {
+            li = z * z;
+        }
+    } else if LID == 3 {
+        // Squared error: 0.5*(p-y)^2.
+        let d = p - y;
+        li = T::lit(0.5) * d * d;
+    } else if LID == 4 {
+        // Epsilon-insensitive: max(0, |y-p|-eps).
+        let z = (y - p).abs() - epsilon;
+        if z > zero {
+            li = z;
+        }
+    } else {
+        // Squared epsilon-insensitive: max(0, |y-p|-eps)^2.
+        let z = (y - p).abs() - epsilon;
+        if z > zero {
+            li = z * z;
+        }
+    }
+    li
+}
+
 /// Lane count of the [`wide_dot`] accumulator (one AVX2 f32 register).
 const DOT_LANES: usize = 8;
 
@@ -280,63 +356,6 @@ fn wide_dot<T: HostFloat>(row: &[T], w: &[T], d: usize) -> T {
     s
 }
 
-/// Lane-parallel running maxima for the `tol > 0` convergence stats.
-///
-/// The device pair (`sgd_copy` + `sgd_delta_max`) folds `max_j |w[j] − snap[j]|`
-/// and `max_j |w[j]|` with `if c > acc { acc = c }` over ascending `j`, seeded
-/// from a host-zeroed `stats`. Written that way on the host each fold is a
-/// branchy loop-carried chain — ~3 cycles per coordinate — which on the DEFAULT
-/// `tol = 1e-3` cost 2.9× the whole fit at `d = 64`.
-///
-/// Two things fix it, and the second is counter-intuitive:
-///
-/// 1. Splitting each fold across [`DOT_LANES`] independent accumulators, so it
-///    emits `vmaxps`/`vmaxpd` instead of a serial compare-and-store.
-/// 2. Running the fold as a SEPARATE pass over a `w_snap` snapshot rather than
-///    fusing it into the coordinate update. Fusing looks strictly better — it
-///    has `w_old` live in a register and needs no snapshot at all — but it
-///    perturbs the update loop enough to cost more than the copy it saves.
-///    Measured per sample at `d = 64` (`f32`, hinge, over the full epoch):
-///    47.6 ns plain, 69.1 ns fused-and-lane-split, **53.7 ns split-pass**. The
-///    `d`-element copy is ~1 ns of L1 traffic; the update loop's codegen is
-///    worth an order of magnitude more than that.
-///
-/// Unlike the sum in [`wide_dot`], the lane split here is EXACT rather than an
-/// approximation:
-///
-/// - `max` is associative and commutative, so lane order cannot change the
-///   result for ordinary values;
-/// - both folded quantities are absolute values, so `0` is a true identity for
-///   the lane seeds (and it is the same value the device `stats` is zeroed to);
-/// - `if c > acc` never replaces on a `NaN` `c` in either arrangement, so a
-///   diverged (`inf − inf`) iterate yields the max over the non-`NaN` entries
-///   under any lane split, exactly as the ascending device fold does.
-///
-/// So the bit-identity gate holds with this on, which is why it is
-/// unconditional and not a knob.
-/// The lane accumulators are plain fixed-size arrays and every loop that feeds
-/// them is driven by `chunks_exact`, so LLVM sees a known trip count and
-/// independent lanes and emits `vmaxps`/`vmaxpd`. Written with a runtime `l` index
-/// over `0..DOT_LANES` instead, it keeps the whole fold scalar (measured: the
-/// `tol = 1e-3` fit stayed ~2.2× the `tol = 0` one).
-type MaxLanes<T> = [T; DOT_LANES];
-
-/// Reduce lane maxima into a running maximum.
-///
-/// Takes and returns BY VALUE: handing out a `&` to the lane array makes its
-/// address escape, and LLVM then keeps the accumulators in memory across the
-/// fold loop, which reintroduces exactly the serialization the lanes exist to
-/// remove.
-#[inline(always)]
-fn reduce_max<T: HostFloat>(lanes: MaxLanes<T>, mut running: T) -> T {
-    for v in lanes {
-        if v > running {
-            running = v;
-        }
-    }
-    running
-}
-
 /// The epoch/batch loop for one `(float, loss)` instantiation.
 fn solve_loss<T: HostFloat, const LID: u32>(
     x: &[T],
@@ -361,7 +380,6 @@ fn solve_loss<T: HostFloat, const LID: u32>(
 
     let track = params.tol > 0.0;
     let l1_active = params.apply_l1 && params.l1_ratio > 0.0 && params.alpha > 0.0;
-    let mut w_snap = if track { vec![T::ZERO; d] } else { Vec::new() };
     let mut q = if l1_active {
         vec![T::ZERO; d]
     } else {
@@ -373,12 +391,16 @@ fn solve_loss<T: HostFloat, const LID: u32>(
 
     // `t` counts SAMPLES consumed across epochs (sklearn's schedule clock).
     let mut t: u64 = 1;
+    // sklearn's `best_loss`/`no_improvement_count` (`tol > 0` only) — carried
+    // ACROSS epochs, unlike `sumloss` below.
+    let mut best_loss = f64::INFINITY;
+    let mut no_improvement_count: usize = 0;
+    let n_iter_no_change = params.n_iter_no_change.max(1);
 
     for _epoch in 0..max_iter {
-        // Running epoch maxima (max |Δw|, max |w|) — the device `stats` pair,
-        // zeroed at epoch start and consulted once at epoch end.
-        let mut max_change = T::ZERO;
-        let mut w_max = T::ZERO;
+        // Running epoch loss accumulator — the device `sumloss[0]`, zeroed at
+        // epoch start and consulted once at epoch end.
+        let mut sumloss = T::ZERO;
 
         let mut start = 0usize;
         while start < n {
@@ -388,7 +410,12 @@ fn solve_loss<T: HostFloat, const LID: u32>(
             // --- Pass 1 + subgradient: margin p_i over the batch rows, then
             //     g[i] = clamp(dloss(p_i, y_i)). Fused into one row scan (the
             //     two kernels are elementwise over the same `i`, so folding
-            //     them changes no value). ---
+            //     them changes no value). When tracking, the loss VALUE
+            //     (`sgd_loss`) is folded in too — same `p_i`/`y_i`, a SEPARATE
+            //     batch-local sum (`batch_sumloss`) added into `sumloss` AFTER
+            //     the batch, mirroring the device's two-kernel/two-launch
+            //     structure (`sgd_loss` then `sgd_sumloss`) exactly. ---
+            let mut batch_sumloss = T::ZERO;
             for i in 0..bsz {
                 let row = &x[(start + i) * d..(start + i) * d + d];
                 let acc = if wide_dot_on {
@@ -400,7 +427,14 @@ fn solve_loss<T: HostFloat, const LID: u32>(
                     }
                     acc
                 };
-                g[i] = dloss_t::<T, LID>(acc + bias, y[start + i], eps);
+                let margin = acc + bias;
+                g[i] = dloss_t::<T, LID>(margin, y[start + i], eps);
+                if track {
+                    batch_sumloss = batch_sumloss + loss_value_t::<T, LID>(margin, y[start + i], eps);
+                }
+            }
+            if track {
+                sumloss = sumloss + batch_sumloss;
             }
 
             // --- Schedule eta for this batch (host f64; batch-start clock). ---
@@ -425,17 +459,10 @@ fn solve_loss<T: HostFloat, const LID: u32>(
             let step = T::from_f64(eta) * T::from_f64(binv);
             let l2 = T::from_f64(l2_factor);
 
-            // WR-02: snapshot the TRUE start-of-batch weights so the delta
-            // reflects the FULL update (gradient step + L2 + L1).
-            if track {
-                w_snap.copy_from_slice(&w);
-            }
-
             // --- Pass 2: w[j] = (w[j] − step·Σ_i g[i]·x[i,j]) · l2_factor.
             //     The `bsz == 1` case (the only sklearn-equivalent one) is
             //     peeled so the gradient gather collapses to a single scaled
-            //     row read. The loop is kept FREE of the convergence fold on
-            //     purpose — see the fold below. ---
+            //     row read. ---
             if bsz == 1 {
                 let row = &x[start * d..start * d + d];
                 let g0 = g[0];
@@ -497,55 +524,23 @@ fn solve_loss<T: HostFloat, const LID: u32>(
                 bias = bias - step * s;
             }
 
-            // --- Convergence bookkeeping (`tol > 0` only): the device
-            //     `sgd_copy` + `sgd_delta_max` pair, as ONE separate lane-split
-            //     pass over `w` and the snapshot. Kept OUT of the update loop
-            //     deliberately — see `MaxLanes`. ---
-            if track {
-                // The lane accumulators are PER BATCH on purpose: kept alive
-                // across the batch loop instead, they stop being register
-                // -promoted and the fit gets ~12 % slower (measured), even
-                // though that would run the reduce once per epoch instead of
-                // once per batch.
-                let mut cf: MaxLanes<T> = [T::ZERO; DOT_LANES];
-                let mut wf: MaxLanes<T> = [T::ZERO; DOT_LANES];
-                let body = (d / DOT_LANES) * DOT_LANES;
-                for (wc, sc) in w[..body]
-                    .chunks_exact(DOT_LANES)
-                    .zip(w_snap[..body].chunks_exact(DOT_LANES))
-                {
-                    for l in 0..DOT_LANES {
-                        let c = (wc[l] - sc[l]).abs();
-                        if c > cf[l] {
-                            cf[l] = c;
-                        }
-                        let a = wc[l].abs();
-                        if a > wf[l] {
-                            wf[l] = a;
-                        }
-                    }
-                }
-                for j in body..d {
-                    let c = (w[j] - w_snap[j]).abs();
-                    if c > cf[0] {
-                        cf[0] = c;
-                    }
-                    let a = w[j].abs();
-                    if a > wf[0] {
-                        wf[0] = a;
-                    }
-                }
-                max_change = reduce_max(cf, max_change);
-                w_max = reduce_max(wf, w_max);
-            }
-
             t += bsz as u64;
             start += bsz;
         }
 
+        // sklearn's training-loss-plateau stop: carried best/no-improvement
+        // state exactly as `_plain_sgd` does.
         if track {
-            let scale = w_max.to_f64().max(1.0);
-            if max_change.to_f64() <= params.tol * scale {
+            let sumloss64 = sumloss.to_f64();
+            if sumloss64 > best_loss - params.tol * n as f64 {
+                no_improvement_count += 1;
+            } else {
+                no_improvement_count = 0;
+            }
+            if sumloss64 < best_loss {
+                best_loss = sumloss64;
+            }
+            if no_improvement_count >= n_iter_no_change {
                 break;
             }
         }

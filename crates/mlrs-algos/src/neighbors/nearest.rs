@@ -44,10 +44,11 @@ use cubecl::server::Handle;
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::distance::{distance_direct, distance_with_ynorm};
+use mlrs_backend::prims::distance::{distance_direct, distance_with_ynorm, metric_distance};
 use mlrs_backend::prims::knn::{
     cpu_rows_applicable, cpu_rows_topk, device_copy, fused_distance_topk, fused_topk_applicable,
 };
+use mlrs_backend::prims::knn_graph::Metric;
 use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -126,6 +127,37 @@ where
     /// The configured default neighbor count (read pre-fit).
     pub fn n_neighbors(&self) -> usize {
         self.n_neighbors
+    }
+
+    /// Fit by TAKING OWNERSHIP of an already-device-resident training matrix —
+    /// the zero-copy sibling of [`Fit::fit`] (KNN-REG-FIT).
+    ///
+    /// Same validation, same fitted state; `x` arrives BY VALUE, so the
+    /// estimator adopts the caller's buffer instead of duplicating it. See
+    /// [`KNeighborsRegressor::fit_owned`](crate::neighbors::regressor::KNeighborsRegressor::fit_owned)
+    /// for why the borrowing form has to copy and why a caller that uploaded
+    /// the operand purely to hand it over does not.
+    ///
+    /// On validation failure `x` is released back into `pool` — the caller has
+    /// already given it up, so nothing else can, and leaking it would raise the
+    /// pool's `live_bytes` permanently (the FOUND-05 conservation property the
+    /// D-10 memory gate asserts on).
+    pub fn fit_owned(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+    ) -> Result<NearestNeighbors<F, Fitted>, AlgoError> {
+        if let Err(e) = validate_geometry(&x, shape) {
+            x.release_into(pool);
+            return Err(e);
+        }
+        Ok(NearestNeighbors {
+            n_neighbors: self.n_neighbors,
+            x_train_: Some(x),
+            train_shape_: Some(shape),
+            _state: PhantomData,
+        })
     }
 }
 
@@ -225,7 +257,6 @@ where
         _y: Option<&DeviceArray<ActiveRuntime, F>>,
         shape: (usize, usize),
     ) -> Result<NearestNeighbors<F, Fitted>, AlgoError> {
-        let (n_train, n_features) = shape;
         validate_geometry(x, shape)?;
 
         // Take device-resident ownership of the training matrix (D-03) with a
@@ -248,12 +279,10 @@ where
         // owned, so releasing the fit input is safe again.
         let x_dev: DeviceArray<ActiveRuntime, F> = device_copy::<F>(pool, x);
 
-        Ok(NearestNeighbors {
-            n_neighbors: self.n_neighbors,
-            x_train_: Some(x_dev),
-            train_shape_: Some((n_train, n_features)),
-            _state: PhantomData,
-        })
+        // The owning path owns the single definition of how fitted state is
+        // assembled, so the two entry points can differ only in how the buffer
+        // got there.
+        self.fit_owned(pool, x_dev, shape)
     }
 }
 
@@ -315,6 +344,37 @@ pub(crate) fn neighbor_indices<F>(
 where
     F: Float + CubeElement + Pod,
 {
+    neighbor_indices_metric::<F>(pool, x_train, train_shape, xq, shape, k, Metric::Euclidean)
+}
+
+/// [`neighbor_indices`] under an arbitrary [`Metric`] (KNN-REG-PARAMS).
+///
+/// `Metric::Euclidean` is bit-for-bit the pre-existing path — it dispatches
+/// through the SAME [`tiled_distance_topk`] and therefore the same
+/// cpu-row-scan / fused / register-blocked kernel family. The other metrics take
+/// the [`tiled_metric_distance_topk`] composition. Keeping the default a
+/// delegation rather than a `match` arm of its own is what guarantees adding a
+/// metric cannot perturb the tuned default.
+#[allow(clippy::type_complexity)]
+pub(crate) fn neighbor_indices_metric<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: Option<&DeviceArray<ActiveRuntime, F>>,
+    train_shape: Option<(usize, usize)>,
+    xq: &DeviceArray<ActiveRuntime, F>,
+    shape: (usize, usize),
+    k: usize,
+    metric: Metric,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, i32>,
+        Vec<u32>,
+    ),
+    AlgoError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
     // --- T-05-08-01 / ASVS V5: validate the untrusted k + query geometry BEFORE
     //     any prim launch (shared with the device core so the two cannot drift). ---
     let (x_train, (n_train, n_features)) =
@@ -323,14 +383,26 @@ where
 
     // --- 1./2. QUERY-TILED distance → select-k, straight into the full output
     //        buffers (see `neighbor_indices_device` for why tiling is required). ---
-    let (val_dev, idx_dev_u32) = tiled_distance_topk::<F>(
-        pool,
-        x_train,
-        (n_train, n_features),
-        xq,
-        (n_query, n_features),
-        k,
-    )?;
+    let (val_dev, idx_dev_u32) = if matches!(metric, Metric::Euclidean) {
+        tiled_distance_topk::<F>(
+            pool,
+            x_train,
+            (n_train, n_features),
+            xq,
+            (n_query, n_features),
+            k,
+        )?
+    } else {
+        tiled_metric_distance_topk::<F>(
+            pool,
+            x_train,
+            (n_train, n_features),
+            xq,
+            (n_query, n_features),
+            k,
+            metric,
+        )?
+    };
 
     // --- 3. u32 → i32 neighbor indices (D-06). Host-cast the small n_query × k
     //        index buffer; the values are training-column indices in
@@ -344,22 +416,30 @@ where
     Ok((val_dev, idx_dev_i32, idx_host))
 }
 
-/// Fully DEVICE-RESIDENT kneighbors core (KNN-01): same validation and same
-/// `distance → top_k` pipeline as [`neighbor_indices`], but it returns the raw
-/// `u32` indices ON the device and performs NO host round-trip at all.
+/// Fully DEVICE-RESIDENT kneighbors core under an arbitrary [`Metric`] (KNN-01 /
+/// KNN-REG-PARAMS) — the core `KNeighborsRegressor::predict` runs on.
 ///
-/// [`neighbor_indices`] exists for the consumers that genuinely need host indices
-/// (`kneighbors`'s public `i32` surface, the classifier's label gather); the
-/// regressor pairs this one with the fused
-/// [`knn_regress_mean_gather`](mlrs_backend::prims::knn::knn_regress_mean_gather)
-/// so its predict never leaves the device.
-pub(crate) fn neighbor_indices_device<F>(
+/// Same validation and same `distance → top_k` pipeline as
+/// [`neighbor_indices_metric`], but it returns the raw `u32` indices ON the
+/// device and performs NO host round-trip at all. [`neighbor_indices`] /
+/// [`neighbor_indices_metric`] exist for the consumers that genuinely need host
+/// indices (`kneighbors`'s public `i32` surface, the classifier's label gather);
+/// the regressor pairs this one with the fused device gathers so its predict
+/// never leaves the device.
+///
+/// Returns `(distances, indices)` both device-resident, the distances TRUE
+/// (already rooted / already in the metric's own units) so a `weights='distance'`
+/// consumer can weight by `1/d` directly. `Metric::Euclidean` delegates to the
+/// unchanged tuned path.
+#[allow(clippy::type_complexity)]
+pub(crate) fn neighbor_indices_device_metric<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x_train: Option<&DeviceArray<ActiveRuntime, F>>,
     train_shape: Option<(usize, usize)>,
     xq: &DeviceArray<ActiveRuntime, F>,
     shape: (usize, usize),
     k: usize,
+    metric: Metric,
 ) -> Result<
     (
         DeviceArray<ActiveRuntime, F>,
@@ -370,8 +450,13 @@ pub(crate) fn neighbor_indices_device<F>(
 where
     F: Float + CubeElement + Pod,
 {
-    let (x_train, (n_train, n_features)) = validate_kneighbors::<F>(x_train, train_shape, xq, shape, k)?;
-    tiled_distance_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k)
+    let (x_train, (n_train, n_features)) =
+        validate_kneighbors::<F>(x_train, train_shape, xq, shape, k)?;
+    if matches!(metric, Metric::Euclidean) {
+        tiled_distance_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k)
+    } else {
+        tiled_metric_distance_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k, metric)
+    }
 }
 
 /// Validate the untrusted `k` + query geometry BEFORE any prim launch
@@ -536,22 +621,7 @@ where
         .map_err(AlgoError::Prim);
     }
 
-    let row_bytes = n_train * size_of::<F>();
-    // Round the budget-derived tile DOWN to the alignment granularity, then clamp
-    // to `n_query`. This preserves the invariant the offset views need: either
-    // `tile_rows` is a multiple of `TILE_ALIGN_ROWS` (so every `start` is too), or
-    // the clamp made it `n_query`, in which case there is a SINGLE tile at
-    // `start = 0` — which is trivially aligned.
-    //
-    // `max(TILE_ALIGN_ROWS)` means a very large `n_train` can exceed the byte
-    // budget: 64 rows is the smallest tile that can be cut at all, so the budget
-    // is a target rather than a hard cap. It is only reachable past
-    // `n_train ≈ 512_000` in f32, where the brute-force method is impractical for
-    // other reasons anyway.
-    let tile_rows = ((DIST_TILE_BUDGET_BYTES / row_bytes.max(1)) / TILE_ALIGN_ROWS
-        * TILE_ALIGN_ROWS)
-        .max(TILE_ALIGN_ROWS)
-        .min(n_query);
+    let tile_rows = dist_tile_rows::<F>(n_train, n_query);
 
     let val_bytes = n_query * k * size_of::<F>();
     let idx_bytes = n_query * k * size_of::<u32>();
@@ -586,6 +656,33 @@ where
         DeviceArray::from_raw(val_handle, n_query * k),
         DeviceArray::from_raw(idx_handle, n_query * k),
     ))
+}
+
+/// Query rows per tile for the two-kernel `distance → top_k` pipelines.
+///
+/// Round the budget-derived tile DOWN to the alignment granularity, then clamp
+/// to `n_query`. This preserves the invariant the offset views need: either the
+/// result is a multiple of [`TILE_ALIGN_ROWS`] (so every `start` is too), or the
+/// clamp made it `n_query`, in which case there is a SINGLE tile at `start = 0`
+/// — which is trivially aligned.
+///
+/// `max(TILE_ALIGN_ROWS)` means a very large `n_train` can exceed the byte
+/// budget: 64 rows is the smallest tile that can be cut at all, so
+/// [`DIST_TILE_BUDGET_BYTES`] is a target rather than a hard cap. It is only
+/// reachable past `n_train ≈ 512_000` in f32, where the brute-force method is
+/// impractical for other reasons anyway.
+///
+/// Shared by the Euclidean and arbitrary-metric tile loops so the two cannot
+/// drift into different alignment invariants — the offset-view binding failure a
+/// drift would cause is a hard device validation error, not a slow path.
+fn dist_tile_rows<F>(n_train: usize, n_query: usize) -> usize
+where
+    F: Float + CubeElement + Pod,
+{
+    let row_bytes = n_train * size_of::<F>();
+    ((DIST_TILE_BUDGET_BYTES / row_bytes.max(1)) / TILE_ALIGN_ROWS * TILE_ALIGN_ROWS)
+        .max(TILE_ALIGN_ROWS)
+        .min(n_query)
 }
 
 /// The fallible tile loop of [`tiled_distance_topk`], split out so its caller
@@ -749,5 +846,174 @@ where
         yn.release_into(pool);
     }
 
+    Ok(())
+}
+
+/// `metric_distance → top_k` over the query rows in TILES for a NON-Euclidean
+/// [`Metric`] (KNN-REG-PARAMS) — the arbitrary-metric sibling of
+/// [`tiled_distance_topk`].
+///
+/// Geometry is assumed already validated by [`validate_kneighbors`].
+///
+/// ## Why this is a separate function rather than a branch inside the Euclidean one
+/// The Euclidean path dispatches across three kernel FAMILIES chosen by backend
+/// and shape (the cpu row-scan, the shared-memory fused family, the
+/// register-blocked two-kernel pipeline), and every one of them hard-codes
+/// `Σ(x−y)²`. None generalises to L1/L∞/Lp/cosine, so a metric branch inside
+/// them would be dead weight at best and a silent wrong-metric dispatch at
+/// worst. This composition uses only the portable per-element metric kernels
+/// plus the shared `top_k`, so it runs on every backend at every shape.
+///
+/// ## Tiling is the same, and free, for the same reason
+/// Materializing the whole `n_query × n_train` block is what bounds the problem
+/// size, and it is pure scratch: top-k is computed independently per query ROW,
+/// so no result depends on two tiles at once. Tiling therefore changes NOTHING
+/// numerically while making peak memory independent of `n_query`. Both outputs
+/// and the query matrix are row-major and contiguous, so each tile is a
+/// zero-copy byte-offset VIEW (`Handle::offset_start`) and `top_k` writes
+/// straight into the full buffers at the right global row offset.
+///
+/// The boundary root is whatever [`metric_distance`] reports it deferred: `true`
+/// only for Euclidean (which never reaches here), so in practice the metric
+/// kernels' TRUE distances pass through `top_k` untouched. The flag is
+/// nonetheless forwarded rather than hard-coded `false`, so a future metric that
+/// selects on an order-preserving power gets its root applied to the `k`
+/// selected values instead of the whole block.
+#[allow(clippy::too_many_arguments)]
+fn tiled_metric_distance_topk<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: &DeviceArray<ActiveRuntime, F>,
+    (n_train, n_features): (usize, usize),
+    xq: &DeviceArray<ActiveRuntime, F>,
+    (n_query, _): (usize, usize),
+    k: usize,
+    metric: Metric,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, u32>,
+    ),
+    AlgoError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    let tile_rows = dist_tile_rows::<F>(n_train, n_query);
+
+    let val_bytes = n_query * k * size_of::<F>();
+    let idx_bytes = n_query * k * size_of::<u32>();
+    let val_handle = pool.acquire(val_bytes);
+    let idx_handle = pool.acquire(idx_bytes);
+
+    // Same conservation duty as the Euclidean path: the two output buffers are
+    // already charged to `BufferPool::live_bytes`, so EVERY early return inside
+    // the loop must be met with an explicit release here. Dropping the handles
+    // instead would leave `live_bytes` permanently raised by `n_query * k * 8`
+    // bytes, and `pool.rs` documents that counter as the FOUND-05 conservation
+    // property the D-10 memory gate asserts on.
+    if let Err(e) = tiled_metric_distance_topk_tiles::<F>(
+        pool,
+        x_train,
+        (n_train, n_features),
+        xq,
+        n_query,
+        k,
+        tile_rows,
+        metric,
+        &val_handle,
+        &idx_handle,
+    ) {
+        pool.release(val_handle, val_bytes);
+        pool.release(idx_handle, idx_bytes);
+        return Err(e);
+    }
+
+    Ok((
+        DeviceArray::from_raw(val_handle, n_query * k),
+        DeviceArray::from_raw(idx_handle, n_query * k),
+    ))
+}
+
+/// The fallible tile loop of [`tiled_metric_distance_topk`], split out so its
+/// caller owns the two output buffers and can return them to the pool on ANY
+/// error path (see the call site).
+#[allow(clippy::too_many_arguments)]
+fn tiled_metric_distance_topk_tiles<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: &DeviceArray<ActiveRuntime, F>,
+    (n_train, n_features): (usize, usize),
+    xq: &DeviceArray<ActiveRuntime, F>,
+    n_query: usize,
+    k: usize,
+    tile_rows: usize,
+    metric: Metric,
+    val_handle: &Handle,
+    idx_handle: &Handle,
+) -> Result<(), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let mut start = 0usize;
+    while start < n_query {
+        let rows = tile_rows.min(n_query - start);
+
+        // Zero-copy row-slice views of the query matrix and of both outputs.
+        let xq_tile: DeviceArray<ActiveRuntime, F> = DeviceArray::from_raw(
+            xq.handle()
+                .clone()
+                .offset_start((start * n_features * size_of::<F>()) as u64),
+            rows * n_features,
+        );
+        let out_val: DeviceArray<ActiveRuntime, F> = DeviceArray::from_raw(
+            val_handle
+                .clone()
+                .offset_start((start * k * size_of::<F>()) as u64),
+            rows * k,
+        );
+        let out_idx: DeviceArray<ActiveRuntime, u32> = DeviceArray::from_raw(
+            idx_handle
+                .clone()
+                .offset_start((start * k * size_of::<u32>()) as u64),
+            rows * k,
+        );
+
+        let (dist, needs_sqrt) = metric_distance::<F>(
+            pool,
+            &xq_tile,
+            (rows, n_features),
+            x_train,
+            (n_train, n_features),
+            metric,
+            None,
+        )
+        .map_err(AlgoError::Prim)?;
+
+        let (val_view, idx_view) = match top_k::<F>(
+            pool,
+            &dist,
+            rows,
+            n_train,
+            k,
+            needs_sqrt,
+            Some(out_val),
+            Some(out_idx),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                dist.release_into(pool);
+                return Err(AlgoError::Prim(e));
+            }
+        };
+        // `val_view`/`idx_view` alias the caller-owned full buffers — drop the
+        // wrappers WITHOUT releasing, or the pool would hand the live output to
+        // a later acquire (WR-07).
+        drop(val_view);
+        drop(idx_view);
+
+        // Scratch only: return it so the next tile reuses the same buffer (D-11).
+        dist.release_into(pool);
+
+        start += rows;
+    }
     Ok(())
 }

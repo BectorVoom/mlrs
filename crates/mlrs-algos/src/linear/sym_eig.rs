@@ -80,33 +80,61 @@ pub fn sym_eig(a: &[f64], d: usize) -> (Vec<f64>, Vec<f64>) {
         return (vec![a[0]], vec![1.0]);
     }
 
-    // `v` starts as a symmetric copy built from the LOWER triangle, so an input
-    // whose upper triangle is stale (or absent) decomposes identically.
-    let mut v = vec![0.0f64; d * d];
+    // `w` starts as a symmetric copy built from the LOWER triangle, so an input
+    // whose upper triangle is stale (or absent) decomposes identically. Because
+    // the matrix is symmetric, that copy is simultaneously `V` and `Vᵀ` — which
+    // is why the transposed working layout below needs no extra setup.
+    let mut w = vec![0.0f64; d * d];
     for i in 0..d {
         for j in 0..=i {
             let x = a[i * d + j];
-            v[i * d + j] = x;
-            v[j * d + i] = x;
+            w[i * d + j] = x;
+            w[j * d + i] = x;
         }
     }
     let mut diag = vec![0.0f64; d];
     let mut sub = vec![0.0f64; d];
 
-    tred2(&mut v, &mut diag, &mut sub, d);
-    tql2(&mut v, &mut diag, &mut sub, d);
-    sort_descending(&mut diag, &mut v, d);
+    tred2(&mut w, &mut diag, &mut sub, d);
+    tql2(&mut w, &mut diag, &mut sub, d);
+    sort_descending(&mut diag, &mut w, d);
+
+    // `w` holds eigenvectors in ROWS; the published contract is COLUMNS. One
+    // `O(d²)` transpose against the `O(d³)` decomposition that produced it.
+    let mut v = vec![0.0f64; d * d];
+    for c in 0..d {
+        let row = &w[c * d..(c + 1) * d];
+        for (r, &val) in row.iter().enumerate() {
+            v[r * d + c] = val;
+        }
+    }
     (diag, v)
 }
 
-/// Householder reduction of the symmetric `v` to tridiagonal form (EISPACK
-/// `tred2`).
+/// Householder reduction of the symmetric `w` to tridiagonal form (EISPACK
+/// `tred2`), operating on the TRANSPOSED layout — `w[c·d + r]` is `V[r][c]`.
 ///
 /// On return `diag`/`sub` hold the tridiagonal's diagonal and subdiagonal, and
-/// `v` holds the accumulated orthogonal transformation.
-fn tred2(v: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
-    for j in 0..d {
-        diag[j] = v[(d - 1) * d + j];
+/// `w` holds the accumulated orthogonal transformation (in rows).
+///
+/// ## Why the layout is transposed (BAYES-GPU)
+/// This recurrence is written against a column-major FORTRAN original: every
+/// inner loop of both the reduction and the back-accumulation walks `k` over
+/// `V[k][j]` for a FIXED `j`. Held row-major, that is a stride of `d` elements
+/// — at `d = 256, f64` a 2 KiB stride, so each iteration touches a fresh
+/// 64-byte cache line and uses 8 of its bytes. The matrix is 512 KiB there, far
+/// past L1 and past a shared L2 slice, so the loop runs at line-fetch rate and
+/// the vectorizer cannot form a single packed load.
+///
+/// Storing the TRANSPOSE makes every one of those loops contiguous — the two
+/// dot-product-and-axpy pairs in the back-accumulation become plain slice
+/// operations over `w`'s rows — at the cost of one `O(d²)` transpose in
+/// [`sym_eig`]. The arithmetic, the operand order and hence the rounding are
+/// UNCHANGED: this is purely a re-indexing, which is what
+/// `sym_eig_test.rs`'s reconstruction and orthogonality gates hold it to.
+fn tred2(w: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
+    for (j, dj) in diag.iter_mut().enumerate().take(d) {
+        *dj = w[j * d + (d - 1)];
     }
 
     // --- Reduce row by row from the bottom. ---
@@ -122,9 +150,9 @@ fn tred2(v: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
             // The row is already zero off the subdiagonal — nothing to reflect.
             sub[i] = diag[i - 1];
             for j in 0..i {
-                diag[j] = v[(i - 1) * d + j];
-                v[i * d + j] = 0.0;
-                v[j * d + i] = 0.0;
+                diag[j] = w[j * d + (i - 1)];
+                w[j * d + i] = 0.0;
+                w[i * d + j] = 0.0;
             }
         } else {
             for k in 0..i {
@@ -146,11 +174,12 @@ fn tred2(v: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
             // Apply the similarity transformation to the remaining columns.
             for j in 0..i {
                 f = diag[j];
-                v[j * d + i] = f;
-                g = sub[j] + v[j * d + j] * f;
+                w[i * d + j] = f;
+                g = sub[j] + w[j * d + j] * f;
                 for k in (j + 1)..i {
-                    g += v[k * d + j] * diag[k];
-                    sub[k] += v[k * d + j] * f;
+                    let wkj = w[j * d + k];
+                    g += wkj * diag[k];
+                    sub[k] += wkj * f;
                 }
                 sub[j] = g;
             }
@@ -167,52 +196,63 @@ fn tred2(v: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
                 let fj = diag[j];
                 let gj = sub[j];
                 for k in j..i {
-                    v[k * d + j] -= fj * sub[k] + gj * diag[k];
+                    w[j * d + k] -= fj * sub[k] + gj * diag[k];
                 }
-                diag[j] = v[(i - 1) * d + j];
-                v[i * d + j] = 0.0;
+                diag[j] = w[j * d + (i - 1)];
+                w[j * d + i] = 0.0;
             }
         }
         diag[i] = h;
     }
 
-    // --- Accumulate the transformations into `v`. ---
+    // --- Accumulate the transformations into `w`. ---
+    //
+    // Both inner loops now run along `w`'s rows: `g` is a dot product of row
+    // `i+1` with row `j`, and the update is an axpy of row `i+1` into row `j`.
     for i in 0..(d - 1) {
-        v[(d - 1) * d + i] = v[i * d + i];
-        v[i * d + i] = 1.0;
+        w[i * d + (d - 1)] = w[i * d + i];
+        w[i * d + i] = 1.0;
         let h = diag[i + 1];
         if h != 0.0 {
-            for k in 0..=i {
-                diag[k] = v[k * d + (i + 1)] / h;
+            for (k, dk) in diag.iter_mut().enumerate().take(i + 1) {
+                *dk = w[(i + 1) * d + k] / h;
             }
             for j in 0..=i {
                 let mut g = 0.0f64;
                 for k in 0..=i {
-                    g += v[k * d + (i + 1)] * v[k * d + j];
+                    g += w[(i + 1) * d + k] * w[j * d + k];
                 }
                 for k in 0..=i {
-                    v[k * d + j] -= g * diag[k];
+                    w[j * d + k] -= g * diag[k];
                 }
             }
         }
         for k in 0..=i {
-            v[k * d + (i + 1)] = 0.0;
+            w[(i + 1) * d + k] = 0.0;
         }
     }
-    for j in 0..d {
-        diag[j] = v[(d - 1) * d + j];
-        v[(d - 1) * d + j] = 0.0;
+    for (j, dj) in diag.iter_mut().enumerate().take(d) {
+        *dj = w[j * d + (d - 1)];
+        w[j * d + (d - 1)] = 0.0;
     }
-    v[(d - 1) * d + (d - 1)] = 1.0;
+    w[(d - 1) * d + (d - 1)] = 1.0;
     sub[0] = 0.0;
 }
 
 /// Implicit-shift QL iteration on the tridiagonal `(diag, sub)`, accumulating
-/// the rotations into `v` (EISPACK `tql2`).
+/// the rotations into `w` (EISPACK `tql2`), in the transposed layout
+/// [`tred2`] leaves behind.
 ///
-/// On return `diag` holds the eigenvalues (unordered) and the columns of `v` the
+/// On return `diag` holds the eigenvalues (unordered) and the ROWS of `w` the
 /// matching eigenvectors.
-fn tql2(v: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
+///
+/// The rotation accumulation is this routine's `O(d³)` term and the whole
+/// reason for the layout: a plane rotation mixes eigenvector columns `i` and
+/// `i + 1` across ALL rows, which is two strided walks of the row-major form
+/// and two contiguous ROW updates here. The pair is taken through
+/// `split_at_mut` so both rows are borrowed mutably at once without indexing
+/// through bounds checks per element.
+fn tql2(w: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
     for i in 1..d {
         sub[i - 1] = sub[i];
     }
@@ -278,11 +318,15 @@ fn tql2(v: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
                     p = c * diag[i] - s * g;
                     diag[i + 1] = h + s * (c * g + s * diag[i]);
 
-                    // Accumulate the plane rotation into the eigenvectors.
-                    for k in 0..d {
-                        let hk = v[k * d + (i + 1)];
-                        v[k * d + (i + 1)] = s * v[k * d + i] + c * hk;
-                        v[k * d + i] = c * v[k * d + i] - s * hk;
+                    // Accumulate the plane rotation into the eigenvectors —
+                    // rows `i` and `i + 1` of `w`, both contiguous.
+                    let (lo, hi) = w.split_at_mut((i + 1) * d);
+                    let row_i = &mut lo[i * d..i * d + d];
+                    let row_j = &mut hi[..d];
+                    for (a, b) in row_i.iter_mut().zip(row_j.iter_mut()) {
+                        let hk = *b;
+                        *b = s * *a + c * hk;
+                        *a = c * *a - s * hk;
                     }
                 }
                 p = -s * s2 * c3 * el1 * sub[l] / dl1;
@@ -299,12 +343,14 @@ fn tql2(v: &mut [f64], diag: &mut [f64], sub: &mut [f64], d: usize) {
     }
 }
 
-/// Reorder `(lambda, v)` into DESCENDING eigenvalue order by selection sort,
-/// swapping whole eigenvector COLUMNS alongside.
+/// Reorder `(lambda, w)` into DESCENDING eigenvalue order by selection sort,
+/// swapping whole eigenvector ROWS of the transposed layout alongside.
 ///
 /// A selection sort is `O(d²)` comparisons against the `O(d³)` decomposition
-/// that precedes it, and it moves each column at most once.
-fn sort_descending(diag: &mut [f64], v: &mut [f64], d: usize) {
+/// that precedes it, and it moves each eigenvector at most once — as one
+/// contiguous `swap_with_slice` rather than the `d` strided element swaps the
+/// column layout would need.
+fn sort_descending(diag: &mut [f64], w: &mut [f64], d: usize) {
     for i in 0..d.saturating_sub(1) {
         let mut best = i;
         for (j, &val) in diag.iter().enumerate().take(d).skip(i + 1) {
@@ -314,9 +360,8 @@ fn sort_descending(diag: &mut [f64], v: &mut [f64], d: usize) {
         }
         if best != i {
             diag.swap(i, best);
-            for r in 0..d {
-                v.swap(r * d + i, r * d + best);
-            }
+            let (lo, hi) = w.split_at_mut(best * d);
+            lo[i * d..i * d + d].swap_with_slice(&mut hi[..d]);
         }
     }
 }

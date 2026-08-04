@@ -149,6 +149,173 @@ pub fn knn_regress_mean<F: Float + CubeElement>(
     }
 }
 
+/// GENERAL neighbor-target gather (KNN-REG-PARAMS): `weights='distance'` and/or
+/// a MULTI-OUTPUT target, in one kernel.
+///
+/// `out[q, o] = (Σ_j w_qj · y_train[idx[q,k+j], o]) / (Σ_j w_qj)` where `w` is
+/// `1` for `weighted == 0` (the uniform mean) and `1/dist[q, j]` for
+/// `weighted == 1`.
+///
+/// - `y_train` is the fitted `n_train × n_outputs` row-major target matrix; a
+///   single-output target is the `n_outputs == 1` case.
+/// - `idx` / `dist` are the `n_query × k` row-major neighbor indices and their
+///   TRUE (already sqrt'd / already-metric) distances from the selection stage.
+///   `dist` is read only when `weighted == 1`, but it is a required binding —
+///   an unbound `Array` argument is not expressible, so the uniform path passes
+///   the same buffer and simply never reads it.
+/// - `out` is `n_query × n_outputs`; `oob` is the per-row corruption flag with
+///   exactly the semantics of [`knn_regress_mean`]'s.
+///
+/// ## Zero distances (sklearn parity, `_get_weights`)
+/// `1/0` is `inf`, and sklearn does NOT let that propagate: when a query row has
+/// ANY neighbor at distance 0, sklearn gives those neighbors weight `1` and
+/// EVERY other neighbor in that row weight `0`, so the prediction is the plain
+/// mean of the coincident training points. Reproducing that exactly needs a
+/// pre-pass over the row (`any_zero`) before the weights can be formed, which is
+/// why the accumulation below is a second loop rather than one fused pass.
+/// Getting this wrong is silent: `inf/inf` is NaN, so a duplicated training
+/// point would turn a correct prediction into NaN with nothing to flag it.
+///
+/// ## Compensated (Neumaier) accumulation
+/// Both the numerator and the weight sum use the same Neumaier compensation as
+/// [`knn_regress_mean`], for the same reason: a naive `f32` running sum grows as
+/// `k · eps` and can exceed the project's 1e-5 sklearn-agreement bar on its own
+/// at large `n_neighbors` with large-magnitude targets. `weights='distance'`
+/// makes it strictly worse than the uniform case — `1/d` spans orders of
+/// magnitude within a single row, which is precisely the mixed-magnitude regime
+/// a naive sum loses the most bits in. The branchless magnitude test is the
+/// cubecl-cpu-MLIR-safe spelling (no `abs` intrinsic on a mutable, no early
+/// exit).
+///
+/// Launched 1D over `n_query` (one unit per query row); the kernel bounds-checks
+/// `q < n_query`, so an over-provisioned launch writes nothing. GATHER-only — no
+/// `SharedMemory`, no mutable `bool`, no plane ops — so the `cubecl-cpu` MLIR
+/// lowering accepts it and no backend feature gate is needed (D-13).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+pub fn knn_regress_gather<F: Float + CubeElement>(
+    y_train: &Array<F>,
+    idx: &Array<u32>,
+    dist: &Array<F>,
+    out: &mut Array<F>,
+    oob: &mut Array<u32>,
+    n_query: u32,
+    k: u32,
+    n_train: u32,
+    n_outputs: u32,
+    weighted: u32,
+) {
+    let q = ABSOLUTE_POS_X;
+    if q < n_query {
+        let base = q * k;
+        let zero = F::new(0.0_f32);
+        let one = F::new(1.0_f32);
+        let mut bad = 0u32;
+
+        // --- Pre-pass: does this row contain a coincident neighbor? sklearn's
+        //     `_get_weights` switches the WHOLE row to an indicator weighting
+        //     when it does (see the doc note), so this must be known before any
+        //     weight is formed. Cheap: k <= a few hundred, and it is skipped
+        //     entirely on the uniform path. ---
+        //
+        // The flag is carried as the row's MINIMUM DISTANCE (`F`), not as a
+        // `u32` counter: a mutable `u32` local compared against a literal
+        // (`if flag > 0u32`) is an E0282 inference failure inside `#[cube]`,
+        // while the mutable-`F`-vs-immutable-`F` compare below is the
+        // `chebyshev_dist` running-maximum idiom the macro is known to lower.
+        // `dist` is a bound argument on both paths so the read is always in
+        // range; the uniform path simply never consults `dmin`.
+        let mut dmin = dist[base as usize];
+        let mut z = 1u32;
+        while z < k {
+            let dz = dist[(base + z) as usize];
+            if dz < dmin {
+                dmin = dz;
+            }
+            z += 1u32;
+        }
+
+        let mut o = 0u32;
+        while o < n_outputs {
+            let mut acc = zero;
+            let mut acc_c = zero;
+            let mut wsum = zero;
+            let mut wsum_c = zero;
+            let mut j = 0u32;
+            while j < k {
+                let t = idx[(base + j) as usize];
+                // WR-02 parity with `knn_regress_mean`: an index outside
+                // `[0, n_train)` contributes NOTHING (no out-of-bounds device
+                // read) and flags the row instead of silently skewing the mean.
+                if t < n_train {
+                    let v = y_train[(t * n_outputs + o) as usize];
+                    let mut w = one;
+                    if weighted == 1u32 {
+                        let d = dist[(base + j) as usize];
+                        if dmin <= zero {
+                            // Coincident-neighbor row: indicator weighting.
+                            w = zero;
+                            if d <= zero {
+                                w = one;
+                            }
+                        } else {
+                            w = one / d;
+                        }
+                    }
+                    let term = w * v;
+
+                    // Neumaier fold of `term` into `acc`.
+                    let s = acc + term;
+                    let mut a_mag = acc;
+                    if a_mag < zero {
+                        a_mag = zero - a_mag;
+                    }
+                    let mut t_mag = term;
+                    if t_mag < zero {
+                        t_mag = zero - t_mag;
+                    }
+                    if a_mag >= t_mag {
+                        acc_c += (acc - s) + term;
+                    } else {
+                        acc_c += (term - s) + acc;
+                    }
+                    acc = s;
+
+                    // Neumaier fold of `w` into `wsum`. Weights are
+                    // non-negative, so the magnitude test always takes the
+                    // first arm — it is kept in the same shape as the numerator
+                    // so a future signed weighting cannot silently break it.
+                    let ws = wsum + w;
+                    let mut w_mag = wsum;
+                    if w_mag < zero {
+                        w_mag = zero - w_mag;
+                    }
+                    let mut wj_mag = w;
+                    if wj_mag < zero {
+                        wj_mag = zero - wj_mag;
+                    }
+                    if w_mag >= wj_mag {
+                        wsum_c += (wsum - ws) + w;
+                    } else {
+                        wsum_c += (w - ws) + wsum;
+                    }
+                    wsum = ws;
+                } else {
+                    bad = 1u32;
+                }
+                j += 1u32;
+            }
+            // `k >= 1` is validated host-side and every weight is > 0 on both
+            // paths (uniform: 1; distance: 1/d with d > 0, or the indicator
+            // weighting where at least the coincident neighbor carries 1), so
+            // the denominator is never zero for an uncorrupted row.
+            out[(q * n_outputs + o) as usize] = (acc + acc_c) / (wsum + wsum_c);
+            o += 1u32;
+        }
+        oob[q as usize] = bad;
+    }
+}
+
 /// FUSED squared-Euclidean distance + top-k selection (KNN-02) — the distance
 /// matrix is NEVER materialized.
 ///

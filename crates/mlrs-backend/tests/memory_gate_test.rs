@@ -1874,6 +1874,7 @@ fn memory_gate_sgd_bounded() {
         batch_size: 4, // genuine minibatching (3 batches/epoch).
         max_iter: 20,
         tol: 0.0, // run all epochs (deterministic, exercises the per-batch scratch).
+        n_iter_no_change: 5,
     };
 
     let mut allocs_after: Vec<u64> = Vec::with_capacity(N);

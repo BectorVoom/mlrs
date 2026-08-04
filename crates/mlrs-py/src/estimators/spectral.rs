@@ -38,14 +38,11 @@ use pyo3::prelude::*;
 
 use mlrs_algos::cluster::spectral_clustering::SpectralClustering;
 use mlrs_algos::cluster::spectral_embedding::SpectralEmbedding;
-// The v3 typestate `Fit` (consuming-self, returns the `Fitted` sibling) is imported
-// under an alias so the per-arm UFCS call disambiguates from any legacy surface and
-// the multiple-method-name collision the typestate module-doc warns about.
-use mlrs_algos::typestate::Fit as TypestateFit;
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
+use crate::egress::{f32_vec_to_pyarrow, f64_vec_to_pyarrow, i32_vec_to_pyarrow};
 use crate::ingress::{
-    as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype,
+    as_f32, as_f64, capsule_to_array, float_dtype, host_slice_f32, host_slice_f64, FloatDtype,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,7 +52,7 @@ use crate::ingress::{
 crate::any_estimator_typestate! {
     any:   AnySpectralEmbedding,
     algo:  mlrs_algos::cluster::spectral_embedding::SpectralEmbedding,
-    unfit: { n_components: usize, affinity: String, gamma: Option<f64>, n_neighbors: usize },
+    unfit: { n_components: usize, affinity: String, gamma: Option<f64>, n_neighbors: Option<usize> },
 }
 
 /// sklearn-compatible `SpectralEmbedding` (graph-Laplacian spectral embedding,
@@ -63,9 +60,15 @@ crate::any_estimator_typestate! {
 ///
 /// The constructor hyperparameters are persisted in [`SpectralEmbeddingParams`]
 /// (NOT only in the `Unfit` enum arm — WR-02) so a SECOND `fit` of the same object
-/// honors the user's params instead of silently reverting to sklearn defaults. The
-/// precision-typed `SpectralEmbedding<F>` (with `gamma=None → 1/n_features`, D-04)
-/// is built by the algos estimator at every `fit` once `n_features` is known.
+/// honors the user's params instead of silently reverting to sklearn defaults.
+///
+/// ## Ingress: no upload (SPECTRAL-PERF-CPU)
+/// The spectral pipeline is a single HOST implementation, so `fit` borrows the
+/// caller's Arrow buffer with [`host_slice_f32`] / [`host_slice_f64`] and never
+/// builds a `DeviceArray` for `X` at all. The former binding uploaded `X` on
+/// every fit; since the algos side then had to read it straight back, that cost
+/// three full passes over the design (`from_host` copies once, `to_host` copies
+/// twice) before any arithmetic happened.
 #[pyclass(name = "SpectralEmbedding")]
 pub struct PySpectralEmbedding {
     /// Constructor hyperparameters, persisted across fits (WR-02). Read on EVERY
@@ -75,7 +78,8 @@ pub struct PySpectralEmbedding {
     inner: AnySpectralEmbedding,
 }
 
-/// The persisted constructor hyperparameters for `SpectralEmbedding` (WR-02).
+/// The persisted constructor hyperparameters for `SpectralEmbedding` (WR-02) —
+/// sklearn 1.9's full eight-parameter surface.
 ///
 /// Held on the `#[pyclass]` struct itself so they survive into the fitted
 /// (`F32`/`F64`) arms and drive every `fit`, not just the first.
@@ -84,29 +88,42 @@ struct SpectralEmbeddingParams {
     n_components: usize,
     affinity: String,
     gamma: Option<f64>,
-    n_neighbors: usize,
+    random_state: Option<u64>,
+    eigen_solver: Option<String>,
+    /// `None` is sklearn's `eigen_tol="auto"`.
+    eigen_tol: Option<f64>,
+    /// `None` resolves to `max(n_samples / 10, 1)` at fit — sklearn's rule, NOT
+    /// a constant 10.
+    n_neighbors: Option<usize>,
+    n_jobs: Option<i64>,
+}
+
+/// Build the precision-typed algos estimator from the persisted params.
+///
+/// Shared by both dtype arms of `fit` so the two cannot drift on which
+/// parameters are forwarded — the failure mode a hand-copied second arm invites
+/// is a silently-ignored hyperparameter, which looks like a numerical bug.
+macro_rules! se_build {
+    ($float:ty, $p:expr) => {
+        SpectralEmbedding::<$float>::builder()
+            .n_components($p.n_components)
+            .affinity($p.affinity.clone())
+            .gamma($p.gamma)
+            .random_state($p.random_state)
+            .eigen_solver($p.eigen_solver.clone())
+            .eigen_tol($p.eigen_tol)
+            .n_neighbors($p.n_neighbors)
+            .n_jobs($p.n_jobs)
+            .build::<$float>()
+            .map_err(build_err_to_py)?
+    };
 }
 
 impl PySpectralEmbedding {
     /// Rust-callable default constructor for the smoke test (sklearn defaults:
-    /// `n_components=2`, `affinity="nearest_neighbors"`, `gamma=None`,
-    /// `n_neighbors=10`).
+    /// `n_components=2`, `affinity="nearest_neighbors"`, everything else `None`).
     pub fn unfit_default() -> Self {
-        let params = SpectralEmbeddingParams {
-            n_components: 2,
-            affinity: "nearest_neighbors".to_string(),
-            gamma: None,
-            n_neighbors: 10,
-        };
-        Self {
-            inner: AnySpectralEmbedding::Unfit {
-                n_components: params.n_components,
-                affinity: params.affinity.clone(),
-                gamma: params.gamma,
-                n_neighbors: params.n_neighbors,
-            },
-            params,
-        }
+        Self::new(2, "nearest_neighbors".to_string(), None, None, None, None, None, None)
     }
 
     /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
@@ -117,20 +134,45 @@ impl PySpectralEmbedding {
 
 #[pymethods]
 impl PySpectralEmbedding {
-    /// `SpectralEmbedding(n_components=2, affinity="nearest_neighbors", gamma=None, n_neighbors=10)`.
+    /// `SpectralEmbedding(n_components=2, *, affinity="nearest_neighbors",
+    /// gamma=None, random_state=None, eigen_solver=None, eigen_tol=None,
+    /// n_neighbors=None, n_jobs=None)`.
+    ///
+    /// `eigen_tol` arrives as `Option<f64>` rather than sklearn's
+    /// `float | "auto"` union: the shim maps the string `"auto"` to `None`
+    /// before crossing the boundary, so the Rust side has one type instead of a
+    /// `PyAny` it would have to re-parse.
     #[new]
-    #[pyo3(signature = (n_components = 2, affinity = "nearest_neighbors".to_string(), gamma = None, n_neighbors = 10))]
+    #[pyo3(signature = (
+        n_components = 2,
+        affinity = "nearest_neighbors".to_string(),
+        gamma = None,
+        random_state = None,
+        eigen_solver = None,
+        eigen_tol = None,
+        n_neighbors = None,
+        n_jobs = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         n_components: usize,
         affinity: String,
         gamma: Option<f64>,
-        n_neighbors: usize,
+        random_state: Option<u64>,
+        eigen_solver: Option<String>,
+        eigen_tol: Option<f64>,
+        n_neighbors: Option<usize>,
+        n_jobs: Option<i64>,
     ) -> Self {
         let params = SpectralEmbeddingParams {
             n_components,
             affinity,
             gamma,
+            random_state,
+            eigen_solver,
+            eigen_tol,
             n_neighbors,
+            n_jobs,
         };
         Self {
             inner: AnySpectralEmbedding::Unfit {
@@ -145,6 +187,8 @@ impl PySpectralEmbedding {
 
     /// Fit the embedding on `x` (`rows × cols`). Unsupervised — no `y`. GIL
     /// released (PY-03); f64 guarded on an f64-incapable backend (D-04).
+    ///
+    /// `x` is borrowed, never uploaded — see the struct docs.
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -157,41 +201,24 @@ impl PySpectralEmbedding {
         // WR-02: read the persisted constructor params (NOT the `Unfit` arm), so a
         // re-`fit` of an already-fitted object honors the user's hyperparameters
         // instead of reverting to sklearn defaults.
-        let SpectralEmbeddingParams {
-            n_components,
-            affinity,
-            gamma,
-            n_neighbors,
-        } = self.params.clone();
+        let p = self.params.clone();
         let fitted = py.detach(|| -> PyResult<AnySpectralEmbedding> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    // Builder gamma setter is Option<f64>; drop the legacy
-                    // `gamma.map(|g| g as f32)` cast (narrowed inside build::<f32>(), A5).
-                    let est = SpectralEmbedding::<f32>::builder()
-                        .n_components(n_components)
-                        .affinity(affinity)
-                        .gamma(gamma)
-                        .n_neighbors(n_neighbors)
-                        .build::<f32>()
-                        .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let est = se_build!(f32, p);
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(AnySpectralEmbedding::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let est = SpectralEmbedding::<f64>::builder()
-                        .n_components(n_components)
-                        .affinity(affinity)
-                        .gamma(gamma)
-                        .n_neighbors(n_neighbors)
-                        .build::<f64>()
-                        .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let est = se_build!(f64, p);
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(AnySpectralEmbedding::F64(fitted))
                 }
@@ -202,21 +229,89 @@ impl PySpectralEmbedding {
     }
 
     /// Host copy of the fitted `embedding_` (row-major `n × n_components`), f32
-    /// arm; the runtime [`not_fitted`] analog if not in the f32 arm (D-13).
-    fn embedding_f32(&self) -> PyResult<Vec<f32>> {
+    /// arm, as a pyarrow array; the runtime [`not_fitted`] analog if not in the
+    /// f32 arm (D-13).
+    fn embedding_f32<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnySpectralEmbedding::F32(e) => Ok(e.embedding(&pool)),
+            AnySpectralEmbedding::F32(e) => f32_vec_to_pyarrow(py, e.embedding(&pool)),
             _ => Err(not_fitted("spectral_embedding", "embedding_ (f32)")),
         }
     }
 
     /// Host copy of the fitted `embedding_`, f64 arm.
-    fn embedding_f64(&self) -> PyResult<Vec<f64>> {
+    fn embedding_f64<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnySpectralEmbedding::F64(e) => Ok(e.embedding(&pool)),
+            AnySpectralEmbedding::F64(e) => f64_vec_to_pyarrow(py, e.embedding(&pool)),
             _ => Err(not_fitted("spectral_embedding", "embedding_ (f64)")),
+        }
+    }
+
+    /// `affinity_matrix_` densified to a row-major `n × n` f64 pyarrow array.
+    ///
+    /// The kNN affinity is stored SPARSE, so asking for it dense materializes
+    /// `n²` values — use [`Self::affinity_matrix_csr`] when the caller can
+    /// consume CSR, which is what sklearn returns for that affinity.
+    fn affinity_matrix_dense<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnySpectralEmbedding::F32(e) => f64_vec_to_pyarrow(py, e.affinity_matrix_dense()),
+            AnySpectralEmbedding::F64(e) => f64_vec_to_pyarrow(py, e.affinity_matrix_dense()),
+            _ => Err(not_fitted("spectral_embedding", "affinity_matrix_")),
+        }
+    }
+
+    /// `affinity_matrix_` as the CSR triple `(indptr, indices, data)` when the
+    /// affinity builder produced a sparse graph, else `None`.
+    ///
+    /// `indptr` / `indices` cross as `i32` — the width `scipy.sparse.csr_matrix`
+    /// itself uses below the 2³¹-nonzero threshold, and the one integer egress
+    /// helper this crate has.
+    fn affinity_matrix_csr<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let csr = match &self.inner {
+            AnySpectralEmbedding::F32(e) => e.affinity_matrix_sparse(),
+            AnySpectralEmbedding::F64(e) => e.affinity_matrix_sparse(),
+            _ => return Err(not_fitted("spectral_embedding", "affinity_matrix_")),
+        };
+        let Some(csr) = csr else { return Ok(None) };
+        let indptr = i32_vec_to_pyarrow(py, csr.indptr.iter().map(|&v| v as i32).collect())?;
+        let indices = i32_vec_to_pyarrow(py, csr.indices.iter().map(|&v| v as i32).collect())?;
+        let data = f64_vec_to_pyarrow(py, csr.data.clone())?;
+        Ok(Some((indptr, indices, data)))
+    }
+
+    /// sklearn's `n_neighbors_` — the RESOLVED neighbor count. `None` unless a
+    /// kNN affinity was used, which is exactly when sklearn sets the attribute.
+    fn n_neighbors_resolved(&self) -> PyResult<Option<usize>> {
+        match &self.inner {
+            AnySpectralEmbedding::F32(e) => Ok(e.n_neighbors_()),
+            AnySpectralEmbedding::F64(e) => Ok(e.n_neighbors_()),
+            _ => Err(not_fitted("spectral_embedding", "n_neighbors_")),
+        }
+    }
+
+    /// sklearn's `gamma_` — the RESOLVED kernel coefficient. `None` unless a
+    /// kernel affinity was used.
+    fn gamma_resolved(&self) -> PyResult<Option<f64>> {
+        match &self.inner {
+            AnySpectralEmbedding::F32(e) => Ok(e.gamma_()),
+            AnySpectralEmbedding::F64(e) => Ok(e.gamma_()),
+            _ => Err(not_fitted("spectral_embedding", "gamma_")),
+        }
+    }
+
+    /// Connected components of the fitted affinity graph. sklearn warns
+    /// `"Graph is not fully connected, spectral embedding may not work as
+    /// expected."` when this exceeds 1 and changes nothing else; the shim raises
+    /// the same warning from this count.
+    fn n_graph_components(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnySpectralEmbedding::F32(e) => Ok(e.n_graph_components()),
+            AnySpectralEmbedding::F64(e) => Ok(e.n_graph_components()),
+            _ => Err(not_fitted("spectral_embedding", "n_graph_components")),
         }
     }
 
@@ -243,15 +338,18 @@ crate::any_estimator_typestate! {
     unfit: { n_clusters: usize, n_components: Option<usize>, affinity: String, gamma: f64, n_neighbors: usize, seed: u64 },
 }
 
-/// sklearn-compatible `SpectralClustering` (spectral embedding → KMeans,
-/// SPECTRAL-02).
+/// sklearn-compatible `SpectralClustering` (spectral embedding → label
+/// assignment, SPECTRAL-02).
 ///
 /// The constructor hyperparameters are persisted in [`SpectralClusteringParams`]
-/// (NOT only in the `Unfit` enum arm — WR-02) so a SECOND `fit` of the same object
-/// honors the user's params instead of silently reverting to sklearn defaults. The
-/// precision-typed `SpectralClustering<F>` (with `n_components=None → n_clusters`,
-/// D-11, and the literal `gamma` default, D-04) is built by the algos estimator at
-/// every `fit`.
+/// (NOT only in the `Unfit` enum arm — WR-02) so a SECOND `fit` of the same
+/// object honors the user's params instead of silently reverting to sklearn
+/// defaults.
+///
+/// Ingress is the no-upload host-slice arm, exactly as for
+/// [`PySpectralEmbedding`] — the pipeline is host-side, so building a
+/// `DeviceArray` for `X` would cost three full passes over the design before any
+/// arithmetic.
 #[pyclass(name = "SpectralClustering")]
 pub struct PySpectralClustering {
     /// Constructor hyperparameters, persisted across fits (WR-02). Read on EVERY
@@ -261,33 +359,89 @@ pub struct PySpectralClustering {
     inner: AnySpectralClustering,
 }
 
-/// The persisted constructor hyperparameters for `SpectralClustering` (WR-02).
+/// The persisted constructor hyperparameters for `SpectralClustering` (WR-02) —
+/// sklearn 1.9's surface.
 ///
-/// Held on the `#[pyclass]` struct itself so they survive into the fitted
-/// (`F32`/`F64`) arms and drive every `fit`, not just the first.
+/// `kernel_params` is deliberately absent: sklearn overwrites
+/// `params["gamma"|"degree"|"coef0"]` from the estimator's own attributes for any
+/// non-callable affinity and then calls `pairwise_kernels(filter_params=True)`,
+/// which drops every key outside those three — so for a string affinity the
+/// parameter is provably a no-op, and callable affinities are out of scope.
 #[derive(Clone)]
 struct SpectralClusteringParams {
     n_clusters: usize,
+    eigen_solver: Option<String>,
     n_components: Option<usize>,
-    affinity: String,
+    random_state: Option<u64>,
+    n_init: usize,
     gamma: f64,
+    affinity: String,
     n_neighbors: usize,
-    seed: u64,
+    /// `None` is sklearn's `eigen_tol="auto"`.
+    eigen_tol: Option<f64>,
+    assign_labels: String,
+    degree: f64,
+    coef0: f64,
+    n_jobs: Option<i64>,
+    verbose: bool,
+}
+
+impl Default for SpectralClusteringParams {
+    /// sklearn's `SpectralClustering` defaults verbatim.
+    fn default() -> Self {
+        Self {
+            n_clusters: 8,
+            eigen_solver: None,
+            n_components: None,
+            random_state: None,
+            n_init: 10,
+            gamma: 1.0,
+            affinity: "rbf".to_string(),
+            n_neighbors: 10,
+            eigen_tol: None,
+            assign_labels: "kmeans".to_string(),
+            degree: 3.0,
+            coef0: 1.0,
+            n_jobs: None,
+            verbose: false,
+        }
+    }
+}
+
+/// Build the precision-typed algos estimator from the persisted params.
+///
+/// Shared by both dtype arms of `fit` so the two cannot drift on which
+/// parameters are forwarded — a hand-copied second arm invites a silently
+/// dropped hyperparameter, which presents as a numerical bug.
+macro_rules! sc_build {
+    ($float:ty, $p:expr) => {
+        SpectralClustering::<$float>::builder()
+            .n_clusters($p.n_clusters)
+            .eigen_solver($p.eigen_solver.clone())
+            .n_components($p.n_components)
+            .random_state($p.random_state)
+            .n_init($p.n_init)
+            .gamma($p.gamma)
+            .affinity($p.affinity.clone())
+            .n_neighbors($p.n_neighbors)
+            .eigen_tol($p.eigen_tol)
+            .assign_labels($p.assign_labels.clone())
+            .degree($p.degree)
+            .coef0($p.coef0)
+            .n_jobs($p.n_jobs)
+            .verbose($p.verbose)
+            .build::<$float>()
+            .map_err(build_err_to_py)?
+    };
 }
 
 impl PySpectralClustering {
-    /// Rust-callable default constructor for the smoke test (sklearn defaults:
-    /// `n_clusters=8`, `n_components=None`, `affinity="rbf"`, `gamma=1.0`,
-    /// `n_neighbors=10`, `seed=0`).
+    /// Rust-callable default constructor for the smoke test.
     pub fn unfit_default() -> Self {
-        let params = SpectralClusteringParams {
-            n_clusters: 8,
-            n_components: None,
-            affinity: "rbf".to_string(),
-            gamma: 1.0,
-            n_neighbors: 10,
-            seed: 0,
-        };
+        Self::from_params(SpectralClusteringParams::default())
+    }
+
+    fn from_params(params: SpectralClusteringParams) -> Self {
         Self {
             inner: AnySpectralClustering::Unfit {
                 n_clusters: params.n_clusters,
@@ -295,7 +449,7 @@ impl PySpectralClustering {
                 affinity: params.affinity.clone(),
                 gamma: params.gamma,
                 n_neighbors: params.n_neighbors,
-                seed: params.seed,
+                seed: params.random_state.unwrap_or(0),
             },
             params,
         }
@@ -309,40 +463,71 @@ impl PySpectralClustering {
 
 #[pymethods]
 impl PySpectralClustering {
-    /// `SpectralClustering(n_clusters=8, n_components=None, affinity="rbf", gamma=1.0, n_neighbors=10, seed=0)`.
+    /// `SpectralClustering(n_clusters=8, *, eigen_solver=None, n_components=None,
+    /// random_state=None, n_init=10, gamma=1.0, affinity="rbf", n_neighbors=10,
+    /// eigen_tol=None, assign_labels="kmeans", degree=3, coef0=1, n_jobs=None,
+    /// verbose=False)`.
+    ///
+    /// `eigen_tol` arrives as `Option<f64>` rather than sklearn's
+    /// `float | "auto"` union: the shim maps `"auto"` to `None` before crossing
+    /// the boundary so the Rust side has one type instead of a `PyAny` to
+    /// re-parse.
     #[new]
-    #[pyo3(signature = (n_clusters = 8, n_components = None, affinity = "rbf".to_string(), gamma = 1.0, n_neighbors = 10, seed = 0))]
+    #[pyo3(signature = (
+        n_clusters = 8,
+        eigen_solver = None,
+        n_components = None,
+        random_state = None,
+        n_init = 10,
+        gamma = 1.0,
+        affinity = "rbf".to_string(),
+        n_neighbors = 10,
+        eigen_tol = None,
+        assign_labels = "kmeans".to_string(),
+        degree = 3.0,
+        coef0 = 1.0,
+        n_jobs = None,
+        verbose = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         n_clusters: usize,
+        eigen_solver: Option<String>,
         n_components: Option<usize>,
-        affinity: String,
+        random_state: Option<u64>,
+        n_init: usize,
         gamma: f64,
+        affinity: String,
         n_neighbors: usize,
-        seed: u64,
+        eigen_tol: Option<f64>,
+        assign_labels: String,
+        degree: f64,
+        coef0: f64,
+        n_jobs: Option<i64>,
+        verbose: bool,
     ) -> Self {
-        let params = SpectralClusteringParams {
+        Self::from_params(SpectralClusteringParams {
             n_clusters,
+            eigen_solver,
             n_components,
-            affinity,
+            random_state,
+            n_init,
             gamma,
+            affinity,
             n_neighbors,
-            seed,
-        };
-        Self {
-            inner: AnySpectralClustering::Unfit {
-                n_clusters: params.n_clusters,
-                n_components: params.n_components,
-                affinity: params.affinity.clone(),
-                gamma: params.gamma,
-                n_neighbors: params.n_neighbors,
-                seed: params.seed,
-            },
-            params,
-        }
+            eigen_tol,
+            assign_labels,
+            degree,
+            coef0,
+            n_jobs,
+            verbose,
+        })
     }
 
     /// Fit the clustering on `x` (`rows × cols`). Unsupervised — no `y`. GIL
     /// released (PY-03); f64 guarded on an f64-incapable backend (D-04).
+    ///
+    /// `x` is borrowed, never uploaded — see the struct docs.
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -352,50 +537,24 @@ impl PySpectralClustering {
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        // WR-02: read the persisted constructor params (NOT the `Unfit` arm), so a
-        // re-`fit` of an already-fitted object honors the user's hyperparameters
-        // instead of reverting to sklearn defaults.
-        let SpectralClusteringParams {
-            n_clusters,
-            n_components,
-            affinity,
-            gamma,
-            n_neighbors,
-            seed,
-        } = self.params.clone();
+        let p = self.params.clone();
         let fitted = py.detach(|| -> PyResult<AnySpectralClustering> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    // Builder setters are f64; drop the legacy `gamma as f32` cast
-                    // (the f64→F narrowing happens once inside build::<f32>(), A5).
-                    let est = SpectralClustering::<f32>::builder()
-                        .n_clusters(n_clusters)
-                        .n_components(n_components)
-                        .affinity(affinity)
-                        .gamma(gamma)
-                        .n_neighbors(n_neighbors)
-                        .seed(seed)
-                        .build::<f32>()
-                        .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let est = sc_build!(f32, p);
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(AnySpectralClustering::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let est = SpectralClustering::<f64>::builder()
-                        .n_clusters(n_clusters)
-                        .n_components(n_components)
-                        .affinity(affinity)
-                        .gamma(gamma)
-                        .n_neighbors(n_neighbors)
-                        .seed(seed)
-                        .build::<f64>()
-                        .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, None, (rows, cols))
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let est = sc_build!(f64, p);
+                    let fitted = est
+                        .fit_from_host_slice(&mut pool, xh, (rows, cols))
                         .map_err(algo_err_to_py)?;
                     Ok(AnySpectralClustering::F64(fitted))
                 }
@@ -405,14 +564,53 @@ impl PySpectralClustering {
         Ok(())
     }
 
-    /// Fitted `labels_` (i32), either dtype arm; the runtime [`not_fitted`] analog
-    /// on the `Unfit` arm (D-13).
-    fn labels_(&self) -> PyResult<Vec<i32>> {
+    /// Fitted `labels_` (length `n`, `i32`) as a pyarrow array.
+    fn labels_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = crate::lock_pool();
+        let labels = match &self.inner {
+            AnySpectralClustering::F32(e) => e.labels(&pool),
+            AnySpectralClustering::F64(e) => e.labels(&pool),
+            _ => return Err(not_fitted("spectral_clustering", "labels_")),
+        };
+        i32_vec_to_pyarrow(py, labels)
+    }
+
+    /// `affinity_matrix_` densified to a row-major `n × n` f64 pyarrow array.
+    fn affinity_matrix_dense<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match &self.inner {
-            AnySpectralClustering::F32(e) => Ok(e.labels(&pool)),
-            AnySpectralClustering::F64(e) => Ok(e.labels(&pool)),
-            _ => Err(not_fitted("spectral_clustering", "labels_")),
+            AnySpectralClustering::F32(e) => f64_vec_to_pyarrow(py, e.affinity_matrix_dense()),
+            AnySpectralClustering::F64(e) => f64_vec_to_pyarrow(py, e.affinity_matrix_dense()),
+            _ => Err(not_fitted("spectral_clustering", "affinity_matrix_")),
+        }
+    }
+
+    /// `affinity_matrix_` as the CSR triple `(indptr, indices, data)` when the
+    /// affinity builder produced a sparse graph, else `None` — the same split
+    /// sklearn produces (`csr_matrix` for the kNN affinities, dense `ndarray`
+    /// for the kernels).
+    fn affinity_matrix_csr<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+        let csr = match &self.inner {
+            AnySpectralClustering::F32(e) => e.affinity_matrix_sparse(),
+            AnySpectralClustering::F64(e) => e.affinity_matrix_sparse(),
+            _ => return Err(not_fitted("spectral_clustering", "affinity_matrix_")),
+        };
+        let Some(csr) = csr else { return Ok(None) };
+        let indptr = i32_vec_to_pyarrow(py, csr.indptr.iter().map(|&v| v as i32).collect())?;
+        let indices = i32_vec_to_pyarrow(py, csr.indices.iter().map(|&v| v as i32).collect())?;
+        let data = f64_vec_to_pyarrow(py, csr.data.clone())?;
+        Ok(Some((indptr, indices, data)))
+    }
+
+    /// Connected components of the fitted affinity graph, for the shim's
+    /// sklearn-parity connectivity warning.
+    fn n_graph_components(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnySpectralClustering::F32(e) => Ok(e.n_graph_components()),
+            AnySpectralClustering::F64(e) => Ok(e.n_graph_components()),
+            _ => Err(not_fitted("spectral_clustering", "n_graph_components")),
         }
     }
 

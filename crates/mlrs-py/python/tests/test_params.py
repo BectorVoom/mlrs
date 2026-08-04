@@ -39,6 +39,21 @@ EXPECTED_PARAMS = {
         "random_state": None,
         "output_type": "input",
     },
+    # RidgeClassifier carries sklearn's FULL RidgeClassifier signature
+    # (alpha .. random_state, minus `tol`'s docstring alias) — the
+    # cpu/cuda fit work (mlrs-ridge-classifier-cpu / mlrs-ridge-classifier-cuda).
+    "RidgeClassifier": {
+        "alpha": 1.0,
+        "fit_intercept": True,
+        "copy_X": True,
+        "max_iter": None,
+        "tol": 1e-4,
+        "class_weight": None,
+        "solver": "auto",
+        "positive": False,
+        "random_state": None,
+        "output_type": "input",
+    },
     # BayesianRidge carries sklearn's FULL signature (max_iter .. verbose).
     "BayesianRidge": {
         "max_iter": 300,
@@ -89,7 +104,19 @@ EXPECTED_PARAMS = {
     "TruncatedSVD": {"n_components": 2, "output_type": "input"},
     "NearestNeighbors": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
     "KNeighborsClassifier": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
-    "KNeighborsRegressor": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
+    # KNN-REG-PARAMS: the regressor carries sklearn's FULL parameter surface,
+    # unlike its two older siblings above.
+    "KNeighborsRegressor": {
+        "n_neighbors": 5,
+        "output_type": "input",
+        "weights": "uniform",
+        "algorithm": "auto",
+        "leaf_size": 30,
+        "p": 2,
+        "metric": "minkowski",
+        "metric_params": None,
+        "n_jobs": None,
+    },
     # PCA requires an explicit n_components — constructed with n_components=2.
     "PCA": {"n_components": 2, "output_type": "input"},
     # --- pre-existing shims that were not in the original ALL_12 matrix (now
@@ -157,6 +184,9 @@ EXPECTED_PARAMS = {
         "batch_size": 1,
         "shuffle": True,
         "seed": 0,
+        # sklearn's SGDClassifier default; the OvR multiclass fit's
+        # loss-plateau early stop (mlrs-mbsgd-wgpu-and-convergence).
+        "n_iter_no_change": 5,
         "output_type": "input",
     },
     "MBSGDRegressor": {
@@ -174,6 +204,8 @@ EXPECTED_PARAMS = {
         "batch_size": 1,
         "shuffle": True,
         "seed": 0,
+        # sklearn's SGDRegressor default (see MBSGDClassifier's note).
+        "n_iter_no_change": 5,
         "output_type": "input",
     },
     "GaussianNB": {
@@ -226,6 +258,43 @@ EXPECTED_PARAMS = {
         "bandwidth_rule": "numeric",
         "output_type": "input",
     },
+    # --- PREP-01: the six preprocessing scalers. Every default matches
+    # sklearn's own, EXCEPT MaxAbsScaler: sklearn's has a `clip` param mlrs
+    # does not implement, so its entry is 2 keys, not 3. --------------------
+    "StandardScaler": {
+        "copy": True,
+        "with_mean": True,
+        "with_std": True,
+        "output_type": "input",
+    },
+    "MinMaxScaler": {
+        "feature_range": (0, 1),
+        "copy": True,
+        "clip": False,
+        "output_type": "input",
+    },
+    "MaxAbsScaler": {
+        "copy": True,
+        "output_type": "input",
+    },
+    "RobustScaler": {
+        "with_centering": True,
+        "with_scaling": True,
+        "quantile_range": (25.0, 75.0),
+        "copy": True,
+        "unit_variance": False,
+        "output_type": "input",
+    },
+    "Normalizer": {
+        "norm": "l2",
+        "copy": True,
+        "output_type": "input",
+    },
+    "Binarizer": {
+        "threshold": 0.0,
+        "copy": True,
+        "output_type": "input",
+    },
     "SpectralClustering": {
         "n_clusters": 8,
         "n_components": None,
@@ -233,13 +302,31 @@ EXPECTED_PARAMS = {
         "gamma": 1.0,
         "n_neighbors": 10,
         "random_state": None,
+        # sklearn's SpectralClustering defaults; the n_samples<=64 cap lift
+        # (mlrs-spectral-cpu-optimization) widened the shim to sklearn's full
+        # param surface, not just the previously-implemented subset.
+        "eigen_solver": None,
+        "n_init": 10,
+        "eigen_tol": "auto",
+        "assign_labels": "kmeans",
+        "degree": 3,
+        "coef0": 1,
+        "n_jobs": None,
+        "verbose": False,
         "output_type": "input",
     },
     "SpectralEmbedding": {
         "n_components": 2,
         "affinity": "nearest_neighbors",
         "gamma": None,
-        "n_neighbors": 10,
+        # sklearn's SpectralEmbedding default is None (resolved at fit), not
+        # 10 — the full param-surface widening also fixed this pre-existing
+        # divergence (see SpectralClustering's note).
+        "n_neighbors": None,
+        "random_state": None,
+        "eigen_solver": None,
+        "eigen_tol": "auto",
+        "n_jobs": None,
         "output_type": "input",
     },
     "UMAP": {
@@ -340,6 +427,7 @@ EXPECTED_PARAMS = {
 SET_PARAM = {
     "LinearRegression": ("fit_intercept", False),
     "Ridge": ("alpha", 2.0),
+    "RidgeClassifier": ("alpha", 2.0),
     "BayesianRidge": ("max_iter", 50),
     "Lasso": ("alpha", 2.0),
     "ElasticNet": ("l1_ratio", 0.25),
@@ -369,6 +457,13 @@ SET_PARAM = {
     "CategoricalNB": ("alpha", 2.0),
     "KernelRidge": ("alpha", 2.0),
     "KernelDensity": ("bandwidth", 2.0),
+    # --- PREP-01: the six preprocessing scalers. --------------------------- #
+    "StandardScaler": ("with_mean", False),
+    "MinMaxScaler": ("feature_range", (-1, 1)),
+    "MaxAbsScaler": ("copy", False),
+    "RobustScaler": ("with_centering", False),
+    "Normalizer": ("norm", "l1"),
+    "Binarizer": ("threshold", 1.0),
     "SpectralClustering": ("n_clusters", 4),
     "SpectralEmbedding": ("n_components", 3),
     "UMAP": ("n_neighbors", 10),

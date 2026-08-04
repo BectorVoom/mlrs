@@ -39,15 +39,17 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use mlrs_core::PrimError;
+use mlrs_kernels::knn::row_sumsq;
 use mlrs_kernels::{
-    dist_combine_clamp, euclidean_sq_dist, euclidean_sq_dist_rb, euclidean_sq_dist_rb4,
-    euclidean_sq_dist_tiled, sqrt_elem,
+    chebyshev_dist, cosine_dist, dist_combine_clamp, euclidean_sq_dist, euclidean_sq_dist_rb,
+    euclidean_sq_dist_rb4, euclidean_sq_dist_tiled, manhattan_dist, minkowski_dist, sqrt_elem,
 };
 
 use crate::capability;
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
 use crate::prims::gemm::gemm;
+use crate::prims::knn_graph::Metric;
 use crate::prims::reduce::{row_reduce, ReducePath, ScalarOp};
 use crate::runtime::ActiveRuntime;
 
@@ -546,4 +548,192 @@ where
     }
 
     Ok(DeviceArray::from_raw(out_handle, out_len))
+}
+
+/// Pairwise QUERY-vs-TRAIN distance under an arbitrary [`Metric`]
+/// (KNN-REG-PARAMS) — the X-vs-Y counterpart of
+/// [`knn_graph`](crate::prims::knn_graph::knn_graph)'s X-vs-X metric dispatch.
+///
+/// Returns `(block, needs_boundary_sqrt)` where `block` is the row-major
+/// `rows_x × rows_y` distance matrix and the flag says whether the value is the
+/// ORDER-PRESERVING SQUARE of the metric rather than the metric itself:
+///
+/// | metric | kernel | returned value | flag |
+/// |---|---|---|---|
+/// | `Euclidean` | [`distance_direct`] | `d²` | `true` |
+/// | `Manhattan` / `Chebyshev` / `Minkowski` | the direct feature-loop kernels | `d` | `false` |
+/// | `Cosine` | [`mlrs_kernels::cosine_dist`] + [`row_sumsq`] norms | `d` | `false` |
+///
+/// The caller forwards the flag to `top_k`'s `sqrt` argument, so the root is
+/// applied to the `rows_x × k` SELECTED values only, never to the whole block
+/// (D-08 / Pitfall 8). The selected INDICES are identical either way — squaring
+/// is monotone on the non-negative block.
+///
+/// ## Why Cosine is a kernel here and a host normalisation in `knn_graph`
+/// `knn_graph` L2-normalises its rows on the HOST once and reuses the GEMM
+/// Euclidean path, which is right for X-vs-X where the same matrix is both
+/// operands. A query-vs-train `predict` has two DIFFERENT operands, one of them
+/// fitted state that must not be mutated, so that route would mean either
+/// storing a second normalised copy of the training matrix or re-normalising it
+/// on every `predict` — a host round-trip of the whole fitted matrix per call.
+/// The dedicated kernel reads each operand once and keeps the path
+/// device-resident; the norm feeders are the same one-launch [`row_sumsq`]
+/// GATHER the fused KNN path uses (NEVER `row_reduce`, whose per-row host
+/// round-trip is a measured >100× pathology at these row counts).
+///
+/// - Geometry is validated BEFORE any `unsafe` launch (D-04 / ASVS V5), reusing
+///   the same [`validate_geometry`] as every other entry point here.
+/// - `Metric::Minkowski { p }` requires `p >= 1` (rejected as a `ShapeMismatch`
+///   on the synthetic `"p"` operand — `PrimError` has no numeric-range variant,
+///   the `knn_graph` precedent) and carries the f64-transcendental capability
+///   guard: `minkowski_dist` is the only metric kernel that evaluates `F::powf`,
+///   which SEGFAULTS the shader compiler on a backend with f64 arithmetic but no
+///   f64 transcendentals. The other metrics are pure arithmetic and stay
+///   available at f64 everywhere, so the guard is per-metric, not per-prim.
+/// - The `rows_x × rows_y` result is acquired from `pool` when `out` is `None`
+///   (D-11) and stays device-resident (D-05).
+#[allow(clippy::too_many_arguments)]
+pub fn metric_distance<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    (rows_x, cols): (usize, usize),
+    y: &DeviceArray<ActiveRuntime, F>,
+    (rows_y, cols_y): (usize, usize),
+    metric: Metric,
+    out: Option<DeviceArray<ActiveRuntime, F>>,
+) -> Result<(DeviceArray<ActiveRuntime, F>, bool), PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    // Euclidean is not merely "one of the metrics" here — it is the tuned
+    // default whose fused / register-blocked / cpu-row-scan family the whole KNN
+    // path is built on. Delegate rather than re-implement, so adding a metric
+    // can never silently change what `metric='euclidean'` computes.
+    if matches!(metric, Metric::Euclidean) {
+        let d = distance_direct::<F>(pool, x, (rows_x, cols), y, (rows_y, cols_y), out)?;
+        return Ok((d, true));
+    }
+
+    if let Metric::Minkowski { p } = metric {
+        // Same guard `knn_graph` and `umap.transform` carry, for the same
+        // kernel: this path launches `minkowski_dist` directly, so neither of
+        // theirs covers it.
+        capability::guard_f64_transcendental::<F>("metric_distance(minkowski)")?;
+        if !(p >= 1.0) {
+            return Err(PrimError::ShapeMismatch {
+                operand: "p",
+                rows: 1,
+                cols: 0,
+                len: 0,
+            });
+        }
+    }
+
+    validate_geometry(
+        x.len(),
+        (rows_x, cols),
+        y.len(),
+        (rows_y, cols_y),
+        out.as_ref().map(DeviceArray::len),
+    )?;
+    // WR-03: the three dims are cast to u32 for the launch; reject an
+    // overflowing dimension BEFORE launch so the cast cannot truncate into a bad
+    // bound.
+    for (operand, dim) in [("rows_x", rows_x), ("rows_y", rows_y), ("cols", cols)] {
+        if dim > u32::MAX as usize {
+            return Err(PrimError::ShapeMismatch {
+                operand,
+                rows: dim,
+                cols: 0,
+                len: u32::MAX as usize,
+            });
+        }
+    }
+
+    let out_len = rows_x.checked_mul(rows_y).ok_or(PrimError::Overflow {
+        operand: "metric_distance",
+        lhs: rows_x,
+        rhs: rows_y,
+    })?;
+    let out_handle = match &out {
+        Some(o) => o.handle().clone(),
+        None => pool.acquire(out_len * size_of::<F>()),
+    };
+
+    let client = pool.client().clone();
+    let (count, dim) = launch_dims_2d(rows_x, rows_y);
+
+    // SAFETY: lengths are the carried/validated element counts; every kernel
+    // below bounds-checks `i < rows_x && j < rows_y` and its feature loop
+    // `kk < cols`.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
+
+    match metric {
+        Metric::Manhattan => manhattan_dist::launch::<F, ActiveRuntime>(
+            &client, count, dim, x_arg, y_arg, out_arg, rows_x as u32, rows_y as u32, cols as u32,
+        ),
+        Metric::Chebyshev => chebyshev_dist::launch::<F, ActiveRuntime>(
+            &client, count, dim, x_arg, y_arg, out_arg, rows_x as u32, rows_y as u32, cols as u32,
+        ),
+        Metric::Minkowski { p } => minkowski_dist::launch::<F, ActiveRuntime>(
+            &client,
+            count,
+            dim,
+            x_arg,
+            y_arg,
+            out_arg,
+            rows_x as u32,
+            rows_y as u32,
+            cols as u32,
+            f64_to_elem::<F>(p),
+        ),
+        Metric::Cosine => {
+            // Per-row SUM OF SQUARES for both operands via the one-launch GATHER
+            // feeder (see the module note on `row_reduce`); the kernel takes the
+            // root once per output element.
+            let xn_handle = pool.acquire(rows_x * size_of::<F>());
+            let yn_handle = pool.acquire(rows_y * size_of::<F>());
+            {
+                let (nc, nd) = super::launch_dims_1d(rows_x, capability::gather_launch_width());
+                let in_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+                let o_arg = unsafe { ArrayArg::from_raw_parts(xn_handle.clone(), rows_x) };
+                row_sumsq::launch::<F, ActiveRuntime>(
+                    &client, nc, nd, in_arg, o_arg, rows_x as u32, cols as u32,
+                );
+                let (nc, nd) = super::launch_dims_1d(rows_y, capability::gather_launch_width());
+                let in_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+                let o_arg = unsafe { ArrayArg::from_raw_parts(yn_handle.clone(), rows_y) };
+                row_sumsq::launch::<F, ActiveRuntime>(
+                    &client, nc, nd, in_arg, o_arg, rows_y as u32, cols as u32,
+                );
+            }
+            let xn_arg = unsafe { ArrayArg::from_raw_parts(xn_handle.clone(), rows_x) };
+            let yn_arg = unsafe { ArrayArg::from_raw_parts(yn_handle.clone(), rows_y) };
+            cosine_dist::launch::<F, ActiveRuntime>(
+                &client, count, dim, x_arg, y_arg, xn_arg, yn_arg, out_arg, rows_x as u32,
+                rows_y as u32, cols as u32,
+            );
+            // Both norm vectors are consumed by the launch above and never read
+            // again (same-stream ordering protects any later reuse).
+            DeviceArray::<ActiveRuntime, F>::from_raw(xn_handle, rows_x).release_into(pool);
+            DeviceArray::<ActiveRuntime, F>::from_raw(yn_handle, rows_y).release_into(pool);
+        }
+        Metric::Euclidean => unreachable!("the Euclidean fast path returned above"),
+    }
+
+    Ok((DeviceArray::from_raw(out_handle, out_len), false))
+}
+
+/// Cast a host `f64` scalar into the kernel element type `F` (`f32` / `f64`) —
+/// the Minkowski exponent's only crossing point. Mirrors
+/// `knn_graph::f64_to_host`, kept local so this module has no dependency on the
+/// graph prim's private helpers.
+fn f64_to_elem<F: Pod>(v: f64) -> F {
+    match size_of::<F>() {
+        4 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&(v as f32))),
+        8 => *bytemuck::from_bytes::<F>(bytemuck::bytes_of(&v)),
+        _ => unreachable!("F is f32 or f64"),
+    }
 }

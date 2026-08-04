@@ -20,6 +20,7 @@ use mlrs_algos::linear::logistic::LogisticRegression;
 use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
 use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::ridge::{Ridge, RidgeSolver};
+use mlrs_algos::linear::ridge_classifier::{ClassWeight, RidgeClassifier};
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
 // Phase 16 (D-01): every estimator in this file now consumes the typestate
 // surface — the legacy trait glob has been removed. The typestate
@@ -32,6 +33,7 @@ use mlrs_algos::typestate::{
     Fit as TypestateFit, Fitted as AlgoFitted, Predict as TypestatePredict,
     PredictLabels as TypestatePredictLabels, PredictProba as TypestatePredictProba,
 };
+use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::linear_predict::HostPrediction;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -171,6 +173,54 @@ fn dense_predict_f64<'py, E: DensePredictHost<f64>>(
         let xh = host_slice_f64(as_f64(&xa)?)?;
         let pred = est
             .predict_from_host_slice(&mut pool, xh, (rows, cols))
+            .map_err(algo_err_to_py)?;
+        if !pred.operand_finite {
+            return Err(nonfinite_input_err(xh, "float64"));
+        }
+        Ok(pred.values)
+    })?;
+    f64_vec_to_pyarrow(py, out)
+}
+
+/// Multi-target twin of [`dense_predict_f32`] (RIDGE-MULTI-TARGET): returns an
+/// `m × n_targets` row-major **pyarrow** float array. Ridge-only — the shared
+/// [`DensePredictHost`] trait (and the four OTHER dense linear regressors that
+/// implement it) stays single-target, so this is a free function over the
+/// concrete `Ridge<f32, AlgoFitted>` rather than a trait method.
+fn dense_predict_multi_f32<'py>(
+    py: Python<'py>,
+    x: &Bound<'_, PyAny>,
+    (rows, cols): (usize, usize),
+    est: &Ridge<f32, AlgoFitted>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let xa = capsule_to_array(x)?;
+    let out = py.detach(|| -> PyResult<Vec<f32>> {
+        let mut pool = crate::lock_pool();
+        let xh = host_slice_f32(as_f32(&xa)?)?;
+        let pred = est
+            .predict_multi_from_host(&mut pool, xh, (rows, cols))
+            .map_err(algo_err_to_py)?;
+        if !pred.operand_finite {
+            return Err(nonfinite_input_err(xh, "float32"));
+        }
+        Ok(pred.values)
+    })?;
+    f32_vec_to_pyarrow(py, out)
+}
+
+/// f64 twin of [`dense_predict_multi_f32`].
+fn dense_predict_multi_f64<'py>(
+    py: Python<'py>,
+    x: &Bound<'_, PyAny>,
+    (rows, cols): (usize, usize),
+    est: &Ridge<f64, AlgoFitted>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let xa = capsule_to_array(x)?;
+    let out = py.detach(|| -> PyResult<Vec<f64>> {
+        let mut pool = crate::lock_pool();
+        let xh = host_slice_f64(as_f64(&xa)?)?;
+        let pred = est
+            .predict_multi_from_host(&mut pool, xh, (rows, cols))
             .map_err(algo_err_to_py)?;
         if !pred.operand_finite {
             return Err(nonfinite_input_err(xh, "float64"));
@@ -511,6 +561,30 @@ macro_rules! ridge_fit_dispatch {
     }};
 }
 
+/// Multi-target twin of [`ridge_fit_dispatch`] (RIDGE-MULTI-TARGET): `$ya` is
+/// `rows × n_targets` row-major (already ravelled that way by the Python
+/// shim's `_normalize_y`, which accepts 2-D input via `check_array(ensure_2d=
+/// False)`). Always takes the DEVICE ingress —
+/// [`Ridge::fit_multi_target_with_sample_weight`] has no host-slice twin of
+/// [`Ridge::fit_from_host_slice`] (fit-side perf is not this feature's target;
+/// see that method's Rust doc comment for why).
+macro_rules! ridge_fit_multi_dispatch {
+    ($float:ty, $p:expr, $xa:expr, $ya:expr, $swa:expr, $rows:expr, $cols:expr, $n_targets:expr,
+     $pool:expr, $as:ident, $host_slice:ident, $validated:ident) => {{
+        let est = ridge_build!($float, $p);
+        let sw = match $swa.as_ref() {
+            Some(a) => Some($host_slice($as(a)?)?),
+            None => None,
+        };
+        let xd = $validated($as(&$xa)?, &mut $pool)?;
+        let yd = $validated($as(&$ya)?, &mut $pool)?;
+        est.fit_multi_target_with_sample_weight(
+            &mut $pool, &xd, &yd, ($rows, $cols), $n_targets, sw,
+        )
+        .map_err(algo_err_to_py)?
+    }};
+}
+
 #[pymethods]
 impl PyRidge {
     /// `Ridge(alpha=1.0, fit_intercept=True, copy_X=True, max_iter=None,
@@ -555,13 +629,22 @@ impl PyRidge {
         }
     }
 
-    /// `fit(X, y, rows, cols, sample_weight=None)`.
+    /// `fit(X, y, rows, cols, sample_weight=None, n_targets=1)`.
     ///
     /// `sample_weight` is an optional length-`rows` Arrow float array in the SAME
     /// dtype as `X` — it is borrowed as a host slice (never uploaded), because
     /// the weighted preprocessing that consumes it is a host pass anyway
     /// (`ridge.rs::preprocess`).
-    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
+    ///
+    /// `n_targets` (RIDGE-MULTI-TARGET): `1` (the default) is the ORIGINAL
+    /// single-target entry point, unchanged — `y` is length `rows`. `> 1` means
+    /// `y` is `rows × n_targets` row-major (the Python shim's `_normalize_y`
+    /// already ravels a 2-D `y` that way) and routes to
+    /// [`Ridge::fit_multi_target_with_sample_weight`], which currently accepts
+    /// it only for the default `cholesky`/`auto` (`positive=False`) solver —
+    /// any other solver with `n_targets > 1` surfaces a typed
+    /// `UnsupportedCapability` error rather than guessing.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None, n_targets = 1))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -570,6 +653,7 @@ impl PyRidge {
         rows: usize,
         cols: usize,
         sample_weight: Option<&Bound<'_, PyAny>>,
+        n_targets: usize,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
@@ -581,20 +665,34 @@ impl PyRidge {
                 let mut pool = crate::lock_pool();
                 match dt {
                     FloatDtype::F32 => {
-                        let fitted = ridge_fit_dispatch!(
-                            f32, p, xa, ya, swa, rows, cols, pool,
-                            as_f32, host_slice_f32, validated_f32
-                        );
+                        let fitted = if n_targets <= 1 {
+                            ridge_fit_dispatch!(
+                                f32, p, xa, ya, swa, rows, cols, pool,
+                                as_f32, host_slice_f32, validated_f32
+                            )
+                        } else {
+                            ridge_fit_multi_dispatch!(
+                                f32, p, xa, ya, swa, rows, cols, n_targets, pool,
+                                as_f32, host_slice_f32, validated_f32
+                            )
+                        };
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
                         Ok((AnyRidge::F32(fitted), n_iter, used))
                     }
                     FloatDtype::F64 => {
                         crate::capability::guard_f64()?;
-                        let fitted = ridge_fit_dispatch!(
-                            f64, p, xa, ya, swa, rows, cols, pool,
-                            as_f64, host_slice_f64, validated_f64
-                        );
+                        let fitted = if n_targets <= 1 {
+                            ridge_fit_dispatch!(
+                                f64, p, xa, ya, swa, rows, cols, pool,
+                                as_f64, host_slice_f64, validated_f64
+                            )
+                        } else {
+                            ridge_fit_multi_dispatch!(
+                                f64, p, xa, ya, swa, rows, cols, n_targets, pool,
+                                as_f64, host_slice_f64, validated_f64
+                            )
+                        };
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
                         Ok((AnyRidge::F64(fitted), n_iter, used))
@@ -661,6 +759,57 @@ impl PyRidge {
             _ => Err(not_fitted("ridge", "intercept_ (f64)")),
         }
     }
+
+    // -- multi-target (RIDGE-MULTI-TARGET) --------------------------------- //
+
+    /// `predict(x)` for a multi-target fit → an `m × n_targets` row-major
+    /// **pyarrow** float array. Shared body: [`dense_predict_multi_f32`].
+    fn predict_multi_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyRidge::F32(est) => dense_predict_multi_f32(py, x, (rows, cols), est),
+            _ => Err(not_fitted("ridge", "predict (f32 multi-target path)")),
+        }
+    }
+    fn predict_multi_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            AnyRidge::F64(est) => dense_predict_multi_f64(py, x, (rows, cols), est),
+            _ => Err(not_fitted("ridge", "predict (f64 multi-target path)")),
+        }
+    }
+
+    /// Flat `n_features × n_targets` row-major `coef_` (the Python shim
+    /// reshapes and transposes to sklearn's `(n_targets, n_features)`).
+    fn coef_multi_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F32(e) => Ok(e.coef_multi(&pool)),
+            _ => Err(not_fitted("ridge", "coef_ (f32 multi-target)")),
+        }
+    }
+    fn coef_multi_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F64(e) => Ok(e.coef_multi(&pool)),
+            _ => Err(not_fitted("ridge", "coef_ (f64 multi-target)")),
+        }
+    }
+
+    /// Length-`n_targets` `intercept_`.
+    fn intercept_multi_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F32(e) => Ok(e.intercept_multi(&pool)),
+            _ => Err(not_fitted("ridge", "intercept_ (f32 multi-target)")),
+        }
+    }
+    fn intercept_multi_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidge::F64(e) => Ok(e.intercept_multi(&pool)),
+            _ => Err(not_fitted("ridge", "intercept_ (f64 multi-target)")),
+        }
+    }
+
     fn is_fitted(&self) -> bool {
         !matches!(self.inner, AnyRidge::Unfit { .. })
     }
@@ -669,6 +818,476 @@ impl PyRidge {
             AnyRidge::Unfit { .. } => None,
             AnyRidge::F32(_) => Some("f32"),
             AnyRidge::F64(_) => Some("f64"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RidgeClassifier — Fit + PredictLabels + decision_function; classes_,
+// coef_, intercept_, n_iter_, solver_
+// ---------------------------------------------------------------------------
+
+/// Parse sklearn's `class_weight` (`None` / `'balanced'` / `{label: weight}`)
+/// into the typed [`ClassWeight`]. A non-scalar hyperparameter, so it is
+/// parsed once here rather than threaded through as a Python object (the
+/// `RidgeSolver` string-parse precedent, `ridge_build!`).
+fn parse_class_weight(v: Option<&Bound<'_, PyAny>>) -> PyResult<ClassWeight> {
+    let Some(v) = v else {
+        return Ok(ClassWeight::Uniform);
+    };
+    if v.is_none() {
+        return Ok(ClassWeight::Uniform);
+    }
+    if let Ok(s) = v.extract::<String>() {
+        return if s == "balanced" {
+            Ok(ClassWeight::Balanced)
+        } else {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "class_weight: unknown string '{s}' (expected 'balanced')"
+            )))
+        };
+    }
+    if let Ok(map) = v.extract::<std::collections::HashMap<i64, f64>>() {
+        return Ok(ClassWeight::Map(map.into_iter().collect()));
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(
+        "class_weight must be None, 'balanced', or a {label: weight} dict",
+    ))
+}
+
+/// The ctor hyperparameters, read back at every `fit` (WR-02: the typestate
+/// wrapper rebuilds a fresh `Unfit` from these, so a second `fit` of the same
+/// Python object works). Mirrors [`RidgeParams`]; `class_weight` is already
+/// parsed into the typed enum (constructed once, at `#[new]`).
+struct RidgeClassifierParams {
+    alpha: f64,
+    fit_intercept: bool,
+    copy_x: bool,
+    max_iter: Option<usize>,
+    tol: f64,
+    class_weight: ClassWeight,
+    solver: String,
+    positive: bool,
+    random_state: Option<u64>,
+}
+
+/// Dtype-dispatched fitted/unfit state (D-06) — hand-written like [`AnyRidge`]
+/// rather than macro-emitted, because `class_weight` is a non-scalar field the
+/// `any_estimator_typestate!` macro's scalar-only `unfit: { .. }` list cannot
+/// express.
+enum AnyRidgeClassifier {
+    Unfit {
+        alpha: f64,
+        fit_intercept: bool,
+        copy_x: bool,
+        max_iter: Option<usize>,
+        tol: f64,
+        class_weight: ClassWeight,
+        solver: String,
+        positive: bool,
+        random_state: Option<u64>,
+    },
+    F32(RidgeClassifier<f32, AlgoFitted>),
+    F64(RidgeClassifier<f64, AlgoFitted>),
+}
+
+/// sklearn-compatible `RidgeClassifier`.
+#[pyclass(name = "RidgeClassifier")]
+pub struct PyRidgeClassifier {
+    inner: AnyRidgeClassifier,
+    n_iter: Option<Vec<usize>>,
+    solver_used: Option<String>,
+}
+
+impl PyRidgeClassifier {
+    /// Rust-callable default constructor for the smoke test. See
+    /// [`PyLinearRegression::unfit_default`].
+    pub fn unfit_default() -> Self {
+        Self {
+            inner: AnyRidgeClassifier::Unfit {
+                alpha: 1.0,
+                fit_intercept: true,
+                copy_x: true,
+                max_iter: None,
+                tol: 1e-4,
+                class_weight: ClassWeight::Uniform,
+                solver: "auto".to_string(),
+                positive: false,
+                random_state: None,
+            },
+            n_iter: None,
+            solver_used: None,
+        }
+    }
+
+    /// Is this wrapper in the unfit (constructed-but-not-fitted) arm?
+    pub fn is_unfit(&self) -> bool {
+        matches!(self.inner, AnyRidgeClassifier::Unfit { .. })
+    }
+
+    fn params(&self) -> RidgeClassifierParams {
+        match &self.inner {
+            AnyRidgeClassifier::Unfit {
+                alpha, fit_intercept, copy_x, max_iter, tol, class_weight, solver, positive, random_state,
+            } => RidgeClassifierParams {
+                alpha: *alpha,
+                fit_intercept: *fit_intercept,
+                copy_x: *copy_x,
+                max_iter: *max_iter,
+                tol: *tol,
+                class_weight: class_weight.clone(),
+                solver: solver.clone(),
+                positive: *positive,
+                random_state: *random_state,
+            },
+            // Already fitted: the shim always constructs a fresh wrapper per
+            // `fit` (WR-02), so this arm is unreachable in practice.
+            _ => RidgeClassifierParams {
+                alpha: 1.0,
+                fit_intercept: true,
+                copy_x: true,
+                max_iter: None,
+                tol: 1e-4,
+                class_weight: ClassWeight::Uniform,
+                solver: "auto".to_string(),
+                positive: false,
+                random_state: None,
+            },
+        }
+    }
+}
+
+/// Build an unfit `RidgeClassifier<F>` from the ctor params (the `ridge_build!`
+/// precedent).
+macro_rules! ridge_classifier_build {
+    ($float:ty, $p:expr) => {{
+        let solver = RidgeSolver::try_from($p.solver.as_str()).map_err(build_err_to_py)?;
+        RidgeClassifier::<$float>::builder()
+            .alpha($p.alpha)
+            .fit_intercept($p.fit_intercept)
+            .copy_x($p.copy_x)
+            .max_iter($p.max_iter)
+            .tol($p.tol)
+            .class_weight($p.class_weight)
+            .solver(solver)
+            .positive($p.positive)
+            .random_state($p.random_state)
+            .build::<$float>()
+            .map_err(build_err_to_py)?
+    }};
+}
+
+/// The two-arm fit dispatch (the `ridge_fit_dispatch!` precedent): the
+/// no-upload HOST arm on `host_fit_applicable` (`cholesky`/`lbfgs` + the cpu
+/// backend, or below the dispatch-cost floor — this is the path
+/// `RidgeClassifier()` takes on cpu, the estimator's whole reason for
+/// existing), else the DEVICE delegation arm.
+///
+/// `class_weight` is consumed (not `Clone`d again) since the params struct is
+/// rebuilt fresh per `fit` (WR-02) and each dispatch arm needs its own build.
+macro_rules! ridge_classifier_fit_dispatch {
+    ($float:ty, $p:expr, $xa:expr, $ya:expr, $swa:expr, $rows:expr, $cols:expr,
+     $pool:expr, $as:ident, $host_slice:ident, $validated:ident) => {{
+        let est = ridge_classifier_build!($float, $p);
+        let sw = match $swa.as_ref() {
+            Some(a) => Some($host_slice($as(a)?)?),
+            None => None,
+        };
+        if est.host_fit_applicable(($rows, $cols)) {
+            let xh = $host_slice($as(&$xa)?)?;
+            let yh = $host_slice($as(&$ya)?)?;
+            est.fit_from_host_slice(&mut $pool, xh, yh, ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        } else {
+            let xd = $validated($as(&$xa)?, &mut $pool)?;
+            let yd = $validated($as(&$ya)?, &mut $pool)?;
+            est.fit_with_sample_weight(&mut $pool, &xd, Some(&yd), ($rows, $cols), sw)
+                .map_err(algo_err_to_py)?
+        }
+    }};
+}
+
+#[pymethods]
+impl PyRidgeClassifier {
+    /// `RidgeClassifier(alpha=1.0, fit_intercept=True, copy_X=True,
+    /// max_iter=None, tol=1e-4, class_weight=None, solver='auto',
+    /// positive=False, random_state=None)` — sklearn's signature one-for-one.
+    #[new]
+    #[pyo3(signature = (
+        alpha = 1.0,
+        fit_intercept = true,
+        copy_x = true,
+        max_iter = None,
+        tol = 1e-4,
+        class_weight = None,
+        solver = "auto".to_string(),
+        positive = false,
+        random_state = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        alpha: f64,
+        fit_intercept: bool,
+        copy_x: bool,
+        max_iter: Option<usize>,
+        tol: f64,
+        class_weight: Option<&Bound<'_, PyAny>>,
+        solver: String,
+        positive: bool,
+        random_state: Option<u64>,
+    ) -> PyResult<Self> {
+        let class_weight = parse_class_weight(class_weight)?;
+        Ok(Self {
+            inner: AnyRidgeClassifier::Unfit {
+                alpha,
+                fit_intercept,
+                copy_x,
+                max_iter,
+                tol,
+                class_weight,
+                solver,
+                positive,
+                random_state,
+            },
+            n_iter: None,
+            solver_used: None,
+        })
+    }
+
+    /// `fit(X, y, rows, cols, sample_weight=None)`. `y` carries the RAW class
+    /// labels (float-encoded, the `LogisticRegression` convention) — the
+    /// `{-1,+1}` target encoding happens inside the estimator.
+    #[pyo3(signature = (x, y, rows, cols, sample_weight = None))]
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
+        let dt = float_dtype(&xa)?;
+        let p = self.params();
+        let (fitted, n_iter, solver_used) =
+            py.detach(|| -> PyResult<(AnyRidgeClassifier, Option<Vec<usize>>, String)> {
+                let mut pool = crate::lock_pool();
+                match dt {
+                    FloatDtype::F32 => {
+                        let fitted = ridge_classifier_fit_dispatch!(
+                            f32, p, xa, ya, swa, rows, cols, pool,
+                            as_f32, host_slice_f32, validated_f32
+                        );
+                        let n_iter = fitted.n_iter();
+                        let used = fitted.solver().name().to_string();
+                        Ok((AnyRidgeClassifier::F32(fitted), n_iter, used))
+                    }
+                    FloatDtype::F64 => {
+                        crate::capability::guard_f64()?;
+                        let fitted = ridge_classifier_fit_dispatch!(
+                            f64, p, xa, ya, swa, rows, cols, pool,
+                            as_f64, host_slice_f64, validated_f64
+                        );
+                        let n_iter = fitted.n_iter();
+                        let used = fitted.solver().name().to_string();
+                        Ok((AnyRidgeClassifier::F64(fitted), n_iter, used))
+                    }
+                }
+            })?;
+        self.inner = fitted;
+        self.n_iter = n_iter;
+        self.solver_used = Some(solver_used);
+        Ok(())
+    }
+
+    /// `predict(x)` → a length-`rows` **pyarrow** `int32` array of class ids
+    /// (the `PyLinearSVC::predict_labels` no-upload / no-list precedent).
+    ///
+    /// TWO arms, chosen by `RidgeClassifier::device_predict_applicable`
+    /// (RIDGECLF-CUDA): the no-upload HOST matvec — which is what the cpu
+    /// backend and every low-cardinality fit take — or the fused DEVICE
+    /// classify kernel, which computes the decision function, its `argmax` and
+    /// the `classes_` lookup in one launch and brings back `rows` `i32`s rather
+    /// than `rows × n_targets` floats. The device arm has to scan the query for
+    /// NaN/±inf separately (the host arm folds that check into the matvec pass
+    /// it is already making), which is the one thing it pays for the crossing
+    /// beyond the upload itself.
+    fn predict_labels<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let xa = capsule_to_array(x)?;
+        let out = py.detach(|| -> PyResult<Vec<i32>> {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyRidgeClassifier::F32(est) => {
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    if est.device_predict_applicable() {
+                        if xh.iter().any(|v| !v.is_finite()) {
+                            return Err(nonfinite_input_err(xh, "float32"));
+                        }
+                        let xd = DeviceArray::from_host(&mut pool, xh);
+                        let labels = est
+                            .predict_labels_device(&mut pool, &xd, (rows, cols))
+                            .map_err(algo_err_to_py)?;
+                        xd.release_into(&mut pool);
+                        return Ok(labels.to_host_metered(&mut pool));
+                    }
+                    let pred = est.predict_labels_from_host(&pool, xh, (rows, cols)).map_err(algo_err_to_py)?;
+                    if !pred.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float32"));
+                    }
+                    Ok(pred.labels)
+                }
+                AnyRidgeClassifier::F64(est) => {
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    if est.device_predict_applicable() {
+                        if xh.iter().any(|v| !v.is_finite()) {
+                            return Err(nonfinite_input_err(xh, "float64"));
+                        }
+                        let xd = DeviceArray::from_host(&mut pool, xh);
+                        let labels = est
+                            .predict_labels_device(&mut pool, &xd, (rows, cols))
+                            .map_err(algo_err_to_py)?;
+                        xd.release_into(&mut pool);
+                        return Ok(labels.to_host_metered(&mut pool));
+                    }
+                    let pred = est.predict_labels_from_host(&pool, xh, (rows, cols)).map_err(algo_err_to_py)?;
+                    if !pred.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float64"));
+                    }
+                    Ok(pred.labels)
+                }
+                _ => Err(not_fitted("ridge_classifier", "predict")),
+            }
+        })?;
+        i32_vec_to_pyarrow(py, out)
+    }
+
+    /// `decision_function(x)` → row-major `rows × n_targets` **pyarrow** float
+    /// array (binary squeezes to `n_targets == 1` at the Python shim, mirroring
+    /// sklearn's own squeeze).
+    ///
+    /// Stays on the HOST arm on every backend, where `predict` above routes to
+    /// the device kernel above a `n_targets` threshold. The asymmetry is not an
+    /// oversight: the two effects that let a device `predict` pay back its
+    /// upload are `k`× the compute AND `k`× less egress (`rows` `i32` labels
+    /// instead of `rows × k` floats), and `decision_function` gets only the
+    /// first of them — it has to return the full score matrix by definition.
+    /// That leaves it with the same profile as `Ridge::predict_multi_from_host`,
+    /// which measured a 2–3× LOSS at `n_targets = 4` on a P100. The device
+    /// path exists and is gated by tests
+    /// (`RidgeClassifier::decision_function_device`); it is not the default
+    /// here because nothing has measured it winning.
+    fn decision_function_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        let xa = capsule_to_array(x)?;
+        let out = py.detach(|| -> PyResult<Vec<f32>> {
+            let pool = crate::lock_pool();
+            match &self.inner {
+                AnyRidgeClassifier::F32(est) => {
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let scores = est.decision_function_from_host(&pool, xh, (rows, cols)).map_err(algo_err_to_py)?;
+                    if !scores.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float32"));
+                    }
+                    Ok(scores.values.into_iter().map(|v| v as f32).collect())
+                }
+                _ => Err(not_fitted("ridge_classifier", "decision_function (f32 path)")),
+            }
+        })?;
+        f32_vec_to_pyarrow(py, out)
+    }
+    fn decision_function_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        let xa = capsule_to_array(x)?;
+        let out = py.detach(|| -> PyResult<Vec<f64>> {
+            let pool = crate::lock_pool();
+            match &self.inner {
+                AnyRidgeClassifier::F64(est) => {
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let scores = est.decision_function_from_host(&pool, xh, (rows, cols)).map_err(algo_err_to_py)?;
+                    if !scores.operand_finite {
+                        return Err(nonfinite_input_err(xh, "float64"));
+                    }
+                    Ok(scores.values)
+                }
+                _ => Err(not_fitted("ridge_classifier", "decision_function (f64 path)")),
+            }
+        })?;
+        f64_vec_to_pyarrow(py, out)
+    }
+
+    /// `1` for a binary fit, `n_classes` for multiclass — the row width of
+    /// `decision_function`'s output and the row COUNT of `coef_`.
+    fn n_targets(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnyRidgeClassifier::F32(e) => Ok(e.n_targets()),
+            AnyRidgeClassifier::F64(e) => Ok(e.n_targets()),
+            _ => Err(not_fitted("ridge_classifier", "n_targets")),
+        }
+    }
+
+    /// The DISTINCT sorted training labels (`classes_`, CR-02).
+    fn classes_(&self) -> Vec<i64> {
+        match &self.inner {
+            AnyRidgeClassifier::F32(e) => e.classes().to_vec(),
+            AnyRidgeClassifier::F64(e) => e.classes().to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// sklearn's `n_iter_`: `None` unless the resolved solver is `lsqr` /
+    /// `sag` / `saga` (in which case it is length `n_targets`).
+    fn n_iter(&self) -> Option<Vec<usize>> {
+        self.n_iter.clone()
+    }
+
+    /// sklearn's `solver_` — the solver that ACTUALLY ran.
+    fn solver_used(&self) -> Option<String> {
+        self.solver_used.clone()
+    }
+
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidgeClassifier::F32(e) => Ok(e.coef(&pool)),
+            _ => Err(not_fitted("ridge_classifier", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidgeClassifier::F64(e) => Ok(e.coef(&pool)),
+            _ => Err(not_fitted("ridge_classifier", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<Vec<f32>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidgeClassifier::F32(e) => Ok(e.intercept(&pool)),
+            _ => Err(not_fitted("ridge_classifier", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<Vec<f64>> {
+        let pool = crate::lock_pool();
+        match &self.inner {
+            AnyRidgeClassifier::F64(e) => Ok(e.intercept(&pool)),
+            _ => Err(not_fitted("ridge_classifier", "intercept_ (f64)")),
+        }
+    }
+    fn is_fitted(&self) -> bool {
+        !matches!(self.inner, AnyRidgeClassifier::Unfit { .. })
+    }
+    fn dtype(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyRidgeClassifier::Unfit { .. } => None,
+            AnyRidgeClassifier::F32(_) => Some("f32"),
+            AnyRidgeClassifier::F64(_) => Some("f64"),
         }
     }
 }
@@ -1211,7 +1830,7 @@ crate::any_estimator_typestate! {
         loss: String, penalty: String, alpha: f64, l1_ratio: f64,
         fit_intercept: bool, max_iter: usize, tol: f64,
         learning_rate: String, eta0: f64, power_t: f64,
-        batch_size: usize, shuffle: bool, seed: u64,
+        batch_size: usize, shuffle: bool, seed: u64, n_iter_no_change: usize,
     },
 }
 
@@ -1222,7 +1841,7 @@ crate::any_estimator_typestate! {
         loss: String, penalty: String, alpha: f64, l1_ratio: f64,
         fit_intercept: bool, max_iter: usize, tol: f64,
         learning_rate: String, eta0: f64, power_t: f64, epsilon: f64,
-        batch_size: usize, shuffle: bool, seed: u64,
+        batch_size: usize, shuffle: bool, seed: u64, n_iter_no_change: usize,
     },
 }
 
@@ -1278,6 +1897,7 @@ impl PyMBSGDClassifier {
                 batch_size: 1,
                 shuffle: true,
                 seed: 0,
+                n_iter_no_change: 5,
             },
         }
     }
@@ -1292,13 +1912,14 @@ impl PyMBSGDClassifier {
 impl PyMBSGDClassifier {
     /// `MBSGDClassifier(loss="hinge", penalty="l2", alpha=1e-4, l1_ratio=0.15,
     /// fit_intercept=True, max_iter=1000, tol=1e-3, learning_rate="optimal",
-    /// eta0=0.01, power_t=0.5, batch_size=1, shuffle=True, seed=0)`.
+    /// eta0=0.01, power_t=0.5, batch_size=1, shuffle=True, seed=0,
+    /// n_iter_no_change=5)`.
     #[new]
     #[pyo3(signature = (
         loss = "hinge".to_string(), penalty = "l2".to_string(), alpha = 1e-4,
         l1_ratio = 0.15, fit_intercept = true, max_iter = 1000, tol = 1e-3,
         learning_rate = "optimal".to_string(), eta0 = 0.01, power_t = 0.5,
-        batch_size = 1, shuffle = true, seed = 0,
+        batch_size = 1, shuffle = true, seed = 0, n_iter_no_change = 5,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1315,6 +1936,7 @@ impl PyMBSGDClassifier {
         batch_size: usize,
         shuffle: bool,
         seed: u64,
+        n_iter_no_change: usize,
     ) -> Self {
         Self {
             inner: AnyMBSGDClassifier::Unfit {
@@ -1331,6 +1953,7 @@ impl PyMBSGDClassifier {
                 batch_size,
                 shuffle,
                 seed,
+                n_iter_no_change,
             },
         }
     }
@@ -1364,15 +1987,16 @@ impl PyMBSGDClassifier {
         let dt = float_dtype(&xa)?;
         let (
             loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
-            lr_s, eta0, power_t, batch_size, shuffle, seed,
+            lr_s, eta0, power_t, batch_size, shuffle, seed, n_iter_no_change,
         ) = match &self.inner {
             AnyMBSGDClassifier::Unfit {
                 loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
                 learning_rate, eta0, power_t, batch_size, shuffle, seed,
+                n_iter_no_change,
             } => (
                 loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
                 *max_iter, *tol, learning_rate.clone(), *eta0, *power_t,
-                *batch_size, *shuffle, *seed,
+                *batch_size, *shuffle, *seed, *n_iter_no_change,
             ),
             _ => return Err(not_fitted("mbsgd_classifier", "re-fit")),
         };
@@ -1399,6 +2023,7 @@ impl PyMBSGDClassifier {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = if host_ingress {
@@ -1432,6 +2057,7 @@ impl PyMBSGDClassifier {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = if host_ingress {
@@ -1526,18 +2152,28 @@ impl PyMBSGDClassifier {
             _ => Err(not_fitted("mbsgd_classifier", "coef_ (f64)")),
         }
     }
-    fn intercept_f32(&self) -> PyResult<f32> {
+    fn intercept_f32(&self) -> PyResult<Vec<f32>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F32(e) => Ok(e.intercept(&pool)),
+            AnyMBSGDClassifier::F32(e) => Ok(e.intercepts(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f32)")),
         }
     }
-    fn intercept_f64(&self) -> PyResult<f64> {
+    fn intercept_f64(&self) -> PyResult<Vec<f64>> {
         let pool = crate::lock_pool();
         match &self.inner {
-            AnyMBSGDClassifier::F64(e) => Ok(e.intercept(&pool)),
+            AnyMBSGDClassifier::F64(e) => Ok(e.intercepts(&pool)),
             _ => Err(not_fitted("mbsgd_classifier", "intercept_ (f64)")),
+        }
+    }
+    /// Rows in `coef_`: `1` for a binary fit, `n_classes` for the one-vs-rest
+    /// multiclass fit — sklearn's `coef_` shape rule. The shim reshapes the
+    /// flat `coef_*` buffer with this.
+    fn n_coef_rows(&self) -> PyResult<usize> {
+        match &self.inner {
+            AnyMBSGDClassifier::F32(e) => Ok(e.n_coef_rows()),
+            AnyMBSGDClassifier::F64(e) => Ok(e.n_coef_rows()),
+            _ => Err(not_fitted("mbsgd_classifier", "n_coef_rows")),
         }
     }
     fn is_fitted(&self) -> bool {
@@ -1581,6 +2217,7 @@ impl PyMBSGDRegressor {
                 batch_size: 1,
                 shuffle: true,
                 seed: 0,
+                n_iter_no_change: 5,
             },
         }
     }
@@ -1596,13 +2233,14 @@ impl PyMBSGDRegressor {
     /// `MBSGDRegressor(loss="squared_error", penalty="l2", alpha=1e-4,
     /// l1_ratio=0.15, fit_intercept=True, max_iter=1000, tol=1e-3,
     /// learning_rate="invscaling", eta0=0.01, power_t=0.25, epsilon=0.1,
-    /// batch_size=1, shuffle=True, seed=0)`.
+    /// batch_size=1, shuffle=True, seed=0, n_iter_no_change=5)`.
     #[new]
     #[pyo3(signature = (
         loss = "squared_error".to_string(), penalty = "l2".to_string(), alpha = 1e-4,
         l1_ratio = 0.15, fit_intercept = true, max_iter = 1000, tol = 1e-3,
         learning_rate = "invscaling".to_string(), eta0 = 0.01, power_t = 0.25,
         epsilon = 0.1, batch_size = 1, shuffle = true, seed = 0,
+        n_iter_no_change = 5,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1620,6 +2258,7 @@ impl PyMBSGDRegressor {
         batch_size: usize,
         shuffle: bool,
         seed: u64,
+        n_iter_no_change: usize,
     ) -> Self {
         Self {
             inner: AnyMBSGDRegressor::Unfit {
@@ -1637,6 +2276,7 @@ impl PyMBSGDRegressor {
                 batch_size,
                 shuffle,
                 seed,
+                n_iter_no_change,
             },
         }
     }
@@ -1656,15 +2296,16 @@ impl PyMBSGDRegressor {
         let dt = float_dtype(&xa)?;
         let (
             loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
-            lr_s, eta0, power_t, epsilon, batch_size, shuffle, seed,
+            lr_s, eta0, power_t, epsilon, batch_size, shuffle, seed, n_iter_no_change,
         ) = match &self.inner {
             AnyMBSGDRegressor::Unfit {
                 loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
                 learning_rate, eta0, power_t, epsilon, batch_size, shuffle, seed,
+                n_iter_no_change,
             } => (
                 loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
                 *max_iter, *tol, learning_rate.clone(), *eta0, *power_t, *epsilon,
-                *batch_size, *shuffle, *seed,
+                *batch_size, *shuffle, *seed, *n_iter_no_change,
             ),
             _ => return Err(not_fitted("mbsgd_regressor", "re-fit")),
         };
@@ -1692,6 +2333,7 @@ impl PyMBSGDRegressor {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
@@ -1717,6 +2359,7 @@ impl PyMBSGDRegressor {
                         .batch_size(batch_size)
                         .shuffle(shuffle)
                         .seed(seed)
+                        .n_iter_no_change(n_iter_no_change)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
                     let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
@@ -2720,9 +3363,10 @@ impl PyBayesianRidge {
         let xa = capsule_to_array(x)?;
         let out = py.detach(|| -> PyResult<Vec<f64>> {
             let xh = host_slice_f32(as_f32(&xa)?)?;
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyBayesianRidge::F32(est) => est
-                    .predict_std_from_host(xh, (rows, cols))
+                    .predict_std_from_host(&mut pool, xh, (rows, cols))
                     .map_err(algo_err_to_py),
                 _ => Err(not_fitted("bayesian_ridge", "predict std (f32 path)")),
             }
@@ -2733,9 +3377,10 @@ impl PyBayesianRidge {
         let xa = capsule_to_array(x)?;
         let out = py.detach(|| -> PyResult<Vec<f64>> {
             let xh = host_slice_f64(as_f64(&xa)?)?;
+            let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyBayesianRidge::F64(est) => est
-                    .predict_std_from_host(xh, (rows, cols))
+                    .predict_std_from_host(&mut pool, xh, (rows, cols))
                     .map_err(algo_err_to_py),
                 _ => Err(not_fitted("bayesian_ridge", "predict std (f64 path)")),
             }

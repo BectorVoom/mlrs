@@ -34,20 +34,34 @@ use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, PredictPro
 /// Minibatch-SGD linear classifier (SGDSVM-01). Construct via
 /// [`MBSGDClassifier::builder`], then the consuming [`Fit::fit`] (returns the
 /// `Fitted`-tagged sibling) + [`PredictLabels::predict_labels`] /
-/// [`PredictProba::predict_proba`]. Fitted `coef_` (length `n_features`) /
-/// `intercept_` (length 1) are device-resident (D-03); the host accessors exist
-/// ONLY on `MBSGDClassifier<F, Fitted>` (the compile-time typestate replaces the
-/// old runtime `NotFitted` guard, D-03).
+/// [`PredictProba::predict_proba`]. Binary targets get a ONE-solve fit with a
+/// length-`n_features` `coef_` / length-1 `intercept_`; 3+ classes get a
+/// one-vs-rest fit with an `n_classes × n_features` `coef_` / length-`n_classes`
+/// `intercept_` (sklearn's own `coef_` shape rule — see [`n_coef_rows`]).
+/// Fitted state is device-resident (D-03); the host accessors exist ONLY on
+/// `MBSGDClassifier<F, Fitted>` (the compile-time typestate replaces the old
+/// runtime `NotFitted` guard, D-03).
+///
+/// [`n_coef_rows`]: MBSGDClassifier::n_coef_rows
 pub struct MBSGDClassifier<F, S = Unfit> {
     /// The lowered, validated hyperparameter bundle (D-06).
     config: SgdConfig,
-    /// DISTINCT sorted class labels inferred at `fit` (Pitfall 4 — ±1 encoding).
+    /// DISTINCT sorted class labels inferred at `fit` (Pitfall 4 — ±1 encoding
+    /// for a binary fit, one-vs-rest for 3+ classes).
     classes_: Vec<i64>,
     /// Feature count inferred at `fit`.
     n_features: usize,
-    /// Fitted coefficients (device-resident), `None` until `fit`.
+    /// Rows in `coef_`: ONE for a binary fit, `classes_.len()` for a
+    /// one-vs-rest multiclass fit — sklearn's `coef_` shape rule (`(1, d)`
+    /// binary, `(n_classes, d)` otherwise), stored explicitly so `predict`
+    /// does not have to re-derive it from `classes_.len()` and get the binary
+    /// case wrong (2 classes, 1 row).
+    n_coef_rows: usize,
+    /// Fitted coefficients (device-resident), `n_coef_rows × n_features`
+    /// row-major, `None` until `fit`.
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
-    /// Fitted intercept (device-resident), `None` until `fit`.
+    /// Fitted intercept (device-resident), length `n_coef_rows`, `None` until
+    /// `fit`.
     intercept_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Compile-time lifecycle marker (zero-sized).
     _state: PhantomData<S>,
@@ -78,14 +92,23 @@ where
         &self.config
     }
 
-    /// The inferred class labels (length 2 for the binary fit).
+    /// The inferred class labels (length 2 for the binary fit, `n_classes`
+    /// for a one-vs-rest multiclass fit).
     pub fn classes(&self) -> &[i64] {
         &self.classes_
     }
 
-    /// Host copy of the fitted `coef_` (length `n_features`). `Some` by
-    /// construction on the `Fitted` state, so no `NotFitted` branch is needed
-    /// (the compile-time typestate replaces the runtime guard, D-03).
+    /// Rows in [`coef`](Self::coef): `1` for a binary fit, `n_classes` for a
+    /// one-vs-rest multiclass fit (sklearn's `coef_` shape rule). The flat
+    /// `coef` buffer is this many rows of `n_features`, row-major.
+    pub fn n_coef_rows(&self) -> usize {
+        self.n_coef_rows
+    }
+
+    /// Host copy of the fitted `coef_`, `n_coef_rows × n_features` row-major
+    /// (so length `n_features` for the binary fit). `Some` by construction on
+    /// the `Fitted` state, so no `NotFitted` branch is needed (the
+    /// compile-time typestate replaces the runtime guard, D-03).
     pub fn coef(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
         self.coef_
             .as_ref()
@@ -93,20 +116,30 @@ where
             .to_host(pool)
     }
 
-    /// Host copy of the fitted `intercept_` (scalar). `Some` by construction on
-    /// the `Fitted` state (D-03).
+    /// Host copy of the fitted `intercept_`'s FIRST entry. Kept for the
+    /// binary fit, where sklearn's `intercept_` is a single value; use
+    /// [`intercepts`](Self::intercepts) for the one-vs-rest vector.
     pub fn intercept(&self, pool: &BufferPool<ActiveRuntime>) -> F {
         self.intercept_
             .as_ref()
             .expect("intercept_ is Some by construction on MBSGDClassifier<F, Fitted>")
             .to_host(pool)[0]
     }
+
+    /// Host copy of the fitted `intercept_`, length
+    /// [`n_coef_rows`](Self::n_coef_rows) — one per solved sub-problem.
+    pub fn intercepts(&self, pool: &BufferPool<ActiveRuntime>) -> Vec<F> {
+        self.intercept_
+            .as_ref()
+            .expect("intercept_ is Some by construction on MBSGDClassifier<F, Fitted>")
+            .to_host(pool)
+    }
 }
 
 /// Builder for [`MBSGDClassifier`] (D-01). Default field initializers encode the
 /// sklearn `SGDClassifier` defaults (D-03): `loss=hinge`, `penalty=l2`,
 /// `alpha=1e-4`, `l1_ratio=0.15`, `max_iter=1000`, `tol=1e-3`,
-/// `learning_rate=optimal`, `eta0=0.01`, `power_t=0.5`.
+/// `learning_rate=optimal`, `eta0=0.01`, `power_t=0.5`, `n_iter_no_change=5`.
 #[derive(Debug, Clone, Copy)]
 pub struct MBSGDClassifierBuilder {
     loss: Loss,
@@ -122,6 +155,7 @@ pub struct MBSGDClassifierBuilder {
     batch_size: usize,
     shuffle: bool,
     seed: u64,
+    n_iter_no_change: usize,
 }
 
 impl Default for MBSGDClassifierBuilder {
@@ -140,6 +174,7 @@ impl Default for MBSGDClassifierBuilder {
             batch_size: 1,
             shuffle: true,
             seed: 0,
+            n_iter_no_change: 5,
         }
     }
 }
@@ -208,6 +243,12 @@ impl MBSGDClassifierBuilder {
     /// Set the RNG seed.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
+        self
+    }
+    /// Set the loss-plateau patience (`tol > 0` only): consecutive
+    /// non-improving epochs before stopping (sklearn `n_iter_no_change`).
+    pub fn n_iter_no_change(mut self, n_iter_no_change: usize) -> Self {
+        self.n_iter_no_change = n_iter_no_change;
         self
     }
 
@@ -288,11 +329,13 @@ impl MBSGDClassifierBuilder {
             batch_size: self.batch_size,
             shuffle: self.shuffle,
             seed: self.seed,
+            n_iter_no_change: self.n_iter_no_change,
         };
         Ok(MBSGDClassifier {
             config,
             classes_: Vec::new(),
             n_features: 0,
+            n_coef_rows: 0,
             coef_: None,
             intercept_: None,
             _state: PhantomData,
@@ -300,14 +343,24 @@ impl MBSGDClassifierBuilder {
     }
 }
 
-/// Derive `classes_` and the ±1 margin target from a host-materialized `y`.
+/// Derive `classes_` and the per-solve ±1 margin target(s) from a
+/// host-materialized `y`.
 ///
 /// Shared by [`Fit::fit`] and [`MBSGDClassifier::fit_from_host_slice`] so the
 /// two ingress paths cannot drift on label validation. Returns
-/// `(classes_, y_pm1)`: distinct sorted class ids (exactly two), and the
-/// per-sample ±1 remap with `classes_[1] → +1` (sklearn maps the HIGHER class
-/// to `+1`).
-fn prepare_labels<F>(y_host: &[F], n_samples: usize) -> Result<(Vec<i64>, Vec<F>), AlgoError>
+/// `(classes_, targets)`:
+///
+/// - a BINARY target (exactly 2 distinct classes) is ONE target vector, with
+///   `classes_[1] → +1` (sklearn maps the HIGHER class to `+1`);
+/// - 3+ classes are `classes_.len()` INDEPENDENT one-vs-rest target vectors,
+///   `targets[c][i] = +1` iff sample `i`'s label is `classes_[c]`, else `−1` —
+///   exactly `sklearn.linear_model.SGDClassifier`'s own multiclass strategy
+///   (`BaseSGDClassifier._fit_multiclass`).
+///
+/// The binary case is deliberately NOT expressed as two OvR solves: that would
+/// double the work and return a `(2, d)` `coef_` sklearn never produces (the
+/// `LinearSVC` OvR precedent's exact rule).
+fn prepare_labels<F>(y_host: &[F], n_samples: usize) -> Result<(Vec<i64>, Vec<Vec<F>>), AlgoError>
 where
     F: Float + CubeElement + Pod,
 {
@@ -326,11 +379,13 @@ where
     let mut classes_: Vec<i64> = raw_labels.clone();
     classes_.sort_unstable();
     classes_.dedup();
-    if classes_.len() != 2 {
+    if classes_.len() < 2 {
+        // sklearn's own wording for the degenerate single-class fit.
         return Err(AlgoError::InvalidLabels {
             estimator: "mbsgd_classifier",
             reason: format!(
-                "binary classifier needs exactly 2 classes, found {}",
+                "this solver needs samples of at least 2 classes in the data, \
+                 but the data contains only {} class",
                 classes_.len()
             ),
         });
@@ -351,11 +406,23 @@ where
             });
         }
     }
-    let yp: Vec<F> = raw_labels
-        .iter()
-        .map(|&l| f64_to_host::<F>(if l == classes_[1] { 1.0 } else { -1.0 }))
-        .collect();
-    Ok((classes_, yp))
+    let targets = if classes_.len() == 2 {
+        vec![raw_labels
+            .iter()
+            .map(|&l| f64_to_host::<F>(if l == classes_[1] { 1.0 } else { -1.0 }))
+            .collect()]
+    } else {
+        classes_
+            .iter()
+            .map(|&cls| {
+                raw_labels
+                    .iter()
+                    .map(|&l| f64_to_host::<F>(if l == cls { 1.0 } else { -1.0 }))
+                    .collect()
+            })
+            .collect()
+    };
+    Ok((classes_, targets))
 }
 
 impl<F> MBSGDClassifier<F, Unfit>
@@ -377,13 +444,28 @@ where
     /// this as a universal entry point.
     ///
     /// [`sgd_host_available`]: mlrs_backend::prims::sgd::sgd_host_available
+    ///
+    /// ## One-vs-rest fan-out (the multiclass speed lever)
+    /// Each of the `n_coef_rows` sub-problems is an INDEPENDENT binary SGD
+    /// solve over the SAME read-only `x` — no shared mutable state at all
+    /// (unlike the LinearSVC L-BFGS OvR precedent, which reuses one worker
+    /// pool sequentially because its objective evaluator owns a `&mut`
+    /// scratch buffer). `sgd_solve_host_slice` takes plain borrowed slices, so
+    /// the classes are solved on real OS threads (`std::thread::scope`,
+    /// `mlrs_backend::capability::cpu_launch_units()` workers, each a
+    /// disjoint row band of the output — no merge step). A binary fit stays
+    /// the single synchronous call it always was; threading one class is pure
+    /// overhead.
     pub fn fit_from_host_slice(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
         x: &[F],
         y: &[F],
         shape: (usize, usize),
-    ) -> Result<MBSGDClassifier<F, Fitted>, AlgoError> {
+    ) -> Result<MBSGDClassifier<F, Fitted>, AlgoError>
+    where
+        F: Send + Sync,
+    {
         let (n_samples, n_features) = shape;
 
         // --- The slice twin of the D-08 geometry guard: `validate_geometry`
@@ -405,16 +487,60 @@ where
             }));
         }
 
-        let (classes_, yp) = prepare_labels::<F>(y, n_samples)?;
+        let (classes_, targets) = prepare_labels::<F>(y, n_samples)?;
         let params = lower_config(&self.config);
-        let (coef, intercept) = sgd_solve_host_slice::<F>(x, &yp, shape, &params)?;
+        let n_coef_rows = targets.len();
+
+        let mut coef_host = vec![f64_to_host::<F>(0.0); n_coef_rows * n_features];
+        let mut intercept_host = vec![f64_to_host::<F>(0.0); n_coef_rows];
+
+        if n_coef_rows == 1 {
+            let (coef, intercept) = sgd_solve_host_slice::<F>(x, &targets[0], shape, &params)?;
+            coef_host.copy_from_slice(&coef);
+            intercept_host[0] = intercept;
+        } else {
+            let workers = mlrs_backend::capability::cpu_launch_units()
+                .max(1)
+                .min(n_coef_rows as u32) as usize;
+            let rows_per_worker = n_coef_rows.div_ceil(workers);
+            let mut worker_err: Option<PrimError> = None;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = coef_host
+                    .chunks_mut(rows_per_worker * n_features)
+                    .zip(intercept_host.chunks_mut(rows_per_worker))
+                    .zip(targets.chunks(rows_per_worker))
+                    .map(|((coef_band, intercept_band), target_band)| {
+                        let params_ref = &params;
+                        scope.spawn(move || -> Result<(), PrimError> {
+                            for (i, t) in target_band.iter().enumerate() {
+                                let (coef_c, intercept_c) =
+                                    sgd_solve_host_slice::<F>(x, t, shape, params_ref)?;
+                                coef_band[i * n_features..(i + 1) * n_features]
+                                    .copy_from_slice(&coef_c);
+                                intercept_band[i] = intercept_c;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    if let Err(e) = h.join().expect("OvR worker thread panicked") {
+                        worker_err = Some(e);
+                    }
+                }
+            });
+            if let Some(e) = worker_err {
+                return Err(AlgoError::Prim(e));
+            }
+        }
 
         Ok(MBSGDClassifier {
             config: self.config,
             classes_,
             n_features,
-            coef_: Some(DeviceArray::from_host(pool, &coef)),
-            intercept_: Some(DeviceArray::from_host(pool, &[intercept])),
+            n_coef_rows,
+            coef_: Some(DeviceArray::from_host(pool, &coef_host)),
+            intercept_: Some(DeviceArray::from_host(pool, &intercept_host)),
             _state: PhantomData,
         })
     }
@@ -452,33 +578,65 @@ where
             }));
         }
 
-        // --- Pitfall 4: distinct-sorted classes_ (logistic.rs precedent), binary
-        //     ±1 remap for the margin loss. Phase-10 scope is the binary linear
-        //     classifier (A6); a non-binary target is rejected. ---
+        // --- Pitfall 4: distinct-sorted classes_ (logistic.rs precedent),
+        //     binary ±1 remap for the margin loss, one-vs-rest for 3+ classes. ---
         let y_host = y.to_host(pool);
-        let (classes_, yp) = prepare_labels::<F>(&y_host, n_samples)?;
-        let yp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &yp);
+        let (classes_, targets) = prepare_labels::<F>(&y_host, n_samples)?;
 
         // --- Lower the validated SgdConfig into the prim-local flat SgdParams
         //     (D-06; the prim cannot take the algos SgdConfig — circular
         //     dependency). The classifier never uses epsilon (regression-only). ---
         let params = lower_config(&self.config);
+        let n_coef_rows = targets.len();
 
-        // Delegate to the validated PRIM-10 prim (10-02). A device failure is a
-        // typed PrimError, wrapped into AlgoError::Prim via `?` (never a panic
-        // across the estimator boundary — T-10-03-03).
-        let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params)?;
+        // A BINARY fit stays exactly the old single-solve path — fully
+        // device-resident, no host round-trip.
+        if n_coef_rows == 1 {
+            let yp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &targets[0]);
+            let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params)?;
+            yp_dev.release_into(pool);
+            return Ok(MBSGDClassifier {
+                config: self.config,
+                classes_,
+                n_features,
+                n_coef_rows,
+                coef_: Some(coef),
+                intercept_: Some(intercept),
+                _state: PhantomData,
+            });
+        }
 
-        // The ±1 target buffer is only needed during the solve (WR-07 re-fit
-        // buffer release).
-        yp_dev.release_into(pool);
+        // --- One-vs-rest solves run SEQUENTIALLY here, unlike the host-slice
+        //     arm: `sgd_solve` takes `&mut BufferPool`, so unlike the
+        //     independent host slices there is one mutable allocator shared
+        //     across every solve and it cannot be borrowed from multiple
+        //     threads at once (the same constraint the LinearSVC OvR L-BFGS
+        //     precedent hit). Each class still costs only ONE upload (`yp_dev`,
+        //     released before the next) and one device solve. ---
+        let mut coef_host: Vec<F> = Vec::with_capacity(n_coef_rows * n_features);
+        let mut intercept_host: Vec<F> = Vec::with_capacity(n_coef_rows);
+        for t in &targets {
+            let yp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, t);
+            // Delegate to the validated PRIM-10 prim (10-02). A device failure
+            // is a typed PrimError, wrapped into AlgoError::Prim via `?`
+            // (never a panic across the estimator boundary — T-10-03-03).
+            let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params)?;
+            // The ±1 target buffer is only needed during the solve (WR-07
+            // re-fit buffer release).
+            yp_dev.release_into(pool);
+            coef_host.extend(coef.to_host(pool));
+            coef.release_into(pool);
+            intercept_host.push(intercept.to_host(pool)[0]);
+            intercept.release_into(pool);
+        }
 
         Ok(MBSGDClassifier {
             config: self.config,
             classes_,
             n_features,
-            coef_: Some(coef),
-            intercept_: Some(intercept),
+            n_coef_rows,
+            coef_: Some(DeviceArray::from_host(pool, &coef_host)),
+            intercept_: Some(DeviceArray::from_host(pool, &intercept_host)),
             _state: PhantomData,
         })
     }
@@ -495,19 +653,37 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, i32>, AlgoError> {
         let (n_query, _n_features) = shape;
+        let k = self.n_coef_rows;
 
-        // The signed decision margin per query row (X·coef + intercept).
+        // The decision margin(s) per query row (X·coef + intercept).
         let margins = self.decision_margin(pool, x, shape)?;
 
-        // sign of the margin selects the class: >= 0 → classes_[1] (the +1 class),
-        // else classes_[0] (the −1 class) — sklearn's `decision >= 0 → +1`.
         let mut labels: Vec<i32> = vec![0i32; n_query];
-        for (r, label) in labels.iter_mut().enumerate() {
-            *label = if margins[r] >= 0.0 {
-                self.classes_[1] as i32
-            } else {
-                self.classes_[0] as i32
-            };
+        if k == 1 {
+            // sign of the margin selects the class: >= 0 → classes_[1] (the +1
+            // class), else classes_[0] (the −1 class) — sklearn's
+            // `decision >= 0 → +1`.
+            for (r, label) in labels.iter_mut().enumerate() {
+                *label = if margins[r] >= 0.0 {
+                    self.classes_[1] as i32
+                } else {
+                    self.classes_[0] as i32
+                };
+            }
+        } else {
+            // One-vs-rest: the argmax column of each row, through `classes_`.
+            // Strict-`>`, so a tie goes to the LOWEST class index — the
+            // `numpy.argmax` rule sklearn's `predict` inherits.
+            for (r, label) in labels.iter_mut().enumerate() {
+                let row = &margins[r * k..(r + 1) * k];
+                let mut best = 0usize;
+                for (j, &v) in row.iter().enumerate().skip(1) {
+                    if v > row[best] {
+                        best = j;
+                    }
+                }
+                *label = self.classes_[best] as i32;
+            }
         }
         Ok(DeviceArray::from_host(pool, &labels))
     }
@@ -518,11 +694,18 @@ where
     F: Float + CubeElement + Pod,
 {
     /// Per-class probabilities from the log-loss sigmoid `1/(1 + exp(−margin))`
-    /// (sklearn's `SGDClassifier(loss="log_loss").predict_proba`). The returned
-    /// matrix is `n_query × 2` (`[P(class₀), P(class₁)]` per row); `P(class₁) =
-    /// σ(margin)`, `P(class₀) = 1 − σ(margin)`. For a non-log loss this sigmoid is
-    /// NOT a calibrated probability (sklearn raises); mlrs returns the same sigmoid
+    /// (sklearn's `SGDClassifier(loss="log_loss").predict_proba`, sklearn's
+    /// `_predict_proba_lr`). For a non-log loss this sigmoid is NOT a
+    /// calibrated probability (sklearn raises); mlrs returns the same sigmoid
     /// shape over the decision margin (the caller pins the log-loss fixture).
+    ///
+    /// Binary: `n_query × 2` (`[P(class₀), P(class₁)]` per row); `P(class₁) =
+    /// σ(margin)`, `P(class₀) = 1 − σ(margin)`.
+    ///
+    /// One-vs-rest (`n_coef_rows > 1`): `n_query × n_classes`, sklearn's OvR
+    /// normalization — sigmoid EVERY column, then divide each row by its own
+    /// sum so the row sums to 1 (NOT a softmax: no exponentiation, just an
+    /// L1 row-normalize of the independently-sigmoided margins).
     fn predict_proba(
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -530,20 +713,48 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         let (n_query, _n_features) = shape;
+        let k = self.n_coef_rows;
         let margins = self.decision_margin(pool, x, shape)?;
 
-        let mut proba: Vec<F> = vec![F::from_int(0i64); n_query * 2];
-        for (r, &m) in margins.iter().enumerate() {
-            // Numerically-stable logistic sigmoid σ(m) = 1/(1 + exp(−m)).
-            let p1 = if m >= 0.0 {
+        // Numerically-stable logistic sigmoid σ(m) = 1/(1 + exp(−m)).
+        let sigmoid = |m: f64| -> f64 {
+            if m >= 0.0 {
                 1.0 / (1.0 + (-m).exp())
             } else {
                 let e = m.exp();
                 e / (1.0 + e)
-            };
-            proba[r * 2] = f64_to_host::<F>(1.0 - p1);
-            proba[r * 2 + 1] = f64_to_host::<F>(p1);
-        }
+            }
+        };
+
+        let proba: Vec<F> = if k == 1 {
+            let mut proba: Vec<F> = vec![F::from_int(0i64); n_query * 2];
+            for (r, &m) in margins.iter().enumerate() {
+                let p1 = sigmoid(m);
+                proba[r * 2] = f64_to_host::<F>(1.0 - p1);
+                proba[r * 2 + 1] = f64_to_host::<F>(p1);
+            }
+            proba
+        } else {
+            let mut proba: Vec<F> = vec![F::from_int(0i64); n_query * k];
+            for r in 0..n_query {
+                let row = &margins[r * k..(r + 1) * k];
+                let mut sum = 0.0f64;
+                let sig: Vec<f64> = row
+                    .iter()
+                    .map(|&m| {
+                        let p = sigmoid(m);
+                        sum += p;
+                        p
+                    })
+                    .collect();
+                // sklearn does NOT guard a zero row-sum (every entry is a
+                // sigmoid output in `(0, 1)`, so `sum` is always `> 0`).
+                for (j, &p) in sig.iter().enumerate() {
+                    proba[r * k + j] = f64_to_host::<F>(p / sum);
+                }
+            }
+            proba
+        };
         Ok(DeviceArray::from_host(pool, &proba))
     }
 }
@@ -552,12 +763,16 @@ impl<F> MBSGDClassifier<F, Fitted>
 where
     F: Float + CubeElement + Pod,
 {
-    /// Host-materialized signed decision margin `X·coef_ + intercept_` (length
-    /// `n_query`), shared by `predict_labels` (sign) and `predict_proba`
-    /// (sigmoid). Runs the on-device matvec GEMM, then broadcasts the scalar
-    /// intercept host-side (the small predict geometry; the fitted state stays
-    /// device-resident until here). Validates geometry / fitted-`n_features`
-    /// (ASVS V5).
+    /// Host-materialized decision matrix `X·coef_ᵀ + intercept_`, `n_query ×
+    /// n_coef_rows` row-major (length `n_query` for a binary fit — the raw
+    /// signed margin), shared by `predict_labels` (sign / argmax) and
+    /// `predict_proba` (sigmoid). ONE on-device GEMM computes every column at
+    /// once (`coef_` stored `n_coef_rows × n_features` row-major, read
+    /// TRANSPOSED via `transb`, so `n_coef_rows == 1` is the exact same call
+    /// the old single-column path made — no special case needed), then the
+    /// per-row intercepts are broadcast host-side (the small predict
+    /// geometry; the fitted state stays device-resident until here).
+    /// Validates geometry / fitted-`n_features` (ASVS V5).
     fn decision_margin(
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -565,6 +780,7 @@ where
         shape: (usize, usize),
     ) -> Result<Vec<f64>, AlgoError> {
         let (n_query, n_features) = shape;
+        let k = self.n_coef_rows;
 
         // `coef_`/`intercept_` are `Some` by construction on the `Fitted` state
         // (the compile-time typestate replaces the old runtime `NotFitted`
@@ -599,17 +815,17 @@ where
             x,
             (n_query, n_features),
             coef,
-            (n_features, 1),
+            (n_features, k),
             false,
-            false,
+            true,
             None,
         )?;
-        let bias = host_to_f64(intercept.to_host(pool)[0]);
+        let bias = intercept.to_host(pool);
         let raw_host = raw.to_host(pool);
         raw.release_into(pool);
 
-        Ok((0..n_query)
-            .map(|r| host_to_f64(raw_host[r]) + bias)
+        Ok((0..n_query * k)
+            .map(|i| host_to_f64(raw_host[i]) + host_to_f64(bias[i % k]))
             .collect())
     }
 }
@@ -660,5 +876,6 @@ pub(crate) fn lower_config(cfg: &SgdConfig) -> SgdParams {
         batch_size: cfg.batch_size,
         max_iter: cfg.max_iter,
         tol: cfg.tol,
+        n_iter_no_change: cfg.n_iter_no_change,
     }
 }

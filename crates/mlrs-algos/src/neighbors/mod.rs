@@ -24,3 +24,42 @@
 pub mod classifier;
 pub mod nearest;
 pub mod regressor;
+
+/// The distance metric a neighbor estimator searches under (KNN-REG-PARAMS).
+///
+/// This is a RE-EXPORT of [`mlrs_backend::prims::knn_graph::Metric`], not a
+/// mirror of it. HDBSCAN and UMAP each define their own copy because their
+/// public metric sets are deliberately narrower than the prim's; the neighbor
+/// estimators expose exactly the prim's set, so a second enum here would be a
+/// pure `match` that can only ever drift (PATTERNS Pitfall 4). The Minkowski
+/// exponent travels INSIDE the `Minkowski { p }` payload — there is no
+/// standalone `p` on the estimator, so the compute path and the reported
+/// hyperparameter cannot disagree.
+///
+/// sklearn's aliases collapse onto these: `metric='l2'`/`'euclidean'` and
+/// `metric='minkowski', p=2` are [`Metric::Euclidean`]; `'l1'`/`'cityblock'`/
+/// `'manhattan'` and `p=1` are [`Metric::Manhattan`]; `'chebyshev'`/`'infinity'`
+/// and `p=inf` are [`Metric::Chebyshev`]. Collapsing the p=1/p=2 special cases
+/// onto the dedicated kernels is not just an optimization — `minkowski_dist`
+/// evaluates `F::powf`, which is capability-gated at f64 on some backends and
+/// less accurate than the direct forms even where it runs.
+pub use mlrs_backend::prims::knn_graph::Metric;
+
+/// How a neighbor's target contributes to a prediction (sklearn `weights=`).
+///
+/// The callable third option sklearn accepts is NOT represented here: an
+/// arbitrary Python function cannot cross into a device kernel. The Python shim
+/// serves it by calling `kneighbors` and doing the weighted average itself, so
+/// the core surface stays total over what it can actually compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Weights {
+    /// `weights='uniform'` — every neighbor contributes `1/k`.
+    Uniform,
+    /// `weights='distance'` — neighbor `j` contributes in proportion to `1/d_j`.
+    ///
+    /// A query that coincides with one or more training points takes sklearn's
+    /// degenerate branch instead: those neighbors get weight 1 and every other
+    /// neighbor in that row gets 0 (otherwise `1/0 = inf` and the normalization
+    /// `inf/inf` is NaN). See `mlrs_kernels::knn::knn_regress_gather`.
+    Distance,
+}

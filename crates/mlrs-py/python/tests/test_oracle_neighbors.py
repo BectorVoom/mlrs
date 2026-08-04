@@ -80,6 +80,123 @@ def test_kneighbors_regressor_oracle(fixture):
     )
 
 
+# ---------------------------------------------------------------------------
+# Deferred upload (KNN-REG-FIT): all three shims must stay observationally
+# identical after moving the device upload out of `fit`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("estimator", ["NearestNeighbors", "KNeighborsClassifier"])
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+def test_fit_still_rejects_non_finite_X(estimator, bad_value):
+    """The NaN/inf rejection fires at ``fit``, not at the first query.
+
+    ``fit`` defers the device upload, and the finite scan moved from numpy's
+    ``check_array`` into the Rust call along with it. If that scan had drifted
+    to the query path, a NaN training set would fit "fine" and only blow up
+    later — sklearn raises at ``fit``, so mlrs must too.
+    """
+    X = np.random.default_rng(0).standard_normal((20, 3)).astype(np.float32)
+    X[4, 1] = bad_value
+    y = np.arange(20, dtype=np.int32) % 2
+    est = getattr(mlrs, estimator)()
+    with pytest.raises(ValueError, match="infinity|NaN|too large"):
+        est.fit(X) if estimator == "NearestNeighbors" else est.fit(X, y)
+
+
+def test_classifier_rejects_non_finite_labels_at_fit():
+    """A non-finite LABEL is rejected at ``fit`` too.
+
+    ``y``'s scan is not a separate pass: the Rust label preparation validates
+    integer-ness and finiteness together, because a NaN label would otherwise
+    become class ``0`` under the saturating cast with no error at all.
+    """
+    X = np.random.default_rng(0).standard_normal((20, 3)).astype(np.float32)
+    y = np.arange(20, dtype=np.float32)
+    y[7] = np.nan
+    with pytest.raises(ValueError):
+        mlrs.KNeighborsClassifier().fit(X, y)
+
+
+def test_classes_available_without_any_query():
+    """``classes_`` is readable the instant ``fit`` returns.
+
+    The shim reads it on the line after ``fit``, so the labels are prepared
+    eagerly even though the matrix upload is deferred. A non-contiguous target
+    also has to round-trip (WR-01), which is why the labels here are ``{0, 2,
+    7}`` rather than ``range(k)``.
+    """
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((30, 3)).astype(np.float32)
+    y = rng.choice([0, 2, 7], size=30).astype(np.int32)
+    clf = mlrs.KNeighborsClassifier(n_neighbors=3).fit(X, y)
+    assert list(clf.classes_) == [0, 2, 7]
+    assert clf.n_features_in_ == 3
+    # And predict still only ever returns labels drawn from that set.
+    assert set(np.asarray(clf.predict(X)).tolist()) <= {0, 2, 7}
+
+
+@pytest.mark.parametrize("estimator", ["NearestNeighbors", "KNeighborsClassifier"])
+def test_repeated_queries_and_refit_are_stable(estimator):
+    """Materialization is idempotent, and a refit re-materializes.
+
+    Two consecutive queries must agree (the first uploads, the second must
+    reuse), and refitting the SAME object on different data must not keep
+    serving the old training set — which is what would happen if the deferred
+    data were consumed but the materialized arm left in place.
+    """
+    rng = np.random.default_rng(1)
+    X = rng.standard_normal((40, 3)).astype(np.float32)
+    Q = rng.standard_normal((6, 3)).astype(np.float32)
+    y = (rng.standard_normal(40) > 0).astype(np.int32)
+
+    if estimator == "NearestNeighbors":
+        est = mlrs.NearestNeighbors(n_neighbors=3)
+        est.fit(X)
+        first = np.asarray(est.kneighbors(Q)[1])
+        assert np.array_equal(first, np.asarray(est.kneighbors(Q)[1]))
+        est.fit(X[::-1].copy())
+        assert not np.array_equal(first, np.asarray(est.kneighbors(Q)[1]))
+    else:
+        est = mlrs.KNeighborsClassifier(n_neighbors=3)
+        est.fit(X, y)
+        first = np.asarray(est.predict(Q))
+        assert np.array_equal(first, np.asarray(est.predict(Q)))
+        est.fit(X, 1 - y)
+        assert np.array_equal(np.asarray(est.predict(Q)), 1 - first)
+
+
+@pytest.mark.parametrize("estimator", ["NearestNeighbors", "KNeighborsClassifier"])
+def test_n_neighbors_survives_a_refit(estimator):
+    """The hyperparameter is re-read from the wrapper on every ``fit``.
+
+    It used to be recovered from the core enum's unfit payload, which is gone
+    once the estimator has been fitted — so a second ``fit`` on the same object
+    silently fell back to ``n_neighbors=5``. Every ``clone``-and-refit path
+    (``cross_val_score``, ``GridSearchCV``) does exactly that.
+    """
+    rng = np.random.default_rng(2)
+    X = rng.standard_normal((30, 3)).astype(np.float32)
+    Q = rng.standard_normal((4, 3)).astype(np.float32)
+    y = (rng.standard_normal(30) > 0).astype(np.int32)
+    if estimator == "NearestNeighbors":
+        est = mlrs.NearestNeighbors(n_neighbors=7)
+        est.fit(X)
+        est.fit(X)  # the refit that used to reset k to 5
+        assert np.asarray(est.kneighbors(Q)[1]).shape[1] == 7
+    else:
+        est = mlrs.KNeighborsClassifier(n_neighbors=7)
+        est.fit(X, y)
+        est.fit(X, y)
+        # A 7-neighbour vote over 2 classes can never tie at 3.5, so a silent
+        # fallback to k=5 would be invisible here — compare against sklearn
+        # instead, which is the actual contract.
+        from sklearn.neighbors import KNeighborsClassifier as SkKNC
+
+        want = SkKNC(n_neighbors=7, algorithm="brute").fit(X, y).predict(Q)
+        assert np.array_equal(np.asarray(est.predict(Q)).ravel(), want.ravel())
+
+
 def test_invalid_algorithm():
     """Verify that NearestNeighbors, KNeighborsClassifier, and KNeighborsRegressor raise ValueError on invalid algorithm.
 

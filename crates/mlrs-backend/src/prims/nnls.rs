@@ -25,7 +25,7 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use mlrs_core::{f64_to_host, PrimError};
-use mlrs_kernels::{ridge_intercept, ridge_nnls_cd, NNLS_MAX_DIM};
+use mlrs_kernels::{ridge_intercept, ridge_intercept_multi, ridge_nnls_cd, NNLS_MAX_DIM};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
@@ -237,4 +237,70 @@ where
     );
 
     Ok(DeviceArray::from_raw(out, 1))
+}
+
+/// Multi-target twin of [`ridge_intercept_device`]: `intercept[t] = ȳ_t −
+/// x̄·coef[·,t]` for each of the `k` targets, computed ON-DEVICE so a
+/// multi-output fit needs no host round-trip at all.
+///
+/// `coef` is `d × k` row-major (FEATURE-major — the layout
+/// `cholesky_solve_reg` returns for `rhs = k` and the fused predict kernels
+/// consume), `ymean` is length `k`, and the result is length `k`.
+///
+/// One unit per target rather than the single-target kernel's single unit: the
+/// `k` dots are independent, so the whole recovery costs the same `d` dependent
+/// steps as one of them. `fit_intercept = false` is the caller's business — it
+/// never launches this.
+pub fn ridge_intercept_multi_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    xmean: &DeviceArray<ActiveRuntime, F>,
+    ymean: &DeviceArray<ActiveRuntime, F>,
+    coef: &DeviceArray<ActiveRuntime, F>,
+    d: usize,
+    k: usize,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    if d == 0 || k == 0 || xmean.len() != d || coef.len() != d * k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "ridge_intercept_multi.coef",
+            rows: d,
+            cols: k,
+            len: coef.len(),
+        });
+    }
+    if ymean.len() != k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "ridge_intercept_multi.ymean",
+            rows: k,
+            cols: 1,
+            len: ymean.len(),
+        });
+    }
+
+    let out = pool.acquire(k * size_of::<F>());
+    let client = pool.client().clone();
+
+    // SAFETY: lengths are the geometry validated immediately above; the kernel
+    // guards `t < k` and walks `c < d` only.
+    let xm = unsafe { ArrayArg::from_raw_parts(xmean.handle().clone(), d) };
+    let ym = unsafe { ArrayArg::from_raw_parts(ymean.handle().clone(), k) };
+    let cf = unsafe { ArrayArg::from_raw_parts(coef.handle().clone(), d * k) };
+    let ov = unsafe { ArrayArg::from_raw_parts(out.clone(), k) };
+
+    let (cc, cd) = super::launch_dims_1d_folded(k, crate::capability::gather_launch_width());
+    ridge_intercept_multi::launch::<F, ActiveRuntime>(
+        &client,
+        cc,
+        cd,
+        xm,
+        ym,
+        cf,
+        ov,
+        d as u32,
+        k as u32,
+    );
+
+    Ok(DeviceArray::from_raw(out, k))
 }

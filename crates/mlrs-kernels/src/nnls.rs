@@ -271,3 +271,38 @@ pub fn ridge_intercept<F: Float + CubeElement>(
         out[0] = ymean[0] - dot;
     }
 }
+
+/// Multi-target twin of [`ridge_intercept`]: `out[t] = ȳ_t − Σ_c x̄_c·coef[c,t]`
+/// for each of the `k` targets, with `coef` in the `d × k` row-major
+/// (feature-major) layout `cholesky_solve` returns and
+/// `linear_predict_bias_multi` consumes.
+///
+/// ONE UNIT PER TARGET, rather than the single-unit serial walk of the
+/// single-target kernel: the `k` dots are independent, so a `k`-wide launch
+/// costs the same `d` dependent steps as one dot instead of `k · d`. Each
+/// unit's own loop is still ASCENDING in `c`, so every target reproduces the
+/// host twin's summation order exactly — only the accumulator width differs
+/// (`F` here, `f64` on the host arm), which is the same tradeoff the
+/// single-target kernel documents.
+///
+/// `fit_intercept = false` is handled by the caller, which never launches this.
+#[cube(launch)]
+pub fn ridge_intercept_multi<F: Float + CubeElement>(
+    xmean: &Array<F>,
+    ymean: &Array<F>,
+    coef: &Array<F>,
+    out: &mut Array<F>,
+    d: u32,
+    k: u32,
+) {
+    let t = ABSOLUTE_POS;
+    if t < k as usize {
+        let mut dot = F::new(0.0_f32);
+        let mut c = 0u32;
+        while c < d {
+            dot += xmean[c as usize] * coef[(c * k + t as u32) as usize];
+            c += 1u32;
+        }
+        out[t] = ymean[t] - dot;
+    }
+}

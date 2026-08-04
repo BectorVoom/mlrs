@@ -29,6 +29,20 @@ ingestion path — for mlrs specifically that is where a device→host→device
 round-trip of the whole training matrix used to live. The interesting column is
 ``predict``, which is where the brute-force search actually happens.
 
+Since KNN-REG-FIT, ``fit`` on all three mlrs neighbors estimators is a
+validation pass only: it checks the training set for NaN/inf and parks the host
+buffers, and the device upload happens on the FIRST query. That is what makes
+the ``fit`` column comparable to sklearn's (which likewise only validates a
+reference it keeps) rather than a copy sklearn never makes. The cost did not
+vanish — it moved into the first ``predict``, where it measured ~10% of that
+call and under 1% of the warm search. When reading the two columns together,
+attribute the first ``predict`` accordingly.
+
+Both columns are unreliable on a busy machine: a competing job inflated
+wall-clock here by 10-30x at random. Prefer ``time.process_time`` and interleave
+the engines within each repetition (min-of-N) when the load average is not close
+to zero.
+
 Requires numpy + scikit-learn; cuML optional.
 """
 

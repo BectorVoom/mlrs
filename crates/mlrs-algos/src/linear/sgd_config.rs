@@ -183,6 +183,12 @@ pub struct SgdConfig {
     pub max_iter: usize,
     /// Stopping tolerance (`0` ⇒ run the full `max_iter` epochs, the oracle pin).
     pub tol: f64,
+    /// Consecutive non-improving epochs (on the sklearn training-loss-plateau
+    /// check, `tol > 0` only) before stopping early — sklearn `n_iter_no_change`
+    /// (default 5). Only `MBSGDClassifier`/`MBSGDRegressor` (the `sgd_solve`
+    /// consumers) read this; `LinearSVC`/`LinearSVR` carry it in their
+    /// `SgdConfig` for D-06 uniformity but their L-BFGS fit never consults it.
+    pub n_iter_no_change: usize,
     /// The learning-rate schedule (SGD estimators only; CD estimators ignore it).
     pub learning_rate: LearningRate,
     /// Initial learning rate `eta0 > 0` for the `constant`/`invscaling` schedules.

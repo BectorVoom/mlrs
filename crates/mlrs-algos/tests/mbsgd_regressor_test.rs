@@ -282,6 +282,7 @@ fn default_matches_sklearn() {
     assert_eq!(cfg.l1_ratio, 0.15, "default l1_ratio");
     assert_eq!(cfg.epsilon, 0.1, "default epsilon");
     assert!(cfg.fit_intercept, "default fit_intercept");
+    assert_eq!(cfg.n_iter_no_change, 5, "default n_iter_no_change");
 }
 
 /// `build()` rejects `epsilon < 0` and a classification loss on the regressor

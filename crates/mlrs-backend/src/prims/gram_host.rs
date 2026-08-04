@@ -211,6 +211,357 @@ fn centered_gram_xty_t<T: GramElem>(
     (x_mean, y_mean, gram, xty)
 }
 
+/// Column means, target means, centered Gram and centered `Xᵀy` for MULTIPLE
+/// target columns in one pass — the `RidgeClassifier` (multiclass one-hot ±1
+/// targets) twin of [`centered_gram_xty`].
+///
+/// The Gram `G = XᵀX` depends only on `x`, never on `y`, so forming it once
+/// and reusing it for every target column (rather than calling
+/// [`centered_gram_xty`] once per column, which would re-walk the whole
+/// `O(n·d²)` design `k` times) is the entire point of this function: only the
+/// `O(n·d·k)` `Xᵀy` term actually needs a per-column pass, and even that shares
+/// the SAME centered-and-transposed tile the Gram sweep already built.
+///
+/// - `x` is the `n × d` row-major design, `y` the `n × k` row-major target
+///   matrix (`k` target columns per row, e.g. sklearn's one-hot `±1`
+///   `LabelBinarizer` output). Both are read in the caller's element type and
+///   accumulated in `f64`.
+/// - `sample_weight` / `fit_intercept` behave exactly as in
+///   [`centered_gram_xty`].
+///
+/// Returns `(x_mean[d], y_means[k], gram[d·d], xty[d·k])`, `xty` row-major
+/// (`xty[i·k + c]` is feature `i`'s dot with target column `c`). `k = 1`
+/// reproduces [`centered_gram_xty`] bit-for-bit (same accumulation order).
+///
+/// Panics if the slice lengths disagree with `(n, d)` / `(n, k)`; callers
+/// validate geometry first, as `centered_gram_xty` requires.
+pub fn centered_gram_multi_xty<F: Pod>(
+    x: &[F],
+    y: &[F],
+    n: usize,
+    d: usize,
+    k: usize,
+    sample_weight: Option<&[f64]>,
+    fit_intercept: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    match size_of::<F>() {
+        4 => centered_gram_multi_xty_t::<f32>(
+            bytemuck::cast_slice(x),
+            bytemuck::cast_slice(y),
+            n,
+            d,
+            k,
+            sample_weight,
+            fit_intercept,
+        ),
+        8 => centered_gram_multi_xty_t::<f64>(
+            bytemuck::cast_slice(x),
+            bytemuck::cast_slice(y),
+            n,
+            d,
+            k,
+            sample_weight,
+            fit_intercept,
+        ),
+        other => unreachable!("gram_host is f32/f64 only, got a {other}-byte element"),
+    }
+}
+
+/// Monomorphized body of [`centered_gram_multi_xty`].
+fn centered_gram_multi_xty_t<T: GramElem>(
+    x: &[T],
+    y: &[T],
+    n: usize,
+    d: usize,
+    k: usize,
+    sw: Option<&[f64]>,
+    fit_intercept: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    assert_eq!(x.len(), n * d, "gram_host: x length must be n*d");
+    assert_eq!(y.len(), n * k, "gram_host: y length must be n*k");
+
+    let units = host_units(n, d);
+    let (x_mean, y_means) = if fit_intercept {
+        column_means_multi(x, y, n, d, k, sw, units)
+    } else {
+        (vec![0.0f64; d], vec![0.0f64; k])
+    };
+
+    let (gram, xty) = accumulate_multi(x, y, n, d, k, &x_mean, &y_means, sw, units);
+    (x_mean, y_means, gram, xty)
+}
+
+/// Multi-column twin of [`column_means`].
+fn column_means_multi<T: GramElem>(
+    x: &[T],
+    y: &[T],
+    n: usize,
+    d: usize,
+    k: usize,
+    sw: Option<&[f64]>,
+    units: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let (mut sums, mut y_sums, w_sum) = if units <= 1 {
+        column_sums_multi(x, y, d, k, sw.map(|w| (w, 0usize)))
+    } else {
+        let rows = n.div_ceil(units);
+        let partials: Vec<(Vec<f64>, Vec<f64>, f64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..units)
+                .filter_map(|u| {
+                    let r0 = u * rows;
+                    if r0 >= n {
+                        return None;
+                    }
+                    let r1 = (r0 + rows).min(n);
+                    let xs = &x[r0 * d..r1 * d];
+                    let ys = &y[r0 * k..r1 * k];
+                    Some(scope.spawn(move || column_sums_multi(xs, ys, d, k, sw.map(|w| (w, r0)))))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("gram_host_multi column-mean worker panicked"))
+                .collect()
+        });
+        let mut s = vec![0.0f64; d];
+        let mut ys = vec![0.0f64; k];
+        let mut ws = 0.0f64;
+        for (ps, py, pw) in partials {
+            for (a, b) in s.iter_mut().zip(ps.iter()) {
+                *a += *b;
+            }
+            for (a, b) in ys.iter_mut().zip(py.iter()) {
+                *a += *b;
+            }
+            ws += pw;
+        }
+        (s, ys, ws)
+    };
+
+    if w_sum > 0.0 {
+        for m in sums.iter_mut() {
+            *m /= w_sum;
+        }
+        for m in y_sums.iter_mut() {
+            *m /= w_sum;
+        }
+    }
+    (sums, y_sums)
+}
+
+/// Multi-column twin of [`column_sums`].
+fn column_sums_multi<T: GramElem>(
+    x: &[T],
+    y: &[T],
+    d: usize,
+    k: usize,
+    sw: Option<(&[f64], usize)>,
+) -> (Vec<f64>, Vec<f64>, f64) {
+    let rows = y.len() / k;
+    let mut sums = vec![0.0f64; d];
+    let mut y_sums = vec![0.0f64; k];
+    match sw {
+        None => {
+            for r in 0..rows {
+                let row = &x[r * d..(r + 1) * d];
+                for (s, v) in sums.iter_mut().zip(row.iter()) {
+                    *s += v.wide();
+                }
+                let yrow = &y[r * k..(r + 1) * k];
+                for (s, v) in y_sums.iter_mut().zip(yrow.iter()) {
+                    *s += v.wide();
+                }
+            }
+            (sums, y_sums, rows as f64)
+        }
+        Some((w, r0)) => {
+            let mut w_sum = 0.0f64;
+            for r in 0..rows {
+                let wr = w[r0 + r];
+                if wr == 0.0 {
+                    continue;
+                }
+                let row = &x[r * d..(r + 1) * d];
+                for (s, v) in sums.iter_mut().zip(row.iter()) {
+                    *s += wr * v.wide();
+                }
+                let yrow = &y[r * k..(r + 1) * k];
+                for (s, v) in y_sums.iter_mut().zip(yrow.iter()) {
+                    *s += wr * v.wide();
+                }
+                w_sum += wr;
+            }
+            (sums, y_sums, w_sum)
+        }
+    }
+}
+
+/// Multi-column twin of [`accumulate`]: the Gram accumulation is IDENTICAL to
+/// the single-column sweep (it never reads `y`); only `xty` grows from a
+/// length-`d` vector to a length-`d·k` row-major matrix.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_multi<T: GramElem>(
+    x: &[T],
+    y: &[T],
+    n: usize,
+    d: usize,
+    k: usize,
+    x_mean: &[f64],
+    y_means: &[f64],
+    sw: Option<&[f64]>,
+    units: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let (mut gram, xty) = if units <= 1 {
+        chunk_gram_multi(x, y, d, k, x_mean, y_means, sw.map(|w| (w, 0usize)))
+    } else {
+        let rows = n.div_ceil(units);
+        let partials: Vec<(Vec<f64>, Vec<f64>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..units)
+                .filter_map(|u| {
+                    let r0 = u * rows;
+                    if r0 >= n {
+                        return None;
+                    }
+                    let r1 = (r0 + rows).min(n);
+                    let xs = &x[r0 * d..r1 * d];
+                    let ys = &y[r0 * k..r1 * k];
+                    Some(scope.spawn(move || {
+                        chunk_gram_multi(xs, ys, d, k, x_mean, y_means, sw.map(|w| (w, r0)))
+                    }))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("gram_host_multi accumulate worker panicked"))
+                .collect()
+        });
+        let mut g = vec![0.0f64; d * d];
+        let mut b = vec![0.0f64; d * k];
+        for (pg, pb) in partials {
+            for (a, v) in g.iter_mut().zip(pg.iter()) {
+                *a += *v;
+            }
+            for (a, v) in b.iter_mut().zip(pb.iter()) {
+                *a += *v;
+            }
+        }
+        (g, b)
+    };
+
+    for i in 0..d {
+        for j in 0..i {
+            gram[j * d + i] = gram[i * d + j];
+        }
+    }
+    (gram, xty)
+}
+
+/// Multi-column twin of [`chunk_gram`]: centers (+ `√w`-scales) both `x` and
+/// EVERY column of `y` into transposed tiles, then reuses [`block4x4`]/[`dot`]
+/// for the Gram and one [`dot`] per `(feature, target-column)` pair for `xty`.
+#[allow(clippy::too_many_arguments)]
+fn chunk_gram_multi<T: GramElem>(
+    x: &[T],
+    y: &[T],
+    d: usize,
+    k: usize,
+    x_mean: &[f64],
+    y_means: &[f64],
+    sw: Option<(&[f64], usize)>,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut gram = vec![0.0f64; d * d];
+    let mut xty = vec![0.0f64; d * k];
+    let mut tile = vec![0.0f64; d * ROW_BLOCK];
+    let mut ycol = vec![0.0f64; k * ROW_BLOCK];
+
+    let rows = y.len() / k;
+    let mut r0 = 0usize;
+    while r0 < rows {
+        let rb = ROW_BLOCK.min(rows - r0);
+
+        for r in 0..rb {
+            let scale = match sw {
+                None => 1.0,
+                Some((w, base)) => w[base + r0 + r].sqrt(),
+            };
+            let row = &x[(r0 + r) * d..(r0 + r + 1) * d];
+            for j in 0..d {
+                tile[j * ROW_BLOCK + r] = (row[j].wide() - x_mean[j]) * scale;
+            }
+            let yrow = &y[(r0 + r) * k..(r0 + r + 1) * k];
+            for c in 0..k {
+                ycol[c * ROW_BLOCK + r] = (yrow[c].wide() - y_means[c]) * scale;
+            }
+        }
+
+        sweep_block_multi(&tile, &ycol, rb, d, k, &mut gram, &mut xty);
+        r0 += rb;
+    }
+
+    (gram, xty)
+}
+
+/// Multi-column twin of [`sweep_block`]: the Gram half is copy-pasted verbatim
+/// (same `4 × 4` register-blocked sweep over the `x` tile alone); the `xty`
+/// half loops over the `k` target columns instead of accumulating one.
+fn sweep_block_multi(
+    tile: &[f64],
+    ycol: &[f64],
+    rb: usize,
+    d: usize,
+    k: usize,
+    gram: &mut [f64],
+    xty: &mut [f64],
+) {
+    let full = d - d % 4;
+
+    let mut i0 = 0usize;
+    while i0 < full {
+        let mut j0 = 0usize;
+        while j0 < i0 {
+            let mut acc = [0.0f64; 16];
+            block4x4(tile, i0, j0, rb, &mut acc);
+            for a in 0..4 {
+                for b in 0..4 {
+                    gram[(i0 + a) * d + (j0 + b)] += acc[a * 4 + b];
+                }
+            }
+            j0 += 4;
+        }
+        let mut acc = [0.0f64; 16];
+        block4x4(tile, i0, i0, rb, &mut acc);
+        for a in 0..4 {
+            for b in 0..=a {
+                gram[(i0 + a) * d + (i0 + b)] += acc[a * 4 + b];
+            }
+        }
+        i0 += 4;
+    }
+
+    for i in full..d {
+        let ti = &tile[i * ROW_BLOCK..i * ROW_BLOCK + rb];
+        for j in 0..=i {
+            let tj = &tile[j * ROW_BLOCK..j * ROW_BLOCK + rb];
+            gram[i * d + j] += dot(ti, tj);
+        }
+    }
+    for i in 0..full {
+        let ti = &tile[i * ROW_BLOCK..i * ROW_BLOCK + rb];
+        for j in full..=i {
+            let tj = &tile[j * ROW_BLOCK..j * ROW_BLOCK + rb];
+            gram[i * d + j] += dot(ti, tj);
+        }
+    }
+
+    for i in 0..d {
+        let ti = &tile[i * ROW_BLOCK..i * ROW_BLOCK + rb];
+        for c in 0..k {
+            let yc = &ycol[c * ROW_BLOCK..c * ROW_BLOCK + rb];
+            xty[i * k + c] += dot(ti, yc);
+        }
+    }
+}
+
 /// Worker threads to split the fit across — see [`HOST_MACS_PER_UNIT`]. Never
 /// more than the machine offers ([`crate::capability::cpu_launch_units`], which
 /// `MLRS_CPU_UNITS` overrides for A/B), never fewer than one, and never more
