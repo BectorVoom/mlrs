@@ -98,7 +98,16 @@ fn fit_device(pool: &mut BufferPool<ActiveRuntime>, x: &[f32], y: &[f32], n: usi
 }
 
 /// One FIT through the shared-Gram HOST arm — the code the cpu backend runs.
+///
+/// `host_fit_applicable` is FALSE on a device backend above `gram_host`'s
+/// fixed dispatch-cost floor, which is every interesting rung of this ladder —
+/// so the arm has to be FORCED for the comparison to exist at all. Without
+/// this the host column reads `inf` at seven of eight rungs and the ratio is
+/// vacuous. The force goes through `abflag`'s thread-local override, never
+/// `std::env::set_var` (an environ data race, and it would leak across the
+/// other tests in the binary).
 fn fit_host(pool: &mut BufferPool<ActiveRuntime>, x: &[f32], y: &[f32], n: usize, d: usize) -> f64 {
+    let _forced = mlrs_backend::abflag::force("MLRS_RIDGE_GRAM_HOST", "1");
     let est = RidgeClassifier::<f32>::new();
     if !est.host_fit_applicable((n, d)) {
         return f64::NAN;
@@ -152,6 +161,63 @@ fn predict_host(
     dt
 }
 
+/// Count the rows where the two `predict` arms chose different labels, and
+/// PANIC on any such row that is not a genuine near-tie.
+///
+/// The device kernel accumulates each class score in `F`; the host one widens
+/// every operand to `f64`. Two classes whose scores sit within `f32` rounding
+/// of each other can therefore order differently between the arms without
+/// either being wrong — but a disagreement between two CLEARLY separated
+/// scores would be a real defect (a wrong coefficient layout, a bad
+/// `classes_` index, an argmax that scans the wrong range). This separates the
+/// two by checking, against the host's own `f64` scores, that the top two
+/// classes of a disagreeing row are within `f32` epsilon of each other.
+///
+/// `scores` is the host `decision_function` output — length `n_query` when
+/// `n_targets == 1`, else row-major `n_query × n_targets`.
+#[allow(clippy::too_many_arguments)]
+fn disagreements(
+    device: &[i32],
+    host: &[i32],
+    scores: &[f64],
+    n_targets: usize,
+    n: usize,
+    d: usize,
+    k: usize,
+) -> usize {
+    // f32 has ~7 significant digits; a dot over `d` terms accumulates a few
+    // ulps per term, so the bound is scaled by the score magnitude and by the
+    // reduction length rather than being an absolute constant.
+    let rel = 1e-6 * (d as f64).sqrt();
+    let mut count = 0usize;
+    for (r, (&dl, &hl)) in device.iter().zip(host.iter()).enumerate() {
+        if dl == hl {
+            continue;
+        }
+        count += 1;
+        let row = &scores[r * n_targets..(r + 1) * n_targets];
+        let gap = if n_targets == 1 {
+            // Binary: the "tie" is the single score against the 0 threshold.
+            row[0].abs()
+        } else {
+            let mut sorted: Vec<f64> = row.to_vec();
+            sorted.sort_by(|a, b| b.partial_cmp(a).expect("scores are finite"));
+            sorted[0] - sorted[1]
+        };
+        // Relative to the row's own magnitude, floored at 1 so a row of
+        // near-zero scores still gets an absolute f32-epsilon allowance.
+        let scale = row.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        assert!(
+            gap <= rel * scale,
+            "n={n} d={d} k={k} row {r}: the arms chose different labels \
+             ({dl} device, {hl} host) but the top-two score gap is {gap:e}, \
+             far above f32 rounding ({:e}) — this is a DEFECT, not a tie",
+            rel * scale
+        );
+    }
+    count
+}
+
 /// `(n_samples, n_features, n_classes)`. The `d = 128` / `d = 256` rungs are
 /// where a device FIT has a chance at all (`n·d²/2` of arithmetic over an `n·d`
 /// transfer, so the advantage grows with `d`); the `k = 26` rungs are where a
@@ -161,11 +227,15 @@ const CONFIGS: &[(usize, usize, usize)] = &[
     (10_000, 16, 2),
     (10_000, 64, 3),
     (100_000, 16, 3),
+    (100_000, 16, 26),
     (100_000, 64, 3),
+    (100_000, 64, 5),
     (100_000, 64, 10),
     (100_000, 64, 26),
     (100_000, 128, 10),
+    (100_000, 128, 26),
     (100_000, 256, 10),
+    (100_000, 256, 26),
 ];
 
 /// Query rows for the predict ladder. Deliberately LARGE: a sub-millisecond
@@ -177,15 +247,25 @@ const N_QUERY: usize = 100_000;
 #[test]
 #[ignore = "wall-clock probe; run explicitly in release mode"]
 fn ridge_classifier_device_vs_host_ladder() {
-    let client = runtime::active_client();
-    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
     let r = reps();
+
+    // A FRESH pool per rung, not one for the whole ladder.
+    //
+    // `DeviceArray::from_host` goes through `client.create`, which always
+    // allocates, while `release_into` caches into a free-list only `acquire`
+    // can drain (measured and documented in `mlrs-ridge-positive-cuda`) — so
+    // repeated uploads never reuse and live device memory grows per call. One
+    // pool across `reps × CONFIGS` uploads of a 102 MiB design exhausted a
+    // 15 GiB T4 part-way through the ladder. Dropping the pool between rungs
+    // releases the allocations with it, and costs nothing that is timed.
+    let new_pool = || BufferPool::<ActiveRuntime>::new(runtime::active_client());
 
     println!(
         "\nRidgeClassifier FIT — min-of-{r}, f32, upload INSIDE the timer, both arms forced"
     );
     println!("{:>9} {:>5} {:>4} {:>12} {:>12} {:>9}", "n", "d", "k", "host (ms)", "device (ms)", "speedup");
     for &(n, d, k) in CONFIGS {
+        let mut pool = new_pool();
         let (x, y) = make_classification(n, d, k, 42);
         let mut best_dev = f64::INFINITY;
         let mut best_host = f64::INFINITY;
@@ -210,6 +290,7 @@ fn ridge_classifier_device_vs_host_ladder() {
     );
     println!("{:>9} {:>5} {:>4} {:>12} {:>12} {:>9}", "n_fit", "d", "k", "host (ms)", "device (ms)", "speedup");
     for &(n, d, k) in CONFIGS {
+        let mut pool = new_pool();
         let (x, y) = make_classification(n, d, k, 42);
         let (xq, _) = make_classification(N_QUERY, d, k, 4242);
         let est = RidgeClassifier::<f32>::new();
@@ -222,25 +303,44 @@ fn ridge_classifier_device_vs_host_ladder() {
         y_dev.release_into(&mut pool);
 
         // Agreement first: a faster arm that disagrees is not a faster arm.
+        //
+        // The gate is NOT exact label equality, because that is not a contract
+        // either arm can honour. The device kernel accumulates each class score
+        // in `F` (`f32` here) and the host one widens to `f64`, so two classes
+        // whose scores sit within `f32` rounding of each other can ORDER
+        // differently between the arms — measured on a T4 at
+        // `d = 16, k = 26`: exactly 1 row of 100 000. The `argmax` logic itself
+        // is identical (strict `>`, first-occurrence tie-break, asserted by
+        // `ridge_classifier_device_test.rs`), so what has to hold is that every
+        // disagreement is a genuine near-tie — which is checked here against
+        // the host's own `f64` scores, not assumed.
         {
             let hp = fitted
                 .predict_labels_from_host(&pool, &xq, (N_QUERY, d))
                 .expect("host predict");
+            let hs = fitted
+                .decision_function_from_host(&pool, &xq, (N_QUERY, d))
+                .expect("host decision_function");
             let xq_dev: DeviceArray<ActiveRuntime, f32> =
                 DeviceArray::from_host(&mut pool, &xq);
             let dp = fitted
                 .predict_labels_device(&mut pool, &xq_dev, (N_QUERY, d))
                 .expect("device predict");
             let dp = dp.to_host(&pool);
-            let mismatches = dp
-                .iter()
-                .zip(hp.labels.iter())
-                .filter(|(a, b)| a != b)
-                .count();
-            assert_eq!(
-                mismatches, 0,
-                "n={n} d={d} k={k}: the two predict arms disagree on {mismatches} of {N_QUERY} rows"
+            let mismatches = disagreements(&dp, &hp.labels, &hs.values, hs.n_targets, n, d, k);
+            // A rate this far above `f32` rounding would mean a real defect,
+            // not a tie: at `k = 26` a T4 produced ONE.
+            assert!(
+                mismatches * 1000 <= N_QUERY,
+                "n={n} d={d} k={k}: {mismatches} of {N_QUERY} rows disagree — \
+                 too many to be f32/f64 near-ties"
             );
+            if mismatches > 0 {
+                println!(
+                    "    (n={n} d={d} k={k}: {mismatches}/{N_QUERY} near-tie label \
+                     disagreements, all verified within f32 rounding)"
+                );
+            }
             xq_dev.release_into(&mut pool);
         }
 

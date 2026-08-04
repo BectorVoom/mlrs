@@ -284,12 +284,44 @@ where
             .predict_labels_device(&mut pool, &xq_dev, qshape)
             .unwrap_or_else(|e| panic!("{label} [{}]: device predict: {e}", spec.name));
         let dev_labels = dev_labels.to_host(&pool);
-        assert_eq!(
-            dev_labels, host_pred.labels,
-            "{label} [{}]: device predict must reproduce the host labels EXACTLY \
-             (both take the strict `>` tie-break)",
-            spec.name
-        );
+        // NOT `assert_eq!` on the whole vector. The two arms run the SAME
+        // decision rule (strict `>`, first-occurrence tie-break) but at
+        // different accumulator widths — the kernel sums each class score in
+        // `F`, the host widens to `f64` — so two classes within `F` rounding of
+        // each other can order differently without either arm being wrong. A T4
+        // produced exactly one such row in 100 000 at `d = 16, k = 26`.
+        //
+        // What IS a contract, and is asserted below: a disagreement may only
+        // happen at a near-tie. A row whose top two scores are clearly
+        // separated must agree, because that can only differ through a real
+        // defect (a transposed `coef_`, a wrong `classes_` index, an argmax
+        // scanning the wrong range).
+        let host_scores_for_ties = dev
+            .decision_function_from_host(&pool, &data.xq, qshape)
+            .expect("host decision_function for the tie check");
+        let k = host_scores_for_ties.n_targets;
+        for (r, (&dl, &hl)) in dev_labels.iter().zip(host_pred.labels.iter()).enumerate() {
+            if dl == hl {
+                continue;
+            }
+            let row = &host_scores_for_ties.values[r * k..(r + 1) * k];
+            let gap = if k == 1 {
+                row[0].abs()
+            } else {
+                let mut sorted: Vec<f64> = row.to_vec();
+                sorted.sort_by(|a, b| b.partial_cmp(a).expect("scores are finite"));
+                sorted[0] - sorted[1]
+            };
+            let scale = row.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            assert!(
+                gap <= tol * scale,
+                "{label} [{}] row {r}: device chose {dl}, host chose {hl}, but the \
+                 top-two score gap is {gap:e} — far above the {:e} rounding band, \
+                 so this is a DEFECT, not a tie",
+                spec.name,
+                tol * scale
+            );
+        }
         // A gate that only ever sees one class would pass on a broken argmax.
         let distinct: std::collections::BTreeSet<i32> = dev_labels.iter().copied().collect();
         assert!(
