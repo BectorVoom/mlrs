@@ -327,20 +327,28 @@ pub enum AlgoError {
         kernel: String,
     },
 
-    /// `GaussianMixture` was given an injected initial parameter
-    /// (`weights_init` / `means_init` / `precisions_init`) whose CONTENT is
-    /// invalid — a weight outside `[0, 1]`, a weight vector that does not sum to
-    /// one, or a non-finite entry (MIX-01). The data-INDEPENDENT half of this
-    /// check cannot be done at `build()` because the required LENGTH depends on
-    /// `n_features` (the D-08 split), so the whole content check lives here.
-    /// Mirrors sklearn's `_check_weights` / `_check_means` / `_check_precisions`
+    /// A mixture estimator was given an injected parameter whose CONTENT is
+    /// invalid, where "invalid" could only be determined once `n_features` was
+    /// known (the D-08 split puts the data-INDEPENDENT half at `build()`).
+    ///
+    /// For `GaussianMixture` (MIX-01) those are the three initializations
+    /// (`weights_init` / `means_init` / `precisions_init`): a weight outside
+    /// `[0, 1]`, a weight vector that does not sum to one, or a non-finite
+    /// entry — sklearn's `_check_weights` / `_check_means` / `_check_precisions`
     /// `ValueError`s.
+    ///
+    /// For `BayesianGaussianMixture` (MIX-02) they are the PRIORS whose
+    /// validity depends on the design: `degrees_of_freedom_prior` must exceed
+    /// `n_features − 1`, `mean_prior` must have length `n_features`, and
+    /// `covariance_prior` must have the `covariance_type`'s shape and be
+    /// positive definite — sklearn's `_check_means_parameters` /
+    /// `_check_precision_parameters` / `_checkcovariance_prior_parameter`.
     #[error("estimator '{estimator}': {param} is invalid — {reason}")]
     InvalidMixtureInit {
-        /// Which estimator rejected the value (always `"gaussian_mixture"`).
+        /// Which estimator rejected the value (`"gaussian_mixture"` /
+        /// `"bayesian_gaussian_mixture"`).
         estimator: &'static str,
-        /// Which injected parameter was rejected (`"weights_init"` /
-        /// `"means_init"` / `"precisions_init"`).
+        /// Which injected parameter or prior was rejected.
         param: &'static str,
         /// The content-validity reason.
         reason: String,
@@ -1160,6 +1168,46 @@ pub enum BuildError {
         estimator: &'static str,
         /// The offending covariance regularization.
         reg_covar: f64,
+    },
+
+    /// An unrecognised `weight_concentration_prior_type` string was supplied to
+    /// `BayesianGaussianMixture` (MIX-02). Mirrors sklearn's
+    /// `StrOptions({'dirichlet_process', 'dirichlet_distribution'})` rejection.
+    /// Its own variant rather than a reuse of
+    /// [`BuildError::UnknownCovarianceType`] because it selects a different
+    /// axis of the model — the PRIOR over the mixing weights, which decides
+    /// whether unneeded components are shrunk away (the stick-breaking process)
+    /// or merely smoothed (the symmetric Dirichlet).
+    #[error(
+        "unknown weight_concentration_prior_type '{value}' \
+         (must be one of 'dirichlet_process', 'dirichlet_distribution')"
+    )]
+    UnknownWeightConcentrationPriorType {
+        /// The unrecognised prior family the caller supplied.
+        value: String,
+    },
+
+    /// A `BayesianGaussianMixture` prior hyperparameter was given a value
+    /// outside its admissible range (MIX-02) — a non-positive
+    /// `weight_concentration_prior` or `mean_precision_prior`, or a
+    /// non-positive `covariance_prior` under `covariance_type='spherical'`.
+    ///
+    /// Only the priors whose validity is data-INDEPENDENT are rejected here
+    /// (the D-08 split). `degrees_of_freedom_prior > n_features − 1`, the
+    /// SHAPES of `mean_prior` / `covariance_prior`, and the positive-definiteness
+    /// of a matrix `covariance_prior` all need `n_features`, so they are `fit`
+    /// checks raised as [`AlgoError::InvalidMixtureInit`].
+    #[error(
+        "estimator '{estimator}': {param} = {value} is invalid (must be finite and > 0)"
+    )]
+    InvalidPrior {
+        /// Which estimator's builder rejected the value (always
+        /// `"bayesian_gaussian_mixture"`).
+        estimator: &'static str,
+        /// Which prior hyperparameter was rejected.
+        param: &'static str,
+        /// The offending value.
+        value: f64,
     },
 
     /// An unrecognised `solver` string was supplied (the

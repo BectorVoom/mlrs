@@ -71,6 +71,11 @@ pub mod kernel_matrix;
 // instead of reading the indices back and looping on the host.
 pub mod knn;
 pub mod knn_graph;
+// KNN-HOST: the plain-Rust worker-pool `distance -> top-k` scan that serves the
+// cpu backend for EVERY metric, any `k` and any `n_features` — the rectangle the
+// tuned `knn::cpu_rows_topk` kernel cannot cover, where the GPU-shaped
+// composition it fell through to lost to sklearn by up to 39x.
+pub mod knn_host;
 // Phase-9 prim stub (Wave-0 scaffold 09-01 owns this registration; the Wave-1
 // plan 09-02 fills the file body — file-disjoint, parallel-safe). The
 // `laplacian` host-fn signature compiles today (geometry validation real;
@@ -111,6 +116,12 @@ pub(crate) mod hgb_host;
 // the reusable task-dispatch pool) every cpu arm synchronizes on; extracted
 // from `hgb_host`, which was where they were first measured and tuned.
 pub(crate) mod host_pool;
+// Runs a host prim's hot region on the machine's REAL vector unit. The crate is
+// compiled for the x86-64 BASELINE (no `target-cpu`), i.e. SSE2, while
+// `cubecl-cpu` JITs for the host — which is why a `-O0` JIT kernel could
+// outrun `-O3` Rust. First measured in `knn_host` (1.6-1.9x), then applied
+// across the host arms.
+pub mod host_simd;
 // Huber-regression primal objective evaluator (HUBER-01): the margin matvec,
 // the inlier/outlier classification against `ε·σ`, the three scalar reductions
 // the `σ` derivative needs, and the `X̃ᵀg` gradient — all out of ONE fused pass
@@ -144,6 +155,11 @@ pub mod svd;
 // and replaces it with ONE fused `-O3` host pass on cpu, where a cubecl launch
 // costs three orders of magnitude more than the matvec it performs.
 pub mod svm_objective;
+// Scalar `lnΓ` / `ψ` / `lnB` (MIX-02). Host-only by construction: the
+// variational mixture E-step calls them `O(k·d)` times per iteration against
+// its own `O(n·k·d²)`, and cubecl's cuda backend advertises no `f64`
+// transcendentals to evaluate them with anyway.
+pub mod special;
 pub mod topk;
 // TSNE-01: the exact-method t-SNE per-iteration gradient prim (Student-t
 // affinity + KL-gradient GATHER over the Phase-2 distance prim).

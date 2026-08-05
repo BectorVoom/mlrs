@@ -206,7 +206,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.
     use estimators::cluster::{PyAgglomerativeClustering, PyDBSCAN, PyHDBSCAN, PyKMeans};
     use estimators::covariance::{PyEmpiricalCovariance, PyLedoitWolf};
-    use estimators::mixture::PyGaussianMixture;
+    use estimators::mixture::{PyBayesianGaussianMixture, PyGaussianMixture};
     use estimators::decomposition::{PyIncrementalPCA, PyPCA, PyTruncatedSVD};
     use estimators::ensemble::{
         PyForestInference, PyHistGradientBoostingClassifier,
@@ -317,8 +317,11 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Preprocessing scaler family (PREP-01, Phase 24): StandardScaler /
     // MinMaxScaler / MaxAbsScaler / RobustScaler / Normalizer / Binarizer.
-    // Mixture models (MIX-01): GaussianMixture.
+    // Mixture models: GaussianMixture (MIX-01) and its variational sibling
+    // BayesianGaussianMixture (MIX-02). Both are host-only wrappers whose fit
+    // never uploads on any backend.
     m.add_class::<PyGaussianMixture>()?;
+    m.add_class::<PyBayesianGaussianMixture>()?;
 
     m.add_class::<PyStandardScaler>()?;
     m.add_class::<PyMinMaxScaler>()?;

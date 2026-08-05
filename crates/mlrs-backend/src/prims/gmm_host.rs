@@ -86,6 +86,20 @@
 //! per iteration total, against sklearn's five-plus, on a loop whose working
 //! set is what limits it.
 //!
+//! ## One engine, two estimators
+//! `BayesianGaussianMixture` (MIX-02) runs on this file too. Its variational
+//! E-step is NOT a different sweep: it differs from the plain one by a vector
+//! of per-COMPONENT constants (the expected log-weights of the stick-breaking
+//! or Dirichlet posterior, and the `ν`/`β` corrections), never by anything that
+//! varies with the row. [`GmmHost::e_step_biased`] takes that vector where
+//! [`GmmHost::e_step`] takes `ln(π)`, so both estimators share the entire
+//! `O(n·k·d²)` inner nest — all three wins below, plus the worker pool and the
+//! `tied` `XᵀX` hoist — and the M-step's `nk`/`xk`/`sk` outputs are literally
+//! sklearn's `_estimate_gaussian_parameters`, which its variational M-step
+//! consumes unchanged. The one extra reduction the variational bound needs (the
+//! responsibility entropy) rides in the same pass under a `const` flag, so the
+//! plain path pays nothing for it.
+//!
 //! ## Parallelism
 //! Both passes are row-blocked over a persistent [`WorkerPool`] (spawned once
 //! per fit, not once per pass — [[mlrs-svm-fit-worker-pool]]), each unit owning
@@ -630,6 +644,25 @@ fn row_ranges(n: usize, units: usize) -> Vec<(usize, usize)> {
 // The engine
 // ---------------------------------------------------------------------------
 
+/// Everything one fused E-step sweep produces.
+///
+/// Returned by [`GmmHost::e_step_biased`]; the plain [`GmmHost::e_step`] keeps
+/// its historical 3-tuple so the `GaussianMixture` call sites are untouched.
+#[derive(Debug, Clone)]
+pub struct EStep {
+    /// `mean_i logsumexp_c(weighted log prob)` — sklearn's `log_prob_norm`,
+    /// which for plain EM IS `lower_bound_`. The variational bound uses it only
+    /// as a diagnostic (its own bound drops the term).
+    pub mean_log_prob_norm: f64,
+    /// `Σ_i r_ic` per component, with sklearn's `10·eps` floor already added.
+    pub nk: Vec<f64>,
+    /// `Σ_i r_ic·xᵢ / nk_c`, `k × d` row-major — sklearn's `xk`.
+    pub means: Vec<f64>,
+    /// `Σ_i Σ_c r_ic·ln r_ic`, the NEGATED responsibility entropy. Zero unless
+    /// the sweep was asked for it.
+    pub resp_log_resp: f64,
+}
+
 /// Per-fit workspace: the design, the geometry, the worker pool, and every
 /// reduction buffer the two passes need — all allocated ONCE per fit and reused
 /// across `max_iter · n_init` iterations.
@@ -646,6 +679,12 @@ pub struct GmmHost<'a> {
     resp: Vec<f64>,
     /// Per-unit `Σ log p(xᵢ)` partial (length `units`).
     part_lpn: Vec<f64>,
+    /// Per-unit `Σ_i Σ_c r_ic · log r_ic` partial (length `units`) — the
+    /// negated responsibility entropy the VARIATIONAL bound needs, and which
+    /// the plain EM bound does not. Only written by the `ENT = true`
+    /// instantiation of [`GmmHost::e_step_inner`]; see
+    /// [`GmmHost::e_step_biased`].
+    part_ent: Vec<f64>,
     /// Per-unit `nk` partial (`units × k`).
     part_nk: Vec<f64>,
     /// Per-unit unnormalized mean partial (`units × k × d`).
@@ -690,6 +729,7 @@ impl<'a> GmmHost<'a> {
             pool: WorkerPool::new(units),
             resp: vec![0.0; n * k],
             part_lpn: vec![0.0; units],
+            part_ent: vec![0.0; units],
             part_nk: vec![0.0; units * k],
             part_means: vec![0.0; units * k * d],
             part_cov: vec![0.0; units * cov_part_stride],
@@ -950,9 +990,52 @@ impl<'a> GmmHost<'a> {
         means: &[f64],
         prec_chol: &[f64],
     ) -> (f64, Vec<f64>, Vec<f64>) {
+        let log_w: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+        let out = self.e_step_inner::<false>(&log_w, means, prec_chol);
+        (out.mean_log_prob_norm, out.nk, out.means)
+    }
+
+    /// The VARIATIONAL E-step: the same fused sweep, driven by a per-component
+    /// additive log-term the caller computes, and additionally reducing the
+    /// responsibility entropy.
+    ///
+    /// `log_weight_term[c]` replaces `ln(π_c)` verbatim — it is added to
+    /// `log|P_c| − ½·d·ln(2π) − ½·maha` with no interpretation. That is exactly
+    /// the degree of freedom `BayesianGaussianMixture` needs: its
+    /// `_estimate_log_prob` differs from the plain one by a sum of
+    /// PER-COMPONENT constants (`E[ln π_c]` from the stick-breaking or
+    /// Dirichlet posterior, `−½·d·ln ν_c`, and `½(E[ln|Λ_c|] − d/β_c)`), never
+    /// by anything that varies with the row. So the whole `O(n·k·d²)` inner
+    /// nest — the triangular Mahalanobis, the `tied` hoist, the fused
+    /// `nk`/`means` reduction — is shared between the two estimators rather
+    /// than duplicated, and a future optimization to it lands on both at once.
+    ///
+    /// The extra output is `Σ_i Σ_c r_ic·ln r_ic`, sklearn's
+    /// `np.sum(np.exp(log_resp) * log_resp)`. It is folded into the SAME pass
+    /// that already holds `r_ic` and `ln r_ic` in registers, so a variational
+    /// iteration costs one extra multiply-add per `(row, component)` against
+    /// the `O(d²)` it already spends there. The plain-EM caller instantiates
+    /// `ENT = false` and the accumulation compiles away entirely.
+    pub fn e_step_biased(
+        &mut self,
+        log_weight_term: &[f64],
+        means: &[f64],
+        prec_chol: &[f64],
+    ) -> EStep {
+        self.e_step_inner::<true>(log_weight_term, means, prec_chol)
+    }
+
+    /// The shared body of both E-steps. `ENT` selects whether the
+    /// responsibility-entropy reduction is compiled in (see
+    /// [`GmmHost::e_step_biased`]).
+    fn e_step_inner<const ENT: bool>(
+        &mut self,
+        log_w: &[f64],
+        means: &[f64],
+        prec_chol: &[f64],
+    ) -> EStep {
         let (n, d, k, ct) = (self.n, self.d, self.k, self.ct);
         let log_det = log_det_cholesky(prec_chol, k, d, ct);
-        let log_w: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
         // The `−0.5·d·ln(2π)` normalizer and `log π_k` and `log|P_k|` are all
         // per-component constants; fold them into ONE bias so the inner loop
         // adds a single number instead of three.
@@ -974,12 +1057,14 @@ impl<'a> GmmHost<'a> {
         };
 
         self.part_lpn.fill(0.0);
+        self.part_ent.fill(0.0);
         self.part_nk.fill(0.0);
         self.part_means.fill(0.0);
 
         let x = self.x;
         let resp = Shared::new(&mut self.resp);
         let p_lpn = Shared::new(&mut self.part_lpn);
+        let p_ent = Shared::new(&mut self.part_ent);
         let p_nk = Shared::new(&mut self.part_nk);
         let p_means = Shared::new(&mut self.part_means);
         let units = self.units;
@@ -994,12 +1079,14 @@ impl<'a> GmmHost<'a> {
             // are owned exclusively by this unit for the whole phase.
             let resp = unsafe { resp.get_mut() };
             let p_lpn = unsafe { p_lpn.get_mut() };
+            let p_ent = unsafe { p_ent.get_mut() };
             let p_nk = unsafe { p_nk.get_mut() };
             let p_means = unsafe { p_means.get_mut() };
 
             let mut wlp = vec![0.0f64; ROW_BLOCK * k];
             let mut scratch = vec![0.0f64; d];
             let mut acc_lpn = 0.0f64;
+            let mut acc_ent = 0.0f64;
             let nk_u = &mut p_nk[u * k..(u + 1) * k];
             let means_u = &mut p_means[u * k * d..(u + 1) * k * d];
 
@@ -1103,9 +1190,19 @@ impl<'a> GmmHost<'a> {
 
                     let row = &mut resp[i * k..(i + 1) * k];
                     for c in 0..k {
-                        let r = (w[c] - lse).exp();
+                        let log_r = w[c] - lse;
+                        let r = log_r.exp();
                         row[c] = r;
                         nk_u[c] += r;
+                        if ENT {
+                            // `r·ln r`, matching sklearn's `np.exp(log_resp) *
+                            // log_resp` including its treatment of an
+                            // underflowed component: `r` is then exactly `0`
+                            // and `log_r` is a large FINITE negative, so the
+                            // product is `0` rather than the `0·(−∞)` NaN a
+                            // `ln(r)` spelling would produce.
+                            acc_ent += r * log_r;
+                        }
                         if r != 0.0 {
                             let mu_acc = &mut means_u[c * d..(c + 1) * d];
                             for j in 0..d {
@@ -1117,6 +1214,9 @@ impl<'a> GmmHost<'a> {
                 i0 = i1;
             }
             p_lpn[u] = acc_lpn;
+            if ENT {
+                p_ent[u] = acc_ent;
+            }
         };
         self.pool.run(&pass);
 
@@ -1138,7 +1238,16 @@ impl<'a> GmmHost<'a> {
                 mu[c * d + j] *= inv;
             }
         }
-        (mean_lpn, nk, mu)
+        EStep {
+            mean_log_prob_norm: mean_lpn,
+            nk,
+            means: mu,
+            resp_log_resp: if ENT {
+                self.part_ent.iter().sum::<f64>()
+            } else {
+                0.0
+            },
+        }
     }
 
     /// `nk` and `means` from an EXTERNALLY supplied `resp` — the init path,
@@ -1413,9 +1522,33 @@ pub fn weighted_log_prob(
     means: &[f64],
     prec_chol: &[f64],
 ) -> Vec<f64> {
+    let log_w: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+    weighted_log_prob_biased(x, n, d, k, ct, &log_w, means, prec_chol)
+}
+
+/// The same scoring pass driven by an explicit per-component additive log-term
+/// instead of `ln(weight_c)` — the scoring counterpart of
+/// [`GmmHost::e_step_biased`], and what `BayesianGaussianMixture`'s
+/// `predict` / `predict_proba` / `score_samples` reduce to.
+///
+/// Split out rather than parameterized on a closure because the term is a
+/// `k`-vector the caller already has in hand: the variational estimator
+/// computes it ONCE per scoring call from `weight_concentration_`,
+/// `degrees_of_freedom_` and `mean_precision_`, and it does not vary by row.
+#[allow(clippy::too_many_arguments)]
+pub fn weighted_log_prob_biased(
+    x: &[f64],
+    n: usize,
+    d: usize,
+    k: usize,
+    ct: CovarianceType,
+    log_weight_term: &[f64],
+    means: &[f64],
+    prec_chol: &[f64],
+) -> Vec<f64> {
     let log_det = log_det_cholesky(prec_chol, k, d, ct);
     let bias: Vec<f64> = (0..k)
-        .map(|c| weights[c].ln() + log_det[c] - 0.5 * d as f64 * LOG_2PI)
+        .map(|c| log_weight_term[c] + log_det[c] - 0.5 * d as f64 * LOG_2PI)
         .collect();
     let mu_p: Vec<f64> = if ct == CovarianceType::Tied {
         let mut out = vec![0.0f64; k * d];

@@ -629,41 +629,7 @@ where
         k: usize,
     ) -> Result<MixtureParams, AlgoError> {
         let ct = self.covariance_type;
-        let mut resp = vec![0.0f64; n * k];
-        match self.init_params {
-            InitParams::KMeans => {
-                let labels = host.kmeans_labels(rng);
-                for (i, &l) in labels.iter().enumerate() {
-                    resp[i * k + l as usize] = 1.0;
-                }
-            }
-            InitParams::KMeansPlusPlus => {
-                for (c, idx) in host.kmeans_plusplus(k, rng).into_iter().enumerate() {
-                    resp[idx * k + c] = 1.0;
-                }
-            }
-            InitParams::Random => {
-                for row in resp.chunks_mut(k) {
-                    let mut s = 0.0;
-                    for slot in row.iter_mut() {
-                        let v = rng.next_f64();
-                        *slot = v;
-                        s += v;
-                    }
-                    // A degenerate all-zero draw is impossible in practice but
-                    // would divide by zero; fall back to the uniform row.
-                    let inv = if s > 0.0 { 1.0 / s } else { 1.0 / k as f64 };
-                    for slot in row.iter_mut() {
-                        *slot *= inv;
-                    }
-                }
-            }
-            InitParams::RandomFromData => {
-                for (c, idx) in distinct_indices(n, k, rng).into_iter().enumerate() {
-                    resp[idx * k + c] = 1.0;
-                }
-            }
-        }
+        let resp = initial_responsibilities(self.init_params, host, rng, n, k);
 
         host.set_resp(&resp);
         let (nk, means) = host.nk_and_means_from_resp();
@@ -1377,6 +1343,60 @@ impl GaussianMixtureBuilder {
 // Local helpers
 // ---------------------------------------------------------------------------
 
+/// sklearn's `_initialize_parameters`: the `n × k` responsibility matrix each
+/// `init_params` route produces, BEFORE any M-step has run.
+///
+/// Shared verbatim with [`BayesianGaussianMixture`](super::bayesian_gaussian_mixture::BayesianGaussianMixture)
+/// (MIX-02), which takes the same four routes — sklearn implements them once on
+/// `BaseMixture` for exactly that reason. Keeping one copy is what makes the
+/// oracle's `init_params` cross apply to both estimators: a divergence between
+/// two transcriptions would show up as one estimator converging to a different
+/// optimum, which is the hardest kind of bug to attribute.
+pub(crate) fn initial_responsibilities(
+    init: InitParams,
+    host: &mut GmmHost<'_>,
+    rng: &mut SplitMix64,
+    n: usize,
+    k: usize,
+) -> Vec<f64> {
+    let mut resp = vec![0.0f64; n * k];
+    match init {
+        InitParams::KMeans => {
+            let labels = host.kmeans_labels(rng);
+            for (i, &l) in labels.iter().enumerate() {
+                resp[i * k + l as usize] = 1.0;
+            }
+        }
+        InitParams::KMeansPlusPlus => {
+            for (c, idx) in host.kmeans_plusplus(k, rng).into_iter().enumerate() {
+                resp[idx * k + c] = 1.0;
+            }
+        }
+        InitParams::Random => {
+            for row in resp.chunks_mut(k) {
+                let mut s = 0.0;
+                for slot in row.iter_mut() {
+                    let v = rng.next_f64();
+                    *slot = v;
+                    s += v;
+                }
+                // A degenerate all-zero draw is impossible in practice but
+                // would divide by zero; fall back to the uniform row.
+                let inv = if s > 0.0 { 1.0 / s } else { 1.0 / k as f64 };
+                for slot in row.iter_mut() {
+                    *slot *= inv;
+                }
+            }
+        }
+        InitParams::RandomFromData => {
+            for (c, idx) in distinct_indices(n, k, rng).into_iter().enumerate() {
+                resp[idx * k + c] = 1.0;
+            }
+        }
+    }
+    resp
+}
+
 /// Map a `gmm_host` factorization failure onto the crate's typed error.
 ///
 /// This is sklearn's
@@ -1385,7 +1405,7 @@ impl GaussianMixtureBuilder {
 /// collapsed onto fewer points than it has dimensions, or `reg_covar` is too
 /// small for the data's conditioning), and carrying the offending pivot so the
 /// caller can see WHICH component died and where.
-fn ill_conditioned(e: IllConditioned) -> AlgoError {
+pub(crate) fn ill_conditioned(e: IllConditioned) -> AlgoError {
     AlgoError::Prim(PrimError::NotPositiveDefinite {
         operand: "gaussian_mixture covariance",
         pivot_index: e.pivot_index,
@@ -1395,7 +1415,7 @@ fn ill_conditioned(e: IllConditioned) -> AlgoError {
 
 /// Row-wise argmax of an `n × k` matrix, ties going to the LOWEST index
 /// (numpy's `argmax` convention).
-fn argmax_rows(m: &[f64], n: usize, k: usize) -> Vec<i32> {
+pub(crate) fn argmax_rows(m: &[f64], n: usize, k: usize) -> Vec<i32> {
     (0..n)
         .map(|i| {
             let row = &m[i * k..(i + 1) * k];
@@ -1428,7 +1448,7 @@ fn distinct_indices(n: usize, k: usize, rng: &mut SplitMix64) -> Vec<usize> {
 
 /// One standard normal draw by the Box-Muller transform. Used only by
 /// [`GaussianMixture::sample`], which is not on any hot path.
-fn standard_normal(rng: &mut SplitMix64) -> f64 {
+pub(crate) fn standard_normal(rng: &mut SplitMix64) -> f64 {
     // `next_f64` is in [0, 1); guard the log against an exact 0.
     let u1 = rng.next_f64().max(f64::MIN_POSITIVE);
     let u2 = rng.next_f64();

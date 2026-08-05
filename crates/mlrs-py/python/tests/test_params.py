@@ -330,6 +330,31 @@ EXPECTED_PARAMS = {
         "verbose_interval": 10,
         "output_type": "input",
     },
+    # BayesianGaussianMixture (MIX-02) — sklearn's full ctor surface, including
+    # all THREE string-valued hyperparameters (`covariance_type`,
+    # `init_params`, `weight_concentration_prior_type`) and the five priors.
+    # Note `n_components` is keyword-ONLY on this estimator (sklearn's own
+    # signature), unlike GaussianMixture's.
+    "BayesianGaussianMixture": {
+        "n_components": 1,
+        "covariance_type": "full",
+        "tol": 1e-3,
+        "reg_covar": 1e-6,
+        "max_iter": 100,
+        "n_init": 1,
+        "init_params": "kmeans",
+        "weight_concentration_prior_type": "dirichlet_process",
+        "weight_concentration_prior": None,
+        "mean_precision_prior": None,
+        "mean_prior": None,
+        "degrees_of_freedom_prior": None,
+        "covariance_prior": None,
+        "random_state": None,
+        "warm_start": False,
+        "verbose": 0,
+        "verbose_interval": 10,
+        "output_type": "input",
+    },
     "SpectralClustering": {
         "n_clusters": 8,
         "n_components": None,
@@ -521,6 +546,7 @@ SET_PARAM = {
     "Binarizer": ("threshold", 1.0),
     "SpectralClustering": ("n_clusters", 4),
     "GaussianMixture": ("covariance_type", "diag"),
+    "BayesianGaussianMixture": ("weight_concentration_prior_type", "dirichlet_distribution"),
     "SpectralEmbedding": ("n_components", 3),
     "UMAP": ("n_neighbors", 10),
     "HDBSCAN": ("min_cluster_size", 10),

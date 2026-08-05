@@ -824,6 +824,25 @@ KNN_REG_P = 3.0
 # duplicated (see `_knn_reg_data`) so a row can have TWO zero-distance
 # neighbours — the case where "use the nearest" and "use all the zeros" differ.
 KNN_REG_COINCIDENT_QUERIES = (3, 9)
+# Every STRING the `metric` parameter accepts, aliases included. Five distance
+# FUNCTIONS, nine spellings: `l2` is `euclidean`, `l1`/`cityblock` are
+# `manhattan`, `infinity` is `chebyshev`, and `minkowski` at the default `p = 2`
+# collapses onto `euclidean`. Each is generated separately so the oracle proves
+# the fold rather than assuming it.
+KNN_REG_METRIC_STRINGS = (
+    "minkowski",
+    "euclidean",
+    "l2",
+    "manhattan",
+    "l1",
+    "cityblock",
+    "chebyshev",
+    "infinity",
+    "cosine",
+)
+# Every STRING the `algorithm` parameter accepts. mlrs resolves all four to
+# brute force; sklearn genuinely builds a tree for two of them.
+KNN_REG_ALGORITHMS = ("auto", "brute", "kd_tree", "ball_tree")
 
 
 def _knn_reg_data(seed: int):
@@ -928,6 +947,42 @@ def gen_knn_regressor_params(seed: int = SEED, dtype=np.float32) -> str:
     dist, idx = nn.kneighbors(xq)
     out["distances_manhattan"] = c(dist)
     out["indices_manhattan"] = c(idx)
+
+    # --- Every STRING value of `metric`, including the aliases (KNN-REG-PARAMS
+    #     oracle completion). The block above covers the five distinct distance
+    #     FUNCTIONS; this one covers the nine strings a user can type, so
+    #     `metric='l1'` is gated by sklearn-under-`'l1'` rather than by the
+    #     assumption that mlrs folds it onto `manhattan` correctly.
+    #
+    #     Generated under `algorithm='auto'` — the default, and the only value
+    #     that accepts all nine (`'infinity'` is tree-only, `'cosine'` is
+    #     brute-only; see `_ALGORITHM_VALID_METRICS` in the shim).
+    for metric in KNN_REG_METRIC_STRINGS:
+        for weights in ("uniform", "distance"):
+            reg = KNeighborsRegressor(
+                n_neighbors=KNN_REG_K,
+                algorithm="auto",
+                weights=weights,
+                metric=metric,
+            ).fit(x, y)
+            out[f"alias_{metric}_{weights}"] = c(reg.predict(xq))
+
+    # --- Every STRING value of `algorithm`, at the default metric.
+    #
+    #     mlrs runs brute force for all four, so these arrays gate that claim:
+    #     `alg_kd_tree_*` is sklearn's K-D TREE answer, and mlrs's brute-force
+    #     predict has to reproduce it. The design has one duplicated train pair,
+    #     but both copies carry the same target (`y` is derived from `x` after
+    #     the duplication), so the tie the two search strategies may break
+    #     differently cannot move a prediction.
+    for algorithm in KNN_REG_ALGORITHMS:
+        for weights in ("uniform", "distance"):
+            reg = KNeighborsRegressor(
+                n_neighbors=KNN_REG_K,
+                algorithm=algorithm,
+                weights=weights,
+            ).fit(x, y)
+            out[f"alg_{algorithm}_{weights}"] = c(reg.predict(xq))
 
     dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
     os.makedirs(_FIXTURE_DIR, exist_ok=True)
@@ -6355,6 +6410,321 @@ def gen_gaussian_mixture(seed: int = SEED, dtype=np.float32) -> str:
 
 
 # ---------------------------------------------------------------------------
+# BayesianGaussianMixture full-parameter-surface fixtures (MIX-02)
+# ---------------------------------------------------------------------------
+
+# The variational sibling shares GaussianMixture's design (`_gmm_design`) — the
+# separation there was already tuned so every `init_params` route lands on ONE
+# optimum, and that premise is what makes an init-by-init comparison possible
+# across two irreproducible RNGs (D-09). Only the case matrix differs.
+BGM_PRIOR_TYPES = ("dirichlet_process", "dirichlet_distribution")
+# The case-name spelling: the Rust side cannot carry `-` in an npz key it builds
+# by format!, so `k-means++` becomes `kmeans++` exactly as in the MIX-01
+# fixture, and the two prior types collapse to `dp` / `dd`.
+BGM_PRIOR_TAGS = {"dirichlet_process": "dp", "dirichlet_distribution": "dd"}
+# The stick-breaking pin (family D) needs MORE components than the fit families,
+# because the whole point is the `Σ_{j>c} nk_j` recursion — at k <= 2 it is
+# nearly vacuous. Deliberately UNEQUAL counts, so a transposed or reversed
+# cumulative sum cannot pass by symmetry.
+# Family 1 runs `n_init` restarts, not one. That is not padding: the two
+# SPARSE initializations ('k-means++' / 'random_from_data') put all their mass
+# on `k` rows, which makes their first M-step a lottery over WHICH rows — and
+# mlrs draws from a different stream (D-09). A single restart therefore lets the
+# two engines land in different basins even where sklearn's own four routes
+# agree with each other, which is exactly what `n_init` exists to defeat. Five
+# restarts was the smallest count at which every compared case agrees.
+BGM_N_INIT = 5
+BGM_STICK_K = 5
+BGM_STICK_NK = (137.0, 61.5, 12.25, 3.0, 0.5)
+BGM_STICK_PRIOR = 0.37
+
+
+def _bgm_scoring(out, name, est, xq):
+    """Record the scoring surface of one fitted BayesianGaussianMixture."""
+    out[f"predict_{name}"] = est.predict(xq)
+    out[f"proba_{name}"] = np.ravel(est.predict_proba(xq))
+    # NO `predict_log_proba`: sklearn's mixture estimators do not define one.
+    # mlrs exposes it (the `PredictLogProba` typestate the whole crate shares),
+    # so the Rust side pins it against `ln(predict_proba)` instead of against a
+    # reference that does not exist.
+    out[f"score_samples_{name}"] = est.score_samples(xq)
+    out[f"score_{name}"] = np.array([est.score(xq)])
+
+
+def _bgm_record(out, name, est, x, cast, with_scoring=False, xq=None):
+    """Record every fitted attribute of one BayesianGaussianMixture.
+
+    Includes the four variational posteriors sklearn exposes on top of
+    `GaussianMixture`'s attribute set (`weight_concentration_`,
+    `mean_precision_`, `degrees_of_freedom_`) and the five resolved priors,
+    because those are precisely what distinguishes this estimator: a
+    transcription that got the Wishart update right but the prior resolution
+    wrong would produce plausible means and covariances and fail only here.
+    """
+    wc = est.weight_concentration_
+    if est.weight_concentration_prior_type == "dirichlet_process":
+        out[f"wca_{name}"] = cast(wc[0])
+        out[f"wcb_{name}"] = cast(wc[1])
+    else:
+        out[f"wca_{name}"] = cast(wc)
+    out[f"weights_{name}"] = cast(est.weights_)
+    out[f"means_{name}"] = cast(est.means_)
+    out[f"cov_{name}"] = cast(np.ravel(est.covariances_))
+    out[f"prec_chol_{name}"] = cast(np.ravel(est.precisions_cholesky_))
+    out[f"beta_{name}"] = cast(est.mean_precision_)
+    out[f"dof_{name}"] = cast(np.ravel(np.atleast_1d(est.degrees_of_freedom_)))
+    # The resolved priors (sklearn's `*_prior_` fitted attributes).
+    out[f"pwc_{name}"] = cast([est.weight_concentration_prior_])
+    out[f"pbeta_{name}"] = cast([est.mean_precision_prior_])
+    out[f"pmean_{name}"] = cast(np.ravel(est.mean_prior_))
+    out[f"pdof_{name}"] = cast([est.degrees_of_freedom_prior_])
+    out[f"pcov_{name}"] = cast(np.ravel(np.atleast_1d(est.covariance_prior_)))
+    out[f"lower_bound_{name}"] = cast([float(np.ravel(est.lower_bound_)[0])])
+    out[f"lower_bounds_{name}"] = cast(np.ravel(est.lower_bounds_))
+    out[f"n_iter_{name}"] = cast([est.n_iter_])
+    out[f"converged_{name}"] = cast([1.0 if est.converged_ else 0.0])
+    out[f"labels_{name}"] = cast(est.predict(x))
+    if with_scoring:
+        scored = {}
+        _bgm_scoring(scored, name, est, xq)
+        for key, value in scored.items():
+            out[key] = cast(value)
+
+
+def gen_bayesian_mixture(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the BayesianGaussianMixture fixture (MIX-02).
+
+    Four families, because the estimator has four independently testable parts
+    and only two of them can be pinned by a converged end-to-end fit:
+
+    1. ``{cov}_{init}_{ptype}`` — the 4 x 4 x 2 cross of ALL THREE string-valued
+       hyperparameters, each fitted to machine precision. Pins that every
+       covariance parameterization, every initialization route and both weight
+       priors reach sklearn's optimum. Compared up to a component PERMUTATION,
+       because the initializations use two different RNGs (D-09).
+    2. ``k1{cov}_{ptype}`` / ``k1i{cov}_{ptype}`` — ``n_components=1`` with
+       ``init_params='random'``. At k=1 that initialization is RNG-FREE in both
+       engines (a one-column responsibility matrix normalizes to exactly 1.0
+       whatever was drawn), so these are compared EXACTLY, in order, including
+       every posterior, every prior, ``lower_bound_``, ``lower_bounds_``,
+       ``n_iter_``, ``converged_``, and the whole scoring surface. The ``i``
+       variant runs ``max_iter=1, tol=0``, leaving no room for two engines to
+       reach the same place by different routes.
+    3. ``pr{i}{cov}_{ptype}`` — the five prior hyperparameters swept off their
+       defaults, at k=1 so the comparison stays exact. These are the parameters
+       with NO analogue in ``GaussianMixture``, so nothing else in the suite
+       would notice if one were ignored.
+    4. ``stick_{ptype}`` — the weight-posterior arithmetic evaluated on a FIXED
+       ``nk`` vector at ``k=5`` via sklearn's own ``_estimate_weights`` /
+       ``_estimate_log_weights``. This family exists because family 1 CANNOT
+       pin it: under ``dirichlet_process`` the stick-breaking recursion is
+       order-dependent (component ``c``'s second Beta parameter sums the ``nk``
+       of everything after it), so two engines that find the same clustering in
+       a different order legitimately disagree on ``weight_concentration_`` and
+       ``weights_``. Evaluating the recursion at a fixed, unequal ``nk`` removes
+       the ordering question entirely.
+
+    Requires ``scikit-learn==1.9.0``.
+    """
+    from sklearn.mixture import BayesianGaussianMixture
+
+    x, xq = _gmm_design(seed, dtype)
+    n, d, k = GMM_N_SAMPLES, GMM_N_FEATURES, GMM_K
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {"X": c(x), "Xq": c(xq)}
+
+    # --- family 1: covariance_type x init_params x prior_type, converged ---- #
+    for cov in GMM_COV_TYPES:
+        for init in GMM_INIT_PARAMS:
+            for ptype in BGM_PRIOR_TYPES:
+                name = f"{cov}_{init.replace('-', '')}_{BGM_PRIOR_TAGS[ptype]}"
+                est = BayesianGaussianMixture(
+                    n_components=k,
+                    covariance_type=cov,
+                    init_params=init,
+                    weight_concentration_prior_type=ptype,
+                    tol=GMM_TOL_TIGHT,
+                    max_iter=GMM_MAX_ITER_TIGHT,
+                    n_init=BGM_N_INIT,
+                    random_state=0,
+                ).fit(x)
+                _bgm_record(out, name, est, x, c)
+
+    # --- family 2: k=1, RNG-free, compared exactly --------------------------- #
+    for cov in GMM_COV_TYPES:
+        for ptype in BGM_PRIOR_TYPES:
+            tag = BGM_PRIOR_TAGS[ptype]
+            est = BayesianGaussianMixture(
+                n_components=1,
+                covariance_type=cov,
+                init_params="random",
+                weight_concentration_prior_type=ptype,
+                tol=1e-8,
+                max_iter=200,
+                random_state=0,
+            ).fit(x)
+            _bgm_record(out, f"k1{cov}_{tag}", est, x, c, with_scoring=True, xq=xq)
+
+            est1 = BayesianGaussianMixture(
+                n_components=1,
+                covariance_type=cov,
+                init_params="random",
+                weight_concentration_prior_type=ptype,
+                tol=0.0,
+                max_iter=1,
+                random_state=0,
+            ).fit(x)
+            _bgm_record(out, f"k1i{cov}_{tag}", est1, x, c)
+
+    # --- family 3: the prior sweep, k=1, exact ------------------------------ #
+    # One non-default value per prior, each chosen far enough from the default
+    # that ignoring the parameter cannot pass: gamma 100x smaller, beta0 5x
+    # larger, nu0 well above `n_features`, and an m0/W0 pair unrelated to the
+    # design's own moments.
+    mean_prior = np.array([1.0, -2.0, 0.5, 3.0])[:d]
+    cov_prior_full = np.eye(d) * 2.5 + 0.25
+    prior_sweep = [
+        {"weight_concentration_prior": 0.01},
+        {"mean_precision_prior": 5.0},
+        {"degrees_of_freedom_prior": float(d) + 3.5},
+        {"mean_prior": mean_prior},
+    ]
+    for i, kwargs in enumerate(prior_sweep):
+        for cov in GMM_COV_TYPES:
+            for ptype in BGM_PRIOR_TYPES:
+                tag = BGM_PRIOR_TAGS[ptype]
+                est = BayesianGaussianMixture(
+                    n_components=1,
+                    covariance_type=cov,
+                    init_params="random",
+                    weight_concentration_prior_type=ptype,
+                    tol=0.0,
+                    max_iter=1,
+                    random_state=0,
+                    **kwargs,
+                ).fit(x)
+                _bgm_record(out, f"pr{i}{cov}_{tag}", est, x, c)
+    # `covariance_prior` is swept separately: its SHAPE depends on
+    # covariance_type, so it cannot ride the shared kwargs dict above.
+    cov_prior_by_type = {
+        "full": cov_prior_full,
+        "tied": cov_prior_full,
+        "diag": np.linspace(0.7, 2.2, d),
+        "spherical": 1.75,
+    }
+    for cov in GMM_COV_TYPES:
+        for ptype in BGM_PRIOR_TYPES:
+            tag = BGM_PRIOR_TAGS[ptype]
+            cp = cov_prior_by_type[cov]
+            out[f"cpin_{cov}"] = c(np.ravel(np.atleast_1d(cp)))
+            est = BayesianGaussianMixture(
+                n_components=1,
+                covariance_type=cov,
+                init_params="random",
+                weight_concentration_prior_type=ptype,
+                tol=0.0,
+                max_iter=1,
+                random_state=0,
+                covariance_prior=cp,
+            ).fit(x)
+            _bgm_record(out, f"pr4{cov}_{tag}", est, x, c)
+
+    # --- family 4: the weight posterior on a FIXED nk ----------------------- #
+    nk = np.asarray(BGM_STICK_NK, dtype=np.float64)
+    out["stick_nk"] = c(nk)
+    out["stick_prior"] = c([BGM_STICK_PRIOR])
+    for ptype in BGM_PRIOR_TYPES:
+        tag = BGM_PRIOR_TAGS[ptype]
+        est = BayesianGaussianMixture(
+            n_components=BGM_STICK_K,
+            covariance_type="full",
+            weight_concentration_prior_type=ptype,
+            weight_concentration_prior=BGM_STICK_PRIOR,
+        )
+        # sklearn's `_check_weights_parameters` normally runs inside `fit`; the
+        # prior is set directly here because there is no design to fit — the
+        # point of this family is to evaluate the weight update ALONE.
+        est.weight_concentration_prior_ = BGM_STICK_PRIOR
+        est._estimate_weights(nk)
+        wc = est.weight_concentration_
+        if ptype == "dirichlet_process":
+            out[f"stick_wca_{tag}"] = c(wc[0])
+            out[f"stick_wcb_{tag}"] = c(wc[1])
+        else:
+            out[f"stick_wca_{tag}"] = c(wc)
+        out[f"stick_logw_{tag}"] = c(est._estimate_log_weights())
+        # `weights_` is derived inside `_set_parameters`, which needs the full
+        # posterior tuple; the Gaussian half is dummy 1-D data because only the
+        # weight half is read here.
+        one = np.ones(BGM_STICK_K)
+        est._set_parameters(
+            (
+                wc,
+                one,
+                np.zeros((BGM_STICK_K, 1)),
+                one,
+                np.ones((BGM_STICK_K, 1, 1)),
+                np.ones((BGM_STICK_K, 1, 1)),
+            )
+        )
+        out[f"stick_weights_{tag}"] = c(est.weights_)
+
+    # --- family 1's stability flags ----------------------------------------- #
+    # A `{cov}_{init}_{ptype}` case can only be compared VALUE-for-value if the
+    # variational objective has one attracting basin for that combination —
+    # otherwise mlrs's initialization RNG (D-09) legitimately lands in a
+    # different one and no tolerance can bridge it. So instead of asserting
+    # basin-uniqueness (which is FALSE for this estimator, unlike for
+    # `GaussianMixture`), the generator MEASURES it and records the verdict.
+    #
+    # The measured exception, stable across every design shape tried
+    # (separation 3-12, sigma 0.6-1.2, simplex and asymmetric centers, k=2/3/4):
+    # `covariance_type='tied'` with `weight_concentration_prior_type=
+    # 'dirichlet_process'` and a SPARSE initialization ('k-means++' /
+    # 'random_from_data', both of which put all their mass on `k` rows). With
+    # `nk ~= 1` per component the shared tied covariance is still essentially
+    # the prior — i.e. the whole design's covariance — so the first E-step is
+    # near-uniform, and the stick-breaking prior's built-in order asymmetry then
+    # pushes the mass onto the low indices and prunes a component before the
+    # covariance can shrink. That is the Dirichlet PROCESS doing exactly what it
+    # exists to do; the symmetric Dirichlet, having no order asymmetry, recovers
+    # from the same start. Both engines exhibit it; only WHICH collapsed
+    # solution they reach is RNG-dependent.
+    for cov in GMM_COV_TYPES:
+        for ptype in BGM_PRIOR_TYPES:
+            tag = BGM_PRIOR_TAGS[ptype]
+            ref = float(out[f"lower_bound_{cov}_kmeans_{tag}"][0])
+            agree = 0
+            for init in GMM_INIT_PARAMS:
+                name = f"{cov}_{init.replace('-', '')}_{tag}"
+                got = float(out[f"lower_bound_{name}"][0])
+                stable = abs(got - ref) <= 1e-2 + 1e-6 * abs(ref)
+                out[f"stable_{name}"] = c([1.0 if stable else 0.0])
+                agree += int(stable)
+            # The design must still be separable enough that the basin the
+            # data-driven routes find is a MAJORITY verdict, not a coin flip —
+            # otherwise "stable" would be a statement about `kmeans` alone.
+            assert agree >= 2, (
+                f"gen_bayesian_mixture: covariance_type='{cov}' "
+                f"weight_concentration_prior_type='{ptype}' has no agreeing "
+                f"pair of init_params routes (only {agree} of "
+                f"{len(GMM_INIT_PARAMS)} reached lower_bound {ref}) — the "
+                "design is not separable enough to pin any optimum"
+            )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"bayesian_mixture_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # TSNE full-parameter-surface fixtures (TSNE-PARAMS)
 # ---------------------------------------------------------------------------
 
@@ -6676,6 +7046,12 @@ def main() -> None:
     # cases that remove the RNG entirely, plus a reg_covar sweep.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_gaussian_mixture(dtype=dtype)}")
+    # BayesianGaussianMixture FULL parameter surface (MIX-02): the
+    # covariance_type x init_params x weight_concentration_prior_type cross, the
+    # RNG-free k=1 exact families, the five-prior sweep, and the stick-breaking
+    # pin on a fixed nk.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_bayesian_mixture(dtype=dtype)}")
     # PCA (DECOMP-01): tall (m>n) + wide (n_features>n_samples); svd_solver=full.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_pca(dtype=dtype, shape=PCA_TALL, n_components=PCA_N_COMPONENTS_TALL, kind='tall')}")
