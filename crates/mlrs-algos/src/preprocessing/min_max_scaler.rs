@@ -201,18 +201,12 @@ where
         }
         let scale: Vec<f64> = self.scale_.as_ref().unwrap().to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
         let min: Vec<f64> = self.min_.as_ref().unwrap().to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        let out = affine_columns_host(pool, x, n, d, &scale, &min);
-        if !self.clip {
-            return Ok(out);
-        }
-        let (lo, hi) = self.feature_range;
-        let mut out_host = out.to_host(pool);
-        for v in out_host.iter_mut() {
-            let v64 = host_to_f64(*v).clamp(lo, hi);
-            *v = f64_to_host::<F>(v64);
-        }
-        out.release_into(pool);
-        Ok(DeviceArray::from_host(pool, &out_host))
+        // `clip` folds into the affine pass rather than re-reading the buffer
+        // it just uploaded — the clamp is free on a value already in a
+        // register, and the round trip it replaces was the whole `n × d`
+        // result, twice.
+        let clamp = self.clip.then_some(self.feature_range);
+        Ok(affine_columns_host(pool, x, n, d, &scale, &min, clamp))
     }
 
     fn inverse_transform(
@@ -234,6 +228,6 @@ where
         let min: Vec<f64> = self.min_.as_ref().unwrap().to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
         let inv_scale: Vec<f64> = scale.iter().map(|&s| 1.0 / s).collect();
         let inv_shift: Vec<f64> = min.iter().zip(scale.iter()).map(|(&m, &s)| -m / s).collect();
-        Ok(affine_columns_host(pool, z, n, d, &inv_scale, &inv_shift))
+        Ok(affine_columns_host(pool, z, n, d, &inv_scale, &inv_shift, None))
     }
 }

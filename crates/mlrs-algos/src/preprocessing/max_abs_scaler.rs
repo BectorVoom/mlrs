@@ -127,7 +127,7 @@ where
         let scale: Vec<f64> = self.scale_.as_ref().unwrap().to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
         let inv_scale: Vec<f64> = scale.iter().map(|&s| 1.0 / s).collect();
         let zero_shift = vec![0.0f64; d];
-        Ok(affine_columns_host(pool, x, n, d, &inv_scale, &zero_shift))
+        Ok(affine_columns_host(pool, x, n, d, &inv_scale, &zero_shift, None))
     }
 
     fn inverse_transform(
@@ -147,6 +147,6 @@ where
         }
         let scale: Vec<f64> = self.scale_.as_ref().unwrap().to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
         let zero_shift = vec![0.0f64; d];
-        Ok(affine_columns_host(pool, z, n, d, &scale, &zero_shift))
+        Ok(affine_columns_host(pool, z, n, d, &scale, &zero_shift, None))
     }
 }

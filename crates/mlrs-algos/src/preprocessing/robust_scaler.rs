@@ -264,7 +264,7 @@ where
             }));
         }
         let (scale_factor, shift_factor) = self.effective_affine(pool);
-        Ok(affine_columns_host(pool, x, n, d, &scale_factor, &shift_factor))
+        Ok(affine_columns_host(pool, x, n, d, &scale_factor, &shift_factor, None))
     }
 
     fn inverse_transform(
@@ -289,6 +289,6 @@ where
             .zip(scale_factor.iter())
             .map(|(&sh, &sc)| -sh / sc)
             .collect();
-        Ok(affine_columns_host(pool, z, n, d, &inv_scale, &inv_shift))
+        Ok(affine_columns_host(pool, z, n, d, &inv_scale, &inv_shift, None))
     }
 }

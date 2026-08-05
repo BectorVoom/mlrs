@@ -5,9 +5,9 @@
 //! introspectable, a superset of sklearn which leaves them `None` when the
 //! corresponding `with_mean`/`with_std` is `False`); `with_mean`/`with_std`
 //! gate only which terms `transform` actually applies. `var_` is the
-//! POPULATION variance (`ddof = 0`, sklearn's convention); a near-zero `var_`
-//! (constant column) gets `scale_ = 1` via
-//! [`super::common::handle_zeros_in_scale`] (PREP-01's degenerate-column gate).
+//! POPULATION variance (`ddof = 0`, sklearn's convention); a column sklearn's
+//! [`super::common::is_constant_feature`] bound calls constant gets
+//! `scale_ = 1` (PREP-01's degenerate-column gate).
 
 use std::marker::PhantomData;
 
@@ -19,7 +19,9 @@ use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, PrimError};
 
-use super::common::{affine_columns_host, column_sum_sumsq, handle_zeros_in_scale, zeros_eps};
+use super::common::{
+    affine_columns_host, column_mean_var, handle_zeros_in_scale_masked, is_constant_feature,
+};
 use crate::error::AlgoError;
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
@@ -148,22 +150,23 @@ where
         validate_geometry(x, shape)?;
         let (n, d) = shape;
 
-        let (sum, sumsq) = column_sum_sumsq::<F>(pool, x, n, d)?;
-        let n64 = n as f64;
-        let mean64: Vec<f64> = sum.iter().map(|&s| s / n64).collect();
-        // var = E[x^2] - mean^2, clamped >= 0 (f64 round-off can dip a true-zero
-        // variance slightly negative, the same guard `gaussian_nb.rs` uses).
-        let mut var64: Vec<f64> = (0..d)
-            .map(|c| {
-                let v = sumsq[c] / n64 - mean64[c] * mean64[c];
-                v.max(0.0)
-            })
+        // Two-pass f64 mean/variance, NOT `E[x²] − mean²` over a device
+        // reduction — see `column_mean_var` for the two ways that identity
+        // loses an f32 design's variance outright.
+        let (mean64, var64) = column_mean_var::<F>(pool, x, n, d);
+        // sklearn's `StandardScaler.partial_fit` does NOT take
+        // `_handle_zeros_in_scale`'s default `10 · eps` path — it passes an
+        // explicit `constant_mask = _is_constant_feature(var_, mean_, n)`,
+        // whose bound scales with the column's own magnitude.
+        let constant_mask: Vec<bool> = var64
+            .iter()
+            .zip(mean64.iter())
+            .map(|(&v, &m)| is_constant_feature(v, m, n))
             .collect();
         let mut scale64: Vec<f64> = var64.iter().map(|&v| v.sqrt()).collect();
-        handle_zeros_in_scale(&mut scale64, zeros_eps::<F>());
-        // var_ itself is exposed pre-`handle_zeros_in_scale` in sklearn (only
-        // `scale_` gets the degenerate-column substitution); keep both.
-        var64.iter_mut().for_each(|v| *v = v.max(0.0));
+        handle_zeros_in_scale_masked(&mut scale64, &constant_mask);
+        // `var_` is exposed pre-substitution in sklearn (only `scale_` gets the
+        // degenerate-column `1.0`); `column_mean_var` already clamped it >= 0.
 
         let mean_dev = DeviceArray::from_host(pool, &mean64.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<_>>());
         let var_dev = DeviceArray::from_host(pool, &var64.iter().map(|&v| f64_to_host::<F>(v)).collect::<Vec<_>>());
@@ -239,7 +242,7 @@ where
             }));
         }
         let (scale_factor, shift_factor) = self.effective_affine(pool);
-        Ok(affine_columns_host(pool, x, n, d, &scale_factor, &shift_factor))
+        Ok(affine_columns_host(pool, x, n, d, &scale_factor, &shift_factor, None))
     }
 
     fn inverse_transform(
@@ -265,6 +268,6 @@ where
             .zip(scale_factor.iter())
             .map(|(&sh, &sc)| -sh / sc)
             .collect();
-        Ok(affine_columns_host(pool, z, n, d, &inv_scale, &inv_shift))
+        Ok(affine_columns_host(pool, z, n, d, &inv_scale, &inv_shift, None))
     }
 }

@@ -12,41 +12,70 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::AlgoError;
 
-/// Column-wise `(sum, sum_of_squares)` over `x` (`n × d`, row-major), as host
-/// `f64` (RESEARCH Pitfall 4 — accumulate in `f64` regardless of `F` so an f32
-/// caller does not lose the mean/variance to catastrophic cancellation).
+/// Column-wise `(mean, POPULATION variance)` over `x` (`n × d`, row-major), as
+/// host `f64` (RESEARCH Pitfall 4 — accumulate in `f64` regardless of `F`).
 ///
-/// CR-01 precedent (`covariance.rs`/`pca.rs`): the reduction is an INTERNAL
-/// implementation detail of `fit`, always run on the always-portable
-/// `ReducePath::Shared` path (never plane-gated to `None`).
-pub(crate) fn column_sum_sumsq<F>(
-    pool: &mut BufferPool<ActiveRuntime>,
+/// TWO passes over ONE host materialization, deliberately NOT the one-pass
+/// `E[x²] − mean²` identity over a `column_reduce` pair. Two independent
+/// failures compound in that spelling:
+///
+/// - `column_reduce::<F>` accumulates in the ELEMENT type `F`
+///   (`mlrs_kernels::reduce`'s `SharedMemory::<F>`), so an `f32` design's `Σx²`
+///   is already rounded to `f32` before anything widens it. `host_to_f64`
+///   afterwards preserves that error, it cannot undo it.
+/// - The identity subtracts two `O(Σx²)`-sized quantities to leave an
+///   `O(var)`-sized one, so a column whose offset is large relative to its
+///   spread loses the answer to cancellation even with exact `f64` sums.
+///
+/// Together they are not academic. 10 000 rows of `N(1000, 1)` at `f32` give
+/// `Σx² ≈ 1e10` carried at ~6e-8 relative — ±600 absolute — against a
+/// `mean² = 1e6` from which a true variance of `1.0` has to survive. The result
+/// comes out wrong by orders of magnitude, and when it clamps to `0` the
+/// degenerate-column gate then sets `scale_ = 1` and `transform` silently
+/// returns UNSCALED data. A mean-zero fixture (what the committed oracle blobs
+/// use) exercises none of this.
+///
+/// sklearn's `_incremental_mean_and_var` sums with `dtype=np.float64` for the
+/// same reason. The extra pass reads a buffer that is already host-resident,
+/// and `transform` materializes the same design anyway
+/// ([`affine_columns_host`]), so this keeps the module on one host arm rather
+/// than adding one.
+pub(crate) fn column_mean_var<F>(
+    pool: &BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
     n: usize,
     d: usize,
-) -> Result<(Vec<f64>, Vec<f64>), AlgoError>
+) -> (Vec<f64>, Vec<f64>)
 where
     F: Float + CubeElement + Pod,
 {
-    let sum_dev = column_reduce::<F>(pool, x, n, d, ScalarOp::Sum, ReducePath::Shared)?
-        .ok_or(AlgoError::Prim(PrimError::InternalNone {
-            operand: "column_reduce",
-            context: "ScalarOp::Sum",
-        }))?;
-    let sumsq_dev = column_reduce::<F>(pool, x, n, d, ScalarOp::SumSq, ReducePath::Shared)?
-        .ok_or(AlgoError::Prim(PrimError::InternalNone {
-            operand: "column_reduce",
-            context: "ScalarOp::SumSq",
-        }))?;
-    let sum64: Vec<f64> = sum_dev.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-    let sumsq64: Vec<f64> = sumsq_dev
-        .to_host(pool)
-        .iter()
-        .map(|&v| host_to_f64(v))
-        .collect();
-    sum_dev.release_into(pool);
-    sumsq_dev.release_into(pool);
-    Ok((sum64, sumsq64))
+    let host = x.to_host(pool);
+    let n64 = n as f64;
+
+    let mut mean = vec![0.0f64; d];
+    for row in host.chunks_exact(d) {
+        for (m, &v) in mean.iter_mut().zip(row.iter()) {
+            *m += host_to_f64(v);
+        }
+    }
+    for m in mean.iter_mut() {
+        *m /= n64;
+    }
+
+    let mut var = vec![0.0f64; d];
+    for row in host.chunks_exact(d) {
+        for ((v, &xv), &m) in var.iter_mut().zip(row.iter()).zip(mean.iter()) {
+            let dev = host_to_f64(xv) - m;
+            *v += dev * dev;
+        }
+    }
+    // `max(0.0)`: an exactly-constant column can leave a `-0.0` here, and
+    // sklearn's `var_` is never negative.
+    for v in var.iter_mut() {
+        *v = (*v / n64).max(0.0);
+    }
+
+    (mean, var)
 }
 
 /// Column-wise `(min, max)` over `x` (`n × d`, row-major), as host `f64`.
@@ -101,8 +130,13 @@ pub(crate) fn zeros_eps<F: CubeElement>() -> f64 {
     }
 }
 
-/// `sklearn._handle_zeros_in_scale`: replace a near-zero scale with `1.0` so a
-/// constant column divides by `1`, not `0` (PREP-01's degenerate-column gate).
+/// `sklearn._handle_zeros_in_scale` with `constant_mask=None`: replace a
+/// near-zero scale with `1.0` so a constant column divides by `1`, not `0`
+/// (PREP-01's degenerate-column gate).
+///
+/// This is the DEFAULT sklearn path, which `MinMaxScaler`, `MaxAbsScaler`,
+/// `RobustScaler` and `normalize` all take. `StandardScaler` does NOT — it
+/// passes an explicit `constant_mask`; see [`handle_zeros_in_scale_masked`].
 pub(crate) fn handle_zeros_in_scale(scale: &mut [f64], eps: f64) {
     for s in scale.iter_mut() {
         if s.abs() < eps {
@@ -111,11 +145,57 @@ pub(crate) fn handle_zeros_in_scale(scale: &mut [f64], eps: f64) {
     }
 }
 
+/// `sklearn._handle_zeros_in_scale` with an explicit `constant_mask` — the
+/// `StandardScaler` path, where the `10 · eps` test is NOT applied at all.
+pub(crate) fn handle_zeros_in_scale_masked(scale: &mut [f64], constant_mask: &[bool]) {
+    for (s, &constant) in scale.iter_mut().zip(constant_mask.iter()) {
+        if constant {
+            *s = 1.0;
+        }
+    }
+}
+
+/// `sklearn.preprocessing._data._is_constant_feature`: is a feature
+/// indistinguishable from a constant one, given the round-off its own mean
+/// injects into the variance?
+///
+/// ```text
+/// var <= n·eps·var + (n·mean·eps)²
+/// ```
+///
+/// This is NOT the `sqrt(var) < 10·eps` test [`handle_zeros_in_scale`] applies.
+/// The difference is the `mean` term, and it is the whole point: variance is
+/// computed by summing `n` squared deviations, so the noise floor scales with
+/// the magnitude of the values, not with `1.0`. A column of 60 samples centred
+/// near `1e8` with a true standard deviation of `1e-7` is constant to sklearn —
+/// its bound is `(60·1e8·2.2e-16)² ≈ 1.7e-12`, above the `1e-14` variance —
+/// while `sqrt(var) = 1e-7` sails past an absolute `2.2e-15` threshold. Taking
+/// the absolute test there divides by `1e-7` and returns values of order `±1`
+/// where sklearn returns order `1e-7`: a ~1.0 per-element divergence against a
+/// 1e-5 contract, on exactly the near-constant columns the gate exists for.
+///
+/// `eps` is `f64::EPSILON` on BOTH widths, matching sklearn's comment that "in
+/// scikit-learn, variance is always computed using float64 accumulators" — and
+/// matching [`column_mean_var`], which does the same here.
+pub(crate) fn is_constant_feature(var: f64, mean: f64, n_samples: usize) -> bool {
+    let eps = f64::EPSILON;
+    let n = n_samples as f64;
+    let upper_bound = n * eps * var + (n * mean * eps) * (n * mean * eps);
+    var <= upper_bound
+}
+
 /// Apply the per-column affine map `out[r, c] = x[r, c] * scale[c] + shift[c]`
 /// on the host (RESEARCH Pitfall 4: accumulate in `f64`), re-uploading the
 /// result — the same single host-materialize pass `pca.rs`'s column centering
 /// uses, generalized to a multiply-then-add (D-05: `Transform` is a one-shot
 /// terminal materialize, not a mid-pipeline round-trip).
+///
+/// `clamp` folds `MinMaxScaler(clip=True)`'s `feature_range` bound into the SAME
+/// pass. It is a parameter rather than the caller's own follow-up loop because
+/// that loop would run on the buffer this function just UPLOADED: a second
+/// `to_host` plus a second `from_host` over the full `n × d` result, i.e. an
+/// extra 64 MiB down and 64 MiB up on a 1 000 000 × 16 `f32` transform, to
+/// apply an operation that costs nothing on the value already in a register.
 pub(crate) fn affine_columns_host<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
@@ -123,6 +203,7 @@ pub(crate) fn affine_columns_host<F>(
     d: usize,
     scale: &[f64],
     shift: &[f64],
+    clamp: Option<(f64, f64)>,
 ) -> DeviceArray<ActiveRuntime, F>
 where
     F: Float + CubeElement + Pod,
@@ -131,7 +212,10 @@ where
     let mut out = vec![F::from_int(0i64); n * d];
     for r in 0..n {
         for c in 0..d {
-            let v = host_to_f64(x_host[r * d + c]) * scale[c] + shift[c];
+            let mut v = host_to_f64(x_host[r * d + c]) * scale[c] + shift[c];
+            if let Some((lo, hi)) = clamp {
+                v = v.clamp(lo, hi);
+            }
             out[r * d + c] = f64_to_host::<F>(v);
         }
     }

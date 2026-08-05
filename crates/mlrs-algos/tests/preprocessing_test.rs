@@ -319,3 +319,138 @@ fn binarizer_f64() {
     let case = load_npz(fixture("binarizer_f64_seed42.npz")).expect("load binarizer_f64");
     run_binarizer::<f64>(&case, &F64_TOL, "f64");
 }
+
+// ===========================================================================
+// StandardScaler — numeric-parity regressions the committed fixtures cannot see
+//
+// Both fixtures are `rng.standard_normal` (mean ~ 0) at a modest spread, which
+// is the one regime in which the two defects below are invisible. They are
+// pinned here rather than as new fixtures because both are about what the
+// arithmetic does, not about what sklearn returns for one blob.
+// ===========================================================================
+
+/// A column whose OFFSET dwarfs its spread must still recover its variance at
+/// `f32` — the `E[x²] − mean²` regression.
+///
+/// The old fit read `Σx` / `Σx²` from `column_reduce::<F>`, which accumulates in
+/// the ELEMENT type, and then subtracted two `O(1e10)` quantities to leave an
+/// `O(1)` one. At `f32` that loses the answer twice over: once to the reduction
+/// (~6e-8 relative on `Σx² ≈ 1e10` is ±600 absolute) and once to the
+/// cancellation. The failure is not a few ulps — the variance came out wrong by
+/// orders of magnitude, and when it clamped to `0` the degenerate-column gate
+/// set `scale_ = 1` and `transform` silently returned UNSCALED data.
+#[test]
+fn standard_scaler_offset_column_variance_f32() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Column 0: mean 1000, deterministic ±1 alternation → population var 1.
+    // Column 1: the same shape at mean 0, as the control.
+    let n = 1000usize;
+    let d = 2usize;
+    let mut host = vec![0.0f32; n * d];
+    for r in 0..n {
+        let s = if r % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        host[r * d] = 1000.0 + s;
+        host[r * d + 1] = s;
+    }
+    let x: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &host);
+
+    let fitted = StandardScaler::<f32>::new()
+        .fit(&mut pool, &x, None, (n, d))
+        .expect("StandardScaler::fit");
+
+    let var: Vec<f64> = fitted.var(&pool).iter().map(|&v| host_to_f64(v)).collect();
+    let scale: Vec<f64> = fitted.scale(&pool).iter().map(|&v| host_to_f64(v)).collect();
+    let mean: Vec<f64> = fitted.mean(&pool).iter().map(|&v| host_to_f64(v)).collect();
+
+    // A `f32` design carries ~1e-7 relative in the DATA itself, so the gate is
+    // the f32 oracle tolerance, not the f64 one. The pre-fix value was not
+    // close in any tolerance: it was wrong by percent-to-100%, or 0.
+    assert_close(&mean, &[1000.0, 0.0], &F32_TOL, "offset-column mean_");
+    assert_close(&var, &[1.0, 1.0], &F32_TOL, "offset-column var_");
+    assert_close(&scale, &[1.0, 1.0], &F32_TOL, "offset-column scale_");
+
+    // And the transform must actually SCALE — the failure mode was a silent
+    // pass-through, which a `var_` assertion alone would not have caught if the
+    // clamp had gone the other way.
+    let z = fitted
+        .transform(&mut pool, &x, (n, d))
+        .expect("StandardScaler::transform");
+    let z_host = z.to_host(&pool);
+    assert_close(
+        &[host_to_f64(z_host[0]), host_to_f64(z_host[1])],
+        &[1.0, 1.0],
+        &F32_TOL,
+        "offset-column transform row 0",
+    );
+}
+
+/// A column that is constant to within its own round-off must get
+/// `scale_ = 1`, by sklearn's MEAN-RELATIVE `_is_constant_feature` bound and
+/// not by an absolute `10 · eps` one.
+///
+/// `var <= n·eps·var + (n·mean·eps)²`. The offset is deliberately MODEST —
+/// `1e4`, not `1e8` — so that the variance is computed accurately and this test
+/// isolates the GATE. At `1e8` the old one-pass identity cancelled the variance
+/// to garbage, which happened to clamp `scale_` to `1` and made the wrong gate
+/// look right; a fixture that only fails when both defects are present gates
+/// neither.
+///
+/// 60 samples at mean `1e4` with a `~4.9e-11` spread (`var ≈ 2.4e-21`) give
+/// sklearn a bound of `(60·1e4·2.2e-16)² ≈ 1.77e-20`, comfortably above the
+/// variance: constant, `scale_ = 1`, transformed values of order `1e-11`. The
+/// absolute test sees `sqrt(var) ≈ 4.9e-11 > 2.2e-15`, keeps
+/// `scale_ = 4.9e-11` and returns order `±1`.
+///
+/// Note this is red only once the variance is CORRECT: against the original
+/// code it passes, because the one-pass identity collapsed this column's
+/// variance to `0` and the absolute gate then substituted `1` for the wrong
+/// reason. Verified by fixing the variance alone — `scale_` comes back as
+/// `4.9112713895738125e-11` under the absolute threshold. The two defects
+/// masked each other, which is why neither shows up in the committed fixtures.
+#[test]
+fn standard_scaler_near_constant_column_is_constant_f64() {
+    if capability::skip_f64_with_log() {
+        println!("standard_scaler near-constant f64: SKIPPED (no f64 support on this adapter)");
+        return;
+    }
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let n = 60usize;
+    let d = 2usize;
+    // Well above `ulp(1e4) ≈ 1.8e-12`, so the deviation survives storage and
+    // the variance below is the one the arithmetic intends.
+    let spread = 5.0e-11f64;
+    let mut host = vec![0.0f64; n * d];
+    for r in 0..n {
+        let s = if r % 2 == 0 { 1.0f64 } else { -1.0f64 };
+        // Column 0: near-constant relative to its own offset — sklearn's bound
+        // calls it constant, an absolute `10·eps` one does not.
+        host[r * d] = 1.0e4 + s * spread;
+        // Column 1: the same spread with NO offset. sklearn's bound collapses
+        // to `n·eps·var < var` there, so this column is genuinely NOT constant
+        // and the mean-relative rule must not swallow it either.
+        host[r * d + 1] = s * spread;
+    }
+    let x: DeviceArray<ActiveRuntime, f64> = DeviceArray::from_host(&mut pool, &host);
+
+    let fitted = StandardScaler::<f64>::new()
+        .fit(&mut pool, &x, None, (n, d))
+        .expect("StandardScaler::fit");
+    let scale: Vec<f64> = fitted.scale(&pool).iter().map(|&v| host_to_f64(v)).collect();
+
+    assert_eq!(
+        scale[0], 1.0,
+        "near-constant column at a 1e4 offset must be treated as constant \
+         (sklearn `_is_constant_feature`), got scale_={}",
+        scale[0]
+    );
+    assert_close(
+        &[scale[1]],
+        &[spread],
+        &F64_TOL,
+        "zero-offset column of the same spread is NOT constant",
+    );
+}

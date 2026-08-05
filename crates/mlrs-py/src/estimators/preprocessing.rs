@@ -42,9 +42,21 @@ crate::any_estimator_typestate! {
 }
 
 /// sklearn-compatible `StandardScaler`.
+///
+/// The constructor's hyperparameters live on the PYCLASS, not only in
+/// `Any*::Unfit`. `fit` overwrites `inner` with the fitted arm, so reading them
+/// back out of the enum works exactly once: a second `fit` on the same handle
+/// would fall through to the `_` arm and silently re-fit with sklearn's
+/// DEFAULTS while `get_params()` still reported what the caller asked for. The
+/// Python shim happens to build a fresh `_mlrs` object per `fit` today, which
+/// hides it — but this is a public `#[pyclass]`, and reusing the handle across
+/// fits is the obvious optimization to make later. Every scaler below keeps its
+/// parameters the same way.
 #[pyclass(name = "StandardScaler")]
 pub struct PyStandardScaler {
     inner: AnyStandardScaler,
+    with_mean: bool,
+    with_std: bool,
 }
 
 #[pymethods]
@@ -53,16 +65,15 @@ impl PyStandardScaler {
     fn new(with_mean: bool, with_std: bool) -> Self {
         Self {
             inner: AnyStandardScaler::Unfit { with_mean, with_std },
+            with_mean,
+            with_std,
         }
     }
 
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (with_mean, with_std) = match &self.inner {
-            AnyStandardScaler::Unfit { with_mean, with_std } => (*with_mean, *with_std),
-            _ => (true, true),
-        };
+        let (with_mean, with_std) = (self.with_mean, self.with_std);
         let fitted = py.detach(|| -> PyResult<AnyStandardScaler> {
             let mut pool = crate::lock_pool();
             match dt {
@@ -201,6 +212,9 @@ crate::any_estimator_typestate! {
 #[pyclass(name = "MinMaxScaler")]
 pub struct PyMinMaxScaler {
     inner: AnyMinMaxScaler,
+    feature_min: f64,
+    feature_max: f64,
+    clip: bool,
 }
 
 #[pymethods]
@@ -209,16 +223,16 @@ impl PyMinMaxScaler {
     fn new(feature_min: f64, feature_max: f64, clip: bool) -> Self {
         Self {
             inner: AnyMinMaxScaler::Unfit { feature_min, feature_max, clip },
+            feature_min,
+            feature_max,
+            clip,
         }
     }
 
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (lo, hi, clip) = match &self.inner {
-            AnyMinMaxScaler::Unfit { feature_min, feature_max, clip } => (*feature_min, *feature_max, *clip),
-            _ => (0.0, 1.0, false),
-        };
+        let (lo, hi, clip) = (self.feature_min, self.feature_max, self.clip);
         let fitted = py.detach(|| -> PyResult<AnyMinMaxScaler> {
             let mut pool = crate::lock_pool();
             match dt {
@@ -507,6 +521,11 @@ crate::any_estimator_typestate! {
 #[pyclass(name = "RobustScaler")]
 pub struct PyRobustScaler {
     inner: AnyRobustScaler,
+    with_centering: bool,
+    with_scaling: bool,
+    q_min: f64,
+    q_max: f64,
+    unit_variance: bool,
 }
 
 #[pymethods]
@@ -515,18 +534,24 @@ impl PyRobustScaler {
     fn new(with_centering: bool, with_scaling: bool, q_min: f64, q_max: f64, unit_variance: bool) -> Self {
         Self {
             inner: AnyRobustScaler::Unfit { with_centering, with_scaling, q_min, q_max, unit_variance },
+            with_centering,
+            with_scaling,
+            q_min,
+            q_max,
+            unit_variance,
         }
     }
 
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (with_centering, with_scaling, q_min, q_max, unit_variance) = match &self.inner {
-            AnyRobustScaler::Unfit { with_centering, with_scaling, q_min, q_max, unit_variance } => {
-                (*with_centering, *with_scaling, *q_min, *q_max, *unit_variance)
-            }
-            _ => (true, true, 25.0, 75.0, false),
-        };
+        let (with_centering, with_scaling, q_min, q_max, unit_variance) = (
+            self.with_centering,
+            self.with_scaling,
+            self.q_min,
+            self.q_max,
+            self.unit_variance,
+        );
         let fitted = py.detach(|| -> PyResult<AnyRobustScaler> {
             let mut pool = crate::lock_pool();
             match dt {
@@ -665,23 +690,23 @@ crate::any_estimator_typestate! {
 #[pyclass(name = "Normalizer")]
 pub struct PyNormalizer {
     inner: AnyNormalizer,
+    norm: String,
 }
 
 #[pymethods]
 impl PyNormalizer {
     #[new]
     fn new(norm: String) -> Self {
-        Self { inner: AnyNormalizer::Unfit { norm } }
+        Self {
+            inner: AnyNormalizer::Unfit { norm: norm.clone() },
+            norm,
+        }
     }
 
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let norm_str = match &self.inner {
-            AnyNormalizer::Unfit { norm } => norm.clone(),
-            _ => "l2".to_string(),
-        };
-        let norm = parse_norm(&norm_str)?;
+        let norm = parse_norm(&self.norm)?;
         let fitted = py.detach(|| -> PyResult<AnyNormalizer> {
             let mut pool = crate::lock_pool();
             match dt {
@@ -757,22 +782,23 @@ crate::any_estimator_typestate! {
 #[pyclass(name = "Binarizer")]
 pub struct PyBinarizer {
     inner: AnyBinarizer,
+    threshold: f64,
 }
 
 #[pymethods]
 impl PyBinarizer {
     #[new]
     fn new(threshold: f64) -> Self {
-        Self { inner: AnyBinarizer::Unfit { threshold } }
+        Self {
+            inner: AnyBinarizer::Unfit { threshold },
+            threshold,
+        }
     }
 
     fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let threshold = match &self.inner {
-            AnyBinarizer::Unfit { threshold } => *threshold,
-            _ => 0.0,
-        };
+        let threshold = self.threshold;
         let fitted = py.detach(|| -> PyResult<AnyBinarizer> {
             let mut pool = crate::lock_pool();
             match dt {
