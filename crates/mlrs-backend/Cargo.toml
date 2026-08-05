@@ -1,6 +1,6 @@
 [package]
 name = "mlrs-backend"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Runtime selection, capability gating, Arrow bridge, device arrays, and buffer pool for mlrs."
 

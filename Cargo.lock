@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "mlrs-algos"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -2530,7 +2530,7 @@ dependencies = [
 
 [[package]]
 name = "mlrs-backend"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "bytemuck",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "mlrs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "log",
@@ -2557,14 +2557,14 @@ dependencies = [
 
 [[package]]
 name = "mlrs-kernels"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cubecl",
 ]
 
 [[package]]
 name = "mlrs-py"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow",
