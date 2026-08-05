@@ -55,6 +55,24 @@ pub fn var(name: &'static str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// The calling thread's OVERRIDE for `name`, if any — the environment is NOT
+/// consulted.
+///
+/// `Some(Some(v))` is a forced value, `Some(None)` a forced "unset", `None` no
+/// override at all.
+///
+/// For dispatchers that CACHE their knob (because reading it per call would show
+/// up in a hot loop): cache the environment half once, and consult this on every
+/// call so a test's [`force`]/[`clear`] still takes effect. Without it a cached
+/// knob makes an in-process A/B silently compare a variant against ITSELF — the
+/// same vacuous-assertion failure the module docs describe, arrived at from the
+/// other direction. It is cheap enough to sit in a dispatcher: one thread-local
+/// borrow and a hash lookup, with no `getenv` and no allocation on the common
+/// (no-override) path.
+pub fn local_override(name: &'static str) -> Option<Option<String>> {
+    OVERRIDES.with(|o| o.borrow().get(name).cloned())
+}
+
 /// Whether knob `name` is set to `"1"` on the calling thread — the shape most
 /// of these knobs use (`MLRS_TOPK_SERIAL=1`, `MLRS_DIST_RB2=1`, …).
 pub fn is_on(name: &'static str) -> bool {

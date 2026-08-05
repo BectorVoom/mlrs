@@ -94,6 +94,7 @@ use mlrs_kernels::{PREDICT_MAX_FEATURES, PREDICT_SHARED_ELEMS, PREDICT_SHARED_MI
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
+use crate::prims::host_simd::avx2_available;
 use crate::runtime::ActiveRuntime;
 
 /// Compute `y = X·coef + intercept` for the `m × n` row-major test matrix `x`,
@@ -367,7 +368,44 @@ fn matvec_bias_multi_parallel<T: HostFloat>(
 /// The serial multi-target row loop: for each row, `k` dot products against
 /// `coef`'s columns plus their own `bias[t]`. Returns whether every element of
 /// `x` was finite.
+/// Multi-target twin of [`matvec_bias_rows`], with the same widening.
+#[inline]
 fn matvec_bias_multi_rows<T: HostFloat>(
+    x: &[T],
+    coef: &[T],
+    bias: &[T],
+    out: &mut [T],
+    n: usize,
+    k: usize,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: as `matvec_bias_rows`.
+        return unsafe { matvec_bias_multi_rows_avx2(x, coef, bias, out, n, k) };
+    }
+    matvec_bias_multi_rows_inner(x, coef, bias, out, n, k)
+}
+
+/// [`matvec_bias_multi_rows_inner`] compiled for AVX2 + FMA.
+///
+/// # Safety
+/// The caller must have established that the CPU supports `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn matvec_bias_multi_rows_avx2<T: HostFloat>(
+    x: &[T],
+    coef: &[T],
+    bias: &[T],
+    out: &mut [T],
+    n: usize,
+    k: usize,
+) -> bool {
+    matvec_bias_multi_rows_inner(x, coef, bias, out, n, k)
+}
+
+/// The body both [`matvec_bias_multi_rows`] arms share.
+#[inline(always)]
+fn matvec_bias_multi_rows_inner<T: HostFloat>(
     x: &[T],
     coef: &[T],
     bias: &[T],
@@ -1021,9 +1059,51 @@ fn matvec_bias_parallel<T: HostFloat>(
     })
 }
 
-/// The serial row loop — one dot product plus the bias per output element.
-/// Returns whether every element of `x` was finite.
+/// The serial row loop, run on the machine's REAL vector unit.
+///
+/// [`host_dot`] splits each row across [`HOST_DOT_LANES`] INDEPENDENT
+/// accumulators precisely so the loop vectorizes — but the crate is compiled for
+/// the x86-64 baseline (SSE2), so those lanes get 128-bit registers on a machine
+/// with 256- or 512-bit ones. Widening them reassociates nothing (each lane sums
+/// its own subsequence in its own order), so the prediction is bit-for-bit what
+/// it was; see [`host_simd`](super::host_simd) for the argument, and for why
+/// this is an explicit twin rather than a closure helper.
+#[inline]
 fn matvec_bias_rows<T: HostFloat>(x: &[T], coef: &[T], bias: T, out: &mut [T], n: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: guarded by the runtime detection this branch tests; the body is
+        // the ordinary row loop, which contains nothing unsafe.
+        return unsafe { matvec_bias_rows_avx2(x, coef, bias, out, n) };
+    }
+    matvec_bias_rows_inner(x, coef, bias, out, n)
+}
+
+/// [`matvec_bias_rows_inner`] compiled for AVX2 + FMA.
+///
+/// # Safety
+/// The caller must have established that the CPU supports `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn matvec_bias_rows_avx2<T: HostFloat>(
+    x: &[T],
+    coef: &[T],
+    bias: T,
+    out: &mut [T],
+    n: usize,
+) -> bool {
+    matvec_bias_rows_inner(x, coef, bias, out, n)
+}
+
+/// The body both [`matvec_bias_rows`] arms share.
+#[inline(always)]
+fn matvec_bias_rows_inner<T: HostFloat>(
+    x: &[T],
+    coef: &[T],
+    bias: T,
+    out: &mut [T],
+    n: usize,
+) -> bool {
     let mut finite = true;
     for (r, o) in out.iter_mut().enumerate() {
         let row = &x[r * n..(r + 1) * n];
@@ -1294,10 +1374,10 @@ const STD_ROWS_PER_UNIT: usize = 4;
 /// `f64` FMA and nothing on the host makes that cheaper.
 ///
 /// `offset` / `mt` are the host `f64` fitted state; they are narrowed to `F`
-/// for the device arm, which is exact for `F = f64` and rounds once for
-/// `F = f32` — the same narrowing `coef_` already takes at `fit`. The result is
-/// always widened back to `f64`, because sklearn's `return_std` output is
-/// `float64` regardless of the design's dtype.
+/// for the device arm, which is exact for `F = f64` — the only width that
+/// reaches it, since [`use_host_std`] keeps an `f32` design on the `f64` host
+/// sweep at every `d`. The result is always widened back to `f64`, because
+/// sklearn's `return_std` output is `float64` regardless of the design's dtype.
 pub fn bayes_predict_std_from_host<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &[F],
@@ -1333,7 +1413,7 @@ where
         });
     }
 
-    if use_host_std(d) {
+    if use_host_std::<F>(d) {
         return Ok(bayes_predict_std_host(x, offset, mt, noise, (n, d)));
     }
 
@@ -1398,14 +1478,58 @@ where
 /// thread without an environment data race. The device-forcing direction is the
 /// one the test needs: without it, "these two arms agree" would compare the host
 /// arm against ITSELF on cpu and wgpu — passing while gating nothing.
-fn use_host_std(d: usize) -> bool {
+fn use_host_std<F>(d: usize) -> bool
+where
+    F: Pod,
+{
+    // The override is read FIRST and wins outright, before the width gate
+    // below as well as the backend one. `=0` has to be able to reach the
+    // device arm at ANY width, or `bayes_predict_std_arms_agree_f32` compares
+    // the host sweep against itself and passes while gating nothing.
     if let Some(v) = crate::abflag::var("MLRS_BAYES_STD_HOST") {
         return v != "0";
     }
-    if matches!(crate::capability::active_backend_name(), "cpu" | "wgpu") {
+    if std_kernel_unusable() {
+        return true;
+    }
+    // An `f32` design keeps the host sweep at EVERY `d`, because this ingress
+    // returns `Vec<f64>` and the kernel cannot.
+    //
+    // `bayes_predict_std_host` accumulates the whole `O(n·d²)` quadratic form
+    // in `f64` for any `F` (its `mt`/`offset` are `f64` already, and widening
+    // the design costs nothing inside an FMA-bound loop). The kernel
+    // accumulates in `F`: ~d² products per row at `f32`, with cancellation
+    // inside each `Mᵀx̃` dot product that `√` does not undo. sklearn's
+    // `(X @ sigma_ * X).sum(axis=1)` promotes to `float64` through `sigma_`
+    // even for a `float32` design, so the device arm here is the one that
+    // diverges from the 1e-5 contract — and it would do so INVISIBLY, giving a
+    // Python user different `return_std` values from the same estimator
+    // depending on which wheel they installed.
+    //
+    // This costs the `f32` device win at `d >= 128` on cuda/rocm and nothing
+    // anywhere else. `MLRS_BAYES_STD_HOST=0` still forces the kernel for
+    // A/B-ing that trade on target hardware.
+    if size_of::<F>() < 8 {
         return true;
     }
     d < STD_DEVICE_MIN_FEATURES
+}
+
+/// Is the [`bayes_predict_std`] KERNEL the wrong arm on this backend no matter
+/// what the ingress costs — the transfer-INDEPENDENT half of [`use_host_std`].
+///
+/// A caller whose design is already device-resident has no upload to amortize,
+/// so `STD_DEVICE_MIN_FEATURES` does not apply to it; the cpu/wgpu verdict
+/// still does, and on wgpu it is not a perf preference. See [`use_host_std`]:
+/// the `f64` kernel is 12–25× slower there at every `d` and at `d = 256` LOSES
+/// THE DEVICE (~9 s of GPU time on an adapter that is also driving the
+/// display). A resident-design path that skipped this gate would hand a wgpu
+/// user a driver reset where the host sweep would have returned the answer.
+pub fn std_kernel_unusable() -> bool {
+    if let Some(v) = crate::abflag::var("MLRS_BAYES_STD_HOST") {
+        return v != "0";
+    }
+    matches!(crate::capability::active_backend_name(), "cpu" | "wgpu")
 }
 
 /// Fitted feature count below which the HOST-INGRESS `predict_std` keeps the
@@ -1431,9 +1555,11 @@ fn use_host_std(d: usize) -> bool {
 ///
 /// Note this bound governs ONLY the uploading ingress.
 /// [`BayesianRidge::predict_std`](mlrs_algos) over an already-resident design
-/// does not consult it and always runs the kernel — correctly, since it beat
-/// the host arm at EVERY `d` measured there (11.2× / 11.5× / 12.5× / 3.7×) with
-/// no transfer to amortize.
+/// does not consult it — correctly, since the kernel beat the host arm at EVERY
+/// `d` measured there (11.2× / 11.5× / 12.5× / 3.7×) with no transfer to
+/// amortize. It DOES consult [`std_kernel_unusable`], which is the part of this
+/// routing that has nothing to do with transfers: that measurement is a Tesla
+/// P100 one, and generalizing it to wgpu would ship a device-lost crash.
 ///
 /// The crossover is machine-specific in two directions at once: a host with
 /// more cores pushes it up, a bus faster than 0.28 GB/s pulls it down. This

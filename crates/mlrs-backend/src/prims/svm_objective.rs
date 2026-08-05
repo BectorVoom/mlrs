@@ -122,6 +122,8 @@ use mlrs_core::{f64_to_host, host_to_f64};
 use crate::device_array::DeviceArray;
 #[cfg(feature = "cpu")]
 use crate::prims::host_pool::{Shared, WorkerPool};
+#[cfg(feature = "cpu")]
+use crate::prims::host_simd::avx2_available;
 use crate::pool::BufferPool;
 use crate::runtime::ActiveRuntime;
 
@@ -467,7 +469,7 @@ where
 
         let Some(workers) = self.workers.as_ref() else {
             let mut acc = Accum::new(d, d_aug, scale);
-            acc.rows(x, wd, bias, &self.targets, loss);
+            acc.rows_dispatch(x, wd, bias, &self.targets, loss);
             return acc.finish();
         };
 
@@ -496,7 +498,7 @@ where
                     return;
                 }
                 let acc = unsafe { &mut slots.get_mut()[u] };
-                acc.rows(&x[lo * d..hi * d], wd, bias, &targets[lo..hi], loss);
+                acc.rows_dispatch(&x[lo * d..hi * d], wd, bias, &targets[lo..hi], loss);
             });
         }
 
@@ -549,6 +551,53 @@ impl Accum {
     ///
     /// Accumulates in `f64` whatever `T` is — the round-off floor that widening
     /// removes is what let an f32 solve miss its own `tol` (module docs).
+    /// [`Accum::rows`] on the machine's REAL vector unit.
+    ///
+    /// The crate is compiled for the x86-64 baseline (SSE2); the `dot` half runs
+    /// [`DOT_LANES`] independent accumulators and the `axpy` half is elementwise,
+    /// so both are exactly the shape a wider register halves the instruction
+    /// count of. Widening reassociates nothing — see
+    /// [`host_simd`](super::host_simd) for the argument and for why this is an
+    /// explicit twin rather than a closure helper.
+    #[inline]
+    fn rows_dispatch<T: HostElem, L: MarginLoss>(
+        &mut self,
+        x: &[T],
+        w: &[f64],
+        bias: f64,
+        targets: &[f64],
+        loss: &L,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if avx2_available() {
+            // SAFETY: guarded by the runtime detection this branch tests; the
+            // body is the ordinary `rows`, which contains nothing unsafe.
+            unsafe {
+                self.rows_avx2(x, w, bias, targets, loss);
+            }
+            return;
+        }
+        self.rows(x, w, bias, targets, loss);
+    }
+
+    /// [`Accum::rows`] compiled for AVX2 + FMA — see [`Accum::rows_dispatch`].
+    ///
+    /// # Safety
+    /// The caller must have established that the CPU supports `avx2` and `fma`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn rows_avx2<T: HostElem, L: MarginLoss>(
+        &mut self,
+        x: &[T],
+        w: &[f64],
+        bias: f64,
+        targets: &[f64],
+        loss: &L,
+    ) {
+        self.rows(x, w, bias, targets, loss);
+    }
+
+    #[inline(always)]
     fn rows<T: HostElem, L: MarginLoss>(
         &mut self,
         x: &[T],

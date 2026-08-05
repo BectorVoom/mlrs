@@ -55,6 +55,8 @@
 
 use bytemuck::Pod;
 
+use super::host_simd::avx2_available;
+
 /// Rows per transposed tile.
 ///
 /// The tile is `d × ROW_BLOCK` `f64`, so it must stay small enough to live in
@@ -494,7 +496,7 @@ fn chunk_gram_multi<T: GramElem>(
             }
         }
 
-        sweep_block_multi(&tile, &ycol, rb, d, k, &mut gram, &mut xty);
+        dispatch_sweep_block_multi(&tile, &ycol, rb, d, k, &mut gram, &mut xty);
         r0 += rb;
     }
 
@@ -504,6 +506,7 @@ fn chunk_gram_multi<T: GramElem>(
 /// Multi-column twin of [`sweep_block`]: the Gram half is copy-pasted verbatim
 /// (same `4 × 4` register-blocked sweep over the `x` tile alone); the `xty`
 /// half loops over the `k` target columns instead of accumulating one.
+#[inline(always)]
 fn sweep_block_multi(
     tile: &[f64],
     ycol: &[f64],
@@ -773,7 +776,7 @@ fn chunk_gram<T: GramElem>(
             ycol[r] = (y[r0 + r].wide() - y_mean) * scale;
         }
 
-        sweep_block(&tile, &ycol, rb, d, &mut gram, &mut xty);
+        dispatch_sweep_block(&tile, &ycol, rb, d, &mut gram, &mut xty);
         r0 += rb;
     }
 
@@ -787,6 +790,7 @@ fn chunk_gram<T: GramElem>(
 /// the loop is FLOP-bound instead of L1-bound (a plain pair-at-a-time dot
 /// sweep loads 2 values per multiply-add). The `i`/`j` tails past the last full
 /// group of four fall back to the scalar pair sweep.
+#[inline(always)]
 fn sweep_block(tile: &[f64], ycol: &[f64], rb: usize, d: usize, gram: &mut [f64], xty: &mut [f64]) {
     let full = d - d % 4;
 
@@ -883,6 +887,92 @@ fn block4x4(tile: &[f64], i0: usize, j0: usize, rb: usize, acc: &mut [f64; 16]) 
 /// independent accumulators so the FP-add latency is hidden and LLVM can keep
 /// the chains in vector registers (the `linear_predict::host_dot` shape). No
 /// `mul_add`: without `target-feature=+fma` it lowers to a `fma` LIBRARY CALL.
+/// Run the `O(n·d²)` sweep on the machine's REAL vector unit.
+///
+/// [`block4x4`]'s sixteen accumulator chains are `f64`, so the baseline SSE2 the
+/// crate is compiled for gives them TWO lanes where this machine has four (AVX2)
+/// or eight (AVX-512). The chains are independent, so widening them reassociates
+/// nothing and the Gram is bit-for-bit what it was — see
+/// [`host_simd`](super::host_simd) for the full argument, the measurement, and
+/// why this is written as an explicit twin rather than a closure helper.
+#[inline]
+fn dispatch_sweep_block(
+    tile: &[f64],
+    ycol: &[f64],
+    rb: usize,
+    d: usize,
+    gram: &mut [f64],
+    xty: &mut [f64],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: guarded by the runtime detection this branch tests; the body is
+        // the ordinary `sweep_block`, which contains nothing unsafe.
+        unsafe {
+            sweep_block_avx2(tile, ycol, rb, d, gram, xty);
+        }
+        return;
+    }
+    sweep_block(tile, ycol, rb, d, gram, xty);
+}
+
+/// [`sweep_block`] compiled for AVX2 + FMA — see [`dispatch_sweep_block`].
+///
+/// # Safety
+/// The caller must have established that the CPU supports `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sweep_block_avx2(
+    tile: &[f64],
+    ycol: &[f64],
+    rb: usize,
+    d: usize,
+    gram: &mut [f64],
+    xty: &mut [f64],
+) {
+    sweep_block(tile, ycol, rb, d, gram, xty);
+}
+
+/// Multi-target twin of [`dispatch_sweep_block`].
+#[inline]
+fn dispatch_sweep_block_multi(
+    tile: &[f64],
+    ycol: &[f64],
+    rb: usize,
+    d: usize,
+    k: usize,
+    gram: &mut [f64],
+    xty: &mut [f64],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: as `dispatch_sweep_block`.
+        unsafe {
+            sweep_block_multi_avx2(tile, ycol, rb, d, k, gram, xty);
+        }
+        return;
+    }
+    sweep_block_multi(tile, ycol, rb, d, k, gram, xty);
+}
+
+/// [`sweep_block_multi`] compiled for AVX2 + FMA.
+///
+/// # Safety
+/// The caller must have established that the CPU supports `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sweep_block_multi_avx2(
+    tile: &[f64],
+    ycol: &[f64],
+    rb: usize,
+    d: usize,
+    k: usize,
+    gram: &mut [f64],
+    xty: &mut [f64],
+) {
+    sweep_block_multi(tile, ycol, rb, d, k, gram, xty);
+}
+
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     const LANES: usize = 8;

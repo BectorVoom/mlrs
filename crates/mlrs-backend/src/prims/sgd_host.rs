@@ -80,6 +80,7 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use super::hgb_host::HostFloat;
+use super::host_simd::avx2_available;
 use super::sgd::{loss_id, optimal_t0, schedule_eta, SgdParams, SGD_DEFAULT_MAX_ITER};
 
 /// Whether the SGD solve should run on the host arm.
@@ -357,7 +358,47 @@ fn wide_dot<T: HostFloat>(row: &[T], w: &[T], d: usize) -> T {
 }
 
 /// The epoch/batch loop for one `(float, loss)` instantiation.
+/// [`solve_loss_inner`] on the machine's REAL vector unit.
+///
+/// The epoch loop is sequential in the SAMPLES (that is the algorithm), but each
+/// sample's `x·w` dot and its `w -= η·g·x` update run over `d` features, which is
+/// where the width goes. The crate is compiled for the x86-64 baseline; widening
+/// reassociates nothing — see [`host_simd`](super::host_simd).
+#[inline]
 fn solve_loss<T: HostFloat, const LID: u32>(
+    x: &[T],
+    y: &[T],
+    n: usize,
+    d: usize,
+    params: &SgdParams,
+) -> (Vec<T>, T) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: guarded by the runtime detection this branch tests; the body
+        // contains nothing unsafe.
+        return unsafe { solve_loss_avx2::<T, LID>(x, y, n, d, params) };
+    }
+    solve_loss_inner::<T, LID>(x, y, n, d, params)
+}
+
+/// [`solve_loss_inner`] compiled for AVX2 + FMA.
+///
+/// # Safety
+/// The caller must have established that the CPU supports `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn solve_loss_avx2<T: HostFloat, const LID: u32>(
+    x: &[T],
+    y: &[T],
+    n: usize,
+    d: usize,
+    params: &SgdParams,
+) -> (Vec<T>, T) {
+    solve_loss_inner::<T, LID>(x, y, n, d, params)
+}
+
+#[inline(always)]
+fn solve_loss_inner<T: HostFloat, const LID: u32>(
     x: &[T],
     y: &[T],
     n: usize,
