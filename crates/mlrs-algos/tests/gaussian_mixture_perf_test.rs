@@ -43,6 +43,8 @@ use std::time::Instant;
 use mlrs_algos::mixture::gaussian_mixture::GaussianMixture;
 use mlrs_algos::typestate::Fitted;
 use mlrs_backend::abflag;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::runtime::{self, ActiveRuntime};
 
 /// Counter-based splitmix64, byte-identical to `scripts/bench_gmm.py`.
 fn splitmix64(state: &mut u64) -> u64 {
@@ -205,7 +207,7 @@ fn rung_fixed_iters(
     }
 }
 
-fn fit(x: &[f64], r: &Rung) -> GaussianMixture<f64, Fitted> {
+fn fit(pool: &mut BufferPool<ActiveRuntime>, x: &[f64], r: &Rung) -> GaussianMixture<f64, Fitted> {
     GaussianMixture::<f64>::builder()
         .n_components(r.k)
         .covariance_type(r.cov)
@@ -217,11 +219,12 @@ fn fit(x: &[f64], r: &Rung) -> GaussianMixture<f64, Fitted> {
         .random_state(Some(0))
         .build::<f64>()
         .expect("valid hyperparameters")
-        .fit_from_host_slice(x, (r.n, r.d))
+        .fit_from_host_slice(pool, x, (r.n, r.d))
         .expect("fit")
 }
 
 fn run_ladder(title: &str, rungs: &[Rung]) {
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
     println!("\n=== {title} ===");
     println!(
         "{:<24} {:>10} {:>10} {:>10} {:>10} {:>7} {:>6}",
@@ -230,8 +233,8 @@ fn run_ladder(title: &str, rungs: &[Rung]) {
     println!("{}", "-".repeat(82));
     for r in rungs {
         let x = make_blobs(r.n, r.d, r.k, 42);
-        let (fit_wall, fit_cpu) = measure(|| fit(&x, r));
-        let fitted = fit(&x, r);
+        let (fit_wall, fit_cpu) = measure(|| fit(&mut pool, &x, r));
+        let fitted = fit(&mut pool, &x, r);
         let (pred_wall, _) = measure(|| fitted.predict_labels_host(&x, (r.n, r.d)).unwrap());
         let (score_wall, _) = measure(|| fitted.score_samples_host(&x, (r.n, r.d)).unwrap());
         let units = abflag::var("MLRS_GMM_UNITS").unwrap_or_else(|| "auto".to_string());
@@ -332,6 +335,7 @@ fn gmm_perf_ladders() {
 #[test]
 #[ignore = "wall-clock probe; run with --release --ignored --nocapture"]
 fn gmm_worker_pool_knee() {
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
     let r = rung("full 20000x16 k=8", 20_000, 16, 8, "full", "kmeans", 100, 1);
     let x = make_blobs(r.n, r.d, r.k, 42);
     println!("\n=== worker-pool width (MLRS_GMM_UNITS) ===");
@@ -340,10 +344,92 @@ fn gmm_worker_pool_knee() {
     let mut base = f64::NAN;
     for units in [1usize, 2, 4, 8, 12, 16] {
         let _g = abflag::force("MLRS_GMM_UNITS", &units.to_string());
-        let (wall, cpu) = measure(|| fit(&x, &r));
+        let (wall, cpu) = measure(|| fit(&mut pool, &x, &r));
         if units == 1 {
             base = wall;
         }
         println!("{units:<10} {wall:>10.2} {cpu:>10.2} {:>8.2}x", base / wall);
+    }
+}
+
+/// DEVICE-vs-HOST EM engine ladder (`MLRS_GMM_DEVICE` forces either arm,
+/// bypassing `gmm_device_applicable`'s size floor so every rung below is a
+/// genuine A/B rather than a report of the gate's own threshold). Sweeps the
+/// three axes the design doc calls out as mattering: `n_samples` (device
+/// should win at large `n`, lose at small `n` — the whole point of the
+/// size-gated predicate), `covariance_type` (`full`/`tied` are the expensive
+/// `O(n·k·d²)` forms), and `n_features`/`n_components`.
+///
+/// Only meaningful on real cuda/rocm hardware — see `gmm_device.rs`'s module
+/// docs for why the device arm is gated off wgpu at `f64` (no transcendentals)
+/// and off cpu always. On cpu/wgpu this still compiles and RUNS (both columns
+/// report the same host-engine numbers, or the device-forced column errors out
+/// via the hard capability gates inside `gmm_device_applicable` — in which case
+/// this test logs and skips rather than asserting a ratio), so the harness
+/// exists and works unmodified when the user runs it on Kaggle/T4 hardware.
+/// Per this repo's own convention (`ridge_default_perf_test.rs` et al.) this
+/// prints a table; it never asserts a specific speedup ratio.
+#[test]
+#[ignore = "wall-clock probe; run with --release --ignored --nocapture"]
+fn gmm_device_vs_host_ladder() {
+    if mlrs_backend::capability::active_backend_name() == "cpu" {
+        println!("\n=== device vs host EM engine: skipped (cpu backend, no device arm) ===");
+        return;
+    }
+    if !mlrs_backend::capability::f64_device_kernels_available()
+        || !mlrs_backend::capability::f64_transcendental_supported()
+    {
+        println!(
+            "\n=== device vs host EM engine: skipped (backend lacks f64 device kernels or \
+             f64 transcendentals — see gmm_device.rs module docs) ==="
+        );
+        return;
+    }
+
+    let rungs: Vec<Rung> = vec![
+        rung_fixed_iters("n=2000", 2_000, 16, 8, "full", "random", 30),
+        rung_fixed_iters("n=20000", 20_000, 16, 8, "full", "random", 30),
+        rung_fixed_iters("n=200000", 200_000, 16, 8, "full", "random", 30),
+        rung_fixed_iters("cov=full n=200000", 200_000, 16, 8, "full", "random", 30),
+        rung_fixed_iters("cov=tied n=200000", 200_000, 16, 8, "tied", "random", 30),
+        rung_fixed_iters("cov=diag n=200000", 200_000, 16, 8, "diag", "random", 30),
+        rung_fixed_iters(
+            "cov=spherical n=200000",
+            200_000,
+            16,
+            8,
+            "spherical",
+            "random",
+            30,
+        ),
+        rung_fixed_iters("d=64 n=200000", 200_000, 64, 8, "full", "random", 30),
+        rung_fixed_iters("d=256 n=200000", 200_000, 256, 8, "full", "random", 30),
+        rung_fixed_iters("k=2 n=200000", 200_000, 16, 2, "full", "random", 30),
+        rung_fixed_iters("k=32 n=200000", 200_000, 16, 32, "full", "random", 30),
+    ];
+
+    println!("\n=== device vs host EM engine (MLRS_GMM_DEVICE forced) ===");
+    println!(
+        "{:<24} {:>12} {:>12} {:>8}",
+        "rung", "host ms", "device ms", "dev/host"
+    );
+    println!("{}", "-".repeat(60));
+    for r in &rungs {
+        let x = make_blobs(r.n, r.d, r.k, 42);
+        let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
+
+        let (host_wall, _) = {
+            let _g = abflag::force("MLRS_GMM_DEVICE", "0");
+            measure(|| fit(&mut pool, &x, r))
+        };
+        let (dev_wall, _) = {
+            let _g = abflag::force("MLRS_GMM_DEVICE", "1");
+            measure(|| fit(&mut pool, &x, r))
+        };
+        println!(
+            "{:<24} {host_wall:>12.2} {dev_wall:>12.2} {:>7.2}x",
+            r.label,
+            dev_wall / host_wall
+        );
     }
 }

@@ -4,14 +4,20 @@
 //! [`mlrs_algos::mixture::gaussian_mixture::GaussianMixture`], dtype-dispatched
 //! (D-06) through the macro-emitted `AnyGaussianMixture` enum.
 //!
-//! ## Why every method here takes the HOST slice, on every backend
-//! The EM engine is host-resident by construction
-//! (`mlrs_backend::prims::gmm_host` module docs), so `host_fit_applicable` is
-//! unconditionally `true` and this wrapper never uploads. That makes the
-//! ingress the cheapest one available: the Arrow buffer the caller handed in is
-//! borrowed straight through, with no `from_host` memcpy at all — which for a
-//! `1M × 16` design is a saving of the same order as an entire sklearn `fit`
-//! ([[mlrs-linear-predict-cpu]]).
+//! ## Why every method here takes the HOST slice
+//! `host_fit_applicable` is unconditionally `true`
+//! (`GaussianMixture::host_fit_applicable` docs), so this wrapper always calls
+//! [`GaussianMixture::fit_from_host_slice`] rather than uploading through
+//! `Fit::fit`. On SMALL/MEDIUM fits, or on any backend without a genuine
+//! device EM engine (`mlrs_backend::prims::gmm_device` module docs), that ALSO
+//! means no upload at all: the Arrow buffer the caller handed in is borrowed
+//! straight through, with no `from_host` memcpy — which for a `1M × 16` design
+//! is a saving of the same order as an entire sklearn `fit`
+//! ([[mlrs-linear-predict-cpu]]). On a large `n` fit on cuda/rocm,
+//! `fit_from_host_slice` uploads internally (once) and runs the EM loop's
+//! bulk passes device-resident — the `pool` parameter this wrapper now threads
+//! through via [`crate::lock_pool`] is what that internal upload uses; it is a
+//! no-op borrow of the process-global pool on every OTHER shape/backend.
 //!
 //! `guard_f64()?` still runs on the F64 arm before anything else (D-04) so an
 //! f64 request on an f64-incapable backend raises rather than silently
@@ -187,7 +193,10 @@ impl PyGaussianMixture {
 
     /// Fit on `x` (`rows × cols`). Unsupervised — no `y`. GIL released (PY-03);
     /// f64 guarded on an f64-incapable backend (D-04). Takes the caller's Arrow
-    /// buffer by reference — nothing is uploaded (module docs).
+    /// buffer by reference; `pool` (the process-global `lock_pool`) is threaded
+    /// through for the rare shape/backend where `fit_from_host_slice` takes the
+    /// device EM engine and uploads once (module docs) — every other call never
+    /// touches it.
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -200,12 +209,13 @@ impl PyGaussianMixture {
         let p = self.params.clone();
         let warm = if p.warm_start { self.warm.clone() } else { None };
         let fitted = py.detach(|| -> PyResult<AnyGaussianMixture> {
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let est = gmm_build!(f32, p, warm);
                     let xh = host_slice_f32(as_f32(&xa)?)?;
                     Ok(AnyGaussianMixture::F32(
-                        est.fit_from_host_slice(xh, (rows, cols))
+                        est.fit_from_host_slice(&mut pool, xh, (rows, cols))
                             .map_err(algo_err_to_py)?,
                     ))
                 }
@@ -214,7 +224,7 @@ impl PyGaussianMixture {
                     let est = gmm_build!(f64, p, warm);
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     Ok(AnyGaussianMixture::F64(
-                        est.fit_from_host_slice(xh, (rows, cols))
+                        est.fit_from_host_slice(&mut pool, xh, (rows, cols))
                             .map_err(algo_err_to_py)?,
                     ))
                 }
