@@ -12,9 +12,14 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — never an in-source
 //! `#[cfg(test)] mod tests`).
 
-// TSNE-01 — exact-method t-SNE (device Q/gradient prim + sklearn-exact host
-// P-matrix / gradient-descent ports).
+// TSNE-01 / TSNE-PARAMS — t-SNE with sklearn's full parameter surface. The
+// estimator (`tsne`) owns the hyperparameters and the fit pipeline; `tsne_metric`
+// owns the 22-string `metric=` surface and `metric_params`; `tsne_knn` owns the
+// Barnes-Hut front-end (k-NN graph + sparse `P`). The descent itself lives in
+// `mlrs_backend::prims::tsne_host`.
 pub mod tsne;
+pub mod tsne_knn;
+pub mod tsne_metric;
 pub mod umap;
 
 // Plan-02/03 homes, pre-declared EMPTY in Plan 14-01 so the two Wave-2 plans

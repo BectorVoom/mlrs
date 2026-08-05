@@ -440,54 +440,122 @@ impl PyUMAP {
 }
 
 // ---------------------------------------------------------------------------
-// TSNE (TSNE-01) — Fit + embedding_/kl_divergence_/n_iter_ (fit/fit_transform
-// only, sklearn parity: TSNE has no out-of-sample transform).
+// TSNE (TSNE-01 / TSNE-PARAMS) — sklearn's FULL constructor surface.
+// Fit + embedding_/kl_divergence_/n_iter_ (fit/fit_transform only, sklearn
+// parity: TSNE is transductive and has no out-of-sample transform).
 // ---------------------------------------------------------------------------
 
 crate::any_estimator_typestate! {
     any:   AnyTsne,
     algo:  mlrs_algos::manifold::tsne::Tsne,
-    unfit: {
-        n_components: usize, perplexity: f64, early_exaggeration: f64,
-        learning_rate: Option<f64>, max_iter: usize, init: String,
-        random_state: Option<u64>, method: String, metric: String,
-    },
+    unfit: {},
 }
 
-/// Parse the sklearn-named `init` string (`"pca"` / `"random"`).
-fn parse_tsne_init(s: &str) -> PyResult<mlrs_algos::manifold::tsne::TsneInit> {
+/// The hyperparameters, persisted on the WRAPPER rather than read back out of
+/// the `Unfit` arm (WR-02). Keeping them here is what makes a SECOND `fit` of
+/// the same Python object work: `fit` consumes the typestate estimator, so the
+/// `Unfit` payload is gone once the first fit lands.
+struct TsneParams {
+    n_components: usize,
+    perplexity: f64,
+    early_exaggeration: f64,
+    /// `None` is sklearn's `'auto'`.
+    learning_rate: Option<f64>,
+    max_iter: usize,
+    n_iter_without_progress: usize,
+    min_grad_norm: f64,
+    metric: String,
+    metric_p: Option<f64>,
+    metric_v: Option<Vec<f64>>,
+    metric_vi: Option<Vec<f64>>,
+    init: String,
+    /// sklearn's `init=<ndarray>`, flattened row-major. When present, `init`
+    /// carries the sentinel `"array"`.
+    init_array: Option<Vec<f64>>,
+    verbose: usize,
+    random_state: Option<u64>,
+    method: String,
+    angle: f64,
+    n_jobs: Option<i32>,
+}
+
+/// Parse the sklearn-named `init` string. The `"array"` sentinel is emitted by
+/// the Python layer when the user passed an ndarray, and is paired with
+/// `init_array`.
+fn parse_tsne_init(
+    s: &str,
+    array: Option<&Vec<f64>>,
+) -> PyResult<mlrs_algos::manifold::tsne::TsneInit> {
     use mlrs_algos::manifold::tsne::TsneInit;
     match s {
         "pca" => Ok(TsneInit::Pca),
         "random" => Ok(TsneInit::Random),
+        "array" => match array {
+            Some(v) => Ok(TsneInit::Array(v.clone())),
+            None => Err(pyo3::exceptions::PyValueError::new_err(
+                "tsne: init=\"array\" requires the flattened init array",
+            )),
+        },
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "tsne: unsupported init {other:?}; expected \"pca\" or \"random\""
+            "tsne: unsupported init {other:?}; expected \"pca\", \"random\", or an ndarray"
         ))),
     }
 }
 
-/// sklearn-compatible `TSNE` (exact method only — the mlrs scope; cuML's
-/// barnes_hut/fft approximations are out of scope). `fit` + `embedding_`,
-/// NO out-of-sample `transform` (sklearn parity).
+/// Parse the sklearn-named `method` string.
+fn parse_tsne_method(s: &str) -> PyResult<mlrs_algos::manifold::tsne::TsneMethod> {
+    mlrs_algos::manifold::tsne::TsneMethod::from_sklearn_name(s).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "tsne: unsupported method {s:?}; expected \"barnes_hut\" or \"exact\""
+        ))
+    })
+}
+
+/// Parse the sklearn-named `metric` string (the full 22-value `StrOptions`
+/// set, aliases collapsed).
+fn parse_tsne_metric(s: &str) -> PyResult<mlrs_algos::manifold::tsne_metric::TsneMetric> {
+    mlrs_algos::manifold::tsne_metric::TsneMetric::from_sklearn_name(s).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "tsne: unsupported metric {s:?}"
+        ))
+    })
+}
+
+/// sklearn-compatible `TSNE` with the full 1.9.0 parameter surface:
+/// `method` in `{'barnes_hut', 'exact'}`, the 22 `metric` strings plus
+/// `metric_params`, `init` in `{'pca', 'random', <ndarray>}`, and the
+/// `angle` / `n_iter_without_progress` / `min_grad_norm` / `verbose` /
+/// `n_jobs` knobs. `fit` + `embedding_`, NO out-of-sample `transform`.
 #[pyclass(name = "TSNE")]
 pub struct PyTSNE {
     inner: AnyTsne,
+    params: TsneParams,
 }
 
 impl PyTSNE {
     /// Rust-callable default constructor for the smoke test.
     pub fn unfit_default() -> Self {
         Self {
-            inner: AnyTsne::Unfit {
+            inner: AnyTsne::Unfit {},
+            params: TsneParams {
                 n_components: 2,
                 perplexity: 30.0,
                 early_exaggeration: 12.0,
                 learning_rate: None,
                 max_iter: 1000,
-                init: "pca".to_string(),
-                random_state: None,
-                method: "exact".to_string(),
+                n_iter_without_progress: 300,
+                min_grad_norm: 1e-7,
                 metric: "euclidean".to_string(),
+                metric_p: None,
+                metric_v: None,
+                metric_vi: None,
+                init: "pca".to_string(),
+                init_array: None,
+                verbose: 0,
+                random_state: None,
+                method: "barnes_hut".to_string(),
+                angle: 0.5,
+                n_jobs: None,
             },
         }
     }
@@ -501,14 +569,23 @@ impl PyTSNE {
 #[pymethods]
 impl PyTSNE {
     /// `TSNE(n_components=2, perplexity=30.0, early_exaggeration=12.0,
-    /// learning_rate=None ('auto'), max_iter=1000, init="pca",
-    /// random_state=None, method="exact", metric="euclidean")`.
+    /// learning_rate=None ('auto'), max_iter=1000, n_iter_without_progress=300,
+    /// min_grad_norm=1e-7, metric="euclidean", metric_p=None, metric_v=None,
+    /// metric_vi=None, init="pca", init_array=None, verbose=0,
+    /// random_state=None, method="barnes_hut", angle=0.5, n_jobs=None)`.
+    ///
+    /// `metric_params` is unpacked by the Python layer into the three scipy
+    /// keywords the Rust side understands, so the boundary stays typed rather
+    /// than carrying a `PyDict`.
     #[new]
     #[pyo3(signature = (
         n_components = 2, perplexity = 30.0, early_exaggeration = 12.0,
-        learning_rate = None, max_iter = 1000, init = String::from("pca"),
-        random_state = None, method = String::from("exact"),
-        metric = String::from("euclidean"),
+        learning_rate = None, max_iter = 1000, n_iter_without_progress = 300,
+        min_grad_norm = 1e-7, metric = String::from("euclidean"),
+        metric_p = None, metric_v = None, metric_vi = None,
+        init = String::from("pca"), init_array = None, verbose = 0,
+        random_state = None, method = String::from("barnes_hut"),
+        angle = 0.5, n_jobs = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -517,60 +594,99 @@ impl PyTSNE {
         early_exaggeration: f64,
         learning_rate: Option<f64>,
         max_iter: usize,
+        n_iter_without_progress: usize,
+        min_grad_norm: f64,
+        metric: String,
+        metric_p: Option<f64>,
+        metric_v: Option<Vec<f64>>,
+        metric_vi: Option<Vec<f64>>,
         init: String,
+        init_array: Option<Vec<f64>>,
+        verbose: usize,
         random_state: Option<u64>,
         method: String,
-        metric: String,
+        angle: f64,
+        n_jobs: Option<i32>,
     ) -> PyResult<Self> {
-        // Data-independent string surface validated AT CONSTRUCTION.
-        parse_tsne_init(&init)?;
-        if method != "exact" {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "tsne: unsupported method {method:?}; mlrs supports \"exact\" only"
-            )));
-        }
-        if metric != "euclidean" {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "tsne: unsupported metric {metric:?}; expected \"euclidean\""
-            )));
-        }
+        // Data-independent string surface validated AT CONSTRUCTION, so a typo
+        // raises where the user wrote it rather than at `fit`.
+        parse_tsne_init(&init, init_array.as_ref())?;
+        parse_tsne_method(&method)?;
+        parse_tsne_metric(&metric)?;
         Ok(Self {
-            inner: AnyTsne::Unfit {
+            inner: AnyTsne::Unfit {},
+            params: TsneParams {
                 n_components,
                 perplexity,
                 early_exaggeration,
                 learning_rate,
                 max_iter,
+                n_iter_without_progress,
+                min_grad_norm,
+                metric,
+                metric_p,
+                metric_v,
+                metric_vi,
                 init,
+                init_array,
+                verbose,
                 random_state,
                 method,
-                metric,
+                angle,
+                n_jobs,
             },
         })
     }
 
-    fn fit(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<()> {
+    fn fit(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<()> {
         use mlrs_algos::manifold::tsne::{LearningRate, Tsne};
+        use mlrs_algos::manifold::tsne_metric::MetricParams;
 
         let xa = capsule_to_array(x)?;
         let dt = float_dtype(&xa)?;
-        let (n_components, perplexity, early_exaggeration, learning_rate, max_iter, init_s, random_state) =
-            match &self.inner {
-                AnyTsne::Unfit {
-                    n_components, perplexity, early_exaggeration, learning_rate,
-                    max_iter, init, random_state, ..
-                } => (
-                    *n_components, *perplexity, *early_exaggeration, *learning_rate,
-                    *max_iter, init.clone(), *random_state,
-                ),
-                _ => return Err(not_fitted("tsne", "re-fit")),
-            };
-        let init = parse_tsne_init(&init_s)?;
-        let lr = match learning_rate {
+        let p = &self.params;
+        let init = parse_tsne_init(&p.init, p.init_array.as_ref())?;
+        let method = parse_tsne_method(&p.method)?;
+        let metric = parse_tsne_metric(&p.metric)?;
+        let metric_params = MetricParams {
+            p: p.metric_p,
+            v: p.metric_v.clone(),
+            vi: p.metric_vi.clone(),
+            w: None,
+        };
+        let lr = match p.learning_rate {
             None => LearningRate::Auto,
             Some(v) => LearningRate::Value(v),
         };
-        let seed = random_state.unwrap_or(0);
+        let seed = p.random_state.unwrap_or(0);
+        let (
+            n_components,
+            perplexity,
+            early_exaggeration,
+            max_iter,
+            n_iter_without_progress,
+            min_grad_norm,
+            verbose,
+            angle,
+            n_jobs,
+        ) = (
+            p.n_components,
+            p.perplexity,
+            p.early_exaggeration,
+            p.max_iter,
+            p.n_iter_without_progress,
+            p.min_grad_norm,
+            p.verbose,
+            p.angle,
+            p.n_jobs,
+        );
+
         let fitted = py.detach(|| -> PyResult<AnyTsne> {
             let mut pool = crate::lock_pool();
             match dt {
@@ -582,11 +698,21 @@ impl PyTSNE {
                         .early_exaggeration(early_exaggeration)
                         .learning_rate(lr)
                         .max_iter(max_iter)
+                        .n_iter_without_progress(n_iter_without_progress)
+                        .min_grad_norm(min_grad_norm)
+                        .metric(metric)
+                        .metric_params(metric_params)
                         .init(init)
+                        .verbose(verbose)
                         .seed(seed)
+                        .method(method)
+                        .angle(angle)
+                        .n_jobs(n_jobs)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit(&mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
                     Ok(AnyTsne::F32(fitted))
                 }
                 FloatDtype::F64 => {
@@ -598,11 +724,21 @@ impl PyTSNE {
                         .early_exaggeration(early_exaggeration)
                         .learning_rate(lr)
                         .max_iter(max_iter)
+                        .n_iter_without_progress(n_iter_without_progress)
+                        .min_grad_norm(min_grad_norm)
+                        .metric(metric)
+                        .metric_params(metric_params)
                         .init(init)
+                        .verbose(verbose)
                         .seed(seed)
+                        .method(method)
+                        .angle(angle)
+                        .n_jobs(n_jobs)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = est.fit(&mut pool, &xd, None, (rows, cols)).map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit(&mut pool, &xd, None, (rows, cols))
+                        .map_err(algo_err_to_py)?;
                     Ok(AnyTsne::F64(fitted))
                 }
             }

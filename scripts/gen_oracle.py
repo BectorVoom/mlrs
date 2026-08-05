@@ -6354,6 +6354,258 @@ def gen_gaussian_mixture(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# TSNE full-parameter-surface fixtures (TSNE-PARAMS)
+# ---------------------------------------------------------------------------
+
+# Every `metric=` string sklearn 1.9.0's TSNE accepts that can be evaluated on
+# a generic float design. Ordered so the aliases sit next to their canonical
+# name; the Rust side collapses them, and the fixture proves the collapse is
+# value-preserving rather than assuming it.
+TSNE_GENERIC_METRICS = (
+    "euclidean",
+    "l2",
+    "sqeuclidean",
+    "l1",
+    "manhattan",
+    "cityblock",
+    "chebyshev",
+    "minkowski",
+    "cosine",
+    "correlation",
+    "canberra",
+    "braycurtis",
+    "seuclidean",
+    "mahalanobis",
+    "hamming",
+    "matching",
+    "jaccard",
+    "dice",
+    "rogerstanimoto",
+    "russellrao",
+    "sokalsneath",
+    "yule",
+)
+
+
+def _tsne_metric_design(seed: int):
+    """The design the metric fixtures are measured on.
+
+    Three properties are deliberate, and each one exists to stop a whole class
+    of metric from degenerating into a constant:
+
+    * **Genuine zeros (~35% of entries).** The six metrics sklearn evaluates on
+      a BOOLEAN cast (`dice`/`jaccard`/`rogerstanimoto`/`russellrao`/
+      `sokalsneath`/`yule`) reduce to the contingency counts of `x != 0`. On an
+      all-nonzero Gaussian design every row casts to all-true and every one of
+      those metrics returns exactly 0 for every pair — a fixture that would
+      pass against almost any implementation. The zeros are what give them
+      information.
+    * **No all-zero row.** `sokalsneath` RAISES and `dice` returns NaN for a
+      pair of all-zero rows. Those degeneracies are mirrored by the Rust port
+      and tested separately; they must not contaminate the value fixture.
+    * **Full-rank, well-conditioned covariance.** `mahalanobis` inverts it and
+      `seuclidean` divides by its diagonal.
+    """
+    rng = np.random.default_rng(seed)
+    centers = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [6.0, 6.0, -6.0, 3.0, -3.0],
+            [-7.0, 4.0, 5.0, -5.0, 2.5],
+        ]
+    )
+    x = np.vstack([centers[b] + 0.7 * rng.standard_normal((16, 5)) for b in range(3)])
+    # Punch in zeros for the boolean family, then repair any all-zero row.
+    mask = rng.random(x.shape) < 0.35
+    x = np.where(mask, 0.0, x)
+    for i in range(x.shape[0]):
+        if not np.any(x[i]):
+            x[i, i % x.shape[1]] = 1.0 + 0.1 * i
+    return x
+
+
+def gen_tsne_metrics(seed: int = SEED, dtype=np.float32) -> str:
+    """`TSNE(metric=...)` value fixture (TSNE-PARAMS) — one archive carrying
+    sklearn's pairwise distances AND the dense joint-probability matrix for
+    every metric string.
+
+    Why both tiers: the distance matrix pins the metric formula itself, and the
+    `P` matrix pins that t-SNE consumes it the way sklearn does — including the
+    `distances **= 2` that applies to every metric EXCEPT `'euclidean'` (which
+    sklearn requests pre-squared) and the f32 rounding inside the perplexity
+    search. A port can get the first right and the second wrong.
+
+    Stores ``X`` plus ``D_<metric>`` / ``P_<metric>`` per metric, the
+    2-feature ``Xh`` + ``D_haversine`` / ``P_haversine`` pair (haversine is
+    only defined on 2 dimensions), the NaN-carrying ``Xnan`` +
+    ``D_nan_euclidean`` / ``P_nan_euclidean`` pair, and the ``Xpre`` square
+    matrix for ``metric='precomputed'``.
+    """
+    import warnings
+
+    from scipy.spatial.distance import squareform
+    from sklearn.manifold._t_sne import _joint_probabilities
+    from sklearn.metrics.pairwise import pairwise_distances
+
+    x = _tsne_metric_design(seed)
+    n = x.shape[0]
+    perplexity = 10.0
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    def dense_p(dist, metric):
+        """sklearn `_fit`'s exact-method distance stage: square unless the
+        metric is `'euclidean'` (already squared), then the perplexity search."""
+        d = np.array(dist, dtype=np.float64, copy=True)
+        if metric != "euclidean":
+            d = d**2
+        return squareform(_joint_probabilities(d, perplexity, 0))
+
+    out = {"X": c(x), "perplexity": c([perplexity])}
+
+    for m in TSNE_GENERIC_METRICS:
+        with warnings.catch_warnings():
+            # The bool-cast metrics emit DataConversionWarning by design.
+            warnings.simplefilter("ignore")
+            if m == "euclidean":
+                dist = pairwise_distances(x, metric=m, squared=True)
+            else:
+                dist = pairwise_distances(x, metric=m)
+        out[f"D_{m}"] = np.asarray(dist, dtype=np.float64)
+        out[f"P_{m}"] = dense_p(dist, m)
+
+    # haversine: radian (latitude, longitude), 2 features only.
+    rng = np.random.default_rng(seed + 11)
+    xh = rng.uniform(-1.0, 1.0, size=(n, 2))
+    dist = pairwise_distances(xh, metric="haversine")
+    out["Xh"] = c(xh)
+    out["D_haversine"] = np.asarray(dist, dtype=np.float64)
+    out["P_haversine"] = dense_p(dist, "haversine")
+
+    # nan_euclidean: a design with genuine missing entries, no all-NaN row.
+    xn = np.array(x, copy=True)
+    nan_mask = rng.random(xn.shape) < 0.12
+    xn = np.where(nan_mask, np.nan, xn)
+    for i in range(n):
+        if np.all(np.isnan(xn[i])):
+            xn[i, 0] = float(i)
+    dist = pairwise_distances(xn, metric="nan_euclidean")
+    out["Xnan"] = c(xn)
+    out["D_nan_euclidean"] = np.asarray(dist, dtype=np.float64)
+    out["P_nan_euclidean"] = dense_p(dist, "nan_euclidean")
+
+    # precomputed: X IS the distance matrix. Built from a DIFFERENT metric than
+    # euclidean so a port that quietly recomputes euclidean distances instead of
+    # reading the matrix fails the gate.
+    xpre = pairwise_distances(x, metric="cityblock")
+    dist = pairwise_distances(xpre, metric="precomputed")
+    out["Xpre"] = c(xpre)
+    out["D_precomputed"] = np.asarray(dist, dtype=np.float64)
+    out["P_precomputed"] = dense_p(dist, "precomputed")
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"tsne_metrics_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, **out)
+    return out_path
+
+
+def gen_tsne_params(seed: int = SEED, dtype=np.float32) -> str:
+    """`TSNE(method=..., init=..., learning_rate=...)` fixture (TSNE-PARAMS).
+
+    The `method` and `init` gates share ONE injected starting embedding
+    (``init_array``). That is the whole point of the design: t-SNE's descent is
+    1000 chaotic iterations, so two runs from different inits are incomparable
+    at the value level, and a band gate on a stochastic init proves very little.
+    Feeding sklearn and mlrs the SAME init removes the only source of
+    divergence that is not arithmetic, which is what makes a tight
+    neighbourhood-preservation band meaningful.
+
+    Stores, for each ``method`` in {``barnes_hut``, ``exact``} and each ``init``
+    in {``pca``, ``random``, ``array``}: ``emb_<tag>``, ``kl_<tag>``,
+    ``trust_<tag>``. Also stores ``lr_auto`` — the value sklearn's
+    ``learning_rate='auto'`` resolves to, ``max(n / early_exaggeration / 4,
+    50)`` — so the Rust side can gate the ``'auto'`` arm against an EXPLICIT
+    learning rate for exact equality rather than by band.
+    """
+    from sklearn.manifold import TSNE as SkTSNE
+    from sklearn.manifold import trustworthiness
+
+    rng = np.random.default_rng(seed)
+    centers = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [6.0, 6.0, -6.0, 3.0, -3.0],
+            [-7.0, 4.0, 5.0, -5.0, 2.5],
+        ]
+    )
+    x = np.vstack([centers[b] + 0.7 * rng.standard_normal((16, 5)) for b in range(3)])
+    n = x.shape[0]
+    perplexity = 10.0
+    early_exaggeration = 12.0
+    init_array = 1e-4 * rng.standard_normal((n, 2))
+
+    def c(arr):
+        return np.asarray(arr, dtype=dtype)
+
+    out = {
+        "X": c(x),
+        "perplexity": c([perplexity]),
+        "init_array": np.asarray(init_array, dtype=np.float64),
+        "lr_auto": c([max(n / early_exaggeration / 4.0, 50.0)]),
+    }
+
+    def record(tag, model):
+        emb = model.fit_transform(x)
+        out[f"emb_{tag}"] = np.asarray(emb, dtype=np.float64)
+        out[f"kl_{tag}"] = c([model.kl_divergence_])
+        out[f"trust_{tag}"] = c([trustworthiness(x, emb, n_neighbors=5)])
+        out[f"niter_{tag}"] = c([model.n_iter_])
+
+    # `method`: both objectives, from the SAME injected init.
+    for method in ("barnes_hut", "exact"):
+        record(
+            method,
+            SkTSNE(
+                n_components=2,
+                perplexity=perplexity,
+                method=method,
+                init=np.array(init_array, copy=True),
+                learning_rate="auto",
+                max_iter=1000,
+                random_state=seed,
+            ),
+        )
+
+    # `init`: the three accepted forms, on the exact objective so the only
+    # difference between the runs is where the descent started.
+    for tag, init in (
+        ("init_pca", "pca"),
+        ("init_random", "random"),
+        ("init_array", np.array(init_array, copy=True)),
+    ):
+        record(
+            tag,
+            SkTSNE(
+                n_components=2,
+                perplexity=perplexity,
+                method="exact",
+                init=init,
+                learning_rate="auto",
+                max_iter=1000,
+                random_state=seed,
+            ),
+        )
+
+    dtype_tag = "f32" if dtype == np.float32 else "f64"
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"tsne_params_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, **out)
+    return out_path
+
+
 def main() -> None:
     for dtype in (np.float32, np.float64):
         path = gen_saxpy(dtype=dtype)
@@ -6510,6 +6762,13 @@ def main() -> None:
     # TSNE (TSNE-01): deterministic P-matrix gate + KL/trustworthiness band.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_tsne(dtype=dtype)}")
+    # TSNE full parameter surface (TSNE-PARAMS): one archive per dtype carrying
+    # sklearn's distances AND joint probabilities for every `metric` string, and
+    # a second carrying the `method` / `init` / `learning_rate='auto'` gates.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_tsne_metrics(dtype=dtype)}")
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_tsne_params(dtype=dtype)}")
     # Lasso (LINEAR-03): sparse coef_ with exact zeros (Pitfall 1).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_lasso(dtype=dtype)}")

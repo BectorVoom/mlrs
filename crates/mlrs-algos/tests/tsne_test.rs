@@ -148,7 +148,7 @@ fn p_matrix_matches_sklearn() {
     let perplexity = case.expect_f64("perplexity")[0];
 
     let dsq = pairwise_sq(&x, TSNE_N, TSNE_P);
-    let p_got = joint_probabilities(&dsq, TSNE_N, perplexity);
+    let p_got = joint_probabilities(&dsq, TSNE_N, perplexity, 4);
 
     assert_eq!(p_got.len(), p_ref.len());
     let mut max_abs = 0.0f64;

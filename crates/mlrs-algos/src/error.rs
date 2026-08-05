@@ -1114,6 +1114,21 @@ pub enum BuildError {
         tol: f64,
     },
 
+    /// `TSNE` was given a Barnes-Hut `angle` outside `[0, 1]` (TSNE-PARAMS).
+    /// θ is the angular size below which a quadtree cell may stand in for the
+    /// points it contains; sklearn's constraint is
+    /// `Interval(Real, 0, 1, closed='both')`, so both endpoints are legal —
+    /// `0` degrades Barnes-Hut to the exact `O(n²)` summation and `1` is the
+    /// coarsest summary. Rejected at `build()` (data-INDEPENDENT, the D-08
+    /// split).
+    #[error("estimator '{estimator}': angle = {angle} is invalid (must be in [0, 1])")]
+    InvalidAngle {
+        /// Which estimator's builder rejected the value (always `"tsne"`).
+        estimator: &'static str,
+        /// The offending summary angle.
+        angle: f64,
+    },
+
     /// An unrecognised `covariance_type` string was supplied to
     /// `GaussianMixture` (MIX-01). Mirrors sklearn's `StrOptions({'full',
     /// 'tied', 'diag', 'spherical'})` rejection. This is its OWN variant rather

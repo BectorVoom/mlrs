@@ -402,17 +402,23 @@ EXPECTED_PARAMS = {
         "linkage": "single",
         "output_type": "input",
     },
-    # --- TSNE-01: TSNE (exact method). ------------------------------------ #
+    # --- TSNE-01 / TSNE-PARAMS: sklearn 1.9.0's FULL TSNE signature. ------ #
     "TSNE": {
         "n_components": 2,
         "perplexity": 30.0,
         "early_exaggeration": 12.0,
         "learning_rate": "auto",
         "max_iter": 1000,
-        "init": "pca",
-        "random_state": None,
-        "method": "exact",
+        "n_iter_without_progress": 300,
+        "min_grad_norm": 1e-7,
         "metric": "euclidean",
+        "metric_params": None,
+        "init": "pca",
+        "verbose": 0,
+        "random_state": None,
+        "method": "barnes_hut",
+        "angle": 0.5,
+        "n_jobs": None,
         "output_type": "input",
     },
     # --- TASK-16 (PY-ENS-05, RF): RandomForestClassifier/Regressor. ------- #
