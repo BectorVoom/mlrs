@@ -85,6 +85,16 @@ EXPECTED_PARAMS = {
         "tol": 1e-4,
         "output_type": "input",
     },
+    # --- HUBER-01: HuberRegressor's full sklearn ctor surface. ------------- #
+    "HuberRegressor": {
+        "epsilon": 1.35,
+        "max_iter": 100,
+        "alpha": 1e-4,
+        "warm_start": False,
+        "fit_intercept": True,
+        "tol": 1e-5,
+        "output_type": "input",
+    },
     "LogisticRegression": {
         "C": 1.0,
         "fit_intercept": True,
@@ -475,6 +485,7 @@ SET_PARAM = {
     "BayesianRidge": ("max_iter", 50),
     "Lasso": ("alpha", 2.0),
     "ElasticNet": ("l1_ratio", 0.25),
+    "HuberRegressor": ("epsilon", 1.5),
     "LogisticRegression": ("C", 2.0),
     "KMeans": ("n_clusters", 5),
     "DBSCAN": ("eps", 1.5),
