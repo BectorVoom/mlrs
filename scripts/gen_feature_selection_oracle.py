@@ -375,6 +375,30 @@ def gen_feature_selection_variance(seed: int = SEED, dtype=np.float32) -> str:
     return path
 
 
+def _meta_design(seed: int = SEED):
+    """`_design` with the DUPLICATE column made independent, for the meta-selectors.
+
+    `_design`'s column 5 is a copy of column 0, which is exactly what
+    `SelectKBest`'s documented tie-break needs: two features with bit-identical
+    scores. For the meta-selectors it is poison. `Ridge` splits a coefficient
+    equally between two identical columns, so their squared importances TIE, and
+    `RFE` then eliminates whichever of the pair its solver's last bits happened to
+    rank lower. mlrs solves the normal equations by Gaussian elimination and
+    sklearn by Cholesky, so the two disagree about a tie that is exact in real
+    arithmetic — producing a different, equally correct mask at
+    `n_features_to_select=3`, where only one of the pair survives.
+
+    Breaking the duplicate removes the coin flip and lets every meta-selector mask
+    be compared for EXACT equality, which is the whole point of choosing a
+    closed-form inner model. The other degenerate columns (constant, all-zero,
+    perfectly correlated) are KEPT: both sides handle those deterministically.
+    """
+    x, y_class, y_reg = _design(seed)
+    rng = np.random.default_rng(seed + 1)
+    x[:, 5] = rng.standard_normal(N_SAMPLES) + 3.0
+    return x, y_class, y_reg
+
+
 def gen_feature_selection_meta(seed: int = SEED, dtype=np.float32) -> str:
     """The four meta-selectors, driven by `Ridge(alpha=1, fit_intercept=False)`.
 
@@ -397,7 +421,9 @@ def gen_feature_selection_meta(seed: int = SEED, dtype=np.float32) -> str:
     )
     from sklearn.linear_model import Ridge
 
-    x, _, y_reg = _design(seed)
+    # The DE-DUPLICATED design (see `_meta_design`): a duplicate column makes
+    # `RFE`'s elimination order a coin flip between two tied importances.
+    x, _, y_reg = _meta_design(seed)
     out = {"X": _c(x, dtype), "y_reg": _c(y_reg, dtype)}
 
     def ridge():
