@@ -109,6 +109,13 @@ pub(crate) trait HostFloat:
     /// `F::log1p` — the instance-form `.log1p()` the [`sgd_loss`
     /// kernel](mlrs_kernels::sgd::sgd_loss) uses for the `Log` loss value.
     fn log1p(self) -> Self;
+    /// `F::sqrt` — the boundary root of the Euclidean k-NN scan and the
+    /// `sqrt(‖x‖²·‖y‖²)` denominator of the cosine one
+    /// ([`knn_host`](super::knn_host)).
+    fn sqrt(self) -> Self;
+    /// `F::powf` — the per-feature `|x−y|^p` and the boundary `v^(1/p)` of the
+    /// Minkowski k-NN scan ([`knn_host`](super::knn_host)).
+    fn powf(self, e: Self) -> Self;
     /// Widen to `f64` — the host twin of `host_to_f64`.
     fn to_f64(self) -> f64;
 }
@@ -135,6 +142,14 @@ impl HostFloat for f32 {
     #[inline(always)]
     fn log1p(self) -> Self {
         f32::ln_1p(self)
+    }
+    #[inline(always)]
+    fn sqrt(self) -> Self {
+        f32::sqrt(self)
+    }
+    #[inline(always)]
+    fn powf(self, e: Self) -> Self {
+        f32::powf(self, e)
     }
     #[inline(always)]
     fn to_f64(self) -> f64 {
@@ -164,6 +179,14 @@ impl HostFloat for f64 {
     #[inline(always)]
     fn log1p(self) -> Self {
         f64::ln_1p(self)
+    }
+    #[inline(always)]
+    fn sqrt(self) -> Self {
+        f64::sqrt(self)
+    }
+    #[inline(always)]
+    fn powf(self, e: Self) -> Self {
+        f64::powf(self, e)
     }
     #[inline(always)]
     fn to_f64(self) -> f64 {

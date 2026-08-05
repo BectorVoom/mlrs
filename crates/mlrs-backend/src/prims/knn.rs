@@ -25,13 +25,17 @@ use cubecl::prelude::*;
 
 use mlrs_core::PrimError;
 use mlrs_kernels::knn::{
-    euclidean_topk_fused, euclidean_topk_fused_dot, euclidean_topk_fused_dot_vec,
-    euclidean_topk_fused_dot_vec8, euclidean_topk_rows_cpu, euclidean_topk_rows_cpu_direct,
-    euclidean_topk_rows_cpu_vec, knn_regress_gather, knn_regress_mean, row_sumsq, CPU_K_CAP,
-    CPU_MAX_COLS, CPU_QUERY_TILE, CPU_QUERY_TILE_WIDE,
+    chebyshev_topk_rows_cpu_metric, cosine_topk_rows_cpu_metric, euclidean_topk_fused,
+    euclidean_topk_fused_dot, euclidean_topk_fused_dot_vec, euclidean_topk_fused_dot_vec8,
+    euclidean_topk_rows_cpu, euclidean_topk_rows_cpu_direct, euclidean_topk_rows_cpu_metric,
+    euclidean_topk_rows_cpu_vec, knn_regress_gather, knn_regress_mean,
+    manhattan_topk_rows_cpu_metric, minkowski_int_topk_rows_cpu_metric,
+    minkowski_topk_rows_cpu_metric, row_sumsq, CPU_K_CAP,
+    CPU_MAX_COLS, CPU_METRIC_K_CAP, CPU_METRIC_LANES, CPU_METRIC_MAX_COLS, CPU_QUERY_TILE,
+    CPU_QUERY_TILE_WIDE,
 };
 use mlrs_kernels::topk::select_k_onepass_indexed;
-use mlrs_kernels::{copy_elem, copy_elem_cpu_chunked, sqrt_elem};
+use mlrs_kernels::{copy_elem, copy_elem_cpu_chunked, powf_elem, sqrt_elem};
 
 use crate::capability;
 use crate::device_array::DeviceArray;
@@ -658,6 +662,233 @@ where
         let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         let sout_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
         sqrt_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg);
+    }
+
+    Ok((
+        DeviceArray::from_raw(val_handle, out_len),
+        DeviceArray::from_raw(idx_handle, out_len),
+    ))
+}
+
+/// The integer exponent `p` denotes, or `0` when it is not one this family
+/// specializes for.
+///
+/// `p` must round-trip through `u32` EXACTLY — `p = 3.0000001` is a different
+/// metric from `p = 3` and must not silently take the multiply chain. The upper
+/// bound is where an unrolled multiply chain stops being obviously cheaper than
+/// one `powf`, and it covers every exponent a user plausibly types.
+fn minkowski_powi(p: f64) -> u32 {
+    let pi = p as u32;
+    if p == f64::from(pi) && (3..=8).contains(&pi) {
+        pi
+    } else {
+        0
+    }
+}
+
+/// Should the METRIC cpu row-scan family serve this selection (KNN-CUBE-METRIC)?
+///
+/// True on the cpu backend for the shape the family's local caches cover:
+/// `n_features <= CPU_METRIC_MAX_COLS` (its transposed query tile) and
+/// `1 <= k <= min(n_train, CPU_METRIC_K_CAP)` (its list stride). Both caps are
+/// four times the Euclidean-only kernel's, which is what turns `metric != l2`
+/// and `n_neighbors > 16` from a fall-through into an ordinary case.
+///
+/// This is checked AFTER [`cpu_rows_applicable`] by callers that can use either:
+/// inside its own rectangle the tuned Euclidean kernel is still the faster arm.
+///
+/// `MLRS_KNN_CPU_METRIC=0` forces the family off for on-target A/B (`=1` cannot
+/// force it onto a non-cpu backend — the lanes ARE the parallelism here, where a
+/// GPU wants units).
+pub fn cpu_metric_rows_applicable<F>(
+    n_query: usize,
+    n_train: usize,
+    n_features: usize,
+    k: usize,
+) -> bool
+where
+    F: Float + CubeElement + Pod,
+{
+    capability::active_backend_name() == "cpu"
+        && n_query >= 1
+        && n_features >= 1
+        && n_features <= CPU_METRIC_MAX_COLS as usize
+        && k >= 1
+        && k <= n_train
+        && k <= CPU_METRIC_K_CAP as usize
+        && crate::abflag::var("MLRS_KNN_CPU_METRIC").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Brute-force `k`-nearest search under `metric`, on the METRIC cpu row-scan
+/// family (KNN-CUBE-METRIC).
+///
+/// Returns `(values, indices)`, `n_query × k` device-resident, with TRUE metric
+/// distances — the Euclidean and Minkowski kernels select on the un-rooted
+/// accumulator and this applies the boundary root to the emitted values only.
+///
+/// Dispatch through [`cpu_metric_rows_applicable`] first; this validates the
+/// bounds the launch derives from but assumes the caps have been checked.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_metric_rows_topk<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    xq: &DeviceArray<ActiveRuntime, F>,
+    (n_query, n_features): (usize, usize),
+    x_train: &DeviceArray<ActiveRuntime, F>,
+    n_train: usize,
+    k: usize,
+    metric: super::knn_graph::Metric,
+) -> Result<(DeviceArray<ActiveRuntime, F>, DeviceArray<ActiveRuntime, u32>), PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    // --- ASVS V5: validate every bound the launch derives from. ---
+    if n_query.checked_mul(n_features).map(|v| v != xq.len()).unwrap_or(true) {
+        return Err(PrimError::ShapeMismatch {
+            operand: "x",
+            rows: n_query,
+            cols: n_features,
+            len: xq.len(),
+        });
+    }
+    if n_train.checked_mul(n_features).map(|v| v != x_train.len()).unwrap_or(true) {
+        return Err(PrimError::ShapeMismatch {
+            operand: "y",
+            rows: n_train,
+            cols: n_features,
+            len: x_train.len(),
+        });
+    }
+    if k < 1 || k > n_train || k > CPU_METRIC_K_CAP as usize {
+        return Err(PrimError::ShapeMismatch {
+            operand: "k",
+            rows: 1,
+            cols: k,
+            len: n_train.min(CPU_METRIC_K_CAP as usize),
+        });
+    }
+    if n_features < 1 || n_features > CPU_METRIC_MAX_COLS as usize {
+        return Err(PrimError::ShapeMismatch {
+            operand: "features",
+            rows: n_features,
+            cols: 0,
+            len: CPU_METRIC_MAX_COLS as usize,
+        });
+    }
+    for (operand, dim) in [("rows", n_query), ("cols", n_train)] {
+        if dim > u32::MAX as usize {
+            return Err(PrimError::ShapeMismatch {
+                operand,
+                rows: dim,
+                cols: 0,
+                len: u32::MAX as usize,
+            });
+        }
+    }
+
+    let out_len = n_query * k;
+    let client = pool.client().clone();
+
+    // Cosine is the one metric whose pair value is not a function of the feature
+    // differences alone; its two squared-norm vectors are hoisted out of the scan
+    // into the same `row_sumsq` feeder the device cosine path uses. Every other
+    // metric gets a ONE-element dummy: the kernels share a signature so the
+    // dispatch below stays a `match` over kernel names rather than over shapes,
+    // and an unread `Array` argument costs a pointer.
+    let cosine = matches!(metric, super::knn_graph::Metric::Cosine);
+    let (xn_len, yn_len) = if cosine { (n_query, n_train) } else { (1, 1) };
+    let xnorm_handle = pool.acquire(xn_len * size_of::<F>());
+    let ynorm_handle = pool.acquire(yn_len * size_of::<F>());
+    if cosine {
+        let (nc, nd) = super::launch_dims_1d(n_query, capability::gather_launch_width());
+        let in_arg = unsafe { ArrayArg::from_raw_parts(xq.handle().clone(), xq.len()) };
+        let out_arg = unsafe { ArrayArg::from_raw_parts(xnorm_handle.clone(), n_query) };
+        row_sumsq::launch::<F, ActiveRuntime>(
+            &client, nc, nd, in_arg, out_arg, n_query as u32, n_features as u32,
+        );
+        let (nc, nd) = super::launch_dims_1d(n_train, capability::gather_launch_width());
+        let in_arg = unsafe { ArrayArg::from_raw_parts(x_train.handle().clone(), x_train.len()) };
+        let out_arg = unsafe { ArrayArg::from_raw_parts(ynorm_handle.clone(), n_train) };
+        row_sumsq::launch::<F, ActiveRuntime>(
+            &client, nc, nd, in_arg, out_arg, n_train as u32, n_features as u32,
+        );
+    }
+
+    let val_handle = pool.acquire(out_len * size_of::<F>());
+    let idx_handle = pool.acquire(out_len * size_of::<u32>());
+    let (count, dim) = cpu_rows_launch_dims(n_query, CPU_METRIC_LANES);
+
+    // SAFETY: lengths are the carried/validated element counts; every kernel in
+    // the family bounds-checks its query rows against `rows_x` and never indexes
+    // `y` past `rows_y * cols`.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(xq.handle().clone(), xq.len()) };
+    let y_arg = unsafe { ArrayArg::from_raw_parts(x_train.handle().clone(), x_train.len()) };
+    let xn_arg = unsafe { ArrayArg::from_raw_parts(xnorm_handle.clone(), xn_len) };
+    let yn_arg = unsafe { ArrayArg::from_raw_parts(ynorm_handle.clone(), yn_len) };
+    let val_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
+    let idx_arg = unsafe { ArrayArg::from_raw_parts(idx_handle.clone(), out_len) };
+
+    let p = match metric {
+        super::knn_graph::Metric::Minkowski { p } => mlrs_core::f64_to_host::<F>(p),
+        _ => mlrs_core::f64_to_host::<F>(2.0),
+    };
+    // An INTEGER exponent takes the repeated-multiplication kernel: a vector
+    // `powf` lowers to one libm call per lane on `cubecl-cpu` and measured 61x
+    // slower (see `metric_step_minkowski_int`). `p = 1` / `p = 2` never reach
+    // here — the shim collapses them onto Manhattan / Euclidean.
+    let pi = match metric {
+        super::knn_graph::Metric::Minkowski { p } => minkowski_powi(p),
+        _ => 0,
+    };
+    let (rows_x, rows_y, cols, kk) = (n_query as u32, n_train as u32, n_features as u32, k as u32);
+
+    match metric {
+        super::knn_graph::Metric::Euclidean => euclidean_topk_rows_cpu_metric::launch::<F, ActiveRuntime>(
+            &client, count, dim, x_arg, y_arg, xn_arg, yn_arg, val_arg, idx_arg, rows_x, rows_y,
+            cols, kk, p, pi,
+        ),
+        super::knn_graph::Metric::Manhattan => manhattan_topk_rows_cpu_metric::launch::<F, ActiveRuntime>(
+            &client, count, dim, x_arg, y_arg, xn_arg, yn_arg, val_arg, idx_arg, rows_x, rows_y,
+            cols, kk, p, pi,
+        ),
+        super::knn_graph::Metric::Chebyshev => chebyshev_topk_rows_cpu_metric::launch::<F, ActiveRuntime>(
+            &client, count, dim, x_arg, y_arg, xn_arg, yn_arg, val_arg, idx_arg, rows_x, rows_y,
+            cols, kk, p, pi,
+        ),
+        super::knn_graph::Metric::Minkowski { .. } if pi > 0 => {
+            minkowski_int_topk_rows_cpu_metric::launch::<F, ActiveRuntime>(
+                &client, count, dim, x_arg, y_arg, xn_arg, yn_arg, val_arg, idx_arg, rows_x,
+                rows_y, cols, kk, p, pi,
+            )
+        }
+        super::knn_graph::Metric::Minkowski { .. } => minkowski_topk_rows_cpu_metric::launch::<F, ActiveRuntime>(
+            &client, count, dim, x_arg, y_arg, xn_arg, yn_arg, val_arg, idx_arg, rows_x, rows_y,
+            cols, kk, p, pi,
+        ),
+        super::knn_graph::Metric::Cosine => cosine_topk_rows_cpu_metric::launch::<F, ActiveRuntime>(
+            &client, count, dim, x_arg, y_arg, xn_arg, yn_arg, val_arg, idx_arg, rows_x, rows_y,
+            cols, kk, p, pi,
+        ),
+    }
+
+    DeviceArray::<ActiveRuntime, F>::from_raw(xnorm_handle, xn_len).release_into(pool);
+    DeviceArray::<ActiveRuntime, F>::from_raw(ynorm_handle, yn_len).release_into(pool);
+
+    // The BOUNDARY root, over only the `n_query × k` emitted values (D-08).
+    match metric {
+        super::knn_graph::Metric::Euclidean => {
+            let (scount, sdim) = super::launch_dims_1d(out_len, capability::gather_launch_width());
+            let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
+            let sout_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
+            sqrt_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg);
+        }
+        super::knn_graph::Metric::Minkowski { p } => {
+            let (scount, sdim) = super::launch_dims_1d(out_len, capability::gather_launch_width());
+            let in_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
+            let sout_arg = unsafe { ArrayArg::from_raw_parts(val_handle.clone(), out_len) };
+            let inv_p = mlrs_core::f64_to_host::<F>(1.0 / p);
+            powf_elem::launch::<F, ActiveRuntime>(&client, scount, sdim, in_arg, sout_arg, inv_p);
+        }
+        _ => {}
     }
 
     Ok((

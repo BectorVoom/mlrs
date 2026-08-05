@@ -147,20 +147,48 @@ _SUPPORTED_METRICS = (
     "cosine",
 )
 
-# What sklearn's tree backends can actually index. ``cosine`` is not a metric
-# either tree admits, so sklearn raises for that pair rather than falling back
-# to brute; mirroring the rejection keeps an mlrs script's failure identical to
-# sklearn's instead of quietly succeeding where sklearn does not.
-_TREE_VALID_METRICS = (
-    "minkowski",
-    "euclidean",
-    "l2",
-    "manhattan",
-    "l1",
-    "cityblock",
-    "chebyshev",
-    "infinity",
-)
+# ``sklearn.neighbors.VALID_METRICS``, restricted to the metrics this shim
+# supports. Every value of ``algorithm`` admits a DIFFERENT metric set, and the
+# two exclusions are not symmetric:
+#
+#   * ``cosine`` is a brute-force-only metric — neither tree can index it;
+#   * ``infinity`` is a TREE-only spelling of Chebyshev — sklearn's brute path
+#     goes through ``pairwise_distances``, which has never known that name.
+#
+# mlrs runs brute force for every ``algorithm``, so it could compute all nine in
+# every case. It rejects the same pairs sklearn does anyway: a script that
+# sklearn refuses must not quietly succeed here, or a user validating against
+# sklearn would find the failure only after switching back.
+_ALGORITHM_VALID_METRICS = {
+    "brute": (
+        "minkowski",
+        "euclidean",
+        "l2",
+        "manhattan",
+        "l1",
+        "cityblock",
+        "chebyshev",
+        "cosine",
+    ),
+    "kd_tree": (
+        "minkowski",
+        "euclidean",
+        "l2",
+        "manhattan",
+        "l1",
+        "cityblock",
+        "chebyshev",
+        "infinity",
+    ),
+}
+# Ball tree admits everything the k-d tree does, out of this shim's nine.
+_ALGORITHM_VALID_METRICS["ball_tree"] = _ALGORITHM_VALID_METRICS["kd_tree"]
+# ``algorithm='auto'`` is not a metric restriction at all: sklearn checks the
+# metric against the BALL TREE's set when it is in it and against brute's
+# otherwise, and every one of the nine is in one or the other. So auto accepts
+# all nine — which is also why it is the only algorithm under which `'cosine'`
+# and `'infinity'` can both be used.
+_ALGORITHM_VALID_METRICS["auto"] = _SUPPORTED_METRICS
 
 
 def _resolve_metric(metric, p, metric_params):
@@ -297,7 +325,10 @@ class KNeighborsRegressor(RegressorMixin, MlrsBase):
                         whole pairwise pass host-side
     ``metric_params``   resolution input only (its ``p`` overrides ``__init__``)
     ``algorithm``       accepted and resolved to brute force (see
-                        ``_REGRESSOR_ALGORITHMS``) — cannot change the result
+                        ``_REGRESSOR_ALGORITHMS``) — cannot change the result,
+                        but DOES restrict which ``metric`` values are legal,
+                        exactly as sklearn's does
+                        (see ``_ALGORITHM_VALID_METRICS``)
     ``leaf_size``       validated, then unused: it tunes a tree mlrs has no
                         equivalent of, and it cannot change the result either
     ``n_jobs``          validated, then unused: parallelism here is the device's,
@@ -376,14 +407,16 @@ class KNeighborsRegressor(RegressorMixin, MlrsBase):
             )
         if self.n_jobs is not None and not isinstance(self.n_jobs, (int, np.integer)):
             raise ValueError(f"n_jobs == {self.n_jobs}, must be an integer or None.")
-        # A tree ALGORITHM restricts the metric even though mlrs runs brute
-        # force for all of them: sklearn raises for the pair, so mlrs must too
-        # or a script that sklearn rejects would silently succeed here.
-        if self.algorithm in ("kd_tree", "ball_tree") and not callable(self.metric):
-            if self.metric not in _TREE_VALID_METRICS:
+        # The ALGORITHM restricts the metric even though mlrs runs brute force
+        # for all of them (see `_ALGORITHM_VALID_METRICS`). A callable is exempt:
+        # sklearn accepts one for every algorithm.
+        if not callable(self.metric):
+            if self.metric not in _ALGORITHM_VALID_METRICS[self.algorithm]:
                 raise ValueError(
-                    f"Metric '{self.metric}' not valid for algorithm "
-                    f"'{self.algorithm}'"
+                    f"Metric '{self.metric}' not valid. Use "
+                    f"sorted(sklearn.neighbors.VALID_METRICS['{self.algorithm}']) "
+                    f"to get valid options. Metric can also be a callable "
+                    f"function."
                 )
 
     def fit(self, X, y):

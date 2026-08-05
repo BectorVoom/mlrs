@@ -44,6 +44,29 @@ METRICS = [
 
 WEIGHTS = ["uniform", "distance"]
 
+# Every STRING the `metric` parameter accepts. Five distance FUNCTIONS, nine
+# spellings — the fixture stores each one separately (`alias_<metric>_<weights>`,
+# generated under `algorithm='auto'`), so `metric='l1'` is gated against
+# sklearn-under-`'l1'` rather than against the assumption that mlrs folds it onto
+# `manhattan` correctly.
+METRIC_STRINGS = [
+    "minkowski",
+    "euclidean",
+    "l2",
+    "manhattan",
+    "l1",
+    "cityblock",
+    "chebyshev",
+    "infinity",
+    "cosine",
+]
+
+# Every STRING the `algorithm` parameter accepts, and the metric-set restriction
+# each one carries. mlrs runs brute force for all four; sklearn genuinely builds
+# a tree for two, and the fixture's `alg_<algorithm>_<weights>` arrays are those
+# tree answers.
+ALGORITHM_STRINGS = ["auto", "brute", "kd_tree", "ball_tree"]
+
 
 def _atol(fixture):
     return 1e-5 if dtype_of(fixture) == np.float64 else 1e-4
@@ -108,6 +131,103 @@ def test_multi_output_oracle(fixture, weights):
     # catches a lost second dimension.
     assert pred.shape == expected.shape
     assert np.allclose(pred, expected, atol=_atol(fixture), rtol=0.0)
+
+
+@pytest.mark.parametrize("fixture", PARAM_FIXTURES)
+@pytest.mark.parametrize("weights", WEIGHTS)
+@pytest.mark.parametrize("metric", METRIC_STRINGS)
+@requires_f64
+def test_every_metric_string_oracle(fixture, weights, metric):
+    """Every STRING ``metric`` accepts matches sklearn under THAT SAME string.
+
+    The `weights` x `metric` matrix above covers the five distance functions;
+    this covers the nine spellings, which is a different claim. An alias is
+    resolved by ``_resolve_metric`` before anything numeric happens, so a wrong
+    fold (``'l1'`` -> Euclidean, say) would produce a perfectly self-consistent
+    wrong answer that only a per-STRING oracle catches.
+
+    Left at the default ``algorithm='auto'`` deliberately: it is the only value
+    that accepts all nine, and it is what the fixture was generated under.
+    """
+    d = np.load(fixture_path(fixture))
+    k = int(d["k"][0])
+    reg = mlrs.KNeighborsRegressor(
+        n_neighbors=k, weights=weights, metric=metric
+    ).fit(d["X"], d["y"])
+    pred = np.asarray(reg.predict(d["Xq"]), dtype=np.float64).ravel()
+    assert np.allclose(
+        pred,
+        np.asarray(d[f"alias_{metric}_{weights}"], dtype=np.float64).ravel(),
+        atol=_atol(fixture),
+        rtol=0.0,
+    )
+
+
+@pytest.mark.parametrize("fixture", PARAM_FIXTURES)
+@pytest.mark.parametrize("weights", WEIGHTS)
+@pytest.mark.parametrize("algorithm", ALGORITHM_STRINGS)
+@requires_f64
+def test_every_algorithm_string_oracle(fixture, weights, algorithm):
+    """mlrs's brute-force answer matches sklearn's under EVERY ``algorithm``.
+
+    ``alg_kd_tree_*`` and ``alg_ball_tree_*`` are sklearn's TREE predictions, so
+    this is the check that mlrs resolving every strategy to brute force is a
+    genuine equivalence and not just an internally consistent shortcut.
+
+    The design contains one duplicated training pair, which two search
+    strategies may order differently — but both copies carry the same target
+    (the fixture derives ``y`` from ``X`` after duplicating the row), so the tie
+    cannot move a prediction either way.
+    """
+    d = np.load(fixture_path(fixture))
+    k = int(d["k"][0])
+    reg = mlrs.KNeighborsRegressor(
+        n_neighbors=k, weights=weights, algorithm=algorithm
+    ).fit(d["X"], d["y"])
+    pred = np.asarray(reg.predict(d["Xq"]), dtype=np.float64).ravel()
+    assert np.allclose(
+        pred,
+        np.asarray(d[f"alg_{algorithm}_{weights}"], dtype=np.float64).ravel(),
+        atol=_atol(fixture),
+        rtol=0.0,
+    )
+
+
+@pytest.mark.parametrize("metric", METRIC_STRINGS)
+@pytest.mark.parametrize("algorithm", ALGORITHM_STRINGS)
+def test_metric_algorithm_validity_matches_sklearn(metric, algorithm):
+    """mlrs accepts a ``(metric, algorithm)`` pair EXACTLY when sklearn does.
+
+    The two exclusions are not symmetric and neither is about what can be
+    computed — mlrs runs brute force for every algorithm and could evaluate all
+    nine metrics in every case:
+
+      * ``cosine`` is brute-only (no tree can index it);
+      * ``infinity`` is tree-only (it is a tree spelling of Chebyshev that
+        sklearn's ``pairwise_distances`` has never known).
+
+    Accepting a pair sklearn rejects would let a script succeed here and fail
+    there, which is worse than the restriction.
+    """
+    x, _, y, _ = _live_data()
+
+    def sk_raises():
+        try:
+            SkKNR(n_neighbors=3, metric=metric, algorithm=algorithm).fit(x, y)
+            return False
+        except ValueError:
+            return True
+
+    def mlrs_raises():
+        try:
+            mlrs.KNeighborsRegressor(
+                n_neighbors=3, metric=metric, algorithm=algorithm
+            ).fit(x, y)
+            return False
+        except ValueError:
+            return True
+
+    assert mlrs_raises() == sk_raises()
 
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
@@ -327,7 +447,9 @@ def test_leaf_size_and_n_jobs_are_accepted_and_inert(leaf_size, n_jobs):
     "kwargs,message",
     [
         ({"algorithm": "invalid"}, "Algorithm is not supported"),
-        ({"algorithm": "kd_tree", "metric": "cosine"}, "not valid for algorithm"),
+        ({"algorithm": "kd_tree", "metric": "cosine"}, "not valid"),
+        ({"algorithm": "ball_tree", "metric": "cosine"}, "not valid"),
+        ({"algorithm": "brute", "metric": "infinity"}, "not valid"),
         ({"metric": "nope"}, "Metric is not supported"),
         ({"weights": "nope"}, "weights not recognized"),
         ({"p": 0.5}, "p must be greater or equal to one"),

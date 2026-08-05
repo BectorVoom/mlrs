@@ -46,9 +46,11 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::{distance_direct, distance_with_ynorm, metric_distance};
 use mlrs_backend::prims::knn::{
-    cpu_rows_applicable, cpu_rows_topk, device_copy, fused_distance_topk, fused_topk_applicable,
+    cpu_metric_rows_applicable, cpu_metric_rows_topk, cpu_rows_applicable, cpu_rows_topk,
+    device_copy, fused_distance_topk, fused_topk_applicable,
 };
 use mlrs_backend::prims::knn_graph::Metric;
+use mlrs_backend::prims::knn_host::{knn_host_applicable, knn_host_topk};
 use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -383,26 +385,15 @@ where
 
     // --- 1./2. QUERY-TILED distance → select-k, straight into the full output
     //        buffers (see `neighbor_indices_device` for why tiling is required). ---
-    let (val_dev, idx_dev_u32) = if matches!(metric, Metric::Euclidean) {
-        tiled_distance_topk::<F>(
-            pool,
-            x_train,
-            (n_train, n_features),
-            xq,
-            (n_query, n_features),
-            k,
-        )?
-    } else {
-        tiled_metric_distance_topk::<F>(
-            pool,
-            x_train,
-            (n_train, n_features),
-            xq,
-            (n_query, n_features),
-            k,
-            metric,
-        )?
-    };
+    let (val_dev, idx_dev_u32) = metric_topk::<F>(
+        pool,
+        x_train,
+        (n_train, n_features),
+        xq,
+        (n_query, n_features),
+        k,
+        metric,
+    )?;
 
     // --- 3. u32 → i32 neighbor indices (D-06). Host-cast the small n_query × k
     //        index buffer; the values are training-column indices in
@@ -452,6 +443,107 @@ where
 {
     let (x_train, (n_train, n_features)) =
         validate_kneighbors::<F>(x_train, train_shape, xq, shape, k)?;
+    metric_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k, metric)
+}
+
+/// The `distance → select-k` DISPATCH, in one place: host arm, tuned Euclidean
+/// device family, or the general per-metric device composition.
+///
+/// Both kneighbors cores route through here so they cannot pick different arms
+/// for the same query — `KNeighborsRegressor::predict` uses the device-resident
+/// core while its `kneighbors` uses the host-index one, and the Python shim's
+/// `weights=<callable>` path REBUILDS a prediction from `kneighbors` distances
+/// and must land on `predict`'s answer.
+///
+/// Order of preference:
+///
+/// 1. [`tiled_distance_topk`] for `Metric::Euclidean` — bit-for-bit the
+///    pre-existing tuned path (fused / register-blocked / cpu row-scan family).
+///    On cpu it is preferred over the host arm only inside the RECTANGLE its
+///    row-scan kernel actually covers ([`cpu_rows_applicable`]: `k <= 16`,
+///    `n_features <= 32`), which is where it is genuinely faster. A/B on a
+///    16-core Zen5 at `n_train = 50_000`, `d = 16`, `n_query = 5_000` (best of
+///    5, interleaved; `MLRS_KNN_HOST` forcing each arm):
+///
+///    | `k`  | tuned kernel | host arm | notes                          |
+///    |------|--------------|----------|--------------------------------|
+///    | 1    | 0.025 s      | 0.037 s  | kernel 1.5× — inside the cap   |
+///    | 15   | 0.034 s      | 0.040 s  | kernel 1.2× — inside the cap   |
+///    | 20   | 6.59 s       | 0.042 s  | host 157× — PAST the cap       |
+///    | 100  | 29.0 s       | 0.100 s  | host 290× — PAST the cap       |
+///
+///    Past the cap the kernel is not slower, it is ABSENT:
+///    [`tiled_distance_topk`] falls through to the GPU-shaped composition, and
+///    the last two rows are that fallback, not a kernel. sklearn takes 0.12 s
+///    and 0.30 s on the same two configs — so the 16-slot list was the boundary
+///    between beating it 4× and losing to it 50-120×.
+///
+///    Inside the cap the kernel's remaining edge is its COMPILER, not its shape:
+///    `cubecl-cpu` JITs for the host's real feature set while this crate is
+///    built for the x86-64 baseline. The host arm closed most of that with a
+///    runtime-detected AVX2 body (see `knn_host::dispatch_scan_block`); what is
+///    left is the ~1.2-1.5× above, which is why the gate stays.
+/// 2. [`cpu_metric_rows_topk`] on the cpu backend (KNN-CUBE-METRIC) — the
+///    CubeCL row-scan family, one kernel per metric, whose lane axis is a
+///    `Vector<F, Const<32>>` of QUERY ROWS. `cubecl-cpu` lowers those to real
+///    MLIR `vector<32xf32>` ops AND JITs for the host cpu, so the kernels get
+///    the machine's true register width for free. Caps: `k <= 128`,
+///    `n_features <= 128` (comptime local-array sizes).
+/// 3. [`knn_host_topk`] (KNN-HOST) — the uncapped plain-Rust fallback, for `k`
+///    or `n_features` past those. It used to be arm 2; the CubeCL family matches
+///    or beats it on every metric (see its module docs for the table).
+/// 4. [`tiled_metric_distance_topk`] for the other metrics on a device backend.
+///
+/// Keeping the Euclidean default a delegation rather than a `match` arm of its
+/// own is what guarantees adding a metric cannot perturb the tuned path.
+#[allow(clippy::type_complexity)]
+fn metric_topk<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: &DeviceArray<ActiveRuntime, F>,
+    (n_train, n_features): (usize, usize),
+    xq: &DeviceArray<ActiveRuntime, F>,
+    shape: (usize, usize),
+    k: usize,
+    metric: Metric,
+) -> Result<
+    (
+        DeviceArray<ActiveRuntime, F>,
+        DeviceArray<ActiveRuntime, u32>,
+    ),
+    AlgoError,
+>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (n_query, _) = shape;
+    let tuned_euclidean = matches!(metric, Metric::Euclidean)
+        && cpu_rows_applicable::<F>(n_query, n_train, n_features, k);
+    // The METRIC cpu row-scan family (KNN-CUBE-METRIC) serves everything the
+    // tuned Euclidean kernel does not, inside its own four-times-wider caps.
+    if !tuned_euclidean && cpu_metric_rows_applicable::<F>(n_query, n_train, n_features, k) {
+        return cpu_metric_rows_topk::<F>(
+            pool,
+            xq,
+            (n_query, n_features),
+            x_train,
+            n_train,
+            k,
+            metric,
+        )
+        .map_err(AlgoError::Prim);
+    }
+    if knn_host_applicable(n_query, n_train, n_features, k, tuned_euclidean) {
+        return knn_host_topk::<F>(
+            pool,
+            xq,
+            (n_query, n_features),
+            x_train,
+            n_train,
+            k,
+            metric,
+        )
+        .map_err(AlgoError::Prim);
+    }
     if matches!(metric, Metric::Euclidean) {
         tiled_distance_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k)
     } else {

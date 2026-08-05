@@ -135,6 +135,22 @@ pub fn sqrt_elem<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>
     }
 }
 
+/// Element-wise `out[i] = in[i]^e` — the BOUNDARY root of the Minkowski k-NN
+/// scan (KNN-CUBE-METRIC).
+///
+/// The scan selects on `Σ |x − y|^p` and this applies the `1/p` root to the
+/// `n_query × k` values it emitted, rather than to every one of the `n_train`
+/// candidates. A root is monotone, so it can change neither which pairs were
+/// selected nor their order — the same deferral `sqrt_elem` performs for the
+/// Euclidean path.
+#[cube(launch)]
+pub fn powf_elem<F: Float + CubeElement>(input: &Array<F>, output: &mut Array<F>, e: F) {
+    let tid = ABSOLUTE_POS;
+    if tid < input.len() {
+        output[tid] = F::powf(input[tid], e);
+    }
+}
+
 /// Element-wise scale `out[i] = in[i] * factor` (Plan 04 covariance consumes
 /// this for the `1/(n-ddof)` normalisation). `factor` is a scalar `F` passed by
 /// value (A6 — like `saxpy_kernel`'s `a`).

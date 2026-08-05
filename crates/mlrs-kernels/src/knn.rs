@@ -2309,6 +2309,7 @@ pub fn euclidean_topk_rows_cpu<F: Float + CubeElement>(
             16u32,
             active,
             k,
+            16u32,
         );
 
         // --- stage: norms, transposed feature cache ---
@@ -2373,6 +2374,7 @@ pub fn euclidean_topk_rows_cpu<F: Float + CubeElement>(
                     v,
                     t,
                     k,
+                    16u32,
                 );
             }
 
@@ -2380,7 +2382,7 @@ pub fn euclidean_topk_rows_cpu<F: Float + CubeElement>(
         }
 
         // --- emit: ascending pair order already, sentinels clamped ---
-        emit_lists::<F>(&lval, &lidx, out_val, out_idx, q0, rows_x, 16u32, k);
+        emit_lists::<F>(&lval, &lidx, out_val, out_idx, q0, rows_x, 16u32, k, 16u32);
     }
 }
 
@@ -2464,6 +2466,7 @@ pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
             16u32,
             active,
             k,
+            16u32,
         );
 
         // The query norms live as a VECTOR so the expansion below is one
@@ -2607,7 +2610,7 @@ pub fn euclidean_topk_rows_cpu_vec<F: Float + CubeElement>(
             t += 4u32;
         }
 
-        emit_lists::<F>(&lval, &lidx, out_val, out_idx, q0, rows_x, 16u32, k);
+        emit_lists::<F>(&lval, &lidx, out_val, out_idx, q0, rows_x, 16u32, k, 16u32);
     }
 }
 
@@ -2660,6 +2663,7 @@ fn insert_lane<F: Float + CubeElement>(
     v: F,
     t: u32,
     k: u32,
+    stride: u32,
 ) {
     let w = lworst_val[a as usize];
     let mut admit: u32 = 0u32;
@@ -2676,8 +2680,8 @@ fn insert_lane<F: Float + CubeElement>(
         let mut cai = t;
         let mut fs = 0u32;
         while fs < k {
-            let jv = lval[(a * 16u32 + fs) as usize];
-            let ji = lidx[(a * 16u32 + fs) as usize];
+            let jv = lval[(a * stride + fs) as usize];
+            let ji = lidx[(a * stride + fs) as usize];
             let mut swap: u32 = 0u32;
             if cav < jv {
                 swap = 1u32;
@@ -2687,8 +2691,8 @@ fn insert_lane<F: Float + CubeElement>(
                 }
             }
             if swap == 1u32 {
-                lval[(a * 16u32 + fs) as usize] = cav;
-                lidx[(a * 16u32 + fs) as usize] = cai;
+                lval[(a * stride + fs) as usize] = cav;
+                lidx[(a * stride + fs) as usize] = cai;
                 cav = jv;
                 cai = ji;
             }
@@ -2696,8 +2700,8 @@ fn insert_lane<F: Float + CubeElement>(
         }
         // The pair that fell off the end is gone; slot `k - 1` is the new worst
         // kept pair.
-        lworst_val[a as usize] = lval[(a * 16u32 + k - 1u32) as usize];
-        lworst_idx[a as usize] = lidx[(a * 16u32 + k - 1u32) as usize];
+        lworst_val[a as usize] = lval[(a * stride + k - 1u32) as usize];
+        lworst_idx[a as usize] = lidx[(a * stride + k - 1u32) as usize];
     }
 }
 
@@ -2744,7 +2748,7 @@ macro_rules! impl_admit_tile {
                         v = zero_f;
                     }
                 }
-                insert_lane::<F>(lval, lidx, lworst_val, lworst_idx, a, v, t, k);
+                insert_lane::<F>(lval, lidx, lworst_val, lworst_idx, a, v, t, k, 16u32);
             }
         }
     };
@@ -2796,7 +2800,7 @@ impl_admit_tile!(admit_tile, 16, 16u32, true);
 /// 64-lane kernel took 6.36 s to compile. The loop's own bookkeeping is only
 /// paid on the rare rows that actually admit.
 macro_rules! impl_admit_row {
-    ($name:ident, $lanes:literal, $lanes_u32:literal) => {
+    ($name:ident, $lanes:literal, $lanes_u32:literal, $stride:literal) => {
         #[cube]
         #[allow(clippy::too_many_arguments)]
         fn $name<F: Float + CubeElement>(
@@ -2820,7 +2824,17 @@ macro_rules! impl_admit_row {
                 }
                 let mut a = 0u32;
                 while a < $lanes_u32 {
-                    insert_lane::<F>(lval, lidx, lworst_val, lworst_idx, a, dbuf[a as usize], t, k);
+                    insert_lane::<F>(
+                        lval,
+                        lidx,
+                        lworst_val,
+                        lworst_idx,
+                        a,
+                        dbuf[a as usize],
+                        t,
+                        k,
+                        $stride,
+                    );
                     a += 1u32;
                 }
                 // Refresh the vector mirror of `lworst_val`, which the inserts
@@ -2835,7 +2849,7 @@ macro_rules! impl_admit_row {
     };
 }
 
-impl_admit_row!(admit_row_w32, 32, 32u32);
+impl_admit_row!(admit_row_w32, 32, 32u32, 16u32);
 
 /// Sentinel-prefill one unit's `lanes` top-k lists so [`insert_lane`] can skip
 /// the fill-phase bookkeeping, and DISABLE the lanes that own no query row.
@@ -2867,6 +2881,7 @@ fn prefill_lists<F: Float + CubeElement>(
     lanes: u32,
     active: u32,
     k: u32,
+    stride: u32,
 ) {
     let inf = F::new(f32::INFINITY);
     let neg_inf = F::new(f32::NEG_INFINITY);
@@ -2875,8 +2890,8 @@ fn prefill_lists<F: Float + CubeElement>(
     while a < lanes {
         let mut j = 0u32;
         while j < k {
-            lval[(a * 16u32 + j) as usize] = inf;
-            lidx[(a * 16u32 + j) as usize] = sentinel_idx;
+            lval[(a * stride + j) as usize] = inf;
+            lidx[(a * stride + j) as usize] = sentinel_idx;
             j += 1u32;
         }
         if a < active {
@@ -2924,6 +2939,7 @@ fn emit_lists<F: Float + CubeElement>(
     rows_x: u32,
     lanes: u32,
     k: u32,
+    stride: u32,
 ) {
     let mut a = 0u32;
     while a < lanes {
@@ -2931,8 +2947,8 @@ fn emit_lists<F: Float + CubeElement>(
         if r < rows_x {
             let mut j = 0u32;
             while j < k {
-                out_val[(r * k + j) as usize] = lval[(a * 16u32 + j) as usize];
-                let mut ix = lidx[(a * 16u32 + j) as usize];
+                out_val[(r * k + j) as usize] = lval[(a * stride + j) as usize];
+                let mut ix = lidx[(a * stride + j) as usize];
                 if ix == u32::MAX {
                     ix = 0u32;
                 }
@@ -2994,6 +3010,7 @@ macro_rules! impl_topk_rows_cpu_direct {
                     $lanes_u32,
                     active,
                     k,
+                    16u32,
                 );
                 // Vector mirror of `lworst_val`, the screen's operand. Kept in
                 // sync by `impl_admit_row`, which returns the refreshed value.
@@ -3146,7 +3163,7 @@ macro_rules! impl_topk_rows_cpu_direct {
                     t += 4u32;
                 }
 
-                emit_lists::<F>(&lval, &lidx, out_val, out_idx, q0, rows_x, $lanes_u32, k);
+                emit_lists::<F>(&lval, &lidx, out_val, out_idx, q0, rows_x, $lanes_u32, k, 16u32);
             }
         }
     };
@@ -3207,4 +3224,501 @@ impl_topk_rows_cpu_direct!(
     32u32,
     32usize,
     512usize
+);
+
+// =====================================================================
+// KNN-CUBE-METRIC: the cpu row-scan family, generalized over the METRIC
+// =====================================================================
+
+/// Query rows one unit owns in the metric row-scan family — the SIMD lane axis.
+///
+/// Same width as [`CPU_QUERY_TILE_WIDE`], and for the same measured reason: the
+/// per-feature `y[t, c]` load and broadcast are paid once per vector op whatever
+/// its width, so the lane count is the lever on them.
+pub const CPU_METRIC_LANES: u32 = 32;
+
+/// Largest `n_features` the metric row-scan family caches in its transposed
+/// query tile.
+///
+/// Four times [`CPU_MAX_COLS`], which the Euclidean-only kernel is capped at.
+/// The tile is `CPU_METRIC_MAX_COLS × Vector<F, 32>` of stack — 16 KiB at f32,
+/// 32 KiB at f64 — which a cpu thread has and a GPU workgroup would not; this
+/// family is cpu-only by construction (`Vector` lanes ARE the parallelism here,
+/// where a GPU wants units).
+pub const CPU_METRIC_MAX_COLS: u32 = 128;
+
+/// Local top-k list stride of the metric row-scan family.
+///
+/// EIGHT times [`CPU_K_CAP`]. Raising it costs stack (`32 lanes × 128 × F`, so
+/// 16 KiB at f32) and nothing else — every loop that walks a list is bounded by
+/// the RUNTIME `k`, not by this, so a wider cap does not lengthen the emitted IR
+/// and therefore does not lengthen the JIT. That is what makes `n_neighbors =
+/// 100` an ordinary case here rather than a cliff.
+pub const CPU_METRIC_K_CAP: u32 = 128;
+
+/// Per-feature step of the EUCLIDEAN metric scan: `acc += (x − y)²`.
+///
+/// The boundary square root is NOT applied here — it is monotone, so it cannot
+/// change which `k` pairs are selected or their order, and the host applies it to
+/// the `n_query × k` emitted values instead of to every one of the `n_train`
+/// candidates.
+#[cube]
+fn metric_step_euclidean<F: Float + CubeElement>(
+    acc: Vector<F, Const<32>>,
+    xv: Vector<F, Const<32>>,
+    yv: Vector<F, Const<32>>,
+    _p: Vector<F, Const<32>>,
+    _pi: u32,
+) -> Vector<F, Const<32>> {
+    let d = xv - yv;
+    fma(d, d, acc)
+}
+
+/// Per-feature step of the MANHATTAN metric scan: `acc += |x − y|`.
+#[cube]
+fn metric_step_manhattan<F: Float + CubeElement>(
+    acc: Vector<F, Const<32>>,
+    xv: Vector<F, Const<32>>,
+    yv: Vector<F, Const<32>>,
+    _p: Vector<F, Const<32>>,
+    _pi: u32,
+) -> Vector<F, Const<32>> {
+    acc + (xv - yv).abs()
+}
+
+/// Per-feature step of the CHEBYSHEV metric scan: `acc = max(acc, |x − y|)`.
+///
+/// ## Written as an explicit SELECT, not as `acc.max(d)` (measured)
+/// `Vector` implements `FloatOps`, so `acc.max(d)` compiles and is the obvious
+/// spelling — but on `cubecl-cpu` it lowers badly. At `50_000 × 5_000 × 16`,
+/// `k = 5` this kernel took **0.047 s** with `max` and **0.031 s** with the
+/// compare + `select_many` below, i.e. `max` cost 1.5x. The tell was that
+/// Chebyshev ran 50% slower than the otherwise-identical Manhattan kernel here
+/// while the two are a dead heat in the plain-Rust `knn_host` arm — a gap that
+/// tracks the OP, not the data.
+///
+/// It is not the scalar kernels' statement-form `if diff > acc { acc = diff; }`
+/// either: the lanes are independent, so a branch would have to be per lane.
+#[cube]
+fn metric_step_chebyshev<F: Float + CubeElement>(
+    acc: Vector<F, Const<32>>,
+    xv: Vector<F, Const<32>>,
+    yv: Vector<F, Const<32>>,
+    _p: Vector<F, Const<32>>,
+    _pi: u32,
+) -> Vector<F, Const<32>> {
+    let d = (xv - yv).abs();
+    let m = d.greater_than(acc);
+    select_many(m, d, acc)
+}
+
+/// Per-feature step of the MINKOWSKI metric scan: `acc += |x − y|^p`.
+///
+/// The `1/p` boundary root is applied host-side to the emitted values only, for
+/// the same monotonicity reason [`metric_step_euclidean`] gives.
+#[cube]
+fn metric_step_minkowski<F: Float + CubeElement>(
+    acc: Vector<F, Const<32>>,
+    xv: Vector<F, Const<32>>,
+    yv: Vector<F, Const<32>>,
+    p: Vector<F, Const<32>>,
+    _pi: u32,
+) -> Vector<F, Const<32>> {
+    acc + (xv - yv).abs().powf(p)
+}
+
+/// Per-feature step of the MINKOWSKI scan at an INTEGER exponent:
+/// `acc += |x − y|^pi` by repeated multiplication.
+///
+/// ## Why this kernel exists at all
+/// `Powf` is implemented for `Vector`, so [`metric_step_minkowski`] compiles —
+/// but on `cubecl-cpu` a vector `powf` lowers to one libm call PER LANE, and
+/// measurement is brutal about it: at `50_000 × 5_000 × 16`, `k = 5`, `p = 3`
+/// the `powf` kernel takes **2.70 s** against **0.044 s** here, a 61× gap that
+/// dwarfs every other tuning decision in the family. `abs`, `max` and `sqrt` do
+/// NOT have this problem — they lower to genuine vector instructions.
+///
+/// The loop is over a RUNTIME `pi` rather than a comptime one: at 2..7
+/// iterations its own bookkeeping is far below one libm call, and a comptime
+/// exponent would mean a separate JIT'd kernel per `p` a process touches.
+#[cube]
+fn metric_step_minkowski_int<F: Float + CubeElement>(
+    acc: Vector<F, Const<32>>,
+    xv: Vector<F, Const<32>>,
+    yv: Vector<F, Const<32>>,
+    _p: Vector<F, Const<32>>,
+    pi: u32,
+) -> Vector<F, Const<32>> {
+    let ad = (xv - yv).abs();
+    let mut r = ad;
+    let mut i = 1u32;
+    while i < pi {
+        r = r * ad;
+        i += 1u32;
+    }
+    acc + r
+}
+
+/// Per-feature step of the COSINE metric scan: the plain dot product.
+///
+/// The norms are folded in ONCE per training row by the kernel's epilogue rather
+/// than per feature — see the `$cosine` arm of [`impl_topk_rows_cpu_metric`].
+#[cube]
+fn metric_step_cosine<F: Float + CubeElement>(
+    acc: Vector<F, Const<32>>,
+    xv: Vector<F, Const<32>>,
+    yv: Vector<F, Const<32>>,
+    _p: Vector<F, Const<32>>,
+    _pi: u32,
+) -> Vector<F, Const<32>> {
+    fma(xv, yv, acc)
+}
+
+/// Generates one metric's cpu row-scan kernel.
+///
+/// The generated kernel's own documentation lives on the `pub` instantiations
+/// below (rustdoc does not render docs written on a private `macro_rules!`).
+///
+/// `$step` is the per-feature [`Vector`] update; `$cosine` switches on the
+/// similarity epilogue, which is the one metric whose pair value is not a
+/// function of the feature differences alone.
+macro_rules! impl_topk_rows_cpu_metric {
+    (
+        $(#[$doc:meta])*
+        $name:ident, $step:ident, $cosine:literal
+    ) => {
+        $(#[$doc])*
+        #[cube(launch)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name<F: Float + CubeElement>(
+            x: &Array<F>,
+            y: &Array<F>,
+            xnorm: &Array<F>,
+            ynorm: &Array<F>,
+            out_val: &mut Array<F>,
+            out_idx: &mut Array<u32>,
+            rows_x: u32,
+            rows_y: u32,
+            cols: u32,
+            k: u32,
+            p: F,
+            pi: u32,
+        ) {
+            let q0 = ABSOLUTE_POS_X * 32u32;
+            if q0 < rows_x {
+                let zero_f = F::from_int(0i64);
+                let one_v = Vector::<F, Const<32>>::from_int(1i64);
+                let two_v = Vector::<F, Const<32>>::from_int(2i64);
+                let zero_v = Vector::<F, Const<32>>::from_int(0i64);
+                let pv = Vector::<F, Const<32>>::new(p);
+
+                // 128 features × one 32-lane vector each. `xt[c]` lane `a` is
+                // feature `c` of the unit's query row `a`.
+                let mut xt = Array::<Vector<F, Const<32>>>::new(128usize);
+                let mut lval = Array::<F>::new(4096usize);
+                let mut lidx = Array::<u32>::new(4096usize);
+                let mut lworst_val = Array::<F>::new(32usize);
+                let mut lworst_idx = Array::<u32>::new(32usize);
+                let mut dbuf = Array::<F>::new(32usize);
+
+                let mut active = rows_x - q0;
+                if active > 32u32 {
+                    active = 32u32;
+                }
+                prefill_lists::<F>(
+                    &mut lval,
+                    &mut lidx,
+                    &mut lworst_val,
+                    &mut lworst_idx,
+                    32u32,
+                    active,
+                    k,
+                    128u32,
+                );
+
+                // --- stage the transposed query tile (and, for cosine, the
+                //     query rows' squared norms as a lane vector). ---
+                let mut xnv = Vector::<F, Const<32>>::from_int(0i64);
+                if comptime!($cosine) {
+                    #[unroll]
+                    for a in 0..32u32 {
+                        let r = q0 + a;
+                        let mut nv = zero_f;
+                        if r < rows_x {
+                            nv = xnorm[r as usize];
+                        }
+                        xnv[a as usize] = nv;
+                    }
+                }
+                let mut c = 0u32;
+                while c < cols {
+                    let mut v = Vector::<F, Const<32>>::from_int(0i64);
+                    #[unroll]
+                    for a in 0..32u32 {
+                        let r = q0 + a;
+                        // An over-provisioned lane (`r >= rows_x`) stages zeros
+                        // and never reaches the emit guard below.
+                        let mut xv = zero_f;
+                        if r < rows_x {
+                            xv = x[(r * cols + c) as usize];
+                        }
+                        v[a as usize] = xv;
+                    }
+                    xt[c as usize] = v;
+                    c += 1u32;
+                }
+
+                // Vector mirror of `lworst_val`, the admission screen's operand.
+                let mut wv = Vector::<F, Const<32>>::new(F::new(f32::INFINITY));
+                #[unroll]
+                for a in 0..32u32 {
+                    wv[a as usize] = lworst_val[a as usize];
+                }
+
+                // --- scan: every training row, once. Four rows per iteration,
+                //     so four INDEPENDENT accumulator chains hide the latency of
+                //     the dependent per-feature update (the `impl_topk_rows_cpu_
+                //     direct` shape, kept). ---
+                let mut t = 0u32;
+                while t < rows_y {
+                    let mut t1 = t + 1u32;
+                    if t1 >= rows_y {
+                        t1 = rows_y - 1u32;
+                    }
+                    let mut t2 = t + 2u32;
+                    if t2 >= rows_y {
+                        t2 = rows_y - 1u32;
+                    }
+                    let mut t3 = t + 3u32;
+                    if t3 >= rows_y {
+                        t3 = rows_y - 1u32;
+                    }
+                    let b0 = t * cols;
+                    let b1 = t1 * cols;
+                    let b2 = t2 * cols;
+                    let b3 = t3 * cols;
+                    let mut a0 = Vector::<F, Const<32>>::from_int(0i64);
+                    let mut a1 = Vector::<F, Const<32>>::from_int(0i64);
+                    let mut a2 = Vector::<F, Const<32>>::from_int(0i64);
+                    let mut a3 = Vector::<F, Const<32>>::from_int(0i64);
+
+                    let mut cc = 0u32;
+                    while cc < cols {
+                        let xv = xt[cc as usize];
+                        a0 = $step::<F>(
+                            a0,
+                            xv,
+                            Vector::<F, Const<32>>::new(y[(b0 + cc) as usize]),
+                            pv,
+                            pi,
+                        );
+                        a1 = $step::<F>(
+                            a1,
+                            xv,
+                            Vector::<F, Const<32>>::new(y[(b1 + cc) as usize]),
+                            pv,
+                            pi,
+                        );
+                        a2 = $step::<F>(
+                            a2,
+                            xv,
+                            Vector::<F, Const<32>>::new(y[(b2 + cc) as usize]),
+                            pv,
+                            pi,
+                        );
+                        a3 = $step::<F>(
+                            a3,
+                            xv,
+                            Vector::<F, Const<32>>::new(y[(b3 + cc) as usize]),
+                            pv,
+                            pi,
+                        );
+                        cc += 1u32;
+                    }
+
+                    if comptime!($cosine) {
+                        // `mlrs_kernels::distance::cosine_dist`'s value, one
+                        // vector at a time: `clamp(1 − dot/√(‖x‖²‖y‖²), 0, 2)`,
+                        // with the zero-norm row scoring similarity 0.
+                        a0 = cosine_fold::<F>(
+                            a0,
+                            xnv,
+                            ynorm[t as usize],
+                            zero_v,
+                            one_v,
+                            two_v,
+                        );
+                        a1 = cosine_fold::<F>(
+                            a1,
+                            xnv,
+                            ynorm[t1 as usize],
+                            zero_v,
+                            one_v,
+                            two_v,
+                        );
+                        a2 = cosine_fold::<F>(
+                            a2,
+                            xnv,
+                            ynorm[t2 as usize],
+                            zero_v,
+                            one_v,
+                            two_v,
+                        );
+                        a3 = cosine_fold::<F>(
+                            a3,
+                            xnv,
+                            ynorm[t3 as usize],
+                            zero_v,
+                            one_v,
+                            two_v,
+                        );
+                    }
+
+                    // One mask-screened admission pass PER ROW — see
+                    // `impl_admit_row` for why per row and not per block.
+                    wv = admit_row_metric::<F>(
+                        &mut lval,
+                        &mut lidx,
+                        &mut lworst_val,
+                        &mut lworst_idx,
+                        &mut dbuf,
+                        a0,
+                        wv,
+                        t,
+                        k,
+                    );
+                    if t + 1u32 < rows_y {
+                        wv = admit_row_metric::<F>(
+                            &mut lval,
+                            &mut lidx,
+                            &mut lworst_val,
+                            &mut lworst_idx,
+                            &mut dbuf,
+                            a1,
+                            wv,
+                            t1,
+                            k,
+                        );
+                    }
+                    if t + 2u32 < rows_y {
+                        wv = admit_row_metric::<F>(
+                            &mut lval,
+                            &mut lidx,
+                            &mut lworst_val,
+                            &mut lworst_idx,
+                            &mut dbuf,
+                            a2,
+                            wv,
+                            t2,
+                            k,
+                        );
+                    }
+                    if t + 3u32 < rows_y {
+                        wv = admit_row_metric::<F>(
+                            &mut lval,
+                            &mut lidx,
+                            &mut lworst_val,
+                            &mut lworst_idx,
+                            &mut dbuf,
+                            a3,
+                            wv,
+                            t3,
+                            k,
+                        );
+                    }
+
+                    t += 4u32;
+                }
+
+                emit_lists::<F>(&lval, &lidx, out_val, out_idx, q0, rows_x, 32u32, k, 128u32);
+            }
+        }
+    };
+}
+
+/// The cosine epilogue, applied once per training row instead of per feature.
+///
+/// `mlrs_kernels::distance::cosine_dist`'s arithmetic verbatim — ONE root over
+/// the PRODUCT of the two squared norms, a zero-norm row scoring similarity 0,
+/// and the `[0, 2]` clamp `sklearn.metrics.pairwise.cosine_distances` applies —
+/// but over a whole lane vector, so the root and the divide are one instruction
+/// each rather than one per query row.
+#[cube]
+fn cosine_fold<F: Float + CubeElement>(
+    dot: Vector<F, Const<32>>,
+    xnorm: Vector<F, Const<32>>,
+    ynorm: F,
+    zero_v: Vector<F, Const<32>>,
+    one_v: Vector<F, Const<32>>,
+    two_v: Vector<F, Const<32>>,
+) -> Vector<F, Const<32>> {
+    let denom = (xnorm * Vector::<F, Const<32>>::new(ynorm)).sqrt();
+    // A zero-norm row scores similarity 0 rather than dividing by zero — the
+    // guard is a lane SELECT, not a branch, because the lanes are independent.
+    let mask = denom.greater_than(zero_v);
+    let sim = select_many(mask, dot / denom, zero_v);
+    (one_v - sim).clamp(zero_v, two_v)
+}
+
+impl_admit_row!(admit_row_metric, 32, 32u32, 128u32);
+
+impl_topk_rows_cpu_metric!(
+    /// EUCLIDEAN cpu row-scan past the tuned kernel's caps (KNN-CUBE-METRIC).
+    ///
+    /// Same shape and same admission rule as
+    /// [`euclidean_topk_rows_cpu_direct`], which stays the arm for `k <= 16` and
+    /// `n_features <= 32`; this one exists for everything past those caps, where
+    /// the alternative was the GPU-shaped `distance → top_k` composition.
+    /// Emits SQUARED distances — the host applies the root to the `k` selected
+    /// values.
+    euclidean_topk_rows_cpu_metric,
+    metric_step_euclidean,
+    false
+);
+
+impl_topk_rows_cpu_metric!(
+    /// MANHATTAN (L1) cpu row-scan (KNN-CUBE-METRIC). Emits true distances.
+    manhattan_topk_rows_cpu_metric,
+    metric_step_manhattan,
+    false
+);
+
+impl_topk_rows_cpu_metric!(
+    /// CHEBYSHEV (L∞) cpu row-scan (KNN-CUBE-METRIC). Emits true distances.
+    chebyshev_topk_rows_cpu_metric,
+    metric_step_chebyshev,
+    false
+);
+
+impl_topk_rows_cpu_metric!(
+    /// MINKOWSKI-`p` cpu row-scan (KNN-CUBE-METRIC).
+    ///
+    /// Emits `Σ |x − y|^p` — the host applies the `1/p` root to the `k` selected
+    /// values, which is monotone and so changes neither the selection nor its
+    /// order.
+    minkowski_topk_rows_cpu_metric,
+    metric_step_minkowski,
+    false
+);
+
+impl_topk_rows_cpu_metric!(
+    /// MINKOWSKI at an INTEGER `p` — the repeated-multiplication lane loop
+    /// ([`metric_step_minkowski_int`]), which is 61x the `powf` kernel.
+    ///
+    /// The host reads `pi` off the exponent and picks between this and
+    /// [`minkowski_topk_rows_cpu_metric`]; both emit `Σ |x − y|^p`, so they share
+    /// the same boundary root.
+    minkowski_int_topk_rows_cpu_metric,
+    metric_step_minkowski_int,
+    false
+);
+
+impl_topk_rows_cpu_metric!(
+    /// COSINE cpu row-scan (KNN-CUBE-METRIC).
+    ///
+    /// Takes the two operands' SQUARED row norms (`row_sumsq`) and emits the
+    /// true cosine distance — there is no boundary transform.
+    cosine_topk_rows_cpu_metric,
+    metric_step_cosine,
+    true
 );
