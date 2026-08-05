@@ -21,6 +21,15 @@ pub mod tolerance;
 pub use compare::{assert_close, assert_slice_close, is_close, NEAR_ZERO_FLOOR};
 pub use error::{BridgeError, PrimError};
 pub use float_cast::{f64_to_host, host_to_f64};
+
+// polars `DataFrame` / `Series` ingress and egress (FSEL-01). Feature-gated and
+// OFF by default — polars is a very large dependency tree and a caller working
+// with plain row-major slices (which is already the numpy layout) needs nothing
+// from it. See the module docs.
+#[cfg(feature = "polars")]
+pub mod frame;
+#[cfg(feature = "polars")]
+pub use frame::FrameError;
 pub use label_perm::{
     best_mapping, best_match_accuracy, best_match_accuracy_pinned_noise, is_perfect_match, remap,
 };

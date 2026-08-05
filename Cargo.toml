@@ -47,6 +47,15 @@ anyhow = "1"
 # wheel `import mlrs` works WITHOUT any preload (packaging-layer fix, PY-04).
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
+# polars DataFrame ingress/egress, OPTIONAL and off by default (FSEL-01).
+# `mlrs-core`'s `polars` feature is the only thing that turns it on, and nothing
+# in the workspace enables it transitively — polars is a very large tree and an
+# mlrs caller working with `&[f32]` slices must not pay for it. PINNED to 0.54
+# rather than `"0"` because it is a pre-1.0 crate whose minor bumps are breaking,
+# and `default-features = false` because the frame conversion needs only the core
+# DataFrame/Series types, not the IO, lazy-engine or SQL layers.
+polars = { version = "0.54", default-features = false }
+
 # .npz named-array reader for the oracle fixtures (D-02). npyz avoids the
 # heavy `ndarray` dependency and reads into plain Vec<T>.
 npyz = { version = "0.9", features = ["npz"] }

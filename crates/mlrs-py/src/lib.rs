@@ -60,6 +60,7 @@ pub mod errors;
 pub mod ingress;
 // The host-only sklearn metrics surface PyO3 free functions (METR-BIND-01,
 // TASK-15): thin wrappers over `mlrs_algos::metrics::{classification,regression}`.
+pub mod feature_selection;
 pub mod metrics;
 
 // The estimator `#[pyclass]` wrappers (Plan 03 onward, across every estimator
@@ -349,6 +350,27 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(metrics::r2_score, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::mean_squared_error, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::mean_absolute_error, m)?)?;
+
+    // The host-only `sklearn.feature_selection` surface (FSEL-01): the five
+    // closed-form score functions, both mutual-information estimators, and the
+    // two selector `fit`s that return their fitted attributes together with the
+    // support mask. Free functions rather than `#[pyclass]`es, and plain
+    // `Vec<f64>` rather than the arrow capsule, for the reason
+    // `feature_selection.rs`'s module doc gives: the whole surface is host `f64`
+    // and the container-native column gather happens in the Python shim.
+    m.add_function(wrap_pyfunction!(feature_selection::f_classif, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::f_oneway, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::chi2, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::r_regression, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::f_regression, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::mutual_info_classif, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::mutual_info_regression, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::variance_threshold, m)?)?;
+    m.add_function(wrap_pyfunction!(feature_selection::univariate_select, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        feature_selection::univariate_select_from_scores,
+        m
+    )?)?;
 
     Ok(())
 }

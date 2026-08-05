@@ -95,6 +95,14 @@ from . import metrics  # noqa: F401
 # a tree where the extension was never built.
 from . import model_selection  # noqa: F401
 
+# The sklearn feature-selection surface (FSEL-01): same SUBMODULE convention as
+# `metrics` and `model_selection` above — access via
+# `mlrs.feature_selection.SelectKBest(...)`. Its score functions and selector
+# fits delegate to `_mlrs`; its container-native column gather (numpy / pandas /
+# polars / pyarrow / list in, the same kind out) is pure host bookkeeping in
+# `mlrs._frame`.
+from . import feature_selection  # noqa: F401
+
 __all__ = [
     "LinearRegression",
     "Ridge",

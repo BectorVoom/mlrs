@@ -45,6 +45,62 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
 use super::selector::{inverse_transform_selected, transform_selected, Selector};
 
+/// `VarianceThreshold`'s whole `fit`, over a row-major `f64` HOST slice:
+/// `(variances_, support_mask)`.
+///
+/// Public and host-shaped because there are two callers and they must not drift:
+/// the typestate [`Fit`] impl below (which reads its device operand to host
+/// first — the statistics are host `f64` by design, see
+/// [`mlrs_backend::prims::feature_score`]), and the PyO3 wrapper, which already
+/// has host data and would otherwise pay two extra copies of the design to route
+/// it through a device buffer it never uses. One implementation means the Rust
+/// oracle test covers the Python path too.
+///
+/// The three sklearn behaviours this reproduces — NaN tolerance, the
+/// `threshold == 0` peak-to-peak substitution, and the raise on an all-dropped
+/// fit — are documented on the module.
+pub fn variances_and_support(
+    x: &[f64],
+    n: usize,
+    d: usize,
+    threshold: f64,
+) -> Result<(Vec<f64>, Vec<bool>), AlgoError> {
+    let moments = col_moments(x, n, d)?;
+    let mut variances = moments.variance_biased();
+    if threshold == 0.0 {
+        // sklearn: `variances_ = nanmin([variances_, peak_to_peaks], axis=0)`.
+        // `nanmin` prefers the non-NaN of the pair, so an all-NaN column (both
+        // NaN) stays NaN and any other column takes the smaller.
+        let ptp = moments.peak_to_peak();
+        for c in 0..d {
+            variances[c] = match (variances[c].is_nan(), ptp[c].is_nan()) {
+                (true, true) => f64::NAN,
+                (true, false) => ptp[c],
+                (false, true) => variances[c],
+                (false, false) => variances[c].min(ptp[c]),
+            };
+        }
+    }
+    let support: Vec<bool> = variances.iter().map(|&v| v > threshold).collect();
+
+    // sklearn: `if np.all(~np.isfinite(variances_) | (variances_ <= threshold)):
+    // raise`. The condition is on NON-FINITE-or-below, not simply on the support
+    // being empty — a column with an INFINITE variance survives the mask
+    // (`inf > threshold`) but does NOT rescue the fit from this check.
+    // Reproduced literally, including that asymmetry.
+    if variances.iter().all(|&v| !v.is_finite() || v <= threshold) {
+        let mut reason = format!("No feature in X meets the variance threshold {threshold:.5}");
+        if n == 1 {
+            reason.push_str(" (X contains only one sample)");
+        }
+        return Err(AlgoError::InvalidFeatureInput {
+            estimator: "variance_threshold",
+            reason,
+        });
+    }
+    Ok((variances, support))
+}
+
 /// `sklearn.feature_selection.VarianceThreshold(threshold=0.0)`.
 #[derive(Debug, Clone)]
 pub struct VarianceThreshold<F, S = Unfit> {
@@ -106,46 +162,7 @@ where
         validate_geometry(x, shape)?;
         let (n, d) = shape;
         let host: Vec<f64> = x.to_host(pool).into_iter().map(host_to_f64).collect();
-        let moments = col_moments(&host, n, d)?;
-
-        let mut variances = moments.variance_biased();
-        if self.threshold == 0.0 {
-            // sklearn: `variances_ = nanmin([variances_, peak_to_peaks], axis=0)`.
-            // `nanmin` prefers the non-NaN of the pair, so an all-NaN column
-            // (both NaN) stays NaN and any other column takes the smaller.
-            let ptp = moments.peak_to_peak();
-            for c in 0..d {
-                variances[c] = match (variances[c].is_nan(), ptp[c].is_nan()) {
-                    (true, true) => f64::NAN,
-                    (true, false) => ptp[c],
-                    (false, true) => variances[c],
-                    (false, false) => variances[c].min(ptp[c]),
-                };
-            }
-        }
-        let support: Vec<bool> = variances.iter().map(|&v| v > self.threshold).collect();
-
-        // sklearn: `if np.all(~np.isfinite(variances_) | (variances_ <=
-        // threshold)): raise`. Note the condition is on NON-FINITE-or-below,
-        // not simply on the support being empty — a column with an infinite
-        // variance survives the mask (`inf > threshold`) but does NOT rescue the
-        // fit from this check. Reproduced literally, including that asymmetry.
-        if variances
-            .iter()
-            .all(|&v| !v.is_finite() || v <= self.threshold)
-        {
-            let mut reason = format!(
-                "No feature in X meets the variance threshold {:.5}",
-                self.threshold
-            );
-            if n == 1 {
-                reason.push_str(" (X contains only one sample)");
-            }
-            return Err(AlgoError::InvalidFeatureInput {
-                estimator: "variance_threshold",
-                reason,
-            });
-        }
+        let (variances, support) = variances_and_support(&host, n, d, self.threshold)?;
 
         Ok(VarianceThreshold {
             threshold: self.threshold,

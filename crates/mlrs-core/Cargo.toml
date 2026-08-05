@@ -11,3 +11,13 @@ log = { workspace = true }
 # Safe host<->device float bit-reinterpret (`bytemuck::Pod` bound) for the
 # shared `float_cast` helpers (IN-02); same workspace pin as the algo crates.
 bytemuck = { workspace = true }
+# polars DataFrame ingress/egress (`frame` module, FSEL-01). OPTIONAL: the
+# `polars` feature below is the only thing that pulls it, nothing in the
+# workspace enables that feature, and no default build of any mlrs crate
+# compiles it. See `src/frame.rs`'s module docs for why the gate exists.
+polars = { workspace = true, optional = true }
+
+[features]
+# Compile the `mlrs_core::frame` polars conversions. Additive and off by
+# default; `cargo build -p mlrs-core --features polars` is the only way in.
+polars = ["dep:polars"]

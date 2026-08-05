@@ -96,6 +96,23 @@ impl SelectionMode {
         }
     }
 
+    /// The `(mode, param)` pair that would reconstruct this mode — the inverse of
+    /// [`SelectionMode::from_mode`].
+    ///
+    /// Exists so the typestate `fit` can delegate to [`fit_host`] without
+    /// duplicating the mode-string parsing: round-tripping through the pair keeps
+    /// `from_mode` the SINGLE place a mode is interpreted and validated.
+    pub fn as_mode_param(&self) -> (&'static str, GenericParam) {
+        match self {
+            Self::Percentile(p) => ("percentile", GenericParam::Value(*p)),
+            Self::KBest(KBest::All) => ("k_best", GenericParam::All),
+            Self::KBest(KBest::Count(k)) => ("k_best", GenericParam::Value(*k as f64)),
+            Self::Fpr(a) => ("fpr", GenericParam::Value(*a)),
+            Self::Fdr(a) => ("fdr", GenericParam::Value(*a)),
+            Self::Fwe(a) => ("fwe", GenericParam::Value(*a)),
+        }
+    }
+
     /// Parse a `GenericUnivariateSelect(mode=..)` string against a `param`
     /// value, producing the mode the string names.
     ///
@@ -204,6 +221,94 @@ impl SelectionMode {
             }
         }
     }
+}
+
+/// A univariate filter's whole `fit`, over row-major `f64` HOST slices:
+/// `(scores_, pvalues_, support_mask)`.
+///
+/// Public and host-shaped for the reason
+/// [`super::variance_threshold::variances_and_support`] documents: the typestate
+/// [`Fit`] impl and the PyO3 wrapper both need it, the statistics are host `f64`
+/// by design, and one implementation is what makes the Rust oracle test cover the
+/// Python path too.
+///
+/// `mode` is `GenericUnivariateSelect`'s mode string (`"percentile"`, `"k_best"`,
+/// `"fpr"`, `"fdr"`, `"fwe"`) — the five specific sklearn classes are just
+/// callers passing their own mode, which is sklearn's own factoring.
+pub fn fit_host(
+    x: &[f64],
+    y: &[f64],
+    n: usize,
+    d: usize,
+    mode: &str,
+    param: GenericParam,
+    score_func: ScoreFunc,
+) -> Result<(Vec<f64>, Option<Vec<f64>>, Vec<bool>), AlgoError> {
+    let selection = SelectionMode::from_mode(mode, param)?;
+    selection.validate("univariate_select")?;
+    // Reject a p-value-less score function BEFORE running it when the mode is
+    // statically known to need p-values: an expensive `mutual_info_regression`
+    // sweep should not run only to be discarded.
+    if selection.needs_pvalues() && !score_func.yields_pvalues() {
+        return Err(AlgoError::ScoreFuncHasNoPValues {
+            estimator: "univariate_select",
+            mode: selection.name(),
+        });
+    }
+    let res = score_func.eval(x, y, n, d)?;
+    validate_score_shape(&res, d)?;
+    let support = selection.mask(&res, "univariate_select")?;
+    Ok((res.scores, res.pvalues, support))
+}
+
+/// Apply a selection mode to ALREADY-COMPUTED scores — the entry point for a
+/// caller-supplied `score_func`.
+///
+/// sklearn's `score_func` is an arbitrary callable, and the PyO3 layer cannot
+/// invoke a Python callable from inside a Rust `fit` without re-acquiring the
+/// GIL there. So for a custom callable the shim evaluates it itself and calls
+/// this: the selection RULE — the stable-sort tie-breaking, the percentile
+/// interpolation, the Benjamini-Hochberg step — stays the single Rust
+/// implementation the oracle tests cover, and the callable is never called from
+/// Rust.
+pub fn mask_from_scores(
+    scores: &[f64],
+    pvalues: Option<&[f64]>,
+    mode: &str,
+    param: GenericParam,
+) -> Result<Vec<bool>, AlgoError> {
+    let selection = SelectionMode::from_mode(mode, param)?;
+    selection.validate("univariate_select")?;
+    let res = ScoreResult {
+        scores: scores.to_vec(),
+        pvalues: pvalues.map(|p| p.to_vec()),
+    };
+    validate_score_shape(&res, scores.len())?;
+    selection.mask(&res, "univariate_select")
+}
+
+/// A score function must return one value per feature, and its p-values (when it
+/// produces them) must agree in length.
+fn validate_score_shape(res: &ScoreResult, d: usize) -> Result<(), AlgoError> {
+    if res.scores.len() != d {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "scores",
+            rows: 1,
+            cols: d,
+            len: res.scores.len(),
+        }));
+    }
+    if let Some(pv) = res.pvalues.as_ref() {
+        if pv.len() != d {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "pvalues",
+                rows: 1,
+                cols: d,
+                len: pv.len(),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Fetch `pvalues_` or report the mode/score-function mismatch.
@@ -455,48 +560,55 @@ where
         };
         let x_host: Vec<f64> = x.to_host(pool).into_iter().map(host_to_f64).collect();
 
-        // Reject a p-value-less score function BEFORE running it when the mode
-        // is statically known to need p-values: an expensive
-        // `mutual_info_regression` sweep should not run only to be discarded.
-        // A `Custom` function still has to run first — its output shape is not
-        // knowable in advance — and is checked below.
-        if self.mode.needs_pvalues() && !self.score_func.yields_pvalues() {
-            return Err(AlgoError::ScoreFuncHasNoPValues {
-                estimator: self.estimator,
-                mode: self.mode.name(),
-            });
-        }
-
-        let res = self.score_func.eval(&x_host, &y_host, n, d)?;
-        if res.scores.len() != d {
-            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                operand: "scores",
-                rows: 1,
-                cols: d,
-                len: res.scores.len(),
-            }));
-        }
-        if let Some(pv) = res.pvalues.as_ref() {
-            if pv.len() != d {
-                return Err(AlgoError::Prim(PrimError::ShapeMismatch {
-                    operand: "pvalues",
-                    rows: 1,
-                    cols: d,
-                    len: pv.len(),
-                }));
-            }
-        }
-        let support = self.mode.mask(&res, self.estimator)?;
+        // The whole fit is [`fit_host`], which the PyO3 wrapper also calls — one
+        // implementation, so this estimator and `mlrs.feature_selection` cannot
+        // drift and the oracle test covers both.
+        //
+        // `self.mode` is re-serialised through its name/param pair rather than
+        // passed as a `SelectionMode`, so `fit_host` remains the single place the
+        // mode string is parsed and validated. It is a handful of scalar
+        // conversions against an `O(n·d)` sweep.
+        let (mode, param) = self.mode.as_mode_param();
+        let (scores, pvalues, support) =
+            fit_host(&x_host, &y_host, n, d, mode, param, self.score_func.clone())
+                .map_err(|e| relabel(e, self.estimator))?;
 
         Ok(UnivariateFilter {
             score_func: self.score_func,
             mode: self.mode,
             estimator: self.estimator,
-            scores: res.scores,
-            pvalues: res.pvalues,
+            scores,
+            pvalues,
             support,
             _state: PhantomData,
         })
+    }
+}
+
+/// Re-tag a [`fit_host`] error with the CONCRETE sklearn class name.
+///
+/// `fit_host` reports `"univariate_select"` because it does not know which of the
+/// six classes called it; a `SelectKBest` user should see `"select_k_best"`. Only
+/// the two variants that carry an estimator name and can originate here are
+/// re-tagged — anything else passes through unchanged rather than being
+/// re-wrapped into a shape it did not have.
+fn relabel(err: AlgoError, estimator: &'static str) -> AlgoError {
+    match err {
+        AlgoError::InvalidSelectorParam {
+            param,
+            value,
+            reason,
+            ..
+        } => AlgoError::InvalidSelectorParam {
+            estimator,
+            param,
+            value,
+            reason,
+        },
+        AlgoError::ScoreFuncHasNoPValues { mode, .. } => {
+            AlgoError::ScoreFuncHasNoPValues { estimator, mode }
+        }
+        other => other,
     }
 }
 

@@ -7,6 +7,15 @@ description = "sklearn-compatible ML estimators for mlrs (Phase 4: LinearRegress
 [dependencies]
 mlrs-core = { path = "../mlrs-core" }
 mlrs-backend = { path = "../mlrs-backend" }
+# polars, reachable ONLY through this crate's `polars` feature (off by default).
+# The library itself never references it — the conversion lives in
+# `mlrs_core::frame` — so this exists purely so
+# `tests/feature_selection_polars_test.rs` can reach both crates at once. It is a
+# regular optional dependency rather than a dev one because Cargo does not allow
+# an optional dev-dependency, and a NON-optional dev-dependency would compile
+# polars for every `cargo test -p mlrs-algos` run, which is minutes of build for
+# everyone not using it.
+polars = { workspace = true, optional = true }
 # Feature-free generic CubeCL kernels (KERNEL-02): KernelDensity launches the six
 # density-value maps + the div_by_row log-sum-exp rescale helper from
 # mlrs-kernels::elementwise directly over the v1 distance base (D-08 — KD does NOT
@@ -51,3 +60,9 @@ cpu = ["mlrs-backend/cpu"]
 wgpu = ["mlrs-backend/wgpu"]
 cuda = ["mlrs-backend/cuda"]
 rocm = ["mlrs-backend/rocm"]
+# polars DataFrame ingress for a Rust caller (FSEL-01). Forwards to
+# `mlrs-core`'s gate; nothing here uses polars in the library itself, so this
+# exists only so the integration test
+# (`tests/feature_selection_polars_test.rs`) can reach both crates at once.
+# Off by default, like the gate it forwards to.
+polars = ["mlrs-core/polars", "dep:polars"]
