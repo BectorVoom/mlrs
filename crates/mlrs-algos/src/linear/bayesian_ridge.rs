@@ -145,7 +145,8 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gram_host::centered_gram_xty;
 use mlrs_backend::prims::linear_predict::{
-    bayes_predict_std, bayes_predict_std_from_host, linear_predict, HostMirror, HostPrediction,
+    bayes_predict_std, bayes_predict_std_from_host, bayes_predict_std_host, linear_predict,
+    std_kernel_unusable, HostMirror, HostPrediction,
 };
 use mlrs_backend::prims::normal_eq::{
     centered_gram_xty_device, device_fit_preferred, device_gram_applicable,
@@ -1471,6 +1472,20 @@ where
     /// launch's own fixed cost sits at, and it keeps `predict` free of fit-time
     /// device state that would have to be kept alive and pool-managed for the
     /// estimator's whole lifetime.
+    ///
+    /// ## The one gate a resident design still owes
+    /// `STD_DEVICE_MIN_FEATURES` is a TRANSFER threshold and does not apply
+    /// here — there is no upload to amortize, and the kernel beat the host arm
+    /// at every `d` measured on a P100. But
+    /// [`std_kernel_unusable`](mlrs_backend::prims::linear_predict::std_kernel_unusable)
+    /// is not about transfers: on wgpu the `f64` kernel is 12–25× slower at
+    /// every `d`, and at `d = 256` it loses the adapter outright (~9 s of GPU
+    /// time past the compositor watchdog on a device that is also driving the
+    /// display). Running it there because a CUDA card liked it is exactly the
+    /// cross-backend extrapolation `mlrs-feedback-verify-on-target-hardware`
+    /// records, and the failure mode is a driver reset rather than a slow
+    /// answer — so those backends take the `f64` host sweep and the result is
+    /// re-uploaded, keeping this method's device-resident contract.
     pub fn predict_std(
         &self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -1486,6 +1501,19 @@ where
                 cols: n_features,
                 len: x.len(),
             }));
+        }
+
+        if std_kernel_unusable() {
+            let x_host = x.to_host(pool);
+            let std64 = bayes_predict_std_host::<F>(
+                &x_host,
+                &self.x_offset_,
+                mt,
+                1.0 / self.alpha_,
+                (n_samples, n_features),
+            );
+            let out: Vec<F> = std64.iter().map(|&v| f64_to_host::<F>(v)).collect();
+            return Ok(DeviceArray::from_host(pool, &out));
         }
 
         let off: Vec<F> = self.x_offset_.iter().map(|v| f64_to_host::<F>(*v)).collect();
@@ -1641,7 +1669,21 @@ where
         let profile = std::env::var("BAYES_PROFILE").is_ok();
         let lap0 = std::time::Instant::now();
 
-        let (x_mean, y_mean, gram, xty) = centered_gram_xty_device::<F>(
+        // A failure HERE is not a caller error — geometry was validated above,
+        // so what is left is the device refusing to compile or launch the
+        // kernel. That is a real possibility on cuda, where
+        // `f64_device_kernels_available` returns a hard-coded `true` rather
+        // than probing (the advertised flag is `false` there because of an
+        // upstream matmul workaround, so reading it would disable this arm on
+        // the fastest `f64` silicon — see its docs). That inference is verified
+        // on one card. Before this arm existed the fit ALWAYS read the design
+        // back and formed the normal equations on the host, and there was no
+        // configuration in which it could fail for want of device `f64`; the
+        // fallback below keeps that true, so a driver/CTK combination the
+        // hard-coded verdict guesses wrong about costs throughput, not the
+        // result. `MLRS_F64_DEVICE=0` remains the way to pin the host arm
+        // without paying the failed launch.
+        let device_ne = centered_gram_xty_device::<F>(
             pool,
             x,
             y,
@@ -1649,7 +1691,15 @@ where
             n_features,
             sw64.as_deref(),
             self.fit_intercept,
-        )?;
+        );
+        let (x_mean, y_mean, gram, xty) = match device_ne {
+            Ok(ne) => ne,
+            Err(_) => {
+                let x_host = x.to_host(pool);
+                let y_host = y.to_host(pool);
+                return self.fit_host_core(pool, &x_host, &y_host, shape, sample_weight);
+            }
+        };
 
         // The two target scalars stay on the host. They are `O(n)` over the
         // length-`n` TARGET — `1/d` of the design that just stayed on the

@@ -823,6 +823,28 @@ where
     let client = runtime::active_client();
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
 
+    // The knob must actually be LIVE, or both "arms" take the host sweep and
+    // every assertion below compares it against itself
+    // ([[mlrs-bench-verify-knob-is-live]]). `f64_device_kernels_available` — what
+    // the callers of this helper skip on — is NOT that question: on cpu it is
+    // `true` (cubecl-cpu's MLIR registry does list `f64`) while
+    // `device_gram_applicable` still refuses, because `gram::gram_path` is a
+    // hard-wired `GramPath::Gemm` under `cfg(feature = "cpu")` and there is no
+    // fused Gram kernel to force. Ask the predicate `fit_with_sample_weight`
+    // actually dispatches on, under the same force, and skip loudly when it says
+    // no.
+    {
+        let _guard = mlrs_backend::abflag::force("MLRS_BAYES_GRAM_DEVICE", "1");
+        if !mlrs_backend::prims::normal_eq::device_gram_applicable::<F>(TALL.1) {
+            println!(
+                "{label}: SKIPPED (MLRS_BAYES_GRAM_DEVICE=1 does not reach the device \
+                 arm on backend={} — the comparison would be vacuous)",
+                capability::active_backend_name()
+            );
+            return;
+        }
+    }
+
     for spec in CASES {
         let (x, y, sw_all, shape) = case_data::<F>(case, spec);
         let sw = spec.sample_weight.then_some(sw_all.as_slice());

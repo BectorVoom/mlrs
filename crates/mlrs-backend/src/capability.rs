@@ -380,6 +380,15 @@ pub fn skip_f64_with_log() -> bool {
 /// `0` is the escape hatch if a future CUDA/driver combination does reject a
 /// plain `f64` kernel: it puts every caller back on its host arm rather than
 /// failing.
+///
+/// The cuda verdict being a HARD-CODED `true` rather than a probe means this
+/// predicate can be wrong on a driver/CTK combination nobody has run, so it
+/// must not be a caller's only fallback — a wrong answer here has to cost
+/// throughput, not the result. `BayesianRidge::fit_with_sample_weight` is the
+/// worked example: it catches a failed device Gram and reads the design back,
+/// which is exactly what it did before the arm existed. `MLRS_F64_DEVICE=0`
+/// then skips the failed launch rather than being the only way to get a fit at
+/// all.
 #[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
 pub fn f64_device_kernels_available() -> bool {
     if let Some(v) = crate::abflag::var("MLRS_F64_DEVICE") {

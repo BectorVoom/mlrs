@@ -114,7 +114,24 @@ pub fn device_gram_applicable<F>(d: usize) -> bool
 where
     F: Float + CubeElement + Pod,
 {
-    if crate::capability::active_backend_name() == "cpu" {
+    // The override is consulted BEFORE the `cpu` gate and AFTER neither of the
+    // capability ones — `=1` forces the device arm where it is LEGAL, which is
+    // what the docs above claim, and `cpu` is a perf preference rather than a
+    // capability. Same ordering as `prims::linear_predict::use_host_std`, and
+    // for the same reason: a knob that cannot reach the arm it names is worse
+    // than no knob (`gram::gram_path` records the two bitwise A/B tests that
+    // learned this the expensive way).
+    //
+    // On the cpu backend the reorder changes nothing TODAY, and that is worth
+    // stating because it is the trap: `gram_path` is a hard-wired
+    // `GramPath::Gemm` under `cfg(feature = "cpu")`, so `fused_centering_available`
+    // refuses at every `d` and the arm is structurally unreachable there — no
+    // flag can force it. `bayesian_ridge_device_gram_agrees_*` therefore SKIP on
+    // cpu rather than forcing, because forcing would compare the host sweep
+    // against itself. If a fused Gram kernel is ever added to the cpu path,
+    // this ordering is what makes `=1` reach it.
+    let forced = crate::abflag::var("MLRS_BAYES_GRAM_DEVICE");
+    if forced.as_deref() == Some("0") {
         return false;
     }
     if !crate::capability::f64_device_kernels_available() {
@@ -123,8 +140,11 @@ where
     if !fused_centering_available::<f64>(d) {
         return false;
     }
-    if let Some(v) = crate::abflag::var("MLRS_BAYES_GRAM_DEVICE") {
-        return v != "0";
+    if forced.is_some() {
+        return true;
+    }
+    if crate::capability::active_backend_name() == "cpu" {
+        return false;
     }
     true
 }
