@@ -495,6 +495,80 @@ pub enum AlgoError {
         estimator: &'static str,
     },
 
+    /// A `feature_selection` selector was given a hyperparameter outside its
+    /// sklearn-documented domain (FSEL-01): `SelectPercentile`'s
+    /// `percentile ∉ [0, 100]`, an `alpha ∉ [0, 1]` on
+    /// `SelectFpr`/`SelectFdr`/`SelectFwe`, `GenericUnivariateSelect`'s
+    /// `param < 0`, `RFE`'s non-positive `step`, `SequentialFeatureSelector`'s
+    /// `n_features_to_select >= n_features`, or a negative
+    /// `SelectFromModel(threshold=..)` scale factor.
+    ///
+    /// One variant rather than nine because the check is uniformly "this number
+    /// is outside this interval" and the interesting content is WHICH parameter
+    /// and WHY — carrying that as a `reason` string keeps the message as
+    /// specific as sklearn's `_parameter_constraints` rejection without a
+    /// variant per selector. Rejected at `build()` when the bound is
+    /// data-INDEPENDENT and at `fit` when it depends on `n_features` (D-05).
+    #[error("estimator '{estimator}': {param} = {value} is invalid ({reason})")]
+    InvalidSelectorParam {
+        /// Which selector rejected the value (e.g. `"select_percentile"`).
+        estimator: &'static str,
+        /// The sklearn parameter name (e.g. `"percentile"`, `"alpha"`, `"step"`).
+        param: &'static str,
+        /// The offending value.
+        value: f64,
+        /// The documented domain that was violated (e.g. `"must be in [0, 100]"`).
+        reason: &'static str,
+    },
+
+    /// A `feature_selection` selector was given an unrecognised string option
+    /// (FSEL-01): `GenericUnivariateSelect(mode=..)` outside
+    /// `{percentile, k_best, fpr, fdr, fwe}`, `SequentialFeatureSelector`'s
+    /// `direction` outside `{forward, backward}`, or a `SelectFromModel`
+    /// `threshold` string that is neither `"mean"`, `"median"`, nor
+    /// `"<scale>*mean"` / `"<scale>*median"`.
+    ///
+    /// Carries the offending value so the message names it, mirroring sklearn's
+    /// `StrOptions` rejection. Distinct from [`AlgoError::UnknownAlgorithm`] and
+    /// friends only in that it names the PARAMETER too, because these selectors
+    /// have several string-valued parameters each.
+    #[error(
+        "estimator '{estimator}': unknown {param} '{value}' \
+         (expected one of: {expected})"
+    )]
+    UnknownSelectorOption {
+        /// Which selector rejected the option.
+        estimator: &'static str,
+        /// The sklearn parameter name (e.g. `"mode"`, `"direction"`).
+        param: &'static str,
+        /// The offending value, as given.
+        value: String,
+        /// The accepted set, in sklearn's order.
+        expected: &'static str,
+    },
+
+    /// A univariate selector's `score_func` returned no p-values but the
+    /// selection mode needs them (FSEL-01).
+    ///
+    /// `SelectFpr` / `SelectFdr` / `SelectFwe` (and `GenericUnivariateSelect` in
+    /// those modes) threshold `pvalues_`, which `r_regression` and both
+    /// `mutual_info_*` functions do not produce — sklearn's own docstrings say
+    /// so ("Function taking two arrays X and y, and returning a pair of arrays
+    /// (scores, pvalues)" for these three, versus "or a single array with
+    /// scores" for `SelectKBest`/`SelectPercentile`). sklearn itself fails with
+    /// a `TypeError` deep inside `_get_support_mask`; this reports the mismatch
+    /// as a typed error at `fit`, naming both sides.
+    #[error(
+        "estimator '{estimator}': selection mode '{mode}' requires p-values, \
+         but the score function returned scores only"
+    )]
+    ScoreFuncHasNoPValues {
+        /// Which selector needed them (e.g. `"select_fdr"`).
+        estimator: &'static str,
+        /// The mode that needs them (`"fpr"` / `"fdr"` / `"fwe"`).
+        mode: &'static str,
+    },
+
     /// A construction-class hyperparameter violation raised by a NON-builder
     /// entry point (FIL-01: `ForestInference::from_trees` validates an
     /// imported forest — empty forest / depth over the complete-layout cap —
@@ -1293,4 +1367,5 @@ pub enum BuildError {
         /// The offending upper bound.
         max: f64,
     },
+
 }

@@ -99,6 +99,14 @@ pub mod nnls;
 pub mod coordinate_descent;
 pub mod dbscan;
 pub mod distance;
+// Feature-selection column moments (FSEL-01): the three `f64` host sweeps every
+// univariate score is assembled from (per-class column sums, X-vs-y cross
+// moments, NaN-aware column moments), plus the device column gather/scatter that
+// IS a selector's `transform` / `inverse_transform`. Host-accumulating for the
+// same reason `gmm_host` and `special` are: the 1e-5 contract is RELATIVE and
+// these scores' p-values reach 1e-27, cuda does not advertise `f64`, and the
+// sweep is one-shot per `fit`. See the module docs.
+pub mod feature_score;
 // Random Forest prim (ENSEMBLE-01): the launch-only batched level-wise forest
 // builder + forest inference over the `mlrs-kernels::tree` kernels. Owns the
 // host quantile binning, seeded bootstrap/feature-subsample RNG (SplitMix64),

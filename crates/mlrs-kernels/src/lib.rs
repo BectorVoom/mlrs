@@ -25,6 +25,12 @@ pub mod distance;
 pub mod coordinate;
 pub mod dbscan;
 pub mod elementwise;
+// Feature-selection column gather/scatter (FSEL-01): every
+// `sklearn.feature_selection` selector's `transform` / `inverse_transform`.
+// Owns its `pub mod` (single-owner, no root re-export — the `gram`/`kmeans`
+// module-scoped-access precedent: callers use
+// `mlrs_kernels::feature_select::{…}`).
+pub mod feature_select;
 // HistGradientBoosting kernels (GBT-01): sequential boosting over batched
 // level-wise gradient/hessian histogram trees (row-blocked gather + reduce),
 // driven by `prims/hist_gradient_boosting.rs`. Reuses `tree.rs` binning,

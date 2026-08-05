@@ -55,6 +55,13 @@ pub mod density;
 // (`mlrs_backend::prims::random_forest`).
 pub mod ensemble;
 pub mod error;
+// The complete `sklearn.feature_selection` surface (FSEL-01): the five
+// closed-form score functions plus both mutual-information estimators, the six
+// univariate filters, `VarianceThreshold`, and the four meta-selectors
+// (`SelectFromModel` / `RFE` / `RFECV` / `SequentialFeatureSelector`). A
+// selector's `transform` is a device column gather; its SCORE is a host `f64`
+// sweep, for the relative-accuracy reason `prims::feature_score` documents.
+pub mod feature_selection;
 pub mod kernel_ridge;
 pub mod linear;
 pub mod manifold;

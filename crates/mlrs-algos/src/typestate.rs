@@ -115,6 +115,11 @@ pub trait State: sealed::Sealed {}
 /// (D-03). An estimator tagged `Unfit` exposes only [`Fit::fit`] /
 /// [`PartialFit::partial_fit`]; `predict`/`transform`/fitted-attribute accessors
 /// are unreachable until the type transitions to [`Fitted`].
+///
+/// `Debug` is derived so an estimator carrying a `PhantomData<(F, S)>` state slot
+/// can itself derive `Debug` — which `Result::expect_err` in a test requires of
+/// the `Ok` type, and which costs nothing on a zero-sized marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unfit;
 
 /// Zero-sized marker: a FITTED estimator (D-03). This is the only state in which
@@ -122,6 +127,9 @@ pub struct Unfit;
 /// accessors are reachable — replacing the old runtime
 /// [`AlgoError::NotFitted`](crate::error::AlgoError::NotFitted) guard with a
 /// compile-time one.
+///
+/// `Debug` is derived for the reason [`Unfit`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fitted;
 
 impl sealed::Sealed for Unfit {}
