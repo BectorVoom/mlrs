@@ -133,6 +133,7 @@ where
         Some((w, m, p)) => (Some(w), Some(m), Some(p)),
         None => (None, None, None),
     };
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
     GaussianMixture::<F>::builder()
         .n_components(K)
         .covariance_type(cov)
@@ -146,7 +147,7 @@ where
         .precisions_init(p0)
         .build::<F>()
         .expect("valid GaussianMixture hyperparameters")
-        .fit_from_host_slice(x, (N, D))
+        .fit_from_host_slice(&mut pool, x, (N, D))
         .expect("gaussian mixture fit")
 }
 
@@ -562,6 +563,7 @@ fn log_proba_and_score_samples_are_consistent() {
 fn n_init_never_lowers_the_best_bound() {
     let case = load("f64");
     let x: Vec<f64> = design(&case, "X");
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
     let one = GaussianMixture::<f64>::builder()
         .n_components(K)
         .init_params("random")
@@ -570,7 +572,7 @@ fn n_init_never_lowers_the_best_bound() {
         .random_state(Some(7))
         .build::<f64>()
         .expect("valid")
-        .fit_from_host_slice(&x, (N, D))
+        .fit_from_host_slice(&mut pool, &x, (N, D))
         .expect("fit");
     let many = GaussianMixture::<f64>::builder()
         .n_components(K)
@@ -580,7 +582,7 @@ fn n_init_never_lowers_the_best_bound() {
         .random_state(Some(7))
         .build::<f64>()
         .expect("valid")
-        .fit_from_host_slice(&x, (N, D))
+        .fit_from_host_slice(&mut pool, &x, (N, D))
         .expect("fit");
     assert!(
         many.lower_bound() >= one.lower_bound() - 1e-12,
@@ -597,6 +599,7 @@ fn n_init_never_lowers_the_best_bound() {
 fn warm_start_resumes_the_ascent() {
     let case = load("f64");
     let x: Vec<f64> = design(&case, "X");
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
     let build = |warm: bool| {
         GaussianMixture::<f64>::builder()
             .n_components(K)
@@ -608,11 +611,13 @@ fn warm_start_resumes_the_ascent() {
             .build::<f64>()
             .expect("valid")
     };
-    let first = build(true).fit_from_host_slice(&x, (N, D)).expect("fit 1");
+    let first = build(true)
+        .fit_from_host_slice(&mut pool, &x, (N, D))
+        .expect("fit 1");
     let cold = first.lower_bound();
     let second = first
         .into_warm_start()
-        .fit_from_host_slice(&x, (N, D))
+        .fit_from_host_slice(&mut pool, &x, (N, D))
         .expect("fit 2");
     assert!(
         second.lower_bound() >= cold,
@@ -622,8 +627,12 @@ fn warm_start_resumes_the_ascent() {
 
     // Without warm_start the second fit must RE-INITIALIZE, i.e. land exactly
     // where the first one did (same seed, same data) rather than continuing.
-    let a = build(false).fit_from_host_slice(&x, (N, D)).expect("cold 1");
-    let b = build(false).fit_from_host_slice(&x, (N, D)).expect("cold 2");
+    let a = build(false)
+        .fit_from_host_slice(&mut pool, &x, (N, D))
+        .expect("cold 1");
+    let b = build(false)
+        .fit_from_host_slice(&mut pool, &x, (N, D))
+        .expect("cold 2");
     assert_eq!(a.lower_bound(), b.lower_bound(), "a cold fit is not deterministic");
 }
 
@@ -815,11 +824,12 @@ fn builder_defaults_match_new() {
 #[test]
 fn more_components_than_samples_is_rejected_at_fit() {
     let x = vec![0.0f64; 3 * D];
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
     let err = GaussianMixture::<f64>::builder()
         .n_components(5)
         .build::<f64>()
         .expect("5 components is a valid hyperparameter")
-        .fit_from_host_slice(&x, (3, D))
+        .fit_from_host_slice(&mut pool, &x, (3, D))
         .expect_err("5 components cannot be fitted to 3 samples");
     assert!(
         format!("{err}").contains("out of range"),

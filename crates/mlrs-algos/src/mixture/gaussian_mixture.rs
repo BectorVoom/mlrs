@@ -48,6 +48,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::gmm_device::{gmm_device_applicable, GmmDevice};
 use mlrs_backend::prims::gmm_host::{
     cholesky_lower_blocks, invert_spd, logsumexp_rows, precisions_cholesky,
     precisions_from_cholesky, weighted_log_prob, CovarianceType, GmmHost, IllConditioned,
@@ -321,23 +322,47 @@ where
     /// Should `fit` take [`GaussianMixture::fit_from_host_slice`] rather than
     /// uploading and going through [`Fit::fit`]?
     ///
-    /// ALWAYS `true`, and deliberately so: the EM loop is host-resident on every
-    /// backend (`gmm_host` module docs), so a device ingress buys nothing but a
-    /// transfer and a read-back. The predicate exists anyway because the two
-    /// entry points take DIFFERENT operand types and a caller has to choose
-    /// before ingress — and because keeping the hook makes a future device arm a
-    /// dispatch change rather than an API change.
+    /// ALWAYS `true`. `fit_from_host_slice` is a strict superset of what
+    /// `Fit::fit` can reach: it never uploads `x` itself (it stays a host
+    /// slice all the way to [`GmmHost`], or is uploaded exactly once by
+    /// [`GmmDevice::new`](mlrs_backend::prims::gmm_device::GmmDevice::new) when
+    /// [`GaussianMixture::device_fit_applicable`] takes the device EM engine),
+    /// whereas `Fit::fit` always pays one upload up front to obtain the
+    /// `DeviceArray` it requires — so there is no shape where `Fit::fit` wins.
+    /// The predicate exists anyway because the two entry points take DIFFERENT
+    /// operand types and a caller has to choose before ingress.
     pub fn host_fit_applicable(&self, _shape: (usize, usize)) -> bool {
         true
     }
 
-    /// `fit` over a HOST slice — the no-upload, no-launch ingress.
+    /// Does the DEVICE EM engine
+    /// ([`GmmDevice`](mlrs_backend::prims::gmm_device::GmmDevice)) apply to
+    /// this `(n_samples, n_features)` shape, given this estimator's
+    /// `n_components`?
+    ///
+    /// Delegates entirely to
+    /// [`gmm_device_applicable`](mlrs_backend::prims::gmm_device::gmm_device_applicable) —
+    /// see that function's docs for the gate order (backend, `f64` capability,
+    /// `f64` transcendentals, the `MLRS_GMM_DEVICE` override, then a size
+    /// floor). `fit_core` consults this ONCE per fit, before the `n_init`
+    /// restart loop, since the design and its geometry do not change across
+    /// restarts.
+    pub fn device_fit_applicable(&self, shape: (usize, usize)) -> bool {
+        gmm_device_applicable(shape.0, shape.1, self.n_components)
+    }
+
+    /// `fit` over a HOST slice — the no-upload-by-default, Python-boundary
+    /// ingress.
     ///
     /// `x` is the `n × d` row-major design borrowed from host memory (at the
     /// Python boundary, the caller's own numpy/Arrow block). Produces exactly
-    /// the fit [`Fit::fit`] does; it just never uploads.
+    /// the fit [`Fit::fit`] does. `pool` is consulted ONLY when
+    /// [`GaussianMixture::device_fit_applicable`] holds for this shape — the
+    /// common case (small/medium fits, or any cpu/wgpu-at-f64 backend) never
+    /// touches it and never uploads `x`.
     pub fn fit_from_host_slice(
         self,
+        pool: &mut BufferPool<ActiveRuntime>,
         x: &[F],
         shape: (usize, usize),
     ) -> Result<GaussianMixture<F, Fitted>, AlgoError> {
@@ -351,7 +376,7 @@ where
             }));
         }
         let x64: Vec<f64> = x.iter().map(|&v| host_to_f64(v)).collect();
-        self.fit_core(&x64, shape)
+        self.fit_core(pool, &x64, shape)
     }
 
     /// The shared body of BOTH ingresses (the design already widened to `f64`).
@@ -359,8 +384,18 @@ where
     /// Mirrors `BaseMixture.fit_predict` structurally: `n_init` restarts, each
     /// an initialization plus up to `max_iter` E/M iterations, keeping the
     /// restart with the highest `lower_bound_`.
+    ///
+    /// [`GaussianMixture::device_fit_applicable`] is consulted ONCE, before the
+    /// restart loop (the design and its geometry are the same for every
+    /// restart): when it holds, `x` is uploaded exactly once into a
+    /// [`GmmDevice`] that stays alive for every restart's whole iteration loop,
+    /// and every `e_step`/`covariances` call in the loop below routes through
+    /// it instead of the host `host` engine. Initialization
+    /// ([`GaussianMixture::initialize`]) ALWAYS runs on `host` regardless — see
+    /// that method and the `gmm_host`/`gmm_device` module docs for why.
     fn fit_core(
         self,
+        pool: &mut BufferPool<ActiveRuntime>,
         x: &[f64],
         shape: (usize, usize),
     ) -> Result<GaussianMixture<F, Fitted>, AlgoError> {
@@ -378,8 +413,21 @@ where
         self.validate_injected(d)?;
 
         let ct = self.covariance_type;
+        // `host` always exists: `initialize` (the two k-means routes + the two
+        // random draws) is a one-time, small-relative-to-`max_iter` cost that
+        // stays host-resident regardless of which engine runs the E/M loop
+        // (`gmm_device` module docs).
         let mut host = GmmHost::new(x, n, d, k, ct, self.reg_covar);
         let mut rng = SplitMix64::new(self.random_state.unwrap_or(DEFAULT_SEED));
+
+        // The device EM engine, built ONCE (not per restart) when applicable —
+        // `x` is uploaded exactly once and `resp` stays device-resident for
+        // every restart's whole `max_iter` loop.
+        let mut device: Option<GmmDevice> = if self.device_fit_applicable(shape) {
+            Some(GmmDevice::new(pool, x, n, d, k, ct, self.reg_covar).map_err(AlgoError::Prim)?)
+        } else {
+            None
+        };
 
         // `warm_start` with a previous fit skips initialization entirely and
         // resumes from the carried parameters, so a second `fit` continues the
@@ -411,13 +459,19 @@ where
             let mut trace: Vec<f64> = Vec::with_capacity(self.max_iter);
             for it in 1..=self.max_iter {
                 let prev = lower_bound;
-                // ONE fused sweep: responsibilities + `nk` + `means` (win #3).
-                let (bound, nk, means) = host.e_step(
-                    &cur.weights,
-                    &cur.means,
-                    &cur.precisions_cholesky,
-                );
-                let covariances = host.covariances(&nk, &means);
+                // ONE fused sweep: responsibilities + `nk` + `means` (win #3),
+                // on whichever engine this fit is using.
+                let (bound, nk, means) = if let Some(dev) = device.as_mut() {
+                    dev.e_step(pool, &cur.weights, &cur.means, &cur.precisions_cholesky)
+                        .map_err(AlgoError::Prim)?
+                } else {
+                    host.e_step(&cur.weights, &cur.means, &cur.precisions_cholesky)
+                };
+                let covariances = if let Some(dev) = device.as_mut() {
+                    dev.covariances(pool, &nk, &means).map_err(AlgoError::Prim)?
+                } else {
+                    host.covariances(&nk, &means)
+                };
                 let prec_chol =
                     precisions_cholesky(&covariances, k, d, ct).map_err(ill_conditioned)?;
                 let inv_n = 1.0 / n as f64;
@@ -459,12 +513,22 @@ where
         // The bound it produces is deliberately NOT stored (sklearn keeps
         // `max_lower_bound`), which is what makes `lower_bound_` lag by one
         // M-step — see the module docs.
-        let (_final_bound, _, _) = host.e_step(
-            &params.weights,
-            &params.means,
-            &params.precisions_cholesky,
-        );
-        let labels: Vec<i32> = argmax_rows(host.resp(), n, k);
+        let labels: Vec<i32> = if let Some(dev) = device.as_mut() {
+            let (_final_bound, _, _) = dev
+                .e_step(pool, &params.weights, &params.means, &params.precisions_cholesky)
+                .map_err(AlgoError::Prim)?;
+            argmax_rows(&dev.resp_to_host(pool), n, k)
+        } else {
+            let (_final_bound, _, _) = host.e_step(
+                &params.weights,
+                &params.means,
+                &params.precisions_cholesky,
+            );
+            argmax_rows(host.resp(), n, k)
+        };
+        if let Some(dev) = device {
+            dev.release_into(pool);
+        }
 
         Ok(GaussianMixture {
             n_components: self.n_components,
@@ -659,7 +723,7 @@ where
     ) -> Result<Self::Fitted, AlgoError> {
         validate_geometry(x, shape)?;
         let host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
-        self.fit_core(&host, shape)
+        self.fit_core(pool, &host, shape)
     }
 }
 

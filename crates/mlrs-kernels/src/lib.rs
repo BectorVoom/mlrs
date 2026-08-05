@@ -30,6 +30,12 @@ pub mod elementwise;
 // driven by `prims/hist_gradient_boosting.rs`. Reuses `tree.rs` binning,
 // cumulative-histogram and forest-traversal kernels.
 pub mod gbt;
+// GaussianMixture DEVICE EM engine kernels (MIX-GPU): the bulk O(n·k·d) /
+// O(n·k·d²) E-step/M-step passes moved off the host, keeping the small
+// O(k·d³) Cholesky/triangular-inverse tail entirely host-side. Owns its
+// `pub mod` (single-owner, no root re-export — the `gram`/`kmeans`
+// module-scoped-access precedent: callers use `mlrs_kernels::gmm::{…}`).
+pub mod gmm;
 // LinearRegression Gram+eig path perf lever (LINEAR-01, D-02): row-blocked
 // shared-memory XᵀX/Xᵀy accumulation replacing the skinny-output/huge-K GEMM
 // formation (the `kmeans.rs` "GEMM sums" pathology, same fix applied). Owns

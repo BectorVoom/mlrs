@@ -34,6 +34,15 @@ pub mod gram_host;
 // `f64`-bound, and has an `O(k·d³)` serial factorization tail. See its module
 // docs for the three structural wins over sklearn's own implementation.
 pub mod gmm_host;
+// DEVICE arm of the mixture EM loop (MIX-GPU), for large `n` on backends with
+// genuine `f64` kernels AND `f64` transcendentals (cuda/rocm in practice — see
+// `gmm_device_applicable`). Keeps `gmm_host`'s `O(k·d³)` Cholesky/triangular-
+// inverse tail entirely host-side and moves only the two `n`-scaling passes
+// (E-step, M-step covariance) onto device-resident `X`/`resp`, mirroring how
+// `normal_eq` relates to `gram`: a device twin that is a DROP-IN replacement
+// for the corresponding host engine's per-iteration calls, not a rewrite of
+// the whole algorithm. See its own module docs for the full design.
+pub mod gmm_device;
 // DEVICE arm of the same normal-equations formation, pinned to `f64`
 // accumulation whatever the estimator's own width (BAYES-GPU). `gram`'s Gram
 // accumulates in the element type, which `BayesianRidge`'s residual identity
@@ -139,6 +148,13 @@ pub mod topk;
 // TSNE-01: the exact-method t-SNE per-iteration gradient prim (Student-t
 // affinity + KL-gradient GATHER over the Phase-2 distance prim).
 pub mod tsne;
+// The parallel HOST t-SNE engine (TSNE-PARAMS): the Barnes-Hut quadtree, both
+// gradient objectives, and the two-phase descent that drives them. Owns
+// `method='barnes_hut'` on every backend — the tree walk is a per-point,
+// per-iteration pointer chase, the shape a SIMT device cannot execute without
+// full warp divergence — and serves `method='exact'` wherever the host arm is
+// faster than the `tsne` device prim above.
+pub mod tsne_host;
 
 // ---------------------------------------------------------------------------
 // Shared 1-D launch geometry

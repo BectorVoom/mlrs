@@ -27,6 +27,29 @@
 //! structural wins over `sklearn.mixture._gaussian_mixture` are baked in, and
 //! they are why a single-threaded run of this file already competes.
 //!
+//! ## A device arm now exists too — for large `n`, not instead of this file
+//! [`crate::prims::gmm_device`] adds a genuine on-device EM engine despite the
+//! three facts above, by being surgical about what actually moves: it keeps
+//! reasons #2 and #3 pinned exactly where they are (the `O(k·d³)` Cholesky /
+//! triangular-inverse tail stays HOST arithmetic, called from the estimator
+//! every iteration same as here, and the reduction is gated off any backend
+//! whose `f64` — or `f64` TRANSCENDENTALS, the sharper landmine
+//! [`crate::capability::f64_transcendental_supported`] documents — are not
+//! genuinely available, via [`crate::capability::f64_device_kernels_available`]
+//! rather than the under-reporting `supports_type(F64)` probe). What moves is
+//! ONLY the two passes whose cost scales with `n`: the E-step's weighted-log-
+//! prob/responsibility/`nk`+`means` sweep and the M-step's covariance sweep,
+//! kept device-resident (`X` and `resp` never leave the device) for the WHOLE
+//! `max_iter` loop of a restart — the same shape `KMeans`'s Lloyd loop uses.
+//! That answers reason #1 too: the per-iteration host traffic shrinks from two
+//! `O(n·k·d)`-ish passes to a few KB of `O(k·d)`-ish scalars, so the fixed
+//! launch overhead is paid a constant number of times per iteration rather than
+//! scaling with what crosses the bus. Below a conservative `n·k·d` size floor
+//! the launch overhead still dominates (reason #1 unmodified), so
+//! [`crate::prims::gmm_device::gmm_device_applicable`] keeps the estimator on
+//! this file at small scale — the device arm is an ADDITIONAL fast path for
+//! large `n` on cuda/rocm hardware, not a replacement for anything here.
+//!
 //! ## The three algorithmic wins over sklearn
 //!
 //! ### 1. The precision Cholesky is TRIANGULAR and sklearn ignores it
@@ -84,7 +107,11 @@ use crate::prims::rng::SplitMix64;
 
 /// `ln(2π)`, the Gaussian log-normalizer constant sklearn spells
 /// `n_features * np.log(2 * np.pi)`.
-const LOG_2PI: f64 = 1.837_877_066_409_345_5;
+///
+/// `pub(crate)` so [`crate::prims::gmm_device`]'s host-side bias computation
+/// (the E-step's `bias[c] = ln(weight_c) + log_det_c − ½·d·LOG_2PI`) shares the
+/// exact same constant rather than a second copy that could drift.
+pub(crate) const LOG_2PI: f64 = 1.837_877_066_409_345_5;
 
 /// Rows processed together by the blocked passes.
 ///
@@ -98,7 +125,10 @@ const ROW_BLOCK: usize = 64;
 /// component cannot divide by zero. The reference computes `resp` in the
 /// design's dtype; we always compute in `f64`, and matching sklearn's `float64`
 /// path is what the oracle compares against.
-const NK_EPS: f64 = 10.0 * f64::EPSILON;
+///
+/// `pub(crate)` so [`crate::prims::gmm_device`]'s device-arm `nk` finish uses
+/// the identical floor rather than a second copy that could drift.
+pub(crate) const NK_EPS: f64 = 10.0 * f64::EPSILON;
 
 /// sklearn's four `covariance_type` values (`StrOptions({'full', 'tied',
 /// 'diag', 'spherical'})`), which select BOTH the parameterization of
