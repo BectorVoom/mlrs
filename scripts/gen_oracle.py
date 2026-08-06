@@ -997,6 +997,193 @@ def gen_knn_regressor_params(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# --- KNN-CLF-PARAMS: the KNeighborsClassifier full-parameter oracle ---------
+#
+# The classifier fixture reuses the REGRESSOR design (`_knn_reg_data`) verbatim
+# and only replaces the target. That is deliberate rather than lazy: the design's
+# two load-bearing properties — a duplicated TRAIN pair and query rows that
+# coincide with training points — are exactly what the `weights='distance'`
+# `1/0` indicator branch needs, and re-deriving them from a fresh seed would risk
+# a fixture where that branch is never taken and every distance case silently
+# tests the generic `1/d` path twice.
+KNN_CLF_K = 5
+KNN_CLF_P = 3.0
+# NON-CONTIGUOUS class ids. A predict path that returned the DENSE column index
+# (or `argmax` straight out of the proba matrix) instead of looking the id up in
+# `classes_` produces `{0, 1, 2}` and is caught here; with `{0, 1, 2}` labels it
+# would pass unnoticed.
+KNN_CLF_CLASSES = (0, 2, 7)
+# The SECOND output column's own label set, disjoint from the first's. A
+# multi-output bug that reuses column 0's `classes_` for column 1 cannot produce
+# these ids at all.
+KNN_CLF_CLASSES_B = (3, 5)
+KNN_CLF_METRIC_STRINGS = KNN_REG_METRIC_STRINGS
+KNN_CLF_ALGORITHMS = KNN_REG_ALGORITHMS
+
+
+def _knn_clf_data(seed: int):
+    """`(X, Xq, y, y_multi)` for the KNN-classifier fixtures — integer targets.
+
+    `X` / `Xq` are the regressor design unchanged (see `_knn_reg_data`); the
+    targets are that design's linear responses bucketed into class ids.
+
+    Bucketing AFTER the duplication in `_knn_reg_data` is what keeps the oracle
+    unambiguous: train rows 2 and 7 are identical, so they get identical linear
+    responses and therefore identical labels. Two search strategies may order
+    that exact-distance tie differently — and at the k-th slot may even pick
+    different members of it — but since both carry the same vote, no ordering can
+    move a prediction.
+
+    Terciles (not fixed thresholds) so the three classes are near-balanced: a
+    dominant class would let a broken vote agree with sklearn by always guessing
+    the majority.
+    """
+    x, xq, y_lin, y_multi_lin = _knn_reg_data(seed)
+    lo, hi = np.quantile(y_lin, [1.0 / 3.0, 2.0 / 3.0])
+    y = np.where(
+        y_lin < lo,
+        KNN_CLF_CLASSES[0],
+        np.where(y_lin < hi, KNN_CLF_CLASSES[1], KNN_CLF_CLASSES[2]),
+    )
+    second = y_multi_lin[:, 1]
+    y_b = np.where(
+        second < np.median(second), KNN_CLF_CLASSES_B[0], KNN_CLF_CLASSES_B[1]
+    )
+    return x, xq, y.astype(np.float64), np.column_stack([y, y_b]).astype(np.float64)
+
+
+def gen_knn_classifier_params(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the KNeighborsClassifier full-parameter oracle (KNN-CLF-PARAMS).
+
+    One fixture, every hyperparameter combination the DEVICE path serves, all
+    from `sklearn.neighbors.KNeighborsClassifier(algorithm='brute', ...)`:
+
+      * `weights` in {uniform, distance}
+      * `metric` in {euclidean, manhattan, chebyshev, minkowski(p=3), cosine}
+      * every STRING spelling of `metric` (nine) and of `algorithm` (four)
+      * a multi-output (two-column) target under both weightings
+
+    BOTH `predict` and `predict_proba` are stored for each case. They are not
+    redundant: `predict` is an argmax, so a proba matrix that is wrong by a
+    constant factor, mis-normalized, or has two columns swapped can still argmax
+    to the right label for every row of a 12-query fixture. The proba arrays are
+    what actually pin the weighting.
+
+    Array names are `predict_<metric>_<weights>` / `proba_<metric>_<weights>`,
+    `alias_<metric>_<weights>` for the nine spellings, `alg_<algorithm>_<weights>`
+    for the four strategies, `predict_multi_<weights>` +
+    `proba_multi_<weights>_<column>` for the 2-column target, and
+    `distances_manhattan` / `indices_manhattan` for the `kneighbors` surface
+    under a NON-default metric.
+
+    The callable-`weights` / callable-`metric` and STRING-label paths are
+    deliberately NOT stored here: they are host-side reimplementations of
+    sklearn's own host code (or, for string labels, an encoding sklearn also does
+    host-side), so a committed oracle would only pin numpy against numpy. The
+    Python tests exercise them against a live sklearn instead, which is the
+    comparison that can actually fail.
+    """
+    from sklearn.neighbors import KNeighborsClassifier
+
+    x, xq, y, y_multi = _knn_clf_data(seed)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {
+        "X": c(x),
+        "Xq": c(xq),
+        "y": c(y),
+        "y_multi": c(y_multi),
+        "k": c([KNN_CLF_K]),
+        "p": c([KNN_CLF_P]),
+        "classes": c(sorted(KNN_CLF_CLASSES)),
+        "classes_b": c(sorted(KNN_CLF_CLASSES_B)),
+    }
+
+    metrics = {
+        "euclidean": dict(metric="euclidean"),
+        "manhattan": dict(metric="manhattan"),
+        "chebyshev": dict(metric="chebyshev"),
+        "minkowski": dict(metric="minkowski", p=KNN_CLF_P),
+        "cosine": dict(metric="cosine"),
+    }
+    for name, kw in metrics.items():
+        for weights in ("uniform", "distance"):
+            clf = KNeighborsClassifier(
+                n_neighbors=KNN_CLF_K,
+                algorithm="brute",
+                weights=weights,
+                **kw,
+            ).fit(x, y)
+            out[f"predict_{name}_{weights}"] = c(clf.predict(xq))
+            out[f"proba_{name}_{weights}"] = c(clf.predict_proba(xq))
+
+    # --- The MULTI-OUTPUT target. `predict` is (n_query, 2); `predict_proba` is
+    #     a LIST of one matrix per output column, so each is stored separately
+    #     (their widths differ — three classes then two).
+    for weights in ("uniform", "distance"):
+        clf = KNeighborsClassifier(
+            n_neighbors=KNN_CLF_K,
+            algorithm="brute",
+            weights=weights,
+            metric="euclidean",
+        ).fit(x, y_multi)
+        out[f"predict_multi_{weights}"] = c(clf.predict(xq))
+        for col, proba in enumerate(clf.predict_proba(xq)):
+            out[f"proba_multi_{weights}_{col}"] = c(proba)
+
+    nn = KNeighborsClassifier(
+        n_neighbors=KNN_CLF_K, algorithm="brute", metric="manhattan"
+    ).fit(x, y)
+    dist, idx = nn.kneighbors(xq)
+    out["distances_manhattan"] = c(dist)
+    out["indices_manhattan"] = c(idx)
+
+    # --- Every STRING value of `metric`, including the aliases. The block above
+    #     covers the five distinct distance FUNCTIONS; this one covers the nine
+    #     strings a user can type, so `metric='l1'` is gated by sklearn-under-
+    #     `'l1'` rather than by the assumption that mlrs folds it onto
+    #     `manhattan` correctly.
+    #
+    #     Generated under `algorithm='auto'` — the default, and the only value
+    #     that accepts all nine (`'infinity'` is tree-only, `'cosine'` is
+    #     brute-only; see `_ALGORITHM_VALID_METRICS` in the shim).
+    for metric in KNN_CLF_METRIC_STRINGS:
+        for weights in ("uniform", "distance"):
+            clf = KNeighborsClassifier(
+                n_neighbors=KNN_CLF_K,
+                algorithm="auto",
+                weights=weights,
+                metric=metric,
+            ).fit(x, y)
+            out[f"alias_{metric}_{weights}"] = c(clf.predict(xq))
+            out[f"alias_proba_{metric}_{weights}"] = c(clf.predict_proba(xq))
+
+    # --- Every STRING value of `algorithm`, at the default metric.
+    #
+    #     mlrs runs brute force for all four, so these arrays gate that claim:
+    #     `alg_kd_tree_*` is sklearn's K-D TREE answer, and mlrs's brute-force
+    #     predict has to reproduce it.
+    for algorithm in KNN_CLF_ALGORITHMS:
+        for weights in ("uniform", "distance"):
+            clf = KNeighborsClassifier(
+                n_neighbors=KNN_CLF_K,
+                algorithm=algorithm,
+                weights=weights,
+            ).fit(x, y)
+            out[f"alg_{algorithm}_{weights}"] = c(clf.predict(xq))
+            out[f"alg_proba_{algorithm}_{weights}"] = c(clf.predict_proba(xq))
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"knn_clf_params_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
 # Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05). The fixed Minkowski-p
 # test exponent (p != 1, 2 so it is a genuine non-degenerate Minkowski case that
 # the general direct kernel — not a special-cased L1/L2 fast path — must satisfy).
@@ -7249,6 +7436,10 @@ def main() -> None:
     # target and a coincident query (the weights='distance' 1/0 branch).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_knn_regressor_params(dtype=dtype)}")
+    # KNN-CLF-PARAMS: the classifier's full parameter surface, on the SAME design
+    # as the regressor fixture above (see `_knn_clf_data`), x {f32, f64}.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_knn_classifier_params(dtype=dtype)}")
     # Phase-13 multi-metric KNN-graph oracle (PRIM-11, D-05): the full fixed
     # metric set (euclidean, manhattan, cosine, chebyshev, minkowski-p) × {f32
     # (rocm gate), f64 (cpu gate)}, each carrying a DUPLICATE-POINT train row
