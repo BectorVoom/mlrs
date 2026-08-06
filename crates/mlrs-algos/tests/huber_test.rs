@@ -71,6 +71,7 @@ use cubecl::prelude::{CubeElement, Float};
 use mlrs_algos::error::BuildError;
 use mlrs_algos::linear::huber::HuberRegressor;
 use mlrs_algos::typestate::{Fitted, Predict};
+use mlrs_backend::abflag;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -481,6 +482,47 @@ fn oracle_value_cases_f64() {
     }
     let case = load_npz(fixture("huber_f64_seed42.npz")).expect("load huber f64 fixture");
     run_value_cases::<f64>(&case, "huber f64");
+}
+
+/// The SAME value gates, run against the DEVICE engine (HUBER-02).
+///
+/// Since the engine is chosen per fit by
+/// `prims::huber_objective::huber_device_applicable`, and the crossover on this
+/// hardware keeps oracle-sized fixtures on the fused host pass, the two tests
+/// above would never touch the device kernels on a GPU backend. Forcing
+/// `MLRS_HUBER_ENGINE=device` is what makes the device arm answer to
+/// scikit-learn rather than only to the round-trip arm it replaced.
+///
+/// Self-skips on the cpu backend, where the "device" is `cubecl-cpu` and the
+/// override is refused as a correctness gate rather than a preference.
+///
+/// Forced through `abflag`, never `std::env::set_var` — that is an `environ`
+/// data race against every sibling test's dispatcher read, and it would leak
+/// process-wide and make the HOST-arm tests above silently measure the device
+/// one ([[mlrs-abflag-test-knobs]]).
+#[test]
+fn oracle_value_cases_f32_device_engine() {
+    if capability::active_backend_name() == "cpu" {
+        return;
+    }
+    let _engine = abflag::force("MLRS_HUBER_ENGINE", "device");
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "huber/device");
+    let case = load_npz(fixture("huber_f32_seed42.npz")).expect("load huber f32 fixture");
+    run_value_cases::<f32>(&case, "huber f32 device-engine");
+}
+
+/// [`oracle_value_cases_f32_device_engine`] at `f64`. Self-skips wherever the
+/// backend cannot do `f64` device kernels at all — which is rocm and cuda here,
+/// so in practice this runs on wgpu ([[mlrs-rocm-hardware-env]]).
+#[test]
+fn oracle_value_cases_f64_device_engine() {
+    if capability::active_backend_name() == "cpu" || capability::skip_f64_with_log() {
+        return;
+    }
+    let _engine = abflag::force("MLRS_HUBER_ENGINE", "device");
+    let case = load_npz(fixture("huber_f64_seed42.npz")).expect("load huber f64 fixture");
+    run_value_cases::<f64>(&case, "huber f64 device-engine");
 }
 
 /// THE gate that does not depend on where either solver stopped: mlrs's
