@@ -207,6 +207,50 @@ pub fn gmm_resp_normalize_rows<F: Float + CubeElement>(
     }
 }
 
+/// Per-row responsibility entropy: `ent_out[i] = Σ_c r_ic·ln r_ic`, where
+/// `log_r = wlp[i,c] − lse_i` and `r = exp(log_r)` — sklearn's
+/// `np.sum(np.exp(log_resp) * log_resp)`, reduced to one scalar per row so the
+/// caller folds it with [`crate::kmeans::sum_device`] exactly like
+/// [`gmm_resp_normalize_rows`]'s `lse_out` already is.
+///
+/// A separate kernel rather than an extra output on [`gmm_resp_normalize_rows`]
+/// — that kernel already ships behind `GaussianMixture`'s device arm, and
+/// widening a `#[cube(launch)]` signature is a cross-cutting change that can
+/// silently break other callers on a different branch. This one is additive:
+/// it re-derives `log_r` from `wlp`/`lse_out` (both already written by
+/// [`gmm_resp_normalize_rows`]) rather than reading back `resp` and calling
+/// `.ln()` a second time, so `log_r` matches the normalize kernel's own value
+/// bit-for-bit instead of round-tripping through `ln(exp(x))`.
+///
+/// Used only by `GmmDevice::e_step_biased`
+/// (`../../mlrs_backend/prims/gmm_device/struct.GmmDevice.html`) —
+/// `BayesianGaussianMixture`'s variational E-step needs the entropy term for
+/// its evidence lower bound; the plain EM E-step does not.
+///
+/// One unit per row (`ABSOLUTE_POS = i`); GATHER-only.
+#[cube(launch)]
+pub fn gmm_entropy_rows<F: Float + CubeElement>(
+    wlp: &Array<F>,
+    lse: &Array<F>,
+    ent_out: &mut Array<F>,
+    n: u32,
+    k: u32,
+) {
+    let i = ABSOLUTE_POS;
+    if i < n as usize {
+        let base = (i as u32) * k;
+        let lse_i = lse[i];
+        let mut acc = F::new(0.0_f32);
+        let mut c = 0u32;
+        while c < k {
+            let log_r = wlp[(base + c) as usize] - lse_i;
+            acc += log_r.exp() * log_r;
+            c += 1u32;
+        }
+        ent_out[i] = acc;
+    }
+}
+
 /// ROW-BLOCKED soft-weight `nk`/`means` partial — the dense-`resp` twin of
 /// `kmeans::centroid_sumcount_blocked`.
 ///

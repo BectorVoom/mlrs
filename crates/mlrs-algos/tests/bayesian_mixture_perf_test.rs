@@ -422,6 +422,94 @@ fn bgm_perf_ladders() {
     );
 }
 
+/// DEVICE-vs-HOST EM engine ladder — the twin of
+/// `gaussian_mixture_perf_test.rs::gmm_device_vs_host_ladder`, forcing
+/// `MLRS_GMM_DEVICE` to bypass `gmm_device_applicable`'s size floor so every
+/// rung is a genuine A/B. Sweeps `n_samples`, `covariance_type`,
+/// `n_features`, `n_components` — the same axes, since [`GmmDevice`]'s
+/// `e_step_biased` shares the whole `O(n·k·d²)` kernel set `e_step` does
+/// (module docs) — plus `weight_concentration_prior_type`, which this
+/// estimator alone has: its cost lives entirely in the `O(k)` bias fold
+/// [`BayesianGaussianMixture::log_weight_term`] computes on HOST before every
+/// device E-step launch, so this rung is the one place a widening gap between
+/// `dp`/`dd` would show up as device overhead the plain model's ladder cannot
+/// exercise.
+///
+/// Only meaningful on real cuda/rocm hardware. On cpu/wgpu this still
+/// compiles and runs (both columns report the same host-engine numbers, or
+/// this logs and skips via the same capability gates
+/// `gaussian_mixture_perf_test.rs` checks), so the harness works unmodified
+/// wherever it is run.
+#[test]
+#[ignore = "wall-clock probe; run with --release --ignored --nocapture"]
+fn bgm_device_vs_host_ladder() {
+    if mlrs_backend::capability::active_backend_name() == "cpu" {
+        println!("\n=== device vs host EM engine: skipped (cpu backend, no device arm) ===");
+        return;
+    }
+    if !mlrs_backend::capability::f64_device_kernels_available()
+        || !mlrs_backend::capability::f64_transcendental_supported()
+    {
+        println!(
+            "\n=== device vs host EM engine: skipped (backend lacks f64 device kernels or \
+             f64 transcendentals — see gmm_device.rs module docs) ==="
+        );
+        return;
+    }
+
+    const DP: &str = "dirichlet_process";
+    const DD: &str = "dirichlet_distribution";
+    let rungs: Vec<Rung> = vec![
+        rung_fixed_iters("n=2000", 2_000, 16, 8, "full", "random", DP, 30),
+        rung_fixed_iters("n=20000", 20_000, 16, 8, "full", "random", DP, 30),
+        rung_fixed_iters("n=200000", 200_000, 16, 8, "full", "random", DP, 30),
+        rung_fixed_iters("cov=full n=200000", 200_000, 16, 8, "full", "random", DP, 30),
+        rung_fixed_iters("cov=tied n=200000", 200_000, 16, 8, "tied", "random", DP, 30),
+        rung_fixed_iters("cov=diag n=200000", 200_000, 16, 8, "diag", "random", DP, 30),
+        rung_fixed_iters(
+            "cov=spherical n=200000",
+            200_000,
+            16,
+            8,
+            "spherical",
+            "random",
+            DP,
+            30,
+        ),
+        rung_fixed_iters("d=64 n=200000", 200_000, 64, 8, "full", "random", DP, 30),
+        rung_fixed_iters("d=256 n=200000", 200_000, 256, 8, "full", "random", DP, 30),
+        rung_fixed_iters("k=2 n=200000", 200_000, 16, 2, "full", "random", DP, 30),
+        rung_fixed_iters("k=32 n=200000", 200_000, 16, 32, "full", "random", DP, 30),
+        rung_fixed_iters("prior=dp n=200000", 200_000, 16, 8, "full", "random", DP, 30),
+        rung_fixed_iters("prior=dd n=200000", 200_000, 16, 8, "full", "random", DD, 30),
+    ];
+
+    println!("\n=== BGM device vs host EM engine (MLRS_GMM_DEVICE forced) ===");
+    println!(
+        "{:<24} {:>12} {:>12} {:>8}",
+        "rung", "host ms", "device ms", "dev/host"
+    );
+    println!("{}", "-".repeat(60));
+    for r in &rungs {
+        let x = make_blobs(r.n, r.d, r.k, 42);
+        let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(runtime::active_client());
+
+        let (host_wall, _) = {
+            let _g = abflag::force("MLRS_GMM_DEVICE", "0");
+            measure(|| fit(&mut pool, &x, r))
+        };
+        let (dev_wall, _) = {
+            let _g = abflag::force("MLRS_GMM_DEVICE", "1");
+            measure(|| fit(&mut pool, &x, r))
+        };
+        println!(
+            "{:<24} {host_wall:>12.2} {dev_wall:>12.2} {:>7.2}x",
+            r.label,
+            dev_wall / host_wall
+        );
+    }
+}
+
 /// Worker-pool width sweep, forced through the shared `MLRS_GMM_UNITS`
 /// `abflag` knob so a flat sweep proves the knob is LIVE rather than proving
 /// the pool does not help ([[mlrs-bench-verify-knob-is-live]]).

@@ -87,9 +87,11 @@ use cubecl::prelude::*;
 
 use mlrs_core::PrimError;
 use mlrs_kernels::gmm::{
-    gmm_cov_diag_blocked, gmm_cov_full_blocked, gmm_fold_partials, gmm_resp_normalize_rows,
-    gmm_soft_sumcount_blocked, gmm_wlp_direct, gmm_xtx_blocked,
+    gmm_cov_diag_blocked, gmm_cov_full_blocked, gmm_entropy_rows, gmm_fold_partials,
+    gmm_resp_normalize_rows, gmm_soft_sumcount_blocked, gmm_wlp_direct, gmm_xtx_blocked,
 };
+
+use cubecl::server::Handle;
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
@@ -316,21 +318,117 @@ impl GmmDevice {
         prec_chol: &[f64],
     ) -> Result<(f64, Vec<f64>, Vec<f64>), PrimError> {
         let (n, d, k, ct) = (self.n, self.d, self.k, self.ct);
-        guard_u32("n", n)?;
-        guard_u32("d", d)?;
-        guard_u32("k", k)?;
-
-        // --- Host prep: the O(k) bias fold (module docs — this stays host
-        //     arithmetic exactly like `gmm_host::GmmHost::e_step`'s). ---
+        // The O(k) bias fold (module docs — this stays host arithmetic
+        // exactly like `gmm_host::GmmHost::e_step`'s): plain EM's bias is
+        // `ln(weight_c)` plus the Cholesky log-det plus the `-0.5*d*ln(2pi)`
+        // normalizer, all folded by `wlp_normalize`.
         let log_det = log_det_cholesky(prec_chol, k, d, ct);
         let bias: Vec<f64> = (0..k)
             .map(|c| weights[c].ln() + log_det[c] - 0.5 * d as f64 * LOG_2PI)
             .collect();
 
+        let (wlp, wlp_len, lse) = self.wlp_normalize(pool, &bias, means, prec_chol)?;
+        pool.release(wlp, wlp_len * 8);
+
+        // --- mean_lpn: fold the n-length lse partials the SAME way KMeans
+        //     folds its per-row shift/changed partials — a row-blocked
+        //     partial-sum + a tiny readback, never an O(n) one. ---
+        let lse_dev = DeviceArray::<ActiveRuntime, f64>::from_raw(lse, n);
+        let mean_lpn = super::kmeans::sum_device::<f64>(pool, &lse_dev, n)? / n as f64;
+        lse_dev.release_into(pool);
+
+        // --- nk / means: the soft-weight generalization of
+        //     `centroid_sums_dev`'s two-stage blocked reduction. ---
+        let (nk, means_out) = self.nk_means_reduce(pool)?;
+
+        Ok((mean_lpn, nk, means_out))
+    }
+
+    /// The VARIATIONAL E-step: the device twin of
+    /// [`gmm_host::GmmHost::e_step_biased`](crate::prims::gmm_host::GmmHost::e_step_biased).
+    /// `log_weight_term[c]` REPLACES `ln(weight_c)` verbatim in the bias fold
+    /// (see that method's docs for why this is the whole degree of freedom
+    /// `BayesianGaussianMixture` needs) — every other pass (the Mahalanobis
+    /// kernel, the `nk`/`means` reduction, [`GmmDevice::covariances`]) is
+    /// byte-for-byte the same code [`GmmDevice::e_step`] uses, shared through
+    /// [`GmmDevice::wlp_normalize`].
+    ///
+    /// The extra return is `Σ_i Σ_c r_ic·ln r_ic` (sklearn's
+    /// `np.sum(np.exp(log_resp) * log_resp)`), computed by
+    /// [`mlrs_kernels::gmm::gmm_entropy_rows`] from the SAME `wlp`/`lse`
+    /// buffers `wlp_normalize` already produced, before they are released —
+    /// one extra small kernel launch per iteration, never a second `O(n·k·d²)`
+    /// pass.
+    pub fn e_step_biased(
+        &mut self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        log_weight_term: &[f64],
+        means: &[f64],
+        prec_chol: &[f64],
+    ) -> Result<(f64, Vec<f64>, Vec<f64>, f64), PrimError> {
+        let (n, d, k, ct) = (self.n, self.d, self.k, self.ct);
+        let log_det = log_det_cholesky(prec_chol, k, d, ct);
+        let bias: Vec<f64> = (0..k)
+            .map(|c| log_weight_term[c] + log_det[c] - 0.5 * d as f64 * LOG_2PI)
+            .collect();
+
+        let (wlp, wlp_len, lse) = self.wlp_normalize(pool, &bias, means, prec_chol)?;
+
+        // --- Entropy: one thread per row, reusing `wlp`/`lse` before they are
+        //     released (module docs on `gmm_entropy_rows`). ---
+        let client = pool.client().clone();
+        let ent = pool.acquire(n * 8);
+        {
+            let (count, dim) =
+                super::launch_dims_1d_folded(n, crate::capability::gather_launch_width());
+            // SAFETY: `wlp`/`lse`/`ent` are sized to `n*k`/`n`/`n`; the kernel
+            // bounds-checks `i < n` and reads `wlp` only at offsets `< n*k`.
+            let wlp_arg = unsafe { ArrayArg::from_raw_parts(wlp.clone(), wlp_len) };
+            let lse_arg = unsafe { ArrayArg::from_raw_parts(lse.clone(), n) };
+            let ent_arg = unsafe { ArrayArg::from_raw_parts(ent.clone(), n) };
+            gmm_entropy_rows::launch::<f64, ActiveRuntime>(
+                &client, count, dim, wlp_arg, lse_arg, ent_arg, n as u32, k as u32,
+            );
+        }
+        pool.release(wlp, wlp_len * 8);
+
+        let lse_dev = DeviceArray::<ActiveRuntime, f64>::from_raw(lse, n);
+        let mean_lpn = super::kmeans::sum_device::<f64>(pool, &lse_dev, n)? / n as f64;
+        lse_dev.release_into(pool);
+
+        let ent_dev = DeviceArray::<ActiveRuntime, f64>::from_raw(ent, n);
+        let resp_log_resp = super::kmeans::sum_device::<f64>(pool, &ent_dev, n)?;
+        ent_dev.release_into(pool);
+
+        let (nk, means_out) = self.nk_means_reduce(pool)?;
+
+        Ok((mean_lpn, nk, means_out, resp_log_resp))
+    }
+
+    /// Shared body of [`GmmDevice::e_step`]/[`GmmDevice::e_step_biased`]:
+    /// given the per-component `bias` already folded (`ln(weight)` or
+    /// `log_weight_term`, plus the Cholesky log-det and the `-0.5*d*ln(2pi)`
+    /// normalizer), runs the `gmm_wlp_direct` → `gmm_resp_normalize_rows`
+    /// pair, writing `self.resp` IN PLACE. Returns the STILL-ACQUIRED `wlp`
+    /// handle (with its length) and the `lse` handle so a caller that also
+    /// needs the entropy term can fold one more kernel over them before
+    /// releasing `wlp` — the caller owns both releases.
+    fn wlp_normalize(
+        &mut self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        bias: &[f64],
+        means: &[f64],
+        prec_chol: &[f64],
+    ) -> Result<(Handle, usize, Handle), PrimError> {
+        let (n, d, k, ct) = (self.n, self.d, self.k, self.ct);
+        guard_u32("n", n)?;
+        guard_u32("d", d)?;
+        guard_u32("k", k)?;
+
         let client = pool.client().clone();
         let means_dev = DeviceArray::<ActiveRuntime, f64>::from_host(pool, means);
         let prec_dev = DeviceArray::<ActiveRuntime, f64>::from_host(pool, prec_chol);
-        let bias_dev = DeviceArray::<ActiveRuntime, f64>::from_host(pool, &bias);
+        let bias_dev = DeviceArray::<ActiveRuntime, f64>::from_host(pool, bias);
 
         // --- Phase 1: wlp[i,c] (n x k GATHER, one thread per pair). ---
         let wlp_len = n * k;
@@ -385,20 +483,8 @@ impl GmmDevice {
                 &client, count, dim, wlp_arg, r_arg, l_arg, n as u32, k as u32,
             );
         }
-        pool.release(wlp, wlp_len * 8);
 
-        // --- mean_lpn: fold the n-length lse partials the SAME way KMeans
-        //     folds its per-row shift/changed partials — a row-blocked
-        //     partial-sum + a tiny readback, never an O(n) one. ---
-        let lse_dev = DeviceArray::<ActiveRuntime, f64>::from_raw(lse, n);
-        let mean_lpn = super::kmeans::sum_device::<f64>(pool, &lse_dev, n)? / n as f64;
-        lse_dev.release_into(pool);
-
-        // --- nk / means: the soft-weight generalization of
-        //     `centroid_sums_dev`'s two-stage blocked reduction. ---
-        let (nk, means_out) = self.nk_means_reduce(pool)?;
-
-        Ok((mean_lpn, nk, means_out))
+        Ok((wlp, wlp_len, lse))
     }
 
     /// Two-stage blocked `nk`/`means` reduction from the CURRENT `resp` —
