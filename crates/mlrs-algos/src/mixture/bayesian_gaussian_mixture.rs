@@ -38,9 +38,25 @@
 //! literally sklearn's `_estimate_gaussian_parameters` outputs, so what is
 //! ADDED here over the plain model is `O(k·d²)` per iteration of conjugate
 //! updates against an `O(n·k·d²)` sweep — the Bayesian machinery is nearly
-//! free at any `n` a user runs. There is no device arm: this estimator is
-//! strictly host, and the `pool` argument its ingresses take is threaded
-//! through only to satisfy the shared `Fit` signature.
+//! free at any `n` a user runs.
+//!
+//! Like [`GaussianMixture`](super::gaussian_mixture::GaussianMixture), this
+//! estimator ALSO has a device EM engine
+//! ([`GmmDevice`](mlrs_backend::prims::gmm_device::GmmDevice)) it can take for
+//! large fits on cuda/rocm. It reuses the identical mechanism: the
+//! variational E-step's `_estimate_log_prob` differs from the plain model's
+//! only by a per-component additive constant
+//! ([`BayesianGaussianMixture::log_weight_term`]), so
+//! [`GmmDevice::e_step_biased`](mlrs_backend::prims::gmm_device::GmmDevice::e_step_biased)
+//! runs the SAME `O(n·k·d²)` Mahalanobis/normalize/reduce kernels
+//! [`GmmDevice::e_step`](mlrs_backend::prims::gmm_device::GmmDevice::e_step)
+//! does for the plain model, plus one small additional kernel
+//! ([`mlrs_kernels::gmm::gmm_entropy_rows`]) for the `Σ r·ln r` term this
+//! estimator's lower bound needs and plain EM does not. The variational
+//! M-step ([`BayesianGaussianMixture::m_step`]) stays host-resident regardless
+//! of engine — it is `O(k·d²)`, not `O(n·k·d²)`, same as
+//! [`GaussianMixture`](super::gaussian_mixture::GaussianMixture)'s
+//! `precisions_cholesky` tail.
 //!
 //! ## sklearn parity notes (the traps)
 //! - **`lower_bound_` is NOT a log-likelihood.** It is the evidence lower bound
@@ -79,6 +95,7 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::gmm_device::{gmm_device_applicable, GmmDevice};
 use mlrs_backend::prims::gmm_host::{
     cholesky_lower_blocks, log_det_cholesky, logsumexp_rows, precisions_cholesky,
     precisions_from_cholesky, weighted_log_prob_biased, CovarianceType, GmmHost,
@@ -427,23 +444,43 @@ where
             && self.verbose_interval == other.verbose_interval
     }
 
-    /// Should `fit` take [`BayesianGaussianMixture::fit_from_host_slice`]?
+    /// Should `fit` take [`BayesianGaussianMixture::fit_from_host_slice`]
+    /// rather than uploading and going through [`Fit::fit`]?
     ///
-    /// ALWAYS `true`, and more strongly than for the plain model: this
-    /// estimator has NO device arm at all, so the host ingress never uploads
-    /// anything while [`Fit::fit`] must pay one upload to obtain the
-    /// `DeviceArray` it takes. The predicate exists because the two entry
-    /// points take different operand types and a caller has to choose before
-    /// ingress.
+    /// ALWAYS `true` — mirrors
+    /// [`GaussianMixture::host_fit_applicable`](super::gaussian_mixture::GaussianMixture::host_fit_applicable)
+    /// exactly, for the same reason: `fit_from_host_slice` is a strict
+    /// superset of what `Fit::fit` can reach. It never uploads `x` itself when
+    /// the variational loop stays host-resident, or is uploaded exactly once
+    /// by [`GmmDevice::new`](mlrs_backend::prims::gmm_device::GmmDevice::new)
+    /// when [`BayesianGaussianMixture::device_fit_applicable`] takes the
+    /// device EM engine — whereas `Fit::fit` always pays one upload up front.
+    /// The predicate exists anyway because the two entry points take
+    /// DIFFERENT operand types and a caller has to choose before ingress.
     pub fn host_fit_applicable(&self, _shape: (usize, usize)) -> bool {
         true
     }
 
-    /// `fit` over a HOST slice — the no-upload, Python-boundary ingress.
+    /// Does the DEVICE EM engine
+    /// ([`GmmDevice`](mlrs_backend::prims::gmm_device::GmmDevice)) apply to
+    /// this `(n_samples, n_features)` shape, given this estimator's
+    /// `n_components`? Delegates entirely to
+    /// [`gmm_device_applicable`](mlrs_backend::prims::gmm_device::gmm_device_applicable) —
+    /// see [`GaussianMixture::device_fit_applicable`](super::gaussian_mixture::GaussianMixture::device_fit_applicable)'s
+    /// docs, which this mirrors exactly. `fit_core` consults this ONCE per
+    /// fit, before the `n_init` restart loop.
+    pub fn device_fit_applicable(&self, shape: (usize, usize)) -> bool {
+        gmm_device_applicable(shape.0, shape.1, self.n_components)
+    }
+
+    /// `fit` over a HOST slice — the no-upload-by-default, Python-boundary
+    /// ingress.
     ///
-    /// `x` is the `n × d` row-major design borrowed from host memory. `pool` is
-    /// accepted for signature symmetry with the rest of the crate and is never
-    /// touched: the variational loop is entirely host-resident.
+    /// `x` is the `n × d` row-major design borrowed from host memory. `pool`
+    /// is only touched when
+    /// [`BayesianGaussianMixture::device_fit_applicable`] holds for this
+    /// shape — the common case (small/medium fits, or any cpu/wgpu-at-f64
+    /// backend) never touches it and never uploads `x`.
     pub fn fit_from_host_slice(
         self,
         pool: &mut BufferPool<ActiveRuntime>,
@@ -471,7 +508,7 @@ where
     /// replaced by their variational counterparts.
     fn fit_core(
         self,
-        _pool: &mut BufferPool<ActiveRuntime>,
+        pool: &mut BufferPool<ActiveRuntime>,
         x: &[f64],
         shape: (usize, usize),
     ) -> Result<BayesianGaussianMixture<F, Fitted>, AlgoError> {
@@ -491,6 +528,14 @@ where
         let ct = self.covariance_type;
         let mut host = GmmHost::new(x, n, d, k, ct, self.reg_covar);
         let mut rng = SplitMix64::new(self.random_state.unwrap_or(DEFAULT_SEED));
+
+        // The device EM engine, built ONCE (not per restart) when applicable —
+        // mirrors `GaussianMixture::fit_core` exactly (module docs).
+        let mut device: Option<GmmDevice> = if self.device_fit_applicable(shape) {
+            Some(GmmDevice::new(pool, x, n, d, k, ct, self.reg_covar).map_err(AlgoError::Prim)?)
+        } else {
+            None
+        };
 
         // sklearn's `do_init = not (warm_start and converged_)`: a warm-started
         // refit resumes from the carried posterior instead of re-initializing.
@@ -525,17 +570,30 @@ where
                 let prev = lower_bound;
                 // The E-step: ONE fused sweep producing the responsibilities,
                 // `nk`, `xk` and the entropy, driven by the per-component
-                // expected-log terms this model contributes.
+                // expected-log terms this model contributes — on whichever
+                // engine this fit is using (mirrors `GaussianMixture`).
                 let lw = self.log_weight_term(&cur, d);
-                let est = host.e_step_biased(&lw, &cur.means, &cur.precisions_cholesky);
+                let (nk, means, resp_log_resp) = if let Some(dev) = device.as_mut() {
+                    let (_mean_lpn, nk, means, resp_log_resp) = dev
+                        .e_step_biased(pool, &lw, &cur.means, &cur.precisions_cholesky)
+                        .map_err(AlgoError::Prim)?;
+                    (nk, means, resp_log_resp)
+                } else {
+                    let est = host.e_step_biased(&lw, &cur.means, &cur.precisions_cholesky);
+                    (est.nk, est.means, est.resp_log_resp)
+                };
                 // `sk` — sklearn's `_estimate_gaussian_parameters` third
                 // output, identical to the plain model's M-step covariance.
-                let sk = host.covariances(&est.nk, &est.means);
-                cur = self.m_step(&priors, &est.nk, &est.means, &sk, d, k)?;
+                let sk = if let Some(dev) = device.as_mut() {
+                    dev.covariances(pool, &nk, &means).map_err(AlgoError::Prim)?
+                } else {
+                    host.covariances(&nk, &means)
+                };
+                cur = self.m_step(&priors, &nk, &means, &sk, d, k)?;
                 // sklearn computes the bound AFTER the M-step but from the
-                // PRE-M-step responsibilities; `est.resp_log_resp` is exactly
-                // that (see the module docs' second trap).
-                lower_bound = self.compute_lower_bound(&cur, est.resp_log_resp, d, k);
+                // PRE-M-step responsibilities; `resp_log_resp` is exactly that
+                // (see the module docs' second trap).
+                lower_bound = self.compute_lower_bound(&cur, resp_log_resp, d, k);
                 trace.push(lower_bound);
                 iters = it;
                 if self.verbose > 0 && it % self.verbose_interval.max(1) == 0 {
@@ -563,8 +621,18 @@ where
         // FINAL posterior rather than the last iteration's. Its bound is
         // deliberately discarded (sklearn keeps `max_lower_bound`).
         let lw = self.log_weight_term(&params, d);
-        let _ = host.e_step_biased(&lw, &params.means, &params.precisions_cholesky);
-        let labels = argmax_rows(host.resp(), n, k);
+        let labels: Vec<i32> = if let Some(dev) = device.as_mut() {
+            let _ = dev
+                .e_step_biased(pool, &lw, &params.means, &params.precisions_cholesky)
+                .map_err(AlgoError::Prim)?;
+            argmax_rows(&dev.resp_to_host(pool), n, k)
+        } else {
+            let _ = host.e_step_biased(&lw, &params.means, &params.precisions_cholesky);
+            argmax_rows(host.resp(), n, k)
+        };
+        if let Some(dev) = device {
+            dev.release_into(pool);
+        }
 
         Ok(BayesianGaussianMixture {
             n_components: self.n_components,

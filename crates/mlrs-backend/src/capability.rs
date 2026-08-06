@@ -366,12 +366,19 @@ pub fn skip_f64_with_log() -> bool {
 /// - **wgpu** → the advertised flag, which there is a GENUINE capability: WGSL
 ///   has no `f64` and an adapter without the `SHADER_F64` feature cannot run one
 ///   at all.
-/// - **rocm** → the advertised flag. `cubecl-hip` shares the same registry, but
-///   unlike cuda this project has no measurement showing `f64` kernels work
-///   there (the D-07 backend gate is `cpu(f64) + rocm(f32)`), and inferring one
-///   backend's behaviour from another's is the mistake
-///   `mlrs-feedback-verify-on-target-hardware` records. Flip it when someone
-///   runs the agreement suite on a ROCm device.
+/// - **rocm** → `true`, same as cuda. `cubecl-hip` shares the SAME
+///   `cubecl-cpp` type registry cuda does, with the SAME matmul-workaround
+///   comment covering both backends — so the a priori guess was that `rocm`
+///   under-reports for the identical reason. Measured 2026-08-06 on real
+///   ROCm hardware (a gfx1151 Radeon 860M APU):
+///   `crates/mlrs-algos/tests/gaussian_mixture_device_test.rs` and
+///   `bayesian_mixture_device_test.rs` — genuine non-matmul `f64` device
+///   kernels (`logsumexp`, blocked reductions) — ran and reproduced the host
+///   arm exactly once `MLRS_F64_DEVICE=1` bypassed the advertised-`false`
+///   default, confirming the under-report. The full `mlrs-backend`/
+///   `mlrs-algos` suites also passed with this hardcoded to `true`, which is
+///   the empirical version of the "wrong answer costs throughput, not
+///   correctness" property below actually being exercised end to end.
 /// - **cpu** → the advertised flag; `cubecl-cpu`'s MLIR registry does list
 ///   `f64`.
 ///
@@ -394,11 +401,11 @@ pub fn f64_device_kernels_available() -> bool {
     if let Some(v) = crate::abflag::var("MLRS_F64_DEVICE") {
         return v != "0";
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     {
         true
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
     {
         feature_enabled(FloatKind::F64)
     }
