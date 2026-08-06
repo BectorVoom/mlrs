@@ -3576,7 +3576,7 @@ macro_rules! huber_fit_dispatch {
             Some(a) => Some($host_slice($as(a)?)?),
             None => None,
         };
-        if mlrs_backend::prims::huber_objective::huber_host_ingress_preferred() {
+        if mlrs_backend::prims::huber_objective::huber_host_ingress_preferred($rows, $cols) {
             let xh = $host_slice($as(&$xa)?)?;
             let yh = $host_slice($as(&$ya)?)?;
             est.fit_from_host_slice(&mut $pool, xh, yh, ($rows, $cols), sw)

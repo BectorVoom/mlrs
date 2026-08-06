@@ -64,10 +64,20 @@
 //!
 //! ## Per-iteration cost
 //! The whole cost of the fit is the objective evaluation, which is
-//! [`HuberObjective`] — one fused pass over the design on cpu (against
-//! scikit-learn's five passes and two full-size fancy-index copies per
-//! evaluation), the two-GEMM shape on the device backends. See that prim's
-//! module docs for the measured breakdown.
+//! [`HuberObjective`]. It carries TWO evaluators and picks between them per fit
+//! ([`huber_device_applicable`](mlrs_backend::prims::huber_objective::huber_device_applicable)):
+//!
+//! - the fused HOST pass — one streaming read of the design across a persistent
+//!   worker pool, against scikit-learn's five passes and two full-size
+//!   fancy-index copies per evaluation;
+//! - the DEVICE engine — five launches and ONE readback of `d_aug + 5` floats,
+//!   with the per-sample gradient factor never leaving the device.
+//!
+//! The split exists because this solver's shape forces it: L-BFGS needs the
+//! loss and gradient on the HOST to choose each step, so the device arm pays a
+//! fixed synchronization per evaluation that no amount of `n` amortizes below,
+//! while the host arm's cost is proportional to `n·d` from the first row. See
+//! that prim's module docs for the measured breakdown and the crossover.
 //!
 //! Tests live in `crates/mlrs-algos/tests/huber_test.rs` (AGENTS.md §2), never
 //! an in-source `#[cfg(test)] mod tests`.

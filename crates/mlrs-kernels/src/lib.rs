@@ -48,6 +48,13 @@ pub mod gmm;
 // its `pub mod` (single-owner, no root re-export — mirrors the `kmeans`
 // module-scoped-access precedent: callers use `mlrs_kernels::gram::{…}`).
 pub mod gram;
+// `HuberRegressor`'s GPU objective engine (HUBER-02): the classify + blocked
+// reduce + pack kernels that keep the per-sample gradient factor `g` DEVICE-
+// resident, so an L-BFGS evaluation stops paying two `n`-length transfers and
+// two pipeline stalls (the `linear_predict`/`gmm_device` host-sync pathology,
+// same class of fix). Owns its `pub mod` + `pub use` (single-owner,
+// file-disjoint — the `gram`/`kmeans` precedent).
+pub mod huber;
 pub mod jacobi_eig;
 // Brute-force KNN predict perf lever (KNN-01): a fused device-side neighbor-
 // target GATHER replacing the `top_k → to_host(idx) → host k-loop → from_host`
