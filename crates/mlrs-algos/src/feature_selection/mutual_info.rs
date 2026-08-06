@@ -42,6 +42,19 @@
 //! `cluster::hdbscan::kdtree`) is a self-contained follow-up that cannot change
 //! any value.
 //!
+//! ## "Exact" is about the SET of neighbours, not about the last bits
+//! Exact structures agree on WHICH points are nearest; they do not agree on the
+//! floating-point distance they report. `NearestNeighbors(algorithm='auto')`
+//! resolves to a KD-tree or to brute force depending on `n_neighbors` versus
+//! `n_samples`, and the two evaluate the Euclidean distance by different
+//! formulas — `sqrt((a − b)²)` against the GEMM identity `a² − 2ab + b²`. They
+//! differ by a few ULP, and this estimator counts neighbours inside a radius set
+//! ONE ULP below that distance, so a few ULP is worth whole integer counts.
+//! [`knn_1d_kth`] therefore reproduces sklearn's dispatch rather than picking
+//! whichever search is convenient. Only `_compute_mi_cd` is affected:
+//! `_compute_mi_cc` searches in the CHEBYSHEV metric, which has no squared
+//! reduced form, so both of its paths return the exact `max|a − b|`.
+//!
 //! ## The `nextafter(r, 0)` detail is load-bearing
 //! Both estimators shrink the k-th neighbour distance by one ULP toward zero
 //! before counting inside it (`np.nextafter(radius, 0)`), so the k-th neighbour
@@ -298,33 +311,26 @@ fn knn_chebyshev_2d_kth(x: &[f64], y: &[f64], k: usize) -> Vec<f64> {
     out
 }
 
-/// The Euclidean distance to each point's `k`-th nearest OTHER point in a 1-D
-/// sample — `NearestNeighbors(n_neighbors=k)` (default metric) restricted to one
-/// dimension, as `_compute_mi_cd` uses within each label group.
-///
-/// In 1-D the sorted order makes this exact in `O(n log n + n·k)`: the `k`-th
-/// nearest neighbour of a sorted point is found by expanding left/right from its
-/// own position, which is the classic two-pointer merge.
-///
-/// The returned distance is `sqrt((a − b)²)`, NOT `|a − b|`. sklearn's
-/// `NearestNeighbors` with its default `minkowski(p=2)` metric evaluates the
-/// Euclidean distance that way, and the two differ by one ULP for some
-/// arguments — which matters because this value is then shrunk by exactly one
-/// ULP to form the counting radius (see [`radius_counts_1d`]).
 /// `|a − b|` — the 1-D Euclidean/Chebyshev distance (they coincide in one
-/// dimension).
+/// dimension), as sklearn's `KDTree` evaluates it.
 ///
-/// The `sqrt((a − b)²)` form sklearn's `minkowski(p=2)` metric nominally uses was
-/// tried, on the theory that its double rounding would explain the residual
-/// `mutual_info_regression` discrepancy. It left every value BIT-IDENTICAL, so it
-/// is not the explanation, and the plain form is kept because it is the one that
-/// says what it means. See `feature_selection_score_test.rs`'s
-/// `MI_REGRESSION_BAND` for where the residual was finally localised.
+/// The tree computes `sqrt(rdist)` where `rdist = (a − b)²`, and the two forms
+/// are BIT-IDENTICAL: for IEEE-754 doubles `sqrt(fl(x²))` rounds back to `|x|`
+/// exactly whenever `x²` neither overflows nor underflows. So the plain form is
+/// kept because it is the one that says what it means. The BRUTE path does NOT
+/// share this property — see [`knn_1d_kth_brute`], which is the whole reason
+/// this module has two searches instead of one.
 fn euclid_1d(a: f64, b: f64) -> f64 {
     (a - b).abs()
 }
 
-fn knn_1d_kth(values: &[f64], k: usize) -> Vec<f64> {
+/// The `k`-th nearest OTHER point in 1-D, as sklearn's KD-TREE path computes it:
+/// the exact `|a − b|` metric, in `O(n log n + n·k)`.
+///
+/// In 1-D the sorted order makes this exact: the `k`-th nearest neighbour of a
+/// sorted point is found by expanding left/right from its own position, which is
+/// the classic two-pointer merge over the two monotone distance streams.
+fn knn_1d_kth_tree(values: &[f64], k: usize) -> Vec<f64> {
     let n = values.len();
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
@@ -365,6 +371,97 @@ fn knn_1d_kth(values: &[f64], k: usize) -> Vec<f64> {
         out[orig] = last;
     }
     out
+}
+
+/// The `k`-th nearest OTHER point in 1-D, as sklearn's BRUTE path computes it:
+/// the GEMM identity `a² − 2ab + b²`, clamped at zero, then `sqrt`.
+///
+/// ## Why this is not the same number as `|a − b|`
+/// sklearn's brute force never forms the difference. `ArgKmin` (and the
+/// `euclidean_distances` fallback behind it) computes the SQUARED distance
+/// matrix as `‖x‖² − 2·xᵀy + ‖y‖²` — one BLAS product plus two norm additions —
+/// and takes the square root only of the `k` values it selects. Each of those
+/// three terms is rounded separately, so the result differs from `|a − b|` by a
+/// few ULP: for `a − b ≈ 0.0539` this module measured `0.053905995835782816`
+/// against `|a − b| = 0.0539059958357857`.
+///
+/// A few ULP is decisive here rather than negligible. The caller shrinks this
+/// value by exactly ONE ULP to form the counting radius, so a distance that is
+/// several ULP too large admits points sklearn's radius excludes, and `m_all`
+/// changes by whole integers. On this crate's oracle it moved
+/// `mutual_info_regression` by 1.2e-1 on the binned column — four orders past
+/// the 1e-5 contract.
+///
+/// The arithmetic is BLAS-INDEPENDENT despite going through GEMM, which is what
+/// makes it reproducible at all: the product has inner dimension `k = 1` here
+/// (the sample is one-dimensional), so `xᵀy` is a SINGLE multiplication with
+/// nothing to reassociate, and scaling it by `−2` is exact. The association of
+/// the two remaining additions is sklearn's — `(‖x‖² + middle) + ‖y‖²` — and
+/// `‖x‖²` is `np.einsum('ij,ij->i', X, X)`, i.e. `a·a` with one rounding.
+///
+/// `O(n²)`, which is not a concern because the caller only reaches this branch
+/// for SMALL groups: [`knn_1d_kth`] dispatches here exactly when
+/// `k >= count / 2`, and `k` is itself capped at `n_neighbors`, so `count` is at
+/// most `2·n_neighbors + 1`.
+fn knn_1d_kth_brute(values: &[f64], k: usize) -> Vec<f64> {
+    let n = values.len();
+    let sq: Vec<f64> = values.iter().map(|&v| v * v).collect();
+    let mut dists: Vec<f64> = Vec::with_capacity(n.saturating_sub(1));
+    let mut out = vec![f64::INFINITY; n];
+    for i in 0..n {
+        dists.clear();
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            // sklearn's term order: `X_norm_squared[i] + middle + Y_norm_squared[j]`.
+            let middle = -2.0 * (values[i] * values[j]);
+            let s = (sq[i] + middle) + sq[j];
+            // `np.maximum(distances, 0)` — the identity can go slightly negative
+            // for near-coincident points, and a negative `sqrt` would be NaN.
+            let s = if s > 0.0 { s } else { 0.0 };
+            dists.push(s.sqrt());
+        }
+        dists.sort_by(|a, b| a.total_cmp(b));
+        out[i] = dists[k - 1];
+    }
+    out
+}
+
+/// The Euclidean distance to each point's `k`-th nearest OTHER point in a 1-D
+/// sample — `NearestNeighbors(n_neighbors=k).fit(c).kneighbors()[0][:, -1]`, as
+/// `_compute_mi_cd` calls it within each label group.
+///
+/// ## The `algorithm='auto'` dispatch is OBSERVABLE, not an implementation detail
+/// `NearestNeighbors` defaults to `algorithm='auto'` and picks its search at FIT
+/// time. `NeighborsBase._fit` selects BRUTE when
+///
+/// ```text
+/// metric == 'precomputed'  or  n_features > 15  or  n_neighbors >= n_samples // 2
+/// ```
+///
+/// and a KD-tree otherwise. The sample here is always one-dimensional and the
+/// metric is the default `minkowski(p=2)` (remapped to `euclidean`), so only the
+/// NEIGHBOUR-COUNT clause can fire — and it fires constantly, because
+/// `_compute_mi_cd` caps `k` at `count − 1` per label group: any group with
+/// `count <= 2·n_neighbors + 1` takes the brute path.
+///
+/// The two paths return DIFFERENT last bits ([`knn_1d_kth_brute`] derives why),
+/// and this estimator counts neighbours inside a radius one ULP below this
+/// value, so following the dispatch is what makes the result match sklearn
+/// instead of merely approximating it. Reproducing only the tree path left
+/// `mutual_info_regression` wrong by 1.2e-1 on the oracle's binned column and by
+/// 5.7e-4 on two ordinary ones — a discrepancy previously mis-attributed to
+/// non-reproducible BLAS rounding, when it was this branch all along.
+///
+/// The `n_features > 15` clause is unreachable from here (the sample is 1-D) and
+/// the `precomputed` clause has no mlrs analogue, so neither is reproduced.
+fn knn_1d_kth(values: &[f64], k: usize) -> Vec<f64> {
+    if k >= values.len() / 2 {
+        knn_1d_kth_brute(values, k)
+    } else {
+        knn_1d_kth_tree(values, k)
+    }
 }
 
 /// Kraskov mutual information between two CONTINUOUS 1-D samples —
@@ -410,14 +507,19 @@ fn compute_mi_cc(x: &[f64], y: &[f64], k: usize) -> f64 {
 /// MI = ψ(n') + mean ψ(k_all) − mean ψ(label_counts) − mean ψ(m_all)
 /// ```
 ///
-/// Two details carry the whole implementation:
+/// Three details carry the whole implementation:
 ///
 /// * `k` is per-GROUP: `min(n_neighbors, count − 1)`, so a small class uses a
 ///   smaller neighbourhood, and a SINGLETON class contributes no radius at all;
 /// * points whose label is unique are then DROPPED entirely (`label_counts > 1`)
 ///   and `n'` is the surviving count, not `n`. Dropping them after computing the
 ///   radii — sklearn's order — is what makes `m_all`'s radius search run over
-///   the FILTERED sample.
+///   the FILTERED sample;
+/// * the per-group radius goes through [`knn_1d_kth`], which follows sklearn's
+///   `algorithm='auto'` brute-vs-tree dispatch. That is a consequence of the
+///   first detail: capping `k` at `count − 1` is exactly what pushes small
+///   groups over `k >= count / 2` and onto the brute path, whose distances
+///   differ from the tree's in the last bits.
 fn compute_mi_cd(c: &[f64], labels: &[u32], k_neighbors: usize) -> f64 {
     let n = c.len();
     let mut radius = vec![0.0f64; n];

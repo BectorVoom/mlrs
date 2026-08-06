@@ -401,37 +401,36 @@ fn regression_scores_match_sklearn_f64() {
 // ===========================================================================
 
 /// The column of the oracle design whose values are heavily TIED (rounded to one
-/// decimal), and on which the k-NN mutual-information estimators do NOT yet match
-/// sklearn — see [`mutual_info_on_tied_columns_diverges_from_sklearn`].
+/// decimal) — the case `mutual_info_*`'s tie-breaking noise exists for, and the
+/// column that localised the brute-vs-tree defect described on
+/// [`MI_REGRESSION_BAND`]. Named because several assertions below single it out
+/// as the hardest column, not because it is exempt from any of them.
 const TIED_COLUMN: usize = 7;
 
-/// Absolute band for the `mutual_info_regression` comparisons on the columns that
-/// DO match, and why it is not 1e-5.
+/// Band for the `mutual_info_regression` comparisons, and the history behind it.
 ///
-/// On tie-free columns the measured residual is 5.7e-4 to 9.5e-4 on two of
-/// sixteen configurations, from a BOUNDARY DECISION that is not portably
-/// reproducible. Both estimators count neighbours inside
-/// `nextafter(kth_distance, 0)` — the k-th distance minus ONE ULP — so a point
-/// within a ULP of that boundary decides an integer count, and `_compute_mi_cd`
-/// obtains `kth_distance` from `NearestNeighbors()`, which on small samples runs
-/// BRUTE FORCE through `euclidean_distances`, i.e. the Gram identity
-/// `sqrt(‖x‖² − 2x·y + ‖y‖²)` evaluated by BLAS. That formula's last bits differ
-/// from `|x − y|` and depend on the BLAS build: sklearn's own value moves with its
-/// BLAS, so there is no bit pattern to match.
+/// This was 2e-3 while `_compute_mi_cd`'s radius was wrong, on the theory that
+/// the residual was a BLAS-dependent boundary decision with no bit pattern to
+/// match. It was not. `NearestNeighbors(algorithm='auto')` dispatches to BRUTE
+/// FORCE when `n_neighbors >= n_samples // 2` — which `_compute_mi_cd` triggers
+/// constantly, because it caps `k` at `count − 1` per label group — and brute
+/// force evaluates the Euclidean distance as the GEMM identity
+/// `sqrt(a² − 2ab + b²)` rather than as `|a − b|`. The two differ by a few ULP,
+/// and since the counting radius is set exactly ONE ULP below that distance, a
+/// few ULP is worth whole integer counts.
 ///
-/// Cheaper explanations were ruled out first and each is now pinned by its own
-/// test or documented code path rather than assumed — the MT19937 stream
-/// (`numpy_rng_test.rs`), numpy's pairwise-vs-sequential reduction shapes
-/// (`numpy_rng::numpy_mean` / `numpy_mean_axis0`), the `|a−b|` vs `sqrt((a−b)²)`
-/// metric form, and the interval-vs-squared radius comparison. Fixing each left
-/// the value BIT-IDENTICAL, which is what localises the remainder to the radius.
+/// It is reproducible after all: the product's inner dimension is 1 for a 1-D
+/// sample, so there is nothing for BLAS to reassociate. `mutual_info.rs`'s
+/// `knn_1d_kth` now follows the dispatch and every configuration below agrees
+/// with sklearn to ~1e-15, so the band is the ordinary contract.
 ///
-/// The consequence is bounded: one neighbour count is worth `1/(m·n)` in the
-/// estimate (`ψ(m+1) − ψ(m) = 1/m`, averaged over `n` points), i.e. 5.7e-4 here.
-/// It cannot cascade, and it reorders a mutual-information RANKING only between
-/// features whose scores are already within 1e-3 of each other.
+/// The earlier eliminations remain valid and each is still pinned by its own
+/// test or documented code path — the MT19937 stream (`numpy_rng_test.rs`),
+/// numpy's pairwise-vs-sequential reduction shapes (`numpy_rng::numpy_mean` /
+/// `numpy_mean_axis0`), the `|a−b|` vs `sqrt((a−b)²)` metric form, and the
+/// interval-vs-squared radius comparison. They were simply not the remainder.
 const MI_REGRESSION_BAND: Tolerance = Tolerance {
-    abs: 2e-3,
+    abs: 1e-5,
     rel: 1e-5,
 };
 
@@ -445,13 +444,15 @@ fn params(k: usize, rs: u64, discrete: DiscreteFeatures) -> MutualInfoParams {
     }
 }
 
-/// Compare every column EXCEPT [`TIED_COLUMN`], which has its own (currently
-/// failing, and explicitly marked) test.
-fn assert_close_skipping_tied(got: &[f64], expected: &[f64], tol: &Tolerance, what: &str) {
+/// Compare EVERY column, one at a time so a failure names the column.
+///
+/// Per-column rather than whole-vector because these scores are decided by
+/// integer neighbour counts: when one column is wrong the others are usually
+/// right, and a single bulk `assert_close` reports only the first index. The
+/// brute-vs-tree defect was localised to [`TIED_COLUMN`] and column 6 by exactly
+/// this granularity.
+fn assert_close_per_column(got: &[f64], expected: &[f64], tol: &Tolerance, what: &str) {
     for c in 0..got.len() {
-        if c == TIED_COLUMN {
-            continue;
-        }
         assert_close_nan(
             &got[c..=c],
             &expected[c..=c],
@@ -468,10 +469,12 @@ fn run_mutual_info(case: &OracleCase, tol: &Tolerance, tag: &str) {
             let p = params(k, rs, DiscreteFeatures::All(false));
             let got = mutual_info_classif(&x, &y_class, N_SAMPLES, N_FEATURES, &p)
                 .expect("mutual_info_classif");
-            // The DISCRETE-target estimator matches sklearn inside the strict
-            // contract on every tie-free column, so it is held to `tol` and not
-            // to the looser regression band.
-            assert_close_skipping_tied(
+            // The DISCRETE-target estimator is held to the fixture's own `tol`
+            // (`F32_TOL` / `F64_TOL`) rather than to `MI_REGRESSION_BAND`. The
+            // two bands are the same 1e-5 for `f64` now that the brute-vs-tree
+            // radius is right; they are kept as separate constants because only
+            // the regression one carries the history of why it was ever looser.
+            assert_close_per_column(
                 &got,
                 case.expect_f64(&format!("mi_classif_rs{rs}_k{k}")),
                 tol,
@@ -479,7 +482,7 @@ fn run_mutual_info(case: &OracleCase, tol: &Tolerance, tag: &str) {
             );
             let got = mutual_info_regression(&x, &y_reg, N_SAMPLES, N_FEATURES, &p)
                 .expect("mutual_info_regression");
-            assert_close_skipping_tied(
+            assert_close_per_column(
                 &got,
                 case.expect_f64(&format!("mi_regression_rs{rs}_k{k}")),
                 &MI_REGRESSION_BAND,
@@ -501,7 +504,7 @@ fn run_mutual_info(case: &OracleCase, tol: &Tolerance, tag: &str) {
     let p = params(3, 0, DiscreteFeatures::Mask(mask));
     let got = mutual_info_classif(&x, &y_class, N_SAMPLES, N_FEATURES, &p)
         .expect("mutual_info_classif(mask)");
-    assert_close_skipping_tied(
+    assert_close_per_column(
         &got,
         case.expect_f64("mi_classif_mask"),
         tol,
@@ -509,7 +512,7 @@ fn run_mutual_info(case: &OracleCase, tol: &Tolerance, tag: &str) {
     );
     let got = mutual_info_regression(&x, &y_reg, N_SAMPLES, N_FEATURES, &p)
         .expect("mutual_info_regression(mask)");
-    assert_close_skipping_tied(
+    assert_close_per_column(
         &got,
         case.expect_f64("mi_regression_mask"),
         &MI_REGRESSION_BAND,
@@ -517,19 +520,31 @@ fn run_mutual_info(case: &OracleCase, tol: &Tolerance, tag: &str) {
     );
 
     // `discrete_features=True` with a DISCRETE target is the contingency-table
-    // estimator — no neighbour search, no radius, no boundary decision — so it is
-    // held to the strict band on EVERY column, tied ones included. That it passes
-    // is what separates the tied-column defect below from a general
-    // discrete-handling error.
+    // estimator — no neighbour search, no radius, no boundary decision at all.
     let x_disc = case.expect_f64("X_disc").to_vec();
     let p = params(3, 0, DiscreteFeatures::All(true));
     let got = mutual_info_classif(&x_disc, &y_class, N_SAMPLES, N_FEATURES, &p)
         .expect("mutual_info_classif(all discrete)");
-    assert_close_nan(
+    assert_close_per_column(
         &got,
         case.expect_f64("mi_classif_all_discrete"),
         tol,
         &format!("mutual_info_classif {tag} all discrete"),
+    );
+
+    // The same BINNED design against a CONTINUOUS target: `_compute_mi_cd` with
+    // the arguments swapped, over label groups small enough that sklearn's
+    // `algorithm='auto'` picks BRUTE force for nearly every one of them. This is
+    // the configuration that exposed the brute-vs-tree radius defect (see
+    // `MI_REGRESSION_BAND`) — it was off by 1.2e-1 on column 6 and 5.7e-4 on
+    // columns 0 and 5 — so it is the case that must not regress.
+    let got = mutual_info_regression(&x_disc, &y_reg, N_SAMPLES, N_FEATURES, &p)
+        .expect("mutual_info_regression(all discrete)");
+    assert_close_per_column(
+        &got,
+        case.expect_f64("mi_regression_all_discrete"),
+        &MI_REGRESSION_BAND,
+        &format!("mutual_info_regression {tag} all discrete"),
     );
 }
 
@@ -547,41 +562,23 @@ fn mutual_info_matches_sklearn_f64() {
     run_mutual_info(&case, &F64_TOL, "f64");
 }
 
-/// KNOWN DEFECT, deliberately visible: the k-NN mutual-information estimators
-/// disagree with sklearn on columns with MANY EXACTLY-TIED values.
+/// The heavily-TIED column, pinned on its own and at the STRICTEST band.
 ///
-/// Marked `#[ignore]` rather than given a tolerance wide enough to pass, because a
-/// band that admits a 1.2e-1 error would also admit every future regression. This
-/// test states the gap, and `run_mutual_info` above gates everything that does
-/// work — so CI protects the working surface and this failure stays legible.
+/// [`run_mutual_info`] already covers it — this test exists so that the column
+/// which carried a known defect for a whole phase has an assertion naming it, and
+/// so that a future regression reports "tied column" rather than "col 7" buried
+/// in a sweep. It is the column `mutual_info_*`'s tie-breaking noise exists for,
+/// and therefore the only one whose score depends on matching numpy's MT19937
+/// stream bit-for-bit.
 ///
-/// ## What is and is not affected
-/// * `f_classif` / `chi2` / `f_regression` / `r_regression`: unaffected, all
-///   match to 1e-5 including on this same tied column.
-/// * `mutual_info_*` on continuous, tie-free columns: matches (to 1e-5 for
-///   `classif`, to [`MI_REGRESSION_BAND`] for `regression`).
-/// * `mutual_info_classif` with `discrete_features=True`: matches to 1e-5 on ALL
-///   columns — that path is the contingency-table estimator and does no neighbour
-///   search at all.
-/// * `mutual_info_*` on a heavily-tied CONTINUOUS column: measured 2.7e-2
-///   (`classif`, rs=42, k=2) and 1.2e-1 (`regression`, all-discrete, column 6).
-///
-/// ## Narrowed hypothesis
-/// The disagreement scales with the number of tied values, is far too large to be
-/// rounding, and survives every last-bit fix listed on [`MI_REGRESSION_BAND`].
-/// That points at TIE-ORDER inside the neighbour search rather than at arithmetic:
-/// with duplicate values, several points sit at identical distance from a query,
-/// and which of them the k-th-neighbour slot resolves to determines the radius and
-/// hence the counts. sklearn's `NearestNeighbors` resolves such ties by its
-/// tree's traversal order; `knn_1d_kth`'s two-pointer walk and
-/// `knn_chebyshev_2d_kth`'s insertion buffer resolve them by index order. The next
-/// step is to compare the per-point k-th RADIUS (not the final estimate) against
-/// `nn.kneighbors()[0][:, -1]` on the tied column, which localises it to one of
-/// those two searches.
+/// The defect it used to record was NOT tie-order in the neighbour search, which
+/// was the standing hypothesis. Ties are broken by the noise before any search
+/// runs; what differed was the DISTANCE FORMULA, because sklearn's
+/// `algorithm='auto'` silently switches to brute force — and to the GEMM identity
+/// `sqrt(a² − 2ab + b²)` — on small label groups. See `MI_REGRESSION_BAND` and
+/// `mutual_info.rs`'s `knn_1d_kth`.
 #[test]
-#[ignore = "known defect: k-NN mutual information disagrees with sklearn on \
-            heavily-tied columns; see this test's docs for scope and hypothesis"]
-fn mutual_info_on_tied_columns_diverges_from_sklearn() {
+fn mutual_info_matches_sklearn_on_the_tied_column() {
     let case =
         load_npz(fixture("fsel_mutual_info_f64_seed42.npz")).expect("load fsel_mutual_info_f64");
     let (x, y_class, y_reg) = design(&case);
@@ -596,18 +593,53 @@ fn mutual_info_on_tied_columns_diverges_from_sklearn() {
                 &F64_TOL,
                 &format!("mutual_info_classif tied column rs={rs} k={k}"),
             );
+            let got = mutual_info_regression(&x, &y_reg, N_SAMPLES, N_FEATURES, &p).unwrap();
+            let want = case.expect_f64(&format!("mi_regression_rs{rs}_k{k}"));
+            assert_close_nan(
+                &got[TIED_COLUMN..=TIED_COLUMN],
+                &want[TIED_COLUMN..=TIED_COLUMN],
+                &F64_TOL,
+                &format!("mutual_info_regression tied column rs={rs} k={k}"),
+            );
         }
     }
-    // The all-discrete REGRESSION case: every column of the binned design is
-    // tied, so this whole configuration belongs here rather than above.
+}
+
+/// The brute-vs-tree dispatch is load-bearing, and this pins the SIZE of getting
+/// it wrong so nobody "simplifies" `knn_1d_kth` back to one search.
+///
+/// `n_neighbors = 5` against a 3-class, 90-sample target keeps every group on the
+/// TREE path (`5 < 30 / 2`), while the binned all-discrete design puts nearly
+/// every group on the BRUTE path. If the two searches returned the same numbers
+/// the second comparison would be redundant with the first; it is not, and the
+/// difference is four orders past the contract, so the dispatch cannot be
+/// dropped. Both are compared against the same sklearn fixture the sweep uses —
+/// this test adds the WHY, not new expectations.
+#[test]
+fn mutual_info_follows_sklearns_brute_vs_tree_dispatch() {
+    let case =
+        load_npz(fixture("fsel_mutual_info_f64_seed42.npz")).expect("load fsel_mutual_info_f64");
+    let (x, y_class, y_reg) = design(&case);
+
+    // Tree path: large, equally-sized label groups.
+    let p = params(5, 0, DiscreteFeatures::All(false));
+    let got = mutual_info_classif(&x, &y_class, N_SAMPLES, N_FEATURES, &p).unwrap();
+    assert_close_per_column(
+        &got,
+        case.expect_f64("mi_classif_rs0_k5"),
+        &F64_TOL,
+        "tree-path mutual_info_classif",
+    );
+
+    // Brute path: the binned design's groups are all smaller than `2k + 1`.
     let x_disc = case.expect_f64("X_disc").to_vec();
     let p = params(3, 0, DiscreteFeatures::All(true));
     let got = mutual_info_regression(&x_disc, &y_reg, N_SAMPLES, N_FEATURES, &p).unwrap();
-    assert_close_nan(
+    assert_close_per_column(
         &got,
         case.expect_f64("mi_regression_all_discrete"),
         &F64_TOL,
-        "mutual_info_regression all discrete",
+        "brute-path mutual_info_regression",
     );
 }
 

@@ -198,11 +198,38 @@ def gen_feature_selection_mutual_info(seed: int = SEED, dtype=np.float32) -> str
     small class in `_compute_mi_cd` clamps `k` per group, and `discrete_features`
     is swept over `{False, True, mask}` because each dispatches to a different
     one of the three estimators.
+
+    ## sklearn is called on the CAST design, unlike every other generator here
+
+    The other generators record `_c(x, dtype)` but call sklearn on the full
+    `float64` `x`, and for a closed-form score that is harmless: rounding the
+    design to `float32` perturbs an F-statistic by ~1e-7 relative, which
+    `F32_TOL` absorbs.
+
+    `mutual_info_*` is not that kind of function. It counts neighbours inside a
+    radius, so its output is a step function of the input and a `float32`
+    rounding of `X` moves whole integer counts. Measured on this design, the
+    `f32` and `float64` answers differ by 9.5e-4 on the tied column — a hundred
+    times the contract, and NOT a defect on either side: they are the correct
+    answers to two different questions.
+
+    So the archive must record the answer for the design it also stores, or the
+    Rust test compares `f32`-input mlrs against `float64`-input sklearn and the
+    only way to make it pass is a tolerance loose enough to hide real
+    regressions. (That is what happened: the gap was mis-read as an
+    irreproducible boundary effect and the band was widened to 2e-3.) The
+    round-trip is a no-op for `dtype=float64`, so the `f64` archive is unchanged.
     """
     from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
 
     x, y_class, y_reg = _design(seed)
     out = {"X": _c(x, dtype), "y_class": _c(y_class, dtype), "y_reg": _c(y_reg, dtype)}
+    # Everything below runs on the design as the RUST side will read it back:
+    # narrowed to `dtype` on the way into the archive, widened to `float64` on
+    # the way out. See the docstring.
+    x = np.asarray(out["X"], dtype=np.float64)
+    y_class = np.asarray(out["y_class"], dtype=np.float64)
+    y_reg = np.asarray(out["y_reg"], dtype=np.float64)
     # Column 7 is the heavily-tied one; marking it discrete exercises the
     # discrete-feature/continuous-target and discrete/discrete branches.
     mask = np.zeros(N_FEATURES, dtype=bool)

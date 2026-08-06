@@ -175,10 +175,9 @@ def test_f_oneway_rejects_a_single_group(design):
 
 @pytest.mark.parametrize("n_neighbors", [2, 3, 5])
 def test_mutual_info_classif_matches_sklearn(design, n_neighbors):
-    """Tie-free columns only — column 4 duplicates column 0 but its VALUES are
-    distinct, so the tied-column defect the Rust suite records is not in play
-    here. `random_state` is explicit on both sides: it is what makes the noise
-    streams comparable at all."""
+    """`random_state` is explicit on both sides: it is what makes the noise
+    streams comparable at all, and without it sklearn draws from numpy's
+    process-global stream while mlrs seeds 0 (a documented divergence)."""
     x, y, _ = design
     want = skfs.mutual_info_classif(
         x, y, n_neighbors=n_neighbors, random_state=0, discrete_features=False
@@ -195,10 +194,11 @@ def test_mutual_info_regression_matches_sklearn(design):
         x, y, random_state=0, discrete_features=False
     )
     got = mfs.mutual_info_regression(x, y, random_state=0, discrete_features=False)
-    # The looser band the Rust suite documents (a one-neighbour boundary decision
-    # inside sklearn's BLAS-backed brute-force distance is not portably
-    # reproducible); see `MI_REGRESSION_BAND` there.
-    _allclose(got, want, "mutual_info_regression", atol=2e-3)
+    # The ordinary contract. This was 2e-3 while `_compute_mi_cd` evaluated its
+    # k-th-neighbour distance as `|a - b|` on every label group, where sklearn
+    # switches to a brute-force GEMM identity for small ones; see
+    # `MI_REGRESSION_BAND` in the Rust suite.
+    _allclose(got, want, "mutual_info_regression", atol=1e-6)
 
 
 def test_mutual_info_discrete_features_forms_agree(design):

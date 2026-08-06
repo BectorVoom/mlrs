@@ -252,11 +252,14 @@ def mutual_info_regression(
 ):
     """Mutual information between each feature and a CONTINUOUS target.
 
-    See :func:`mutual_info_classif` on ``random_state``. Note that mlrs's k-NN
-    mutual information is known to disagree with sklearn on columns containing
-    MANY EXACTLY-TIED values; the Rust test
-    ``mutual_info_on_tied_columns_diverges_from_sklearn`` records the measured
-    size and scope of that gap.
+    See :func:`mutual_info_classif` on ``random_state``.
+
+    Matches sklearn to the 1e-5 contract on tied and tie-free columns alike. That
+    required reproducing sklearn's ``NearestNeighbors(algorithm='auto')``
+    brute-vs-tree dispatch, because the two search paths report Euclidean
+    distances that differ in the last bits and this estimator counts neighbours
+    inside a radius one ULP below that distance — see ``knn_1d_kth`` in
+    ``mutual_info.rs``.
     """
     x, yv, rows, cols = _as_xy(X, y)
     d_all, d_mask = _discrete_args(discrete_features, cols)
