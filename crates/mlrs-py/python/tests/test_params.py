@@ -118,9 +118,22 @@ EXPECTED_PARAMS = {
     },
     "DBSCAN": {"eps": 0.5, "min_samples": 5, "output_type": "input"},
     "TruncatedSVD": {"n_components": 2, "output_type": "input"},
-    "NearestNeighbors": {"n_neighbors": 5, "algorithm": "auto", "output_type": "input"},
+    # NEIGH-PARAMS: NearestNeighbors carries sklearn's FULL parameter surface
+    # too, `radius` in place of the two k-neighbours estimators' `weights`
+    # (neither direction has a vote/mean to weight the other lacks).
+    "NearestNeighbors": {
+        "n_neighbors": 5,
+        "output_type": "input",
+        "radius": 1.0,
+        "algorithm": "auto",
+        "leaf_size": 30,
+        "metric": "minkowski",
+        "p": 2,
+        "metric_params": None,
+        "n_jobs": None,
+    },
     # KNN-CLF-PARAMS / KNN-REG-PARAMS: both k-neighbours estimators carry
-    # sklearn's FULL parameter surface, unlike the unsupervised index above.
+    # sklearn's FULL parameter surface too.
     "KNeighborsClassifier": {
         "n_neighbors": 5,
         "output_type": "input",

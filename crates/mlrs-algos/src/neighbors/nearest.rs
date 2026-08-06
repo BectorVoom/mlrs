@@ -54,7 +54,7 @@ use mlrs_backend::prims::knn_host::{knn_host_applicable, knn_host_topk};
 use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
-use mlrs_core::PrimError;
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, KNeighbors, Unfit};
@@ -75,6 +75,10 @@ pub struct NearestNeighbors<F, S = Unfit> {
     /// Default neighbor count used when a caller passes its own `k` to
     /// `kneighbors`; retained for the sklearn-faithful constructor surface.
     n_neighbors: usize,
+    /// The distance metric `kneighbors` / `radius_neighbors` search under
+    /// (NEIGH-PARAMS). Defaults to [`Metric::Euclidean`] (D-08), mirroring
+    /// `KNeighborsClassifier`/`KNeighborsRegressor`.
+    metric: Metric,
     /// Device-resident training matrix (`n_train × n_features`, row-major),
     /// `None` until `fit`.
     x_train_: Option<DeviceArray<ActiveRuntime, F>>,
@@ -98,6 +102,7 @@ where
     pub fn new() -> Self {
         Self {
             n_neighbors: NN_DEFAULT_N_NEIGHBORS,
+            metric: Metric::Euclidean,
             x_train_: None,
             train_shape_: None,
             _state: PhantomData,
@@ -116,6 +121,7 @@ where
     pub fn into_builder(self) -> NearestNeighborsBuilder {
         NearestNeighborsBuilder {
             n_neighbors: self.n_neighbors,
+            metric: self.metric,
         }
     }
 
@@ -123,7 +129,7 @@ where
     /// defaults-equality test (BLDR-01):
     /// `NearestNeighbors::new().hyperparams_eq(&NearestNeighbors::builder().build()?)`.
     pub fn hyperparams_eq(&self, other: &Self) -> bool {
-        self.n_neighbors == other.n_neighbors
+        self.n_neighbors == other.n_neighbors && self.metric == other.metric
     }
 
     /// The configured default neighbor count (read pre-fit).
@@ -156,6 +162,7 @@ where
         }
         Ok(NearestNeighbors {
             n_neighbors: self.n_neighbors,
+            metric: self.metric,
             x_train_: Some(x),
             train_shape_: Some(shape),
             _state: PhantomData,
@@ -187,6 +194,37 @@ where
         self.train_shape_
             .expect("train_shape_ is Some by construction on NearestNeighbors<F, Fitted>")
     }
+
+    /// All training points within `radius` of each row of `xq` (sklearn's
+    /// `radius_neighbors`, NEIGH-RADIUS).
+    ///
+    /// Unlike `kneighbors`, the result is RAGGED (each query row can match a
+    /// different number of training points), so it is returned host-side rather
+    /// than as fixed-width device arrays: [`RadiusNeighbors::indices`] /
+    /// [`RadiusNeighbors::distances`] are the per-row matches CONCATENATED in
+    /// ascending training-index order (never sorted by distance — matching
+    /// sklearn's own `sort_results=False` brute-force order, which a Python shim
+    /// may re-sort), and [`RadiusNeighbors::counts`] gives each row's match count
+    /// so the caller can split the flat buffers back into per-row slices (a CSR
+    /// layout without a separately-stored `indptr` — the caller derives it via
+    /// `counts`' running sum).
+    pub fn radius_neighbors(
+        &self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        xq: &DeviceArray<ActiveRuntime, F>,
+        shape: (usize, usize),
+        radius: f64,
+    ) -> Result<RadiusNeighbors<F>, AlgoError> {
+        radius_neighbor_indices_metric::<F>(
+            pool,
+            self.x_train_.as_ref(),
+            self.train_shape_,
+            xq,
+            shape,
+            radius,
+            self.metric,
+        )
+    }
 }
 
 /// Builder for [`NearestNeighbors`] (D-01). `Default` re-derives the sklearn
@@ -195,6 +233,7 @@ where
 #[derive(Debug, Clone, Copy)]
 pub struct NearestNeighborsBuilder {
     n_neighbors: usize,
+    metric: Metric,
 }
 
 impl Default for NearestNeighborsBuilder {
@@ -210,6 +249,13 @@ impl NearestNeighborsBuilder {
     /// Set the default neighbor count `n_neighbors`.
     pub fn n_neighbors(mut self, v: usize) -> Self {
         self.n_neighbors = v;
+        self
+    }
+
+    /// Set the distance [`Metric`] `kneighbors` / `radius_neighbors` search under
+    /// (NEIGH-PARAMS). Defaults to [`Metric::Euclidean`].
+    pub fn metric(mut self, v: Metric) -> Self {
+        self.metric = v;
         self
     }
 
@@ -235,6 +281,7 @@ impl NearestNeighborsBuilder {
         }
         Ok(NearestNeighbors {
             n_neighbors: self.n_neighbors,
+            metric: self.metric,
             x_train_: None,
             train_shape_: None,
             _state: PhantomData,
@@ -305,51 +352,30 @@ where
         ),
         AlgoError,
     > {
-        let (distances, indices, _) = neighbor_indices::<F>(
+        let (distances, indices, _) = neighbor_indices_metric::<F>(
             pool,
             self.x_train_.as_ref(),
             self.train_shape_,
             x,
             shape,
             k,
+            self.metric,
         )?;
         Ok((distances, indices))
     }
 }
 
-/// Shared kneighbors core (NEIGH-01/02/03): validate `k` + geometry, then
-/// `distance(xq, x_train, sqrt=false)` → `top_k(.., k, sqrt=true)`. Returns the
-/// `n_query × k` sqrt-Euclidean distances (`F`, device-resident), the same-shape
-/// neighbor indices (`i32`, device-resident, host-cast from the `top_k` `u32`,
-/// D-06), AND the host `u32` index buffer so the classifier / regressor can gather
-/// neighbor targets without a second round-trip.
+/// Shared kneighbors core (NEIGH-01/02/03) under an arbitrary [`Metric`]
+/// (KNN-REG-PARAMS): validate `k` + geometry, then dispatch to
+/// [`metric_topk`]. Returns the `n_query × k` distances (`F`, device-resident,
+/// true metric distances), the same-shape neighbor indices (`i32`,
+/// device-resident, host-cast from the `top_k` `u32`, D-06), AND the host `u32`
+/// index buffer so the classifier / regressor can gather neighbor targets
+/// without a second round-trip.
 ///
 /// Factored here so `KNeighborsClassifier` / `KNeighborsRegressor` build their
 /// vote / mean on EXACTLY the `NearestNeighbors` neighbor set (Pitfall 8 — same
 /// tie-break, same distances).
-#[allow(clippy::type_complexity)]
-pub(crate) fn neighbor_indices<F>(
-    pool: &mut BufferPool<ActiveRuntime>,
-    x_train: Option<&DeviceArray<ActiveRuntime, F>>,
-    train_shape: Option<(usize, usize)>,
-    xq: &DeviceArray<ActiveRuntime, F>,
-    shape: (usize, usize),
-    k: usize,
-) -> Result<
-    (
-        DeviceArray<ActiveRuntime, F>,
-        DeviceArray<ActiveRuntime, i32>,
-        Vec<u32>,
-    ),
-    AlgoError,
->
-where
-    F: Float + CubeElement + Pod,
-{
-    neighbor_indices_metric::<F>(pool, x_train, train_shape, xq, shape, k, Metric::Euclidean)
-}
-
-/// [`neighbor_indices`] under an arbitrary [`Metric`] (KNN-REG-PARAMS).
 ///
 /// `Metric::Euclidean` is bit-for-bit the pre-existing path — it dispatches
 /// through the SAME [`tiled_distance_topk`] and therefore the same
@@ -407,16 +433,197 @@ where
     Ok((val_dev, idx_dev_i32, idx_host))
 }
 
+/// The ragged result of [`NearestNeighbors::radius_neighbors`] /
+/// [`radius_neighbor_indices_metric`] (NEIGH-RADIUS).
+///
+/// Each query row can match a different number of training points, so — unlike
+/// `kneighbors`' fixed-width `n_query × k` — the match set is returned as a CSR
+/// layout without a separately-materialized `indptr`: `distances`/`indices` are
+/// the per-row matches CONCATENATED (row 0's matches, then row 1's, ...) and
+/// `counts[i]` is row `i`'s match count, so a caller derives the offsets with a
+/// running sum. Within a row, matches are in ASCENDING TRAINING-INDEX order
+/// (never distance-sorted) — the same unsorted order sklearn's own brute-force
+/// `radius_neighbors(sort_results=False)` returns, since both scan candidates in
+/// index order and keep the ones within `radius`.
+pub struct RadiusNeighbors<F> {
+    /// Per-match true metric distances, row-major concatenated.
+    pub distances: Vec<F>,
+    /// Per-match training-point indices (`i32`, D-06), row-major concatenated.
+    pub indices: Vec<i32>,
+    /// Per-row match count, length `n_query`.
+    pub counts: Vec<u32>,
+}
+
+/// [`NearestNeighbors::radius_neighbors`] core (NEIGH-RADIUS): every training
+/// point within `radius` of each row of `xq`, under `metric`.
+///
+/// ## Why this cannot reuse `top_k`
+/// `top_k` selects a FIXED width `k` per row; a radius query's match count is
+/// data-dependent (0 to `n_train`), so the result is materialized host-side as
+/// it is discovered rather than into fixed-width device buffers — mirroring
+/// what sklearn's own brute-force path does (`pairwise_distances_chunked` +
+/// `np.where(chunk <= radius)` per chunk, entirely host/numpy).
+///
+/// ## Squared-distance threshold, sqrt only on survivors (Pitfall 8)
+/// [`metric_distance`] reports `needs_sqrt = true` only for `Metric::Euclidean`
+/// (its GEMM fast path returns the order-preserving SQUARED distance). Since
+/// `sqrt` is monotone on `[0, ∞)`, thresholding the squared block against
+/// `radius²` selects EXACTLY the same rows `sqrt(d) <= radius` would, so the
+/// (comparatively expensive, `O(tile · n_train)`) sqrt is applied only to the
+/// handful of surviving matches instead of the whole tile.
+///
+/// ## Tiling
+/// Reuses [`dist_tile_rows`] (the same query-row tile sizing `kneighbors` uses)
+/// so peak memory stays bounded by [`DIST_TILE_BUDGET_BYTES`] regardless of
+/// `n_query`, for the same reason `tiled_metric_distance_topk` tiles: no result
+/// depends on two tiles at once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn radius_neighbor_indices_metric<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x_train: Option<&DeviceArray<ActiveRuntime, F>>,
+    train_shape: Option<(usize, usize)>,
+    xq: &DeviceArray<ActiveRuntime, F>,
+    shape: (usize, usize),
+    radius: f64,
+    metric: Metric,
+) -> Result<RadiusNeighbors<F>, AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x_train, (n_train, n_features)) =
+        validate_radius_query::<F>(x_train, train_shape, xq, shape, radius)?;
+    let (n_query, _) = shape;
+
+    let mut distances: Vec<F> = Vec::new();
+    let mut indices: Vec<i32> = Vec::new();
+    let mut counts: Vec<u32> = Vec::with_capacity(n_query);
+
+    let tile_rows = dist_tile_rows::<F>(n_train, n_query);
+    let mut start = 0usize;
+    while start < n_query {
+        let rows = tile_rows.min(n_query - start);
+
+        let xq_tile: DeviceArray<ActiveRuntime, F> = DeviceArray::from_raw(
+            xq.handle()
+                .clone()
+                .offset_start((start * n_features * size_of::<F>()) as u64),
+            rows * n_features,
+        );
+
+        let (dist, needs_sqrt) = metric_distance::<F>(
+            pool,
+            &xq_tile,
+            (rows, n_features),
+            x_train,
+            (n_train, n_features),
+            metric,
+            None,
+        )
+        .map_err(AlgoError::Prim)?;
+
+        let dist_host: Vec<F> = dist.to_host(pool);
+        dist.release_into(pool);
+
+        // Threshold on the SQUARED distance when the block is squared (Pitfall
+        // 8) — `radius²` selects exactly the rows `sqrt(d) <= radius` would,
+        // without sqrting the whole tile. The comparison itself stays in `F`
+        // (a single `f64_to_host` for the whole tile, not one per candidate):
+        // the earlier per-element `host_to_f64` round-trip made the SCAN
+        // itself the cost (every one of `tile * n_train` candidates pays it,
+        // regardless of whether it matches), where sklearn's brute path is a
+        // single vectorised `numpy` comparison over the whole block. `F`'s
+        // `PartialOrd` (from `Numeric`) makes the unconverted compare exact —
+        // `f64_to_host` then `<=` on `F` orders identically to `<=` on the
+        // `f64` values it came from, for the finite, non-NaN distances a
+        // metric ever produces.
+        let thresh_f: F = f64_to_host::<F>(if needs_sqrt { radius * radius } else { radius });
+        for r in 0..rows {
+            let row = &dist_host[r * n_train..(r + 1) * n_train];
+            let mut row_count = 0u32;
+            for (j, &v) in row.iter().enumerate() {
+                if v <= thresh_f {
+                    let true_dist = if needs_sqrt {
+                        f64_to_host::<F>(host_to_f64(v).sqrt())
+                    } else {
+                        v
+                    };
+                    distances.push(true_dist);
+                    indices.push(j as i32);
+                    row_count += 1;
+                }
+            }
+            counts.push(row_count);
+        }
+
+        start += rows;
+    }
+
+    Ok(RadiusNeighbors {
+        distances,
+        indices,
+        counts,
+    })
+}
+
+/// Validate the untrusted `radius` + query geometry BEFORE any prim launch
+/// (T-05-08-01 / ASVS V5), returning the unwrapped fitted state. Mirrors
+/// [`validate_kneighbors`] except there is no `k` to bound — any non-negative
+/// `radius` is a legal query (an empty match set is a valid answer, not an
+/// error).
+fn validate_radius_query<'a, F>(
+    x_train: Option<&'a DeviceArray<ActiveRuntime, F>>,
+    train_shape: Option<(usize, usize)>,
+    xq: &DeviceArray<ActiveRuntime, F>,
+    shape: (usize, usize),
+    radius: f64,
+) -> Result<(&'a DeviceArray<ActiveRuntime, F>, (usize, usize)), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let x_train = x_train.ok_or(AlgoError::NotFitted {
+        estimator: "knn",
+        operation: "radius_neighbors",
+    })?;
+    let (n_train, n_features) = train_shape.ok_or(AlgoError::NotFitted {
+        estimator: "knn",
+        operation: "radius_neighbors",
+    })?;
+    let (n_query, q_features) = shape;
+
+    if !(radius >= 0.0) {
+        return Err(AlgoError::InvalidEps {
+            estimator: "nearest_neighbors",
+            eps: radius,
+        });
+    }
+    if n_query == 0 || q_features == 0 || xq.len() != n_query * q_features {
+        return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+            operand: "xq",
+            rows: n_query,
+            cols: q_features,
+            len: xq.len(),
+        }));
+    }
+    if q_features != n_features {
+        return Err(AlgoError::Prim(PrimError::DimMismatch {
+            dim: "n_features",
+            lhs: q_features,
+            rhs: n_features,
+        }));
+    }
+    Ok((x_train, (n_train, n_features)))
+}
+
 /// Fully DEVICE-RESIDENT kneighbors core under an arbitrary [`Metric`] (KNN-01 /
 /// KNN-REG-PARAMS) — the core `KNeighborsRegressor::predict` runs on.
 ///
 /// Same validation and same `distance → top_k` pipeline as
 /// [`neighbor_indices_metric`], but it returns the raw `u32` indices ON the
-/// device and performs NO host round-trip at all. [`neighbor_indices`] /
-/// [`neighbor_indices_metric`] exist for the consumers that genuinely need host
-/// indices (`kneighbors`'s public `i32` surface, the classifier's label gather);
-/// the regressor pairs this one with the fused device gathers so its predict
-/// never leaves the device.
+/// device and performs NO host round-trip at all. [`neighbor_indices_metric`]
+/// exists for the consumers that genuinely need host indices (`kneighbors`'s
+/// public `i32` surface, the classifier's label gather); the regressor pairs
+/// this one with the fused device gathers so its predict never leaves the
+/// device.
 ///
 /// Returns `(distances, indices)` both device-resident, the distances TRUE
 /// (already rooted / already in the metric's own units) so a `weights='distance'`
