@@ -592,27 +592,45 @@ fn multiclass_builder() -> mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier
 /// A 3-class fit gets a `(3, d)` `coef_` / length-3 `intercept_`, and predicts
 /// every training-cluster label correctly (the clusters are separated by
 /// several units; any sane OvR hyperplane recovers them).
-#[test]
-fn multiclass_ovr_fit_and_predict() {
-    let (x, y) = three_class_blobs::<f64>(20, 0xC0FF_EE01);
+///
+/// `row_sum_band` is the tolerance on the `predict_proba` row sums, which is the
+/// only dtype-sensitive assertion here — every other check is a shape or an
+/// exact integer label.
+fn multiclass_case<F>(row_sum_band: f64, what: &str)
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, y) = three_class_blobs::<F>(20, 0xC0FF_EE01);
     let n = 60;
     let d = 2;
 
     let client = runtime::active_client();
     let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
-    let x_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &x);
-    let y_dev = DeviceArray::<ActiveRuntime, f64>::from_host(&mut pool, &y);
+    let x_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, &x);
+    let y_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, &y);
 
     let clf = multiclass_builder()
-        .build::<f64>()
+        .build::<F>()
         .expect("build")
         .fit(&mut pool, &x_dev, Some(&y_dev), (n, d))
         .expect("multiclass fit");
 
-    assert_eq!(clf.classes(), &[0, 1, 2], "classes_");
-    assert_eq!(clf.n_coef_rows(), 3, "n_coef_rows == n_classes for OvR");
-    assert_eq!(clf.coef(&pool).len(), 3 * d, "coef_ is (3, d) flattened");
-    assert_eq!(clf.intercepts(&pool).len(), 3, "intercept_ is length 3");
+    assert_eq!(clf.classes(), &[0, 1, 2], "{what}: classes_");
+    assert_eq!(
+        clf.n_coef_rows(),
+        3,
+        "{what}: n_coef_rows == n_classes for OvR"
+    );
+    assert_eq!(
+        clf.coef(&pool).len(),
+        3 * d,
+        "{what}: coef_ is (3, d) flattened"
+    );
+    assert_eq!(
+        clf.intercepts(&pool).len(),
+        3,
+        "{what}: intercept_ is length 3"
+    );
 
     let labels = clf
         .predict_labels(&mut pool, &x_dev, (n, d))
@@ -622,7 +640,8 @@ fn multiclass_ovr_fit_and_predict() {
         let expected = (i / 20) as i32;
         assert_eq!(
             label, expected,
-            "row {i}: predicted {label}, expected {expected} (well-separated clusters)"
+            "{what}: row {i}: predicted {label}, expected {expected} \
+             (well-separated clusters)"
         );
     }
 
@@ -631,14 +650,43 @@ fn multiclass_ovr_fit_and_predict() {
         .predict_proba(&mut pool, &x_dev, (n, d))
         .expect("predict_proba")
         .to_host(&pool);
-    assert_eq!(proba.len(), n * 3, "predict_proba is (n, 3)");
+    assert_eq!(proba.len(), n * 3, "{what}: predict_proba is (n, 3)");
     for r in 0..n {
-        let row_sum: f64 = proba[r * 3..(r + 1) * 3].iter().sum();
+        let row_sum: f64 = proba[r * 3..(r + 1) * 3]
+            .iter()
+            .map(|&v| host_to_f64(v))
+            .sum();
         assert!(
-            (row_sum - 1.0).abs() < 1e-9,
-            "row {r}: predict_proba sums to {row_sum}, not 1.0"
+            (row_sum - 1.0).abs() < row_sum_band,
+            "{what}: row {r}: predict_proba sums to {row_sum}, not 1.0"
         );
     }
+}
+
+/// The one-vs-rest shape/label/proba contract, f32 — the arm that runs on EVERY
+/// backend, including the ones with no f64.
+#[test]
+fn multiclass_ovr_fit_and_predict_f32() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F32, backend, "default");
+    multiclass_case::<f32>(1e-6, "multiclass OvR f32");
+}
+
+/// The same contract in f64 (cpu runs; rocm skips).
+///
+/// This carries the file's f64 capability gate for the reason the module docs
+/// give, and it needs it more than its siblings do rather than less: the OvR
+/// `predict_proba`/`decision` path reaches a GEMM, and a backend that reports no
+/// f64 support fails that launch outright instead of merely losing precision.
+#[test]
+fn multiclass_ovr_fit_and_predict() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(capability::FloatKind::F64, backend, "default");
+    if capability::skip_f64_with_log() || capability::skip_f64_transcendental_with_log() {
+        println!("mbsgd_classifier multiclass f64 backend={backend}: SKIPPED (no f64 support)");
+        return;
+    }
+    multiclass_case::<f64>(1e-9, "multiclass OvR f64");
 }
 
 /// The one-vs-rest fan-out is embarrassingly parallel over independent binary

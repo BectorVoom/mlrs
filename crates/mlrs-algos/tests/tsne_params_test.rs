@@ -659,11 +659,46 @@ fn verbose_is_value_neutral() {
 /// `angle` is Barnes-Hut's accuracy/speed dial. At `angle = 0` no cell can ever
 /// satisfy `width² / dist² < 0`, so every leaf is visited individually and the
 /// negative force becomes the EXACT `O(n²)` summation. That gives the parameter
-/// a checkable endpoint: `barnes_hut(angle=0)` must land in the same KL
-/// neighbourhood as `exact` on the same init, which no band over intermediate
-/// angles could establish.
+/// a checkable endpoint: `barnes_hut(angle=0)` must reproduce `exact`'s KL from
+/// the same init, which no band over intermediate angles could establish.
+///
+/// ## Why the horizon is SHORT
+/// The endpoint claim is about the FORCE, so it has to be read before t-SNE's
+/// chaos buries it. Over the full schedule this comparison measures nothing: the
+/// `exact` arm and the two `barnes_hut` arms are three trajectories of a chaotic
+/// descent, and which one ends nearer is a coin flip. Swept over the horizon on
+/// this fixture, `|kl_bh(0) − kl_exact| <= |kl_bh(1) − kl_exact|` INVERTS at
+/// 150/400/500 iterations on cpu and at 100/300 on rocm — it is not a
+/// backend disagreement, it is noise that both backends have. (The
+/// backend-dependence is only in WHICH iteration counts invert: `barnes_hut`
+/// runs entirely host-side in f64, so `kl_bh0`/`kl_bh1` are bit-identical
+/// across backends and only the device-kernel `exact` arm moves.) The previous
+/// 300-iteration form of this test passed on cpu by luck and failed on rocm.
+///
+/// At 20 iterations the trajectories have not yet separated and the claim is
+/// unambiguous: `angle = 0` tracks `exact` to ~8e-9 while `angle = 1` sits
+/// 5.8e-3 away — six orders of separation, measured identically on cpu and
+/// rocm. So the gate below asserts BOTH halves of that, which is far stronger
+/// than the ordering it replaces:
+///   1. `angle = 0` really is the exact summation (a tight ABSOLUTE bound), and
+///   2. `angle = 1` really is not (so an `angle` that silently went inert, which
+///      would satisfy any ordering test trivially, fails here).
+///
+/// A short horizon means this runs entirely inside the early-exaggeration phase.
+/// That costs nothing here — `angle` enters the negative force identically in
+/// both phases — and the full schedule is covered by
+/// [`method_reaches_sklearn_band`].
 #[test]
 fn angle_zero_degrades_barnes_hut_towards_exact() {
+    /// `|kl_bh(angle=0) − kl_exact|` must be at most this. Measured 7.85e-9
+    /// (cpu) / 7.92e-9 (rocm); the bound keeps two orders of headroom over both.
+    const EXACT_SUMMATION_TOL: f64 = 1e-6;
+    /// `|kl_bh(angle=1) − kl_exact|` must be at least this, or `angle` is inert
+    /// and the gate above proves nothing. Measured 5.794e-3 on both backends.
+    const COARSE_MIN_GAP: f64 = 1e-4;
+    /// The horizon, in iterations — see the doc comment.
+    const HORIZON: usize = 20;
+
     let case = params_case();
     let x = case.f64("X").expect("X").to_vec();
     let init = case.f64("init_array").expect("init_array").to_vec();
@@ -674,7 +709,7 @@ fn angle_zero_degrades_barnes_hut_towards_exact() {
             .method(method)
             .angle(angle)
             .init(TsneInit::Array(init.clone()))
-            .max_iter(300)
+            .max_iter(HORIZON)
             .build::<f64>()
             .expect("valid hyperparameters")
     };
@@ -682,15 +717,18 @@ fn angle_zero_degrades_barnes_hut_towards_exact() {
     let (_, kl_bh0, _) = run_fit(build(TsneMethod::BarnesHut, 0.0), &x, N, P);
     let (_, kl_bh_coarse, _) = run_fit(build(TsneMethod::BarnesHut, 1.0), &x, N, P);
 
-    // `barnes_hut` still uses a SPARSE k-NN P where `exact` uses the dense one,
-    // so the two KLs are not the same number even at angle 0 — but the
-    // exact-summation arm must be the closer of the two.
     let near = (kl_bh0 - kl_exact).abs();
     let far = (kl_bh_coarse - kl_exact).abs();
     assert!(
-        near <= far,
-        "angle=0 (exact summation) should track the exact method at least as \
-         closely as angle=1: |{kl_bh0} - {kl_exact}| = {near} vs {far}"
+        near <= EXACT_SUMMATION_TOL,
+        "angle=0 must BE the exact summation over {HORIZON} iterations: \
+         |{kl_bh0} - {kl_exact}| = {near:e} exceeds {EXACT_SUMMATION_TOL:e}"
+    );
+    assert!(
+        far >= COARSE_MIN_GAP,
+        "angle=1 must actually summarize — |{kl_bh_coarse} - {kl_exact}| = \
+         {far:e} is below {COARSE_MIN_GAP:e}, so `angle` looks inert and the \
+         angle=0 gate above is vacuous"
     );
 }
 

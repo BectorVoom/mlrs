@@ -9,7 +9,10 @@ Two tiers (the Rust ``tsne_test.rs`` analog through the Python surface):
 - Determinism: PCA-init refit is bit-identical.
 
 f64 fixtures are skipped-with-reason on an f64-incapable backend via
-``conftest.requires_f64``.
+``conftest.requires_f64``. The string-parameter gates (``metric`` / ``init``)
+do not load a fixture — they synthesize their design — so they instead run at
+both dtypes via ``DESIGN_DTYPES`` and skip only the f64 arm, which keeps every
+metric and init string covered on an f64-incapable backend.
 """
 
 import numpy as np
@@ -20,6 +23,59 @@ import mlrs
 from conftest import dtype_of, fixture_path, requires_f64
 
 TSNE_FIXTURES = ["tsne_f32_seed42", "tsne_f64_seed42"]
+
+# The two design dtypes the string-parameter gates below run at. The f64 arm
+# skips on an f64-incapable backend; the f32 arm runs EVERYWHERE, so those gates
+# keep covering every metric/init string on rocm rather than vanishing with the
+# f64 arm (they previously built a float64 design unconditionally and died in
+# the shim's dtype guard rather than skipping).
+DESIGN_DTYPES = [np.float32, np.float64]
+
+# The widest float dtype the ACTIVE backend can run. Every gate in this file
+# synthesizes its own design instead of loading a dtype-tagged fixture, and
+# numpy hands back float64 by default — so without this they all built an f64
+# design unconditionally and died in the shim's dtype guard on an f64-incapable
+# backend (rocm) rather than adapting or skipping. The gates that are
+# mlrs-vs-mlrs (exact-equality, value-neutrality, two-routes-agree) or that
+# assert a validation ERROR are dtype-insensitive, so they simply build at this
+# dtype and keep running everywhere; only the gates that compare VALUES against
+# a float64 sklearn oracle parametrize over `DESIGN_DTYPES` and skip the f64 arm.
+DESIGN_DTYPE = np.float64 if mlrs.backend_supports_f64() else np.float32
+
+
+def _skip_unsupported_dtype(dtype):
+    if dtype == np.float64 and not mlrs.backend_supports_f64():
+        pytest.skip("backend does not support f64")
+
+
+def _route_rtol():
+    """Tolerance for an mlrs-vs-mlrs "two routes agree" comparison.
+
+    Both sides run at ``DESIGN_DTYPE`` through different code paths that are
+    mathematically identical (minkowski p=2 vs euclidean; a callable metric vs
+    the precomputed matrix it realizes to), so this bounds path divergence, not
+    dtype error — but the divergence is still resolved at the design's
+    precision, so it scales with it.
+    """
+    return 1e-9 if DESIGN_DTYPE == np.float64 else 1e-5
+
+
+def _kl_rtol(dtype):
+    """Relative tolerance on ``kl_divergence_`` for a design of this dtype.
+
+    Both KL gates below compare mlrs at `dtype` against sklearn at float64 — the
+    f32 arm is held to the TRUE answer, not to a float32 re-derivation of it, so
+    it gates the dtype path rather than just its self-consistency.
+
+    ``1e-10`` is what the f64 arm reaches. The f32 arm is measured (rocm,
+    gfx1151) at a worst relative disagreement of 2.7e-7 across all 22 metrics on
+    BOTH gates, which is far tighter than the f32 epsilon would suggest because
+    the perplexity search sklearn and mlrs share already rounds to float32. The
+    band is set an order above that measurement, and still discriminates
+    enormously: the frozen KL spans 0.90 (`yule`) to 1.40 (`rogerstanimoto`)
+    across the metric set, four orders above this tolerance.
+    """
+    return 1e-10 if dtype == np.float64 else 5e-6
 
 
 def _trustworthiness(x, emb, k=5):
@@ -101,8 +157,9 @@ def _metric_design(seed=0):
     return x
 
 
+@pytest.mark.parametrize("dtype", DESIGN_DTYPES)
 @pytest.mark.parametrize("metric", _TSNE_METRICS)
-def test_tsne_every_metric_string_matches_sklearn(metric):
+def test_tsne_every_metric_string_matches_sklearn(metric, dtype):
     """Each metric string reproduces sklearn's input-space geometry EXACTLY,
     through the full binding path.
 
@@ -134,6 +191,7 @@ def test_tsne_every_metric_string_matches_sklearn(metric):
     un-exaggerated `P` after the schedule ends, in every branch — but the
     ORACLE does, so the fixture steps off the boundary.
     """
+    _skip_unsupported_dtype(dtype)
     X = _metric_design()
     common = dict(
         perplexity=8.0, metric=metric, method="exact",
@@ -141,21 +199,23 @@ def test_tsne_every_metric_string_matches_sklearn(metric):
     )
     init = 1e-4 * np.random.default_rng(31).standard_normal((X.shape[0], 2))
 
-    est = mlrs.TSNE(init=init.copy(), **common)
-    emb = np.asarray(est.fit_transform(X), dtype=np.float64)
+    est = mlrs.TSNE(init=init.astype(dtype).copy(), **common)
+    emb = np.asarray(est.fit_transform(X.astype(dtype)), dtype=np.float64)
     assert emb.shape == (X.shape[0], 2)
     assert np.isfinite(emb).all(), f"metric={metric}: embedding must be finite"
 
+    # The oracle always runs at float64 — the f32 arm is held to the TRUE KL.
     sk = SkTSNE(init=init.copy(), **common).fit(X)
     assert sk.kl_divergence_ < 1e300, "the oracle hit sklearn's max_iter=250 sentinel"
     np.testing.assert_allclose(
-        est.kl_divergence_, sk.kl_divergence_, rtol=1e-10, atol=0.0,
+        est.kl_divergence_, sk.kl_divergence_, rtol=_kl_rtol(dtype), atol=0.0,
         err_msg=f"metric={metric}: the joint probabilities differ from sklearn's",
     )
 
 
+@pytest.mark.parametrize("dtype", DESIGN_DTYPES)
 @pytest.mark.parametrize("metric", _TSNE_METRICS)
-def test_tsne_every_metric_string_tracks_sklearn_over_a_short_horizon(metric):
+def test_tsne_every_metric_string_tracks_sklearn_over_a_short_horizon(metric, dtype):
     """Second tier: the whole DESCENT — gradient, gains, momentum, both phases
     — tracks sklearn per metric, not just the `P` the frozen gate pins.
 
@@ -176,6 +236,7 @@ def test_tsne_every_metric_string_tracks_sklearn_over_a_short_horizon(metric):
     `yule` optimum is 1.156 against an initial 0.902. Nothing tight can be
     asserted about that, and asserting something loose would gate nothing.
     """
+    _skip_unsupported_dtype(dtype)
     X = _metric_design()
     common = dict(
         perplexity=8.0, metric=metric, method="exact",
@@ -183,29 +244,40 @@ def test_tsne_every_metric_string_tracks_sklearn_over_a_short_horizon(metric):
     )
     init = 1e-4 * np.random.default_rng(31).standard_normal((X.shape[0], 2))
 
-    est = mlrs.TSNE(init=init.copy(), **common)
-    emb = np.asarray(est.fit_transform(X), dtype=np.float64)
+    est = mlrs.TSNE(init=init.astype(dtype).copy(), **common)
+    emb = np.asarray(est.fit_transform(X.astype(dtype)), dtype=np.float64)
+    # The oracle always runs at float64 — the f32 arm is held to the TRUE KL.
     sk = SkTSNE(init=init.copy(), **common).fit(X)
 
     assert np.isfinite(emb).all()
     # The descent must actually have moved, or this would pass vacuously.
     assert not np.allclose(emb, init), f"metric={metric}: the embedding never moved"
     np.testing.assert_allclose(
-        est.kl_divergence_, sk.kl_divergence_, rtol=1e-6, atol=0.0,
+        est.kl_divergence_, sk.kl_divergence_, rtol=max(_kl_rtol(dtype), 1e-6),
+        atol=0.0,
         err_msg=f"metric={metric}: the descent diverged from sklearn's",
     )
 
 
+@pytest.mark.parametrize("dtype", DESIGN_DTYPES)
 @pytest.mark.parametrize("method", ["barnes_hut", "exact"])
-def test_tsne_method_matches_sklearn_band_from_shared_init(method):
+def test_tsne_method_matches_sklearn_band_from_shared_init(method, dtype):
     """Both `method` values, started from the SAME injected embedding so the
-    only remaining difference is arithmetic."""
+    only remaining difference is arithmetic.
+
+    Both assertions are BANDS (neighbourhood preservation within 0.05, KL within
+    +0.25), so they are dtype-insensitive and the f32 arm is held to exactly the
+    same slack — the oracle stays at float64 either way.
+    """
+    _skip_unsupported_dtype(dtype)
     rng = np.random.default_rng(3)
     X = np.vstack([rng.normal(c, 0.7, (40, 5)) for c in [0.0, 6.0, -7.0]])
     init = 1e-4 * rng.standard_normal((X.shape[0], 2))
 
-    est = mlrs.TSNE(perplexity=10.0, method=method, init=init.copy(), random_state=0)
-    emb = np.asarray(est.fit_transform(X), dtype=np.float64)
+    est = mlrs.TSNE(
+        perplexity=10.0, method=method, init=init.astype(dtype).copy(), random_state=0
+    )
+    emb = np.asarray(est.fit_transform(X.astype(dtype)), dtype=np.float64)
     sk = SkTSNE(perplexity=10.0, method=method, init=init.copy(), random_state=0).fit(X)
 
     t_mlrs = _trustworthiness(X, emb)
@@ -214,17 +286,23 @@ def test_tsne_method_matches_sklearn_band_from_shared_init(method):
     assert 0.0 < est.kl_divergence_ <= sk.kl_divergence_ + 0.25
 
 
+@pytest.mark.parametrize("dtype", DESIGN_DTYPES)
 @pytest.mark.parametrize("init", ["pca", "random", "array"])
-def test_tsne_every_init_string_reaches_sklearns_band(init):
+def test_tsne_every_init_string_reaches_sklearns_band(init, dtype):
+    _skip_unsupported_dtype(dtype)
     rng = np.random.default_rng(5)
     X = np.vstack([rng.normal(c, 0.7, (40, 5)) for c in [0.0, 6.0, -7.0]])
     arg = 1e-4 * rng.standard_normal((X.shape[0], 2)) if init == "array" else init
 
-    est = mlrs.TSNE(perplexity=10.0, method="exact", init=arg, random_state=0)
-    emb = np.asarray(est.fit_transform(X), dtype=np.float64)
+    est_init = arg.astype(dtype).copy() if init == "array" else arg
+    est = mlrs.TSNE(perplexity=10.0, method="exact", init=est_init, random_state=0)
+    emb = np.asarray(est.fit_transform(X.astype(dtype)), dtype=np.float64)
     sk_init = arg.copy() if init == "array" else arg
     sk = SkTSNE(perplexity=10.0, method="exact", init=sk_init, random_state=0).fit(X)
 
+    # A neighbourhood-preservation band, not a value gate — it is the dtype-
+    # insensitive tier, so both arms share the 0.05 slack (measured f32 margin
+    # on rocm is ~0.048-0.052, i.e. the band is doing real work at both dtypes).
     t_mlrs = _trustworthiness(X, emb)
     t_sk = _trustworthiness(X, sk.embedding_)
     assert t_mlrs >= t_sk - 0.05, f"init={init}: trust {t_mlrs} vs sklearn {t_sk}"
@@ -235,7 +313,7 @@ def test_tsne_learning_rate_auto_equals_the_resolved_constant():
     with that number rather than a band, which could not tell it from a nearby
     constant."""
     rng = np.random.default_rng(7)
-    X = rng.normal(size=(60, 4))
+    X = rng.normal(size=(60, 4)).astype(DESIGN_DTYPE)
     resolved = max(X.shape[0] / 12.0 / 4.0, 50.0)
 
     a = np.asarray(
@@ -253,10 +331,23 @@ def test_tsne_learning_rate_auto_equals_the_resolved_constant():
 
 def test_tsne_metric_params_reach_the_pair_loop():
     """`metric_params={'p': ...}` must change the geometry; `p=2` must
-    reproduce plain euclidean exactly."""
+    reproduce plain euclidean exactly.
+
+    ## Why the horizon is SHORT
+    This is a claim about the METRIC — that `minkowski(p=2)` and `euclidean`
+    compute the same distances — so it has to be read before t-SNE's chaos
+    buries it. The two routes reach those distances by different formulas
+    (`sqrt(Σd²)` vs `(Σ|d|^p)^(1/p)`), which agree bit-for-bit in float64 but
+    differ in the last ulp or two in float32. Over the full 300-iteration
+    descent that ulp amplifies exponentially — measured on this design at
+    float32: 4.7e-10 apart at 1 iteration, 1.1e-4 at 10, and fully diverged
+    (relative difference ~1.9) by 50. A long horizon therefore tests the
+    chaos, not the metric, and can only be made to pass by pinning the test to
+    float64. Two iterations isolate the metric and gate it at BOTH dtypes.
+    """
     rng = np.random.default_rng(11)
-    X = rng.normal(size=(50, 4))
-    common = dict(perplexity=8.0, init="pca", method="exact", max_iter=300)
+    X = rng.normal(size=(50, 4)).astype(DESIGN_DTYPE)
+    common = dict(perplexity=8.0, init="pca", method="exact", max_iter=2)
 
     eu = np.asarray(mlrs.TSNE(metric="euclidean", **common).fit_transform(X), dtype=np.float64)
     mk2 = np.asarray(
@@ -267,7 +358,8 @@ def test_tsne_metric_params_reach_the_pair_loop():
         mlrs.TSNE(metric="minkowski", metric_params={"p": 3.0}, **common).fit_transform(X),
         dtype=np.float64,
     )
-    np.testing.assert_allclose(mk2, eu, rtol=1e-9, atol=1e-9)
+    tol = _route_rtol()
+    np.testing.assert_allclose(mk2, eu, rtol=tol, atol=tol)
     assert not np.allclose(mk3, eu), "p=3 must not reproduce the euclidean embedding"
 
     with pytest.raises(ValueError, match="metric_params"):
@@ -277,22 +369,30 @@ def test_tsne_metric_params_reach_the_pair_loop():
 def test_tsne_callable_metric_matches_the_precomputed_route():
     """A callable `metric` is realized by evaluating it into a dense distance
     matrix; that must agree with passing the same matrix as
-    `metric='precomputed'`."""
+    `metric='precomputed'`.
+
+    Short horizon for the same reason as
+    :func:`test_tsne_metric_params_reach_the_pair_loop` — this gates the
+    REALIZATION of the callable, and the two routes build the matrix by
+    different arithmetic, so a long chaotic descent would turn a last-ulp
+    float32 difference into a total divergence and force the gate to float64.
+    """
     rng = np.random.default_rng(13)
-    X = rng.normal(size=(40, 3))
+    X = rng.normal(size=(40, 3)).astype(DESIGN_DTYPE)
 
     def cityblock(u, v):
         return float(np.abs(u - v).sum())
 
-    common = dict(perplexity=8.0, init="random", method="exact", max_iter=300, random_state=0)
+    common = dict(perplexity=8.0, init="random", method="exact", max_iter=2, random_state=0)
     via_callable = np.asarray(
         mlrs.TSNE(metric=cityblock, **common).fit_transform(X), dtype=np.float64
     )
-    dist = np.abs(X[:, None, :] - X[None, :, :]).sum(-1)
+    dist = np.abs(X[:, None, :] - X[None, :, :]).sum(-1).astype(DESIGN_DTYPE)
     via_precomputed = np.asarray(
         mlrs.TSNE(metric="precomputed", **common).fit_transform(dist), dtype=np.float64
     )
-    np.testing.assert_allclose(via_callable, via_precomputed, rtol=1e-9, atol=1e-9)
+    tol = _route_rtol()
+    np.testing.assert_allclose(via_callable, via_precomputed, rtol=tol, atol=tol)
 
 
 def test_tsne_callable_metric_works_with_the_default_pca_init():
@@ -310,41 +410,45 @@ def test_tsne_callable_metric_works_with_the_default_pca_init():
 
     # The default init must simply work.
     est = mlrs.TSNE(perplexity=8.0, metric=cityblock, max_iter=300)
-    emb = np.asarray(est.fit_transform(X), dtype=np.float64)
+    emb = np.asarray(est.fit_transform(X.astype(DESIGN_DTYPE)), dtype=np.float64)
     assert emb.shape == (40, 2)
     assert np.isfinite(emb).all()
 
     # ...and must agree with sklearn's own callable + PCA-init run, which is
-    # deterministic once the step size keeps the trajectory short.
+    # deterministic once the step size keeps the trajectory short. The oracle
+    # stays at float64 whatever the design dtype is, so the tolerance follows
+    # the design (`_kl_rtol`) rather than being pinned to the f64 figure.
     common = dict(perplexity=8.0, max_iter=300, learning_rate=1e-3, init="pca")
     a = mlrs.TSNE(metric=cityblock, method="exact", **common)
-    a.fit(X)
+    a.fit(X.astype(DESIGN_DTYPE))
     b = SkTSNE(metric=cityblock, method="exact", **common).fit(X)
-    np.testing.assert_allclose(a.kl_divergence_, b.kl_divergence_, rtol=1e-6)
+    np.testing.assert_allclose(
+        a.kl_divergence_, b.kl_divergence_, rtol=max(_kl_rtol(DESIGN_DTYPE), 1e-6)
+    )
 
     # The explicit `precomputed` spelling still refuses `init='pca'`.
-    dist = np.abs(X[:, None, :] - X[None, :, :]).sum(-1)
+    dist = np.abs(X[:, None, :] - X[None, :, :]).sum(-1).astype(DESIGN_DTYPE)
     with pytest.raises(ValueError, match="pca"):
         mlrs.TSNE(perplexity=8.0, metric="precomputed", init="pca").fit(dist)
 
 
 def test_tsne_haversine_and_precomputed_geometry_rules():
     rng = np.random.default_rng(17)
-    X2 = rng.uniform(-1.0, 1.0, size=(40, 2))
+    X2 = rng.uniform(-1.0, 1.0, size=(40, 2)).astype(DESIGN_DTYPE)
     # haversine is defined on exactly 2 features and must fit there...
     est = mlrs.TSNE(perplexity=8.0, metric="haversine", init="random", max_iter=250)
     assert np.isfinite(np.asarray(est.fit_transform(X2), dtype=np.float64)).all()
     # ...and be rejected anywhere else.
     with pytest.raises(ValueError):
         mlrs.TSNE(perplexity=8.0, metric="haversine", init="random").fit(
-            rng.normal(size=(40, 5))
+            rng.normal(size=(40, 5)).astype(DESIGN_DTYPE)
         )
     # `precomputed` needs a square X, and rules out init='pca'.
     with pytest.raises(ValueError):
         mlrs.TSNE(perplexity=8.0, metric="precomputed", init="random").fit(
-            rng.normal(size=(40, 5))
+            rng.normal(size=(40, 5)).astype(DESIGN_DTYPE)
         )
-    dist = np.abs(X2[:, None, :] - X2[None, :, :]).sum(-1)
+    dist = np.abs(X2[:, None, :] - X2[None, :, :]).sum(-1).astype(DESIGN_DTYPE)
     with pytest.raises(ValueError, match="pca"):
         mlrs.TSNE(perplexity=8.0, metric="precomputed", init="pca").fit(dist)
 
@@ -352,7 +456,7 @@ def test_tsne_haversine_and_precomputed_geometry_rules():
 def test_tsne_wminkowski_is_rejected_like_sklearn():
     """sklearn accepts the string at validation and then fails, because scipy
     removed the metric. mlrs fails too rather than silently substituting one."""
-    X = np.random.default_rng(19).normal(size=(30, 4))
+    X = np.random.default_rng(19).normal(size=(30, 4)).astype(DESIGN_DTYPE)
     with pytest.raises(ValueError):
         mlrs.TSNE(perplexity=8.0, metric="wminkowski", init="random").fit(X)
 
@@ -361,7 +465,7 @@ def test_tsne_n_jobs_and_verbose_are_value_neutral():
     """Both only move the wall clock, so anything short of bit-identical output
     is a bug — the parallel reductions run in point order by construction."""
     rng = np.random.default_rng(23)
-    X = rng.normal(size=(80, 5))
+    X = rng.normal(size=(80, 5)).astype(DESIGN_DTYPE)
     common = dict(perplexity=10.0, init="pca", max_iter=300)
     base = np.asarray(mlrs.TSNE(n_jobs=1, **common).fit_transform(X), dtype=np.float64)
     for n_jobs in (2, 4, -1, None):
@@ -375,7 +479,7 @@ def test_tsne_n_jobs_and_verbose_are_value_neutral():
 
 
 def test_tsne_barnes_hut_component_cap_matches_sklearn():
-    X = np.random.default_rng(29).normal(size=(40, 5))
+    X = np.random.default_rng(29).normal(size=(40, 5)).astype(DESIGN_DTYPE)
     with pytest.raises(ValueError):
         mlrs.TSNE(perplexity=8.0, method="barnes_hut", n_components=4, init="random").fit(X)
     # The exact method has no such cap.
