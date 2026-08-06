@@ -61,6 +61,11 @@ pub mod ingress;
 // The host-only sklearn metrics surface PyO3 free functions (METR-BIND-01,
 // TASK-15): thin wrappers over `mlrs_algos::metrics::{classification,regression}`.
 pub mod metrics;
+// The `mlrs.model_selection` PyO3 free-function surface (MODSEL-BIND-01):
+// splitter index generation, ParameterGrid/Sampler combinatorics, search +
+// halving schedules, CV aggregation and decision-threshold tuning, over
+// `mlrs_algos::model_selection`. Host-only, like `metrics`.
+pub mod model_selection;
 
 // The estimator `#[pyclass]` wrappers (Plan 03 onward, across every estimator
 // family landed since — linear/cluster/decomposition/neighbors/covariance/
@@ -201,6 +206,10 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // The driver is present: register the low-level surface.
     m.add_function(wrap_pyfunction!(backend_supports_f64, m)?)?;
+
+    // The `model_selection` surface (MODSEL-BIND-01) — one call, since it
+    // registers ~33 free functions plus the `NumpyRandomState` class.
+    model_selection::register(m)?;
 
     // Register all estimator `#[pyclass]` wrappers (PY-01). The pure-Python
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.

@@ -710,17 +710,28 @@ def test_submodule_is_reachable_from_package_root():
     assert not hasattr(mlrs, "train_test_split")
 
 
-def test_module_does_not_require_the_compiled_extension(monkeypatch):
-    """Importing and CALLING the module must not touch `mlrs._mlrs` — break the
-    loader and the split still works."""
-    import mlrs
+def test_module_imports_without_touching_the_extension():
+    """The algorithms live in `_mlrs`, but the IMPORT must stay lazy.
 
-    def boom():
-        raise ImportError("extension deliberately unavailable")
+    `import mlrs.model_selection` runs at `import mlrs` time, so an eager
+    extension import here would make the whole package unimportable on a tree
+    where `maturin develop` has not run — which is exactly the state a
+    contributor is in before their first build."""
+    import ast
+    import inspect
 
-    monkeypatch.setattr(mlrs, "_load_ext", boom)
-    tr, te = train_test_split(np.arange(20), random_state=0)
-    assert len(tr) == 15 and len(te) == 5
+    import mlrs.model_selection as ms
+
+    tree = ast.parse(inspect.getsource(ms))
+    module_level_imports = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    imported = {
+        alias.name for node in module_level_imports for alias in node.names
+    }
+    assert "_mlrs" not in imported
 
 
 # --------------------------------------------------------------------------- #
@@ -897,19 +908,53 @@ def test_kfold_folds_are_reproducible_and_seed_sensitive():
 
 
 # --------------------------------------------------------------------------- #
-# 7. search passthrough (MODSEL-02) + sklearn interop
+# 7. search + sklearn interop
 # --------------------------------------------------------------------------- #
 
 
-def test_search_passthrough_is_sklearn_itself():
-    """These are deliberately re-exported, not reimplemented — pin that, so a
-    future 'helpful' reimplementation is a conscious decision."""
+def test_search_is_mlrs_owned_not_a_reexport():
+    """The search estimators used to be sklearn re-exports; they are now mlrs
+    classes over the Rust schedule. Pin that, so an accidental re-export (or a
+    stale import) is a test failure rather than a silent loss of the Rust
+    path."""
+    # sklearn gates the halving searches behind an experimental import, and
+    # touching them without it raises ImportError from the module `__getattr__`
+    # (which `getattr(..., default)` does NOT swallow).
+    from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+
     import mlrs.model_selection as ms
 
-    assert ms.GridSearchCV is skm.GridSearchCV
-    assert ms.RandomizedSearchCV is skm.RandomizedSearchCV
-    assert ms.cross_val_score is skm.cross_val_score
-    assert ms.cross_validate is skm.cross_validate
+    for name in (
+        "GridSearchCV",
+        "RandomizedSearchCV",
+        "HalvingGridSearchCV",
+        "HalvingRandomSearchCV",
+        "cross_val_score",
+        "cross_validate",
+    ):
+        assert getattr(ms, name) is not getattr(skm, name, None)
+        assert getattr(ms, name).__module__ == "mlrs.model_selection"
+
+
+def test_public_surface_covers_sklearn():
+    """Every public name in sklearn.model_selection exists here.
+
+    The comparison is against ``dir(sklearn.model_selection)`` rather than a
+    hand-maintained list, so a name added upstream shows up as a failure here
+    instead of as a silent gap."""
+    from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+
+    import mlrs.model_selection as ms
+
+    # `__all__` rather than `dir()`: the module namespace also leaks imported
+    # helpers (`typing`, ...) that are not part of the documented API and that
+    # mlrs has no reason to re-export.
+    missing = sorted(name for name in set(skm.__all__) if not hasattr(ms, name))
+    assert missing == []
+    # ...and mlrs exports nothing sklearn does not, so `from mlrs.model_selection
+    # import *` cannot shadow an unrelated name.
+    extra = sorted(set(ms.__all__) - set(skm.__all__) - {"InvalidParameterError"})
+    assert extra == []
 
 
 @pytest.mark.parametrize("cls", [KFold, StratifiedKFold])

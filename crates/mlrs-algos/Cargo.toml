@@ -28,6 +28,17 @@ thiserror = { workspace = true }
 # clipped numeric, not the warning text (Phase-11 A2).
 log = { workspace = true }
 
+# OPTIONAL row-container support for `model_selection::container` (MODSEL-RS-03).
+# Both are OFF by default so the four backend wheels — which reach polars and
+# numpy through their own PYTHON APIs, never through this crate — do not pay
+# polars' build cost. A Rust-native consumer opts in with
+# `features = ["ndarray", "polars"]`.
+ndarray = { version = "0.16", optional = true }
+# default-features=false: the full polars default set drags in every IO format
+# (parquet/csv/json) and lazy-frame machinery; `RowContainer` only needs the
+# eager DataFrame gather.
+polars = { version = "0.53", optional = true, default-features = false }
+
 [dev-dependencies]
 # Oracle harness (`load_npz`, `OracleCase`) + tolerance/sign-flip helpers the
 # estimator tests consume. Reachable through the main `mlrs-core` dep, but named
@@ -51,3 +62,9 @@ cpu = ["mlrs-backend/cpu"]
 wgpu = ["mlrs-backend/wgpu"]
 cuda = ["mlrs-backend/cuda"]
 rocm = ["mlrs-backend/rocm"]
+
+# Row-container adapters (MODSEL-RS-03). Named explicitly rather than relying on
+# Cargo's implicit optional-dependency features so `cargo check --features
+# ndarray` is a documented, checked configuration rather than an accident.
+ndarray = ["dep:ndarray"]
+polars = ["dep:polars"]
