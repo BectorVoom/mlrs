@@ -1068,6 +1068,11 @@ where
     // captured (never panics across the boundary) and surfaced after the solve.
     let mut prim_err: Option<PrimError> = None;
     let mut probe_evals: usize = 0;
+    // `max|grad|` at the STARTING iterate `w = 0`, captured on the first
+    // evaluation. This is the scale the convergence floor below is measured
+    // against — see the `floor_accept` comment for why an absolute floor is
+    // wrong.
+    let mut grad_scale: f64 = 0.0;
     let probe_t0 = std::time::Instant::now();
     let closure = |w: &[f64]| -> (f64, Vec<f64>) {
         probe_evals += 1;
@@ -1092,6 +1097,9 @@ where
         for (j, gj) in grad.iter_mut().enumerate() {
             *gj = w[j] + c * *gj;
         }
+        if probe_evals == 1 {
+            grad_scale = grad.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        }
         (loss, grad)
     };
 
@@ -1106,13 +1114,14 @@ where
     // never fire and the strong-Wolfe line search instead BREAKS DOWN at the floor —
     // exactly the `logistic.rs` precision-floor accept (05-10). We therefore accept
     // a line-search breakdown / cap as converged when the residual `max|grad|` is at
-    // or below the dtype floor `k·sqrt(eps_F)` (the smallest gradient a flat-near-
-    // minimum float loss can resolve); a residual ABOVE the floor is a genuine
-    // non-stationary breakdown and stays `NotConverged` (T-10-04-03 DoS signal).
-    // (On the cpu backend the f32 floor is much lower than `f_epsilon::<f32>()`
-    // implies, because `SvmObjective`'s host arm accumulates in f64 whatever `F`
-    // is — the floor accept then simply never has to fire. It is kept as the
-    // device backends' f32 path still accumulates in `F`.)
+    // or below the dtype floor `k·sqrt(eps_F)·grad_scale` (the smallest gradient a
+    // flat-near-minimum float loss can resolve, measured against the problem's own
+    // gradient scale — see `floor_accept` below); a residual ABOVE the floor is a
+    // genuine non-stationary breakdown and stays `NotConverged` (T-10-04-03 DoS
+    // signal). (On the cpu backend the achieved residual is far below the floor
+    // whatever `F` is, because `SvmObjective`'s host arm accumulates in f64 — the
+    // floor accept then simply never has to fire. It is load-bearing only on the
+    // device backends, whose f32 path accumulates in `F`.)
     // WR-01: thread the caller-configured L-BFGS gradient tolerance through
     // (sklearn `tol`), clamped to a sane positive floor so a `tol = 0` (the pinned
     // deterministic-epochs oracle override) still requests a deep converged solve
@@ -1128,11 +1137,14 @@ where
     if mlrs_backend::abflag::is_on("MLRS_SVM_PROBE") {
         eprintln!(
             "[svm probe] {estimator} n={n_samples} d={n_features} evals={probe_evals} \
-             iters={} stop={:?} max_grad={:.3e} loss={:.9e} solve={:.2}ms",
+             iters={} stop={:?} max_grad={:.3e} loss={:.9e} grad_scale={:.3e} \
+             rel={:.3e} solve={:.2}ms",
             result.iters,
             result.stop_reason,
             result.max_grad,
             result.loss,
+            grad_scale,
+            result.max_grad / grad_scale.max(f64::MIN_POSITIVE),
             probe_t0.elapsed().as_secs_f64() * 1e3,
         );
     }
@@ -1140,10 +1152,36 @@ where
         return Err(AlgoError::Prim(e));
     }
 
-    // Dtype precision floor for the convex-minimum residual gradient: f32 ≈
-    // 1.7e-4, f64 ≈ 7.5e-9 (the `logistic.rs` GAUGE_FLOOR_K·sqrt(eps) shape; here
-    // there is no gauge null-space, just float round-off near the unique minimum).
-    let floor_accept = 0.5 * f_epsilon::<F>().sqrt();
+    // Dtype precision floor for the convex-minimum residual gradient (the
+    // `logistic.rs` GAUGE_FLOOR_K·sqrt(eps) shape; here there is no gauge
+    // null-space, just float round-off near the unique minimum).
+    //
+    // The floor is RELATIVE to `grad_scale`, not absolute. `max|grad|` is not a
+    // dimensionless quantity: the gradient is `w + C·X̃ᵀg`, so the round-off the
+    // floor models — the error in accumulating `X̃ᵀg` in `F` — scales with the
+    // magnitude of the terms being summed, i.e. with the problem's own gradient
+    // scale. A floor of `k·sqrt(eps_F)` alone is therefore only calibrated for
+    // problems whose gradient happens to be O(1).
+    //
+    // That mis-calibration was invisible for a long time because the two
+    // backends this ran on could not expose it. On cpu `SvmObjective`'s host arm
+    // accumulates in f64 whatever `F` is, so the achieved residual sits far below
+    // any floor and the accept never has to fire. It took a device f32 backend
+    // (rocm) with a poorly-separated one-vs-rest sub-problem to reach the floor
+    // at a realistic gradient scale: measured there, a sub-problem with
+    // `grad_scale = 2.4e2` bottoms out at `max|grad| = 2.1e-3` — a five-order
+    // reduction, unambiguously the float-precision minimum — while the absolute
+    // floor sat at 1.7e-4 and rejected it as a non-stationary breakdown. Its
+    // fitted `coef_` matches the liblinear oracle inside the documented f32 band
+    // and its predicted labels match sklearn's exactly, so the solve was right
+    // and only the verdict was wrong.
+    //
+    // `max(1.0, …)` keeps the floor from TIGHTENING below the historical absolute
+    // value on a degenerate sub-1 gradient scale, so this only ever widens the
+    // accept. It stays discriminating: a genuine breakdown away from the optimum
+    // leaves `max|grad|` within an order or two of `grad_scale`, three-plus
+    // orders above this floor.
+    let floor_accept = 0.5 * f_epsilon::<F>().sqrt() * grad_scale.max(1.0);
     let residual_ok = result.max_grad <= floor_accept;
     let broke = result.stop_reason == LbfgsStopReason::LineSearchFailed && !residual_ok;
     let hit_cap = result.iters >= max_iter && !result.converged && !residual_ok;

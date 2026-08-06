@@ -235,7 +235,17 @@ class TSNE(MlrsBase):
         if not callable(self.metric):
             return self.metric, X, None
 
-        arr = np.asarray(X, dtype=np.float64)
+        # Realize at the DESIGN's float width, not unconditionally at float64.
+        # The callable itself is evaluated in Python and so returns Python
+        # floats whatever the design is, but the matrix handed BACK across the
+        # boundary has to be a dtype the active backend can actually run: an
+        # f64-incapable backend (rocm) rejects an f64 operand, so forcing the
+        # upcast here made `TSNE(metric=my_callable)` unusable there at ANY
+        # input dtype — including the float32 one the user was told to pass.
+        # Preserving float32 and widening everything else (ints, float16) to
+        # float64 leaves every previously-working case bit-identical.
+        work_dtype = np.float32 if np.asarray(X).dtype == np.float32 else np.float64
+        arr = np.asarray(X, dtype=work_dtype)
         n = arr.shape[0]
         dist = np.empty((n, n), dtype=arr.dtype)
         for i in range(n):
