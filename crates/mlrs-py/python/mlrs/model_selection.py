@@ -756,6 +756,20 @@ def _scorer_router(scorers):
     )
 
 
+def _disabled_routing_bunch(params, *, groups=None, estimator_callees=("fit",)):
+    """The three-consumer ``Bunch`` shape shared by every routing-disabled path.
+
+    ``params`` goes wholesale to the estimator's callee(s); ``groups`` goes to
+    the splitter; the scorer starts empty — some callers add ``sample_weight``
+    to it afterwards, per sklearn's own routing-disabled special case.
+    """
+    return Bunch(
+        estimator=Bunch(**{callee: params for callee in estimator_callees}),
+        splitter=Bunch(split={"groups": groups}),
+        scorer=Bunch(score={}),
+    )
+
+
 def _route_cv_params(
     owner,
     *,
@@ -784,10 +798,8 @@ def _route_cv_params(
     """
     params = {} if params is None else params
     if not _routing_enabled():
-        return Bunch(
-            estimator=Bunch(**{callee: params for callee in estimator_callees}),
-            splitter=Bunch(split={"groups": groups}),
-            scorer=Bunch(score={}),
+        return _disabled_routing_bunch(
+            params, groups=groups, estimator_callees=estimator_callees
         )
 
     estimator_mapping = MethodMapping()
@@ -2023,6 +2035,14 @@ def _resolve_scorers(estimator, scoring):
     )
 
 
+def _scorer_accepts_sample_weight(scorer):
+    """Does this one scorer's signature accept a ``sample_weight`` kwarg?"""
+    accepts = getattr(scorer, "_accept_sample_weight", None)
+    if accepts is not None:
+        return bool(accepts())
+    return "sample_weight" in inspect.signature(scorer).parameters  # bare callable
+
+
 def _score_all(scorers, estimator, X, y, score_params, error_score):
     """Run every scorer, returning ``{name: float}``.
 
@@ -2034,9 +2054,11 @@ def _score_all(scorers, estimator, X, y, score_params, error_score):
     (a nested router routes by name; see :func:`_scorer_router`) and the split
     back out per scorer happens here — which is what lets two metrics in one
     ``scoring=`` dict request different metadata, and what enforces their
-    individual requests. A lone scorer was already filtered to its own request
-    by the caller, and with routing disabled every scorer gets everything;
-    both are sklearn's behaviour in the same case.
+    individual requests. With routing disabled, every OTHER kwarg is shared
+    identically, but ``sample_weight`` is still filtered per scorer (dropped
+    for any scorer whose signature doesn't accept it) — mirroring sklearn's
+    ``_MultimetricScorer.__call__``, which does the same split so a mixed
+    ``scoring=`` dict doesn't crash the scorers that can't take a weight.
 
     The routing call sits OUTSIDE the per-scorer ``try``: a metadata request
     that was never set is a caller error, not a degenerate fold, and must not
@@ -2045,6 +2067,14 @@ def _score_all(scorers, estimator, X, y, score_params, error_score):
     if len(scorers) > 1 and score_params and _routing_enabled():
         routed = process_routing(_scorer_router(scorers), "score", **score_params)
         per_scorer = {name: routed[name].score for name in scorers}
+    elif score_params and "sample_weight" in score_params:
+        common = {k: v for k, v in score_params.items() if k != "sample_weight"}
+        per_scorer = {}
+        for name, scorer in scorers.items():
+            params = dict(common)
+            if _scorer_accepts_sample_weight(scorer):
+                params["sample_weight"] = score_params["sample_weight"]
+            per_scorer[name] = params
     else:
         per_scorer = {name: score_params for name in scorers}
 
@@ -2874,20 +2904,22 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
         return router
 
     def _scorers_accept_sample_weight(self, scorers):
-        """Do the scorers take a ``sample_weight``? — and warn once each if not.
+        """Does ANY scorer take a ``sample_weight``? — and warn once each if not.
 
         Only consulted on the routing-DISABLED path, where there is no request
         to read and sklearn falls back to asking the scorer's signature. The
         warning is the point: fitting on weights while scoring without them is a
         silent statistical error, not a formatting detail.
+
+        Mirrors sklearn's ``_MultimetricScorer._accept_sample_weight`` (an
+        ``any(...)`` over the scorers): with a mixed multimetric dict, this
+        decides only whether ``sample_weight`` is worth attaching at all —
+        :func:`_score_all` still forwards it to each scorer individually,
+        exactly as ``_MultimetricScorer.__call__`` does.
         """
-        accepted = True
+        accepted = False
         for name, scorer in scorers.items():
-            accepts = getattr(scorer, "_accept_sample_weight", None)
-            if accepts is not None:
-                takes = bool(accepts())
-            else:  # a bare callable passed as `scoring=`
-                takes = "sample_weight" in inspect.signature(scorer).parameters
+            takes = _scorer_accepts_sample_weight(scorer)
             if not takes:
                 warnings.warn(
                     f"The scoring {name}={scorer} does not support sample_weight, "
@@ -2896,7 +2928,7 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
                     UserWarning,
                     stacklevel=3,
                 )
-            accepted = accepted and takes
+            accepted = accepted or takes
         return accepted
 
     def _get_routed_params_for_fit(self, params, scorers):
@@ -3491,13 +3523,18 @@ class BaseSuccessiveHalving(BaseSearchCV):
     def fit(self, X, y=None, **params):
         """Run the halving search, then refit on the best of the LAST round.
 
-        The schedule depends on the fold count, so the split params have to be
-        routed here as well as in :meth:`BaseSearchCV.fit`; routing is a pure
-        function of ``params``, so doing it twice costs a dict and changes
-        nothing.
+        The schedule depends on the fold count, so the split params are needed
+        here as well as in :meth:`BaseSearchCV.fit`. Only the splitter's own
+        bucket is computed — going through the full
+        :meth:`_get_routed_params_for_fit` would also run the scorer/
+        ``sample_weight`` routing a second time, and unlike splitting that
+        step has a side effect (the "scorer does not support sample_weight"
+        warning), so it must run exactly once, inside ``super().fit()``.
         """
-        scorers, _ = self._get_scorers()
-        split_params = self._get_routed_params_for_fit(params, scorers).splitter.split
+        if _routing_enabled():
+            split_params = process_routing(self, "fit", **params).splitter.split
+        else:
+            split_params = {"groups": params.get("groups")}
         base_cv = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
         self._check_input_parameters(X, y, split_params, base_cv)
         # `_run_search` needs `y` to re-derive the (stratified) base splitter.
@@ -3914,11 +3951,7 @@ class TunedThresholdClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstima
         if params and _routing_enabled():
             routed = process_routing(self, "fit", **params)
         else:
-            routed = Bunch(
-                estimator=Bunch(fit=params),
-                splitter=Bunch(split={}),
-                scorer=Bunch(score={}),
-            )
+            routed = _disabled_routing_bunch(params)
 
         scorer = self._resolve_scorer()
         score_func = getattr(scorer, "_score_func", None)
