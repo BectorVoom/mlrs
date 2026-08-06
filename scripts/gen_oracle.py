@@ -997,6 +997,216 @@ def gen_knn_regressor_params(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# --- NEIGH-PARAMS: the NearestNeighbors full-parameter oracle --------------
+#
+# Reuses the REGRESSOR design (`_knn_reg_data`, `y`/`y_multi` ignored — this is
+# the unsupervised index) for the same reason KNN-CLF-PARAMS does: the
+# duplicated TRAIN pair and the coincident-query rows are exactly what a
+# metric/algorithm sweep needs to gate a tie-break the same way across every
+# combination, and re-deriving them from a fresh seed would risk a fixture
+# where the tie is never exercised.
+NN_PARAMS_K = KNN_REG_K
+NN_PARAMS_P = KNN_REG_P
+NN_PARAMS_METRIC_STRINGS = KNN_REG_METRIC_STRINGS
+NN_PARAMS_ALGORITHMS = KNN_REG_ALGORITHMS
+# A radius chosen PER METRIC against the `_knn_reg_data` design (points spread
+# by `standard_normal() * 3.0 + 5.0` in 4-D) to land WELL inside that metric's
+# own pairwise-distance range: neither 0 matches everywhere nor everyone
+# matches everywhere, so the fixture actually exercises the ragged-count path
+# per query row. This MUST be per-metric — cosine distance is bounded to
+# `[0, 2]`, so the coordinate-space radius that is a genuine partial threshold
+# for euclidean/manhattan/chebyshev/minkowski matches EVERY point under cosine
+# (a degenerate, untested threshold).
+NN_RADIUS = {
+    "euclidean": 6.0,
+    "manhattan": 10.0,
+    "chebyshev": 4.0,
+    "minkowski": 7.0,
+    "cosine": 0.1,
+}
+
+
+def _canonical_kneighbors(x, xq, k, algorithm="brute", **sk_kwargs):
+    """sklearn's `k` nearest neighbours, tie-broken to mlrs's LOWEST-INDEX
+    convention (the `gen_knn_metric` over-fetch + lexsort pattern).
+
+    sklearn's own top-`k` is not guaranteed to break a BOUNDARY tie (two points
+    equidistant at the `k`-th/`(k+1)`-th cutoff) the same way mlrs's `top_k`
+    does. Reordering an ALREADY-RETURNED top-`k` cannot recover the canonical
+    answer when the tie decides SET MEMBERSHIP rather than just ORDER within
+    the returned set — which is exactly what happens here: `_knn_reg_data`
+    deliberately duplicates training row 2 onto row 7, so any metric under
+    which that duplicate pair straddles the `k`-th cutoff for some query needs
+    a tie-break rule to pick between them, and this is that rule, applied
+    identically to what the oracle stores.
+
+    Over-fetches EVERY training point, then selects the canonical `k` per query
+    row via a `(distance, index)` lexicographic key.
+    """
+    from sklearn.neighbors import NearestNeighbors as SkNearestNeighbors
+
+    nn_all = SkNearestNeighbors(
+        n_neighbors=x.shape[0], algorithm=algorithm, **sk_kwargs
+    ).fit(x)
+    dist_all, idx_all = nn_all.kneighbors(xq)
+    distances = np.empty((xq.shape[0], k), dtype=dist_all.dtype)
+    indices = np.empty((xq.shape[0], k), dtype=idx_all.dtype)
+    for r in range(xq.shape[0]):
+        order = np.lexsort((idx_all[r], dist_all[r]))  # primary=distance, secondary=index
+        sel = order[:k]
+        distances[r] = dist_all[r][sel]
+        indices[r] = idx_all[r][sel]
+    return distances, indices
+
+
+def gen_nearest_neighbors_params(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the NearestNeighbors full-parameter oracle (NEIGH-PARAMS).
+
+    One fixture, every hyperparameter combination the `kneighbors` device path
+    serves, all from `sklearn.neighbors.NearestNeighbors(algorithm='brute',
+    ...)`:
+
+      * `metric` in {euclidean, manhattan, chebyshev, minkowski(p=3), cosine}
+        (`distances_<metric>` / `indices_<metric>`)
+      * every STRING spelling of `metric` (nine, under `algorithm='auto'`) —
+        `alias_distances_<metric>` / `alias_indices_<metric>`
+      * every STRING spelling of `algorithm` (four; mlrs runs brute force for
+        all of them) — `alg_distances_<algorithm>` / `alg_indices_<algorithm>`
+
+    The callable-`metric` path is deliberately NOT stored here — see
+    `gen_knn_regressor_params` for why (a committed oracle would only pin numpy
+    against numpy); the Python tests exercise it against a live sklearn instead.
+    """
+    from sklearn.neighbors import NearestNeighbors as SkNearestNeighbors
+
+    x, xq, _y, _y_multi = _knn_reg_data(seed)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {
+        "X": c(x),
+        "Xq": c(xq),
+        "k": c([NN_PARAMS_K]),
+        "p": c([NN_PARAMS_P]),
+    }
+
+    metrics = {
+        "euclidean": dict(metric="euclidean"),
+        "manhattan": dict(metric="manhattan"),
+        "chebyshev": dict(metric="chebyshev"),
+        "minkowski": dict(metric="minkowski", p=NN_PARAMS_P),
+        "cosine": dict(metric="cosine"),
+    }
+    for name, kw in metrics.items():
+        dist, idx = _canonical_kneighbors(x, xq, NN_PARAMS_K, **kw)
+        out[f"distances_{name}"] = c(dist)
+        out[f"indices_{name}"] = c(idx)
+
+    # --- Every STRING value of `metric`, including the aliases (mirrors
+    #     KNN-REG-PARAMS' identical block: nine spellings for five distance
+    #     FUNCTIONS). `algorithm` is irrelevant to `_canonical_kneighbors`
+    #     (value-neutral by construction — see the `alg_` block below), so this
+    #     is the same answer `algorithm='auto'` would give.
+    for metric in NN_PARAMS_METRIC_STRINGS:
+        dist, idx = _canonical_kneighbors(
+            x, xq, NN_PARAMS_K, algorithm="auto", metric=metric
+        )
+        out[f"alias_distances_{metric}"] = c(dist)
+        out[f"alias_indices_{metric}"] = c(idx)
+
+    # --- Every STRING value of `algorithm`, at the default metric. mlrs runs
+    #     brute force for all four; sklearn's tree strategies are a genuinely
+    #     DIFFERENT search than brute force, but `algorithm` cannot change WHICH
+    #     points are nearest — only how they are found — so the canonical
+    #     (brute-force, lowest-index-tie-broken) answer is what every value of
+    #     `algorithm` must agree with, and this is that same answer stored under
+    #     each name for the Python test to replay per algorithm string.
+    for algorithm in NN_PARAMS_ALGORITHMS:
+        dist, idx = _canonical_kneighbors(x, xq, NN_PARAMS_K)
+        out[f"alg_distances_{algorithm}"] = c(dist)
+        out[f"alg_indices_{algorithm}"] = c(idx)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"nn_params_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
+def gen_nearest_neighbors_radius(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the `NearestNeighbors.radius_neighbors` oracle (NEIGH-RADIUS).
+
+    Same design as `gen_nearest_neighbors_params`. sklearn's per-row match sets
+    are RAGGED (a different width per query row) and cannot round-trip through
+    `np.savez` at a fixed shape — nor can `mlrs_core::load_npz`, which only
+    decodes fixed-shape float arrays — so each metric's matches are stored FLAT,
+    concatenated in ASCENDING TRAIN-INDEX order (sklearn's brute-force
+    `sort_results=False` order — a plain `np.where` column scan, verified to
+    match `RadiusNeighbors` in `crates/mlrs-algos/src/neighbors/nearest.rs`
+    exactly): `radius_counts_<metric>[i]` is query row `i`'s match count, and a
+    consumer derives the per-row slice with a running sum over it (the same CSR-
+    without-`indptr` layout `RadiusNeighbors` documents).
+
+      * `metric` in {euclidean, manhattan, chebyshev, minkowski(p=3), cosine} —
+        `radius_distances_<metric>` / `radius_indices_<metric>` /
+        `radius_counts_<metric>` / `radius_<metric>` (the threshold used,
+        PER-METRIC — see `NN_RADIUS`: cosine distance is bounded to `[0, 2]`,
+        so it needs a different threshold than the coordinate-space metrics to
+        land on a genuine PARTIAL match set rather than "everyone matches").
+    """
+    from sklearn.neighbors import NearestNeighbors as SkNearestNeighbors
+
+    x, xq, _y, _y_multi = _knn_reg_data(seed)
+
+    def c(arr):
+        return np.ascontiguousarray(np.asarray(arr)).astype(dtype)
+
+    out = {
+        "X": c(x),
+        "Xq": c(xq),
+    }
+
+    metrics = {
+        "euclidean": dict(metric="euclidean"),
+        "manhattan": dict(metric="manhattan"),
+        "chebyshev": dict(metric="chebyshev"),
+        "minkowski": dict(metric="minkowski", p=NN_PARAMS_P),
+        "cosine": dict(metric="cosine"),
+    }
+    for name, kw in metrics.items():
+        radius = NN_RADIUS[name]
+        out[f"radius_{name}"] = c([radius])
+        nn = SkNearestNeighbors(algorithm="brute", **kw).fit(x)
+        dist_list, idx_list = nn.radius_neighbors(
+            xq, radius=radius, sort_results=False
+        )
+        counts = np.array([len(a) for a in idx_list], dtype=np.int64)
+        flat_dist = (
+            np.concatenate(list(dist_list))
+            if len(dist_list)
+            else np.array([], dtype=np.float64)
+        )
+        flat_idx = (
+            np.concatenate(list(idx_list))
+            if len(idx_list)
+            else np.array([], dtype=np.int64)
+        )
+        out[f"radius_distances_{name}"] = c(flat_dist)
+        out[f"radius_indices_{name}"] = c(flat_idx)
+        out[f"radius_counts_{name}"] = c(counts)
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(
+        _FIXTURE_DIR, f"nn_radius_{dtype_tag}_seed{seed}.npz"
+    )
+    np.savez(out_path, **out)
+    return out_path
+
+
 # --- KNN-CLF-PARAMS: the KNeighborsClassifier full-parameter oracle ---------
 #
 # The classifier fixture reuses the REGRESSOR design (`_knn_reg_data`) verbatim
@@ -7436,6 +7646,13 @@ def main() -> None:
     # target and a coincident query (the weights='distance' 1/0 branch).
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_knn_regressor_params(dtype=dtype)}")
+    # NEIGH-PARAMS: NearestNeighbors' full parameter surface, on the SAME design
+    # as the regressor fixture above (see `_knn_reg_data`), x {f32, f64}.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_nearest_neighbors_params(dtype=dtype)}")
+    # NEIGH-RADIUS: NearestNeighbors.radius_neighbors, same design, x {f32, f64}.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_nearest_neighbors_radius(dtype=dtype)}")
     # KNN-CLF-PARAMS: the classifier's full parameter surface, on the SAME design
     # as the regressor fixture above (see `_knn_clf_data`), x {f32, f64}.
     for dtype in (np.float32, np.float64):

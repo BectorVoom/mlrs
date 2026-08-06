@@ -1,18 +1,21 @@
 """Neighbors estimator shims (PY-01/PY-02) delegating to ``_mlrs``.
 
-NearestNeighbors (no scoring mixin — exposes ``kneighbors``, not ``predict``),
-KNeighborsClassifier -> ``ClassifierMixin``, KNeighborsRegressor ->
-``RegressorMixin``. ``fit`` returns ``self``; the predict / ``kneighbors`` paths
-delegate to the matching ``_mlrs.Py*`` wrapper and wrap the host output (D-03;
-neighbor indices are ``int32``, D-06).
+NearestNeighbors (no scoring mixin — exposes ``kneighbors`` /
+``radius_neighbors``, not ``predict``), KNeighborsClassifier ->
+``ClassifierMixin``, KNeighborsRegressor -> ``RegressorMixin``. ``fit`` returns
+``self``; the predict / ``kneighbors`` paths delegate to the matching
+``_mlrs.Py*`` wrapper and wrap the host output (D-03; neighbor indices are
+``int32``, D-06).
 
-The classifier and the regressor both carry sklearn's FULL parameter surface
-(KNN-REG-PARAMS / KNN-CLF-PARAMS) and share it through
-:class:`_KNeighborsBase` — one copy of the validation, the metric resolution,
-and the ``kneighbors`` / ``kneighbors_graph`` surface, so the two cannot drift
-on which parameter values they accept or on which neighbours they report.
-``NearestNeighbors`` is deliberately NOT on that base: it is the unsupervised
-index and still exposes only ``n_neighbors`` / ``algorithm``.
+All three estimators carry sklearn's FULL parameter surface (NEIGH-PARAMS /
+KNN-REG-PARAMS / KNN-CLF-PARAMS) and share it through :class:`_NeighborsBase`
+— one copy of the validation, the metric resolution, and the ``kneighbors`` /
+``kneighbors_graph`` / ``radius_neighbors`` / ``radius_neighbors_graph``
+surface, so the three cannot drift on which parameter values they accept or on
+which neighbours they report. ``NearestNeighbors`` additionally carries
+``radius`` (sklearn's radius-query default) — the only hyperparameter the two
+k-neighbours estimators do not have, since neither implements a
+radius-neighbours predict.
 """
 
 import warnings
@@ -24,72 +27,13 @@ from sklearn.utils.multiclass import check_classification_targets
 
 from .base import MlrsBase
 
-# The neighbor-search strategies this backend implements. mlrs is brute-force
-# only (NEIGH-01); ``auto`` resolves to it, and sklearn's tree strategies are
-# rejected rather than silently substituted.
-_SUPPORTED_ALGORITHMS = ["auto", "brute"]
-
-
-def _check_algorithm(algorithm):
-    """Reject an unsupported ``algorithm`` with sklearn-shaped wording.
-
-    Called from ``NearestNeighbors.fit``, which still accepts only
-    ``auto``/``brute``. The two k-neighbours estimators validate the wider set in
-    :meth:`_KNeighborsBase._validate_params_for_fit` (see
-    ``_NEIGHBORS_ALGORITHMS``) — bringing the unsupervised index up to that
-    surface is follow-on work, not something this helper should straddle.
-    """
-    if algorithm not in _SUPPORTED_ALGORITHMS:
-        raise ValueError(
-            f"Algorithm is not supported: {algorithm}. "
-            f"Supported algorithms are {_SUPPORTED_ALGORITHMS}"
-        )
-
-
-class NearestNeighbors(MlrsBase):
-    """Brute-force k-NN search (NEIGH-01). Exposes ``kneighbors`` — no predict."""
-
-    def __init__(self, n_neighbors=5, output_type="input", *, algorithm="auto"):
-        self.n_neighbors = n_neighbors
-        self.algorithm = algorithm
-        self.output_type = output_type
-
-    def fit(self, X, y=None):
-        _check_algorithm(self.algorithm)
-        # `ensure_all_finite=False` RELOCATES the NaN/inf rejection into the
-        # Rust `fit`, it does not drop it — see `KNeighborsRegressor.fit`.
-        xa, rows, cols = self._normalize(X, ensure_all_finite=False)
-        obj = self._ext().NearestNeighbors(self.n_neighbors)
-        obj.fit(xa, rows, cols)
-        self._mlrs_obj = obj
-        self.n_features_in_ = cols
-        return self
-
-    def kneighbors(self, X=None, n_neighbors=None, return_distance=True):
-        self._check_fitted()
-        if X is None:
-            raise ValueError(
-                "mlrs NearestNeighbors.kneighbors requires X (v1)"
-            )
-        k = self.n_neighbors if n_neighbors is None else n_neighbors
-        xa, rows, cols = self._check_predict_X(X)
-        dist, idx = getattr(self._mlrs_obj, "kneighbors" + self._suffix())(
-            xa, rows, cols, k
-        )
-        indices = self._to_output(idx, (rows, k), X, np.int32)
-        if not return_distance:
-            return indices
-        distances = self._to_output(dist, (rows, k), X, self._np_float())
-        return distances, indices
-
-
 # ---------------------------------------------------------------------------
-# Shared k-neighbours parameter surface (KNN-REG-PARAMS / KNN-CLF-PARAMS)
+# Shared neighbours parameter surface (NEIGH-PARAMS / KNN-REG-PARAMS /
+# KNN-CLF-PARAMS)
 # ---------------------------------------------------------------------------
 
-# Every ``algorithm`` sklearn accepts. Unlike ``_SUPPORTED_ALGORITHMS`` above
-# (which the unsupervised index still uses), the two k-neighbours estimators
-# accept the TREE names too and resolve them to the brute-force search.
+# Every ``algorithm`` sklearn accepts, for all three estimators: they accept
+# the TREE names too and resolve them all to the brute-force search.
 #
 # This is not a silent substitution of a different answer: ``algorithm`` selects
 # how the neighbours are FOUND, never which ones they are, and sklearn's own
@@ -294,21 +238,26 @@ def _drop_self_column(dist, idx, k):
     )
 
 
-class _KNeighborsBase(MlrsBase):
-    """The parameter surface + neighbour queries shared by the two k-NN estimators.
+class _NeighborsBase(MlrsBase):
+    """The parameter surface + neighbour queries shared by all three estimators.
 
-    Both subclasses take sklearn's keyword-only tail verbatim
-    (``weights``/``algorithm``/``leaf_size``/``p``/``metric``/``metric_params``/
-    ``n_jobs``) after mlrs's own second-positional ``output_type``, store every
-    argument unvalidated in ``__init__`` per the sklearn contract, and validate
+    Every subclass takes sklearn's keyword-only tail verbatim
+    (``[weights]``/``algorithm``/``leaf_size``/``p``/``metric``/
+    ``metric_params``/``n_jobs``, ``weights`` only on the two k-neighbours
+    estimators) after mlrs's own second-positional ``output_type``, stores every
+    argument unvalidated in ``__init__`` per the sklearn contract, and validates
     in ``fit`` through :meth:`_validate_params_for_fit`.
 
     Which parameters reach the device, and which stop here:
 
     ==================  ==========================================================
-    ``n_neighbors``     device — the selection width
+    ``n_neighbors``     device — the selection width (``kneighbors`` path)
+    ``radius``          device — the selection threshold (``radius_neighbors``
+                        path; ``NearestNeighbors`` only)
     ``weights``         device for ``'uniform'`` / ``'distance'``; a CALLABLE is
-                        applied host-side to ``kneighbors`` distances
+                        applied host-side to ``kneighbors`` distances (the two
+                        k-neighbours estimators only — ``NearestNeighbors`` has
+                        no vote/mean to weight)
     ``metric`` / ``p``  device for the built-in metrics; a CALLABLE runs the
                         whole pairwise pass host-side
     ``metric_params``   resolution input only (its ``p`` overrides ``__init__``)
@@ -340,13 +289,20 @@ class _KNeighborsBase(MlrsBase):
         arguments verbatim and defer validation to ``fit``
         (``check_no_attributes_set_in_init`` /
         ``check_parameters_default_constructible``).
+
+        The ``weights`` check is gated on ``hasattr`` rather than living on a
+        subclass override: ``NearestNeighbors`` has no ``weights`` attribute at
+        all (there is no vote/mean to weight), and every other check here is
+        identical across all three estimators — a subclass override would only
+        exist to reorder this one line, at the cost of two nearly-identical
+        copies of the rest of the method.
         """
         if self.algorithm not in _NEIGHBORS_ALGORITHMS:
             raise ValueError(
                 f"Algorithm is not supported: {self.algorithm}. "
                 f"Supported algorithms are {list(_NEIGHBORS_ALGORITHMS)}"
             )
-        if not callable(self.weights) and self.weights not in (
+        if hasattr(self, "weights") and not callable(self.weights) and self.weights not in (
             "uniform",
             "distance",
         ):
@@ -484,6 +440,168 @@ class _KNeighborsBase(MlrsBase):
             idx = np.asarray(flat_i, dtype=np.int32).reshape(rows, k)
         return dist, idx, rows
 
+    # -- radius queries (NEIGH-RADIUS) --------------------------------------- #
+
+    def _host_radius_neighbors(self, Xq, radius):
+        """Brute-force `radius_neighbors` under a CALLABLE metric, host-side.
+
+        `n_query × n_train` Python-level metric calls, mirroring
+        `_host_kneighbors`. Matches are kept in ASCENDING TRAIN-INDEX order (a
+        plain left-to-right column scan) rather than sorted by distance —
+        the same unsorted convention the device path returns (see
+        `RadiusNeighbors` in `crates/mlrs-algos/src/neighbors/nearest.rs`), so a
+        callable metric cannot silently change the reported order.
+        """
+        train = self._fit_X
+        dist_list, idx_list = [], []
+        for i in range(Xq.shape[0]):
+            d = np.array(
+                [self.metric(Xq[i], train[j]) for j in range(train.shape[0])],
+                dtype=np.float64,
+            )
+            mask = d <= radius
+            idx_list.append(np.nonzero(mask)[0].astype(np.int32))
+            dist_list.append(d[mask])
+        return dist_list, idx_list
+
+    def _raw_radius_neighbors(self, X, radius):
+        """`(dist_list, idx_list, rows)` — the INTERNAL radius-query form.
+
+        Each of `dist_list[i]` / `idx_list[i]` is a 1-D array of query row `i`'s
+        matches (RAGGED — a different width per row), in ascending train-index
+        order. `radius_neighbors` / `radius_neighbors_graph` both go through
+        here, mirroring `_raw_kneighbors`.
+        """
+        xa, rows, cols = self._check_predict_X(X)
+        if callable(self.metric):
+            query = np.ascontiguousarray(
+                np.asarray(xa.to_numpy(zero_copy_only=False), dtype=self._np_float())
+                .reshape(rows, cols)
+            )
+            dist_list, idx_list = self._host_radius_neighbors(query, radius)
+        else:
+            flat_d, flat_i, counts = getattr(
+                self._mlrs_obj, "radius_neighbors" + self._suffix()
+            )(xa, rows, cols, float(radius))
+            flat_d = np.asarray(flat_d, dtype=self._np_float())
+            flat_i = np.asarray(flat_i, dtype=np.int32)
+            offsets = np.concatenate([[0], np.cumsum(np.asarray(counts, dtype=np.int64))])
+            dist_list = [flat_d[offsets[r]:offsets[r + 1]] for r in range(rows)]
+            idx_list = [flat_i[offsets[r]:offsets[r + 1]] for r in range(rows)]
+        return dist_list, idx_list, rows
+
+    @staticmethod
+    def _drop_self_ragged(dist_list, idx_list, rows):
+        """Remove each query row's own index from a RAGGED `radius_neighbors`
+        result (the radius-query sibling of `_drop_self_column`).
+
+        Filters by INDEX IDENTITY, not "first" or "distance 0" — a genuine
+        duplicate training point at distance 0 stays; only the row's own index
+        is dropped, and only where it is actually present (a radius smaller
+        than the point's own distance-0 match cannot happen, but a caller could
+        still pass one, e.g. `radius=0` with floating-point jitter).
+        """
+        new_dist, new_idx = [], []
+        for i in range(rows):
+            d, idx = dist_list[i], idx_list[i]
+            keep = idx != i
+            new_dist.append(d[keep])
+            new_idx.append(idx[keep])
+        return new_dist, new_idx
+
+    @staticmethod
+    def _sort_ragged_by_distance(dist_list, idx_list, rows):
+        """Sort each row's ragged matches by distance (`sort_results=True`)."""
+        for i in range(rows):
+            order = np.argsort(dist_list[i], kind="stable")
+            dist_list[i] = dist_list[i][order]
+            idx_list[i] = idx_list[i][order]
+        return dist_list, idx_list
+
+    def _resolve_radius(self, radius):
+        """Validate the effective query `radius` (sklearn: must be non-negative)."""
+        r = self.radius if radius is None else radius
+        if not isinstance(r, (int, float, np.integer, np.floating)) or r < 0:
+            raise ValueError(f"radius must be non-negative, got {r!r}")
+        return float(r)
+
+    def radius_neighbors(self, X=None, radius=None, return_distance=True, sort_results=False):
+        """Every training point within `radius` of each row of `X`.
+
+        The match count varies per row, so — unlike `kneighbors` — this returns
+        two numpy OBJECT arrays (one ragged sub-array per query row), regardless
+        of `output_type`: arrow/cudf have no ragged representation (the same
+        exemption `kneighbors_graph` documents for its sparse-matrix return).
+
+        `X=None` queries the TRAINING set with each point's own self-match
+        removed by INDEX IDENTITY (see `_drop_self_ragged`), exactly as
+        `kneighbors(X=None)` does. `sort_results=True` requires
+        `return_distance=True` (sklearn's own restriction — an index-only,
+        distance-sorted result is not orderable).
+        """
+        self._check_fitted()
+        if sort_results and not return_distance:
+            raise ValueError("return_distance must be True if sort_results is True.")
+        r = self._resolve_radius(radius)
+        query_is_train = X is None
+        query = self._fit_X if query_is_train else X
+
+        dist_list, idx_list, rows = self._raw_radius_neighbors(query, r)
+        if query_is_train:
+            dist_list, idx_list = self._drop_self_ragged(dist_list, idx_list, rows)
+        if sort_results:
+            dist_list, idx_list = self._sort_ragged_by_distance(dist_list, idx_list, rows)
+
+        indices = np.empty(rows, dtype=object)
+        for i in range(rows):
+            indices[i] = idx_list[i]
+        if not return_distance:
+            return indices
+        distances = np.empty(rows, dtype=object)
+        for i in range(rows):
+            distances[i] = dist_list[i]
+        return distances, indices
+
+    def radius_neighbors_graph(self, X=None, radius=None, mode="connectivity", sort_results=False):
+        """The `(n_query, n_samples_fit_)` sparse radius-neighbour graph.
+
+        `mode='connectivity'` stores 1 at each neighbour, `mode='distance'`
+        stores the distance. Returns a scipy CSR matrix, as sklearn does — like
+        `kneighbors_graph`, NOT routed through `output_type`.
+        """
+        from scipy.sparse import csr_matrix
+
+        self._check_fitted()
+        if mode not in ("connectivity", "distance"):
+            raise ValueError(
+                f'Unsupported mode, must be one of "connectivity" or '
+                f'"distance" but got "{mode}" instead'
+            )
+        r = self._resolve_radius(radius)
+        query_is_train = X is None
+        query = self._fit_X if query_is_train else X
+
+        dist_list, idx_list, rows = self._raw_radius_neighbors(query, r)
+        if query_is_train:
+            dist_list, idx_list = self._drop_self_ragged(dist_list, idx_list, rows)
+        if sort_results:
+            dist_list, idx_list = self._sort_ragged_by_distance(dist_list, idx_list, rows)
+
+        counts = np.array([len(a) for a in idx_list], dtype=np.int64)
+        indptr = np.concatenate([[0], np.cumsum(counts)])
+        all_idx = (
+            np.concatenate(idx_list) if rows else np.array([], dtype=np.int32)
+        )
+        if mode == "connectivity":
+            data = np.ones(all_idx.shape[0], dtype=np.float64)
+        else:
+            data = (
+                np.concatenate(dist_list).astype(np.float64)
+                if rows
+                else np.array([], dtype=np.float64)
+            )
+        return csr_matrix((data, all_idx, indptr), shape=(rows, self.n_samples_fit_))
+
     def _resolve_k(self, n_neighbors, query_is_train):
         """Validate the effective `k` and the width the search must run at.
 
@@ -565,18 +683,91 @@ class _KNeighborsBase(MlrsBase):
 
 
 # ---------------------------------------------------------------------------
+# NearestNeighbors (NEIGH-PARAMS)
+# ---------------------------------------------------------------------------
+
+
+class NearestNeighbors(_NeighborsBase):
+    """Brute-force neighbour search, matching sklearn's full parameter surface
+    (NEIGH-PARAMS). No scoring mixin — exposes ``kneighbors`` /
+    ``radius_neighbors`` (+ their ``_graph`` siblings), never ``predict``.
+
+    ``NearestNeighbors(n_neighbors=5, output_type='input', *, radius=1.0,
+    algorithm='auto', leaf_size=30, metric='minkowski', p=2,
+    metric_params=None, n_jobs=None)``.
+
+    See :class:`_NeighborsBase` for which parameters reach the device and which
+    stop at this shim; ``radius`` is the one parameter unique to this estimator
+    (the two k-neighbours estimators have no radius-based predict).
+    """
+
+    def __init__(
+        self,
+        n_neighbors=5,
+        output_type="input",
+        *,
+        radius=1.0,
+        algorithm="auto",
+        leaf_size=30,
+        metric="minkowski",
+        p=2,
+        metric_params=None,
+        n_jobs=None,
+    ):
+        self.n_neighbors = n_neighbors
+        self.output_type = output_type
+        self.radius = radius
+        self.algorithm = algorithm
+        self.leaf_size = leaf_size
+        self.metric = metric
+        self.p = p
+        self.metric_params = metric_params
+        self.n_jobs = n_jobs
+
+    def _validate_params_for_fit(self):
+        super()._validate_params_for_fit()
+        if not isinstance(self.radius, (int, float, np.integer, np.floating)) or self.radius < 0:
+            raise ValueError(f"radius must be non-negative, got {self.radius!r}")
+
+    def fit(self, X, y=None):
+        self._validate_params_for_fit()
+        effective_metric, effective_params, effective_p = self._resolve_fit_metric()
+
+        # `ensure_all_finite=False` RELOCATES the NaN/inf rejection into the
+        # Rust `fit`, it does not drop it — see `KNeighborsRegressor.fit`.
+        xa, rows, cols = self._normalize(X, ensure_all_finite=False)
+        dtype = self._x_float(xa)
+
+        metric_name, device_p = self._device_metric_args(
+            effective_metric, effective_p
+        )
+        obj = self._ext().NearestNeighbors(self.n_neighbors, metric_name, device_p)
+        obj.fit(xa, rows, cols)
+        self._mlrs_obj = obj
+
+        self.n_features_in_ = cols
+        self.n_samples_fit_ = rows
+        self.effective_metric_ = effective_metric
+        self.effective_metric_params_ = effective_params
+        # Only the ARROW buffer is retained; the numpy view of the training
+        # matrix is built on first access (see `_fit_X` on the base).
+        self._fit_arrow = (xa, rows, cols, dtype)
+        return self
+
+
+# ---------------------------------------------------------------------------
 # KNeighborsClassifier (KNN-CLF-PARAMS)
 # ---------------------------------------------------------------------------
 
 
-class KNeighborsClassifier(ClassifierMixin, _KNeighborsBase):
+class KNeighborsClassifier(ClassifierMixin, _NeighborsBase):
     """k-NN classification, matching sklearn's full parameter surface (NEIGH-02).
 
     ``KNeighborsClassifier(n_neighbors=5, output_type='input', *,
     weights='uniform', algorithm='auto', leaf_size=30, p=2, metric='minkowski',
     metric_params=None, n_jobs=None)``.
 
-    See :class:`_KNeighborsBase` for which parameters reach the device and which
+    See :class:`_NeighborsBase` for which parameters reach the device and which
     stop at this shim.
 
     ## Labels are ENCODED here, not in Rust
@@ -836,14 +1027,14 @@ class KNeighborsClassifier(ClassifierMixin, _KNeighborsBase):
 # ---------------------------------------------------------------------------
 
 
-class KNeighborsRegressor(RegressorMixin, _KNeighborsBase):
+class KNeighborsRegressor(RegressorMixin, _NeighborsBase):
     """k-NN regression, matching sklearn's full parameter surface (NEIGH-03).
 
     ``KNeighborsRegressor(n_neighbors=5, output_type='input', *,
     weights='uniform', algorithm='auto', leaf_size=30, p=2, metric='minkowski',
     metric_params=None, n_jobs=None)``.
 
-    See :class:`_KNeighborsBase` for which parameters reach the device and which
+    See :class:`_NeighborsBase` for which parameters reach the device and which
     stop at this shim. Multi-output targets are supported: a 2-D ``y``
     (``n_samples × n_outputs``) makes ``predict`` return ``n_samples ×
     n_outputs``.

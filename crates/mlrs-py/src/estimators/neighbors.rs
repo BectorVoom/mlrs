@@ -66,16 +66,55 @@ struct NnPendingFit {
     dt: FloatDtype,
 }
 
+/// The hyperparameters `fit` rebuilds the core estimator from (NEIGH-PARAMS).
+///
+/// WR-02: held on the WRAPPER, not read back out of the `Unfit` enum arm — see
+/// [`KnnRegParams`] for why (sklearn's `clone` + refit path would otherwise
+/// silently fall back to the defaults).
+#[derive(Clone, Copy)]
+struct NnParams {
+    n_neighbors: usize,
+    metric: Metric,
+}
+
+impl Default for NnParams {
+    fn default() -> Self {
+        Self {
+            n_neighbors: 5,
+            metric: Metric::Euclidean,
+        }
+    }
+}
+
+impl NnParams {
+    /// Build the unfit f32 core estimator, mapping a rejected hyperparameter to
+    /// its Python exception. Called BOTH from `fit` (for its validation effect,
+    /// discarding the result) and from `materialize` (for the estimator itself),
+    /// so the two cannot disagree about which parameter sets are acceptable.
+    fn build_f32(&self) -> PyResult<NearestNeighbors<f32>> {
+        NearestNeighbors::<f32>::builder()
+            .n_neighbors(self.n_neighbors)
+            .metric(self.metric)
+            .build::<f32>()
+            .map_err(build_err_to_py)
+    }
+
+    /// f64 twin of [`NnParams::build_f32`].
+    fn build_f64(&self) -> PyResult<NearestNeighbors<f64>> {
+        NearestNeighbors::<f64>::builder()
+            .n_neighbors(self.n_neighbors)
+            .metric(self.metric)
+            .build::<f64>()
+            .map_err(build_err_to_py)
+    }
+}
+
 /// sklearn-compatible `NearestNeighbors` (unsupervised neighbor index).
 #[pyclass(name = "NearestNeighbors")]
 pub struct PyNearestNeighbors {
     inner: AnyNearestNeighbors,
-    /// WR-02: the hyperparameter lives on the WRAPPER, not in the `Unfit` enum
-    /// payload. After a `fit` the enum is in a fitted (or pending) arm and that
-    /// payload is gone, so a second `fit` on the same object — which is what
-    /// every `clone`-and-refit path does — would silently fall back to the
-    /// default.
-    n_neighbors: usize,
+    /// WR-02: see [`NnParams`].
+    params: NnParams,
     /// `Some` between `fit` and the first query — see [`NnPendingFit`].
     pending: Option<NnPendingFit>,
 }
@@ -86,7 +125,7 @@ impl PyNearestNeighbors {
     pub fn unfit_default() -> Self {
         Self {
             inner: AnyNearestNeighbors::Unfit { n_neighbors: 5 },
-            n_neighbors: 5,
+            params: NnParams::default(),
             pending: None,
         }
     }
@@ -102,15 +141,12 @@ impl PyNearestNeighbors {
         let Some(p) = self.pending.take() else {
             return Ok(());
         };
-        let n_neighbors = self.n_neighbors;
+        let params = self.params;
         let built = py.detach(|| -> PyResult<AnyNearestNeighbors> {
             let mut pool = crate::lock_pool();
             match p.dt {
                 FloatDtype::F32 => {
-                    let est = NearestNeighbors::<f32>::builder()
-                        .n_neighbors(n_neighbors)
-                        .build::<f32>()
-                        .map_err(build_err_to_py)?;
+                    let est = params.build_f32()?;
                     let xd = DeviceArray::from_host(&mut pool, host_slice_f32(as_f32(&p.x)?)?);
                     Ok(AnyNearestNeighbors::F32(
                         est.fit_owned(&mut pool, xd, (p.rows, p.cols))
@@ -118,10 +154,7 @@ impl PyNearestNeighbors {
                     ))
                 }
                 FloatDtype::F64 => {
-                    let est = NearestNeighbors::<f64>::builder()
-                        .n_neighbors(n_neighbors)
-                        .build::<f64>()
-                        .map_err(build_err_to_py)?;
+                    let est = params.build_f64()?;
                     let xd = DeviceArray::from_host(&mut pool, host_slice_f64(as_f64(&p.x)?)?);
                     Ok(AnyNearestNeighbors::F64(
                         est.fit_owned(&mut pool, xd, (p.rows, p.cols))
@@ -147,15 +180,21 @@ impl PyNearestNeighbors {
 
 #[pymethods]
 impl PyNearestNeighbors {
-    /// `NearestNeighbors(n_neighbors=5)`.
+    /// `NearestNeighbors(n_neighbors=5, metric='minkowski', p=2)`.
+    ///
+    /// `metric=<callable>` is NOT accepted here — an arbitrary Python function
+    /// cannot cross into a device kernel. The shim serves it from `kneighbors`
+    /// output instead and only ever constructs this wrapper with a built-in
+    /// metric (see `KNeighborsClassifier::new` for the identical rationale).
     #[new]
-    #[pyo3(signature = (n_neighbors = 5))]
-    fn new(n_neighbors: usize) -> Self {
-        Self {
+    #[pyo3(signature = (n_neighbors = 5, metric = "minkowski", p = 2.0))]
+    fn new(n_neighbors: usize, metric: &str, p: f64) -> PyResult<Self> {
+        let metric = metric_from_str(metric, p)?;
+        Ok(Self {
             inner: AnyNearestNeighbors::Unfit { n_neighbors },
-            n_neighbors,
+            params: NnParams { n_neighbors, metric },
             pending: None,
-        }
+        })
     }
 
     /// Fit (validate + store the training matrix). Unsupervised — no `y`. GIL
@@ -172,7 +211,7 @@ impl PyNearestNeighbors {
         if matches!(dt, FloatDtype::F64) {
             crate::capability::guard_f64()?;
         }
-        let n_neighbors = self.n_neighbors;
+        let params = self.params;
         py.detach(|| -> PyResult<()> {
             match dt {
                 FloatDtype::F32 => {
@@ -180,25 +219,21 @@ impl PyNearestNeighbors {
                     if !all_finite_f32(xh) {
                         return Err(nonfinite_input_err(xh, "float32"));
                     }
-                    NearestNeighbors::<f32>::builder()
-                        .n_neighbors(n_neighbors)
-                        .build::<f32>()
-                        .map_err(build_err_to_py)?;
+                    params.build_f32()?;
                 }
                 FloatDtype::F64 => {
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     if !all_finite_f64(xh) {
                         return Err(nonfinite_input_err(xh, "float64"));
                     }
-                    NearestNeighbors::<f64>::builder()
-                        .n_neighbors(n_neighbors)
-                        .build::<f64>()
-                        .map_err(build_err_to_py)?;
+                    params.build_f64()?;
                 }
             }
             Ok(())
         })?;
-        self.inner = AnyNearestNeighbors::Unfit { n_neighbors };
+        self.inner = AnyNearestNeighbors::Unfit {
+            n_neighbors: params.n_neighbors,
+        };
         self.pending = Some(NnPendingFit { x: xa, rows, cols, dt });
         Ok(())
     }
@@ -237,6 +272,62 @@ impl PyNearestNeighbors {
             }
         })
     }
+
+    /// `radius_neighbors(x, radius)` → `(distances, indices, counts)`: every
+    /// training point within `radius` of each query row, RAGGED (`counts[i]` is
+    /// row `i`'s match count; `distances`/`indices` are the per-row matches
+    /// concatenated in ascending training-index order — see
+    /// [`mlrs_algos::neighbors::nearest::RadiusNeighbors`]). The shim splits the
+    /// flat buffers back into per-row arrays via `counts`' running sum.
+    fn radius_neighbors_f32(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+        radius: f64,
+    ) -> PyResult<(Vec<f32>, Vec<i32>, Vec<u32>)> {
+        self.materialize(py)?;
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyNearestNeighbors::F32(est) => {
+                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                    let r = est
+                        .radius_neighbors(&mut pool, &xd, (rows, cols), radius)
+                        .map_err(algo_err_to_py)?;
+                    Ok((r.distances, r.indices, r.counts))
+                }
+                _ => Err(not_fitted("nearest_neighbors", "radius_neighbors (f32 path)")),
+            }
+        })
+    }
+    fn radius_neighbors_f64(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+        radius: f64,
+    ) -> PyResult<(Vec<f64>, Vec<i32>, Vec<u32>)> {
+        self.materialize(py)?;
+        let xa = capsule_to_array(x)?;
+        py.detach(|| {
+            let mut pool = crate::lock_pool();
+            match &self.inner {
+                AnyNearestNeighbors::F64(est) => {
+                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                    let r = est
+                        .radius_neighbors(&mut pool, &xd, (rows, cols), radius)
+                        .map_err(algo_err_to_py)?;
+                    Ok((r.distances, r.indices, r.counts))
+                }
+                _ => Err(not_fitted("nearest_neighbors", "radius_neighbors (f64 path)")),
+            }
+        })
+    }
+
     /// A DEFERRED fit counts as fitted: the training data is validated and held,
     /// only its upload is outstanding.
     fn is_fitted(&self) -> bool {
@@ -256,6 +347,19 @@ impl PyNearestNeighbors {
             AnyNearestNeighbors::Unfit { .. } => None,
             AnyNearestNeighbors::F32(_) => Some("f32"),
             AnyNearestNeighbors::F64(_) => Some("f64"),
+        }
+    }
+    /// The RESOLVED metric name (sklearn's `effective_metric_`) — see
+    /// `KNeighborsClassifier::effective_metric`.
+    fn effective_metric(&self) -> String {
+        metric_to_str(self.params.metric).to_string()
+    }
+    /// The RESOLVED Minkowski exponent (sklearn's `effective_metric_params_`
+    /// `{'p': ...}` entry), `None` for the metrics that do not take one.
+    fn effective_p(&self) -> Option<f64> {
+        match self.params.metric {
+            Metric::Minkowski { p } => Some(p),
+            _ => None,
         }
     }
 }
