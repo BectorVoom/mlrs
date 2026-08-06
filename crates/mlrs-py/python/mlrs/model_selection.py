@@ -91,6 +91,37 @@ since ``sklearn.utils`` imports it; this module still never imports it itself.)
    container the caller passed in, and neither can change which ROWS are
    selected.
 
+## Metadata routing
+
+``params=`` is routed exactly as sklearn routes it, under the same global switch
+(``sklearn.set_config(enable_metadata_routing=True)``).
+
+With routing **off** — the default — ``params`` goes wholesale to the
+estimator's ``fit``, ``groups=`` goes to the splitter, and any row-aligned entry
+is indexed per fold. With it **on**, three consumers each receive exactly what
+they requested through ``set_fit_request`` / ``set_split_request`` /
+``set_score_request``: the estimator (``fit``), the splitter (``split``) and the
+scorers (``score``). Metadata that nobody requested is an error rather than a
+silent drop — which is the whole point of the mechanism, since a dropped
+``sample_weight`` produces a plausible number rather than a failure.
+
+Two structural notes, both of which are why this is more than forwarding a dict:
+
+* every splitter is a ``_MetadataRequester``, so ``groups`` can be routed to a
+  group-based splitter and *cannot* be routed to one that would ignore it
+  (:class:`BaseCrossValidator` declares ``groups`` ``UNUSED``, as sklearn does);
+* the search estimators and the threshold classifiers publish their own
+  :meth:`get_metadata_routing`, so they route correctly when nested inside
+  someone else's pipeline rather than only when called directly.
+
+The scorers are the one place mlrs's internals differ in shape: they live in a
+plain ``{name: scorer}`` dict here where sklearn has a scorer object, so the
+routing node is assembled by :func:`_scorer_router` — reproducing sklearn's
+single-scorer and multimetric cases rather than collapsing them, because the two
+enforce an unset request at different moments.
+
+See ``docs/model-selection.md`` §6, and §7 for the deliberate differences.
+
 ## Labels cross into Rust as codes
 
 ``y`` and ``groups`` may be strings, objects, floats or 2-D multi-label rows.
@@ -126,8 +157,17 @@ from sklearn.base import (
     clone,
     is_classifier,
 )
+from sklearn.exceptions import UnsetMetadataPassedError
 from sklearn.metrics import check_scoring
-from sklearn.utils import check_random_state
+from sklearn.utils import Bunch, check_random_state
+from sklearn.utils.metadata_routing import (
+    UNUSED,
+    MetadataRouter,
+    MethodMapping,
+    _MetadataRequester,
+    _routing_enabled,
+    process_routing,
+)
 from sklearn.utils.multiclass import type_of_target
 from sklearn.utils.validation import check_is_fitted
 
@@ -653,11 +693,141 @@ def _validate_shuffle_split(n_samples, test_size, train_size, default_test_size=
 
 
 # --------------------------------------------------------------------------- #
+# metadata routing
+# --------------------------------------------------------------------------- #
+
+
+def _check_groups_routing_disabled(groups):
+    """Refuse the ``groups=`` shorthand while routing is enabled.
+
+    ``groups=`` is the routing-DISABLED convenience that hands the splitter its
+    grouping directly. With routing on, every consumer's metadata travels
+    through ``params``, and honouring both would leave two disagreeing sources
+    for one input — so sklearn rejects the pair, and so does mlrs.
+    """
+    if groups is not None and _routing_enabled():
+        raise ValueError(
+            "`groups` can only be passed if metadata routing is not enabled via"
+            " `sklearn.set_config(enable_metadata_routing=True)`. When routing is"
+            " enabled, pass `groups` alongside other metadata via the `params`"
+            " argument instead."
+        )
+
+
+class _GroupsConsumerMixin(_MetadataRequester):
+    """Mark a splitter as a CONSUMER of ``groups`` (sklearn's ``GroupsConsumerMixin``).
+
+    Every splitter's ``split`` request is derived from its signature, which
+    makes ``groups`` a *known but unrequested* input: passing it under routing
+    is then an error rather than a silent no-op — exactly the point, since
+    ``KFold`` ignoring a grouping is the failure mode the request mechanism
+    exists to catch. The group-based splitters flip it to requested-by-default
+    here, because for them ``groups`` is not metadata a user opts into but the
+    input the splitter is built around.
+    """
+
+    __metadata_request__split = {"groups": True}
+
+
+def _scorer_router(scorers):
+    """The routing node for a ``{name: scorer}`` dict.
+
+    sklearn hands its scorer object to the router directly and lets *it*
+    publish the requests; mlrs keeps its scorers in a plain dict (see
+    :func:`_resolve_scorers`), so the equivalent node is assembled here — and
+    the two cases sklearn distinguishes are reproduced rather than collapsed:
+
+    * ONE scorer: the scorer itself is the node, so an unset request on it is
+      caught by the caller's own ``process_routing`` — early, before a single
+      fold is fitted;
+    * SEVERAL: a router over them, mirroring ``_MultimetricScorer``. A nested
+      router routes by name only, so the caller sees their UNION and each
+      scorer's own unset requests are enforced later, by :func:`_score_all`.
+
+    Collapsing the first case into the second would move a hard error out of
+    the caller and into per-fold scoring, where ``error_score`` would quietly
+    turn it into a NaN.
+    """
+    if len(scorers) == 1:
+        return next(iter(scorers.values()))
+    return MetadataRouter(owner="scorers").add(
+        **scorers,
+        method_mapping=MethodMapping().add(caller="score", callee="score"),
+    )
+
+
+def _route_cv_params(
+    owner,
+    *,
+    estimator,
+    splitter,
+    scorers,
+    params,
+    groups,
+    estimator_callees=("fit",),
+):
+    """Split ``params`` into per-consumer buckets, routing-aware.
+
+    Returns a ``Bunch`` with ``estimator`` / ``splitter`` / ``scorer`` members,
+    each a ``Bunch`` of ``{method: kwargs}`` — sklearn's shape, so the two
+    branches below are the only place either behaviour is written down:
+
+    * routing **enabled**: each consumer gets exactly what it asked for through
+      ``set_fit_request`` / ``set_split_request`` / ``set_score_request``, and
+      metadata that was passed but requested by nobody is an error;
+    * routing **disabled** (the default): ``params`` goes wholesale to the
+      estimator's ``fit``, ``groups`` goes to the splitter, and the scorers get
+      nothing — sklearn's own legacy behaviour.
+
+    ``scorers=None`` omits the scorer node entirely, for the one caller
+    (:func:`cross_val_predict`) that never scores.
+    """
+    params = {} if params is None else params
+    if not _routing_enabled():
+        return Bunch(
+            estimator=Bunch(**{callee: params for callee in estimator_callees}),
+            splitter=Bunch(split={"groups": groups}),
+            scorer=Bunch(score={}),
+        )
+
+    estimator_mapping = MethodMapping()
+    for callee in estimator_callees:
+        estimator_mapping.add(caller="fit", callee=callee)
+    router = (
+        MetadataRouter(owner=owner)
+        .add(estimator=estimator, method_mapping=estimator_mapping)
+        .add(
+            splitter=splitter,
+            method_mapping=MethodMapping().add(caller="fit", callee="split"),
+        )
+    )
+    if scorers is not None:
+        router.add(
+            scorer=_scorer_router(scorers),
+            method_mapping=MethodMapping().add(caller="fit", callee="score"),
+        )
+    try:
+        routed = process_routing(router, "fit", **params)
+    except UnsetMetadataPassedError as exc:
+        # `process_routing` names the caller `<owner>.fit`, because that is the
+        # method the mapping routes FROM. The user called a function, not a
+        # `fit`, so the message would name a method they never invoked.
+        raise UnsetMetadataPassedError(
+            message=str(exc).replace(f"{owner}.fit", owner),
+            unrequested_params=exc.unrequested_params,
+            routed_params=exc.routed_params,
+        ) from None
+    if scorers is None:
+        routed.scorer = Bunch(score={})
+    return routed
+
+
+# --------------------------------------------------------------------------- #
 # splitter base classes
 # --------------------------------------------------------------------------- #
 
 
-class BaseCrossValidator(metaclass=ABCMeta):
+class BaseCrossValidator(_MetadataRequester, metaclass=ABCMeta):
     """Base class for the index-yielding cross-validators.
 
     Deliberately NOT a subclass of ``sklearn.model_selection.BaseCrossValidator``
@@ -665,7 +835,23 @@ class BaseCrossValidator(metaclass=ABCMeta):
     ``GridSearchCV``, ``cross_val_score``) duck-type on ``split`` +
     ``get_n_splits`` rather than on the base class. The integration is covered
     by tests that hand an mlrs splitter to sklearn's own ``GridSearchCV``.
+
+    It IS a ``_MetadataRequester``, which is the one piece of sklearn's routing
+    machinery a splitter cannot supply by duck-typing: the base class derives a
+    ``split`` metadata request from the subclass's ``split`` signature and
+    generates the ``set_split_request`` setter from it. Group-based splitters
+    additionally mix in :class:`_GroupsConsumerMixin`.
+
+    ``groups`` is declared ``UNUSED`` here rather than merely unrequested: every
+    splitter in this module *accepts* the argument for signature compatibility,
+    but the ones that are not group-based ignore it (with a warning — see
+    :func:`_warn_unused_groups`). Leaving it requestable would generate a
+    ``KFold().set_split_request(groups=True)`` that promises a grouping the
+    splitter does not honour; ``UNUSED`` removes both the setter and the
+    request, so routed ``groups`` reach a group splitter or nothing at all.
     """
+
+    __metadata_request__split = {"groups": UNUSED}
 
     @abstractmethod
     def split(self, X=None, y=None, groups=None):
@@ -864,7 +1050,7 @@ class KFold(_BaseKFold):
         return _yield_splits(trains, tests)
 
 
-class GroupKFold(_BaseKFold):
+class GroupKFold(_GroupsConsumerMixin, _BaseKFold):
     """K-fold variant where the same group never spans train and test.
 
     Parameters
@@ -942,7 +1128,7 @@ class StratifiedKFold(_BaseKFold):
         return _yield_splits(trains, tests)
 
 
-class StratifiedGroupKFold(_BaseKFold):
+class StratifiedGroupKFold(_GroupsConsumerMixin, _BaseKFold):
     """Folds that keep groups intact AND preserve the class distribution.
 
     Greedy: the most lopsided group (highest per-class count standard deviation)
@@ -1116,7 +1302,7 @@ class LeavePOut(BaseCrossValidator):
         return stream()
 
 
-class LeaveOneGroupOut(BaseCrossValidator):
+class LeaveOneGroupOut(_GroupsConsumerMixin, BaseCrossValidator):
     """Hold out one whole group per split."""
 
     def get_n_splits(self, X=None, y=None, groups=None):
@@ -1137,7 +1323,7 @@ class LeaveOneGroupOut(BaseCrossValidator):
         return _yield_splits(trains, tests)
 
 
-class LeavePGroupsOut(BaseCrossValidator):
+class LeavePGroupsOut(_GroupsConsumerMixin, BaseCrossValidator):
     """Hold out every combination of ``n_groups`` whole groups.
 
     Parameters
@@ -1253,7 +1439,7 @@ class ShuffleSplit(BaseShuffleSplit):
         return _yield_splits(trains, tests)
 
 
-class GroupShuffleSplit(BaseShuffleSplit):
+class GroupShuffleSplit(_GroupsConsumerMixin, BaseShuffleSplit):
     """A :class:`ShuffleSplit` over the *groups*, expanded back to rows.
 
     ``test_size`` / ``train_size`` are proportions of the DISTINCT GROUPS, not
@@ -1843,12 +2029,31 @@ def _score_all(scorers, estimator, X, y, score_params, error_score):
     A scorer that raises is reported as ``error_score`` (with a warning) rather
     than aborting the whole cross-validation, matching sklearn — a single
     degenerate fold should not lose the other four folds' results.
+
+    With SEVERAL scorers under routing, ``score_params`` arrives as their UNION
+    (a nested router routes by name; see :func:`_scorer_router`) and the split
+    back out per scorer happens here — which is what lets two metrics in one
+    ``scoring=`` dict request different metadata, and what enforces their
+    individual requests. A lone scorer was already filtered to its own request
+    by the caller, and with routing disabled every scorer gets everything;
+    both are sklearn's behaviour in the same case.
+
+    The routing call sits OUTSIDE the per-scorer ``try``: a metadata request
+    that was never set is a caller error, not a degenerate fold, and must not
+    be absorbed into ``error_score``.
     """
+    if len(scorers) > 1 and score_params and _routing_enabled():
+        routed = process_routing(_scorer_router(scorers), "score", **score_params)
+        per_scorer = {name: routed[name].score for name in scorers}
+    else:
+        per_scorer = {name: score_params for name in scorers}
+
     scores = {}
     for name, scorer in scorers.items():
+        params = per_scorer[name]
         try:
-            value = scorer(estimator, X, y, **score_params) if y is not None else scorer(
-                estimator, X, **score_params
+            value = scorer(estimator, X, y, **params) if y is not None else scorer(
+                estimator, X, **params
             )
             scores[name] = float(value)
         except Exception as exc:
@@ -2011,9 +2216,13 @@ def cross_validate(
 ):
     """Evaluate metrics by cross-validation, recording fit and score times.
 
-    Parameters mirror :func:`sklearn.model_selection.cross_validate`. ``params``
-    is forwarded to the estimator's ``fit``, with any row-aligned entry (a
-    ``sample_weight``, say) indexed per fold.
+    Parameters mirror :func:`sklearn.model_selection.cross_validate`. With
+    metadata routing DISABLED (the default), ``params`` is forwarded to the
+    estimator's ``fit``, with any row-aligned entry (a ``sample_weight``, say)
+    indexed per fold. With routing ENABLED, ``params`` is split between the
+    estimator, the splitter and the scorers according to what each requested —
+    and the per-fold indexing still applies to whichever bucket a row-aligned
+    entry lands in.
 
     Returns
     -------
@@ -2022,10 +2231,19 @@ def cross_validate(
         multimetric scoring), plus ``train_*`` / ``estimator`` / ``indices``
         when requested.
     """
+    _check_groups_routing_disabled(groups)
     X, y, groups = _indexable(X, y, groups)
     cv = check_cv(cv, y, classifier=is_classifier(estimator))
     scorers, multimetric = _resolve_scorers(estimator, scoring)
-    splits = list(cv.split(X, y, groups))
+    routed = _route_cv_params(
+        "cross_validate",
+        estimator=estimator,
+        splitter=cv,
+        scorers=scorers,
+        params=params,
+        groups=groups,
+    )
+    splits = list(cv.split(X, y, **routed.splitter.split))
 
     results = _parallel(n_jobs, pre_dispatch, verbose)(
         _delayed(_fit_and_score)(
@@ -2035,7 +2253,8 @@ def cross_validate(
             scorers=scorers,
             train=train,
             test=test,
-            fit_params=params,
+            fit_params=routed.estimator.fit,
+            score_params=routed.scorer.score,
             return_train_score=return_train_score,
             return_times=True,
             return_estimator=return_estimator,
@@ -2152,7 +2371,11 @@ def _enforce_prediction_order(fold_classes, predictions, all_classes, method):
 
 
 def _fit_and_predict(estimator, X, y, train, test, params, method, all_classes):
-    """Fit on ``train`` and call ``method`` on ``test``."""
+    """Fit on ``train`` and call ``method`` on ``test``.
+
+    ``params`` is already routed to the estimator's ``fit``; only the per-fold
+    indexing is left to do.
+    """
     n_samples = _num_samples(X)
     X_train = _safe_indexing(X, train)
     X_test = _safe_indexing(X, test)
@@ -2193,10 +2416,23 @@ def cross_val_predict(
     The splitter must PARTITION the rows — every row in exactly one test set —
     so :class:`ShuffleSplit` and friends are rejected. The check runs in Rust
     and raises sklearn's own "only works for partitions" message.
+
+    Nothing is scored here, so — as in sklearn — the router has no scorer node:
+    under routing, ``params`` may only be metadata the estimator's ``fit`` or
+    the splitter's ``split`` requested.
     """
+    _check_groups_routing_disabled(groups)
     X, y, groups = _indexable(X, y, groups)
     cv = check_cv(cv, y, classifier=is_classifier(estimator))
-    splits = list(cv.split(X, y, groups))
+    routed = _route_cv_params(
+        "cross_val_predict",
+        estimator=estimator,
+        splitter=cv,
+        scorers=None,
+        params=params,
+        groups=groups,
+    )
+    splits = list(cv.split(X, y, **routed.splitter.split))
     n_samples = _num_samples(X)
 
     # Rust validates the partition and hands back the scatter map in one pass.
@@ -2210,7 +2446,14 @@ def cross_val_predict(
 
     predictions = _parallel(n_jobs, pre_dispatch, verbose)(
         _delayed(_fit_and_predict)(
-            clone(estimator), X, y, train, test, params, method, all_classes
+            clone(estimator),
+            X,
+            y,
+            train,
+            test,
+            routed.estimator.fit,
+            method,
+            all_classes,
         )
         for train, test in splits
     )
@@ -2261,6 +2504,11 @@ def learning_curve(
     ``exploit_incremental_learning`` is accepted for signature compatibility;
     passing ``True`` raises rather than silently ignoring it, because the whole
     point of the flag is a different (``partial_fit``-driven) cost profile.
+
+    The routing declaration mirrors sklearn's and maps ``fit`` to BOTH the
+    estimator's ``fit`` and its ``partial_fit``, so a request written for either
+    method is accepted. Only the ``fit`` bucket is ever consumed here — as in
+    sklearn whenever ``exploit_incremental_learning=False``.
     """
     if exploit_incremental_learning:
         raise NotImplementedError(
@@ -2269,10 +2517,20 @@ def learning_curve(
             "sklearn.model_selection.learning_curve for the partial_fit path."
         )
 
+    _check_groups_routing_disabled(groups)
     X, y, groups = _indexable(X, y, groups)
     cv = check_cv(cv, y, classifier=is_classifier(estimator))
     scorers, _ = _resolve_scorers(estimator, scoring)
-    cv_iter = list(cv.split(X, y, groups))
+    routed = _route_cv_params(
+        "learning_curve",
+        estimator=estimator,
+        splitter=cv,
+        scorers=scorers,
+        params=params,
+        groups=groups,
+        estimator_callees=("fit", "partial_fit"),
+    )
+    cv_iter = list(cv.split(X, y, **routed.splitter.split))
 
     n_max_training_samples = min(len(train) for train, _ in cv_iter)
     sizes = np.asarray(train_sizes)
@@ -2308,7 +2566,8 @@ def learning_curve(
             scorers=scorers,
             train=train,
             test=test,
-            fit_params=params,
+            fit_params=routed.estimator.fit,
+            score_params=routed.scorer.score,
             return_train_score=True,
             return_times=True,
             error_score=error_score,
@@ -2354,10 +2613,19 @@ def validation_curve(
     -------
     train_scores, test_scores : ndarray of shape (n_param_values, n_cv_folds)
     """
+    _check_groups_routing_disabled(groups)
     X, y, groups = _indexable(X, y, groups)
     cv = check_cv(cv, y, classifier=is_classifier(estimator))
     scorers, _ = _resolve_scorers(estimator, scoring)
-    cv_iter = list(cv.split(X, y, groups))
+    routed = _route_cv_params(
+        "validation_curve",
+        estimator=estimator,
+        splitter=cv,
+        scorers=scorers,
+        params=params,
+        groups=groups,
+    )
+    cv_iter = list(cv.split(X, y, **routed.splitter.split))
 
     results = _parallel(n_jobs, pre_dispatch, verbose)(
         _delayed(_fit_and_score)(
@@ -2368,7 +2636,8 @@ def validation_curve(
             train=train,
             test=test,
             parameters={param_name: value},
-            fit_params=params,
+            fit_params=routed.estimator.fit,
+            score_params=routed.scorer.score,
             return_train_score=True,
             error_score=error_score,
         )
@@ -2384,11 +2653,13 @@ def validation_curve(
     return train_scores, test_scores
 
 
-def _permutation_test_score(estimator, X, y, groups, cv, scorers, params):
+def _permutation_test_score(
+    estimator, X, y, cv, scorers, *, split_params, fit_params, score_params
+):
     """The mean cross-validated score for one (possibly permuted) target."""
     avg = []
     name = next(iter(scorers))
-    for train, test in cv.split(X, y, groups):
+    for train, test in cv.split(X, y, **split_params):
         result = _fit_and_score(
             clone(estimator),
             X,
@@ -2396,7 +2667,8 @@ def _permutation_test_score(estimator, X, y, groups, cv, scorers, params):
             scorers=scorers,
             train=train,
             test=test,
-            fit_params=params,
+            fit_params=fit_params,
+            score_params=score_params,
             error_score="raise",
         )
         avg.append(result["test_scores"][name])
@@ -2445,23 +2717,62 @@ def permutation_test_score(
         ``(C + 1) / (n_permutations + 1)`` where ``C`` counts permutations
         scoring at least as well as the true target — so the best attainable
         p-value is ``1 / (n_permutations + 1)``, never 0.
+
+    Notes
+    -----
+    Under metadata routing, ``groups`` arrives inside ``params`` (the ``groups=``
+    argument is refused, as in sklearn) and mlrs uses it for BOTH the split and
+    the within-group permutation. scikit-learn uses it only for the split, which
+    silently turns a grouped permutation test into an ungrouped one — see
+    ``docs/upstream-sklearn-issues.md`` (SK-002).
     """
+    _check_groups_routing_disabled(groups)
     X, y, groups = _indexable(X, y, groups)
     cv = check_cv(cv, y, classifier=is_classifier(estimator))
     scorers, _ = _resolve_scorers(estimator, scoring)
+    routed = _route_cv_params(
+        "permutation_test_score",
+        estimator=estimator,
+        splitter=cv,
+        scorers=scorers,
+        params=params,
+        groups=groups,
+    )
+    # SK-002: the permutation is constrained by whatever grouping the SPLITTER
+    # was given, however it got there — an explicit `groups=` with routing off,
+    # a routed `groups` with it on. Reading it back off the routed bucket is
+    # what keeps those two spellings equivalent.
+    shuffle_groups = routed.splitter.split.get("groups", groups)
 
-    score = _permutation_test_score(clone(estimator), X, y, groups, cv, scorers, params)
+    score = _permutation_test_score(
+        clone(estimator),
+        X,
+        y,
+        cv,
+        scorers,
+        split_params=routed.splitter.split,
+        fit_params=routed.estimator.fit,
+        score_params=routed.scorer.score,
+    )
 
     # The permutations are drawn UP FRONT, in order, so the target sequence does
     # not depend on how joblib happens to schedule the workers.
     with _rust_rng(random_state) as bridge:
         permuted_targets = [
-            _shuffle_target(y, groups, bridge.handle) for _ in range(n_permutations)
+            _shuffle_target(y, shuffle_groups, bridge.handle)
+            for _ in range(n_permutations)
         ]
 
     permutation_scores = _parallel(n_jobs, "2*n_jobs", verbose)(
         _delayed(_permutation_test_score)(
-            clone(estimator), X, y_perm, groups, cv, scorers, params
+            clone(estimator),
+            X,
+            y_perm,
+            cv,
+            scorers,
+            split_params=routed.splitter.split,
+            fit_params=routed.estimator.fit,
+            score_params=routed.scorer.score,
         )
         for y_perm in permuted_targets
     )
@@ -2528,6 +2839,92 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
             return int(refit(results))
         return int(_ext().best_index(list(results[f"mean_test_{refit_metric}"])))
 
+    def _get_scorers(self):
+        """``(scorers, multimetric)`` — resolved once per call, never cached.
+
+        ``self.scoring`` is a constructor parameter a caller may still change,
+        so :meth:`get_metadata_routing` has to re-resolve rather than read a
+        fitted attribute (it is also callable *before* ``fit``).
+        """
+        return _resolve_scorers(self.estimator, self.scoring)
+
+    def get_metadata_routing(self):
+        """Declare what this search routes where.
+
+        The three consumers are the estimator (``fit``), the splitter
+        (``split``) and the scorers (``score``, reached from both ``fit`` and
+        this object's own ``score``).
+        """
+        router = MetadataRouter(owner=self)
+        router.add(
+            estimator=self.estimator,
+            method_mapping=MethodMapping().add(caller="fit", callee="fit"),
+        )
+        scorers, _ = self._get_scorers()
+        router.add(
+            scorer=_scorer_router(scorers),
+            method_mapping=MethodMapping()
+            .add(caller="score", callee="score")
+            .add(caller="fit", callee="score"),
+        )
+        router.add(
+            splitter=self.cv,
+            method_mapping=MethodMapping().add(caller="fit", callee="split"),
+        )
+        return router
+
+    def _scorers_accept_sample_weight(self, scorers):
+        """Do the scorers take a ``sample_weight``? — and warn once each if not.
+
+        Only consulted on the routing-DISABLED path, where there is no request
+        to read and sklearn falls back to asking the scorer's signature. The
+        warning is the point: fitting on weights while scoring without them is a
+        silent statistical error, not a formatting detail.
+        """
+        accepted = True
+        for name, scorer in scorers.items():
+            accepts = getattr(scorer, "_accept_sample_weight", None)
+            if accepts is not None:
+                takes = bool(accepts())
+            else:  # a bare callable passed as `scoring=`
+                takes = "sample_weight" in inspect.signature(scorer).parameters
+            if not takes:
+                warnings.warn(
+                    f"The scoring {name}={scorer} does not support sample_weight, "
+                    "which may lead to statistically incorrect results when "
+                    f"fitting {self} with sample_weight. ",
+                    UserWarning,
+                    stacklevel=3,
+                )
+            accepted = accepted and takes
+        return accepted
+
+    def _get_routed_params_for_fit(self, params, scorers):
+        """Split ``**params`` between the estimator, the splitter and the scorers.
+
+        Mirrors :func:`_route_cv_params`, but the router is this estimator's own
+        :meth:`get_metadata_routing` rather than one assembled per call — a
+        search IS a routing consumer, so ``GridSearchCV`` nested inside a
+        pipeline routes through the same declaration.
+        """
+        if _routing_enabled():
+            return process_routing(self, "fit", **params)
+
+        params = params.copy()
+        groups = params.pop("groups", None)
+        routed = Bunch(
+            estimator=Bunch(fit=params),
+            splitter=Bunch(split={"groups": groups}),
+            scorer=Bunch(score={}),
+        )
+        # sklearn's routing-disabled special case: a `sample_weight` used for
+        # fitting is also handed to the scorers, so the selected candidate is
+        # the best one under the SAME weighting it was trained with.
+        weight = params.get("sample_weight")
+        if weight is not None and self._scorers_accept_sample_weight(scorers):
+            routed.scorer.score["sample_weight"] = weight
+        return routed
+
     def _resolve_refit_metric(self, scorers, multimetric):
         if not multimetric:
             return "score"
@@ -2545,14 +2942,22 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
     def fit(self, X, y=None, **params):
         """Run the search, then (unless ``refit=False``) refit on the full data.
 
-        ``**params`` is forwarded to the estimator's ``fit``, except ``groups``,
-        which goes to the splitter.
+        With metadata routing DISABLED, ``**params`` is forwarded to the
+        estimator's ``fit``, except ``groups``, which goes to the splitter (and
+        except a ``sample_weight``, which also reaches the scorers). With
+        routing ENABLED, every consumer gets what it requested and nothing else.
         """
-        groups = params.pop("groups", None)
         estimator = self.estimator
-        X, y, groups = _indexable(X, y, groups)
-
         scorers, multimetric = _resolve_scorers(estimator, self.scoring)
+        routed_params = self._get_routed_params_for_fit(params, scorers)
+
+        groups = routed_params.splitter.split.get("groups")
+        X, y, groups = _indexable(X, y, groups)
+        if "groups" in routed_params.splitter.split:
+            # `_indexable` may have re-wrapped `groups`; the splitter must see
+            # the wrapped object, since that is what `_safe_indexing` handles.
+            routed_params.splitter.split["groups"] = groups
+
         refit_metric = self._resolve_refit_metric(scorers, multimetric)
 
         base_cv = check_cv(self.cv, y, classifier=is_classifier(estimator))
@@ -2573,7 +2978,7 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
             nonlocal results
             cv = base_cv if cv is None else cv
             candidate_params = list(candidate_params)
-            splits = list(cv.split(X, y, groups))
+            splits = list(cv.split(X, y, **routed_params.splitter.split))
             self.n_splits_ = len(splits)
             if not candidate_params:
                 raise ValueError("No fits were performed. Was the CV iterator empty?")
@@ -2587,7 +2992,8 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
                     train=train,
                     test=test,
                     parameters=parameters,
-                    fit_params=params,
+                    fit_params=routed_params.estimator.fit,
+                    score_params=routed_params.scorer.score,
                     return_train_score=self.return_train_score,
                     return_times=True,
                     return_parameters=False,
@@ -2632,9 +3038,9 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
             )
             refit_start = time.time()
             if y is not None:
-                self.best_estimator_.fit(X, y, **params)
+                self.best_estimator_.fit(X, y, **routed_params.estimator.fit)
             else:
-                self.best_estimator_.fit(X, **params)
+                self.best_estimator_.fit(X, **routed_params.estimator.fit)
             self.refit_time_ = time.time() - refit_start
             if hasattr(self.best_estimator_, "feature_names_in_"):
                 self.feature_names_in_ = self.best_estimator_.feature_names_in_
@@ -2728,13 +3134,22 @@ class BaseSearchCV(MetaEstimatorMixin, BaseEstimator, metaclass=ABCMeta):
         return self._delegate("score_samples", X)
 
     def score(self, X, y=None, **params):
-        """Score the refit best estimator with the search's own scorer."""
+        """Score the refit best estimator with the search's own scorer.
+
+        With routing ENABLED, ``**params`` is filtered down to what the scorer
+        requested through ``set_score_request``. With it disabled the params are
+        passed straight through, which is a deliberate widening: sklearn refuses
+        them outright there, and refusing metadata mlrs can deliver would narrow
+        what already works (``docs/model-selection.md`` §7).
+        """
         check_is_fitted(self)
         _check_refit(self, "score")
         scorer = self.scorer_
         if self.multimetric_:
             metric = self.refit if isinstance(self.refit, str) else next(iter(scorer))
             scorer = scorer[metric]
+        if params and _routing_enabled():
+            params = process_routing(self, "score", **params).scorer["score"]
         return scorer(self.best_estimator_, X, y, **params)
 
     @property
@@ -2904,15 +3319,18 @@ class _SubsampleMetaSplitter:
             order = np.asarray(bridge.handle.permutation(indices.shape[0]), dtype=np.intp)
         return indices[order][:n]
 
-    def split(self, X, y=None, groups=None):
-        for train_idx, test_idx in self.base_cv.split(X, y, groups):
+    def split(self, X, y=None, **kwargs):
+        # `**kwargs` rather than `groups=None`: whatever the round's routed
+        # split params are, they belong to `base_cv`, and this wrapper has no
+        # business knowing which of them a given splitter consumes.
+        for train_idx, test_idx in self.base_cv.split(X, y, **kwargs):
             train_idx = self._resample(np.asarray(train_idx))
             if self.subsample_test:
                 test_idx = self._resample(np.asarray(test_idx))
             yield train_idx, test_idx
 
-    def get_n_splits(self, X=None, y=None, groups=None):
-        return self.base_cv.get_n_splits(X, y, groups)
+    def get_n_splits(self, X=None, y=None, **kwargs):
+        return self.base_cv.get_n_splits(X, y, **kwargs)
 
 
 class BaseSuccessiveHalving(BaseSearchCV):
@@ -2971,7 +3389,7 @@ class BaseSuccessiveHalving(BaseSearchCV):
         scores = np.asarray(results[f"mean_test_{refit_metric}"])[last_iter_rows]
         return int(last_iter_rows[int(_ext().best_index(list(scores)))])
 
-    def _check_input_parameters(self, X, y, groups, base_cv):
+    def _check_input_parameters(self, X, y, split_params, base_cv):
         if self.resource != "n_samples" and self.resource not in self.estimator.get_params():
             raise ValueError(
                 f"Cannot use resource={self.resource} which is not supported "
@@ -2989,7 +3407,7 @@ class BaseSuccessiveHalving(BaseSearchCV):
 
         # `smallest` is `n_splits * 2`, times the class count for a classifier —
         # enough rows that every fold can hold at least a couple of each class.
-        n_splits = base_cv.get_n_splits(X, y, groups)
+        n_splits = base_cv.get_n_splits(X, y, **split_params)
         smallest = n_splits * 2
         if is_classifier(self.estimator) and y is not None:
             smallest *= len(np.unique(np.asarray(y)))
@@ -3071,10 +3489,17 @@ class BaseSuccessiveHalving(BaseSearchCV):
             candidate_params = [results["params"][this_iter[i]] for i in keep]
 
     def fit(self, X, y=None, **params):
-        """Run the halving search, then refit on the best of the LAST round."""
-        groups = params.get("groups", None)
+        """Run the halving search, then refit on the best of the LAST round.
+
+        The schedule depends on the fold count, so the split params have to be
+        routed here as well as in :meth:`BaseSearchCV.fit`; routing is a pure
+        function of ``params``, so doing it twice costs a dict and changes
+        nothing.
+        """
+        scorers, _ = self._get_scorers()
+        split_params = self._get_routed_params_for_fit(params, scorers).splitter.split
         base_cv = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
-        self._check_input_parameters(X, y, groups, base_cv)
+        self._check_input_parameters(X, y, split_params, base_cv)
         # `_run_search` needs `y` to re-derive the (stratified) base splitter.
         self._y = y
         return super().fit(X, y, **params)
@@ -3176,13 +3601,13 @@ class HalvingRandomSearchCV(BaseSuccessiveHalving):
         self.param_distributions = param_distributions
         self.n_candidates = n_candidates
 
-    def _check_input_parameters(self, X, y, groups, base_cv):
+    def _check_input_parameters(self, X, y, split_params, base_cv):
         if self.min_resources == self.n_candidates == "exhaust":
             # Each would be derived from the other — there is nothing to solve.
             raise ValueError(
                 "n_candidates and min_resources cannot be both set to 'exhaust'."
             )
-        super()._check_input_parameters(X, y, groups, base_cv)
+        super()._check_input_parameters(X, y, split_params, base_cv)
 
     def _generate_candidate_params(self):
         n_candidates = self.n_candidates
@@ -3279,8 +3704,23 @@ class FixedThresholdClassifier(ClassifierMixin, MetaEstimatorMixin, BaseEstimato
         self.pos_label = pos_label
         self.response_method = response_method
 
+    def get_metadata_routing(self):
+        """Declare what this wrapper routes where — the estimator's ``fit``, only."""
+        return MetadataRouter(owner=self).add(
+            estimator=self.estimator,
+            method_mapping=MethodMapping().add(caller="fit", callee="fit"),
+        )
+
     def fit(self, X, y, **params):
-        """Fit the wrapped estimator; the threshold itself needs no fitting."""
+        """Fit the wrapped estimator; the threshold itself needs no fitting.
+
+        With routing ENABLED, ``**params`` is filtered to what the estimator
+        requested. With it disabled the params pass straight through — sklearn
+        rejects them there, and mlrs keeps the wider behaviour it already had
+        (``docs/model-selection.md`` §7).
+        """
+        if params and _routing_enabled():
+            params = process_routing(self, "fit", **params).estimator.fit
         self.estimator_ = clone(self.estimator).fit(X, y, **params)
         self.classes_ = self.estimator_.classes_
         if len(self.classes_) != 2:
@@ -3386,8 +3826,16 @@ class TunedThresholdClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstima
         self.random_state = random_state
         self.store_cv_results = store_cv_results
 
-    def _curve_for_split(self, estimator, X_val, y_val, score_func, sign):
-        """One fold's ``(thresholds, objective_scores)`` curve."""
+    def _curve_for_split(
+        self, estimator, X_val, y_val, score_func, sign, score_params=None
+    ):
+        """One fold's ``(thresholds, objective_scores)`` curve.
+
+        ``score_params`` is whatever the metric requested, already indexed to
+        this fold's validation rows — the threshold sweep re-evaluates the same
+        metric at every grid point, so the metadata has to travel with it.
+        """
+        score_params = score_params or {}
         method = _resolve_response_method(estimator, self.response_method)
         scores = _binary_scores(estimator, X_val, method)
         if isinstance(self.thresholds, numbers.Integral):
@@ -3395,10 +3843,46 @@ class TunedThresholdClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstima
         else:
             grid = np.asarray(self.thresholds, dtype=float)
         objective = [
-            sign * score_func(y_val, _threshold_to_labels(scores, th, estimator.classes_))
+            sign
+            * score_func(
+                y_val,
+                _threshold_to_labels(scores, th, estimator.classes_),
+                **score_params,
+            )
             for th in grid
         ]
         return np.asarray(grid, dtype=float), np.asarray(objective, dtype=float)
+
+    def _resolve_scorer(self):
+        """The scorer object behind ``scoring`` — a string is looked up first."""
+        from sklearn.metrics import get_scorer
+
+        if isinstance(self.scoring, str):
+            return get_scorer(self.scoring)
+        return self.scoring
+
+    def get_metadata_routing(self):
+        """Declare what this estimator routes where.
+
+        The scorer node is the *scorer object* behind ``scoring``, so a
+        ``make_scorer(..., ).set_score_request(sample_weight=True)`` is honoured
+        even though the sweep calls the underlying metric function directly.
+        """
+        return (
+            MetadataRouter(owner=self)
+            .add(
+                estimator=self.estimator,
+                method_mapping=MethodMapping().add(caller="fit", callee="fit"),
+            )
+            .add(
+                splitter=self.cv,
+                method_mapping=MethodMapping().add(caller="fit", callee="split"),
+            )
+            .add(
+                scorer=self._resolve_scorer(),
+                method_mapping=MethodMapping().add(caller="fit", callee="score"),
+            )
+        )
 
     def _resolve_cv(self, X, y):
         if isinstance(self.cv, numbers.Real) and not isinstance(self.cv, numbers.Integral):
@@ -3410,10 +3894,16 @@ class TunedThresholdClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstima
         return check_cv(self.cv, y, classifier=True)
 
     def fit(self, X, y, **params):
-        """Tune the threshold by cross-validation, then (optionally) refit."""
-        from sklearn.metrics import get_scorer
+        """Tune the threshold by cross-validation, then (optionally) refit.
 
+        With routing ENABLED, ``**params`` is split between the estimator's
+        ``fit``, the splitter's ``split`` and the metric, each bucket indexed to
+        the rows of the fold that consumes it. With it disabled the params go
+        wholesale to the estimator's ``fit`` — sklearn rejects them there, and
+        mlrs keeps the wider behaviour it already had.
+        """
         X, y, _ = _indexable(X, y, None)
+        n_samples = _num_samples(X)
         classes = np.unique(np.asarray(y))
         if len(classes) != 2:
             raise ValueError(
@@ -3421,7 +3911,16 @@ class TunedThresholdClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstima
                 f"{len(classes)} classes."
             )
 
-        scorer = get_scorer(self.scoring) if isinstance(self.scoring, str) else self.scoring
+        if params and _routing_enabled():
+            routed = process_routing(self, "fit", **params)
+        else:
+            routed = Bunch(
+                estimator=Bunch(fit=params),
+                splitter=Bunch(split={}),
+                scorer=Bunch(score={}),
+            )
+
+        scorer = self._resolve_scorer()
         score_func = getattr(scorer, "_score_func", None)
         sign = getattr(scorer, "_sign", 1)
         if score_func is None:
@@ -3434,13 +3933,19 @@ class TunedThresholdClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstima
         if self.cv == "prefit":
             check_is_fitted(self.estimator)
             self.estimator_ = self.estimator
-            curves = [self._curve_for_split(self.estimator_, X, y, score_func, sign)]
+            curves = [
+                self._curve_for_split(
+                    self.estimator_, X, y, score_func, sign, routed.scorer.score
+                )
+            ]
         else:
             cv = self._resolve_cv(X, y)
             curves = []
-            for train, val in cv.split(X, y):
+            for train, val in cv.split(X, y, **routed.splitter.split):
                 fitted = clone(self.estimator).fit(
-                    _safe_indexing(X, train), _safe_indexing(y, train), **params
+                    _safe_indexing(X, train),
+                    _safe_indexing(y, train),
+                    **_index_params(routed.estimator.fit, train, n_samples),
                 )
                 curves.append(
                     self._curve_for_split(
@@ -3449,10 +3954,13 @@ class TunedThresholdClassifierCV(ClassifierMixin, MetaEstimatorMixin, BaseEstima
                         _safe_indexing(y, val),
                         score_func,
                         sign,
+                        _index_params(routed.scorer.score, val, n_samples),
                     )
                 )
             self.estimator_ = (
-                clone(self.estimator).fit(X, y, **params) if self.refit else fitted
+                clone(self.estimator).fit(X, y, **routed.estimator.fit)
+                if self.refit
+                else fitted
             )
 
         grid_kwargs = (

@@ -17,9 +17,19 @@ against that invariant by
 `test_oracle_cluster.py::test_hdbscan_brute_accepts_tree_only_metric_aliases`,
 and the full accept/reject matrix is swept in the same file.
 
+**The one exception, and what it costs to make one.** `SK-002` changes a
+*result*, not an accept/reject decision — the only entry here that does. It is
+admissible on one condition, which any future entry of this kind must also meet:
+the scikit-learn result it replaces answers a question the caller did not ask
+(there, the p-value of an ungrouped permutation test for a caller who supplied
+groups), so there is no baseline worth preserving to preserve. The divergence is
+confined to that single configuration, and both behaviours — mlrs's and
+scikit-learn's — are pinned by tests, so an upstream fix surfaces as a failure.
+
 | ID | Component | Status | mlrs response |
 | --- | --- | --- | --- |
 | [SK-001](#sk-001) | `cluster.HDBSCAN` — `algorithm='brute'` rejects four metrics its own `metric` constraint accepts | Reported, sklearn 1.9.0 | Diverges: accepts `infinity` / `p` |
+| [SK-002](#sk-002) | `model_selection.permutation_test_score` — routed `groups` constrain the split but not the permutation | Written up, **not yet filed**; sklearn 1.9.0 | Diverges: the permutation is grouped too |
 
 ---
 
@@ -210,6 +220,239 @@ pairwise_distances must be a str among {'nan_euclidean', 'chebyshev',
 'cityblock', 'canberra', 'haversine', 'euclidean', 'yule'} or a callable.
 Got 'infinity' instead.
 ```
+
+#### Versions
+
+```shell
+System:
+    python: 3.14.6 (main, Jun 11 2026, 00:00:00) [GCC 16.1.1 20260515 (Red Hat 16.1.1-2)]
+executable: /usr/bin/python
+   machine: Linux-7.1.5-201.fc44.x86_64-x86_64-with-glibc2.43
+
+Python dependencies:
+      sklearn: 1.9.0
+          pip: 26.0.1
+   setuptools: 83.0.0
+        numpy: 2.4.6
+        scipy: 1.18.0
+       Cython: None
+       pandas: 3.0.5
+   matplotlib: 3.11.1
+       joblib: 1.5.3
+threadpoolctl: 3.6.0
+     narwhals: 2.24.0
+
+Built with OpenMP: True
+```
+
+---
+
+## SK-002
+
+**`permutation_test_score`: with metadata routing enabled, `groups` constrains
+the cross-validation split but no longer constrains the permutation, so the
+same input spelled two ways gives two different p-values.**
+
+Affects scikit-learn 1.9.0. Found while wiring metadata routing through
+`mlrs.model_selection` (MODSEL-ROUTING).
+
+The function takes its grouping two ways, and they are meant to be the same
+input:
+
+* `groups=` — the routing-disabled spelling, refused outright when routing is
+  on (`_check_groups_routing_disabled`, `sklearn/model_selection/_validation.py`
+  L64);
+* `params={"groups": ...}` — the routing-enabled spelling, routed to the
+  splitter's `split`.
+
+The permutation is drawn by `_shuffle(y, groups, random_state)`, which reads the
+*explicit* `groups` parameter. Under routing that parameter is necessarily
+`None` — the function itself raises if it is anything else — so the routed
+grouping reaches the splitter and never reaches the shuffle. The documented
+behaviour of `groups` ("Labels to constrain permutation within groups, i.e. y
+values are permuted among samples with the same group identifier",
+`_validation.py` L1512-L1515) is silently lost, and nothing warns.
+
+This is an inconsistency between code paths rather than a judgement call, and it
+is visible inside a single call: the argument on L1700 reads the explicit
+`groups` while `split_params=` three lines below reads the routed one.
+
+### What mlrs does about it
+
+mlrs reads the grouping back off the routed splitter bucket, so both spellings
+constrain both the split and the permutation. A grouped permutation test means
+the same thing whether or not routing is enabled.
+
+This is the one divergence in this file that changes *numbers* rather than
+*what is accepted*, so it is worth being explicit about the invariant at the top
+of this document. It applies to exactly one configuration — routing enabled,
+`params={"groups": ...}`, `permutation_test_score` — which cannot have a
+scikit-learn baseline worth preserving: under scikit-learn that call reports the
+p-value of an *ungrouped* test while the caller has asked for a grouped one.
+Reproducing it would mean reproducing a result the caller did not request. Every
+other configuration, including every routing-disabled one, is unchanged and
+matches scikit-learn exactly.
+
+Both behaviours are pinned by
+`crates/mlrs-py/python/tests/test_oracle_model_selection_routing.py::test_permutation_test_score_constrains_the_shuffle_by_routed_groups`,
+which asserts that mlrs's two spellings agree *and* that scikit-learn's two
+disagree — so an upstream fix fails the test rather than drifting past it.
+
+### The report
+
+<sub>The remainder of this section is the issue body as prepared for upstream.
+It has **not been filed yet** — unlike SK-001, which is quoted as submitted. It
+is written in scikit-learn's issue template so it can be filed unchanged, and
+kept here in that form so it stays comparable with whatever upstream replies.
+Every quotation below is verbatim from the installed 1.9.0 source, and every
+output block is captured from a real run.</sub>
+
+#### Describe the bug
+
+`permutation_test_score` permutes `y` within groups when given `groups`:
+
+```python
+# sklearn/model_selection/_validation.py
+def _shuffle(y, groups, random_state):                                    # L1733
+    """Return a shuffled copy of y eventually shuffle among same groups."""
+    if groups is None:
+        indices = random_state.permutation(len(y))
+    else:
+        indices = np.arange(len(groups))
+        for group in np.unique(groups):
+            this_mask = groups == group
+            indices[this_mask] = random_state.permutation(indices[this_mask])
+    return _safe_indexing(y, indices)
+```
+
+The call site passes it the *explicit* `groups` argument, three lines above
+handing the *routed* one to the splitter (L1696-L1708):
+
+```python
+    permutation_scores = Parallel(n_jobs=n_jobs, verbose=verbose)(
+        delayed(_permutation_test_score)(
+            clone(estimator),
+            X,
+            _shuffle(y, groups, random_state),               # <- explicit `groups`
+            cv,
+            scorer,
+            split_params=routed_params.splitter.split,       # <- routed `groups`
+            fit_params=routed_params.estimator.fit,
+            score_params=routed_params.scorer.score,
+        )
+        for _ in range(n_permutations)
+    )
+```
+
+(The two trailing comments are mine; everything else is verbatim.)
+
+But when metadata routing is enabled, the explicit argument is guaranteed to be
+`None`, because the same function rejects anything else (L64-L71):
+
+```python
+def _check_groups_routing_disabled(groups):
+    if groups is not None and _routing_enabled():
+        raise ValueError(
+            "`groups` can only be passed if metadata routing is not enabled via"
+            " `sklearn.set_config(enable_metadata_routing=True)`. When routing is"
+            " enabled, pass `groups` alongside other metadata via the `params` argument"
+            " instead."
+        )
+```
+
+So with routing on, `_shuffle` always takes the `groups is None` branch and
+permutes globally, while `routed_params.splitter.split` still carries the
+caller's grouping into the split. The *splitting* is grouped, the *permutation*
+is not, and the test measures a null hypothesis the caller did not ask for —
+with no warning.
+
+#### Steps/Code to Reproduce
+
+```python
+import numpy as np
+import sklearn
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import GroupKFold, permutation_test_score
+
+rng = np.random.RandomState(0)
+groups = np.repeat(np.arange(6), 10)
+# y is CONSTANT within each group, so a within-group permutation is the identity:
+# every permuted score must equal the true score exactly, and the p-value must
+# be 1.0.
+y = groups.astype(float)
+X = np.column_stack([y + rng.normal(scale=0.1, size=60), rng.normal(size=60)])
+
+kw = dict(cv=GroupKFold(n_splits=3), n_permutations=20, random_state=7)
+
+score, perms, pvalue = permutation_test_score(Ridge(), X, y, groups=groups, **kw)
+print(f"groups=       (routing off): score={score:.3f}  "
+      f"every permuted score == true score: {np.allclose(perms, score)}  "
+      f"pvalue={pvalue:.4f}")
+
+with sklearn.config_context(enable_metadata_routing=True):
+    score, perms, pvalue = permutation_test_score(
+        Ridge(), X, y, params={"groups": groups}, **kw
+    )
+    print(f"params={{'groups'}} (routing on):  score={score:.3f}  "
+          f"every permuted score == true score: {np.allclose(perms, score)}  "
+          f"pvalue={pvalue:.4f}")
+```
+
+#### Expected Results
+
+Both spellings pass the same grouping to the same function, so both should
+report the same p-value — here `1.0`, since `y` is constant within a group and a
+within-group permutation cannot change a single label.
+
+Taking the grouping from wherever the splitter got it is a three-line change,
+and is correct in both configurations: with routing off the routed bucket is
+built as `{"groups": groups}`, so the `.get` returns the explicit argument; with
+routing on it holds whatever was routed, or nothing at all for a splitter that
+did not request `groups` (in which case the fallback is the `None` that gives
+today's global permutation).
+
+```diff
+--- a/sklearn/model_selection/_validation.py
++++ b/sklearn/model_selection/_validation.py
+@@ -1693,11 +1693,14 @@
+         fit_params=routed_params.estimator.fit,
+         score_params=routed_params.scorer.score,
+     )
++    # `groups` is always None when routing is enabled (it is refused above), so
++    # take the grouping from wherever the splitter got it.
++    shuffle_groups = routed_params.splitter.split.get("groups", groups)
+     permutation_scores = Parallel(n_jobs=n_jobs, verbose=verbose)(
+         delayed(_permutation_test_score)(
+             clone(estimator),
+             X,
+-            _shuffle(y, groups, random_state),
++            _shuffle(y, shuffle_groups, random_state),
+             cv,
+             scorer,
+             split_params=routed_params.splitter.split,
+```
+
+Applied to a copy of the installed 1.9.0, that patch makes the reproduction
+print `pvalue=1.0000` for both spellings, and
+`sklearn/model_selection/tests/test_validation.py` still passes in full
+(121 passed, 90 skipped).
+
+An alternative that changes no results would be to *warn* when `groups` is
+routed to the splitter under `permutation_test_score`, saying the permutation is
+unconstrained. That is strictly worse for the caller who wanted a grouped test,
+but it avoids changing an output, so it may fit scikit-learn's deprecation
+policy better than the patch above.
+
+#### Actual Results
+
+```shell
+groups=       (routing off): score=0.995  every permuted score == true score: True  pvalue=1.0000
+params={'groups'} (routing on):  score=0.995  every permuted score == true score: False  pvalue=0.0476
+```
+
+Enabling routing turns "no evidence of a group-independent signal" (p = 1.0)
+into "significant at the 5% level" (p = 0.0476), from the same data, the same
+seed and the same grouping.
 
 #### Versions
 

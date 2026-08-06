@@ -245,9 +245,64 @@ scikit-learn).
 
 ---
 
-## 6. Known differences from scikit-learn
+## 6. Metadata routing
 
-Small, deliberate, and none of them change which rows a split selects:
+`sample_weight` and friends reach their consumer the same way they do in
+scikit-learn, under the same global switch:
+
+```python
+import sklearn
+sklearn.set_config(enable_metadata_routing=True)
+```
+
+**Off (the default).** `params=` goes wholesale to the estimator's `fit`, with
+row-aligned entries indexed per fold; `groups=` goes to the splitter; the
+scorers get nothing — except in the search estimators, where a `sample_weight`
+used for fitting is also handed to the scorers (and a scorer that cannot take
+one warns), matching scikit-learn's legacy special case.
+
+**On.** Each consumer receives exactly what it asked for, and metadata nobody
+asked for is an error rather than a silent drop:
+
+```python
+from sklearn.linear_model import Ridge
+from mlrs.model_selection import GroupKFold, cross_validate
+
+est = Ridge().set_fit_request(sample_weight=True).set_score_request(sample_weight=False)
+cross_validate(est, X, y, cv=GroupKFold(n_splits=4),
+               params={"sample_weight": w, "groups": g})
+```
+
+The three consumers are the **estimator** (`fit`), the **splitter** (`split`)
+and the **scorers** (`score`), wired through `cross_validate`,
+`cross_val_score`, `cross_val_predict`, `learning_curve`, `validation_curve`,
+`permutation_test_score`, the four search estimators (which are themselves
+routers, so they nest inside a `Pipeline`) and the two threshold classifiers.
+
+Three things are worth knowing before you turn it on:
+
+* **`groups=` is refused while routing is enabled** — pass it inside `params`.
+  Honouring both would leave two disagreeing sources for one input.
+* **Only the group-based splitters can be given `groups`.** `KFold` accepts the
+  argument and ignores it, so it declares `groups` *unused*: there is no
+  `KFold().set_split_request(groups=True)` to write, and routing one there is an
+  error rather than a no-op. This mirrors scikit-learn exactly.
+* **`scoring=None` makes the estimator its own scorer**, so an estimator whose
+  `score` takes a `sample_weight` needs `set_score_request(...)` as well as
+  `set_fit_request(...)`. "Weight the fit" and "weight the score" are separate
+  asks, and leaving the second unset raises.
+
+Parity is gated by
+`crates/mlrs-py/python/tests/test_oracle_model_selection_routing.py`, which
+checks the routing *declarations* against scikit-learn's, the routed values
+against a recording consumer, and the numbers against a live scikit-learn call.
+
+---
+
+## 7. Known differences from scikit-learn
+
+Small, deliberate, and none of them change which rows a split selects. Only the
+last one changes a *number*, in one configuration, for the reason given there:
 
 * **`pandas.Index`** is gathered positionally and returned as an `Index`.
   scikit-learn raises `TypeError` on it.
@@ -259,7 +314,13 @@ Small, deliberate, and none of them change which rows a split selects:
 * **`TunedThresholdClassifierCV(scoring=...)`** requires a scoring string or a
   `make_scorer` result, not a bare callable: the threshold sweep needs the
   underlying metric function, which a plain scorer callable does not expose.
-* **Metadata routing** (`set_score_request` / `set_fit_request`) is not wired
-  through. `params=` is forwarded to the estimator's `fit`, with row-aligned
-  entries indexed per fold — the behavior you get from scikit-learn with routing
-  disabled, which is its default.
+* **Extra `fit` / `score` kwargs with routing off.** With
+  `enable_metadata_routing=False` (the default), scikit-learn *rejects* metadata
+  passed to `FixedThresholdClassifier.fit`, `TunedThresholdClassifierCV.fit` and
+  `GridSearchCV.score`; mlrs forwards it, as it always has. Divergences here may
+  only widen what is accepted (see `docs/upstream-sklearn-issues.md`), and
+  nothing that works under scikit-learn behaves differently.
+* **`permutation_test_score` under routing** constrains its permutation by the
+  routed `groups`. scikit-learn constrains only the *split* by them, so its
+  grouped permutation test silently becomes ungrouped when routing is on —
+  `SK-002` in `docs/upstream-sklearn-issues.md`.
