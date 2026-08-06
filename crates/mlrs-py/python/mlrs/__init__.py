@@ -87,12 +87,15 @@ from .timeseries import ARIMA, AutoARIMA
 # `mlrs.metrics.accuracy_score(...)` etc.
 from . import metrics  # noqa: F401
 
-# The host-only sklearn model-selection surface (MODSEL-01): same SUBMODULE
-# convention as `metrics` above — access via
-# `mlrs.model_selection.train_test_split(...)`. Like `metrics` it is pure
-# host-side work, but unlike `metrics` it does not touch `_mlrs` at all (the
-# split is index bookkeeping plus a container gather), so it is fully usable on
-# a tree where the extension was never built.
+# The sklearn model-selection surface (MODSEL-01/02 + MODSEL-RS-01..08): same
+# SUBMODULE convention as `metrics` above — access via
+# `mlrs.model_selection.train_test_split(...)`. The splitters, the
+# ParameterGrid/Sampler combinatorics, the search + successive-halving
+# schedules, the CV aggregation and the decision-threshold tuning all run in
+# Rust (`mlrs_algos::model_selection`, via `_mlrs`); the module itself owns the
+# sklearn-compatible classes and the container handling. `_mlrs` is imported
+# LAZILY there, so this import still succeeds on a tree where the extension was
+# never built.
 from . import model_selection  # noqa: F401
 
 # The sklearn feature-selection surface (FSEL-01): same SUBMODULE convention as

@@ -6164,6 +6164,173 @@ def gen_normalizer(seed: int = SEED, dtype=np.float32, norm: str = "l2") -> str:
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# model_selection splitter fixtures (MODSEL-RS-02)
+# ---------------------------------------------------------------------------
+# The parity decision for this whole surface is HOST-MATCH: an mlrs splitter
+# must select the same ROWS as sklearn's, index for index, including under
+# `shuffle=True`. So the fixture stores the literal index vectors sklearn
+# produced, not a summary statistic — a "same sizes, same class balance"
+# fixture would pass against a generator that walks numpy's MT19937 stream
+# differently, which is exactly the bug worth catching.
+#
+# Layout, per case `<name>`:
+#   <name>__train      flat concatenation of every split's train indices
+#   <name>__train_len  per-split lengths, so the flat buffer can be re-cut
+#   <name>__test       ... and the same pair for the test side
+# Index arrays are stored as float64: every value is a small integer, exactly
+# representable, and `mlrs_core::oracle` decodes float dtypes only.
+
+# 37 rows: coprime with every fold count below, so the uneven-fold branch
+# (`fold_sizes[:n % k] += 1`) is exercised rather than accidentally skipped.
+MODSEL_N = 37
+
+
+def _modsel_design(seed: int = SEED):
+    """The shared (X, y, groups, test_fold) design for every splitter case.
+
+    `y` is deliberately IMBALANCED (17/13/7) so stratification has real work to
+    do, and `groups` is deliberately RAGGED so `GroupKFold`'s greedy balance and
+    `StratifiedGroupKFold`'s variance ordering both have ties to break.
+    """
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((MODSEL_N, 4))
+    y = np.array([0] * 17 + [1] * 13 + [2] * 7)
+    rng.shuffle(y)
+    # 7 ragged groups.
+    groups = np.array([i % 7 for i in range(MODSEL_N)])
+    groups[:5] = 0
+    # PredefinedSplit's fold tags, including the never-tested `-1` sentinel.
+    test_fold = np.array([-1, 0, 1, 2] * 9 + [0])
+    return x, y, groups, test_fold
+
+
+def _modsel_pack(store, name, splits):
+    """Flatten `[(train, test), ...]` into the four fixture arrays."""
+    trains = [np.asarray(tr, dtype=np.int64) for tr, _ in splits]
+    tests = [np.asarray(te, dtype=np.int64) for _, te in splits]
+    store[f"{name}__train"] = np.concatenate(trains).astype(np.float64) if trains else np.zeros(0)
+    store[f"{name}__train_len"] = np.array([len(t) for t in trains], dtype=np.float64)
+    store[f"{name}__test"] = np.concatenate(tests).astype(np.float64) if tests else np.zeros(0)
+    store[f"{name}__test_len"] = np.array([len(t) for t in tests], dtype=np.float64)
+
+
+def gen_model_selection_splits(seed: int = SEED) -> str:
+    """Every cross-validation splitter's exact sklearn indices (MODSEL-RS-02)."""
+    from sklearn.model_selection import (
+        GroupKFold,
+        GroupShuffleSplit,
+        KFold,
+        LeaveOneGroupOut,
+        LeaveOneOut,
+        LeavePGroupsOut,
+        LeavePOut,
+        PredefinedSplit,
+        RepeatedKFold,
+        RepeatedStratifiedKFold,
+        ShuffleSplit,
+        StratifiedGroupKFold,
+        StratifiedKFold,
+        StratifiedShuffleSplit,
+        TimeSeriesSplit,
+    )
+
+    x, y, groups, test_fold = _modsel_design(seed)
+    store = {"y": y.astype(np.float64), "groups": groups.astype(np.float64),
+             "test_fold": test_fold.astype(np.float64),
+             "n_samples": np.array([MODSEL_N], dtype=np.float64)}
+
+    def add(name, splitter, **split_kwargs):
+        _modsel_pack(store, name, list(splitter.split(x, **split_kwargs)))
+
+    add("kfold_5", KFold(n_splits=5))
+    add("kfold_7", KFold(n_splits=7))
+    add("kfold_5_shuffle_42", KFold(n_splits=5, shuffle=True, random_state=42))
+    add("kfold_3_shuffle_0", KFold(n_splits=3, shuffle=True, random_state=0))
+
+    add("groupkfold_3", GroupKFold(n_splits=3), groups=groups)
+    add(
+        "groupkfold_3_shuffle_42",
+        GroupKFold(n_splits=3, shuffle=True, random_state=42),
+        groups=groups,
+    )
+
+    add("stratkfold_3", StratifiedKFold(n_splits=3), y=y)
+    add(
+        "stratkfold_3_shuffle_42",
+        StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+        y=y,
+    )
+    add(
+        "stratkfold_4_shuffle_7",
+        StratifiedKFold(n_splits=4, shuffle=True, random_state=7),
+        y=y,
+    )
+
+    add("stratgroupkfold_3", StratifiedGroupKFold(n_splits=3), y=y, groups=groups)
+    add(
+        "stratgroupkfold_3_shuffle_42",
+        StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42),
+        y=y,
+        groups=groups,
+    )
+
+    add("timeseries_5", TimeSeriesSplit(n_splits=5))
+    add("timeseries_3_gap2", TimeSeriesSplit(n_splits=3, gap=2))
+    add(
+        "timeseries_3_max10_test5",
+        TimeSeriesSplit(n_splits=3, max_train_size=10, test_size=5),
+    )
+
+    add("loo", LeaveOneOut())
+    add("lpo_2", LeavePOut(p=2))
+
+    add("logo", LeaveOneGroupOut(), groups=groups)
+    add("lpgo_2", LeavePGroupsOut(n_groups=2), groups=groups)
+
+    _modsel_pack(store, "predefined", list(PredefinedSplit(test_fold).split()))
+
+    add("shufflesplit_42", ShuffleSplit(random_state=42))
+    add(
+        "shufflesplit_5_t03_1",
+        ShuffleSplit(n_splits=5, test_size=0.3, random_state=1),
+    )
+    add(
+        "shufflesplit_train_int",
+        ShuffleSplit(n_splits=3, train_size=20, test_size=10, random_state=5),
+    )
+
+    add("groupshuffle_42", GroupShuffleSplit(random_state=42), groups=groups)
+    add(
+        "groupshuffle_3_t04_2",
+        GroupShuffleSplit(n_splits=3, test_size=0.4, random_state=2),
+        groups=groups,
+    )
+
+    add("stratshuffle_42", StratifiedShuffleSplit(random_state=42), y=y)
+    add(
+        "stratshuffle_5_t025_3",
+        StratifiedShuffleSplit(n_splits=5, test_size=0.25, random_state=3),
+        y=y,
+    )
+
+    add(
+        "repeatedkfold_3x2_42",
+        RepeatedKFold(n_splits=3, n_repeats=2, random_state=42),
+    )
+    add(
+        "repeatedstratkfold_3x2_42",
+        RepeatedStratifiedKFold(n_splits=3, n_repeats=2, random_state=42),
+        y=y,
+    )
+
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"model_selection_splits_seed{seed}.npz")
+    np.savez(out_path, **store)
+    return out_path
+
+
+
 def gen_binarizer(seed: int = SEED, dtype=np.float32) -> str:
     """`Binarizer` fixture (PREP-01, `threshold=0.5`), including exact-threshold
     entries (sklearn's `>` is STRICT — a tie must binarize to 0)."""
@@ -7326,6 +7493,11 @@ def main() -> None:
             print(f"wrote {gen_normalizer(dtype=dtype, norm=norm)}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_binarizer(dtype=dtype)}")
+
+    # ---- model_selection splitter fixtures (MODSEL-RS-02) ----
+    # Dtype-free: these carry INDEX vectors, not float measurements, so there
+    # is no f32/f64 pair to generate.
+    print(f"wrote {gen_model_selection_splits()}")
 
     # ---- feature_selection fixtures (FSEL-01) ----
     # Delegated to their own module: the 18-name feature-selection surface shares

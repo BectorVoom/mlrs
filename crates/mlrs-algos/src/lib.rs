@@ -76,6 +76,13 @@ pub mod metrics;
 // EM loop is launch-bound, `f64`-bound, and has a serial `O(k·d³)`
 // factorization tail (see that module's docs).
 pub mod mixture;
+// The sklearn `model_selection` surface (MODSEL-RS-01..08): every
+// cross-validation splitter's index generation, the parameter-grid/sampler
+// combinatorics, the search + successive-halving schedules, the CV/curve
+// aggregation and the decision-threshold math. Host-only integer/float
+// bookkeeping with no device kernel anywhere — see `model_selection/mod.rs`
+// for why, and for the numpy-MT19937 parity contract the splitters carry.
+pub mod model_selection;
 pub mod naive_bayes;
 pub mod neighbors;
 // The sklearn `preprocessing` scaler family (PREP-01, Phase 24): `StandardScaler`
