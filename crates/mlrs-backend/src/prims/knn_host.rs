@@ -138,18 +138,18 @@ use crate::runtime::ActiveRuntime;
 /// whole scan; Cosine already beats sklearn 28× at this width, so the split is
 /// not worth its weight. Revisit it if the Cosine cell ever becomes the one that
 /// matters.
-const QB: usize = 16;
+pub(super) const QB: usize = 16;
 
 /// `MID` for [`Metric::Euclidean`] — `Σ (x−y)²`, square root at the boundary.
-const MID_EUCLIDEAN: u32 = 0;
+pub(super) const MID_EUCLIDEAN: u32 = 0;
 /// `MID` for [`Metric::Manhattan`] — `Σ |x−y|`, no boundary transform.
-const MID_MANHATTAN: u32 = 1;
+pub(super) const MID_MANHATTAN: u32 = 1;
 /// `MID` for [`Metric::Chebyshev`] — `max |x−y|`, no boundary transform.
-const MID_CHEBYSHEV: u32 = 2;
+pub(super) const MID_CHEBYSHEV: u32 = 2;
 /// `MID` for [`Metric::Minkowski`] — `Σ |x−y|^p`, `p`-th root at the boundary.
-const MID_MINKOWSKI: u32 = 3;
+pub(super) const MID_MINKOWSKI: u32 = 3;
 /// `MID` for [`Metric::Cosine`] — `clamp(1 − x·y/‖x‖‖y‖, 0, 2)`, no transform.
-const MID_COSINE: u32 = 4;
+pub(super) const MID_COSINE: u32 = 4;
 
 /// Should the host arm serve this search?
 ///
@@ -340,7 +340,7 @@ const MINKOWSKI_POWI_MAX: u32 = 8;
 ///
 /// `p` must round-trip through `u32` EXACTLY — `p = 3.0000001` is a different
 /// metric from `p = 3` and must not silently take the integer path.
-fn minkowski_powi(p: f64) -> Option<u32> {
+pub(super) fn minkowski_powi(p: f64) -> Option<u32> {
     let pi = p as u32;
     if p == f64::from(pi) && (3..=MINKOWSKI_POWI_MAX).contains(&pi) {
         Some(pi)
@@ -364,7 +364,7 @@ fn minkowski_powi(p: f64) -> Option<u32> {
 ///
 /// This is also the form sklearn uses: `cosine_distances` normalizes both
 /// operands and then dots them, rather than dividing the dot afterwards.
-fn row_inv_norm_host<T: HostFloat>(v: &[T], rows: usize, d: usize) -> Vec<T> {
+pub(super) fn row_inv_norm_host<T: HostFloat>(v: &[T], rows: usize, d: usize) -> Vec<T> {
     let mut out = vec![T::ZERO; rows];
     for (r, o) in out.iter_mut().enumerate() {
         let row = &v[r * d..(r + 1) * d];
@@ -387,7 +387,7 @@ fn row_inv_norm_host<T: HostFloat>(v: &[T], rows: usize, d: usize) -> Vec<T> {
 /// workers that would own nothing and only pay barrier crossings, and by the
 /// machine's own unit count ([`cpu_launch_units`](crate::capability::cpu_launch_units),
 /// which `MLRS_CPU_UNITS` overrides for A/B).
-fn host_units(n_query: usize) -> usize {
+pub(super) fn host_units(n_query: usize) -> usize {
     let blocks = n_query.div_ceil(QB);
     blocks
         .max(1)
@@ -493,7 +493,7 @@ fn scan<T: HostFloat, const MID: u32, const PI: u32>(
 /// Lanes beyond `active` (a trailing partial block) stage zeros; [`prefill`]
 /// disables them so they never admit, and [`emit`] never reads them.
 #[inline]
-fn stage_tile<T: HostFloat>(xq: &[T], xtile: &mut [[T; QB]], q0: usize, active: usize, d: usize) {
+pub(super) fn stage_tile<T: HostFloat>(xq: &[T], xtile: &mut [[T; QB]], q0: usize, active: usize, d: usize) {
     for (c, slot) in xtile.iter_mut().enumerate().take(d) {
         for (a, lane) in slot.iter_mut().enumerate() {
             *lane = if a < active {
@@ -632,76 +632,11 @@ fn scan_block<T: HostFloat, const MID: u32, const PI: u32>(
     worst_i: &mut [u32; QB],
 ) {
     let pe = T::from_f64(p);
-    let one = T::ONE;
-    let two = T::lit(2.0);
 
     for t in 0..n_train {
         let yrow = &xt[t * d..t * d + d];
-
-        // The QB lanes are INDEPENDENT reductions, which is what lets this
-        // vectorize — a reduction over the feature axis could not, because Rust
-        // will not reassociate float addition. Zipping the tile against the
-        // training row walks both without a bounds check per feature.
-        let mut acc = [T::ZERO; QB];
-        for (xc, &yv) in xtile.iter().zip(yrow.iter()) {
-            if MID == MID_EUCLIDEAN {
-                for a in 0..QB {
-                    let diff = xc[a] - yv;
-                    acc[a] = acc[a] + diff * diff;
-                }
-            } else if MID == MID_MANHATTAN {
-                for a in 0..QB {
-                    acc[a] = acc[a] + (xc[a] - yv).abs();
-                }
-            } else if MID == MID_CHEBYSHEV {
-                for a in 0..QB {
-                    let v = (xc[a] - yv).abs();
-                    // A SELECT, not a conditional store: written as `if v >
-                    // acc[a] { acc[a] = v }` the lane loop measured 5x slower
-                    // than the Manhattan one it is otherwise identical to (0.044
-                    // s against 0.009 s at 20_000 x 2_000 x 16) — LLVM will not
-                    // vectorize a loop whose store is predicated, and this is the
-                    // same running max written so it is unconditional.
-                    acc[a] = if v > acc[a] { v } else { acc[a] };
-                }
-            } else if MID == MID_MINKOWSKI && PI > 0 {
-                for a in 0..QB {
-                    let ad = (xc[a] - yv).abs();
-                    // `PI` is a constant, so this is an unrolled multiply chain
-                    // and the whole lane loop stays vectorizable.
-                    let mut r = ad;
-                    for _ in 1..PI {
-                        r = r * ad;
-                    }
-                    acc[a] = acc[a] + r;
-                }
-            } else if MID == MID_MINKOWSKI {
-                for a in 0..QB {
-                    acc[a] = acc[a] + (xc[a] - yv).abs().powf(pe);
-                }
-            } else {
-                // Cosine accumulates the plain dot product; the norms are folded
-                // in below, once per training row instead of once per feature.
-                for a in 0..QB {
-                    acc[a] = acc[a] + xc[a] * yv;
-                }
-            }
-        }
-
-        if MID == MID_COSINE {
-            // `1 − dot·(1/‖x‖)·(1/‖y‖)`, then the `[0, 2]` clamp sklearn's
-            // `cosine_distances` applies. Both reciprocals are precomputed
-            // (`row_inv_norm_host`) and the training row's is hoisted out of the
-            // lane loop, so this epilogue is two multiplies and two selects per
-            // lane — no root and no divide anywhere in the scan.
-            let yn = ynorm[t];
-            for a in 0..QB {
-                let mut dv = one - acc[a] * xn[a] * yn;
-                dv = if dv < T::ZERO { T::ZERO } else { dv };
-                dv = if dv > two { two } else { dv };
-                acc[a] = dv;
-            }
-        }
+        let yn = if MID == MID_COSINE { ynorm[t] } else { T::ZERO };
+        let acc = lane_distances::<T, MID, PI>(xtile, yrow, xn, yn, pe);
 
         // Screen the whole block with one pass before touching any list:
         // admission is a REJECT for the overwhelming majority of training rows
@@ -718,6 +653,101 @@ fn scan_block<T: HostFloat, const MID: u32, const PI: u32>(
             }
         }
     }
+}
+
+/// One training row's distance to all `QB` staged query rows, under metric
+/// `MID` — the vectorizable core BOTH host scans are built on.
+///
+/// Returns the metric's INTERNAL (pre-boundary-transform) value: squared for
+/// Euclidean, `Σ|Δ|^p` for Minkowski, and the true distance for
+/// Manhattan/Chebyshev/Cosine. A monotone boundary transform (`sqrt`, `^(1/p)`)
+/// is applied by the caller to the values it actually keeps — the `k` selected
+/// here, the matches within `radius` in [`radius_host`](super::radius_host) —
+/// never to all `n_train` candidates.
+///
+/// Split out so the radius scan reuses this loop VERBATIM rather than growing a
+/// second copy that could drift on a tie, a NaN, or a clamp; `#[inline(always)]`
+/// keeps it a straight-line body inside each caller's `#[target_feature]` twin,
+/// which is where the width the machine actually has comes from
+/// ([`dispatch_scan_block`]).
+///
+/// `xn`/`yn` are the RECIPROCAL row norms Cosine folds in (`row_inv_norm_host`);
+/// every other metric ignores them. `pe` is `p` widened to `T`, read only by the
+/// non-integer Minkowski arm.
+#[inline(always)]
+pub(super) fn lane_distances<T: HostFloat, const MID: u32, const PI: u32>(
+    xtile: &[[T; QB]],
+    yrow: &[T],
+    xn: &[T; QB],
+    yn: T,
+    pe: T,
+) -> [T; QB] {
+    // The QB lanes are INDEPENDENT reductions, which is what lets this
+    // vectorize — a reduction over the feature axis could not, because Rust
+    // will not reassociate float addition. Zipping the tile against the
+    // training row walks both without a bounds check per feature.
+    let mut acc = [T::ZERO; QB];
+    for (xc, &yv) in xtile.iter().zip(yrow.iter()) {
+        if MID == MID_EUCLIDEAN {
+            for a in 0..QB {
+                let diff = xc[a] - yv;
+                acc[a] = acc[a] + diff * diff;
+            }
+        } else if MID == MID_MANHATTAN {
+            for a in 0..QB {
+                acc[a] = acc[a] + (xc[a] - yv).abs();
+            }
+        } else if MID == MID_CHEBYSHEV {
+            for a in 0..QB {
+                let v = (xc[a] - yv).abs();
+                // A SELECT, not a conditional store: written as `if v >
+                // acc[a] { acc[a] = v }` the lane loop measured 5x slower
+                // than the Manhattan one it is otherwise identical to (0.044
+                // s against 0.009 s at 20_000 x 2_000 x 16) — LLVM will not
+                // vectorize a loop whose store is predicated, and this is the
+                // same running max written so it is unconditional.
+                acc[a] = if v > acc[a] { v } else { acc[a] };
+            }
+        } else if MID == MID_MINKOWSKI && PI > 0 {
+            for a in 0..QB {
+                let ad = (xc[a] - yv).abs();
+                // `PI` is a constant, so this is an unrolled multiply chain
+                // and the whole lane loop stays vectorizable.
+                let mut r = ad;
+                for _ in 1..PI {
+                    r = r * ad;
+                }
+                acc[a] = acc[a] + r;
+            }
+        } else if MID == MID_MINKOWSKI {
+            for a in 0..QB {
+                acc[a] = acc[a] + (xc[a] - yv).abs().powf(pe);
+            }
+        } else {
+            // Cosine accumulates the plain dot product; the norms are folded
+            // in below, once per training row instead of once per feature.
+            for a in 0..QB {
+                acc[a] = acc[a] + xc[a] * yv;
+            }
+        }
+    }
+
+    if MID == MID_COSINE {
+        // `1 − dot·(1/‖x‖)·(1/‖y‖)`, then the `[0, 2]` clamp sklearn's
+        // `cosine_distances` applies. Both reciprocals are precomputed
+        // (`row_inv_norm_host`) and the training row's is hoisted out of the
+        // lane loop, so this epilogue is two multiplies and two selects per
+        // lane — no root and no divide anywhere in the scan.
+        let one = T::ONE;
+        let two = T::lit(2.0);
+        for a in 0..QB {
+            let mut dv = one - acc[a] * xn[a] * yn;
+            dv = if dv < T::ZERO { T::ZERO } else { dv };
+            dv = if dv > two { two } else { dv };
+            acc[a] = dv;
+        }
+    }
+    acc
 }
 
 /// THE admission rule — [`insert_lane`](mlrs_kernels::knn)'s, with the list

@@ -11,7 +11,7 @@
 //! → `i32` at the boundary); [`labels_to_py`] carries that contract so the shim
 //! materializes numpy `int32`.
 
-use arrow::array::{Array, Float32Array, Float64Array, Int32Array};
+use arrow::array::{Array, Float32Array, Float64Array, Int32Array, UInt32Array};
 use arrow::pyarrow::ToPyArrow;
 use pyo3::prelude::*;
 
@@ -111,4 +111,14 @@ pub fn f64_vec_to_pyarrow(py: Python<'_>, values: Vec<f64>) -> PyResult<Bound<'_
 /// four bytes per row.
 pub fn i32_vec_to_pyarrow(py: Python<'_>, values: Vec<i32>) -> PyResult<Bound<'_, PyAny>> {
     Int32Array::from(values).to_data().to_pyarrow(py)
+}
+
+/// `u32` twin of [`i32_vec_to_pyarrow`], for per-row COUNT vectors.
+///
+/// The ragged `radius_neighbors` result carries one count per query row
+/// alongside its two (much longer) match buffers; keeping it on the same
+/// zero-copy path means the whole three-buffer CSR return crosses the boundary
+/// without a single boxed Python object.
+pub fn u32_vec_to_pyarrow(py: Python<'_>, values: Vec<u32>) -> PyResult<Bound<'_, PyAny>> {
+    UInt32Array::from(values).to_data().to_pyarrow(py)
 }

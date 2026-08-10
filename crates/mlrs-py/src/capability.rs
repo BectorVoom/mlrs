@@ -27,6 +27,25 @@ pub fn supports_f64() -> bool {
     feature_enabled(FloatKind::F64)
 }
 
+/// Does the active backend evaluate f64 TRANSCENDENTALS (`exp`/`log`/`powf`/
+/// `tanh`) in device code?
+///
+/// A strictly narrower question than [`supports_f64`], and the two genuinely
+/// differ: **wgpu** reports f64 support (its adapter has the extension) but WGSL
+/// has no `f64` type, so its transcendental coverage is the driver's business
+/// and mlrs treats it as absent — see
+/// `mlrs_backend::capability::f64_transcendental_supported`. A prim that needs
+/// one (`metric_distance(minkowski)`, `knn_graph(minkowski)`) rejects the launch
+/// there rather than returning wrong numbers.
+///
+/// Surfaced to Python as `mlrs._mlrs.backend_supports_f64_transcendental()` so
+/// the oracle suite can skip exactly those cells — `backend_supports_f64` alone
+/// is the wrong gate for them, and gating on it is what left two f64 Minkowski
+/// cases FAILING on wgpu instead of skipping.
+pub fn supports_f64_transcendental() -> bool {
+    mlrs_backend::capability::f64_transcendental_supported()
+}
+
 /// Guard an f64 compute path against an f64-incapable backend (D-04).
 ///
 /// Returns `Ok(())` when the active backend supports float64; otherwise returns

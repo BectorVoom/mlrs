@@ -38,7 +38,7 @@ from sklearn.exceptions import DataConversionWarning
 from sklearn.neighbors import KNeighborsClassifier as SkKNC
 
 import mlrs
-from conftest import dtype_of, fixture_path, requires_f64
+from conftest import dtype_of, fixture_path, requires_f64, skip_f64_minkowski
 
 PARAM_FIXTURES = ["knn_clf_params_f32_seed42", "knn_clf_params_f64_seed42"]
 
@@ -120,6 +120,7 @@ def _live_data(seed=7, n_train=45, n_query=10, d=3, n_classes=3):
 @requires_f64
 def test_weights_metric_matrix_oracle(fixture, weights, metric_kwargs, metric_name):
     """Every device-served ``weights`` x ``metric`` pair matches sklearn."""
+    skip_f64_minkowski(fixture, metric_name)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     clf = mlrs.KNeighborsClassifier(

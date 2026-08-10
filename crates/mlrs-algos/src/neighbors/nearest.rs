@@ -51,6 +51,8 @@ use mlrs_backend::prims::knn::{
 };
 use mlrs_backend::prims::knn_graph::Metric;
 use mlrs_backend::prims::knn_host::{knn_host_applicable, knn_host_topk};
+use mlrs_backend::prims::radius::{radius_device_applicable, radius_scan_device_tile};
+use mlrs_backend::prims::radius_host::{radius_host_applicable, radius_host_scan};
 use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -494,6 +496,30 @@ where
         validate_radius_query::<F>(x_train, train_shape, xq, shape, radius)?;
     let (n_query, _) = shape;
 
+    // --- ARM 1 (the default on EVERY backend): the FUSED host scan — never
+    //     materializes the distance block at all, so there is no tile to read
+    //     back and no unvectorized pass over one. It is the default on the GPU
+    //     backends too because it MEASURED faster there (3-6x over arm 2 on
+    //     both wgpu and this machine's integrated rocm device); the table and
+    //     the discrete-GPU caveat are on `radius_device_applicable`. ---
+    if radius_host_applicable(n_query, n_train, n_features) {
+        let m = radius_host_scan::<F>(
+            pool,
+            xq,
+            (n_query, n_features),
+            x_train,
+            n_train,
+            radius,
+            metric,
+        )
+        .map_err(AlgoError::Prim)?;
+        return Ok(RadiusNeighbors {
+            distances: m.distances,
+            indices: m.indices,
+            counts: m.counts,
+        });
+    }
+
     let mut distances: Vec<F> = Vec::new();
     let mut indices: Vec<i32> = Vec::new();
     let mut counts: Vec<u32> = Vec::with_capacity(n_query);
@@ -521,6 +547,33 @@ where
         )
         .map_err(AlgoError::Prim)?;
 
+        // --- ARM 2 (`MLRS_RADIUS_DEVICE=1`): threshold + ORDERED compaction ON
+        //     the device, so only the matches cross the bus instead of the
+        //     whole `rows × n_train` tile (NEIGH-RADIUS-GPU). Opt-in: it wins
+        //     only where that tile is a real bus transfer, which no device
+        //     available here is. ---
+        if radius_device_applicable(rows, n_train) {
+            let m = radius_scan_device_tile::<F>(
+                pool,
+                &dist,
+                rows,
+                n_train,
+                if needs_sqrt { radius * radius } else { radius },
+                needs_sqrt,
+                0,
+            )
+            .map_err(AlgoError::Prim)?;
+            dist.release_into(pool);
+            distances.extend_from_slice(&m.distances);
+            indices.extend_from_slice(&m.indices);
+            counts.extend_from_slice(&m.counts);
+            start += rows;
+            continue;
+        }
+
+        // --- ARM 3: read the tile back and threshold it host-side — the
+        //     pre-NEIGH-RADIUS composition, kept as the A/B baseline both knobs
+        //     (`MLRS_RADIUS_HOST=0`, `MLRS_RADIUS_DEVICE=0`) fall back to. ---
         let dist_host: Vec<F> = dist.to_host(pool);
         dist.release_into(pool);
 

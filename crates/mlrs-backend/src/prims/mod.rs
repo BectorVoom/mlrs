@@ -147,6 +147,15 @@ pub mod kmeans;
 // fallback branch. Consumed by Ridge/LinearRegression/ElasticNet/Lasso predict.
 pub mod linear_predict;
 pub mod lbfgs;
+// `radius_neighbors`' DEVICE arm (NEIGH-RADIUS-GPU): drives the
+// `mlrs-kernels::radius` count + ordered-compaction pair over a device-resident
+// distance tile, so only the matches cross the bus. File-disjoint,
+// single-owner (the `dbscan` prim precedent).
+pub mod radius;
+// `radius_neighbors`' HOST arm (NEIGH-RADIUS-HOST): the fused, worker-pool
+// distance→threshold scan the cpu backend runs, sharing `knn_host`'s
+// vectorized per-metric lane loop.
+pub mod radius_host;
 pub mod reduce;
 // Phase-10 SGD solver prim (PRIM-10). `sgd_solve` is fully implemented: a
 // validate-before-launch geometry guard fronts a host epoch loop that drives the

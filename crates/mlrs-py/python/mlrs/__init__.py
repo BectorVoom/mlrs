@@ -161,6 +161,7 @@ __all__ = [
     "Normalizer",
     "Binarizer",
     "backend_supports_f64",
+    "backend_supports_f64_transcendental",
 ]
 
 _EXT_MISSING_MSG = (
@@ -205,4 +206,6 @@ def __getattr__(name):
         return _load_ext()
     if name == "backend_supports_f64":
         return _load_ext().backend_supports_f64
+    if name == "backend_supports_f64_transcendental":
+        return _load_ext().backend_supports_f64_transcendental
     raise AttributeError(f"module 'mlrs' has no attribute {name!r}")
