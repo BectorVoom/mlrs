@@ -1026,6 +1026,52 @@ NN_RADIUS = {
 }
 
 
+# The radius each metric ALIAS is queried at: an alias is a SPELLING of one of
+# the five distance functions, so it inherits that function's threshold from
+# `NN_RADIUS`. `minkowski` appears here at its DEFAULT `p = 2`, which is
+# euclidean — the alias sweep is about the spelling, not about `p` (the `p`
+# surface has its own `radius_minkowski` cell at `p = NN_PARAMS_P`).
+NN_RADIUS_ALIAS = {
+    "minkowski": NN_RADIUS["euclidean"],
+    "euclidean": NN_RADIUS["euclidean"],
+    "l2": NN_RADIUS["euclidean"],
+    "manhattan": NN_RADIUS["manhattan"],
+    "l1": NN_RADIUS["manhattan"],
+    "cityblock": NN_RADIUS["manhattan"],
+    "chebyshev": NN_RADIUS["chebyshev"],
+    "infinity": NN_RADIUS["chebyshev"],
+    "cosine": NN_RADIUS["cosine"],
+}
+
+
+def _canonical_radius_neighbors(x, xq, radius, algorithm="brute", **sk_kwargs):
+    """sklearn's radius match sets, canonicalized to ASCENDING TRAIN INDEX.
+
+    Radius membership has no tie ambiguity — a point is inside the threshold or
+    it is not, and both engines decide that with the same `<=` — but the ORDER
+    the matches come out in is strategy-dependent: the brute-force path scans
+    columns left to right (already ascending), while `kd_tree`/`ball_tree`
+    return them in TREE-TRAVERSAL order. mlrs is brute force for every
+    `algorithm`, so the oracle is stored in the ascending form both can be
+    compared in, with each row's distances permuted alongside its indices.
+
+    Returns the flat CSR-without-`indptr` triple `(distances, indices, counts)`.
+    """
+    from sklearn.neighbors import NearestNeighbors as SkNearestNeighbors
+
+    nn = SkNearestNeighbors(algorithm=algorithm, **sk_kwargs).fit(x)
+    dist_list, idx_list = nn.radius_neighbors(xq, radius=radius, sort_results=False)
+    counts = np.array([len(a) for a in idx_list], dtype=np.int64)
+    dists, idxs = [], []
+    for d_row, i_row in zip(dist_list, idx_list):
+        order = np.argsort(np.asarray(i_row), kind="stable")
+        dists.append(np.asarray(d_row)[order])
+        idxs.append(np.asarray(i_row)[order])
+    flat_dist = np.concatenate(dists) if len(dists) else np.array([], dtype=np.float64)
+    flat_idx = np.concatenate(idxs) if len(idxs) else np.array([], dtype=np.int64)
+    return flat_dist, flat_idx, counts
+
+
 def _canonical_kneighbors(x, xq, k, algorithm="brute", **sk_kwargs):
     """sklearn's `k` nearest neighbours, tie-broken to mlrs's LOWEST-INDEX
     convention (the `gen_knn_metric` over-fetch + lexsort pattern).
@@ -1156,6 +1202,10 @@ def gen_nearest_neighbors_radius(seed: int = SEED, dtype=np.float32) -> str:
         PER-METRIC — see `NN_RADIUS`: cosine distance is bounded to `[0, 2]`,
         so it needs a different threshold than the coordinate-space metrics to
         land on a genuine PARTIAL match set rather than "everyone matches").
+      * every STRING spelling of `metric` (nine, under `algorithm='auto'`) —
+        `radius_alias_{distances,indices,counts,r}_<metric>`
+      * every STRING spelling of `algorithm` (four) —
+        `radius_alg_{distances,indices,counts}_<algorithm>`
     """
     from sklearn.neighbors import NearestNeighbors as SkNearestNeighbors
 
@@ -1197,6 +1247,38 @@ def gen_nearest_neighbors_radius(seed: int = SEED, dtype=np.float32) -> str:
         out[f"radius_distances_{name}"] = c(flat_dist)
         out[f"radius_indices_{name}"] = c(flat_idx)
         out[f"radius_counts_{name}"] = c(counts)
+
+    # --- Every STRING value of `metric` (nine spellings, five functions) under
+    #     `algorithm='auto'` — the only value that accepts all nine ('infinity'
+    #     is TREE-only, 'cosine' brute-only; see `_ALGORITHM_VALID_METRICS` in
+    #     the shim). This is the radius twin of the `alias_` block in
+    #     `gen_nearest_neighbors_params`, and the reason it exists separately is
+    #     that `radius_neighbors` reaches a DIFFERENT engine than `kneighbors`
+    #     on every backend (a threshold+compaction pass, not a top-k), so the
+    #     `kneighbors` alias sweep does not cover it.
+    for metric in NN_PARAMS_METRIC_STRINGS:
+        radius = NN_RADIUS_ALIAS[metric]
+        fd, fi, cnt = _canonical_radius_neighbors(
+            x, xq, radius, algorithm="auto", metric=metric
+        )
+        out[f"radius_alias_r_{metric}"] = c([radius])
+        out[f"radius_alias_distances_{metric}"] = c(fd)
+        out[f"radius_alias_indices_{metric}"] = c(fi)
+        out[f"radius_alias_counts_{metric}"] = c(cnt)
+
+    # --- Every STRING value of `algorithm`, at the default metric. `algorithm`
+    #     cannot change WHICH points are within the radius — only how they are
+    #     found — so sklearn's own answer under each strategy is stored, in the
+    #     canonical ascending-index form (a tree returns them in traversal
+    #     order; see `_canonical_radius_neighbors`).
+    for algorithm in NN_PARAMS_ALGORITHMS:
+        radius = NN_RADIUS["euclidean"]
+        fd, fi, cnt = _canonical_radius_neighbors(
+            x, xq, radius, algorithm=algorithm, metric="euclidean"
+        )
+        out[f"radius_alg_distances_{algorithm}"] = c(fd)
+        out[f"radius_alg_indices_{algorithm}"] = c(fi)
+        out[f"radius_alg_counts_{algorithm}"] = c(cnt)
 
     dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
     os.makedirs(_FIXTURE_DIR, exist_ok=True)

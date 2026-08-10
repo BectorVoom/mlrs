@@ -172,3 +172,94 @@ requires_f64 = pytest.mark.skipif(
     not _backend_supports_f64(),
     reason="backend does not support f64 (mlrs.backend_supports_f64() is False)",
 )
+
+
+def _backend_supports_f64_transcendental():
+    """Query the narrower transcendental flag (`exp`/`log`/`powf`/`tanh` in f64
+    device code). ``True`` if mlrs is not importable yet, as above; ``True`` on
+    an older extension that predates the flag, so the gate can only ever ADD
+    skips relative to `requires_f64`."""
+    try:
+        import mlrs
+
+        return bool(mlrs.backend_supports_f64_transcendental())
+    except Exception:
+        return True
+
+
+# The NARROWER f64 gate, for oracle cells whose kernel evaluates a
+# transcendental: wgpu reports f64 support but has no f64 `powf` in device code,
+# so `metric='minkowski'` with a non-collapsing `p` (anything but 1 or 2) is
+# rejected at launch there while every other f64 metric runs. `requires_f64` is
+# the wrong marker for those cells — under it they FAIL on wgpu rather than
+# skip.
+requires_f64_transcendental = pytest.mark.skipif(
+    not _backend_supports_f64_transcendental(),
+    reason=(
+        "backend has no f64 transcendentals in device code "
+        "(mlrs.backend_supports_f64_transcendental() is False)"
+    ),
+)
+
+
+def default_float_dtype():
+    """The float dtype a LIVE (non-fixture) test design should use.
+
+    ``np.float64`` where the backend supports it, ``np.float32`` where it does
+    not (rocm / cuda). A test that hardcodes float64 does not skip on those
+    backends — it FAILS at ingress with "backend does not support float64",
+    which is how a whole suite of live sklearn-comparison tests came to be red
+    on rocm while its fixture-replay half was merely skipped.
+    """
+    return np.float64 if _backend_supports_f64() else np.float32
+
+
+def live_atol():
+    """Absolute tolerance for a live sklearn comparison at
+    [`default_float_dtype`]'s precision — sklearn always answers in f64, so an
+    f32 backend is compared against a MORE precise reference, not a matching
+    one.
+    """
+    return 1e-5 if default_float_dtype() == np.float64 else 1e-3
+
+
+def skip_unsupported_fixture_dtype(fixture):
+    """Skip only the f64 FIXTURES on an f64-incapable backend (rocm / cuda).
+
+    The `requires_f64` MARKER is the blunt version of this: applied to a test
+    parametrized over both an f32 and an f64 fixture it skips BOTH, so a suite
+    written that way has zero coverage on rocm — including its string-parameter
+    oracle cells, which are dtype-independent surface. This gate keeps the f32
+    half running there and skips only the half the backend genuinely cannot do.
+    """
+    if dtype_of(fixture) == np.float64 and not _backend_supports_f64():
+        pytest.skip(
+            "backend does not support f64 (mlrs.backend_supports_f64() is False)"
+        )
+
+
+def skip_f64_minkowski(fixture, metric_name):
+    """Skip an f64 ``metric='minkowski'`` oracle cell on a backend with no f64
+    transcendentals in device code.
+
+    Minkowski at a non-collapsing ``p`` (anything but 1 or 2) is the ONE metric
+    in the neighbors family whose kernel evaluates ``powf``, which wgpu cannot
+    do in f64 even though it reports f64 support — the launch is rejected with a
+    clear capability error. Every other f64 metric runs there, so this cannot be
+    a module-level marker: it is a property of the ``(metric, dtype)`` PAIR, and
+    gating those cells on `requires_f64` instead left them FAILING on wgpu
+    rather than skipping (found running the neighbors oracle suite on wgpu).
+
+    Shared by the three neighbors param suites (`NearestNeighbors`,
+    `KNeighborsClassifier`, `KNeighborsRegressor`), which all replay the same
+    metric matrix.
+    """
+    if (
+        metric_name == "minkowski"
+        and dtype_of(fixture) == np.float64
+        and not _backend_supports_f64_transcendental()
+    ):
+        pytest.skip(
+            "backend has no f64 transcendentals in device code "
+            "(mlrs.backend_supports_f64_transcendental() is False)"
+        )

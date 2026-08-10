@@ -22,7 +22,9 @@ check live here:
   and validate correctly, and every invalid combination raises at ``fit``.
 
 f64 fixtures are skipped-with-reason on an f64-incapable backend (rocm) via the
-``conftest.requires_f64`` marker.
+``conftest.skip_unsupported_fixture_dtype`` gate — per FIXTURE, so an
+f64-incapable backend (rocm) still runs the f32 half rather than skipping
+the whole parametrization.
 """
 
 import warnings
@@ -33,7 +35,14 @@ from sklearn.base import clone
 from sklearn.neighbors import NearestNeighbors as SkNN
 
 import mlrs
-from conftest import dtype_of, fixture_path, requires_f64
+from conftest import (
+    default_float_dtype,
+    dtype_of,
+    fixture_path,
+    live_atol,
+    skip_f64_minkowski,
+    skip_unsupported_fixture_dtype,
+)
 
 PARAM_FIXTURES = ["nn_params_f32_seed42", "nn_params_f64_seed42"]
 RADIUS_FIXTURES = ["nn_radius_f32_seed42", "nn_radius_f64_seed42"]
@@ -79,8 +88,9 @@ def _live_data(seed=7, n_train=45, n_query=10, d=3):
     too.
     """
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((n_train, d)) * 2.0 + 5.0
-    xq = rng.standard_normal((n_query, d)) * 2.0 + 5.0
+    dt = default_float_dtype()
+    x = (rng.standard_normal((n_train, d)) * 2.0 + 5.0).astype(dt)
+    xq = (rng.standard_normal((n_query, d)) * 2.0 + 5.0).astype(dt)
     xq[1] = x[4]
     return x, xq
 
@@ -92,9 +102,10 @@ def _live_data(seed=7, n_train=45, n_query=10, d=3):
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("metric_kwargs,metric_name", METRICS)
-@requires_f64
 def test_metric_matrix_oracle(fixture, metric_kwargs, metric_name):
     """Every device-served ``metric`` matches sklearn's ``kneighbors``."""
+    skip_unsupported_fixture_dtype(fixture)
+    skip_f64_minkowski(fixture, metric_name)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     nn = mlrs.NearestNeighbors(n_neighbors=k, **metric_kwargs).fit(d["X"])
@@ -113,13 +124,13 @@ def test_metric_matrix_oracle(fixture, metric_kwargs, metric_name):
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("metric", METRIC_STRINGS)
-@requires_f64
 def test_every_metric_string_oracle(fixture, metric):
     """Every STRING ``metric`` accepts matches sklearn under THAT SAME string.
 
     Left at the default ``algorithm='auto'`` deliberately — the only value
     that accepts all nine, and what the fixture was generated under.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     nn = mlrs.NearestNeighbors(n_neighbors=k, metric=metric).fit(d["X"])
@@ -138,7 +149,6 @@ def test_every_metric_string_oracle(fixture, metric):
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("algorithm", ALGORITHM_STRINGS)
-@requires_f64
 def test_every_algorithm_string_oracle(fixture, algorithm):
     """mlrs's brute-force answer matches sklearn's under EVERY ``algorithm``.
 
@@ -146,6 +156,7 @@ def test_every_algorithm_string_oracle(fixture, algorithm):
     answers — mlrs always runs brute force, so this is the check that
     resolving every strategy to brute force is a genuine equivalence.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     nn = mlrs.NearestNeighbors(n_neighbors=k, algorithm=algorithm).fit(d["X"])
@@ -194,7 +205,6 @@ def test_metric_algorithm_validity_matches_sklearn(metric, algorithm):
 
 @pytest.mark.parametrize("fixture", RADIUS_FIXTURES)
 @pytest.mark.parametrize("metric_kwargs,metric_name", METRICS)
-@requires_f64
 def test_radius_neighbors_metric_matrix_oracle(fixture, metric_kwargs, metric_name):
     """Every device-served ``metric`` matches sklearn's ``radius_neighbors``.
 
@@ -204,6 +214,8 @@ def test_radius_neighbors_metric_matrix_oracle(fixture, metric_kwargs, metric_na
     ``radius``, so — unlike ``kneighbors``' top-k tie-break — there is no
     ordering ambiguity, and the per-row slices compare EXACTLY.
     """
+    skip_unsupported_fixture_dtype(fixture)
+    skip_f64_minkowski(fixture, metric_name)
     d = np.load(fixture_path(fixture))
     radius = float(d[f"radius_{metric_name}"][0])
     counts = d[f"radius_counts_{metric_name}"].astype(np.int64)
@@ -229,10 +241,89 @@ def test_radius_neighbors_metric_matrix_oracle(fixture, metric_kwargs, metric_na
         offset += want_n
 
 
+def _assert_ragged_oracle(dist, idx, flat_dist, flat_idx, counts, atol, label):
+    """Compare a ragged ``radius_neighbors`` result against the flat oracle.
+
+    Positionally, not as a set: both engines scan candidates in ascending train
+    index and keep the ones within ``radius``, and the fixture is stored in that
+    same canonical order (`_canonical_radius_neighbors` re-sorts sklearn's
+    tree strategies into it), so there is no ordering slack to allow.
+    """
+    offset = 0
+    for q in range(len(idx)):
+        want_n = int(counts[q])
+        assert len(idx[q]) == want_n, f"{label}: row {q} match count"
+        assert np.array_equal(
+            np.asarray(idx[q]).astype(np.int64), flat_idx[offset : offset + want_n]
+        ), f"{label}: row {q} indices"
+        if dist is not None:
+            assert np.allclose(
+                np.asarray(dist[q], dtype=np.float64),
+                flat_dist[offset : offset + want_n],
+                atol=atol,
+                rtol=0.0,
+            ), f"{label}: row {q} distances"
+        offset += want_n
+    assert offset == len(flat_idx), f"{label}: counts must exhaust the oracle"
+
+
 @pytest.mark.parametrize("fixture", RADIUS_FIXTURES)
-@requires_f64
+@pytest.mark.parametrize("metric", METRIC_STRINGS)
+def test_radius_neighbors_every_metric_string_oracle(fixture, metric):
+    """Every STRING ``metric`` accepts matches sklearn's ``radius_neighbors``.
+
+    The ``kneighbors`` alias sweep does not cover this: on every backend the
+    radius query reaches a DIFFERENT engine (a threshold + ragged compaction
+    pass, not a top-k selection), so each spelling has to be replayed against
+    its own oracle here. Left at ``algorithm='auto'`` — the only value that
+    accepts all nine spellings, and what the fixture was generated under.
+    """
+    skip_unsupported_fixture_dtype(fixture)
+    d = np.load(fixture_path(fixture))
+    radius = float(d[f"radius_alias_r_{metric}"][0])
+    nn = mlrs.NearestNeighbors(metric=metric).fit(d["X"])
+    dist, idx = nn.radius_neighbors(d["Xq"], radius=radius)
+    _assert_ragged_oracle(
+        dist,
+        idx,
+        np.asarray(d[f"radius_alias_distances_{metric}"], dtype=np.float64),
+        d[f"radius_alias_indices_{metric}"].astype(np.int64),
+        d[f"radius_alias_counts_{metric}"].astype(np.int64),
+        _atol(fixture),
+        f"metric={metric}",
+    )
+
+
+@pytest.mark.parametrize("fixture", RADIUS_FIXTURES)
+@pytest.mark.parametrize("algorithm", ALGORITHM_STRINGS)
+def test_radius_neighbors_every_algorithm_string_oracle(fixture, algorithm):
+    """Every STRING ``algorithm`` gives sklearn's own ``radius_neighbors`` set.
+
+    mlrs runs brute force for all four. sklearn's tree strategies are a
+    genuinely different search — and return their matches in TRAVERSAL order,
+    not ascending index — but they cannot change WHICH points are inside the
+    radius, which is what the canonicalized fixture pins.
+    """
+    skip_unsupported_fixture_dtype(fixture)
+    d = np.load(fixture_path(fixture))
+    radius = float(d["radius_euclidean"][0])
+    nn = mlrs.NearestNeighbors(algorithm=algorithm, metric="euclidean").fit(d["X"])
+    dist, idx = nn.radius_neighbors(d["Xq"], radius=radius)
+    _assert_ragged_oracle(
+        dist,
+        idx,
+        np.asarray(d[f"radius_alg_distances_{algorithm}"], dtype=np.float64),
+        d[f"radius_alg_indices_{algorithm}"].astype(np.int64),
+        d[f"radius_alg_counts_{algorithm}"].astype(np.int64),
+        _atol(fixture),
+        f"algorithm={algorithm}",
+    )
+
+
+@pytest.mark.parametrize("fixture", RADIUS_FIXTURES)
 def test_radius_neighbors_graph_oracle(fixture):
     """``radius_neighbors_graph(mode='distance')`` matches the flat oracle."""
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     radius = float(d["radius_euclidean"][0])
     nn = mlrs.NearestNeighbors(metric="euclidean").fit(d["X"])
@@ -264,7 +355,7 @@ def test_callable_metric_matches_sklearn():
 
     got_d, got_i = mlrs.NearestNeighbors(metric=m).fit(x).kneighbors(xq)
     want_d, want_i = SkNN(algorithm="brute", metric=m).fit(x).kneighbors(xq)
-    assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=1e-5, rtol=0.0)
+    assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=live_atol(), rtol=0.0)
     assert np.array_equal(np.asarray(got_i).astype(np.int64), want_i.astype(np.int64))
 
     radius = float(np.median(want_d))
@@ -281,7 +372,7 @@ def test_kneighbors_self_query_matches_sklearn():
     x, _ = _live_data()
     dist, idx = mlrs.NearestNeighbors().fit(x).kneighbors()
     want_d, want_i = SkNN(algorithm="brute").fit(x).kneighbors()
-    assert np.allclose(np.asarray(dist, dtype=np.float64), want_d, atol=1e-5, rtol=0.0)
+    assert np.allclose(np.asarray(dist, dtype=np.float64), want_d, atol=live_atol(), rtol=0.0)
     assert np.array_equal(np.asarray(idx).astype(np.int64), want_i.astype(np.int64))
     assert not np.any(np.asarray(idx) == np.arange(x.shape[0])[:, None])
 
@@ -305,7 +396,7 @@ def test_kneighbors_graph_matches_sklearn(mode, self_query):
     got = mlrs.NearestNeighbors().fit(x).kneighbors_graph(query, mode=mode)
     want = SkNN(algorithm="brute").fit(x).kneighbors_graph(query, mode=mode)
     assert got.shape == want.shape
-    assert np.allclose(got.toarray(), want.toarray(), atol=1e-5, rtol=0.0)
+    assert np.allclose(got.toarray(), want.toarray(), atol=live_atol(), rtol=0.0)
 
 
 @pytest.mark.parametrize("mode", ["connectivity", "distance"])
@@ -317,7 +408,7 @@ def test_radius_neighbors_graph_matches_sklearn_live(mode, self_query):
     got = mlrs.NearestNeighbors().fit(x).radius_neighbors_graph(query, radius=radius, mode=mode)
     want = SkNN(algorithm="brute").fit(x).radius_neighbors_graph(query, radius=radius, mode=mode)
     assert got.shape == want.shape
-    assert np.allclose(got.toarray(), want.toarray(), atol=1e-5, rtol=0.0)
+    assert np.allclose(got.toarray(), want.toarray(), atol=live_atol(), rtol=0.0)
 
 
 def test_radius_neighbors_sort_results():
@@ -372,7 +463,7 @@ def test_metric_params_p_overrides_init_p_with_warning():
     assert est.effective_metric_ == "manhattan"
     want_d, _ = SkNN(algorithm="brute", metric="manhattan").fit(x).kneighbors(xq)
     got_d, _ = est.kneighbors(xq)
-    assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=1e-5, rtol=0.0)
+    assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=live_atol(), rtol=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +476,7 @@ def test_every_algorithm_accepted_and_equivalent(algorithm):
     x, xq = _live_data()
     got_d, got_i = mlrs.NearestNeighbors(algorithm=algorithm).fit(x).kneighbors(xq)
     want_d, want_i = SkNN(algorithm=algorithm).fit(x).kneighbors(xq)
-    assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=1e-5, rtol=0.0)
+    assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=live_atol(), rtol=0.0)
     assert np.array_equal(np.asarray(got_i).astype(np.int64), want_i.astype(np.int64))
 
 
@@ -487,5 +578,5 @@ def test_clone_round_trips_the_full_parameter_set():
     cloned_d, cloned_i = clone(est).fit(x).kneighbors(xq)
     want_d, want_i = SkNN(algorithm="brute", n_neighbors=3, metric="manhattan").fit(x).kneighbors(xq)
     for got_d, got_i in [(first_d, first_i), (refit_d, refit_i), (cloned_d, cloned_i)]:
-        assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=1e-5, rtol=0.0)
+        assert np.allclose(np.asarray(got_d, dtype=np.float64), want_d, atol=live_atol(), rtol=0.0)
         assert np.array_equal(np.asarray(got_i).astype(np.int64), want_i.astype(np.int64))

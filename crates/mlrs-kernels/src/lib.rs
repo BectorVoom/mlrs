@@ -82,6 +82,11 @@ pub mod mutual_reachability;
 // per-coordinate launch, so the whole solve is one cube. This file owns its
 // `pub mod` + `pub use` (file-disjoint, single-owner — the `gram` precedent).
 pub mod nnls;
+// `radius_neighbors`' device threshold + ORDERED segment compaction over a
+// distance tile (NEIGH-RADIUS-GPU) — the pair that keeps the ragged match set
+// on the device instead of reading the whole tile back. Owns its `pub mod`
+// (file-disjoint, single-owner — the `dbscan` precedent).
+pub mod radius;
 pub mod reduce;
 // Phase-10 SGD kernels (Wave-0 scaffold plan 10-01 owns this registration; the
 // Wave-1 plan drives them from `prims/sgd.rs` — file-disjoint, parallel-safe).

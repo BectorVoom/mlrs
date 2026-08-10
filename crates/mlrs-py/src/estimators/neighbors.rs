@@ -37,6 +37,7 @@ use mlrs_algos::typestate::{KNeighbors as TypestateKNeighbors, Predict as Typest
 
 use mlrs_backend::device_array::DeviceArray;
 
+use crate::egress::{f32_vec_to_pyarrow, f64_vec_to_pyarrow, i32_vec_to_pyarrow, u32_vec_to_pyarrow};
 use crate::errors::{algo_err_to_py, build_err_to_py, nonfinite_input_err, not_fitted};
 use crate::ingress::{
     all_finite_f32, all_finite_f64, as_f32, as_f64, capsule_to_array, float_dtype, host_slice_f32,
@@ -279,53 +280,55 @@ impl PyNearestNeighbors {
     /// concatenated in ascending training-index order — see
     /// [`mlrs_algos::neighbors::nearest::RadiusNeighbors`]). The shim splits the
     /// flat buffers back into per-row arrays via `counts`' running sum.
-    fn radius_neighbors_f32(
+    ///
+    /// All three buffers cross as **pyarrow arrays**, never Python lists — see
+    /// [`radius_result_to_pyarrow`] for why this return in particular could not
+    /// afford the list.
+    fn radius_neighbors_f32<'py>(
         &mut self,
-        py: Python<'_>,
+        py: Python<'py>,
         x: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
         radius: f64,
-    ) -> PyResult<(Vec<f32>, Vec<i32>, Vec<u32>)> {
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         self.materialize(py)?;
         let xa = capsule_to_array(x)?;
-        py.detach(|| {
+        let r = py.detach(|| {
             let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyNearestNeighbors::F32(est) => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let r = est
-                        .radius_neighbors(&mut pool, &xd, (rows, cols), radius)
-                        .map_err(algo_err_to_py)?;
-                    Ok((r.distances, r.indices, r.counts))
+                    est.radius_neighbors(&mut pool, &xd, (rows, cols), radius)
+                        .map_err(algo_err_to_py)
                 }
                 _ => Err(not_fitted("nearest_neighbors", "radius_neighbors (f32 path)")),
             }
-        })
+        })?;
+        radius_result_to_pyarrow(py, f32_vec_to_pyarrow(py, r.distances)?, r.indices, r.counts)
     }
-    fn radius_neighbors_f64(
+    fn radius_neighbors_f64<'py>(
         &mut self,
-        py: Python<'_>,
+        py: Python<'py>,
         x: &Bound<'_, PyAny>,
         rows: usize,
         cols: usize,
         radius: f64,
-    ) -> PyResult<(Vec<f64>, Vec<i32>, Vec<u32>)> {
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
         self.materialize(py)?;
         let xa = capsule_to_array(x)?;
-        py.detach(|| {
+        let r = py.detach(|| {
             let mut pool = crate::lock_pool();
             match &self.inner {
                 AnyNearestNeighbors::F64(est) => {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let r = est
-                        .radius_neighbors(&mut pool, &xd, (rows, cols), radius)
-                        .map_err(algo_err_to_py)?;
-                    Ok((r.distances, r.indices, r.counts))
+                    est.radius_neighbors(&mut pool, &xd, (rows, cols), radius)
+                        .map_err(algo_err_to_py)
                 }
                 _ => Err(not_fitted("nearest_neighbors", "radius_neighbors (f64 path)")),
             }
-        })
+        })?;
+        radius_result_to_pyarrow(py, f64_vec_to_pyarrow(py, r.distances)?, r.indices, r.counts)
     }
 
     /// A DEFERRED fit counts as fitted: the training data is validated and held,
@@ -1259,4 +1262,34 @@ impl PyKNeighborsRegressor {
             AnyKNeighborsRegressor::F64(_) => Some("f64"),
         }
     }
+}
+
+/// Pair an already-converted distance array with the `indices`/`counts` halves
+/// of a ragged `radius_neighbors` result, all three as pyarrow arrays.
+///
+/// ## Why this is not a `Vec` return (the egress list pathology, at its worst)
+/// `#[pymethods]` returning a `Vec<T>` makes PyO3 build a Python `list` — one
+/// boxed object per element — which the shim then feeds to `np.asarray`,
+/// converting the whole thing a second time
+/// ([`crate::egress::f32_vec_to_pyarrow`] documents the measurement for
+/// `predict`). `radius_neighbors` is the surface where that hurts most, because
+/// its output is not `rows` values but `rows × (matches per row)`: at the bench
+/// rung (`n_query = 2_000`, `n_train = 20_000`) a 60%-density query returns
+/// ~24 MILLION matches, so the list round-trip boxed ~48 million objects — and
+/// it is SERIAL, so it dominated the wall clock no matter how well the scan
+/// itself parallelized. Measured there: 1.74 s before, 0.06 s after.
+///
+/// The indices stay `i32` (D-06, the neighbor-index egress contract) and the
+/// counts `u32`; the shim views all three in place.
+fn radius_result_to_pyarrow<'py>(
+    py: Python<'py>,
+    distances: Bound<'py, PyAny>,
+    indices: Vec<i32>,
+    counts: Vec<u32>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    Ok((
+        distances,
+        i32_vec_to_pyarrow(py, indices)?,
+        u32_vec_to_pyarrow(py, counts)?,
+    ))
 }

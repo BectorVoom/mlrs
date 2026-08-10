@@ -24,9 +24,28 @@ Only the parameters that can move the wall clock get a sweep:
                 comparison core-for-core rather than 16-against-1.
 ``radius``      ``radius_neighbors``' selection threshold. Unlike ``kneighbors``,
                 the match COUNT is data-dependent, so this also prices the
-                host-side ragged-compaction pass (`radius_neighbor_indices_metric`
-                in `crates/mlrs-algos/src/neighbors/nearest.rs`) at different
-                output densities.
+                ragged-compaction pass at different output densities — and the
+                output SIZE grows with it, which is what makes this the one
+                sweep whose cost is dominated by the Python boundary rather than
+                the scan (see below).
+
+                Three arms serve it, A/B-switchable in the environment; this is
+                the sweep their tables were measured with:
+
+                  (default)                 the fused host scan
+                                            (`prims/radius_host.rs`) — no
+                                            distance tile is ever materialized
+                  ``MLRS_RADIUS_DEVICE=1``  the device count + ordered-compaction
+                                            kernels (`prims/radius.rs`), which
+                                            keep the tile on the device
+                  ``MLRS_RADIUS_HOST=0``    the original composition: build the
+                                            tile, read it back, scan it host-side
+
+                Run the sweep once per arm to reproduce the tables on
+                `radius_device_applicable` / the `radius_host` module docs. Use
+                ``NN_PARAM_WALLCLOCK=1`` for them: the host arm is parallel and
+                sklearn's brute path is partly parallel too, so CPU-time hides
+                the answer a user experiences.
 
 ``leaf_size`` gets no sweep: it is read only on a tree route, which mlrs never
 takes, and sklearn's own sensitivity to it is a property of its trees.

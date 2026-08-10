@@ -180,6 +180,17 @@ fn backend_supports_f64() -> bool {
     capability::supports_f64()
 }
 
+/// Does this wheel's backend evaluate f64 transcendentals in device code?
+///
+/// The narrower companion to [`backend_supports_f64`] — see
+/// [`capability::supports_f64_transcendental`] for why wgpu answers `false` to
+/// this while answering `true` to the other, and which oracle cases need this
+/// gate rather than that one.
+#[pyfunction]
+fn backend_supports_f64_transcendental() -> bool {
+    capability::supports_f64_transcendental()
+}
+
 /// The `_mlrs` extension module (PyO3 `abi3-py312`), a submodule of the
 /// pure-Python `mlrs` package (`module-name = "mlrs._mlrs"`).
 ///
@@ -207,6 +218,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // The driver is present: register the low-level surface.
     m.add_function(wrap_pyfunction!(backend_supports_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(backend_supports_f64_transcendental, m)?)?;
 
     // The `model_selection` surface (MODSEL-BIND-01) — one call, since it
     // registers ~33 free functions plus the `NumpyRandomState` class.
