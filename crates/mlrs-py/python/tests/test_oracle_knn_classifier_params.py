@@ -25,8 +25,12 @@ fixture queries. Labels are compared EXACTLY (they are identifiers, so a
 tolerance would pass a prediction naming a different class); probabilities carry
 the 1e-5 bar.
 
-f64 fixtures are skipped-with-reason on an f64-incapable backend (rocm) via the
-``conftest.requires_f64`` marker.
+f64 fixtures are skipped-with-reason on an f64-incapable backend (rocm) via
+``conftest.skip_unsupported_fixture_dtype`` — per FIXTURE, so the f32 half of a
+parametrization still runs there rather than the whole thing skipping (a plain
+``@requires_f64`` marker would skip both). The live-sklearn-comparison design
+(``_live_data``) uses ``conftest.default_float_dtype()`` for the same reason:
+hardcoding float64 there does not skip on rocm, it FAILS at ingress.
 """
 
 import warnings
@@ -38,7 +42,14 @@ from sklearn.exceptions import DataConversionWarning
 from sklearn.neighbors import KNeighborsClassifier as SkKNC
 
 import mlrs
-from conftest import dtype_of, fixture_path, requires_f64, skip_f64_minkowski
+from conftest import (
+    default_float_dtype,
+    dtype_of,
+    fixture_path,
+    live_atol,
+    skip_f64_minkowski,
+    skip_unsupported_fixture_dtype,
+)
 
 PARAM_FIXTURES = ["knn_clf_params_f32_seed42", "knn_clf_params_f64_seed42"]
 
@@ -99,8 +110,9 @@ def _live_data(seed=7, n_train=45, n_query=10, d=3, n_classes=3):
     look correct.
     """
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((n_train, d)) * 2.0 + 5.0
-    xq = rng.standard_normal((n_query, d)) * 2.0 + 5.0
+    dt = default_float_dtype()
+    x = (rng.standard_normal((n_train, d)) * 2.0 + 5.0).astype(dt)
+    xq = (rng.standard_normal((n_query, d)) * 2.0 + 5.0).astype(dt)
     xq[1] = x[4]
     lin = x @ rng.standard_normal(d)
     cuts = np.quantile(lin, np.linspace(0, 1, n_classes + 1)[1:-1])
@@ -117,9 +129,9 @@ def _live_data(seed=7, n_train=45, n_query=10, d=3, n_classes=3):
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
 @pytest.mark.parametrize("metric_kwargs,metric_name", METRICS)
-@requires_f64
 def test_weights_metric_matrix_oracle(fixture, weights, metric_kwargs, metric_name):
     """Every device-served ``weights`` x ``metric`` pair matches sklearn."""
+    skip_unsupported_fixture_dtype(fixture)
     skip_f64_minkowski(fixture, metric_name)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
@@ -139,7 +151,6 @@ def test_weights_metric_matrix_oracle(fixture, weights, metric_kwargs, metric_na
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
 @pytest.mark.parametrize("metric", METRIC_STRINGS)
-@requires_f64
 def test_every_metric_string_oracle(fixture, weights, metric):
     """Every STRING ``metric`` accepts matches sklearn under THAT SAME string.
 
@@ -152,6 +163,7 @@ def test_every_metric_string_oracle(fixture, weights, metric):
     Left at the default ``algorithm='auto'`` deliberately: it is the only value
     that accepts all nine, and it is what the fixture was generated under.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     clf = mlrs.KNeighborsClassifier(
@@ -172,7 +184,6 @@ def test_every_metric_string_oracle(fixture, weights, metric):
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
 @pytest.mark.parametrize("algorithm", ALGORITHM_STRINGS)
-@requires_f64
 def test_every_algorithm_string_oracle(fixture, weights, algorithm):
     """mlrs's brute-force answer matches sklearn's under EVERY ``algorithm``.
 
@@ -185,6 +196,7 @@ def test_every_algorithm_string_oracle(fixture, weights, algorithm):
     fixture buckets ``y`` from ``X`` after duplicating the row), so the tie
     cannot move a vote either way.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     clf = mlrs.KNeighborsClassifier(
@@ -204,7 +216,6 @@ def test_every_algorithm_string_oracle(fixture, weights, algorithm):
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
-@requires_f64
 def test_multi_output_oracle(fixture, weights):
     """A 2-D target predicts a 2-D result, column for column.
 
@@ -213,6 +224,7 @@ def test_multi_output_oracle(fixture, weights):
     reused column 0's ``classes_`` for column 1 — that would produce two
     three-wide matrices and fail on shape before any value is compared.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     clf = mlrs.KNeighborsClassifier(n_neighbors=k, weights=weights).fit(
@@ -243,7 +255,6 @@ def test_multi_output_oracle(fixture, weights):
 
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
-@requires_f64
 def test_kneighbors_non_default_metric_oracle(fixture):
     """``kneighbors`` reports the CONFIGURED metric's neighbours.
 
@@ -259,6 +270,7 @@ def test_kneighbors_non_default_metric_oracle(fixture):
     guarantee. The distances, which ARE fully determined, are compared
     elementwise.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     clf = mlrs.KNeighborsClassifier(n_neighbors=k, metric="manhattan").fit(
@@ -303,9 +315,9 @@ def test_callable_weights_matches_sklearn():
         if isinstance(want_p, list):
             assert len(got_p) == len(want_p)
             for a, b in zip(got_p, want_p):
-                assert np.allclose(np.asarray(a), b, atol=1e-5, rtol=0.0)
+                assert np.allclose(np.asarray(a), b, atol=live_atol(), rtol=0.0)
         else:
-            assert np.allclose(np.asarray(got_p), want_p, atol=1e-5, rtol=0.0)
+            assert np.allclose(np.asarray(got_p), want_p, atol=live_atol(), rtol=0.0)
 
 
 def test_callable_metric_matches_sklearn():
@@ -322,7 +334,7 @@ def test_callable_metric_matches_sklearn():
         want.predict(xq).astype(np.int64),
     )
     assert np.allclose(
-        np.asarray(got.predict_proba(xq)), want.predict_proba(xq), atol=1e-5, rtol=0.0
+        np.asarray(got.predict_proba(xq)), want.predict_proba(xq), atol=live_atol(), rtol=0.0
     )
     # `effective_metric_` is the callable itself, as sklearn reports it.
     assert got.effective_metric_ is m
@@ -351,7 +363,7 @@ def test_callable_weights_agrees_with_builtin_formula():
     dp = np.asarray(device.predict_proba(xq))
     hp = np.asarray(host.predict_proba(xq))
     assert np.isfinite(dp).all()
-    assert np.allclose(dp, hp, atol=1e-5, rtol=0.0)
+    assert np.allclose(dp, hp, atol=live_atol(), rtol=0.0)
     assert np.array_equal(
         np.asarray(device.predict(xq)).astype(np.int64),
         np.asarray(host.predict(xq)).astype(np.int64),
@@ -395,7 +407,7 @@ def test_non_integer_label_spaces_match_sklearn(encode):
     assert np.array_equal(pred, want.predict(xq))
     assert pred.dtype == want.predict(xq).dtype
     assert np.allclose(
-        np.asarray(got.predict_proba(xq)), want.predict_proba(xq), atol=1e-5, rtol=0.0
+        np.asarray(got.predict_proba(xq)), want.predict_proba(xq), atol=live_atol(), rtol=0.0
     )
 
 
@@ -435,7 +447,7 @@ def test_kneighbors_self_query_matches_sklearn():
     x, _, y, _ = _live_data()
     dist, idx = mlrs.KNeighborsClassifier().fit(x, y).kneighbors()
     want_d, want_i = SkKNC(algorithm="brute").fit(x, y).kneighbors()
-    assert np.allclose(np.asarray(dist, dtype=np.float64), want_d, atol=1e-5, rtol=0.0)
+    assert np.allclose(np.asarray(dist, dtype=np.float64), want_d, atol=live_atol(), rtol=0.0)
     assert np.array_equal(np.asarray(idx).astype(np.int64), want_i.astype(np.int64))
     # No row may keep itself as a neighbour.
     assert not np.any(np.asarray(idx) == np.arange(x.shape[0])[:, None])
@@ -450,7 +462,7 @@ def test_kneighbors_graph_matches_sklearn(mode, self_query):
     got = mlrs.KNeighborsClassifier().fit(x, y).kneighbors_graph(query, mode=mode)
     want = SkKNC(algorithm="brute").fit(x, y).kneighbors_graph(query, mode=mode)
     assert got.shape == want.shape
-    assert np.allclose(got.toarray(), want.toarray(), atol=1e-5, rtol=0.0)
+    assert np.allclose(got.toarray(), want.toarray(), atol=live_atol(), rtol=0.0)
 
 
 # ---------------------------------------------------------------------------

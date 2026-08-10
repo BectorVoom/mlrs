@@ -17,8 +17,12 @@ Two kinds of check live here, and the split is deliberate:
   check that can actually fail, and it is what keeps this shim honest as sklearn
   evolves its own resolution rules.
 
-f64 fixtures are skipped-with-reason on an f64-incapable backend (rocm) via the
-``conftest.requires_f64`` marker.
+f64 fixtures are skipped-with-reason on an f64-incapable backend (rocm) via
+``conftest.skip_unsupported_fixture_dtype`` — per FIXTURE, so the f32 half of a
+parametrization still runs there rather than the whole thing skipping (a plain
+``@requires_f64`` marker would skip both). The live-sklearn-comparison design
+(``_live_data``) uses ``conftest.default_float_dtype()`` for the same reason:
+hardcoding float64 there does not skip on rocm, it FAILS at ingress.
 """
 
 import warnings
@@ -29,7 +33,14 @@ from sklearn.base import clone
 from sklearn.neighbors import KNeighborsRegressor as SkKNR
 
 import mlrs
-from conftest import dtype_of, fixture_path, requires_f64, skip_f64_minkowski
+from conftest import (
+    default_float_dtype,
+    dtype_of,
+    fixture_path,
+    live_atol,
+    skip_f64_minkowski,
+    skip_unsupported_fixture_dtype,
+)
 
 PARAM_FIXTURES = ["knn_reg_params_f32_seed42", "knn_reg_params_f64_seed42"]
 
@@ -81,8 +92,9 @@ def _live_data(seed=7, n_train=45, n_query=10, d=3):
     sees a zero distance would not exercise the same code sklearn's does.
     """
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((n_train, d)) * 2.0 + 5.0
-    xq = rng.standard_normal((n_query, d)) * 2.0 + 5.0
+    dt = default_float_dtype()
+    x = (rng.standard_normal((n_train, d)) * 2.0 + 5.0).astype(dt)
+    xq = (rng.standard_normal((n_query, d)) * 2.0 + 5.0).astype(dt)
     xq[1] = x[4]
     y = x @ rng.standard_normal(d) + 0.5
     y_multi = np.column_stack([y, x @ rng.standard_normal(d) - 1.0])
@@ -97,9 +109,9 @@ def _live_data(seed=7, n_train=45, n_query=10, d=3):
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
 @pytest.mark.parametrize("metric_kwargs,metric_name", METRICS)
-@requires_f64
 def test_weights_metric_matrix_oracle(fixture, weights, metric_kwargs, metric_name):
     """Every device-served ``weights`` x ``metric`` pair matches sklearn."""
+    skip_unsupported_fixture_dtype(fixture)
     skip_f64_minkowski(fixture, metric_name)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
@@ -117,9 +129,9 @@ def test_weights_metric_matrix_oracle(fixture, weights, metric_kwargs, metric_na
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
-@requires_f64
 def test_multi_output_oracle(fixture, weights):
     """A 2-D target predicts a 2-D result, column for column."""
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     reg = mlrs.KNeighborsRegressor(n_neighbors=k, weights=weights).fit(
@@ -137,7 +149,6 @@ def test_multi_output_oracle(fixture, weights):
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
 @pytest.mark.parametrize("metric", METRIC_STRINGS)
-@requires_f64
 def test_every_metric_string_oracle(fixture, weights, metric):
     """Every STRING ``metric`` accepts matches sklearn under THAT SAME string.
 
@@ -150,6 +161,7 @@ def test_every_metric_string_oracle(fixture, weights, metric):
     Left at the default ``algorithm='auto'`` deliberately: it is the only value
     that accepts all nine, and it is what the fixture was generated under.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     reg = mlrs.KNeighborsRegressor(
@@ -167,7 +179,6 @@ def test_every_metric_string_oracle(fixture, weights, metric):
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
 @pytest.mark.parametrize("weights", WEIGHTS)
 @pytest.mark.parametrize("algorithm", ALGORITHM_STRINGS)
-@requires_f64
 def test_every_algorithm_string_oracle(fixture, weights, algorithm):
     """mlrs's brute-force answer matches sklearn's under EVERY ``algorithm``.
 
@@ -180,6 +191,7 @@ def test_every_algorithm_string_oracle(fixture, weights, algorithm):
     (the fixture derives ``y`` from ``X`` after duplicating the row), so the tie
     cannot move a prediction either way.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     reg = mlrs.KNeighborsRegressor(
@@ -232,7 +244,6 @@ def test_metric_algorithm_validity_matches_sklearn(metric, algorithm):
 
 
 @pytest.mark.parametrize("fixture", PARAM_FIXTURES)
-@requires_f64
 def test_kneighbors_non_default_metric_oracle(fixture):
     """``kneighbors`` reports the CONFIGURED metric's neighbours.
 
@@ -250,6 +261,7 @@ def test_kneighbors_non_default_metric_oracle(fixture):
     sort. The distances, which ARE fully determined, are still compared
     elementwise above.
     """
+    skip_unsupported_fixture_dtype(fixture)
     d = np.load(fixture_path(fixture))
     k = int(d["k"][0])
     reg = mlrs.KNeighborsRegressor(n_neighbors=k, metric="manhattan").fit(
@@ -289,7 +301,7 @@ def test_callable_weights_matches_sklearn():
         )
         want = SkKNR(algorithm="brute", weights=w).fit(x, target).predict(xq)
         assert got.shape == want.shape
-        assert np.allclose(got, want, atol=1e-5, rtol=0.0)
+        assert np.allclose(got, want, atol=live_atol(), rtol=0.0)
 
 
 def test_callable_metric_matches_sklearn():
@@ -301,7 +313,7 @@ def test_callable_metric_matches_sklearn():
 
     got = np.asarray(mlrs.KNeighborsRegressor(metric=m).fit(x, y).predict(xq))
     want = SkKNR(algorithm="brute", metric=m).fit(x, y).predict(xq)
-    assert np.allclose(got, want, atol=1e-5, rtol=0.0)
+    assert np.allclose(got, want, atol=live_atol(), rtol=0.0)
 
     # `effective_metric_` is the callable itself, as sklearn reports it.
     assert mlrs.KNeighborsRegressor(metric=m).fit(x, y).effective_metric_ is m
@@ -332,7 +344,7 @@ def test_callable_weights_agrees_with_builtin_formula():
         mlrs.KNeighborsRegressor(weights=as_distance).fit(x, y).predict(xq)
     )
     assert np.isfinite(device).all()
-    assert np.allclose(device, host, atol=1e-5, rtol=0.0)
+    assert np.allclose(device, host, atol=live_atol(), rtol=0.0)
 
 
 def test_kneighbors_self_query_matches_sklearn():
@@ -340,7 +352,7 @@ def test_kneighbors_self_query_matches_sklearn():
     x, _, y, _ = _live_data()
     dist, idx = mlrs.KNeighborsRegressor().fit(x, y).kneighbors()
     want_d, want_i = SkKNR(algorithm="brute").fit(x, y).kneighbors()
-    assert np.allclose(np.asarray(dist, dtype=np.float64), want_d, atol=1e-5, rtol=0.0)
+    assert np.allclose(np.asarray(dist, dtype=np.float64), want_d, atol=live_atol(), rtol=0.0)
     assert np.array_equal(np.asarray(idx).astype(np.int64), want_i.astype(np.int64))
     # No row may keep itself as a neighbour.
     assert not np.any(np.asarray(idx) == np.arange(x.shape[0])[:, None])
@@ -355,7 +367,7 @@ def test_kneighbors_graph_matches_sklearn(mode, self_query):
     got = mlrs.KNeighborsRegressor().fit(x, y).kneighbors_graph(query, mode=mode)
     want = SkKNR(algorithm="brute").fit(x, y).kneighbors_graph(query, mode=mode)
     assert got.shape == want.shape
-    assert np.allclose(got.toarray(), want.toarray(), atol=1e-5, rtol=0.0)
+    assert np.allclose(got.toarray(), want.toarray(), atol=live_atol(), rtol=0.0)
 
 
 @pytest.mark.parametrize(
@@ -402,7 +414,7 @@ def test_metric_params_p_overrides_init_p_with_warning():
     # p=1 wins -> manhattan, NOT the p=2 euclidean from __init__.
     assert est.effective_metric_ == "manhattan"
     want = SkKNR(algorithm="brute", metric="manhattan").fit(x, y).predict(xq)
-    assert np.allclose(np.asarray(est.predict(xq)), want, atol=1e-5, rtol=0.0)
+    assert np.allclose(np.asarray(est.predict(xq)), want, atol=live_atol(), rtol=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +435,7 @@ def test_every_algorithm_accepted_and_equivalent(algorithm):
         mlrs.KNeighborsRegressor(algorithm=algorithm).fit(x, y).predict(xq)
     )
     want = SkKNR(algorithm=algorithm).fit(x, y).predict(xq)
-    assert np.allclose(got, want, atol=1e-5, rtol=0.0)
+    assert np.allclose(got, want, atol=live_atol(), rtol=0.0)
 
 
 @pytest.mark.parametrize("leaf_size", [1, 30, 200])
@@ -540,8 +552,8 @@ def test_repeated_queries_and_refit_are_stable():
     est.fit(x, y * 3.0 + 1.0)
     refit = np.asarray(est.predict(xq))
     want = SkKNR(algorithm="brute").fit(x, y * 3.0 + 1.0).predict(xq)
-    assert np.allclose(refit, want, atol=1e-5, rtol=0.0)
-    assert not np.allclose(refit, first, atol=1e-5, rtol=0.0)
+    assert np.allclose(refit, want, atol=live_atol(), rtol=0.0)
+    assert not np.allclose(refit, first, atol=live_atol(), rtol=0.0)
 
 
 def test_predict_before_fit_still_raises_not_fitted():
@@ -578,6 +590,6 @@ def test_clone_round_trips_the_full_parameter_set():
     want = SkKNR(
         algorithm="brute", n_neighbors=3, weights="distance", metric="manhattan"
     ).fit(x, y).predict(xq)
-    assert np.allclose(first, want, atol=1e-5, rtol=0.0)
-    assert np.allclose(refit, want, atol=1e-5, rtol=0.0)
-    assert np.allclose(cloned, want, atol=1e-5, rtol=0.0)
+    assert np.allclose(first, want, atol=live_atol(), rtol=0.0)
+    assert np.allclose(refit, want, atol=live_atol(), rtol=0.0)
+    assert np.allclose(cloned, want, atol=live_atol(), rtol=0.0)
