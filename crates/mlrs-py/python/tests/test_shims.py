@@ -30,13 +30,27 @@ from mlrs.base import MlrsBase
 def _exported_shim_names():
     """Every exported ``mlrs`` symbol that is an ``MlrsBase`` estimator shim.
 
-    Derived from ``mlrs.__all__`` (excludes the ``backend_supports_f64`` flag and
-    the ``johnson_lindenstrauss_min_dim`` helper) so the matrix grows
+    Derived from ``mlrs.__all__`` (excludes the ``backend_supports_f64`` flags
+    and the ``johnson_lindenstrauss_min_dim`` helper) so the matrix grows
     automatically as new shim classes are registered — no hard-coded list.
+
+    The ``getattr`` is guarded because ``mlrs.__all__`` is not uniformly
+    resolvable without the compiled extension: ``backend_supports_f64`` and
+    ``backend_supports_f64_transcendental`` are served by the package
+    ``__getattr__``, which imports ``_mlrs`` and raises ``ImportError`` on a
+    not-yet-built tree. A bare ``getattr`` here therefore took the WHOLE module
+    down at import time — collection, not just the device-touching half — which
+    silently voided this file's Wave-0 contract (every assertion below is
+    pure-Python and is exactly what should still run pre-build). A name that
+    cannot be resolved without the extension is not an ``MlrsBase`` shim by
+    construction, so skipping it loses nothing.
     """
     names = []
     for name in mlrs.__all__:
-        obj = getattr(mlrs, name)
+        try:
+            obj = getattr(mlrs, name)
+        except ImportError:
+            continue
         if isinstance(obj, type) and issubclass(obj, MlrsBase):
             names.append(name)
     return names

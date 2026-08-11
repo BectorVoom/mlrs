@@ -597,12 +597,25 @@ def _exported_shim_names():
     and the ``johnson_lindenstrauss_min_dim`` helper function). Deriving the
     expected matrix membership from this set keeps EXPECTED_PARAMS honest: a
     newly-added shim that is not in the table fails ``test_matrix_covers_exports``.
+
+    The ``getattr`` is guarded for the same reason as its twin in
+    ``test_shims.py``: ``backend_supports_f64`` /
+    ``backend_supports_f64_transcendental`` are exported names that the package
+    ``__getattr__`` serves by importing the compiled extension, so a bare
+    ``getattr`` raises ``ImportError`` on a not-yet-built tree. This module is
+    called out as pure-Python (module docstring), and this function is its only
+    line that was not — it is reached from ``test_matrix_covers_exports``, which
+    would have been the one red test pre-build. Skipping an unresolvable name is
+    safe: it cannot be an ``MlrsBase`` shim.
     """
     from mlrs.base import MlrsBase
 
     names = []
     for name in mlrs.__all__:
-        obj = getattr(mlrs, name)
+        try:
+            obj = getattr(mlrs, name)
+        except ImportError:
+            continue
         if isinstance(obj, type) and issubclass(obj, MlrsBase):
             names.append(name)
     return names
