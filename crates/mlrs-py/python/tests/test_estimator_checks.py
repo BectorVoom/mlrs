@@ -495,31 +495,16 @@ _ROCM_GAUSSIAN_NB_LOG_PROBA_NOISE = (
     "the check passes at f64 (cpu/wgpu, not xfailed there)."
 )
 
-# UMAP's fit/transform ARE verified bit-identical at a fixed seed elsewhere in
-# this file (see the `_UMAP_TRANSFORM` comment above) — but that was verified
-# against the host-parallel cpu engine (mlrs-umap-cpu-optimization), not the
-# rocm device kernel path this harness now reaches once the ingress downcast
-# lets UMAP's checks run at all. `check_pipeline_consistency` (Pipeline(...)
-# vs the bare estimator) and `check_fit_idempotent` (two independent fits of
-# the SAME X) both show LARGE (not rounding-scale) embedding divergence on
-# rocm — consistent with the SGD embedding optimization being sensitive to
-# summation-order differences in the device kernel's parallel reductions,
-# amplified chaotically over the optimization (the same class of sensitivity
-# already documented for UMAP's transform contract, and for chaotic gradient
-# descent generally). This is a SYMPTOM, not a root-caused fix: flagged
-# explicitly rather than silently absorbed into a generic xfail, since it is
-# a real open question about the rocm device engine's run-to-run
-# reproducibility, not a test-harness artifact.
-_ROCM_UMAP_DEVICE_NONDETERMINISM = (
-    "on rocm this check reaches UMAP's DEVICE kernel path (the bit-identical "
-    "determinism documented elsewhere in this file was verified on the "
-    "host-parallel cpu engine, not this path); two fits of the same data "
-    "diverge by O(10) in embedding coordinates, consistent with "
-    "summation-order-sensitive parallel reductions in the SGD layout "
-    "optimization being amplified chaotically. A real open question about "
-    "the rocm device engine's run-to-run reproducibility — not root-caused "
-    "or fixed here, only documented."
-)
+# NOTE: UMAP's device-kernel non-determinism (`check_pipeline_consistency` /
+# `check_fit_idempotent` on rocm) was root-caused to a genuine cross-cube
+# READ/WRITE data race in `umap_layout_step` (see the `mlrs-umap-device-
+# layout-race` project memory for the full investigation) and FIXED by giving
+# the kernel a frozen per-epoch `snapshot` buffer for foreign-neighbour reads
+# — the same epoch-snapshot design `umap_host_layout::drive` already used on
+# cpu. Verified: 5/5 repeated `fit()` calls with the same seed now produce
+# bit-identical embeddings on real rocm hardware (previously diverged by up
+# to 7.6). No rocm-only xfail entry for UMAP remains — both checks pass
+# outright, same as cpu/wgpu.
 
 _ROCM_ONLY = {
     "LogisticRegression": {
@@ -536,10 +521,6 @@ _ROCM_ONLY = {
     },
     "GaussianNB": {
         "check_classifiers_train": _ROCM_GAUSSIAN_NB_LOG_PROBA_NOISE,
-    },
-    "UMAP": {
-        "check_pipeline_consistency": _ROCM_UMAP_DEVICE_NONDETERMINISM,
-        "check_fit_idempotent": _ROCM_UMAP_DEVICE_NONDETERMINISM,
     },
 }
 

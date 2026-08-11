@@ -74,6 +74,10 @@ fn launch_step<F: Float + CubeElement + bytemuck::Pod>(
     let neg_idx: Vec<u32> = vec![2, 0, 1];
 
     let emb_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &emb);
+    // The snapshot is the epoch-start embedding — for a single launch that is
+    // just a second copy of `emb` (see umap_layout.rs's module doc for why the
+    // kernel now takes both a live `embedding` and a frozen `snapshot`).
+    let snapshot_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &emb);
     let pos_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_offsets);
     let pos_tail_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_tail);
     let neg_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_offsets);
@@ -85,6 +89,8 @@ fn launch_step<F: Float + CubeElement + bytemuck::Pod>(
 
     let emb_arg =
         unsafe { ArrayArg::from_raw_parts(emb_dev.handle().clone(), n_vertices * dim) };
+    let snapshot_arg =
+        unsafe { ArrayArg::from_raw_parts(snapshot_dev.handle().clone(), n_vertices * dim) };
     let pos_off_arg =
         unsafe { ArrayArg::from_raw_parts(pos_off_dev.handle().clone(), pos_offsets.len()) };
     let pos_tail_arg =
@@ -99,6 +105,7 @@ fn launch_step<F: Float + CubeElement + bytemuck::Pod>(
         count,
         cube_dim,
         emb_arg,
+        snapshot_arg,
         pos_off_arg,
         pos_tail_arg,
         neg_off_arg,
@@ -115,6 +122,7 @@ fn launch_step<F: Float + CubeElement + bytemuck::Pod>(
 
     let out: Vec<f64> = emb_dev.to_host(pool).iter().map(|&v| from_f::<F>(v)).collect();
     emb_dev.release_into(pool);
+    snapshot_dev.release_into(pool);
     pos_off_dev.release_into(pool);
     pos_tail_dev.release_into(pool);
     neg_off_dev.release_into(pool);

@@ -1361,8 +1361,17 @@ fn device_epoch_driver<F>(
         }
 
         // Upload this epoch's coordinates + CSR buffers, launch, read back.
+        //
+        // `snapshot` is a SEPARATE device buffer uploaded from the SAME host
+        // values as `embedding` (both reflect this epoch's START state) — the
+        // kernel reads every foreign-neighbour coordinate from `snapshot` and
+        // writes only its own owner row into `embedding`, so no cube ever
+        // observes another cube's in-flight write within this launch (the
+        // cross-cube read/write race fix; see umap_layout.rs's module doc and
+        // the mlrs-umap-device-layout-race project memory).
         let emb_f: Vec<F> = embedding.iter().map(|&v| f64_to_host::<F>(v)).collect();
         let emb_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &emb_f);
+        let snapshot_dev = DeviceArray::<ActiveRuntime, F>::from_host(pool, &emb_f);
         let pos_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_offsets);
         let pos_tail_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &pos_tail);
         let neg_off_dev = DeviceArray::<ActiveRuntime, u32>::from_host(pool, &neg_offsets);
@@ -1372,6 +1381,9 @@ fn device_epoch_driver<F>(
         let cube_dim = CubeDim { x: 1, y: 1, z: 1 };
         let emb_arg =
             unsafe { ArrayArg::from_raw_parts(emb_dev.handle().clone(), n_vertices * dim) };
+        let snapshot_arg = unsafe {
+            ArrayArg::from_raw_parts(snapshot_dev.handle().clone(), n_vertices * dim)
+        };
         let pos_off_arg =
             unsafe { ArrayArg::from_raw_parts(pos_off_dev.handle().clone(), pos_offsets.len()) };
         let pos_tail_arg =
@@ -1386,6 +1398,7 @@ fn device_epoch_driver<F>(
             count,
             cube_dim,
             emb_arg,
+            snapshot_arg,
             pos_off_arg,
             pos_tail_arg,
             neg_off_arg,
@@ -1416,6 +1429,7 @@ fn device_epoch_driver<F>(
         embedding.copy_from_slice(&updated);
 
         emb_dev.release_into(pool);
+        snapshot_dev.release_into(pool);
         pos_off_dev.release_into(pool);
         pos_tail_dev.release_into(pool);
         neg_off_dev.release_into(pool);

@@ -33,6 +33,28 @@
 //! draws every negative-sample target index with `SplitMix64::next_below` and
 //! packs them into the `neg_idx` device buffer this kernel merely GATHERs.
 //!
+//! ## The epoch snapshot (cross-cube read/write race fix)
+//! Every owner-cube writes ONLY its own row (`move_other = 0` in production —
+//! see `FIT_MOVE_OTHER` below), but it also READS its positive/negative
+//! neighbours' rows to compute the SGD gradient. On a symmetric edge (owner=A,
+//! tail=B) / (owner=B, tail=A) — the fuzzy graph is always symmetric — cube A's
+//! read of row B and cube B's concurrent WRITE to row B race: GPU kernel
+//! launches give NO inter-cube ordering within a launch, so a single shared
+//! read/write buffer makes the result depend on hardware scheduling (confirmed
+//! non-deterministic on real rocm hardware, 2026-08-11 — two `fit()` calls with
+//! the same seed diverged by O(10) in embedding coordinates; see the
+//! `mlrs-umap-device-layout-race` project memory). Every foreign-vertex read
+//! therefore comes from `snapshot` — a SEPARATE, read-only buffer holding the
+//! embedding as it was at the START of this epoch — while `embedding` is the
+//! live, owner-exclusive read/write target. This is the SAME epoch-snapshot
+//! design `umap_host_layout::drive` already uses on the cpu backend (see that
+//! module's `drive` doc comment): it turns the update from Gauss-Seidel to
+//! Jacobi WITHIN an epoch (a neighbour already processed earlier in the same
+//! epoch is read at its epoch-start position, not its live one) — a deliberate,
+//! already-oracle-validated tradeoff (`umap_test::layout_property_*`), not an
+//! approximation invented here. An owner still reads/writes its OWN row live,
+//! so one owner's sequential accumulation across its own edges is unchanged.
+//!
 //! ## cpu-MLIR safety (the primary correctness gate)
 //! Uses ONLY `F`/`u32` accumulators + `if` guards + the STATIC `F::powf` form.
 //! NO `SharedMemory`, NO `Atomic`, NO `F::INFINITY`, NO mutable-`bool` scan, NO
@@ -56,7 +78,14 @@ pub use self::umap_layout_step as umap_layout_kernel;
 /// Buffer contract (all device arrays, row-major / CSR):
 /// - `embedding` — `(n_vertices, dim)` row-major coordinates, updated IN PLACE.
 ///   Owners are the contiguous rows `0..n_owners`; rows `n_owners..n_vertices`
-///   are read-only frozen GATHER targets (D-03).
+///   are read-only frozen GATHER targets (D-03). An owner reads/writes ONLY its
+///   OWN row here (`cur_base`) — every FOREIGN (neighbour) row is read from
+///   `snapshot` instead (see the epoch-snapshot module doc above).
+/// - `snapshot` — `(n_vertices, dim)` row-major coordinates as of the START of
+///   this epoch, READ-ONLY. The caller uploads this as a copy of `embedding`
+///   before the launch; the kernel never writes it. Supplies every foreign
+///   (positive/negative-neighbour) coordinate read, so no cube ever observes
+///   another cube's in-flight write within this launch.
 /// - `pos_offsets` — length `n_owners + 1` CSR offsets: owner `o`'s positive
 ///   edges are `pos_tail[pos_offsets[o] .. pos_offsets[o+1]]`.
 /// - `pos_tail` — positive-edge target vertex indices (`u32`, `< n_vertices`).
@@ -86,6 +115,7 @@ pub use self::umap_layout_step as umap_layout_kernel;
 #[allow(clippy::too_many_arguments)]
 pub fn umap_layout_step<F: Float + CubeElement>(
     embedding: &mut Array<F>,
+    snapshot: &Array<F>,
     pos_offsets: &Array<u32>,
     pos_tail: &Array<u32>,
     neg_offsets: &Array<u32>,
@@ -122,11 +152,14 @@ pub fn umap_layout_step<F: Float + CubeElement>(
 
                     // dist_squared = Σ_d (cur_d − other_d)² — a self-contained
                     // nested accumulate (read in the SAME iteration it is built).
+                    // `other` is a FOREIGN row: read from the frozen `snapshot`,
+                    // never from the live `embedding` another cube may be
+                    // concurrently writing (the cross-cube read/write race fix).
                     let mut dist_sq = F::from_int(0i64);
                     let mut d0 = 0u32;
                     while d0 < dim {
                         let diff = embedding[(cur_base + d0) as usize]
-                            - embedding[(other_base + d0) as usize];
+                            - snapshot[(other_base + d0) as usize];
                         dist_sq += diff * diff;
                         d0 += 1u32;
                     }
@@ -147,7 +180,7 @@ pub fn umap_layout_step<F: Float + CubeElement>(
                     let mut d1 = 0u32;
                     while d1 < dim {
                         let cur_d = embedding[(cur_base + d1) as usize];
-                        let other_d = embedding[(other_base + d1) as usize];
+                        let other_d = snapshot[(other_base + d1) as usize];
                         // grad_d = clip(grad·(cur_d − other_d), −4, 4) — finite
                         // literals + statement-`if` (NO F::INFINITY / max / min).
                         let mut grad_d = grad_coeff * (cur_d - other_d);
@@ -183,11 +216,13 @@ pub fn umap_layout_step<F: Float + CubeElement>(
                     if other != row {
                         let other_base = other * dim;
 
+                        // `other` is a FOREIGN row: read from the frozen
+                        // `snapshot`, mirroring the attractive pass above.
                         let mut dist_sq = F::from_int(0i64);
                         let mut d2 = 0u32;
                         while d2 < dim {
                             let diff = embedding[(cur_base + d2) as usize]
-                                - embedding[(other_base + d2) as usize];
+                                - snapshot[(other_base + d2) as usize];
                             dist_sq += diff * diff;
                             d2 += 1u32;
                         }
@@ -203,7 +238,7 @@ pub fn umap_layout_step<F: Float + CubeElement>(
                             let grad_coeff = (F::new(2.0_f32) * gamma * b) / den;
                             while d3 < dim {
                                 let cur_d = embedding[(cur_base + d3) as usize];
-                                let other_d = embedding[(other_base + d3) as usize];
+                                let other_d = snapshot[(other_base + d3) as usize];
                                 let mut grad_d = grad_coeff * (cur_d - other_d);
                                 if grad_d > F::new(4.0_f32) {
                                     grad_d = F::new(4.0_f32);
