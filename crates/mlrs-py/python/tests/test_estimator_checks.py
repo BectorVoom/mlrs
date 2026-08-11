@@ -26,6 +26,10 @@ pytest.importorskip("mlrs")
 
 import mlrs  # noqa: E402  (after importorskip)
 from mlrs import _io  # noqa: E402  (after importorskip)
+from sklearn.linear_model import (  # noqa: E402  (StackingRegressor members)
+    LinearRegression as SkLinearRegression,
+    Ridge as SkRidge,
+)
 from sklearn.utils import get_tags  # noqa: E402
 from sklearn.utils.estimator_checks import (  # noqa: E402
     parametrize_with_checks,
@@ -107,6 +111,22 @@ def _estimators():
         mlrs.RobustScaler(),
         mlrs.Normalizer(),
         mlrs.Binarizer(),
+        # --- STACK-01: the stacking meta-estimator. Two CHEAP host base
+        # regressors and `cv=2`, because one `fit` here is `cv + 1` fits per
+        # member and the harness fits each entry ~49 times. `passthrough` stays
+        # at its default: sklearn's OWN StackingRegressor fails
+        # `check_{regressor,transformer}_data_not_an_array` with
+        # `passthrough=True` (it hstacks the duck-typed `_NotAnArray` straight
+        # through), so gating mlrs on that configuration would enforce a
+        # standard the reference implementation does not meet. Verified 2026-08-11:
+        # 57 passed / 1 skipped at the default, identical to sklearn's own.
+        mlrs.StackingRegressor(
+            estimators=[
+                ("lr", SkLinearRegression()),
+                ("ridge", SkRidge()),
+            ],
+            cv=2,
+        ),
     ]
 
 
