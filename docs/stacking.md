@@ -69,21 +69,26 @@ device.
 ### `n_jobs` is ignored when a member holds a device handle
 
 A fitted mlrs estimator owns a compiled `#[pyclass]` wrapping device state.
-Neither joblib fan-out can carry it, and the two fail differently:
+Neither joblib fan-out is worth taking over one:
 
 * **process backends** (`loky` — joblib's default — `multiprocessing`, `dask`)
   return each worker's result by pickling it, so `n_jobs=2` raises
-  `TypeError: cannot pickle 'builtins.Ridge' object`;
-* **the threading backend** looks like the answer, since mlrs releases the GIL
-  around device work. A two-member `cv=5` fit on rocm did run 2.6x faster with
-  bit-identical predictions — and the same design at three members and `cv=10`
-  tore the CubeCL HIP runtime down (native panics, "Memory page 0 doesn't
-  exist", dead interpreter). A crash that only appears above some concurrency
-  threshold is worse than no parallelism.
+  `TypeError: cannot pickle 'builtins.Ridge' object`. Unconditional;
+* **the threading backend** works, and barely helps. Every device call holds the
+  process-global `Mutex<BufferPool>`, so the fan-out cannot overlap the work it
+  fans out: six members at `cv=20` on rocm went 1.584 s serial → 1.343 s at
+  `n_jobs=4` (1.18x), bit-identical. Picking a backend on the caller's behalf
+  for ~18% is a bad trade; finer-grained locking, not a scheduler switch, is
+  what would make this parameter pay.
 
 So `mlrs.StackingRegressor` emits a `UserWarning` and fits serially in that
-case, rather than failing or corrupting. `n_jobs` works normally over host
-(scikit-learn) members.
+case. `n_jobs` works normally over host (scikit-learn) members.
+
+Historically the threading route did not merely underperform — it aborted the
+process, because CubeCL allocates one stream (and one memory arena) per OS
+thread. That is fixed by the stream cap (`mlrs_backend::stream_cap`); see
+[stream-cap.md](stream-cap.md). The reason `n_jobs` is still reduced is the
+mutex, not the crash.
 
 ## Parity
 

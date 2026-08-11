@@ -845,13 +845,14 @@ def test_n_jobs_over_mlrs_members_warns_and_runs_serially(n_jobs):
     """A device-handle member forces serial fitting, loudly — never a crash.
 
     This is the one place mlrs deliberately does NOT do what ``n_jobs`` asks,
-    and both alternatives were tried on real hardware before settling:
+    and both alternatives were measured on real hardware before settling:
 
     * a process backend (joblib's default) raises ``TypeError: cannot pickle
       'builtins.Ridge' object`` — the fitted handle wraps device state;
-    * the threading backend works at small fan-out and then tears the CubeCL
-      runtime down at larger ones (three members, ``cv=10``, rocm gfx1151:
-      native panics and a dead interpreter).
+    * the threading backend runs correctly (since ``mlrs_backend::stream_cap``
+      capped CubeCL's per-OS-thread stream count) but barely helps: every device
+      call holds the process-global pool mutex, so six members at ``cv=20`` on
+      rocm went 1.584 s serial -> 1.343 s at ``n_jobs=4``.
 
     So the fit runs serially with a ``UserWarning``, and — asserted here — gives
     exactly the answer the serial fit gives.

@@ -38,9 +38,16 @@ pub type Client = cubecl::client::ComputeClient<ActiveRuntime>;
 /// Exactly one backend feature must be enabled; with none, this function is
 /// not compiled (and the workspace build would fail to resolve `ActiveRuntime`,
 /// enforcing the exactly-one-feature contract — T-01-03).
+///
+/// This is the ONLY place in the workspace that builds a client, which is what
+/// makes it the right place to install the CubeCL stream cap
+/// ([`crate::stream_cap`], STREAM-CAP-01): the cap must be written into the
+/// global config BEFORE any client exists, and after the first client is built
+/// cubecl's write-once config can no longer be changed.
 #[cfg(any(feature = "cpu", feature = "wgpu", feature = "cuda", feature = "rocm"))]
 pub fn active_client() -> Client {
     use cubecl::Runtime as _;
+    crate::stream_cap::install();
     let device = ActiveDevice::default();
     ActiveRuntime::client(&device)
 }

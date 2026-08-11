@@ -722,29 +722,32 @@ def _fit_one(estimator, X, y, fit_params):
 def _effective_n_jobs(n_jobs, members):
     """``n_jobs``, reduced to serial when a member holds a device handle.
 
-    Neither joblib fan-out is usable over a fitted mlrs estimator, and the two
-    fail in different ways — which is why this reduces rather than picking the
-    "working" backend:
+    Neither joblib fan-out is worth taking over a fitted mlrs estimator:
 
     * **Process backends** (``loky``, the joblib default; ``multiprocessing``;
       ``dask``) return each worker's result by PICKLING it. A fitted mlrs
       estimator owns ``self._mlrs_obj``, a compiled ``#[pyclass]`` wrapping
       device state, and that is not picklable — ``n_jobs=2`` raises
-      ``TypeError: cannot pickle 'builtins.Ridge' object``.
-    * **The threading backend** looks like the answer, since mlrs releases the
-      GIL around device work (``py.detach``, PY-03), and a two-member ``cv=5``
-      fit on rocm did run 2.6x faster with bit-identical predictions. It is NOT
-      safe. Scaled to three members at ``cv=10`` on the same gfx1151 device it
-      tore the CubeCL HIP runtime down — a cascade of native panics
-      ("Memory page 0 doesn't exist", "CallError") from concurrent clients on
-      one server, killing the interpreter. A crash that only appears above some
-      concurrency threshold is worse than no parallelism, so mlrs does not take
-      that route on the caller's behalf.
+      ``TypeError: cannot pickle 'builtins.Ridge' object``. This is
+      unconditional.
+    * **The threading backend** works, and barely helps. Every device call runs
+      while holding the process-global ``Mutex<BufferPool>``
+      (``crates/mlrs-py/src/lib.rs``), so the fan-out cannot overlap the work it
+      is fanning out. Measured on rocm gfx1151, six members at ``cv=20``:
+      1.584 s serial -> 1.343 s at ``n_jobs=4`` (1.18x), bit-identical. Choosing
+      a backend on the caller's behalf for ~18% is a bad trade; finer-grained
+      locking, not a scheduler switch, is what would make this parameter pay.
 
-    So the composition runs serially and says so, once, rather than failing or
-    corrupting. ``n_jobs`` still works normally over host (sklearn) members —
-    measured on this box at n=100000, d=64, cv=5: 1.61 s -> 0.96 s at
-    ``n_jobs=4``.
+    HISTORY: until the CubeCL stream cap landed (``mlrs_backend::stream_cap``,
+    STREAM-CAP-01) the threading route did not merely underperform — it aborted
+    the process. CubeCL allocates one stream per OS thread and one memory arena
+    per stream, so a thread fan-out exhausted the device heap. That is fixed; the
+    reason this function still reduces ``n_jobs`` is the mutex above, not the
+    crash.
+
+    So the composition runs serially and says so, once. ``n_jobs`` still works
+    normally over host (sklearn) members — measured at n=100000, d=64, cv=5:
+    1.61 s -> 0.96 s at ``n_jobs=4``.
     """
     if n_jobs in (None, 1):
         return n_jobs
@@ -753,9 +756,10 @@ def _effective_n_jobs(n_jobs, members):
     _warnings.warn(
         "StackingRegressor: n_jobs is ignored because at least one composed "
         "estimator is an mlrs estimator holding a device handle. Process-based "
-        "joblib backends cannot pickle that handle, and the threading backend "
-        "is not safe against the CubeCL runtime under concurrent use. Fitting "
-        "serially. Pass host (e.g. scikit-learn) sub-estimators to use n_jobs.",
+        "joblib backends cannot pickle that handle, and mlrs serializes device "
+        "work behind one pool lock, so a threaded fan-out measures ~1.2x at "
+        "best. Fitting serially. Pass host (e.g. scikit-learn) sub-estimators "
+        "to use n_jobs.",
         UserWarning,
         stacklevel=3,
     )
