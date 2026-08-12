@@ -44,5 +44,10 @@ pub mod naive_bayes;
 pub mod neighbors;
 pub mod preprocessing;
 pub mod projection;
+// `RANSACRegressor` (RANSAC-01). Its own module rather than a section of
+// `linear`: it is the only linear-family wrapper that borrows the caller's
+// numpy `RandomState` for a whole fit and calls BACK into Python per trial
+// (`is_data_valid` / `is_model_valid`).
+pub mod ransac;
 pub mod spectral;
 pub mod timeseries;

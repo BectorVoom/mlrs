@@ -265,6 +265,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use estimators::projection::{
         johnson_lindenstrauss_min_dim, PyGaussianRandomProjection, PySparseRandomProjection,
     };
+    use estimators::ransac::PyRANSACRegressor;
     use estimators::spectral::{PySpectralClustering, PySpectralEmbedding};
     m.add_class::<PyLinearRegression>()?;
     m.add_class::<PyRidge>()?;
@@ -278,6 +279,10 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `X·coef_ + intercept_` prediction, an L-BFGS fit over `[w, c, σ]` that
     // bounds each outlier's influence instead of squaring it.
     m.add_class::<PyHuberRegressor>()?;
+    // RANSACRegressor (RANSAC-01): the outlier-EXCLUDING robust regressor —
+    // a consensus search over random sub-samples rather than a reweighted
+    // objective, with sklearn's exact numpy-MT19937 draw sequence.
+    m.add_class::<PyRANSACRegressor>()?;
     m.add_class::<PyLasso>()?;
     m.add_class::<PyElasticNet>()?;
     m.add_class::<PyLogisticRegression>()?;

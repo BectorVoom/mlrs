@@ -569,6 +569,70 @@ pub enum AlgoError {
         mode: &'static str,
     },
 
+    /// `RANSACRegressor` was asked to draw a sub-sample larger than the design
+    /// (`min_samples > n_samples`). Data-DEPENDENT — the resolved `min_samples`
+    /// is `n_features + 1` by default and `ceil(frac · n_samples)` for a
+    /// fractional request, so neither is knowable at `build()` — which is why
+    /// this is an `AlgoError` and not the builder's business (the D-08 split).
+    /// Mirrors sklearn's ``"`min_samples` may not be larger than number of
+    /// samples: n_samples = %d."``.
+    #[error(
+        "estimator '{estimator}': min_samples = {min_samples} may not be larger \
+         than the number of samples (n_samples = {n_samples})"
+    )]
+    MinSamplesExceedsNSamples {
+        /// Which estimator rejected the value (`"ransac"`).
+        estimator: &'static str,
+        /// The RESOLVED sub-sample size (after `None`/fraction lowering).
+        min_samples: usize,
+        /// Rows in the design.
+        n_samples: usize,
+    },
+
+    /// `RANSACRegressor` finished every trial without ever recording a
+    /// consensus set. sklearn raises `ValueError` here with one of two
+    /// messages, chosen by whether the skip budget was blown; `skipped_out`
+    /// carries that choice so the PyO3 layer reproduces the exact text.
+    ///
+    /// This is not a convergence *warning*: with no best sub-sample there is
+    /// nothing to refit, so there is no fitted estimator to return.
+    #[error(
+        "estimator '{estimator}': no valid consensus set was found in \
+         {n_trials} trial(s) (skips: {n_skips}, exceeded max_skips: {skipped_out})"
+    )]
+    NoValidConsensusSet {
+        /// Which estimator failed (`"ransac"`).
+        estimator: &'static str,
+        /// Trials actually run before giving up (sklearn's `n_trials_`).
+        n_trials: usize,
+        /// Total skips across the three sklearn skip counters.
+        n_skips: usize,
+        /// Whether the loop stopped because the skips exceeded `max_skips`
+        /// (sklearn's first message) rather than exhausting `max_trials`
+        /// (its second).
+        skipped_out: bool,
+    },
+
+    /// A caller-supplied validity predicate (`is_data_valid` / `is_model_valid`)
+    /// asked the fit to ABORT rather than returning a verdict.
+    ///
+    /// The predicates are `Fn(..) -> RansacVerdict` precisely so the Rust core
+    /// stays free of any foreign error type: a PyO3 wrapper whose Python
+    /// callable raised stashes the real `PyErr`, answers
+    /// [`Abort`](crate::linear::ransac::RansacVerdict::Abort), and re-raises the
+    /// original exception once `fit` has unwound to the boundary. This variant
+    /// is what carries the abort back out; it should never reach a user
+    /// verbatim from the Python layer.
+    #[error(
+        "estimator '{estimator}': the '{callback}' callback aborted the fit"
+    )]
+    CallbackAborted {
+        /// Which estimator was fitting (`"ransac"`).
+        estimator: &'static str,
+        /// Which predicate aborted (`"is_data_valid"` / `"is_model_valid"`).
+        callback: &'static str,
+    },
+
     /// A construction-class hyperparameter violation raised by a NON-builder
     /// entry point (FIL-01: `ForestInference::from_trees` validates an
     /// imported forest — empty forest / depth over the complete-layout cap —

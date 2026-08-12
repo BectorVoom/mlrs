@@ -71,6 +71,12 @@ def _estimators():
         # ~15 steps on the harness's tiny fixtures, so the class default needs no
         # shrinking (the BayesianRidge case, not the MBSGD one).
         mlrs.HuberRegressor(),
+        # RANSACRegressor: `random_state` is pinned so the consensus search is
+        # deterministic across the harness's repeated fits (several checks fit
+        # twice and compare). `max_trials` is left at the class default — the
+        # dynamic-trial rule collapses it to single digits on the harness's
+        # 30-row fixtures, so unlike MBSGD there is nothing to shrink.
+        mlrs.RANSACRegressor(random_state=0),
         # MBSGD: `max_iter` shrunk for the check-sweep's 30-row fixtures, the
         # same treatment RandomForest/HGB get below. At the class default
         # (`max_iter=1000`) a SINGLE fit of a 30x4 matrix costs ~163 s on the cpu
@@ -354,6 +360,26 @@ _EXPECTED = {
                 "fixture; scikit-learn's own HuberRegressor fails it too. The "
                 "equivalence holds to machine precision when both fits converge "
                 "— gated in test_oracle_huber.py."
+            )
+        },
+    ),
+    # RANSACRegressor passes everything sklearn's OWN RANSACRegressor passes —
+    # including `check_supervised_y_2d` and `check_requires_y_none`, which most
+    # mlrs shims xfail (`_SUPERVISED`) and this one does NOT, because its shim
+    # emits sklearn's `DataConversionWarning` for a column-vector target and
+    # sklearn's exact "requires y to be passed" message for `y=None`. Only
+    # `_COMMON` applies, plus the one check below.
+    "RANSACRegressor": _merge(
+        _COMMON,
+        {
+            "check_sample_weight_equivalence_on_dense_data": (
+                "the check's 27-row fixture is smaller than the default "
+                "`min_samples = n_features + 1` once it removes rows, so the "
+                "fit raises sklearn's own `min_samples may not be larger than "
+                "number of samples` before any weight equivalence can be "
+                "measured; scikit-learn's own RANSACRegressor fails it "
+                "identically. Weighted/unweighted equivalence IS gated, on a "
+                "fixture large enough to fit, in test_oracle_ransac.py."
             )
         },
     ),

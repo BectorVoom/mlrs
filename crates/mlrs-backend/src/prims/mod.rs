@@ -156,6 +156,12 @@ pub mod radius;
 // distance→threshold scan the cpu backend runs, sharing `knn_host`'s
 // vectorized per-metric lane loop.
 pub mod radius_host;
+// `RANSACRegressor`'s compute engine (RANSAC-01): the per-trial fused
+// matvec→loss→threshold scan over a persistent worker pool, the consensus R²,
+// and the `min_samples × d` one-sided-Jacobi least-squares solve each
+// sub-sample poses. HOST on every backend — a hundred trials of a launch-bound
+// `n × d` pass, each of which the NEXT draw's stopping rule must read back.
+pub mod ransac_host;
 pub mod reduce;
 // Phase-10 SGD solver prim (PRIM-10). `sgd_solve` is fully implemented: a
 // validate-before-launch geometry guard fronts a host epoch loop that drives the

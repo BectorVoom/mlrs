@@ -94,7 +94,11 @@ fn size_spec(int_value: Option<usize>, float_value: Option<f64>) -> SizeSpec {
 // believed it had advanced the shared generator.
 #[pyclass(name = "NumpyRandomState", module = "mlrs._mlrs")]
 pub struct PyNumpyRandomState {
-    inner: CoreRng,
+    /// `pub(crate)` so a Rust-side driver that borrows the generator for a whole
+    /// fit — `estimators::ransac`, whose trial loop draws once per iteration —
+    /// can snapshot it out and write the advanced words back, rather than
+    /// holding a `RefCell` borrow across a callback into Python.
+    pub(crate) inner: CoreRng,
 }
 
 #[pymethods]

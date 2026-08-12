@@ -3770,6 +3770,257 @@ def gen_huber(seed: int = SEED, dtype=np.float32) -> str:
     return out_path
 
 
+# --------------------------------------------------------------------------- #
+# RANSACRegressor (RANSAC-01) — full parameter surface
+# --------------------------------------------------------------------------- #
+
+# Fixture geometry. Small enough that the committed blob stays a few hundred KB,
+# large enough that `_dynamic_max_trials` genuinely shrinks `max_trials` (which
+# it cannot do when the consensus is the whole design).
+RANSAC_N_SAMPLES = 300
+RANSAC_N_FEATURES = 5
+RANSAC_N_TEST = 11
+# Fraction of rows given a large additive shock in `y`. This IS the estimator's
+# subject: with no gross outliers every trial wins the whole design, `max_trials`
+# collapses to one, and none of the parameters below has anything to act on.
+RANSAC_OUTLIER_FRAC = 0.25
+# How far the shock is. Chosen large relative to the inlier noise (`0.1`) so no
+# row sits anywhere near `residual_threshold` — see `gen_ransac`'s MARGIN assert
+# for why that is a hard requirement of this fixture and not a preference.
+RANSAC_OUTLIER_SHIFT = 40.0
+
+
+def gen_ransac(seed: int = SEED, dtype=np.float32) -> str:
+    """Generate the RANSACRegressor full-parameter-surface fixture (RANSAC-01).
+
+    Covers every ``sklearn.linear_model.RANSACRegressor`` ctor parameter —
+    ``estimator``, ``min_samples``, ``residual_threshold``, ``is_data_valid``,
+    ``is_model_valid``, ``max_trials``, ``max_skips``, ``stop_n_inliers``,
+    ``stop_score``, ``stop_probability``, ``loss``, ``random_state`` — plus
+    ``fit(..., sample_weight=...)``.
+
+    ## The string-valued parameter, and the premise assert that pins it
+    ``loss`` is the ONLY parameter with a ``StrOptions`` constraint, and both of
+    its values (``'absolute_error'``, ``'squared_error'``) get a case below. The
+    generator does not ASSUME that: it reads sklearn's own
+    ``_parameter_constraints`` and fails here if the set of string-valued
+    parameters, or the option set of this one, ever changes.
+
+    ## Why this fixture can gate the TRAJECTORY, not just the answer
+    mlrs reproduces numpy's MT19937 exactly, so for an integer ``random_state``
+    both libraries visit the same sub-samples in the same order. Every case
+    therefore ships ``n_trials_`` and the three ``n_skips_*`` counters and the
+    full ``inlier_mask_``, and the Rust test compares them for EXACT equality —
+    a far stronger statement than agreeing on the final coefficients, and the
+    one that would catch a stopping rule or a skip-counter that drifted.
+
+    That is only well-posed if no row sits within reach of the residual
+    comparison's own rounding, so the generator MEASURES the margin (the closest
+    row's distance to ``residual_threshold``, relative to the residual scale)
+    and asserts it. A fixture that lost that margin would start failing
+    intermittently on an unrelated change, which is worse than not having the
+    gate.
+
+    ## `min_samples=None` is data-dependent, so the resolved value ships too
+    ``None`` lowers to ``n_features + 1`` and a fraction to
+    ``ceil(frac * n_samples)``; both are shipped per case as
+    ``min_samples_<name>`` so the Rust test gates the LOWERING and not only its
+    consequences. ``residual_threshold_<name>`` ships for the same reason (the
+    ``None`` default is the target MAD).
+
+    The reference is fitted on the design AFTER the round-trip through the
+    fixture dtype, so an f32 fixture's reference is the answer for the exact
+    bytes the test feeds back in.
+
+    Requires ``scikit-learn==1.9.0``.
+    """
+    from sklearn.linear_model import LinearRegression, RANSACRegressor
+    from sklearn.utils._param_validation import StrOptions
+
+    # --- premise: `loss` is the one string-valued parameter ----------------
+    constraints = RANSACRegressor._parameter_constraints
+    str_params = {
+        name: sorted(next(c.options for c in cs if isinstance(c, StrOptions)))
+        for name, cs in constraints.items()
+        if any(isinstance(c, StrOptions) for c in cs)
+    }
+    assert str_params == {"loss": ["absolute_error", "squared_error"]}, (
+        "gen_ransac: sklearn's string-valued RANSACRegressor parameters are "
+        f"{str_params}, not the {{'loss': ['absolute_error', 'squared_error']}} "
+        "this fixture enumerates — add the new option(s) as cases and update "
+        "ransac_test.rs"
+    )
+
+    rng = np.random.default_rng(seed + 517)
+    n, d = RANSAC_N_SAMPLES, RANSAC_N_FEATURES
+
+    # Round-trip through the fixture dtype BEFORE fitting (see docstring).
+    x = rng.standard_normal((n, d)).astype(dtype).astype(np.float64)
+    true_coef = rng.standard_normal(d)
+    y = x @ true_coef + 1.5 + 0.1 * rng.standard_normal(n)
+    n_out = int(round(RANSAC_OUTLIER_FRAC * n))
+    out_idx = rng.choice(n, size=n_out, replace=False)
+    y[out_idx] += RANSAC_OUTLIER_SHIFT * np.sign(rng.standard_normal(n_out)) + 20.0
+    y = y.astype(dtype).astype(np.float64)
+    x_test = rng.standard_normal((RANSAC_N_TEST, d)).astype(dtype).astype(np.float64)
+    # Strictly-positive, non-uniform weights so the weighted cases genuinely
+    # differ from the unweighted ones.
+    sw = rng.uniform(0.25, 3.0, size=n).astype(dtype).astype(np.float64)
+
+    # The two callback cases need predicates that actually REJECT some
+    # sub-samples (a predicate that never fires leaves the skip counters at zero
+    # and tests nothing). The thresholds below were chosen by measurement: each
+    # rejects a double-digit number of the 100 draws without starving the search.
+    def is_data_valid(x_sub, y_sub):
+        return float(np.abs(x_sub).max()) < 2.0
+
+    def is_model_valid(model, x_sub, y_sub):
+        return float(np.abs(model.coef_).max()) < 3.0
+
+    # (case name, ctor kwargs, use_sample_weight)
+    cases = [
+        ("default", dict(), False),
+        # --- loss: THE string-valued parameter, both options ---------------
+        ("loss_abs", dict(loss="absolute_error"), False),
+        ("loss_sq", dict(loss="squared_error"), False),
+        # --- min_samples: all three forms `None` / int / fraction ----------
+        ("ms_int", dict(min_samples=20), False),
+        ("ms_frac", dict(min_samples=0.3), False),
+        ("ms_one", dict(min_samples=1), False),
+        # --- residual_threshold: the `None` MAD default vs explicit --------
+        ("rt_tight", dict(residual_threshold=0.4), False),
+        ("rt_loose", dict(residual_threshold=8.0), False),
+        # --- max_trials: truncation, and a budget the search never uses ----
+        ("trials_3", dict(max_trials=3), False),
+        ("trials_500", dict(max_trials=500), False),
+        # --- stop_probability: drives `_dynamic_max_trials` ----------------
+        ("stopprob_low", dict(stop_probability=0.1), False),
+        ("stopprob_high", dict(stop_probability=0.999999), False),
+        ("stopprob_one", dict(stop_probability=1.0), False),
+        # --- the two early-exit thresholds ---------------------------------
+        ("stop_inliers", dict(stop_n_inliers=200), False),
+        ("stop_score", dict(stop_score=0.5), False),
+        # --- max_skips: the ConvergenceWarning branch ----------------------
+        ("max_skips", dict(residual_threshold=0.05, max_skips=3), False),
+        # --- estimator: the base LinearRegression's own fit_intercept ------
+        ("noint", dict(estimator=LinearRegression(fit_intercept=False),
+                       min_samples=d + 1), False),
+        # --- the two validity callbacks ------------------------------------
+        ("data_valid", dict(is_data_valid=is_data_valid), False),
+        ("model_valid", dict(is_model_valid=is_model_valid), False),
+        # --- sample_weight, crossed with the knobs it interacts with -------
+        ("sw", dict(), True),
+        ("sw_ms20", dict(min_samples=20), True),
+        ("sw_sq", dict(loss="squared_error"), True),
+        ("sw_noint", dict(estimator=LinearRegression(fit_intercept=False),
+                          min_samples=d + 1), True),
+    ]
+
+    c = lambda a: np.asarray(a, dtype=dtype)  # noqa: E731
+    out = {"X": c(x), "y": c(y), "X_test": c(x_test), "sample_weight": c(sw)}
+
+    margins = []
+    for name, kwargs, use_sw in cases:
+        kw = dict(random_state=seed)
+        kw.update(kwargs)
+        est = RANSACRegressor(**kw)
+        with warnings.catch_warnings():
+            # `max_skips` is DESIGNED to trip sklearn's ConvergenceWarning here;
+            # that is the branch the case exists to pin, not a defect.
+            warnings.simplefilter("ignore")
+            est.fit(x, y, sample_weight=sw if use_sw else None)
+
+        # Fitted attributes are `f64` on BOTH arms: the sub-sample solve
+        # accumulates in f64 whatever the design's width, and rounding the
+        # coefficients to f32 would hide real drift behind the storage format
+        # (the `bayesian_ridge` / `huber` precision precedent).
+        out[f"coef_{name}"] = np.ravel(est.estimator_.coef_).astype(np.float64)
+        out[f"intercept_{name}"] = np.ravel(
+            np.atleast_1d(est.estimator_.intercept_)
+        ).astype(np.float64)
+        out[f"inlier_mask_{name}"] = est.inlier_mask_.astype(np.float64)
+        out[f"counters_{name}"] = np.asarray(
+            [
+                est.n_trials_,
+                est.n_skips_no_inliers_,
+                est.n_skips_invalid_data_,
+                est.n_skips_invalid_model_,
+            ],
+            dtype=np.float64,
+        )
+        out[f"pred_{name}"] = c(est.predict(x_test))
+
+        # The RESOLVED lowerings, so the Rust test gates them directly.
+        if est.min_samples is None:
+            resolved_ms = d + 1
+        elif 0 < est.min_samples < 1:
+            resolved_ms = int(np.ceil(est.min_samples * n))
+        else:
+            resolved_ms = int(est.min_samples)
+        if est.residual_threshold is None:
+            resolved_rt = float(np.median(np.abs(y - np.median(y))))
+        else:
+            resolved_rt = float(est.residual_threshold)
+        out[f"min_samples_{name}"] = np.asarray([float(resolved_ms)], dtype=np.float64)
+        out[f"residual_threshold_{name}"] = np.asarray([resolved_rt], dtype=np.float64)
+
+        # --- the margin that makes an EXACT `inlier_mask_` gate well-posed --
+        # How close the nearest row gets to the threshold, relative to the
+        # residual scale. Below ~1e-6 the two libraries' `gemv` blocking could
+        # move a row across, and the exact mask comparison in `ransac_test.rs`
+        # would be a coin flip on an unrelated change.
+        y_pred = est.estimator_.predict(x)
+        if est.loss == "squared_error":
+            resid = (y - y_pred) ** 2
+        else:
+            resid = np.abs(y - y_pred)
+        scale = max(float(np.max(resid)), resolved_rt, 1.0)
+        margin = float(np.min(np.abs(resid - resolved_rt))) / scale
+        out[f"margin_{name}"] = np.asarray([margin], dtype=np.float64)
+        margins.append((name, margin))
+
+    worst = min(margins, key=lambda kv: kv[1])
+    assert worst[1] > 1e-6, (
+        f"gen_ransac: case {worst[0]!r} has a row only {worst[1]:.3e} (relative) "
+        "from `residual_threshold` — the exact `inlier_mask_` gate in "
+        "ransac_test.rs cannot be trusted at that margin. Reseed, or widen "
+        "RANSAC_OUTLIER_SHIFT."
+    )
+
+    # --- premise: the callback cases actually rejected something -----------
+    for name in ("data_valid", "model_valid"):
+        skips = out[f"counters_{name}"]
+        idx = 2 if name == "data_valid" else 3
+        assert skips[idx] > 0, (
+            f"gen_ransac: the {name!r} predicate never rejected a sub-sample, so "
+            "the case pins nothing — tighten its threshold"
+        )
+    # --- premise: `max_skips` really did trip the early exit ---------------
+    ms = out["counters_max_skips"]
+    assert ms[1] + ms[2] + ms[3] > 3, (
+        "gen_ransac: the `max_skips` case did not exceed its skip budget, so it "
+        "does not pin the ConvergenceWarning branch — lower residual_threshold"
+    )
+    # --- premise: the outlier structure is what the estimator sees ---------
+    n_inliers = int(out["inlier_mask_default"].sum())
+    assert 0.5 * n < n_inliers < n, (
+        f"gen_ransac: the default case keeps {n_inliers} of {n} rows as inliers "
+        "— the consensus is either the whole design (nothing to exclude) or a "
+        "minority (the search failed); neither exercises RANSAC"
+    )
+    # --- premise: `_dynamic_max_trials` genuinely shortens the search ------
+    assert out["counters_default"][0] < 100, (
+        "gen_ransac: the default case ran all 100 trials, so `stop_probability` "
+        "and the dynamic-trial formula are untested by it"
+    )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, f"ransac_{dtype_tag}_seed{seed}.npz")
+    np.savez(out_path, **out)
+    return out_path
+
+
 def _huber_tight_optimum(x, y, epsilon, alpha, sample_weight, fit_intercept):
     """The Huber minimizer driven to machine precision, for the residual probe.
 
@@ -7691,6 +7942,13 @@ def main() -> None:
     # control-flow cases, and the warm_start pair.
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_huber(dtype=dtype)}")
+    # RANSACRegressor FULL parameter surface (RANSAC-01): both `loss`
+    # options (the estimator's ONE string-valued parameter), all three
+    # `min_samples` forms, every stop rule, both validity callbacks and
+    # `sample_weight`. Ships `n_trials_` / `n_skips_*` / `inlier_mask_` so
+    # the Rust test gates the TRAJECTORY, not only the final coefficients.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_ransac(dtype=dtype)}")
     # GaussianMixture FULL parameter surface (MIX-01): the covariance_type x
     # init_params cross fitted to machine precision, plus fully-injected-init
     # cases that remove the RNG entirely, plus a reg_covar sweep.

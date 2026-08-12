@@ -61,6 +61,15 @@ pub mod elastic_net;
 pub mod lasso;
 pub mod linear_regression;
 pub mod logistic;
+// `RANSACRegressor` (RANSAC-01) — the outlier-EXCLUDING robust regressor, the
+// counterpart to `HuberRegressor`'s outlier-DOWNWEIGHTING one. Deliberately not
+// unified with it: there is no objective to minimize here, only a consensus
+// search over random sub-samples, and the base model it refits is an ordinary
+// least-squares solve. The compute engine is
+// `mlrs_backend::prims::ransac_host` — host-resident on EVERY backend, because
+// a trial is a launch-bound `n × d` pass whose result the NEXT draw's stopping
+// rule must read back (see that module's docs).
+pub mod ransac;
 pub mod ridge;
 pub mod ridge_classifier;
 pub mod ridge_solvers;
