@@ -47,6 +47,7 @@ pub mod hist_gradient_boosting_regressor;
 pub mod tree_shap;
 pub mod random_forest_classifier;
 pub mod random_forest_regressor;
+pub mod stacking;
 
 /// The sklearn `max_features` policy for per-node feature subsampling
 /// (resolved to a concrete count at `fit`, when `n_features` is known).

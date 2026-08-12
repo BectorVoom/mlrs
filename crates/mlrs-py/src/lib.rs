@@ -67,6 +67,11 @@ pub mod metrics;
 // halving schedules, CV aggregation and decision-threshold tuning, over
 // `mlrs_algos::model_selection`. Host-only, like `metrics`.
 pub mod model_selection;
+// The stacking meta-estimator's structural PyO3 free-function surface
+// (STACK-BIND-01): name validation, `'drop'` bookkeeping, meta-feature column
+// layout, `get_feature_names_out` strings and the `cv="prefit"` sentinel, over
+// `mlrs_algos::ensemble::stacking`. Host-only, like `metrics`.
+pub mod stacking;
 
 // The estimator `#[pyclass]` wrappers (Plan 03 onward, across every estimator
 // family landed since — linear/cluster/decomposition/neighbors/covariance/
@@ -223,6 +228,10 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The `model_selection` surface (MODSEL-BIND-01) — one call, since it
     // registers ~33 free functions plus the `NumpyRandomState` class.
     model_selection::register(m)?;
+
+    // The stacking composition surface (STACK-BIND-01) — six host-only free
+    // functions backing `mlrs.StackingRegressor`.
+    stacking::register(m)?;
 
     // Register all estimator `#[pyclass]` wrappers (PY-01). The pure-Python
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.

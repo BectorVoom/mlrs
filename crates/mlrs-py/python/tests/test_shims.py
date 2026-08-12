@@ -11,6 +11,7 @@ delegation to ``_mlrs`` is exercised by the live-extension oracle gate.
 Req: PY-01 (fit returns self / NotFitted), PY-02 (sklearn names + get/set_params).
 """
 
+import numpy as np
 import pytest
 from sklearn.base import (
     ClassifierMixin,
@@ -21,6 +22,7 @@ from sklearn.base import (
 )
 from sklearn.exceptions import NotFittedError
 
+import conftest
 import mlrs
 from mlrs.base import MlrsBase
 
@@ -28,13 +30,27 @@ from mlrs.base import MlrsBase
 def _exported_shim_names():
     """Every exported ``mlrs`` symbol that is an ``MlrsBase`` estimator shim.
 
-    Derived from ``mlrs.__all__`` (excludes the ``backend_supports_f64`` flag and
-    the ``johnson_lindenstrauss_min_dim`` helper) so the matrix grows
+    Derived from ``mlrs.__all__`` (excludes the ``backend_supports_f64`` flags
+    and the ``johnson_lindenstrauss_min_dim`` helper) so the matrix grows
     automatically as new shim classes are registered — no hard-coded list.
+
+    The ``getattr`` is guarded because ``mlrs.__all__`` is not uniformly
+    resolvable without the compiled extension: ``backend_supports_f64`` and
+    ``backend_supports_f64_transcendental`` are served by the package
+    ``__getattr__``, which imports ``_mlrs`` and raises ``ImportError`` on a
+    not-yet-built tree. A bare ``getattr`` here therefore took the WHOLE module
+    down at import time — collection, not just the device-touching half — which
+    silently voided this file's Wave-0 contract (every assertion below is
+    pure-Python and is exactly what should still run pre-build). A name that
+    cannot be resolved without the extension is not an ``MlrsBase`` shim by
+    construction, so skipping it loses nothing.
     """
     names = []
     for name in mlrs.__all__:
-        obj = getattr(mlrs, name)
+        try:
+            obj = getattr(mlrs, name)
+        except ImportError:
+            continue
         if isinstance(obj, type) and issubclass(obj, MlrsBase):
             names.append(name)
     return names
@@ -237,8 +253,18 @@ def test_random_forest_oob_score_conditional_attribute():
     # skipped (not failed) on a not-yet-built tree, keeping this file's
     # pure-Python collection contract intact for part (a) above.
     pytest.importorskip("mlrs._mlrs")
-    X = [[0.0, 0.0], [1.0, 1.0], [2.0, 0.5], [0.5, 2.0], [1.5, 1.5], [3.0, 3.0]]
-    y = [0.0, 1.0, 2.0, 0.5, 1.5, 3.0]
+    # The dtype is the BACKEND's, not float64. A plain Python float list ingests
+    # as float64, which rocm/cuda reject outright ("backend 'rocm' does not
+    # support float64") — so hardcoding it turns this shim-contract assertion
+    # into a dtype-support assertion, and it FAILS on those backends rather than
+    # testing what it is named for. `oob_score_`'s presence has nothing to do
+    # with precision, so the test takes whatever float the backend has.
+    dtype = conftest.default_float_dtype()
+    X = np.array(
+        [[0.0, 0.0], [1.0, 1.0], [2.0, 0.5], [0.5, 2.0], [1.5, 1.5], [3.0, 3.0]],
+        dtype=dtype,
+    )
+    y = np.array([0.0, 1.0, 2.0, 0.5, 1.5, 3.0], dtype=dtype)
     est = mlrs.RandomForestRegressor(
         n_estimators=2, max_depth=2, oob_score=False
     ).fit(X, y)

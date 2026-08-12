@@ -22,3 +22,6 @@ pub mod bridge;
 pub mod device_array;
 pub mod pool;
 pub mod prims;
+// STREAM-CAP-01: caps CubeCL's per-OS-thread stream count before the first
+// client is built. Installed by `runtime::active_client`.
+pub mod stream_cap;

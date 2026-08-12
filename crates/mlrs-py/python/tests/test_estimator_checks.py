@@ -26,6 +26,10 @@ pytest.importorskip("mlrs")
 
 import mlrs  # noqa: E402  (after importorskip)
 from mlrs import _io  # noqa: E402  (after importorskip)
+from sklearn.linear_model import (  # noqa: E402  (StackingRegressor members)
+    LinearRegression as SkLinearRegression,
+    Ridge as SkRidge,
+)
 from sklearn.utils import get_tags  # noqa: E402
 from sklearn.utils.estimator_checks import (  # noqa: E402
     parametrize_with_checks,
@@ -114,6 +118,22 @@ def _estimators():
         mlrs.RobustScaler(),
         mlrs.Normalizer(),
         mlrs.Binarizer(),
+        # --- STACK-01: the stacking meta-estimator. Two CHEAP host base
+        # regressors and `cv=2`, because one `fit` here is `cv + 1` fits per
+        # member and the harness fits each entry ~49 times. `passthrough` stays
+        # at its default: sklearn's OWN StackingRegressor fails
+        # `check_{regressor,transformer}_data_not_an_array` with
+        # `passthrough=True` (it hstacks the duck-typed `_NotAnArray` straight
+        # through), so gating mlrs on that configuration would enforce a
+        # standard the reference implementation does not meet. Verified 2026-08-11:
+        # 57 passed / 1 skipped at the default, identical to sklearn's own.
+        mlrs.StackingRegressor(
+            estimators=[
+                ("lr", SkLinearRegression()),
+                ("ridge", SkRidge()),
+            ],
+            cv=2,
+        ),
     ]
 
 
@@ -475,28 +495,53 @@ def _preserves_dtype_check_applies(estimator):
 # (LinearSVC/LinearSVR's solver) already contain deliberate, empirically-
 # calibrated dtype-precision-floor acceptance logic for the symmetric
 # over-parameterized objective's gauge null-space (see
-# `logistic.rs::GAUGE_FLOOR_K` and its ~80-line comment). On the check
-# harness's small fixtures and each estimator's sklearn-default `max_iter`
-# (100 for LogisticRegression, 1000 for LinearSVC/LinearSVR), running that
-# same solve at float32 (this harness's rocm downcast) exhausts max_iter
-# before even that floor-acceptance branch fires, and `fit` raises
-# `AlgoError::NotConverged` where sklearn's check expects a clean fit. This is
-# a genuine rocm/float32 behavior difference a real user could hit on a small
-# or ill-conditioned dataset with these estimators' library DEFAULTS — not
-# just a test-fixture quirk — so it is called out explicitly rather than
-# folded into a generic "iterative solver" excuse. Retuning the f32
-# convergence floor for these specific solvers is separate follow-up work,
-# not attempted here.
+# `logistic.rs::GAUGE_FLOOR_K` and its ~80-line comment). ROOT-CAUSED with
+# real repros against these EXACT check fixtures (`X = rng.normal(loc=100,
+# size=(100,2))`, `y` an UNCORRELATED random draw — see
+# `mlrs-logreg-svm-f32-degenerate-convergence` project memory for the full
+# writeup):
+#   - the initial guess that this was "exhausts max_iter, needs headroom" is
+#     WRONG — verified directly: it still fails identically at max_iter=5000.
+#     It stalls via LineSearchFailed after only ~20 iterations, every time.
+#   - LogisticRegression: `grad_scale` (the problem's own gradient scale) is
+#     SMALL here (<1.0), so `linear_svc.rs`'s already-landed relative-floor
+#     fix (`k*sqrt(eps)*grad_scale.max(1.0)`, from the
+#     `mlrs-precision-floor-must-be-relative` memory) would not even widen
+#     anything for this case — a different fix shape is needed, not a
+#     mechanical port. Forced-accept diagnostic: predict_proba matches
+#     sklearn's own fit to within 0.0026 absolute and predict() 100% —
+#     reasonable, but a couple of orders looser than the usual 1e-5 oracle,
+#     consistent with a genuinely hard near-separable small-sample fit
+#     (sklearn's own intercept is |26.8|, itself a near-separation signature).
+#   - LinearSVC/LinearSVR: the relative floor from the 2026-08-06 fix IS
+#     present here (grad_scale is large, 30-1300), but the residual still
+#     lands 1.4x-26x past it. Forced-accept diagnostic: predict() 100% match
+#     (SVC) / 0.9998+ correlation (SVR) vs sklearn. CRITICALLY, sklearn's OWN
+#     liblinear reference ALSO raises "ConvergenceWarning: Liblinear failed
+#     to converge" fitting this exact fixture — the check's own random-label
+#     data is genuinely too ill-posed for ANY solver to cleanly converge, so
+#     mlrs's NotConverged here is arguably CORRECT, defensible behavior, not
+#     a bug.
+# Given (a) only ONE fixture/seed was measured here (the landed 2026-08-06 fix
+# validated across 4 distinct cases before changing a formula) and (b) even
+# sklearn's own reference doesn't cleanly converge on the SVC/SVR fixture,
+# blindly widening a floor constant from this single data point risks either
+# masking a genuine non-convergence signal elsewhere or still not covering
+# other cases — deliberately NOT attempted here; flagged as a real, deeper
+# follow-up candidate rather than fixed.
 _ROCM_F32_NOT_CONVERGED = (
-    "on an f64-incapable backend (rocm), downcasting the check harness's "
-    "fixture to float32 (see _DTYPE_PRESERVE_ROCM_REASON) exhausts this "
-    "estimator's default max_iter before its f32 gauge/precision-floor "
-    "convergence acceptance (logistic.rs::GAUGE_FLOOR_K and its linear_svc.rs "
-    "analogue) can fire, so fit() raises AlgoError::NotConverged where "
-    "sklearn's check expects a clean fit. A real rocm/float32 precision gap "
-    "reachable with this estimator's library-default max_iter on small or "
-    "ill-conditioned data (not a test-fixture-only artifact); retuning the "
-    "f32 convergence floor for this solver is separate follow-up work."
+    "on an f64-incapable backend (rocm), this estimator's f32 L-BFGS solve "
+    "stalls via a LineSearchFailed breakdown after ~20 iterations on this "
+    "check's near-degenerate random-label fixture (X ~ N(loc=100), y "
+    "uncorrelated) — CONFIRMED not an iteration-budget issue (fails "
+    "identically at max_iter=5000) and CONFIRMED numerically reasonable when "
+    "forced through (predict matches sklearn 100%/0.9998+ correlation; "
+    "sklearn's own liblinear reference also fails to converge on the "
+    "LinearSVC/LinearSVR fixture). A genuinely hard/ill-conditioned corner "
+    "case, not a simple max_iter or floor-constant tuning gap — see the "
+    "mlrs-logreg-svm-f32-degenerate-convergence project memory for the full "
+    "root-cause investigation and why a blind floor widening was not "
+    "attempted from a single measured case."
 )
 
 # `check_classifiers_train` asserts `predict_log_proba == log(predict_proba)`
