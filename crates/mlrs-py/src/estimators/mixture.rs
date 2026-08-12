@@ -34,6 +34,8 @@
 
 use pyo3::prelude::*;
 
+use crate::estimators::linear::parse_device;
+
 use mlrs_algos::mixture::bayesian_gaussian_mixture::{
     BayesianGaussianMixture, BayesianMixtureParams,
 };
@@ -54,6 +56,8 @@ crate::any_estimator_typestate! {
 /// a SECOND `fit` of the same object rebuilds correctly (WR-02).
 #[derive(Clone)]
 struct GmmParams {
+    /// DEVICE-PARAM-01, a STRING until `fit` (D-09).
+    device: String,
     n_components: usize,
     covariance_type: String,
     tol: f64,
@@ -91,6 +95,7 @@ impl PyGaussianMixture {
 macro_rules! gmm_build {
     ($float:ty, $p:expr, $warm:expr) => {
         GaussianMixture::<$float>::builder()
+            .device(parse_device($p.device.as_str())?)
             .n_components($p.n_components)
             .covariance_type($p.covariance_type.clone())
             .tol($p.tol)
@@ -154,6 +159,7 @@ impl PyGaussianMixture {
         warm_start = false,
         verbose = 0,
         verbose_interval = 10,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -171,10 +177,12 @@ impl PyGaussianMixture {
         warm_start: bool,
         verbose: usize,
         verbose_interval: usize,
+        device: String,
     ) -> Self {
         Self {
             inner: AnyGaussianMixture::Unfit { n_components },
             params: GmmParams {
+                device,
                 n_components,
                 covariance_type,
                 tol,
@@ -323,6 +331,16 @@ impl PyGaussianMixture {
             AnyGaussianMixture::F32(e) => Ok(e.covariance_shape()),
             AnyGaussianMixture::F64(e) => Ok(e.covariance_shape()),
             _ => Err(not_fitted("gaussian_mixture", "covariance_shape")),
+        }
+    }
+
+    /// `device_` — the EM engine that actually ran (`"cpu"` / `"gpu"`), read
+    /// off the fitted estimator. `None` before `fit`.
+    fn device_used(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyGaussianMixture::F32(e) => e.device_arm(),
+            AnyGaussianMixture::F64(e) => e.device_arm(),
+            _ => None,
         }
     }
 
@@ -549,6 +567,8 @@ crate::any_estimator_typestate! {
 /// of the same object rebuilds correctly (WR-02).
 #[derive(Clone)]
 struct BgmParams {
+    /// DEVICE-PARAM-01, a STRING until `fit` (D-09).
+    device: String,
     n_components: usize,
     covariance_type: String,
     tol: f64,
@@ -595,6 +615,7 @@ impl PyBayesianGaussianMixture {
 macro_rules! bgm_build {
     ($float:ty, $p:expr, $warm:expr) => {
         BayesianGaussianMixture::<$float>::builder()
+            .device(parse_device($p.device.as_str())?)
             .n_components($p.n_components)
             .covariance_type($p.covariance_type.clone())
             .tol($p.tol)
@@ -674,6 +695,7 @@ impl PyBayesianGaussianMixture {
         warm_start = false,
         verbose = 0,
         verbose_interval = 10,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -694,10 +716,12 @@ impl PyBayesianGaussianMixture {
         warm_start: bool,
         verbose: usize,
         verbose_interval: usize,
+        device: String,
     ) -> Self {
         Self {
             inner: AnyBayesianGaussianMixture::Unfit { n_components },
             params: BgmParams {
+                device,
                 n_components,
                 covariance_type,
                 tol,
@@ -886,6 +910,16 @@ impl PyBayesianGaussianMixture {
     /// The sklearn SHAPE of `covariances_` / `precisions_`.
     fn covariance_shape(&self) -> PyResult<Vec<usize>> {
         bgm_attr_f64!(self, "covariance_shape", |e| e.covariance_shape())
+    }
+
+    /// `device_` — the EM engine that actually ran (`"cpu"` / `"gpu"`), read
+    /// off the fitted estimator. `None` before `fit`.
+    fn device_used(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyBayesianGaussianMixture::F32(e) => e.device_arm(),
+            AnyBayesianGaussianMixture::F64(e) => e.device_arm(),
+            _ => None,
+        }
     }
 
     fn converged(&self) -> PyResult<bool> {

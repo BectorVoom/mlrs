@@ -25,6 +25,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::abflag;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -173,16 +174,16 @@ where
     let bits = match kind {
         Kind::Reg => {
             let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(&mut pool, &y_reg);
-            let m = hgb_fit_reg::<F>(&mut pool, &x_dev, (n, d), &y_dev, params).expect("fit reg");
+            let m = hgb_fit_reg::<F>(&mut pool, &x_dev, (n, d), &y_dev, params, Device::Auto).expect("fit reg");
             snapshot(&m, &pool)
         }
         Kind::Binary => {
             let y2: Vec<u32> = y_idx.iter().map(|&c| u32::from(c >= 1)).collect();
-            let m = hgb_fit_class::<F>(&mut pool, &x_dev, (n, d), &y2, 2, params).expect("fit bin");
+            let m = hgb_fit_class::<F>(&mut pool, &x_dev, (n, d), &y2, 2, params, Device::Auto).expect("fit bin");
             snapshot(&m, &pool)
         }
         Kind::Multi => {
-            let m = hgb_fit_class::<F>(&mut pool, &x_dev, (n, d), &y_idx, 3, params)
+            let m = hgb_fit_class::<F>(&mut pool, &x_dev, (n, d), &y_idx, 3, params, Device::Auto)
                 .expect("fit multi");
             snapshot(&m, &pool)
         }

@@ -18,6 +18,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gemm::gemm;
@@ -44,6 +45,8 @@ use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, PredictPro
 ///
 /// [`n_coef_rows`]: MBSGDClassifier::n_coef_rows
 pub struct MBSGDClassifier<F, S = Unfit> {
+    /// Where to run the heavy phase (DEVICE-PARAM-01).
+    device: Device,
     /// The lowered, validated hyperparameter bundle (D-06).
     config: SgdConfig,
     /// DISTINCT sorted class labels inferred at `fit` (Pitfall 4 — ±1 encoding
@@ -142,6 +145,7 @@ where
 /// `learning_rate=optimal`, `eta0=0.01`, `power_t=0.5`, `n_iter_no_change=5`.
 #[derive(Debug, Clone, Copy)]
 pub struct MBSGDClassifierBuilder {
+    device: Device,
     loss: Loss,
     penalty: Penalty,
     alpha: f64,
@@ -161,6 +165,7 @@ pub struct MBSGDClassifierBuilder {
 impl Default for MBSGDClassifierBuilder {
     fn default() -> Self {
         Self {
+            device: Device::Auto,
             loss: Loss::Hinge,
             penalty: Penalty::L2,
             alpha: 1e-4,
@@ -180,6 +185,14 @@ impl Default for MBSGDClassifierBuilder {
 }
 
 impl MBSGDClassifierBuilder {
+
+    /// Pin the execution arm (DEVICE-PARAM-01). [`Device::Auto`] keeps the
+    /// existing gate and its `MLRS_*` A/B flag; `Cpu`/`Gpu` override its PERF
+    /// half only — each prim keeps its own capability checks inside.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
     /// Set the loss family.
     pub fn loss(mut self, loss: Loss) -> Self {
         self.loss = loss;
@@ -332,6 +345,7 @@ impl MBSGDClassifierBuilder {
             n_iter_no_change: self.n_iter_no_change,
         };
         Ok(MBSGDClassifier {
+            device: self.device,
             config,
             classes_: Vec::new(),
             n_features: 0,
@@ -535,6 +549,7 @@ where
         }
 
         Ok(MBSGDClassifier {
+            device: self.device,
             config: self.config,
             classes_,
             n_features,
@@ -593,9 +608,10 @@ where
         // device-resident, no host round-trip.
         if n_coef_rows == 1 {
             let yp_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &targets[0]);
-            let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params)?;
+            let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params, self.device)?;
             yp_dev.release_into(pool);
             return Ok(MBSGDClassifier {
+                device: self.device,
                 config: self.config,
                 classes_,
                 n_features,
@@ -620,7 +636,7 @@ where
             // Delegate to the validated PRIM-10 prim (10-02). A device failure
             // is a typed PrimError, wrapped into AlgoError::Prim via `?`
             // (never a panic across the estimator boundary — T-10-03-03).
-            let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params)?;
+            let (coef, intercept) = sgd_solve::<F>(pool, x, &yp_dev, shape, &params, self.device)?;
             // The ±1 target buffer is only needed during the solve (WR-07
             // re-fit buffer release).
             yp_dev.release_into(pool);
@@ -631,6 +647,7 @@ where
         }
 
         Ok(MBSGDClassifier {
+            device: self.device,
             config: self.config,
             classes_,
             n_features,

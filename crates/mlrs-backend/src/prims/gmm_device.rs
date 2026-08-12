@@ -129,14 +129,28 @@ use crate::runtime::ActiveRuntime;
 ///    per-launch dispatch cost still dominates a `max_iter · n_init` loop of
 ///    tiny passes (`gmm_host` reason #1, unmodified by this module) — see
 ///    [`GMM_DEVICE_MIN_WORK`].
+/// Whether this backend can RUN the device EM engine at all — a capability,
+/// not a preference.
+///
+/// The E-step evaluates a Gaussian log-density, so it needs `f64` device
+/// kernels AND `f64` transcendentals. A backend missing them does not fail at
+/// launch — the driver's shader compiler can SEGFAULT (see
+/// `umap_host_knn.rs`). Split out of [`gmm_device_applicable`] so
+/// `device="gpu"` overrides the SIZE half without overriding this one.
+///
+/// The cpu-backend check stays on the perf side deliberately: `cubecl-cpu`
+/// compiles and runs these kernels correctly, just slowly, so forcing them
+/// there is a legitimate (if unwise) request.
+pub fn gmm_device_possible() -> bool {
+    crate::capability::f64_device_kernels_available()
+        && crate::capability::f64_transcendental_supported()
+}
+
 pub fn gmm_device_applicable(n: usize, d: usize, k: usize) -> bool {
     if crate::capability::active_backend_name() == "cpu" {
         return false;
     }
-    if !crate::capability::f64_device_kernels_available() {
-        return false;
-    }
-    if !crate::capability::f64_transcendental_supported() {
+    if !gmm_device_possible() {
         return false;
     }
     if let Some(v) = crate::abflag::var("MLRS_GMM_DEVICE") {

@@ -50,6 +50,13 @@ def _estimators():
     return [
         mlrs.LinearRegression(),
         mlrs.Ridge(),
+        # RidgeCV: the harness's fixtures are ~30 rows, so the DEFAULT three
+        # alphas are already a real grid there and need no shrinking. It is in
+        # this list rather than absent because it takes `sample_weight` in
+        # `fit`, which enrols a shim in sklearn 1.9's weight-invariance checks
+        # ([[mlrs-sklearn-estimator-checks-landmines]]) — the ones most likely
+        # to catch a weighted-centering or weighted-scoring mistake.
+        mlrs.RidgeCV(),
         # BayesianRidge: `max_iter` is the evidence-iteration cap, and the
         # loop converges in single digits on the harness's tiny fixtures, so
         # the class default needs no shrinking (unlike MBSGD/RF/HGB below).
@@ -303,6 +310,24 @@ _EXPECTED = {
     # `n_iter_` (sklearn sets it unconditionally to `iter_ + 1`), so
     # `check_non_transformer_estimators_n_iter` genuinely passes and is NOT
     # carved out here.
+    # RidgeCV needs a NARROWER map than `_COMMON` + `_SUPERVISED`: it passes
+    # `check_dtype_object`, all three sparse checks, and `check_supervised_y_2d`
+    # (the last because it is a genuine multi-output estimator, so sklearn does
+    # not probe the column-vector warning at all). Handing it the shared maps
+    # made five checks XPASS, which advertises as unsupported something that is
+    # in fact supported — the `_PREP01` precedent above. Only the two real
+    # divergences are listed.
+    #
+    # Nothing about the CV machinery needs an exemption, which is the point of
+    # putting RidgeCV in this sweep at all: having `sample_weight` in `fit`
+    # enrols it in sklearn 1.9's weight-invariance checks
+    # ([[mlrs-sklearn-estimator-checks-landmines]]) — the ones most likely to
+    # catch a weighted-centering or weighted-scoring mistake — and those run
+    # GREEN.
+    "RidgeCV": _merge(
+        {"check_estimators_pickle": _COMMON["check_estimators_pickle"]},
+        {"check_requires_y_none": _SUPERVISED["check_requires_y_none"]},
+    ),
     "BayesianRidge": _merge(_COMMON, _SUPERVISED),
     "Lasso": _merge(_COMMON, _SUPERVISED, _N_ITER),
     "ElasticNet": _merge(_COMMON, _SUPERVISED, _N_ITER),

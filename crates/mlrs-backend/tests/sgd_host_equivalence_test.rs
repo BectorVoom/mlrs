@@ -26,6 +26,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::abflag;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -112,7 +113,7 @@ where
     let x_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, x);
     let y_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, y);
     let (coef, intercept) =
-        sgd_solve::<F>(&mut pool, &x_dev, &y_dev, (n, d), params).expect("sgd_solve");
+        sgd_solve::<F>(&mut pool, &x_dev, &y_dev, (n, d), params, Device::Auto).expect("sgd_solve");
     let c = coef.to_host(&mut pool);
     let b = intercept.to_host(&mut pool)[0];
     (c, b)

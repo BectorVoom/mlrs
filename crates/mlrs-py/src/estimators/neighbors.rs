@@ -24,6 +24,10 @@
 use arrow::array::ArrayRef;
 use pyo3::prelude::*;
 
+use crate::estimators::linear::parse_device;
+
+use mlrs_backend::device::Device;
+
 use mlrs_algos::neighbors::classifier::{prepare_labels, KNeighborsClassifier, PreparedLabels};
 use mlrs_algos::neighbors::nearest::NearestNeighbors;
 use mlrs_algos::neighbors::regressor::KNeighborsRegressor;
@@ -74,6 +78,10 @@ struct NnPendingFit {
 /// silently fall back to the defaults).
 #[derive(Clone, Copy)]
 struct NnParams {
+    /// DEVICE-PARAM-01. Already the typed enum here (unlike the string the
+    /// linear wrappers carry) because these params structs are `Copy` and the
+    /// neighbours ctor parses eagerly — `Metric` next to it does the same.
+    device: Device,
     n_neighbors: usize,
     metric: Metric,
 }
@@ -81,6 +89,7 @@ struct NnParams {
 impl Default for NnParams {
     fn default() -> Self {
         Self {
+            device: Device::Auto,
             n_neighbors: 5,
             metric: Metric::Euclidean,
         }
@@ -95,6 +104,7 @@ impl NnParams {
     fn build_f32(&self) -> PyResult<NearestNeighbors<f32>> {
         NearestNeighbors::<f32>::builder()
             .n_neighbors(self.n_neighbors)
+            .device(self.device)
             .metric(self.metric)
             .build::<f32>()
             .map_err(build_err_to_py)
@@ -104,6 +114,7 @@ impl NnParams {
     fn build_f64(&self) -> PyResult<NearestNeighbors<f64>> {
         NearestNeighbors::<f64>::builder()
             .n_neighbors(self.n_neighbors)
+            .device(self.device)
             .metric(self.metric)
             .build::<f64>()
             .map_err(build_err_to_py)
@@ -188,12 +199,13 @@ impl PyNearestNeighbors {
     /// output instead and only ever constructs this wrapper with a built-in
     /// metric (see `KNeighborsClassifier::new` for the identical rationale).
     #[new]
-    #[pyo3(signature = (n_neighbors = 5, metric = "minkowski", p = 2.0))]
-    fn new(n_neighbors: usize, metric: &str, p: f64) -> PyResult<Self> {
+    #[pyo3(signature = (n_neighbors = 5, metric = "minkowski", p = 2.0, device = "auto"))]
+    fn new(n_neighbors: usize, metric: &str, p: f64, device: &str) -> PyResult<Self> {
         let metric = metric_from_str(metric, p)?;
+        let device = parse_device(device)?;
         Ok(Self {
             inner: AnyNearestNeighbors::Unfit { n_neighbors },
-            params: NnParams { n_neighbors, metric },
+            params: NnParams { n_neighbors, metric, device },
             pending: None,
         })
     }
@@ -399,6 +411,10 @@ struct ClfPendingFit {
 /// silently fall back to the defaults).
 #[derive(Clone, Copy)]
 struct KnnClfParams {
+    /// DEVICE-PARAM-01. Already the typed enum here (unlike the string the
+    /// linear wrappers carry) because these params structs are `Copy` and the
+    /// neighbours ctor parses eagerly — `Metric` next to it does the same.
+    device: Device,
     n_neighbors: usize,
     weights: Weights,
     metric: Metric,
@@ -407,6 +423,7 @@ struct KnnClfParams {
 impl Default for KnnClfParams {
     fn default() -> Self {
         Self {
+            device: Device::Auto,
             n_neighbors: 5,
             weights: Weights::Uniform,
             metric: Metric::Euclidean,
@@ -422,6 +439,7 @@ impl KnnClfParams {
     fn build_f32(&self) -> PyResult<KNeighborsClassifier<f32>> {
         KNeighborsClassifier::<f32>::builder()
             .n_neighbors(self.n_neighbors)
+            .device(self.device)
             .weights(self.weights)
             .metric(self.metric)
             .build::<f32>()
@@ -432,6 +450,7 @@ impl KnnClfParams {
     fn build_f64(&self) -> PyResult<KNeighborsClassifier<f64>> {
         KNeighborsClassifier::<f64>::builder()
             .n_neighbors(self.n_neighbors)
+            .device(self.device)
             .weights(self.weights)
             .metric(self.metric)
             .build::<f64>()
@@ -523,13 +542,15 @@ impl PyKNeighborsClassifier {
     /// serves them from `kneighbors` output instead and only ever constructs this
     /// wrapper with a built-in weighting and metric.
     #[new]
-    #[pyo3(signature = (n_neighbors = 5, weights = "uniform", metric = "minkowski", p = 2.0))]
-    fn new(n_neighbors: usize, weights: &str, metric: &str, p: f64) -> PyResult<Self> {
+    #[pyo3(signature = (n_neighbors = 5, weights = "uniform", metric = "minkowski", p = 2.0, device = "auto"))]
+    fn new(n_neighbors: usize, weights: &str, metric: &str, p: f64, device: &str) -> PyResult<Self> {
+        let device = parse_device(device)?;
         let weights = weights_from_str(weights)?;
         let metric = metric_from_str(metric, p)?;
         Ok(Self {
             inner: AnyKNeighborsClassifier::Unfit { n_neighbors },
             params: KnnClfParams {
+                device,
                 n_neighbors,
                 weights,
                 metric,
@@ -861,6 +882,10 @@ fn metric_to_str(m: Metric) -> &'static str {
 /// that.
 #[derive(Clone, Copy)]
 struct KnnRegParams {
+    /// DEVICE-PARAM-01. Already the typed enum here (unlike the string the
+    /// linear wrappers carry) because these params structs are `Copy` and the
+    /// neighbours ctor parses eagerly — `Metric` next to it does the same.
+    device: Device,
     n_neighbors: usize,
     weights: Weights,
     metric: Metric,
@@ -869,6 +894,7 @@ struct KnnRegParams {
 impl Default for KnnRegParams {
     fn default() -> Self {
         Self {
+            device: Device::Auto,
             n_neighbors: 5,
             weights: Weights::Uniform,
             metric: Metric::Euclidean,
@@ -884,6 +910,7 @@ impl KnnRegParams {
     fn build_f32(&self) -> PyResult<KNeighborsRegressor<f32>> {
         KNeighborsRegressor::<f32>::builder()
             .n_neighbors(self.n_neighbors)
+            .device(self.device)
             .weights(self.weights)
             .metric(self.metric)
             .build::<f32>()
@@ -894,6 +921,7 @@ impl KnnRegParams {
     fn build_f64(&self) -> PyResult<KNeighborsRegressor<f64>> {
         KNeighborsRegressor::<f64>::builder()
             .n_neighbors(self.n_neighbors)
+            .device(self.device)
             .weights(self.weights)
             .metric(self.metric)
             .build::<f64>()
@@ -1023,13 +1051,15 @@ impl PyKNeighborsRegressor {
     /// output instead and only ever constructs this wrapper with a built-in
     /// weighting.
     #[new]
-    #[pyo3(signature = (n_neighbors = 5, weights = "uniform", metric = "minkowski", p = 2.0))]
-    fn new(n_neighbors: usize, weights: &str, metric: &str, p: f64) -> PyResult<Self> {
+    #[pyo3(signature = (n_neighbors = 5, weights = "uniform", metric = "minkowski", p = 2.0, device = "auto"))]
+    fn new(n_neighbors: usize, weights: &str, metric: &str, p: f64, device: &str) -> PyResult<Self> {
+        let device = parse_device(device)?;
         let weights = weights_from_str(weights)?;
         let metric = metric_from_str(metric, p)?;
         Ok(Self {
             inner: AnyKNeighborsRegressor::Unfit { n_neighbors },
             params: KnnRegParams {
+                device,
                 n_neighbors,
                 weights,
                 metric,

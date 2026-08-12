@@ -87,6 +87,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::huber_objective::{HuberDesign, HuberEval, HuberObjective};
@@ -134,6 +135,12 @@ const GRAD_FLOOR_K: f64 = 0.5;
 /// `HuberRegressor<F, Fitted>` (the compile-time typestate replaces a runtime
 /// `NotFitted` guard, D-03).
 pub struct HuberRegressor<F, S = Unfit> {
+    /// Where to run the heavy phase (DEVICE-PARAM-01).
+    device: Device,
+    /// The objective arm the LAST `fit` actually built, `None` until then.
+    /// Recorded off the constructed engine rather than re-derived from the
+    /// gate, so it cannot name an arm the solve did not take.
+    device_: Option<&'static str>,
     /// Outlier cut-off on the SCALED residual (sklearn `epsilon`, `>= 1.0`).
     epsilon: f64,
     /// L-BFGS iteration cap (sklearn `max_iter`).
@@ -250,6 +257,16 @@ where
         self.n_iter_
     }
 
+    /// The objective arm that ACTUALLY ran, `"cpu"` or `"gpu"` (DEVICE-PARAM-01).
+    ///
+    /// `device='gpu'` overrides the SIZE half of `huber_device_applicable`, not
+    /// its capability half: the cpu backend cannot compile the margin kernel at
+    /// all (`huber_device_possible`), and this reports the host fallback so an
+    /// unhonourable preference is visible rather than silently faked.
+    pub fn device_arm(&self) -> Option<&'static str> {
+        self.device_
+    }
+
     /// Whether the solve met its stopping criterion within `max_iter`. False is
     /// sklearn's `ConvergenceWarning` case, not an error (module docs).
     pub fn converged(&self) -> bool {
@@ -306,6 +323,7 @@ where
 /// `alpha=0.0001`, `warm_start=False`, `fit_intercept=True`, `tol=1e-5`.
 #[derive(Debug, Clone, Default)]
 pub struct HuberRegressorBuilder {
+    device: Device,
     epsilon: Option<f64>,
     max_iter: Option<usize>,
     alpha: Option<f64>,
@@ -316,6 +334,14 @@ pub struct HuberRegressorBuilder {
 }
 
 impl HuberRegressorBuilder {
+
+    /// Pin the execution arm (DEVICE-PARAM-01). [`Device::Auto`] keeps the
+    /// existing gate and its `MLRS_*` A/B flag; `Cpu`/`Gpu` override its PERF
+    /// half only — each prim keeps its own capability checks inside.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
     /// Set the outlier cut-off on the scaled residual (sklearn `epsilon >= 1`).
     pub fn epsilon(mut self, epsilon: f64) -> Self {
         self.epsilon = Some(epsilon);
@@ -402,6 +428,8 @@ impl HuberRegressorBuilder {
             epsilon,
             max_iter,
             alpha,
+            device: self.device,
+            device_: None,
             warm_start: self.warm_start,
             fit_intercept,
             tol,
@@ -539,8 +567,11 @@ where
             targets,
             sw64,
             self.fit_intercept,
+            self.device,
         )
         .map_err(AlgoError::Prim)?;
+
+        let device_arm = objective.arm_name();
 
         let outcome = match self.solve(&objective, pool) {
             Ok(o) => o,
@@ -576,6 +607,8 @@ where
             epsilon: self.epsilon,
             max_iter: self.max_iter,
             alpha: self.alpha,
+            device: self.device,
+            device_: Some(device_arm),
             warm_start: self.warm_start,
             fit_intercept: self.fit_intercept,
             tol: self.tol,

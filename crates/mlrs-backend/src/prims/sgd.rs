@@ -57,6 +57,7 @@ use mlrs_kernels::sgd::{
 };
 
 use crate::device_array::DeviceArray;
+use crate::device::Device;
 use crate::pool::BufferPool;
 use crate::runtime::ActiveRuntime;
 
@@ -172,8 +173,9 @@ pub fn loss_id(loss: SgdLoss) -> u32 {
 ///
 /// See `prims::sgd_host` for why the cpu AND wgpu backends have a host arm at
 /// all (cuda/rocm are untested and stay on the device path).
-pub fn sgd_host_available() -> bool {
-    super::sgd_host::host_solve_applicable()
+pub fn sgd_host_available(device: Device) -> bool {
+    super::sgd_host::sgd_host_possible()
+        && device.prefers_host(super::sgd_host::host_solve_applicable)
 }
 
 /// [`sgd_solve`] over HOST slices, returning the fitted `(coef, intercept)` on
@@ -208,7 +210,7 @@ where
     // construction (it never falls back to a device kernel), so it has no
     // dependency on what the active backend's shader compiler supports.
     validate_geometry(x.len(), y.len(), n, d)?;
-    if !sgd_host_available() {
+    if !sgd_host_available(Device::Auto) {
         return Err(PrimError::UnsupportedCapability {
             operand: "sgd_solve_host_slice",
             capability: "a host-resident SGD solve (this entry point is cpu/wgpu-only)",
@@ -249,6 +251,7 @@ pub fn sgd_solve<F>(
     y: &DeviceArray<ActiveRuntime, F>,
     shape: (usize, usize),
     params: &SgdParams,
+    device: Device,
 ) -> Result<
     (
         DeviceArray<ActiveRuntime, F>,
@@ -287,7 +290,7 @@ where
     //     needlessly block f64 log-loss (etc.) MBSGD fits on exactly this kind
     //     of adapter even though the host arm has no dependency on the
     //     limitation at all. ---
-    if super::sgd_host::host_solve_applicable() {
+    if sgd_host_available(device) {
         let x_host = x.to_host(pool);
         let y_host = y.to_host(pool);
         let (w, b) = super::sgd_host::sgd_solve_host::<F>(&x_host, &y_host, n, d, params);

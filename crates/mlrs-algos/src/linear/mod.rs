@@ -48,6 +48,15 @@
 //!   `svm_objective` cpu-host/device-GEMM split but not its evaluator). Added by
 //!   plan **HUBER-01**.
 //!
+//! - `RidgeCV` (RIDGECV-01) — **generalized (leave-one-out) cross-validation**
+//!   in closed form off ONE symmetric eigendecomposition
+//!   ([`ridge_cv::ridge_gcv`]), plus an explicit `GridSearchCV` arm for a
+//!   user-supplied `cv` ([`ridge_cv::ridge_cv_grid`]). Deliberately NOT a loop
+//!   over [`ridge::Ridge`]: the whole point is that the Gram, its
+//!   eigendecomposition and the eigenbasis projection of the design are formed
+//!   ONCE and shared by every `alpha`, which drops sklearn's `O(n_alphas·n·d²)`
+//!   default route to `O(n·d²) + O(n_alphas·n·d)`.
+//!
 //! The estimator plans UNCOMMENT/add their own `pub mod <estimator>;` line here
 //! and create the matching file; they do NOT edit `lib.rs` (owned by 04-01),
 //! keeping the estimator plans file-disjoint and parallel-safe.
@@ -72,6 +81,7 @@ pub mod logistic;
 pub mod ransac;
 pub mod ridge;
 pub mod ridge_classifier;
+pub mod ridge_cv;
 pub mod ridge_solvers;
 pub mod sym_eig;
 

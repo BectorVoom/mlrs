@@ -226,6 +226,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::center::center_columns;
@@ -407,6 +408,10 @@ pub struct Ridge<F, S = Unfit> {
     /// Seed for the `sag`/`saga` sampling order. `None` uses
     /// [`SAG_DEFAULT_SEED`].
     random_state: Option<u64>,
+    /// Where to run the heavy phase (DEVICE-PARAM-01). `Auto` keeps the
+    /// original shape/backend heuristic — and is the only value that consults
+    /// the `MLRS_RIDGE_GRAM_HOST` A/B flag; `Cpu`/`Gpu` pin the arm.
+    device: Device,
     /// Fitted coefficients (length `n_features`), device-resident, `None` until
     /// `fit`.
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
@@ -418,6 +423,12 @@ pub struct Ridge<F, S = Unfit> {
     /// sklearn's `solver_`: the solver that ACTUALLY ran, after `auto`
     /// resolution and after any singular-Gram fallback. `None` until `fit`.
     solver_: Option<RidgeSolver>,
+    /// The execution arm that ACTUALLY ran (`"cpu"` / `"gpu"`), `None` until
+    /// `fit`. The companion to `solver_`, and for the same reason: `device` is
+    /// a preference the estimator may not be able to honour for every
+    /// `solver`/`positive`/shape combination, so the one thing it must never do
+    /// is leave the caller guessing which arm produced the numbers.
+    device_: Option<&'static str>,
     /// Memoized host copy of `(coef_, intercept_)` for the host-ingress
     /// `predict` path (IN-05 `OnceLock` mirror idiom). Empty until the first
     /// `predict_from_host` on the cpu backend, and never filled at all on the
@@ -458,10 +469,12 @@ where
             solver: RidgeSolver::Auto,
             positive: false,
             random_state: None,
+            device: Device::Auto,
             coef_: None,
             intercept_: None,
             n_iter_: None,
             solver_: None,
+            device_: None,
             predict_mirror: HostMirror::new(),
             predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
@@ -487,6 +500,7 @@ where
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
         }
     }
 
@@ -503,6 +517,7 @@ where
             && self.solver == other.solver
             && self.positive == other.positive
             && self.random_state == other.random_state
+            && self.device == other.device
     }
 
     /// `fit` with sklearn's `sample_weight` — the full-surface entry point.
@@ -808,10 +823,15 @@ where
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
             coef_: Some(coef),
             intercept_: Some(intercept_dev),
             n_iter_: n_iter,
             solver_: Some(solver_used),
+            // This entry point IS the device ingress — the caller reached it by
+            // branching on `host_fit_applicable` and getting false — so the arm
+            // is known without re-deriving it.
+            device_: Some("gpu"),
             predict_mirror: HostMirror::new(),
             predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
@@ -882,7 +902,7 @@ where
             }));
         }
 
-        let (alpha, fit_intercept, copy_x, max_iter, tol, solver, positive, random_state) = (
+        let (alpha, fit_intercept, copy_x, max_iter, tol, solver, positive, random_state, device) = (
             self.alpha,
             self.fit_intercept,
             self.copy_x,
@@ -891,6 +911,7 @@ where
             self.solver,
             self.positive,
             self.random_state,
+            self.device,
         );
         let resolved = solver.resolve(positive);
         if n_targets > 1 && resolved != RidgeSolver::Cholesky {
@@ -905,6 +926,7 @@ where
         let mut intercept_host: Vec<F> = vec![F::from_int(0i64); n_targets];
         let mut n_iter0: Option<usize> = None;
         let mut solver_used0: Option<RidgeSolver> = None;
+        let mut device_0: Option<&'static str> = None;
         for t in 0..n_targets {
             let mut y_t: Vec<F> = Vec::with_capacity(n_samples);
             for r in 0..n_samples {
@@ -920,10 +942,12 @@ where
                 solver,
                 positive,
                 random_state,
+                device,
                 coef_: None,
                 intercept_: None,
                 n_iter_: None,
                 solver_: None,
+                device_: None,
                 predict_mirror: HostMirror::new(),
                 predict_mirror_multi: HostMirrorMulti::new(),
                 _state: PhantomData,
@@ -949,6 +973,7 @@ where
             if t == 0 {
                 n_iter0 = single.n_iter_;
                 solver_used0 = single.solver_;
+                device_0 = single.device_;
             }
             if let Some(c) = single.coef_ {
                 c.release_into(pool);
@@ -967,10 +992,14 @@ where
             solver,
             positive,
             random_state,
+            device,
             coef_: Some(DeviceArray::from_host(pool, &coef_host)),
             intercept_: Some(DeviceArray::from_host(pool, &intercept_host)),
             n_iter_: n_iter0,
             solver_: solver_used0,
+            // Every target ran the same arm: the route depends on `X`, the
+            // solver and the shape, none of which vary across `y`'s columns.
+            device_: device_0,
             predict_mirror: HostMirror::new(),
             predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
@@ -1006,8 +1035,16 @@ where
     /// which is the whole point: on the applicable arm the design is never
     /// uploaded at all.
     pub fn host_fit_applicable(&self, shape: (usize, usize)) -> bool {
+        // `consumes_gram_only` is a CAPABILITY, not a preference: only the two
+        // normal-equations solvers have a host-slice entry point at all, so
+        // `device = Cpu` cannot conjure one for `lsqr`/`sag`/`saga`/`svd`. Those
+        // configurations keep the device ingress and report `device_ = "gpu"`,
+        // which is why the fitted attribute exists — an inert preference that
+        // says so is very different from one that lies.
         self.solver.resolve(self.positive).consumes_gram_only()
-            && gram_host_applicable(shape.0, shape.1)
+            && self
+                .device
+                .prefers_host(|| gram_host_applicable(shape.0, shape.1))
     }
 
     /// [`Fit::fit`] over HOST slices — the no-upload, no-launch ingress for the
@@ -1153,6 +1190,7 @@ where
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
             coef_: Some(upload_coef::<F>(pool, &coef64)),
             intercept_: Some(DeviceArray::from_host(
                 pool,
@@ -1160,6 +1198,9 @@ where
             )),
             n_iter_: None,
             solver_: Some(solver_used),
+            // Reached only through `host_fit_applicable`, so this IS the host
+            // arm — no upload, no launch.
+            device_: Some("cpu"),
             predict_mirror: HostMirror::new(),
             predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
@@ -1250,6 +1291,7 @@ pub struct RidgeBuilder {
     solver: RidgeSolver,
     positive: bool,
     random_state: Option<u64>,
+    device: Device,
 }
 
 impl Default for RidgeBuilder {
@@ -1315,6 +1357,15 @@ impl RidgeBuilder {
         self
     }
 
+    /// Pin the execution arm (DEVICE-PARAM-01). [`Device::Auto`] — the default
+    /// — keeps the shape/backend heuristic; `Cpu`/`Gpu` override it wherever
+    /// this `solver`/`positive` pair has both arms. The arm that actually ran
+    /// is reported by [`Ridge::device`] after `fit`.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     /// Build the (unfit) estimator, validating the data-INDEPENDENT
     /// hyperparameters BEFORE any data is seen (D-08; the data-DEPENDENT
     /// geometry check lives in [`Fit::fit`]):
@@ -1375,10 +1426,12 @@ impl RidgeBuilder {
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
             coef_: None,
             intercept_: None,
             n_iter_: None,
             solver_: None,
+            device_: None,
             predict_mirror: HostMirror::new(),
             predict_mirror_multi: HostMirrorMulti::new(),
             _state: PhantomData,
@@ -1414,6 +1467,18 @@ where
     /// `sparse_cg`, `lbfgs` — see the module-doc table).
     pub fn n_iter(&self) -> Option<usize> {
         self.n_iter_
+    }
+
+    /// The execution arm that ACTUALLY ran, `"cpu"` or `"gpu"`
+    /// (DEVICE-PARAM-01).
+    ///
+    /// Read this rather than assuming the `device` you asked for: an explicit
+    /// preference is honoured wherever the configuration has both arms, and
+    /// where it does not — `solver='lsqr'` has no host-slice ingress, for
+    /// instance — the fit still runs and this reports what carried it.
+    pub fn device(&self) -> &'static str {
+        self.device_
+            .expect("device_ is Some by construction on Ridge<F, Fitted>")
     }
 
     /// sklearn's `solver_`: the solver that ACTUALLY ran — `auto` already

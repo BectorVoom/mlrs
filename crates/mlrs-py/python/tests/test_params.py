@@ -28,6 +28,11 @@ import mlrs
 EXPECTED_PARAMS = {
     "LinearRegression": {"fit_intercept": True, "output_type": "input"},
     # Ridge carries sklearn's FULL Ridge signature (alpha .. random_state).
+    # `device` (DEVICE-PARAM-01) is mlrs-only surface, not sklearn's: it pins
+    # the host/device execution arm that was previously reachable only through
+    # an `MLRS_*` environment flag. It sits BEFORE `output_type` (the other
+    # mlrs-only param) and after the whole sklearn signature, so the sklearn
+    # prefix of the signature still matches upstream positionally.
     "Ridge": {
         "alpha": 1.0,
         "fit_intercept": True,
@@ -37,6 +42,21 @@ EXPECTED_PARAMS = {
         "solver": "auto",
         "positive": False,
         "random_state": None,
+        "device": "auto",
+        "output_type": "input",
+    },
+    # RidgeCV carries sklearn's FULL RidgeCV signature. `alphas` is a TUPLE in
+    # sklearn's default and stays one here: `get_params` must round-trip the
+    # ctor argument verbatim (the __init__ purity rule), so normalizing it to an
+    # ndarray at construction would break `clone`.
+    "RidgeCV": {
+        "alphas": (0.1, 1.0, 10.0),
+        "fit_intercept": True,
+        "scoring": None,
+        "cv": None,
+        "gcv_mode": None,
+        "store_cv_results": False,
+        "alpha_per_target": False,
         "output_type": "input",
     },
     # RidgeClassifier carries sklearn's FULL RidgeClassifier signature
@@ -52,6 +72,7 @@ EXPECTED_PARAMS = {
         "solver": "auto",
         "positive": False,
         "random_state": None,
+        "device": "auto",
         "output_type": "input",
     },
     # BayesianRidge carries sklearn's FULL signature (max_iter .. verbose).
@@ -68,6 +89,7 @@ EXPECTED_PARAMS = {
         "fit_intercept": True,
         "copy_X": True,
         "verbose": False,
+        "device": "auto",
         "output_type": "input",
     },
     "Lasso": {
@@ -93,6 +115,7 @@ EXPECTED_PARAMS = {
         "warm_start": False,
         "fit_intercept": True,
         "tol": 1e-5,
+        "device": "auto",
         "output_type": "input",
     },
     # --- RANSAC-01: RANSACRegressor's full sklearn ctor surface. ----------- #
@@ -147,6 +170,7 @@ EXPECTED_PARAMS = {
         "p": 2,
         "metric_params": None,
         "n_jobs": None,
+        "device": "auto",
     },
     # KNN-CLF-PARAMS / KNN-REG-PARAMS: both k-neighbours estimators carry
     # sklearn's FULL parameter surface too.
@@ -160,6 +184,7 @@ EXPECTED_PARAMS = {
         "metric": "minkowski",
         "metric_params": None,
         "n_jobs": None,
+        "device": "auto",
     },
     "KNeighborsRegressor": {
         "n_neighbors": 5,
@@ -171,6 +196,7 @@ EXPECTED_PARAMS = {
         "metric": "minkowski",
         "metric_params": None,
         "n_jobs": None,
+        "device": "auto",
     },
     # PCA requires an explicit n_components — constructed with n_components=2.
     "PCA": {"n_components": 2, "output_type": "input"},
@@ -242,6 +268,7 @@ EXPECTED_PARAMS = {
         # sklearn's SGDClassifier default; the OvR multiclass fit's
         # loss-plateau early stop (mlrs-mbsgd-wgpu-and-convergence).
         "n_iter_no_change": 5,
+        "device": "auto",
         "output_type": "input",
     },
     "MBSGDRegressor": {
@@ -261,6 +288,7 @@ EXPECTED_PARAMS = {
         "seed": 0,
         # sklearn's SGDRegressor default (see MBSGDClassifier's note).
         "n_iter_no_change": 5,
+        "device": "auto",
         "output_type": "input",
     },
     "GaussianNB": {
@@ -367,6 +395,7 @@ EXPECTED_PARAMS = {
         "warm_start": False,
         "verbose": 0,
         "verbose_interval": 10,
+        "device": "auto",
         "output_type": "input",
     },
     # BayesianGaussianMixture (MIX-02) — sklearn's full ctor surface, including
@@ -392,6 +421,7 @@ EXPECTED_PARAMS = {
         "warm_start": False,
         "verbose": 0,
         "verbose_interval": 10,
+        "device": "auto",
         "output_type": "input",
     },
     "SpectralClustering": {
@@ -444,6 +474,7 @@ EXPECTED_PARAMS = {
         "negative_sample_rate": 5,
         "a": None,
         "b": None,
+        "device": "auto",
         "output_type": "input",
     },
     # HDBS-PARAMS: sklearn's COMPLETE 14-parameter surface, in sklearn's own
@@ -493,6 +524,7 @@ EXPECTED_PARAMS = {
         "method": "barnes_hut",
         "angle": 0.5,
         "n_jobs": None,
+        "device": "auto",
         "output_type": "input",
     },
     # --- TASK-16 (PY-ENS-05, RF): RandomForestClassifier/Regressor. ------- #
@@ -528,6 +560,7 @@ EXPECTED_PARAMS = {
         "n_bins": 64,
         "l2_regularization": 0.0,
         "min_samples_leaf": 20,
+        "device": "auto",
         "output_type": "input",
     },
     "HistGradientBoostingRegressor": {
@@ -537,6 +570,7 @@ EXPECTED_PARAMS = {
         "n_bins": 64,
         "l2_regularization": 0.0,
         "min_samples_leaf": 20,
+        "device": "auto",
         "output_type": "input",
     },
 }
@@ -544,7 +578,8 @@ EXPECTED_PARAMS = {
 # The first non-output_type param to round-trip via set_params, with a new value.
 SET_PARAM = {
     "LinearRegression": ("fit_intercept", False),
-    "Ridge": ("alpha", 2.0),
+    "Ridge": ("device", "gpu"),
+    "RidgeCV": ("gcv_mode", "svd"),
     "RidgeClassifier": ("alpha", 2.0),
     "BayesianRidge": ("max_iter", 50),
     "Lasso": ("alpha", 2.0),

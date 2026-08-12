@@ -12,7 +12,11 @@ before ``fit`` and materialize via the dtype-suffixed wrapper accessor (D-03/D-0
 """
 
 import numpy as np
-from sklearn.base import ClassifierMixin, MetaEstimatorMixin, RegressorMixin
+from sklearn.base import BaseEstimator as _SkBaseEstimator
+from sklearn.base import ClassifierMixin
+from sklearn.base import MetaEstimatorMixin
+from sklearn.base import MultiOutputMixin as _SkMultiOutputMixin
+from sklearn.base import RegressorMixin
 
 from .base import MlrsBase
 # RANSACRegressor's parameter rejections raise the SAME exception type
@@ -83,10 +87,18 @@ class Ridge(RegressorMixin, MlrsBase):
     """L2-regularized least squares (LINEAR-02).
 
     ``Ridge(alpha=1.0, fit_intercept=True, copy_X=True, max_iter=None,
-    tol=1e-4, solver='auto', positive=False, random_state=None)`` — the full
-    ``sklearn.linear_model.Ridge`` parameter surface, including
-    ``fit(X, y, sample_weight=...)`` and the ``n_iter_`` / ``solver_`` fitted
-    attributes. See ``crates/mlrs-algos/src/linear/ridge.rs`` for the per-solver
+    tol=1e-4, solver='auto', positive=False, random_state=None,
+    device='auto')`` — the full ``sklearn.linear_model.Ridge`` parameter
+    surface, including ``fit(X, y, sample_weight=...)`` and the ``n_iter_`` /
+    ``solver_`` fitted attributes.
+
+    ``device`` (mlrs-only, DEVICE-PARAM-01) pins where the heavy phase runs:
+    ``'cpu'`` takes the host arm — no upload of the design and no kernel launch
+    — and ``'gpu'`` takes the ``cubecl`` arm; ``'auto'`` (the default) keeps the
+    shape/backend heuristic and is the only value that consults the
+    ``MLRS_RIDGE_GRAM_HOST`` A/B flag. It is a PREFERENCE: ``solver='lsqr'`` and
+    friends have no host ingress, so read ``device_`` for the arm that actually
+    ran. See ``crates/mlrs-algos/src/linear/ridge.rs`` for the per-solver
     routing (and for why ``copy_X`` is a genuine no-op here: mlrs never writes
     into the caller's buffer).
     """
@@ -101,6 +113,7 @@ class Ridge(RegressorMixin, MlrsBase):
         solver="auto",
         positive=False,
         random_state=None,
+        device="auto",
         output_type="input",
     ):
         self.alpha = alpha
@@ -111,6 +124,7 @@ class Ridge(RegressorMixin, MlrsBase):
         self.solver = solver
         self.positive = positive
         self.random_state = random_state
+        self.device = device
         self.output_type = output_type
 
     def _seed(self):
@@ -153,6 +167,7 @@ class Ridge(RegressorMixin, MlrsBase):
             self.solver,
             self.positive,
             self._seed(),
+            self._device(),
         )
         obj.fit(xa, ya, rows, cols, swa, n_targets)
         self._mlrs_obj = obj
@@ -206,6 +221,433 @@ class Ridge(RegressorMixin, MlrsBase):
         self._check_fitted()
         return self._mlrs_obj.solver_used()
 
+    # ``device_`` (the execution arm that actually ran) is inherited from
+    # :class:`~mlrs.base.MlrsBase` — it is identical for every estimator that
+    # takes the parameter, so it is defined once there rather than per shim.
+
+
+class _IdentityRegressor(RegressorMixin, _SkBaseEstimator):
+    """A regressor whose ``predict`` IS its input.
+
+    ``scoring`` is a scorer, and a scorer's signature is
+    ``scorer(estimator, X, y)`` — it wants to call ``predict`` itself. The LOO
+    predictions are already computed by the time we score them, so the "X" we
+    hand the scorer is the prediction vector and the estimator is this. Exactly
+    the trick sklearn's own ``_RidgeGCV._score`` uses, for the same reason.
+    """
+
+    def decision_function(self, y_predict):
+        return y_predict
+
+    def predict(self, y_predict):
+        return y_predict
+
+
+def _scorer_accepts_sample_weight(scorer, estimator):
+    """sklearn's ``BaseSearchCV._check_scorers_accept_sample_weight``.
+
+    A scorer built from a metric that has no ``sample_weight`` parameter
+    (``max_error``, say) is NOT given the weights, and sklearn warns about it.
+    Both halves are reproduced: silently weighting such a scorer would disagree
+    with sklearn, and silently NOT warning would hide a real statistical
+    caveat from the caller.
+    """
+    from inspect import signature
+
+    if hasattr(scorer, "_accept_sample_weight"):
+        accept = bool(scorer._accept_sample_weight())
+    else:
+        accept = "sample_weight" in signature(scorer).parameters
+    if not accept:
+        import warnings
+
+        warnings.warn(
+            f"The scoring {scorer} does not support sample_weight, which may "
+            "lead to statistically incorrect results when fitting "
+            f"{estimator} with sample_weight. "
+        )
+    return accept
+
+
+def _argmax_first(scores):
+    """``np.argmax`` with sklearn's ``_RidgeGCV`` tie/NaN semantics.
+
+    sklearn updates its running winner with a strict ``alpha_score >
+    best_score``, so the FIRST alpha of a tie wins and a NaN score never wins at
+    all (``NaN > x`` is False). ``np.argmax`` agrees on ties but PICKS a NaN, so
+    this is written out rather than delegated.
+    """
+    best = 0
+    best_value = None
+    for i, s in enumerate(scores):
+        if np.isnan(s):
+            continue
+        if best_value is None or s > best_value:
+            best_value, best = s, i
+    if best_value is None:
+        return 0
+    return best
+
+
+class RidgeCV(_SkMultiOutputMixin, RegressorMixin, MlrsBase):
+    """Ridge regression with built-in cross-validation (RIDGECV-01).
+
+    ``RidgeCV(alphas=(0.1, 1.0, 10.0), *, fit_intercept=True, scoring=None,
+    cv=None, gcv_mode=None, store_cv_results=False, alpha_per_target=False)`` —
+    the full ``sklearn.linear_model.RidgeCV`` parameter surface, including
+    ``fit(X, y, sample_weight=...)``, 2-D ``y``, and the ``alpha_`` /
+    ``best_score_`` / ``cv_results_`` fitted attributes.
+
+    Two engines, exactly as sklearn has:
+
+    * ``cv=None`` (the DEFAULT) runs generalized (leave-one-out) CV in closed
+      form off ONE symmetric eigendecomposition
+      (``crates/mlrs-algos/src/linear/ridge_cv.rs``). sklearn re-forms an
+      ``n x d`` product per alpha there; mlrs forms the eigenbasis projection
+      once, which is why the whole fit is ``O(n*d^2) + O(n_alphas*n*d)`` rather
+      than ``O(n_alphas*n*d^2)``.
+    * any other ``cv`` runs the explicit ``GridSearchCV(Ridge(), {'alpha':
+      alphas}, cv=cv)`` sklearn runs, with the train Gram hoisted out of the
+      alpha loop, then refits :class:`Ridge` on the full data at the winner.
+
+    ``scoring`` and ``cv`` may be arbitrary Python objects, so those two stay
+    here: the shim resolves the splitter (``mlrs.model_selection.check_cv``) and
+    applies the scorer, and Rust owns every ``O(n*d^2)`` pass either way.
+
+    ``gcv_mode`` is accepted and validated (``'auto'`` / ``'svd'`` / ``'eigen'``,
+    or ``None`` for ``'auto'``). mlrs derives all three from the SAME
+    eigendecomposition — of whichever Gram is smaller — so unlike sklearn they
+    are one code path and return identical values; see the Rust module docs for
+    the derivation and for the conditioning caveat that comes with it.
+    """
+
+    def __init__(
+        self,
+        alphas=(0.1, 1.0, 10.0),
+        *,
+        fit_intercept=True,
+        scoring=None,
+        cv=None,
+        gcv_mode=None,
+        store_cv_results=False,
+        alpha_per_target=False,
+        output_type="input",
+    ):
+        self.alphas = alphas
+        self.fit_intercept = fit_intercept
+        self.scoring = scoring
+        self.cv = cv
+        self.gcv_mode = gcv_mode
+        self.store_cv_results = store_cv_results
+        self.alpha_per_target = alpha_per_target
+        self.output_type = output_type
+
+    # -- parameter resolution ------------------------------------------- #
+
+    def _resolved_alphas(self):
+        """``self.alphas`` as a 1-D float array, validated the way sklearn's
+        ``_BaseRidgeCV.fit`` validates it.
+
+        The boundary differs by engine and that is sklearn's rule, not a
+        convenience: the GCV identity divides by ``alpha``, so ``cv=None``
+        requires ``alpha > 0`` (``include_boundaries='neither'``), while an
+        explicit ``cv`` refits a real ``Ridge`` per fold and ``alpha=0`` is a
+        legitimate (unpenalized) grid point there.
+        """
+        alphas = np.atleast_1d(np.asarray(self.alphas, dtype=np.float64)).ravel()
+        if alphas.size == 0:
+            raise ValueError("alphas must contain at least one value")
+        strict = self.cv is None
+        for i, a in enumerate(alphas):
+            name = "alphas" if alphas.size == 1 else f"alphas[{i}]"
+            if not np.isfinite(a) or a < 0.0 or (strict and a <= 0.0):
+                # sklearn's `check_scalar` phrasing, verbatim, so a caller
+                # matching on the message keeps working.
+                bound = "> 0.0" if strict else ">= 0.0"
+                raise ValueError(f"{name} == {a}, must be {bound}.")
+        return alphas
+
+    def _scorer(self):
+        """The resolved scorer, or ``None`` for ``scoring=None``.
+
+        sklearn's ``_BaseRidgeCV`` calls ``check_scoring(..., allow_none=True)``
+        and then explicitly RESETS the result to ``None`` when ``scoring`` is
+        ``None`` ("reset `scorer` variable to original user-intend"), because
+        ``check_scoring`` hands back a passthrough scorer rather than ``None``
+        there. Skipping that reset silently scores the GCV arm with R² instead
+        of ``-mean(looe^2)`` — two different winners on the same data — so the
+        ``None`` short-circuit is written first and on purpose.
+
+        On the explicit-``cv`` arm the reset is harmless in the other direction:
+        that passthrough scorer IS ``RegressorMixin.score``, i.e. exactly the R²
+        the Rust grid engine already computes, so ``scoring=None`` takes the
+        fast in-Rust reduction rather than a Python callback per fold.
+        """
+        if self.scoring is None:
+            return None
+        from sklearn.metrics import check_scoring
+
+        return check_scoring(self, scoring=self.scoring)
+
+    # -- fit ------------------------------------------------------------- #
+
+    def fit(self, X, y, sample_weight=None):
+        alphas = self._resolved_alphas()
+        scorer = self._scorer()
+
+        xa, rows, cols = self._normalize(X)
+        dtype = LinearRegression._x_float(xa)
+        y_arr = np.asarray(y)
+        y_ndim = int(y_arr.ndim)
+        n_y = int(y_arr.shape[1]) if y_ndim == 2 else 1
+        ya = self._normalize_y(y, dtype=dtype)
+        swa = (
+            None
+            if sample_weight is None
+            else self._normalize_y(sample_weight, dtype=dtype)
+        )
+        dt = "f32" if dtype is np.float32 else "f64"
+
+        obj = self._ext().RidgeCV(
+            [float(a) for a in alphas],
+            self.fit_intercept,
+            "auto" if self.gcv_mode is None else self.gcv_mode,
+        )
+
+        if self.cv is None:
+            coef, intercept, alpha_, best_score_, cv_results_ = self._fit_gcv(
+                obj, xa, ya, swa, rows, cols, n_y, y_arr, alphas, scorer, dtype,
+                sample_weight,
+            )
+        else:
+            if self.store_cv_results:
+                raise ValueError(
+                    "cv!=None and store_cv_results=True are incompatible"
+                )
+            if self.alpha_per_target:
+                raise ValueError("cv!=None and alpha_per_target=True are incompatible")
+            coef, intercept, alpha_, best_score_, cv_results_ = self._fit_grid(
+                obj, X, xa, ya, swa, rows, cols, n_y, y_arr, alphas, scorer,
+                sample_weight,
+            )
+
+        obj.set_fitted(
+            [float(v) for v in np.asarray(coef, dtype=np.float64).ravel(order="C")],
+            [float(v) for v in np.asarray(intercept, dtype=np.float64).ravel()],
+            cols,
+            n_y,
+            dt,
+        )
+        self._mlrs_obj = obj
+        self._n_targets_ = n_y
+        self._y_ndim_ = y_ndim
+        self.alpha_ = alpha_
+        self.best_score_ = best_score_
+        if cv_results_ is not None:
+            self.cv_results_ = cv_results_
+        self._post_fit(cols)
+        return self
+
+    def _fit_gcv(
+        self, obj, xa, ya, swa, rows, cols, n_y, y_arr, alphas, scorer, np_dtype,
+        sample_weight,
+    ):
+        """sklearn's ``_RidgeGCV`` arm (``cv=None``)."""
+        n_alphas = alphas.size
+        want_pred = scorer is not None
+        obj.gcv(
+            xa, ya, rows, cols, n_y, swa, want_pred,
+            bool(self.store_cv_results),
+        )
+
+        per_target = bool(self.alpha_per_target) and n_y > 1
+        raw = None
+        if want_pred or self.store_cv_results:
+            # `n_samples x n_alphas x n_targets` row-major out of Rust (rows
+            # outermost so each worker owned a contiguous slice).
+            raw = np.asarray(obj.gcv_cv_values(), dtype=np.float64).reshape(
+                rows, n_alphas, n_y
+            )
+
+        if not want_pred:
+            scores = np.asarray(obj.gcv_scores(), dtype=np.float64).reshape(
+                n_alphas, n_y
+            )
+            alpha_scores = scores if per_target else scores.mean(axis=1)
+        else:
+            preds = np.transpose(raw, (1, 0, 2))  # (n_alphas, n, n_y)
+            truth = np.asarray(y_arr, dtype=np.float64)
+            ident = _IdentityRegressor()
+            # `_BaseRidgeCV` forwards `sample_weight` to the scorer here
+            # UNCONDITIONALLY (no accepts-check, unlike its GridSearchCV arm),
+            # so a scorer without the parameter raises -- which is sklearn's
+            # behaviour and therefore this one's.
+            sp = {} if sample_weight is None else {
+                "sample_weight": np.asarray(sample_weight, dtype=np.float64)
+            }
+            if per_target:
+                alpha_scores = np.empty((n_alphas, n_y), dtype=np.float64)
+                for i in range(n_alphas):
+                    for t in range(n_y):
+                        alpha_scores[i, t] = scorer(
+                            ident, preds[i, :, t], truth[:, t], **sp
+                        )
+            else:
+                alpha_scores = np.empty(n_alphas, dtype=np.float64)
+                for i in range(n_alphas):
+                    p = preds[i] if truth.ndim == 2 else preds[i, :, 0]
+                    alpha_scores[i] = scorer(ident, p, truth, **sp)
+
+        coefs = np.asarray(obj.gcv_coefs(), dtype=np.float64).reshape(
+            n_alphas, cols, n_y
+        )
+        if per_target:
+            best_idx = np.array(
+                [_argmax_first(alpha_scores[:, t]) for t in range(n_y)]
+            )
+            coef = np.empty((cols, n_y), dtype=np.float64)
+            for t in range(n_y):
+                coef[:, t] = coefs[best_idx[t], :, t]
+            alpha_ = alphas[best_idx].copy()
+            best_score_ = np.array(
+                [alpha_scores[best_idx[t], t] for t in range(n_y)]
+            )
+        else:
+            best_idx = _argmax_first(alpha_scores)
+            coef = coefs[best_idx]
+            alpha_ = float(alphas[best_idx])
+            best_score_ = float(alpha_scores[best_idx])
+
+        x_offset = np.asarray(obj.gcv_x_offset(), dtype=np.float64)
+        y_offset = np.asarray(obj.gcv_y_offset(), dtype=np.float64)
+        if self.fit_intercept:
+            intercept = y_offset - x_offset @ coef
+        else:
+            intercept = np.zeros(n_y, dtype=np.float64)
+
+        cv_results_ = None
+        if self.store_cv_results:
+            # sklearn: (n_samples, n_alphas) for 1-D y, (n_samples, n_targets,
+            # n_alphas) for 2-D.
+            out = np.transpose(raw, (0, 2, 1))
+            if y_arr.ndim == 1:
+                out = out[:, 0, :]
+            cv_results_ = np.ascontiguousarray(out, dtype=np_dtype)
+        return coef, intercept, alpha_, best_score_, cv_results_
+
+    def _fit_grid(
+        self, obj, X, xa, ya, swa, rows, cols, n_y, y_arr, alphas, scorer,
+        sample_weight,
+    ):
+        """sklearn's ``GridSearchCV(Ridge(), {'alpha': alphas}, cv=cv)`` arm."""
+        from .model_selection import check_cv
+
+        n_alphas = alphas.size
+        splitter = check_cv(self.cv, y_arr, classifier=False)
+        # `X` is handed to the splitter UNCONVERTED. Splitters read it through
+        # `_num_samples`, which already understands numpy / pandas / polars /
+        # pyarrow / plain sequences; forcing `np.asarray` first would break a
+        # pyarrow Table for no gain (`_normalize` above has already produced the
+        # Arrow buffer the Rust side actually consumes).
+        splits = [
+            (np.asarray(tr, dtype=np.int64), np.asarray(te, dtype=np.int64))
+            for tr, te in splitter.split(X, y_arr)
+        ]
+        if not splits:
+            raise ValueError("No fits were performed. Was the CV iterator empty?")
+        want_pred = scorer is not None
+        # sklearn's GridSearchCV forwards `sample_weight` to the TEST-fold
+        # scorer too, when the scorer takes it -- which the default regressor
+        # scorer (`RegressorMixin.score`) does. Dropping that makes the held-out
+        # R^2 unweighted, which moves `best_score_` in the fourth decimal and
+        # can move `alpha_` outright.
+        weighted = sample_weight is not None and (
+            scorer is None or _scorer_accepts_sample_weight(scorer, self)
+        )
+        obj.grid(
+            xa,
+            ya,
+            rows,
+            cols,
+            n_y,
+            [tr.tolist() for tr, _ in splits],
+            [te.tolist() for _, te in splits],
+            swa,
+            want_pred,
+            weighted,
+        )
+
+        if not want_pred:
+            scores = np.asarray(obj.grid_scores(), dtype=np.float64).reshape(
+                len(splits), n_alphas
+            )
+        else:
+            flat = np.asarray(obj.grid_predictions(), dtype=np.float64)
+            truth = np.asarray(y_arr, dtype=np.float64)
+            ident = _IdentityRegressor()
+            scores = np.empty((len(splits), n_alphas), dtype=np.float64)
+            sw_all = (
+                None
+                if not weighted
+                else np.asarray(sample_weight, dtype=np.float64)
+            )
+            base = 0
+            for s, (_, te) in enumerate(splits):
+                block = flat[
+                    base * n_alphas * n_y : (base + te.size) * n_alphas * n_y
+                ].reshape(n_alphas, te.size, n_y)
+                yt = truth[te]
+                sp = {} if sw_all is None else {"sample_weight": sw_all[te]}
+                for a in range(n_alphas):
+                    p = block[a] if truth.ndim == 2 else block[a, :, 0]
+                    scores[s, a] = scorer(ident, p, yt, **sp)
+                base += te.size
+
+        mean = scores.mean(axis=0)
+        best_idx = _argmax_first(mean)
+        alpha_ = float(alphas[best_idx])
+        best_score_ = float(mean[best_idx])
+
+        # sklearn's GridSearchCV(refit=True): the reported coef_/intercept_ come
+        # from a FRESH Ridge fit on the whole design at the winning alpha, not
+        # from any fold. Delegating to `Ridge` reuses its validated host arm
+        # rather than re-deriving the same solve here.
+        best = Ridge(
+            alpha=alpha_, fit_intercept=self.fit_intercept, solver="auto"
+        ).fit(X, y_arr, sample_weight=sample_weight)
+        coef = np.asarray(best.coef_, dtype=np.float64)
+        coef = coef.reshape(n_y, cols).T if coef.ndim == 2 else coef.reshape(cols, 1)
+        intercept = np.atleast_1d(
+            np.asarray(best.intercept_, dtype=np.float64)
+        ).reshape(n_y)
+        return coef, intercept, alpha_, best_score_, None
+
+    # -- predict / fitted attributes ------------------------------------- #
+
+    def predict(self, X):
+        xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
+        out = self._suffixed("predict")(xa, rows, cols)
+        shape = (rows,) if self._n_targets_ == 1 else (rows, self._n_targets_)
+        return self._to_output(out, shape, X, self._np_float())
+
+    @property
+    def coef_(self):
+        flat = self._suffixed("coef")()
+        d, t = self.n_features_in_, self._n_targets_
+        arr = self._to_output(flat, (d, t), None, self._np_float())
+        # sklearn ravels a single-target coef_ and transposes a multi-target one
+        # to `(n_targets, n_features)`.
+        return arr.reshape(d) if t == 1 else arr.T
+
+    @property
+    def intercept_(self):
+        self._check_fitted()
+        flat = self._suffixed("intercept")()
+        arr = np.asarray(flat, dtype=self._np_float())
+        if self._n_targets_ == 1 and getattr(self, "_y_ndim_", 1) == 1:
+            return arr.reshape(())[()]
+        return arr
+
 
 def _seed_from_random_state(random_state):
     """``random_state`` -> the ``u64`` seed the Rust ``sag``/``saga`` arm takes
@@ -255,6 +697,7 @@ class RidgeClassifier(ClassifierMixin, MlrsBase):
         solver="auto",
         positive=False,
         random_state=None,
+        device="auto",
         output_type="input",
     ):
         self.alpha = alpha
@@ -266,6 +709,7 @@ class RidgeClassifier(ClassifierMixin, MlrsBase):
         self.solver = solver
         self.positive = positive
         self.random_state = random_state
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y, sample_weight=None):
@@ -283,6 +727,7 @@ class RidgeClassifier(ClassifierMixin, MlrsBase):
             self.solver,
             self.positive,
             _seed_from_random_state(self.random_state),
+            self._device(),
         )
         obj.fit(xa, ya, rows, cols, swa)
         self._mlrs_obj = obj
@@ -374,6 +819,7 @@ class HuberRegressor(RegressorMixin, MlrsBase):
         warm_start=False,
         fit_intercept=True,
         tol=1e-5,
+        device="auto",
         output_type="input",
     ):
         self.epsilon = epsilon
@@ -382,6 +828,7 @@ class HuberRegressor(RegressorMixin, MlrsBase):
         self.warm_start = warm_start
         self.fit_intercept = fit_intercept
         self.tol = tol
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y, sample_weight=None):
@@ -406,6 +853,7 @@ class HuberRegressor(RegressorMixin, MlrsBase):
                 self.warm_start,
                 self.fit_intercept,
                 self.tol,
+                self._device(),
             )
         obj.fit(xa, ya, rows, cols, swa)
         self._mlrs_obj = obj
@@ -499,6 +947,7 @@ class BayesianRidge(RegressorMixin, MlrsBase):
         fit_intercept=True,
         copy_X=True,
         verbose=False,
+        device="auto",
         output_type="input",
     ):
         self.max_iter = max_iter
@@ -513,6 +962,7 @@ class BayesianRidge(RegressorMixin, MlrsBase):
         self.fit_intercept = fit_intercept
         self.copy_X = copy_X
         self.verbose = verbose
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y, sample_weight=None):
@@ -537,6 +987,7 @@ class BayesianRidge(RegressorMixin, MlrsBase):
             self.fit_intercept,
             self.copy_X,
             self.verbose,
+            self._device(),
         )
         obj.fit(xa, ya, rows, cols, swa)
         self._mlrs_obj = obj
@@ -809,6 +1260,7 @@ class MBSGDRegressor(RegressorMixin, MlrsBase):
         shuffle=True,
         seed=0,
         n_iter_no_change=5,
+        device="auto",
         output_type="input",
     ):
         self.loss = loss
@@ -826,6 +1278,7 @@ class MBSGDRegressor(RegressorMixin, MlrsBase):
         self.shuffle = shuffle
         self.seed = seed
         self.n_iter_no_change = n_iter_no_change
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y):
@@ -847,6 +1300,7 @@ class MBSGDRegressor(RegressorMixin, MlrsBase):
             self.shuffle,
             self.seed,
             self.n_iter_no_change,
+            self._device(),
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
@@ -893,6 +1347,7 @@ class MBSGDClassifier(ClassifierMixin, MlrsBase):
         shuffle=True,
         seed=0,
         n_iter_no_change=5,
+        device="auto",
         output_type="input",
     ):
         self.loss = loss
@@ -909,6 +1364,7 @@ class MBSGDClassifier(ClassifierMixin, MlrsBase):
         self.shuffle = shuffle
         self.seed = seed
         self.n_iter_no_change = n_iter_no_change
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y):
@@ -929,6 +1385,7 @@ class MBSGDClassifier(ClassifierMixin, MlrsBase):
             self.shuffle,
             self.seed,
             self.n_iter_no_change,
+            self._device(),
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj

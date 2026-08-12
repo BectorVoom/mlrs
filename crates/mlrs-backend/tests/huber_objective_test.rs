@@ -28,6 +28,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::capability::{self, FloatKind};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -201,6 +202,7 @@ fn check_eval<F>(
             targets.clone(),
             weights.clone(),
             fit_intercept,
+            Device::Auto,
         )
         .expect("HuberObjective::new rejected a valid geometry");
         assert_eq!(obj.d_aug(), d_aug, "{label}: d_aug");
@@ -353,6 +355,7 @@ fn gradient_matches_central_differences() {
             targets.clone(),
             Some(weights.clone()),
             fit_intercept,
+            Device::Auto,
         )
         .expect("HuberObjective::new");
 
@@ -407,17 +410,17 @@ fn rejects_invalid_geometry() {
 
     // n·d disagrees with the slab length.
     assert!(matches!(
-        HuberObjective::<f32>::new(&mut pool, HuberDesign::Host(&x), (5, 3), vec![0.0; 5], None, true),
+        HuberObjective::<f32>::new(&mut pool, HuberDesign::Host(&x), (5, 3), vec![0.0; 5], None, true, Device::Auto),
         Err(PrimError::ShapeMismatch { operand: "x", .. })
     ));
     // Zero rows / zero features.
     assert!(matches!(
-        HuberObjective::<f32>::new(&mut pool, HuberDesign::Host(&x), (0, 3), vec![], None, true),
+        HuberObjective::<f32>::new(&mut pool, HuberDesign::Host(&x), (0, 3), vec![], None, true, Device::Auto),
         Err(PrimError::ShapeMismatch { operand: "x", .. })
     ));
     // targets length.
     assert!(matches!(
-        HuberObjective::<f32>::new(&mut pool, HuberDesign::Host(&x), (4, 3), vec![0.0; 3], None, true),
+        HuberObjective::<f32>::new(&mut pool, HuberDesign::Host(&x), (4, 3), vec![0.0; 3], None, true, Device::Auto),
         Err(PrimError::ShapeMismatch {
             operand: "targets",
             ..
@@ -432,7 +435,7 @@ fn rejects_invalid_geometry() {
             vec![0.0; 4],
             Some(vec![1.0; 3]),
             true
-        ),
+        , Device::Auto),
         Err(PrimError::ShapeMismatch {
             operand: "sample_weight",
             ..
@@ -446,6 +449,7 @@ fn rejects_invalid_geometry() {
         vec![0.0; 4],
         None,
         true,
+        Device::Auto,
     )
     .expect("valid geometry");
     assert!(matches!(

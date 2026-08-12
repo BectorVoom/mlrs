@@ -152,16 +152,18 @@ def test_value_cases_match_fixture(fixture):
 def test_ctor_signature_matches_sklearn():
     """mlrs' ctor carries sklearn's parameters, with sklearn's defaults.
 
-    `output_type` is mlrs-only (it selects the array library results come back
-    in) and is excluded; everything else must match name-for-name and
-    default-for-default, because a shim whose defaults have drifted silently
-    changes the model a user gets from `HuberRegressor()`.
+    `output_type` and `device` are mlrs-only — the first selects the array
+    library results come back in, the second where the objective runs
+    (DEVICE-PARAM-01), and NEITHER changes the fitted model. Both are excluded;
+    everything else must match name-for-name and default-for-default, because a
+    shim whose defaults have drifted silently changes the model a user gets from
+    `HuberRegressor()`.
     """
     sk = inspect.signature(SkHuber.__init__).parameters
     ours = inspect.signature(mlrs.HuberRegressor.__init__).parameters
 
     sk_names = {n for n in sk if n != "self"}
-    our_names = {n for n in ours if n not in ("self", "output_type")}
+    our_names = {n for n in ours if n not in ("self", "output_type", "device")}
     assert our_names == sk_names, (
         f"parameter surface drift: mlrs-only={our_names - sk_names}, "
         f"sklearn-only={sk_names - our_names}"
@@ -176,19 +178,26 @@ def test_ctor_signature_matches_sklearn():
 def test_no_string_valued_parameters():
     """HuberRegressor has NO string-valued parameter, and this pins it.
 
-    Every ctor parameter is a float, an int or a bool — there is no `solver=`,
-    no `loss=`, nothing with a `StrOptions` constraint — so there is no
-    string-valued parameter for an oracle case to cover. `gen_huber` asserts the
-    same fact against sklearn's own `_parameter_constraints`; this asserts it
-    against the defaults both classes actually expose. If a future sklearn adds
-    one, both fail rather than the new parameter going untested.
+    Every parameter that reaches the MODEL is a float, an int or a bool —
+    there is no `solver=`, no `loss=`, nothing with a `StrOptions` constraint —
+    so there is no string-valued parameter for an oracle case to cover.
+    `gen_huber` asserts the same fact against sklearn's own
+    `_parameter_constraints`; this asserts it against the defaults both classes
+    actually expose. If a future sklearn adds one, both fail rather than the new
+    parameter going untested.
+
+    mlrs' own `output_type` and `device` are strings but are excluded: they
+    select the egress array library and the execution arm, and a value-neutral
+    knob has nothing for an ORACLE to compare against sklearn. `device` is
+    covered instead by `test_device_param.py`, which asserts the two arms agree.
     """
     for cls in (SkHuber, mlrs.HuberRegressor):
         params = inspect.signature(cls.__init__).parameters
         strings = {
             n: p.default
             for n, p in params.items()
-            if n not in ("self", "output_type") and isinstance(p.default, str)
+            if n not in ("self", "output_type", "device")
+            and isinstance(p.default, str)
         }
         assert not strings, (
             f"{cls.__module__}.{cls.__name__} grew string-valued parameter(s) "

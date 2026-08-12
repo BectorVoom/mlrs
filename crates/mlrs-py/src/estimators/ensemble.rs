@@ -44,6 +44,8 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::estimators::linear::parse_device;
+
 use mlrs_algos::ensemble::hist_gradient_boosting_classifier::HistGradientBoostingClassifier;
 use mlrs_algos::ensemble::hist_gradient_boosting_regressor::HistGradientBoostingRegressor;
 use mlrs_algos::ensemble::random_forest_classifier::RandomForestClassifier;
@@ -971,6 +973,7 @@ crate::any_estimator_typestate! {
     unfit: {
         max_iter: usize, learning_rate: f64, max_depth: usize, n_bins: usize,
         l2_regularization: f64, min_samples_leaf: usize,
+        device: String,
     },
 }
 
@@ -981,6 +984,10 @@ crate::any_estimator_typestate! {
 #[pyclass(name = "HistGradientBoostingClassifier")]
 pub struct PyHistGradientBoostingClassifier {
     inner: AnyHistGradientBoostingClassifier,
+    /// `device_` — the arm that actually ran. Recorded at `fit` because the
+    /// typestate transition consumes the `Unfit` variant the preference was
+    /// read from, and a fitted estimator must still be able to name its arm.
+    device_used: Option<String>,
 }
 
 impl PyHistGradientBoostingClassifier {
@@ -988,6 +995,7 @@ impl PyHistGradientBoostingClassifier {
     /// [`PyRandomForestClassifier::unfit_default`]).
     pub fn unfit_default() -> Self {
         Self {
+            device_used: None,
             inner: AnyHistGradientBoostingClassifier::Unfit {
                 max_iter: 100,
                 learning_rate: 0.1,
@@ -995,6 +1003,7 @@ impl PyHistGradientBoostingClassifier {
                 n_bins: 64,
                 l2_regularization: 0.0,
                 min_samples_leaf: 20,
+                device: "auto".to_string(),
             },
         }
     }
@@ -1015,6 +1024,7 @@ impl PyHistGradientBoostingClassifier {
         n_bins = 64,
         l2_regularization = 0.0,
         min_samples_leaf = 20,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1024,8 +1034,10 @@ impl PyHistGradientBoostingClassifier {
         n_bins: usize,
         l2_regularization: f64,
         min_samples_leaf: usize,
+        device: String,
     ) -> PyResult<Self> {
         Ok(Self {
+            device_used: None,
             inner: AnyHistGradientBoostingClassifier::Unfit {
                 max_iter,
                 learning_rate,
@@ -1033,6 +1045,7 @@ impl PyHistGradientBoostingClassifier {
                 n_bins,
                 l2_regularization,
                 min_samples_leaf,
+                device,
             },
         })
     }
@@ -1053,8 +1066,10 @@ impl PyHistGradientBoostingClassifier {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
         let dt = float_dtype(&xa)?;
-        let (max_iter, learning_rate, max_depth, n_bins, l2_regularization, min_samples_leaf) =
-            match &self.inner {
+        let (
+            max_iter, learning_rate, max_depth, n_bins, l2_regularization,
+            min_samples_leaf, device_s,
+        ) = match &self.inner {
                 AnyHistGradientBoostingClassifier::Unfit {
                     max_iter,
                     learning_rate,
@@ -1062,6 +1077,7 @@ impl PyHistGradientBoostingClassifier {
                     n_bins,
                     l2_regularization,
                     min_samples_leaf,
+                    device,
                 } => (
                     *max_iter,
                     *learning_rate,
@@ -1069,6 +1085,7 @@ impl PyHistGradientBoostingClassifier {
                     *n_bins,
                     *l2_regularization,
                     *min_samples_leaf,
+                    device.clone(),
                 ),
                 _ => return Err(not_fitted("hist_gradient_boosting_classifier", "re-fit")),
             };
@@ -1079,6 +1096,7 @@ impl PyHistGradientBoostingClassifier {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
                     let est = HistGradientBoostingClassifier::<f32>::builder()
+                        .device(parse_device(&device_s)?)
                         .max_iter(max_iter)
                         .learning_rate(learning_rate)
                         .max_depth(max_depth)
@@ -1096,6 +1114,7 @@ impl PyHistGradientBoostingClassifier {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
                     let est = HistGradientBoostingClassifier::<f64>::builder()
+                        .device(parse_device(&device_s)?)
                         .max_iter(max_iter)
                         .learning_rate(learning_rate)
                         .max_depth(max_depth)
@@ -1110,9 +1129,26 @@ impl PyHistGradientBoostingClassifier {
                 }
             }
         })?;
+        // The boosting loop's arm is a pure function of (preference, backend),
+        // read from the same predicate `hgb_fit_*` branches on.
+        self.device_used = Some(
+            mlrs_backend::prims::hist_gradient_boosting::hgb_device_arm(
+                parse_device(&device_s)?,
+            )
+            .to_string(),
+        );
         self.inner = fitted;
         Ok(())
     }
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    ///
+    /// A preference the backend cannot honour is REPORTED here, not faked: the
+    /// capability half of each gate still decides, and this names what carried
+    /// the fit.
+    fn device_used(&self) -> Option<String> {
+        self.device_used.clone()
+    }
+
 
     /// `predict = argmax(predict_proba)` mapped back through `classes_` (i32).
     fn predict_labels(
@@ -1253,6 +1289,7 @@ crate::any_estimator_typestate! {
     unfit: {
         max_iter: usize, learning_rate: f64, max_depth: usize, n_bins: usize,
         l2_regularization: f64, min_samples_leaf: usize,
+        device: String,
     },
 }
 
@@ -1263,6 +1300,10 @@ crate::any_estimator_typestate! {
 #[pyclass(name = "HistGradientBoostingRegressor")]
 pub struct PyHistGradientBoostingRegressor {
     inner: AnyHistGradientBoostingRegressor,
+    /// `device_` — the arm that actually ran. Recorded at `fit` because the
+    /// typestate transition consumes the `Unfit` variant the preference was
+    /// read from, and a fitted estimator must still be able to name its arm.
+    device_used: Option<String>,
 }
 
 impl PyHistGradientBoostingRegressor {
@@ -1270,6 +1311,7 @@ impl PyHistGradientBoostingRegressor {
     /// [`PyRandomForestClassifier::unfit_default`]).
     pub fn unfit_default() -> Self {
         Self {
+            device_used: None,
             inner: AnyHistGradientBoostingRegressor::Unfit {
                 max_iter: 100,
                 learning_rate: 0.1,
@@ -1277,6 +1319,7 @@ impl PyHistGradientBoostingRegressor {
                 n_bins: 64,
                 l2_regularization: 0.0,
                 min_samples_leaf: 20,
+                device: "auto".to_string(),
             },
         }
     }
@@ -1297,6 +1340,7 @@ impl PyHistGradientBoostingRegressor {
         n_bins = 64,
         l2_regularization = 0.0,
         min_samples_leaf = 20,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1306,8 +1350,10 @@ impl PyHistGradientBoostingRegressor {
         n_bins: usize,
         l2_regularization: f64,
         min_samples_leaf: usize,
+        device: String,
     ) -> PyResult<Self> {
         Ok(Self {
+            device_used: None,
             inner: AnyHistGradientBoostingRegressor::Unfit {
                 max_iter,
                 learning_rate,
@@ -1315,6 +1361,7 @@ impl PyHistGradientBoostingRegressor {
                 n_bins,
                 l2_regularization,
                 min_samples_leaf,
+                device,
             },
         })
     }
@@ -1335,8 +1382,10 @@ impl PyHistGradientBoostingRegressor {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
         let dt = float_dtype(&xa)?;
-        let (max_iter, learning_rate, max_depth, n_bins, l2_regularization, min_samples_leaf) =
-            match &self.inner {
+        let (
+            max_iter, learning_rate, max_depth, n_bins, l2_regularization,
+            min_samples_leaf, device_s,
+        ) = match &self.inner {
                 AnyHistGradientBoostingRegressor::Unfit {
                     max_iter,
                     learning_rate,
@@ -1344,6 +1393,7 @@ impl PyHistGradientBoostingRegressor {
                     n_bins,
                     l2_regularization,
                     min_samples_leaf,
+                    device,
                 } => (
                     *max_iter,
                     *learning_rate,
@@ -1351,6 +1401,7 @@ impl PyHistGradientBoostingRegressor {
                     *n_bins,
                     *l2_regularization,
                     *min_samples_leaf,
+                    device.clone(),
                 ),
                 _ => return Err(not_fitted("hist_gradient_boosting_regressor", "re-fit")),
             };
@@ -1361,6 +1412,7 @@ impl PyHistGradientBoostingRegressor {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
                     let est = HistGradientBoostingRegressor::<f32>::builder()
+                        .device(parse_device(&device_s)?)
                         .max_iter(max_iter)
                         .learning_rate(learning_rate)
                         .max_depth(max_depth)
@@ -1378,6 +1430,7 @@ impl PyHistGradientBoostingRegressor {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
                     let est = HistGradientBoostingRegressor::<f64>::builder()
+                        .device(parse_device(&device_s)?)
                         .max_iter(max_iter)
                         .learning_rate(learning_rate)
                         .max_depth(max_depth)
@@ -1392,9 +1445,26 @@ impl PyHistGradientBoostingRegressor {
                 }
             }
         })?;
+        // The boosting loop's arm is a pure function of (preference, backend),
+        // read from the same predicate `hgb_fit_*` branches on.
+        self.device_used = Some(
+            mlrs_backend::prims::hist_gradient_boosting::hgb_device_arm(
+                parse_device(&device_s)?,
+            )
+            .to_string(),
+        );
         self.inner = fitted;
         Ok(())
     }
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    ///
+    /// A preference the backend cannot honour is REPORTED here, not faked: the
+    /// capability half of each gate still decides, and this names what carried
+    /// the fit.
+    fn device_used(&self) -> Option<String> {
+        self.device_used.clone()
+    }
+
 
     /// `predict(x)` → length-`rows` host `Vec<f32>` (f32 fitted path).
     fn predict_f32(

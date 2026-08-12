@@ -78,6 +78,7 @@ class UMAP(TransformerMixin, MlrsBase):
         negative_sample_rate=5,
         a=None,
         b=None,
+        device="auto",
         output_type="input",
     ):
         self.n_neighbors = n_neighbors
@@ -95,6 +96,7 @@ class UMAP(TransformerMixin, MlrsBase):
         self.negative_sample_rate = negative_sample_rate
         self.a = a
         self.b = b
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y=None):
@@ -115,6 +117,7 @@ class UMAP(TransformerMixin, MlrsBase):
             self.negative_sample_rate,
             self.a,
             self.b,
+            self._device(),
         )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
@@ -192,6 +195,7 @@ class TSNE(MlrsBase):
         method="barnes_hut",
         angle=0.5,
         n_jobs=None,
+        device="auto",
         output_type="input",
     ):
         self.n_components = n_components
@@ -209,6 +213,7 @@ class TSNE(MlrsBase):
         self.method = method
         self.angle = angle
         self.n_jobs = n_jobs
+        self.device = device
         self.output_type = output_type
 
     def _resolve_metric(self, X):
@@ -313,6 +318,7 @@ class TSNE(MlrsBase):
             self.method,
             float(self.angle),
             None if self.n_jobs is None else int(self.n_jobs),
+            self._device(),
         )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
