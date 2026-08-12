@@ -265,16 +265,27 @@ class _RustRng:
                 "mlrs.model_selection requires a legacy numpy RandomState "
                 f"(MT19937); got bit generator {state[0]!r}."
             )
-        self._tail = tuple(state[3:])
         self.handle = _ext().NumpyRandomState(
             np.asarray(state[1], dtype=np.uint32).tolist(), int(state[2])
         )
 
     def sync(self):
-        """Write the advanced Rust state back into the caller's generator."""
+        """Write the advanced Rust state back into the caller's generator.
+
+        Only the 624-word key and the position come from Rust; the legacy
+        tuple's tail (``has_gauss`` and the cached gaussian) is read back off the
+        LIVE object rather than from the snapshot taken at construction. Those
+        two are the ONE part of the state Rust never models, and something else
+        may legitimately have moved them inside the borrow: RANSAC's
+        arbitrary-base arm calls a Python estimator once per trial, and one that
+        drew an odd number of gaussians would otherwise have its half-used cache
+        rolled back here. For every other caller nothing touched the generator
+        in between and this reads exactly what the snapshot held.
+        """
         key, pos = self.handle.get_state()
+        tail = tuple(self.rs.get_state(legacy=True)[3:])
         self.rs.set_state(
-            ("MT19937", np.asarray(key, dtype=np.uint32), int(pos), *self._tail)
+            ("MT19937", np.asarray(key, dtype=np.uint32), int(pos), *tail)
         )
 
     def reload(self):
@@ -285,7 +296,6 @@ class _RustRng:
         own index draws are the only case.
         """
         state = self.rs.get_state(legacy=True)
-        self._tail = tuple(state[3:])
         self.handle = _ext().NumpyRandomState(
             np.asarray(state[1], dtype=np.uint32).tolist(), int(state[2])
         )

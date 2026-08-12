@@ -57,10 +57,15 @@ use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_algos::error::{AlgoError, BuildError};
 use mlrs_algos::linear::ransac::{
-    MinSamples, RansacCallbacks, RansacLoss, RansacModel, RansacRegressor, RansacVerdict,
+    MinSamples, RansacCallbacks, RansacDriver, RansacLoss, RansacModel, RansacRegressor,
+    RansacTrialBridge, RansacVerdict, TrialStatus,
 };
+use mlrs_algos::typestate::Fitted;
 use mlrs_algos::model_selection::rng::NumpyRandomState;
 use mlrs_backend::capability;
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::ransac_host::RansacHostEngine;
+use mlrs_backend::runtime::{self, ActiveRuntime};
 use mlrs_core::{load_npz, OracleCase};
 
 /// Fixture geometry — `gen_oracle.py`'s `RANSAC_N_SAMPLES` × `RANSAC_N_FEATURES`.
@@ -253,9 +258,24 @@ impl Case {
     }
 }
 
+/// A fresh pool for one fit. The host arm never touches it — it exists for the
+/// device scan, which every test here leaves unselected (`device` defaults to
+/// `Auto` and `RANSAC_DEVICE_MIN_WORK` keeps `Auto` on the host).
+fn pool() -> BufferPool<ActiveRuntime> {
+    BufferPool::new(runtime::active_client())
+}
+
 /// The fixture's `is_data_valid`: `max|X_subset| < 2.0`.
-fn data_valid<F: Pod>(xs: &[F], _ys: &[F], _m: usize) -> RansacVerdict {
-    let worst = xs.iter().map(|&v| to_f64(v).abs()).fold(0.0f64, f64::max);
+///
+/// The predicate receives the sub-sample's ROW INDICES rather than a gathered
+/// copy (RANSAC-02), so it reads the design it was handed — which is what the
+/// shim's bridge does too, as one numpy fancy index.
+fn data_valid<F: Pod>(x: &[F], d: usize, idxs: &[i64]) -> RansacVerdict {
+    let worst = idxs
+        .iter()
+        .flat_map(|&g| &x[g as usize * d..(g as usize + 1) * d])
+        .map(|&v| to_f64(v).abs())
+        .fold(0.0f64, f64::max);
     if worst < 2.0 {
         RansacVerdict::Valid
     } else {
@@ -264,7 +284,7 @@ fn data_valid<F: Pod>(xs: &[F], _ys: &[F], _m: usize) -> RansacVerdict {
 }
 
 /// The fixture's `is_model_valid`: `max|coef_| < 3.0`.
-fn model_valid<F: Pod>(model: RansacModel<'_>, _xs: &[F], _ys: &[F], _m: usize) -> RansacVerdict {
+fn model_valid(model: RansacModel<'_>, _idxs: &[i64]) -> RansacVerdict {
     let worst = model.coef.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
     if worst < 3.0 {
         RansacVerdict::Valid
@@ -342,16 +362,17 @@ where
         .build::<F>()
         .expect("the fixture's configurations are all inside sklearn's bounds");
 
-    let callbacks = match case.predicate {
-        Predicate::None => RansacCallbacks::default(),
-        Predicate::Data => RansacCallbacks {
-            is_data_valid: Some(&data_valid::<F>),
+    let dv = |idxs: &[i64]| data_valid::<F>(&x, N_FEATURES, idxs);
+    let driver = match case.predicate {
+        Predicate::None => RansacDriver::default(),
+        Predicate::Data => RansacDriver::with_callbacks(RansacCallbacks {
+            is_data_valid: Some(&dv),
             is_model_valid: None,
-        },
-        Predicate::Model => RansacCallbacks {
+        }),
+        Predicate::Model => RansacDriver::with_callbacks(RansacCallbacks {
             is_data_valid: None,
-            is_model_valid: Some(&model_valid::<F>),
-        },
+            is_model_valid: Some(&model_valid),
+        }),
     };
 
     // The SAME seed sklearn's `check_random_state(42)` produces, so the two draw
@@ -359,13 +380,14 @@ where
     let mut rng = NumpyRandomState::from_seed(SEED);
     let fitted = est
         .fit_from_host_slice(
+            &mut pool(),
             &x,
             &y,
             (N_SAMPLES, N_FEATURES),
             1,
             case.sample_weight.then_some(sw.as_slice()),
             &mut rng,
-            &callbacks,
+            &driver,
         )
         .unwrap_or_else(|e| panic!("case '{}': fit failed: {e}", case.name));
 
@@ -563,13 +585,14 @@ fn the_two_loss_options_classify_differently() {
             .build::<f64>()
             .expect("valid")
             .fit_from_host_slice(
+                &mut pool(),
                 &x,
                 &y,
                 (N_SAMPLES, N_FEATURES),
                 1,
                 None,
                 &mut rng,
-                &RansacCallbacks::default(),
+                &RansacDriver::default(),
             )
             .expect("fit");
         sizes.push(fitted.inlier_mask().iter().filter(|&&m| m).count());
@@ -595,7 +618,7 @@ fn a_callback_can_abort_the_fit() {
     let y = as_f::<f32>(&oracle, "y");
 
     let calls = Cell::new(0usize);
-    let abort_on_third = |_xs: &[f32], _ys: &[f32], _m: usize| -> RansacVerdict {
+    let abort_on_third = |_idxs: &[i64]| -> RansacVerdict {
         calls.set(calls.get() + 1);
         if calls.get() >= 3 {
             RansacVerdict::Abort
@@ -607,16 +630,17 @@ fn a_callback_can_abort_the_fit() {
         .build::<f32>()
         .expect("valid")
         .fit_from_host_slice(
+            &mut pool(),
             &x,
             &y,
             (N_SAMPLES, N_FEATURES),
             1,
             None,
             &mut NumpyRandomState::from_seed(SEED),
-            &RansacCallbacks {
+            &RansacDriver::with_callbacks(RansacCallbacks {
                 is_data_valid: Some(&abort_on_third),
                 is_model_valid: None,
-            },
+            }),
         )
         .expect_err("an aborting predicate must not produce a fitted estimator");
     assert!(
@@ -644,7 +668,7 @@ fn rejecting_every_subsample_is_an_error_not_a_warning() {
     let oracle = load::<f32>();
     let x = as_f::<f32>(&oracle, "X");
     let y = as_f::<f32>(&oracle, "y");
-    let never = |_xs: &[f32], _ys: &[f32], _m: usize| RansacVerdict::Invalid;
+    let never = |_idxs: &[i64]| RansacVerdict::Invalid;
 
     for (max_skips, want_skipped_out, want_trials) in
         [(f64::INFINITY, false, 100usize), (3.0, true, 5usize)]
@@ -654,16 +678,17 @@ fn rejecting_every_subsample_is_an_error_not_a_warning() {
             .build::<f32>()
             .expect("valid")
             .fit_from_host_slice(
+                &mut pool(),
                 &x,
                 &y,
                 (N_SAMPLES, N_FEATURES),
                 1,
                 None,
                 &mut NumpyRandomState::from_seed(SEED),
-                &RansacCallbacks {
+                &RansacDriver::with_callbacks(RansacCallbacks {
                     is_data_valid: Some(&never),
                     is_model_valid: None,
-                },
+                }),
             )
             .expect_err("no consensus set must be an error");
         match err {
@@ -700,13 +725,14 @@ fn a_blown_skip_budget_with_a_consensus_is_reported_not_raised() {
         .build::<f32>()
         .expect("valid")
         .fit_from_host_slice(
+            &mut pool(),
             &x,
             &y,
             (N_SAMPLES, N_FEATURES),
             1,
             None,
             &mut NumpyRandomState::from_seed(SEED),
-            &RansacCallbacks::default(),
+            &RansacDriver::default(),
         )
         .expect("a consensus WAS found, so this is a warning case not an error");
     assert!(
@@ -718,13 +744,14 @@ fn a_blown_skip_budget_with_a_consensus_is_reported_not_raised() {
         .build::<f32>()
         .expect("valid")
         .fit_from_host_slice(
+            &mut pool(),
             &x,
             &y,
             (N_SAMPLES, N_FEATURES),
             1,
             None,
             &mut NumpyRandomState::from_seed(SEED),
-            &RansacCallbacks::default(),
+            &RansacDriver::default(),
         )
         .expect("fit");
     assert!(
@@ -746,13 +773,14 @@ fn min_samples_larger_than_the_design_is_rejected_at_fit() {
         .build::<f32>()
         .expect("the bound is not knowable at build time, so this must build")
         .fit_from_host_slice(
+            &mut pool(),
             &x,
             &y,
             (N_SAMPLES, N_FEATURES),
             1,
             None,
             &mut NumpyRandomState::from_seed(SEED),
-            &RansacCallbacks::default(),
+            &RansacDriver::default(),
         )
         .expect_err("a sub-sample larger than the design must be rejected");
     assert!(
@@ -872,13 +900,14 @@ fn the_fit_is_identical_at_every_worker_width() {
             .build::<f32>()
             .expect("valid")
             .fit_from_host_slice(
+                &mut pool(),
                 &x,
                 &y,
                 (N_SAMPLES, N_FEATURES),
                 1,
                 None,
                 &mut rng,
-                &RansacCallbacks::default(),
+                &RansacDriver::default(),
             )
             .expect("fit");
         (
@@ -900,5 +929,210 @@ fn the_fit_is_identical_at_every_worker_width() {
                  reduction is not worker-count independent"
             ),
         }
+    }
+}
+
+// =========================================================================== //
+// The arbitrary-base arm (RANSAC-02)
+// =========================================================================== //
+
+/// A [`RansacTrialBridge`] over the SAME least squares the native arm fits, so
+/// the two arms are comparable statement for statement.
+///
+/// It exists to test the CONTRACT rather than any particular estimator: a
+/// foreign base's only job is to answer "here are my predictions for the whole
+/// design, or here is why I am skipping", and everything the loop does with that
+/// answer is what these tests are about. The PyO3 implementation is the same
+/// shape with `estimator.fit`/`predict` in place of `subset_lstsq`.
+struct OlsBridge<'a> {
+    engine: RansacHostEngine<'a, f64>,
+    x: &'a [f64],
+    n: usize,
+    d: usize,
+    /// How many times the loop called in — the per-trial crossing count, which
+    /// is the claim the foreign arm is built around.
+    calls: Cell<usize>,
+    /// A trial index whose data the bridge rejects, and one whose model it does.
+    reject_data_at: Option<usize>,
+    reject_model_at: Option<usize>,
+    /// The consensus refit, so the test can check the loop asked for one.
+    refits: Cell<usize>,
+}
+
+impl OlsBridge<'_> {
+    fn seen(&self) -> usize {
+        self.calls.get()
+    }
+}
+
+impl RansacTrialBridge for OlsBridge<'_> {
+    fn run_trial(
+        &self,
+        idxs: &[i64],
+        _rng: &mut NumpyRandomState,
+        scan: &mut dyn FnMut(&[f64], Option<&[f64]>),
+    ) -> Result<TrialStatus, ()> {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        if self.reject_data_at == Some(call) {
+            return Ok(TrialStatus::InvalidData);
+        }
+        let (coef, icept) = self.engine.subset_lstsq(idxs, true, None);
+        if self.reject_model_at == Some(call) {
+            return Ok(TrialStatus::InvalidModel);
+        }
+        let y_pred: Vec<f64> = (0..self.n)
+            .map(|i| {
+                let row = &self.x[i * self.d..(i + 1) * self.d];
+                row.iter().zip(&coef).map(|(a, b)| a * b).sum::<f64>() + icept[0]
+            })
+            .collect();
+        // The scan reads this buffer in place and does not outlive the call —
+        // the callback contract this trait is shaped around.
+        scan(&y_pred, None);
+        Ok(TrialStatus::Fitted)
+    }
+
+    fn refit(&self, _idxs: &[i64], _rng: &mut NumpyRandomState) -> Result<(), ()> {
+        self.refits.set(self.refits.get() + 1);
+        Ok(())
+    }
+}
+
+fn ols_bridge<'a>(x: &'a [f64], y: &'a [f64]) -> OlsBridge<'a> {
+    OlsBridge {
+        engine: RansacHostEngine::new(x, y, N_SAMPLES, N_FEATURES, 1, N_SAMPLES * N_FEATURES)
+            .expect("geometry"),
+        x,
+        n: N_SAMPLES,
+        d: N_FEATURES,
+        calls: Cell::new(0),
+        reject_data_at: None,
+        reject_model_at: None,
+        refits: Cell::new(0),
+    }
+}
+
+fn fit_default(x: &[f64], y: &[f64], driver: &RansacDriver<'_>) -> RansacRegressor<f64, Fitted> {
+    RansacRegressor::<f64>::builder()
+        .build::<f64>()
+        .expect("sklearn's defaults are in range")
+        .fit_from_host_slice(
+            &mut pool(),
+            x,
+            y,
+            (N_SAMPLES, N_FEATURES),
+            1,
+            None,
+            &mut NumpyRandomState::from_seed(SEED),
+            driver,
+        )
+        .expect("the fixture design has a consensus set")
+}
+
+/// A base the loop cannot fit itself produces the SAME fit as the one it can,
+/// for one call per trial and no more.
+#[test]
+fn a_foreign_base_matches_the_native_arm() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let oracle = load::<f64>();
+    let (x, y) = (as_f::<f64>(&oracle, "X"), as_f::<f64>(&oracle, "y"));
+
+    let native = fit_default(&x, &y, &RansacDriver::default());
+    let bridge = ols_bridge(&x, &y);
+    let foreign = fit_default(&x, &y, &RansacDriver::foreign(&bridge));
+
+    assert_eq!(native.n_trials(), foreign.n_trials(), "n_trials_");
+    assert_eq!(
+        native.inlier_mask(),
+        foreign.inlier_mask(),
+        "the consensus set"
+    );
+    assert_eq!(
+        native.n_skips_no_inliers(),
+        foreign.n_skips_no_inliers(),
+        "n_skips_no_inliers_"
+    );
+    // ONE call per trial — the floor the module docs claim, measured rather
+    // than asserted in prose.
+    assert_eq!(
+        bridge.seen(),
+        foreign.n_trials(),
+        "the loop must call the bridge exactly once per trial"
+    );
+    assert_eq!(bridge.refits.get(), 1, "exactly one consensus refit");
+    // The foreign arm holds no linear model of its own: the fitted estimator is
+    // the caller's object, and asking this one to predict is an error rather
+    // than a silently empty matvec.
+    assert!(!foreign.has_linear_model());
+    assert!(foreign.predict_from_host(&x, (N_SAMPLES, N_FEATURES)).is_err());
+    assert_eq!(foreign.device_arm(), "cpu", "the foreign arm has no device");
+}
+
+/// The bridge's two skip verdicts land in sklearn's two counters.
+#[test]
+fn a_foreign_base_can_skip_a_trial_either_way() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let oracle = load::<f64>();
+    let (x, y) = (as_f::<f64>(&oracle, "X"), as_f::<f64>(&oracle, "y"));
+
+    let mut bridge = ols_bridge(&x, &y);
+    bridge.reject_data_at = Some(0);
+    bridge.reject_model_at = Some(1);
+    let fitted = fit_default(&x, &y, &RansacDriver::foreign(&bridge));
+
+    assert_eq!(fitted.n_skips_invalid_data(), 1, "n_skips_invalid_data_");
+    assert_eq!(fitted.n_skips_invalid_model(), 1, "n_skips_invalid_model_");
+}
+
+/// A bridge that gives up unwinds the fit as a callback abort, and does not
+/// leave a half-fitted estimator behind.
+#[test]
+fn a_foreign_base_can_abort_the_fit() {
+    if capability::skip_f64_with_log() {
+        return;
+    }
+    let oracle = load::<f64>();
+    let (x, y) = (as_f::<f64>(&oracle, "X"), as_f::<f64>(&oracle, "y"));
+
+    struct Boom;
+    impl RansacTrialBridge for Boom {
+        fn run_trial(
+            &self,
+            _idxs: &[i64],
+            _rng: &mut NumpyRandomState,
+            _scan: &mut dyn FnMut(&[f64], Option<&[f64]>),
+        ) -> Result<TrialStatus, ()> {
+            Err(())
+        }
+        fn refit(&self, _idxs: &[i64], _rng: &mut NumpyRandomState) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    let boom = Boom;
+    let err = RansacRegressor::<f64>::builder()
+        .build::<f64>()
+        .expect("defaults")
+        .fit_from_host_slice(
+            &mut pool(),
+            &x,
+            &y,
+            (N_SAMPLES, N_FEATURES),
+            1,
+            None,
+            &mut NumpyRandomState::from_seed(SEED),
+            &RansacDriver::foreign(&boom),
+        )
+        .expect_err("a bridge that gives up must not produce a fitted estimator");
+    match err {
+        AlgoError::CallbackAborted { callback, .. } => {
+            assert_eq!(callback, "estimator.fit")
+        }
+        other => panic!("expected CallbackAborted, got {other:?}"),
     }
 }

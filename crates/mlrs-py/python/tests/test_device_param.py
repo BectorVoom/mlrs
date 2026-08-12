@@ -121,6 +121,15 @@ CASES = [
     ),
     ("HuberRegressor", lambda d: mlrs.HuberRegressor(device=d), True, "coef_"),
     (
+        # RANSAC-02. `device` moves the per-trial SCAN; the sub-sample solve and
+        # the draw sequence are host on both arms, so `coef_` must agree exactly
+        # and not merely to a band.
+        "RANSACRegressor",
+        lambda d: mlrs.RANSACRegressor(random_state=0, device=d),
+        True,
+        None,
+    ),
+    (
         "MBSGDRegressor",
         lambda d: mlrs.MBSGDRegressor(max_iter=30, seed=0, device=d),
         True,
@@ -160,6 +169,16 @@ STOCHASTIC_IDS = {"UMAP"}
 # Estimators with no single fit-time arm to report.
 NO_DEVICE_ATTR = NEIGHBOUR_IDS | STOCHASTIC_IDS
 
+# Estimators whose fitted answer is not one array on the estimator itself: a
+# forest has no coefficient vector, and RANSAC's live on the `estimator_` it
+# refitted. Both are compared through what a caller actually consumes —
+# `predict`.
+PREDICT_IDS = {
+    "HistGradientBoostingRegressor",
+    "HistGradientBoostingClassifier",
+    "RANSACRegressor",
+}
+
 
 def _fit(factory, needs_y, device):
     X, y = design()
@@ -186,8 +205,8 @@ def test_arms_agree_on_the_fit(label, factory, needs_y, attr):
     got = {}
     for device in ("cpu", "gpu"):
         est = _fit(factory, needs_y, device)
-        if attr is None and label.startswith("HistGradientBoosting"):
-            # A forest has no coefficient vector; its answer is the prediction.
+        if attr is None and label in PREDICT_IDS:
+            # No single fitted array to compare; the answer is the prediction.
             got[device] = np.asarray(est.predict(X[:50]), dtype=np.float64).ravel()
         elif attr is None:
             # The neighbour search IS the answer: compare the distances the two

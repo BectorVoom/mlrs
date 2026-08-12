@@ -87,6 +87,12 @@ pub mod nnls;
 // on the device instead of reading the whole tile back. Owns its `pub mod`
 // (file-disjoint, single-owner — the `dbscan` precedent).
 pub mod radius;
+// `RANSACRegressor`'s BATCHED trial scan (RANSAC-02) — the pair that turns "one
+// launch and one host stall per trial" into "one per BATCH of trials", which is
+// what makes a device arm viable for a loop whose stopping rule reads the
+// previous trial's inlier count. Owns its `pub mod` (file-disjoint,
+// single-owner — the `radius`/`dbscan` precedent).
+pub mod ransac;
 pub mod reduce;
 // Phase-10 SGD kernels (Wave-0 scaffold plan 10-01 owns this registration; the
 // Wave-1 plan drives them from `prims/sgd.rs` — file-disjoint, parallel-safe).

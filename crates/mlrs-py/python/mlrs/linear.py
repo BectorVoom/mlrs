@@ -1592,51 +1592,57 @@ class LinearSVC(ClassifierMixin, MlrsBase):
 
 
 # =========================================================================== #
-# RANSACRegressor (RANSAC-01) — the outlier-EXCLUDING robust regressor.
+# RANSACRegressor (RANSAC-01 / RANSAC-02) — the outlier-EXCLUDING robust
+# regressor.
 # =========================================================================== #
 #
 # RANSAC is a meta-estimator, and that shapes this shim: sklearn's ``estimator=``
-# takes ANY duck-typed regressor. mlrs answers that with two fit paths behind one
-# public class, chosen per-fit:
+# takes ANY duck-typed regressor. There is now ONE fit path — the Rust trial loop
+# — and the base estimator decides only who fits each sub-sample:
 #
 #   ===============================  =======================================
-#   configuration                    path
+#   base estimator                   sub-model fit
 #   ===============================  =======================================
-#   ``estimator=None``, or a         the Rust engine (`_fit_rust`)
-#   ``LinearRegression`` with
-#   ``positive=False`` — AND a
-#   string ``loss``
-#   anything else (another           `_fit_python`, a faithful
-#   estimator class, ``positive=     transcription of sklearn's own loop
-#   True``, a callable ``loss``)
+#   ``estimator=None``, or a         native, in Rust
+#   ``LinearRegression`` with        (``RansacBase::Ols``)
+#   ``positive=False``
+#   anything else                    the estimator's own ``fit``, through
+#                                    :class:`_RansacBridge` — ONE call per
+#                                    trial (``RansacBase::Foreign``)
 #   ===============================  =======================================
 #
-# Both paths draw their sub-samples from the SAME numpy ``RandomState`` through
-# the SAME ``sample_without_replacement``, so they agree index-for-index with
-# sklearn — and with each other — for a given ``random_state``. What differs is
-# only who fits the sub-model and who scans the residuals.
+# The second row is what replaced this module's earlier Python transcription of
+# sklearn's loop. That transcription ran ~10 numpy operations per trial and two
+# full fancy-index copies of the design; the bridge runs the estimator's ``fit``
+# and one ``predict``, and every downstream step — the loss, the threshold, the
+# consensus size, the R², the skip counters and all four stop rules — happens in
+# Rust over a worker pool. Deleting it also removed the risk it carried: two
+# implementations of one estimator, free to drift apart.
 #
-# ``is_data_valid`` / ``is_model_valid`` are supported on BOTH paths. They are
-# RANSAC's own parameters, not the base estimator's, and they fire at most once
-# per trial — so the Rust loop calls back up into Python rather than
-# surrendering the whole configuration to the slow path (see
-# ``crates/mlrs-py/src/estimators/ransac.rs``).
-#
-# A CALLABLE ``loss`` is the one RANSAC-own parameter the Rust path cannot take:
-# its contract is ``loss(y_true, y_pred) -> array``, which needs the
-# materialized ``y_pred`` that the fused scan deliberately never writes out.
-# That configuration takes the Python path.
+# ``is_data_valid`` / ``is_model_valid`` are supported on both, and a CALLABLE
+# ``loss`` no longer forces a different path — the bridge evaluates it (its
+# contract is ``loss(y_true, y_pred) -> array``, which needs the materialized
+# ``y_pred`` the fused native scan never writes) and returns the residual
+# alongside the predictions, so Rust still owns the comparison and the
+# bookkeeping.
+
+
+#: ``_RansacBridge.run_trial`` status codes. The same three constants are named
+#: in ``crates/mlrs-py/src/estimators/ransac.rs``; they are a wire format, so
+#: they are spelled out on both sides rather than inferred.
+_TRIAL_FITTED, _TRIAL_INVALID_DATA, _TRIAL_INVALID_MODEL = 0, 1, 2
 
 
 def _ransac_base_is_plain_ols(estimator):
-    """Is ``estimator`` an ordinary least squares the Rust engine can host?
+    """Is ``estimator`` an ordinary least squares the Rust engine fits natively?
 
     ``None`` is sklearn's default (a fresh ``LinearRegression()``). An explicit
     ``LinearRegression`` — sklearn's or mlrs's — qualifies too, but only with
     ``positive=False``: the non-negative variant is a different solver
-    (``scipy.optimize.nnls``), not a parameter of this one.
+    (``scipy.optimize.nnls``), not a parameter of this one, so it goes through
+    the bridge like any other estimator.
 
-    Returns ``(usable, fit_intercept)``.
+    Returns ``(native, fit_intercept)``.
     """
     if estimator is None:
         return True, True
@@ -1649,46 +1655,198 @@ def _ransac_base_is_plain_ols(estimator):
     return False, True
 
 
-def _dynamic_max_trials(n_inliers, n_samples, min_samples, probability):
-    """sklearn ``_ransac._dynamic_max_trials``, for the Python fit path.
+class _RansacBridge:
+    """The one Python object the Rust trial loop calls into.
 
-    The Rust path has its own copy
-    (``mlrs_backend::prims::ransac_host::dynamic_max_trials``); this one exists
-    so the fallback loop is a transcription of sklearn's and not a call into
-    sklearn's private module.
-    """
-    inlier_ratio = n_inliers / float(n_samples)
-    nom = max(np.spacing(1), 1 - probability)
-    denom = max(np.spacing(1), 1 - inlier_ratio**min_samples)
-    if nom == 1:
-        return 0
-    if denom == 1:
-        return float("inf")
-    return abs(float(np.ceil(np.log(nom) / np.log(denom))))
+    It owns everything the loop needs from Python for the whole fit — the
+    design, the base estimator, the two validity predicates, the loss — so a
+    trial is a single ``call_method1`` and not a series of attribute lookups.
+    The sub-sample arrives as row INDICES (an ``int32`` pyarrow array); ``X[idx]``
+    here is the same numpy fancy index sklearn performs, and it replaces the
+    ``min_samples × n_features`` Python floats the previous callback shape
+    materialized per trial.
 
-
-class _PythonRansacHandle:
-    """Stand-in for the compiled handle on the Python fit path.
-
-    :class:`~mlrs.base.MlrsBase` keys ``check_is_fitted`` on ``_mlrs_obj`` and
-    reads ``dtype()`` for the accessor suffix; the Python path has no compiled
-    object, so this supplies both. It is never reached for arithmetic — every
-    property that would use it branches on ``_from_rust`` first.
+    Four flags are read once by the Rust side and then never re-probed:
+    ``foreign`` (drive ``run_trial`` at all), ``has_data_valid``,
+    ``has_model_valid``, ``supplies_residual``.
     """
 
-    def __init__(self, estimator, n_targets):
-        self._estimator = estimator
-        self._n_targets = n_targets
+    def __init__(self, owner, X, y, sample_weight, native, base_fit_intercept, rs):
+        from sklearn.base import clone
+        from sklearn.linear_model import LinearRegression as _SkLinearRegression
 
-    def dtype(self):
-        return "f64"
+        self._owner = owner
+        self._X = X
+        self._y = y
+        self._sw = sample_weight
+        self._n_targets = 1 if y.ndim == 1 else int(y.shape[1])
+        self._base_fit_intercept = base_fit_intercept
+        self.foreign = not native
+        self.has_data_valid = owner.is_data_valid is not None
+        self.has_model_valid = owner.is_model_valid is not None
+        self.supplies_residual = callable(owner.loss)
+        self._loss = owner._loss_fn()
+        self.estimator = None
+        self.seeded = False
+        self._rs = rs
+        if self.foreign:
+            self.estimator = (
+                clone(owner.estimator)
+                if owner.estimator is not None
+                else _SkLinearRegression()
+            )
+            # sklearn seeds the sub-estimator from the SAME generator the trial
+            # draws come from, so a randomized base consumes words BETWEEN
+            # draws. Rust borrows that generator for the fit, so `seeded` is
+            # what makes every bridge call round-trip its state: push it in
+            # before the estimator runs, hand the advanced words back after.
+            # An estimator that has no `random_state` never pays for it.
+            try:
+                self.estimator.set_params(random_state=self._rs)
+                self.seeded = True
+            except ValueError:
+                pass
+            self._fit_params = {}
+            if sample_weight is not None:
+                from sklearn.utils.validation import has_fit_parameter
 
-    def n_targets(self):
-        return self._n_targets
+                if not has_fit_parameter(self.estimator, "sample_weight"):
+                    raise ValueError(
+                        f"{type(self.estimator).__name__} does not support "
+                        "sample_weight. Sample weights are only used for the "
+                        "calibration itself."
+                    )
+                self._fit_params["sample_weight"] = sample_weight
+
+    # -- the validity predicates (native base only) ------------------------ #
+
+    def data_valid(self, idx):
+        i = _as_index(idx)
+        return bool(self._owner.is_data_valid(self._X[i], self._y[i]))
+
+    def model_valid(self, idx, coef, icept):
+        """``is_model_valid(model, X_subset, y_subset)`` for the NATIVE base.
+
+        sklearn hands the predicate the fitted ESTIMATOR OBJECT, so one is built
+        here from the coefficients Rust computed: a real
+        ``sklearn.linear_model.LinearRegression`` with ``coef_`` /
+        ``intercept_`` / ``n_features_in_`` set, which is what a predicate that
+        calls ``model.predict(...)`` or reads ``model.coef_`` needs. The Rust
+        side deliberately does not model "a Python estimator".
+        """
+        from sklearn.linear_model import LinearRegression as _SkLinearRegression
+
+        i = _as_index(idx)
+        d = int(self._X.shape[1])
+        t = self._n_targets
+        model = _SkLinearRegression(fit_intercept=self._base_fit_intercept)
+        c = np.asarray(coef, dtype=np.float64)
+        b = np.asarray(icept, dtype=np.float64)
+        model.coef_ = c.reshape(d) if t == 1 else c.reshape(t, d)
+        model.intercept_ = b[0] if t == 1 else b
+        model.n_features_in_ = d
+        return bool(self._owner.is_model_valid(model, self._X[i], self._y[i]))
+
+    # -- the foreign base's trial ------------------------------------------ #
+
+    def run_trial(self, idx, state):
+        """One trial: validate, fit the sub-sample, predict the WHOLE design.
+
+        Returns ``(status, y_pred, resid, state)`` with the arrays as pyarrow
+        (``None`` when the status is a skip, ``resid`` ``None`` unless ``loss``
+        is a callable, and ``state`` ``None`` unless the base is seeded).
+        Statement for statement with sklearn's loop body, minus everything Rust
+        now does with the result.
+        """
+        self._load_state(state)
+        i = _as_index(idx)
+        x_sub, y_sub = self._X[i], self._y[i]
+        if self.has_data_valid and not self._owner.is_data_valid(x_sub, y_sub):
+            return _TRIAL_INVALID_DATA, None, None, self._dump_state()
+        sub_params = {k: v[i] for k, v in self._fit_params.items()}
+        self.estimator.fit(x_sub, y_sub, **sub_params)
+        if self.has_model_valid and not self._owner.is_model_valid(
+            self.estimator, x_sub, y_sub
+        ):
+            return _TRIAL_INVALID_MODEL, None, None, self._dump_state()
+        y_pred = np.asarray(self.estimator.predict(self._X), dtype=np.float64)
+        resid = None
+        if self.supplies_residual:
+            # `_to_arrow` infers the dtype, so the cast happens HERE where it is
+            # a no-op for a loss that already returned float64.
+            resid = _to_arrow(
+                np.ascontiguousarray(
+                    np.asarray(self._loss(self._y, y_pred), dtype=np.float64).ravel()
+                )
+            )
+        return (
+            _TRIAL_FITTED,
+            _to_arrow(np.ascontiguousarray(y_pred.ravel())),
+            resid,
+            self._dump_state(),
+        )
+
+    def refit(self, idx, state):
+        """The final fit on the consensus set — sklearn's last statement."""
+        self._load_state(state)
+        i = _as_index(idx)
+        params = {k: v[i] for k, v in self._fit_params.items()}
+        self.estimator.fit(self._X[i], self._y[i], **params)
+        return self._dump_state()
+
+    # -- the shared MT19937 stream ----------------------------------------- #
+
+    def _load_state(self, state):
+        """Adopt the words Rust's draw left, so the estimator draws from THERE.
+
+        Only the 624-word key and the position are carried; the legacy tuple's
+        tail (the cached gaussian) stays on the caller's object, which is right
+        — Rust never draws a gaussian, so a cache the estimator filled on an
+        earlier trial must survive to the next one, exactly as it does in
+        sklearn.
+        """
+        if state is None:
+            return
+        words = np.asarray(state.to_numpy(zero_copy_only=True), dtype=np.uint32)
+        tail = tuple(self._rs.get_state(legacy=True)[3:])
+        self._rs.set_state(("MT19937", words[:-1], int(words[-1]), *tail))
+
+    def _dump_state(self):
+        """Hand the advanced words back to Rust."""
+        if not self.seeded:
+            return None
+        import pyarrow as pa
+
+        st = self._rs.get_state(legacy=True)
+        words = np.empty(len(st[1]) + 1, dtype=np.uint32)
+        words[:-1] = st[1]
+        words[-1] = st[2]
+        return pa.array(words)
+
+
+def _as_index(arrow_idx):
+    """A pyarrow ``int32`` index array as a numpy index, without a copy."""
+    return np.asarray(arrow_idx.to_numpy(zero_copy_only=True))
+
+
+def _to_arrow(values):
+    """A contiguous numpy array as a pyarrow array, WITHOUT a copy.
+
+    The dtype is deliberately inferred rather than passed as ``type=``: an
+    explicit ``type`` sends ``pa.array`` down a converting path even when the
+    numpy dtype already matches it, and that path is not vectorized. Measured on
+    a contiguous 50 000-element float64 array: **686 µs typed, 1.3 µs inferred**
+    — which at one call per trial was the entire per-trial cost of the bridge
+    (0.69 ms of an 0.88 ms gap against sklearn's own loop). Callers therefore
+    hand this an array that is ALREADY the intended dtype.
+    """
+    import pyarrow as pa
+
+    return pa.array(values)
 
 
 class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
-    """RANdom SAmple Consensus robust regression (RANSAC-01).
+    """RANdom SAmple Consensus robust regression (RANSAC-01 / RANSAC-02).
 
     ``RANSACRegressor(estimator=None, *, min_samples=None,
     residual_threshold=None, is_data_valid=None, is_model_valid=None,
@@ -1702,8 +1860,20 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
     EXCLUDES outliers: it searches random ``min_samples``-row sub-samples for
     the model with the largest consensus set and refits on that set alone.
 
-    See ``crates/mlrs-algos/src/linear/ransac.rs`` for the trial loop and
-    ``crates/mlrs-backend/src/prims/ransac_host.rs`` for the per-trial scan.
+    ``ANY`` base estimator is supported and the trial loop always runs in Rust.
+    sklearn's default ``LinearRegression`` is fitted natively, with no crossing
+    into Python at all; any other regressor is fitted by its own ``fit`` through
+    a bridge that costs exactly ONE call per trial, with the loss, the inlier
+    mask, the consensus R² and every stop rule still evaluated in Rust.
+
+    ``device`` (mlrs-only, DEVICE-PARAM-01) places the per-trial SCAN: the
+    device arm scans a batch of trials per launch and is opt-in, since the host
+    scan wins at every size measured on integrated hardware. It applies to the
+    native base only — read ``device_`` for the arm that actually ran.
+
+    See ``crates/mlrs-algos/src/linear/ransac.rs`` for the trial loop,
+    ``crates/mlrs-backend/src/prims/ransac_host.rs`` for the per-trial scan and
+    ``.../ransac_device.rs`` for the batched device one.
     """
 
     def __init__(
@@ -1722,6 +1892,7 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
         loss="absolute_error",
         random_state=None,
         output_type="input",
+        device="auto",
     ):
         self.estimator = estimator
         self.min_samples = min_samples
@@ -1736,15 +1907,18 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
         self.loss = loss
         self.random_state = random_state
         self.output_type = output_type
+        self.device = device
 
     # -- validation -------------------------------------------------------- #
 
     def _validate_ransac_params(self):
         """sklearn's ``_parameter_constraints``, reproduced with its wording.
 
-        Raised HERE rather than in Rust for the same reason sklearn raises it in
-        ``_fit_context``: the checks are data-independent and BOTH fit paths
-        need them, and only one of the two has a Rust builder to raise from.
+        Raised HERE rather than in Rust because the checks are
+        data-independent and cover parameters the Rust builder never sees (a
+        CALLABLE ``loss``, ``is_data_valid``), so sklearn's wording has to live
+        somewhere that sees all of them — the same reason sklearn itself raises
+        them in ``_fit_context``.
         """
         _bad = "The '{}' parameter of RANSACRegressor must be {}. Got {!r} instead."
         if not isinstance(self.loss, str) or self.loss not in (
@@ -1867,18 +2041,27 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
                 )
 
         rs = check_random_state(self.random_state)
-        usable, base_fit_intercept = _ransac_base_is_plain_ols(self.estimator)
+        ols_base, base_fit_intercept = _ransac_base_is_plain_ols(self.estimator)
+        # A CALLABLE `loss` also takes the bridge, whatever the base is: its
+        # contract is `loss(y_true, y_pred) -> array`, and the native scan is
+        # FUSED — it forms each row's residual and throws it away, so there is
+        # no `y_pred` to hand a Python callable. The bridge produces both.
+        native = ols_base and isinstance(self.loss, str)
+        if self.min_samples is None and not ols_base:
+            # sklearn's own message: `n_features + 1` is only the right default
+            # sub-sample size for a linear model, so any other base must say.
+            raise ValueError(
+                "`min_samples` needs to be explicitly set when estimator is "
+                "not a LinearRegression."
+            )
 
         # Reset any previous fit's materialized estimator; a refit must not
         # serve the old one out of the cache.
         self._estimator_cache = None
-        if usable and isinstance(self.loss, str):
-            self._fit_rust(
-                y, xa, rows, cols, n_targets, dtype, sample_weight, rs,
-                base_fit_intercept,
-            )
-        else:
-            self._fit_python(X, y, rows, cols, n_targets, sample_weight, rs)
+        self._fit_rust(
+            X, y, xa, rows, cols, n_targets, dtype, sample_weight, rs,
+            native, base_fit_intercept,
+        )
 
         self._n_targets_ = n_targets
         self._post_fit(cols)
@@ -1896,16 +2079,21 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
         return self
 
     def _fit_rust(
-        self, y, xa, rows, cols, n_targets, dtype, sample_weight, rs,
-        base_fit_intercept,
+        self, X, y, xa, rows, cols, n_targets, dtype, sample_weight, rs,
+        native, base_fit_intercept,
     ):
-        """The native path: the whole trial loop runs in Rust.
+        """The one fit path: the whole trial loop runs in Rust.
 
         ``rs`` is BORROWED — its MT19937 words are lifted into the Rust
         generator and the advanced words are written back — so a caller who
         passed their own ``RandomState`` sees it advance exactly as sklearn's
         would. ``mlrs.model_selection._rust_rng`` is the one implementation of
         that borrow, shared with every splitter.
+
+        The bridge is built only when Python has something to contribute: a base
+        estimator Rust cannot fit natively, a validity predicate, or a callable
+        ``loss``. With none of those the call runs with the GIL RELEASED and
+        never re-enters Python at all.
         """
         from .model_selection import _rust_rng
 
@@ -1923,235 +2111,69 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
             float(self.stop_n_inliers),
             float(self.stop_score),
             float(self.stop_probability),
-            self.loss,
+            self.loss if isinstance(self.loss, str) else "absolute_error",
             base_fit_intercept,
+            self._device(),
         )
-        with _rust_rng(rs) as bridge:
+        needs_bridge = (
+            not native
+            or self.is_data_valid is not None
+            or self.is_model_valid is not None
+            or callable(self.loss)
+        )
+        bridge = None
+        if needs_bridge:
+            # The bridge holds the design in the CALLER's shapes and at the
+            # design's own width — sklearn's `validate_data` keeps a float32
+            # input float32, so the base estimator fits and predicts there, and
+            # reproducing that is what keeps a row within an f32 ulp of
+            # `residual_threshold` on the same side of it as sklearn puts it.
+            xb = np.asarray(X, dtype=dtype)
+            if xb.ndim == 1:
+                xb = xb.reshape(-1, 1)
+            yb = np.asarray(y, dtype=dtype)
+            if yb.ndim == 2 and yb.shape[1] == 1:
+                yb = yb.ravel()
+            swb = (
+                None
+                if sample_weight is None
+                else np.asarray(sample_weight, dtype=np.float64)
+            )
+            bridge = _RansacBridge(
+                self, xb, yb, swb, native, base_fit_intercept, rs
+            )
+        with _rust_rng(rs) as handle:
             obj.fit(
-                xa,
-                ya,
-                rows,
-                cols,
-                n_targets,
-                bridge.handle,
-                swa,
-                self._data_bridge(),
-                self._model_bridge(base_fit_intercept),
+                xa, ya, rows, cols, n_targets, handle.handle, swa, bridge,
             )
         self._mlrs_obj = obj
-        self._from_rust = True
-
-    def _data_bridge(self):
-        """Adapt ``is_data_valid`` to the wrapper's flat-list signature."""
-        if self.is_data_valid is None:
-            return None
-
-        def bridge(xs, ys, m, d, t):
-            x_sub = np.asarray(xs, dtype=np.float64).reshape(m, d)
-            y_sub = np.asarray(ys, dtype=np.float64)
-            y_sub = y_sub.reshape(m) if t == 1 else y_sub.reshape(m, t)
-            return bool(self.is_data_valid(x_sub, y_sub))
-
-        return bridge
-
-    def _model_bridge(self, base_fit_intercept):
-        """Adapt ``is_model_valid`` to the wrapper's flat-list signature.
-
-        sklearn hands the predicate the fitted ESTIMATOR OBJECT, so one is built
-        here from the coefficients Rust computed: a real
-        ``sklearn.linear_model.LinearRegression`` with ``coef_`` /
-        ``intercept_`` / ``n_features_in_`` set, which is what a predicate that
-        calls ``model.predict(...)`` or reads ``model.coef_`` needs. The Rust
-        side deliberately does not model "a Python estimator".
-        """
-        if self.is_model_valid is None:
-            return None
-        from sklearn.linear_model import LinearRegression as _SkLinearRegression
-
-        def bridge(coef, intercept, xs, ys, m, d, t):
-            model = _SkLinearRegression(fit_intercept=base_fit_intercept)
-            c = np.asarray(coef, dtype=np.float64)
-            b = np.asarray(intercept, dtype=np.float64)
-            model.coef_ = c.reshape(d) if t == 1 else c.reshape(t, d)
-            model.intercept_ = b[0] if t == 1 else b
-            model.n_features_in_ = d
-            x_sub = np.asarray(xs, dtype=np.float64).reshape(m, d)
-            y_sub = np.asarray(ys, dtype=np.float64)
-            y_sub = y_sub.reshape(m) if t == 1 else y_sub.reshape(m, t)
-            return bool(self.is_model_valid(model, x_sub, y_sub))
-
-        return bridge
-
-    def _fit_python(self, X, y, rows, cols, n_targets, sample_weight, rs):
-        """sklearn's own trial loop, for a base estimator Rust cannot host.
-
-        Statement for statement with ``sklearn.linear_model._ransac`` — the SAME
-        ``sample_without_replacement`` off the SAME generator, so the draw
-        sequence still matches index for index. What differs is only that the
-        sub-model is the caller's estimator, fitted through its own ``fit``.
-        """
-        from sklearn.base import clone
-        from sklearn.linear_model import LinearRegression as _SkLinearRegression
-        from sklearn.utils import check_array
-        from sklearn.utils.random import sample_without_replacement
-        from sklearn.utils.validation import has_fit_parameter
-
-        xa = check_array(X, dtype=np.float64, ensure_all_finite=False)
-        ya = check_array(y, dtype=np.float64, ensure_2d=False)
-        estimator = (
-            clone(self.estimator)
-            if self.estimator is not None
-            else _SkLinearRegression()
-        )
-
-        if self.min_samples is None:
-            if not isinstance(estimator, _SkLinearRegression):
-                raise ValueError(
-                    "`min_samples` needs to be explicitly set when estimator "
-                    "is not a LinearRegression."
-                )
-            min_samples = cols + 1
-        elif 0 < self.min_samples < 1:
-            min_samples = int(np.ceil(self.min_samples * rows))
-        else:
-            min_samples = int(self.min_samples)
-        if min_samples > rows:
-            raise ValueError(
-                "`min_samples` may not be larger than number of samples: "
-                f"n_samples = {rows}."
-            )
-
-        if self.residual_threshold is None:
-            residual_threshold = float(np.median(np.abs(ya - np.median(ya))))
-        else:
-            residual_threshold = float(self.residual_threshold)
-        loss_function = self._loss_fn()
-
-        # sklearn seeds the sub-estimator from the SAME generator when it has a
-        # `random_state`; one that has not consumes nothing.
-        try:
-            estimator.set_params(random_state=rs)
-        except ValueError:
-            pass
-
-        fit_params = {}
-        if sample_weight is not None:
-            if not has_fit_parameter(estimator, "sample_weight"):
-                raise ValueError(
-                    f"{type(estimator).__name__} does not support sample_weight. "
-                    "Sample weights are only used for the calibration itself."
-                )
-            fit_params["sample_weight"] = np.asarray(sample_weight, dtype=np.float64)
-
-        n_inliers_best = 1
-        score_best = -np.inf
-        inlier_mask_best = None
-        n_skips_no_inliers = n_skips_invalid_data = n_skips_invalid_model = 0
-        sample_idxs = np.arange(rows)
-        n_trials = 0
-        max_trials = self.max_trials
-
-        while n_trials < max_trials:
-            n_trials += 1
-            if (
-                n_skips_no_inliers + n_skips_invalid_data + n_skips_invalid_model
-            ) > self.max_skips:
-                break
-            subset_idxs = sample_without_replacement(
-                rows, min_samples, random_state=rs
-            )
-            x_subset, y_subset = xa[subset_idxs], ya[subset_idxs]
-            if self.is_data_valid is not None and not self.is_data_valid(
-                x_subset, y_subset
-            ):
-                n_skips_invalid_data += 1
-                continue
-            sub_params = {k: v[subset_idxs] for k, v in fit_params.items()}
-            estimator.fit(x_subset, y_subset, **sub_params)
-            if self.is_model_valid is not None and not self.is_model_valid(
-                estimator, x_subset, y_subset
-            ):
-                n_skips_invalid_model += 1
-                continue
-            residuals_subset = loss_function(ya, estimator.predict(xa))
-            inlier_mask_subset = residuals_subset <= residual_threshold
-            n_inliers_subset = int(np.sum(inlier_mask_subset))
-            if n_inliers_subset < n_inliers_best:
-                n_skips_no_inliers += 1
-                continue
-            inlier_idxs_subset = sample_idxs[inlier_mask_subset]
-            score_subset = estimator.score(
-                xa[inlier_idxs_subset], ya[inlier_idxs_subset]
-            )
-            if n_inliers_subset == n_inliers_best and score_subset < score_best:
-                continue
-            n_inliers_best = n_inliers_subset
-            score_best = score_subset
-            inlier_mask_best = inlier_mask_subset
-            max_trials = min(
-                max_trials,
-                _dynamic_max_trials(
-                    n_inliers_best, rows, min_samples, self.stop_probability
-                ),
-            )
-            if n_inliers_best >= self.stop_n_inliers or score_best >= self.stop_score:
-                break
-
-        skips = n_skips_no_inliers + n_skips_invalid_data + n_skips_invalid_model
-        if inlier_mask_best is None:
-            if skips > self.max_skips:
-                raise ValueError(
-                    "RANSAC skipped more iterations than `max_skips` without "
-                    "finding a valid consensus set. Iterations were skipped "
-                    "because each randomly chosen sub-sample failed the passing "
-                    "criteria. See estimator attributes for diagnostics "
-                    "(n_skips*)."
-                )
-            raise ValueError(
-                "RANSAC could not find a valid consensus set. All `max_trials` "
-                "iterations were skipped because each randomly chosen "
-                "sub-sample failed the passing criteria. See estimator "
-                "attributes for diagnostics (n_skips*)."
-            )
-
-        best_idxs = sample_idxs[inlier_mask_best]
-        best_params = {k: v[best_idxs] for k, v in fit_params.items()}
-        estimator.fit(xa[best_idxs], ya[best_idxs], **best_params)
-
-        self._from_rust = False
-        self._py_estimator = estimator
-        self._py_inlier_mask = inlier_mask_best
-        self._py_counters = (
-            n_trials,
-            n_skips_no_inliers,
-            n_skips_invalid_data,
-            n_skips_invalid_model,
-            skips > self.max_skips,
-        )
-        # `MlrsBase._check_fitted` keys on `_mlrs_obj`; the Python path has no
-        # compiled handle, so this stand-in carries the contract.
-        self._mlrs_obj = _PythonRansacHandle(estimator, n_targets)
+        # The bridge is DROPPED here: it held the design, the loss closure and a
+        # reference back to this estimator, none of which a fitted model should
+        # keep alive (or try to pickle). All that survives is the object sklearn
+        # calls `estimator_`.
+        self._base_estimator_ = None if bridge is None else bridge.estimator
+        self._native_base = native
 
     # -- fitted attributes ------------------------------------------------- #
 
     @property
     def _exceeded_max_skips(self):
-        if self._from_rust:
-            return bool(self._mlrs_obj.exceeded_max_skips())
-        return bool(self._py_counters[4])
+        return bool(self._mlrs_obj.exceeded_max_skips())
 
     @property
     def estimator_(self):
         """The base estimator refitted on the consensus set.
 
-        On the Rust path there is no Python estimator object to hand back, so
-        one is MATERIALIZED from the fitted coefficients — a real
+        With a base Rust fits natively there is no Python estimator object to
+        hand back, so one is MATERIALIZED from the fitted coefficients — a real
         ``sklearn.linear_model.LinearRegression`` whose ``predict`` / ``score``
-        behave as sklearn's do. It is cached, so repeated access is free.
+        behave as sklearn's do. It is cached, so repeated access is free. With
+        any other base this IS the caller's own object, refitted on the
+        consensus set by the bridge's last call.
         """
         self._check_fitted()
-        if not self._from_rust:
-            return self._py_estimator
+        if not self._native_base:
+            return self._base_estimator_
         cached = getattr(self, "_estimator_cache", None)
         if cached is not None:
             return cached
@@ -2172,61 +2194,47 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
     def inlier_mask_(self):
         """sklearn ``inlier_mask_`` — the consensus set of the winning model."""
         self._check_fitted()
-        if not self._from_rust:
-            return self._py_inlier_mask
         return np.asarray(self._mlrs_obj.inlier_mask(), dtype=bool)
 
     @property
     def n_trials_(self):
         """sklearn ``n_trials_`` — always ``<= max_trials``."""
         self._check_fitted()
-        return (
-            self._mlrs_obj.n_trials() if self._from_rust else self._py_counters[0]
-        )
+        return self._mlrs_obj.n_trials()
 
     @property
     def n_skips_no_inliers_(self):
         """sklearn ``n_skips_no_inliers_``."""
         self._check_fitted()
-        return (
-            self._mlrs_obj.n_skips_no_inliers()
-            if self._from_rust
-            else self._py_counters[1]
-        )
+        return self._mlrs_obj.n_skips_no_inliers()
 
     @property
     def n_skips_invalid_data_(self):
         """sklearn ``n_skips_invalid_data_``."""
         self._check_fitted()
-        return (
-            self._mlrs_obj.n_skips_invalid_data()
-            if self._from_rust
-            else self._py_counters[2]
-        )
+        return self._mlrs_obj.n_skips_invalid_data()
 
     @property
     def n_skips_invalid_model_(self):
         """sklearn ``n_skips_invalid_model_``."""
         self._check_fitted()
-        return (
-            self._mlrs_obj.n_skips_invalid_model()
-            if self._from_rust
-            else self._py_counters[3]
-        )
+        return self._mlrs_obj.n_skips_invalid_model()
 
     # -- inference --------------------------------------------------------- #
 
     def predict(self, X):
         """``estimator_.predict(X)`` — sklearn delegates, and so does this.
 
-        On the Rust path the matvec runs through the compiled HOST predict
-        rather than through the materialized sklearn object, so a large
+        With a natively-fitted base the matvec runs through the compiled HOST
+        predict rather than through the materialized sklearn object, so a large
         ``predict`` is not paid in numpy (and, per
-        [[mlrs-ridge-predict-cuda-vs-cpu]], not paid on a device either).
+        [[mlrs-ridge-predict-cuda-vs-cpu]], not paid on a device either). With
+        any other base there is no coefficient vector to run — the model IS the
+        caller's estimator — so the delegation is literal.
         """
         self._check_fitted()
-        if not self._from_rust:
-            return self._py_estimator.predict(np.asarray(X, dtype=np.float64))
+        if not self._native_base:
+            return self._base_estimator_.predict(np.asarray(X, dtype=np.float64))
         xa, rows, cols = self._check_predict_X(X, ensure_all_finite=False)
         out = self._suffixed("predict")(xa, rows, cols)
         t = self._n_targets_
@@ -2245,13 +2253,18 @@ class RANSACRegressor(MetaEstimatorMixin, RegressorMixin, MlrsBase):
         return r2_score(y, self.predict(X), sample_weight=sample_weight)
 
     @property
-    def _from_rust(self):
-        """Which fit path produced the current fitted state."""
-        return getattr(self, "_fit_path_is_rust", False)
+    def _native_base(self):
+        """Whether the fitted base is the one Rust fits natively.
 
-    @_from_rust.setter
-    def _from_rust(self, v):
-        self._fit_path_is_rust = bool(v)
+        Kept as a property with a default so an unfitted instance answers it
+        without raising — several fitted-attribute paths read it before their
+        own ``_check_fitted``.
+        """
+        return getattr(self, "_base_is_native", True)
+
+    @_native_base.setter
+    def _native_base(self, v):
+        self._base_is_native = bool(v)
 
     def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()

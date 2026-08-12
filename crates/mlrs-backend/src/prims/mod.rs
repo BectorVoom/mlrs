@@ -162,6 +162,12 @@ pub mod radius_host;
 // sub-sample poses. HOST on every backend — a hundred trials of a launch-bound
 // `n × d` pass, each of which the NEXT draw's stopping rule must read back.
 pub mod ransac_host;
+// RANSAC-02's DEVICE twin of the above. The per-trial launch+stall objection
+// stands; what it removes is the per-TRIAL part, by scanning a BATCH of
+// mutually independent trials in one launch and replaying the sequential
+// bookkeeping over the results afterwards (rewinding the draw stream when a
+// stop rule fires mid-batch). The sub-sample solve deliberately stays host-side.
+pub mod ransac_device;
 pub mod reduce;
 // Phase-10 SGD solver prim (PRIM-10). `sgd_solve` is fully implemented: a
 // validate-before-launch geometry guard fronts a host epoch loop that drives the

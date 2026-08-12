@@ -7,17 +7,17 @@
 //! [`mlrs_algos::linear::ransac`], which is where they can reach the
 //! `model_selection` RNG.
 //!
-//! ## Why the engine is host-resident on EVERY backend
+//! ## Why this engine is the DEFAULT on every backend
 //! Two independent reasons, both measured elsewhere in this crate:
 //!
 //! 1. **The per-trial pass is a single `n × d` matvec fused with an `O(n)`
 //!    threshold.** That is the exact shape [`linear_predict`](super::linear_predict)
 //!    already found to be memory-bandwidth-bound on the host and *launch*-bound
 //!    on a device — and RANSAC runs it a hundred times with a different `coef`
-//!    each time, so a device arm would pay a hundred launches plus a hundred
-//!    `coef` uploads and a hundred host syncs to read back the inlier count the
-//!    NEXT draw's stopping rule needs. The sync is unavoidable: `max_trials`
-//!    shrinks as a function of the best consensus found so far.
+//!    each time, so a per-trial device arm would pay a hundred launches plus a
+//!    hundred `coef` uploads and a hundred host syncs to read back the inlier
+//!    count the NEXT draw's stopping rule needs. The sync is unavoidable:
+//!    `max_trials` shrinks as a function of the best consensus found so far.
 //! 2. **The sub-sample fit is a `min_samples × d` least-squares solve**, with
 //!    `min_samples = d + 1` by default. A `d`-column Jacobi rotation sweep on
 //!    eleven rows is nothing but launch overhead on a GPU
@@ -26,6 +26,14 @@
 //! So this is the `gmm_host` / `hgb_host` situation again, and it takes the same
 //! shape: one persistent [`WorkerPool`] spawned per fit, every trial dispatched
 //! as one pass over fixed row blocks.
+//!
+//! [`ransac_device`](super::ransac_device) (RANSAC-02) answers reason 1 — and
+//! only reason 1 — by scanning a BATCH of mutually independent trials per
+//! launch, so the launch and the stall are paid per batch rather than per trial.
+//! Reason 2 stands unchanged: the sub-sample solve stays here on both arms, and
+//! [`subset_lstsq_batch`](RansacHostEngine::subset_lstsq_batch) is where a batch
+//! of them is spread across this pool. The device arm is opt-in
+//! (`RANSAC_DEVICE_MIN_WORK`); this one runs by default everywhere.
 //!
 //! ## Determinism of the parallel reductions
 //! The row axis is split into fixed-size [`SCAN_BLOCK`] blocks whose boundaries
@@ -157,7 +165,37 @@ where
     /// Spawns the pool, so build it ONCE per fit and drive every trial through
     /// it — that is the whole reason this is a struct rather than a free
     /// function ([`WorkerPool`] docs).
-    pub fn new(x: &'a [F], y: &'a [F], n: usize, d: usize, t: usize) -> Result<Self, PrimError> {
+    ///
+    /// `work_per_pass` is the element count ONE dispatched pass reads, and it is
+    /// the caller's to supply because the arms do genuinely different passes:
+    ///
+    /// | arm | dispatched pass | `work_per_pass` |
+    /// |---|---|---|
+    /// | native, host scan | [`scan`](Self::scan) over the design | `n · d · t` |
+    /// | native, device scan | [`subset_lstsq_batch`](Self::subset_lstsq_batch) | `batch · m · d` |
+    /// | arbitrary base | [`scan_pred`](Self::scan_pred) over the targets | `n · t` |
+    ///
+    /// ## Why this is not derived from `(n, d, t)` here
+    /// It used to be, and the arbitrary-base arm paid 2.7× for it. That arm's
+    /// pass has NO `d` factor — it reads `y` and the caller's predictions and
+    /// nothing else — so an `n · d`-sized pool spawned fifteen threads to split
+    /// half a megabyte, and then crossed two barriers per trial around a gap
+    /// filled by the caller's Python `fit`/`predict`. The barrier's spin-then-
+    /// yield backoff ([`host_pool`](super::host_pool)) is tuned for
+    /// back-to-back passes; across a millisecond-long foreign call it burns
+    /// cores that numpy's own BLAS pool is simultaneously trying to spin on.
+    /// Measured at `n = 50 000, d = 32` with a `Ridge` base: 542 ms at sixteen
+    /// units, 247 ms at four, **197 ms at one**. Sized from `n · t` the planner
+    /// picks one unit there by itself, and only widens where a pass is actually
+    /// big enough to split.
+    pub fn new(
+        x: &'a [F],
+        y: &'a [F],
+        n: usize,
+        d: usize,
+        t: usize,
+        work_per_pass: usize,
+    ) -> Result<Self, PrimError> {
         if x.len() != n * d {
             return Err(PrimError::ShapeMismatch {
                 operand: "ransac_x",
@@ -177,7 +215,7 @@ where
         let blocks: Vec<(usize, usize)> = (0..n.div_ceil(SCAN_BLOCK.max(1)))
             .map(|b| (b * SCAN_BLOCK, ((b + 1) * SCAN_BLOCK).min(n)))
             .collect();
-        let units = plan_units(n, d, t, blocks.len());
+        let units = plan_units(work_per_pass, blocks.len());
         Ok(Self {
             x,
             y,
@@ -226,6 +264,12 @@ where
     /// `bayesian_ridge`/`huber` precision precedent). They are narrowed to the
     /// design's width once, here, because sklearn's `estimator.predict` runs in
     /// the design's dtype and the residual comparison must too.
+    ///
+    /// The one-trial case of [`scan_batch`](Self::scan_batch), spelled out
+    /// because it is what the host arm runs: the host engine deliberately does
+    /// NOT speculate a batch of trials (that exists to amortize a device
+    /// launch — see [`scan_batch`](Self::scan_batch)), so this is the shape it
+    /// actually takes.
     pub fn scan(
         &self,
         coef: &[f64],
@@ -234,11 +278,138 @@ where
         threshold: f64,
         mask: &mut [bool],
     ) -> TrialScan {
-        debug_assert_eq!(coef.len(), self.t * self.d);
-        debug_assert_eq!(intercept.len(), self.t);
+        let mut out = self.scan_batch(coef, intercept, 1, loss, threshold, mask);
+        out.pop().expect("scan_batch(batch = 1) yields one scan")
+    }
+
+    /// Score every row against EACH of `batch` candidate models in one pass over
+    /// the design, writing `batch` consecutive inlier masks.
+    ///
+    /// `coef` is `batch` consecutive `t × d` row-major blocks, `intercept`
+    /// `batch` consecutive length-`t` blocks, `mask` is `batch · n` long. The
+    /// returned scans are in trial order.
+    ///
+    /// ## Why a host batch exists at all
+    /// The device arm ([`ransac_device`](super::ransac_device)) speculates a
+    /// batch of trials to amortize its launch and its host stall; this is the
+    /// same computation on the host, which the arms-agree tests A/B against it,
+    /// and it is what a caller gets when the device arm is unavailable but the
+    /// batched shape has already been planned. The host arm's own driver uses
+    /// `batch = 1`: with no launch to amortize, speculation buys nothing and the
+    /// surplus trials a stop rule discards would be pure waste.
+    ///
+    /// The parallel work item is a `(trial, row-block)` PAIR, so a batch of one
+    /// trial still spreads across the pool exactly as the unbatched scan did,
+    /// and the fold is over `(trial, block)` in that order — independent of the
+    /// worker count, which is the determinism property the module docs pin.
+    pub fn scan_batch(
+        &self,
+        coef: &[f64],
+        intercept: &[f64],
+        batch: usize,
+        loss: RansacLoss,
+        threshold: f64,
+        mask: &mut [bool],
+    ) -> Vec<TrialScan> {
+        debug_assert_eq!(coef.len(), batch * self.t * self.d);
+        debug_assert_eq!(intercept.len(), batch * self.t);
+        debug_assert_eq!(mask.len(), batch * self.n);
+
+        // Per-(trial, block) partials, folded in that order by the driver
+        // (module docs).
+        let nb = self.blocks.len();
+        let items = batch * nb;
+        let mut part_n = vec![0usize; items];
+        let mut part_sq = vec![0.0f64; items * self.t];
+
+        {
+            let sh_mask = Shared::new(mask);
+            let sh_n = Shared::new(&mut part_n);
+            let sh_sq = Shared::new(&mut part_sq);
+            let (n, d, t, units) = (self.n, self.d, self.t, self.units);
+            let blocks = &self.blocks;
+            let (x, y) = (self.x, self.y);
+            let pass = move |u: usize| {
+                // Item `it` is owned by exactly one unit, so the `Shared`
+                // writes below are disjoint by construction.
+                let mut it = u;
+                while it < items {
+                    let (trial, b) = (it / nb, it % nb);
+                    let (lo, hi) = blocks[b];
+                    // SAFETY: unit `u` owns item `it` alone (the stride above),
+                    // and each item writes only `mask[trial*n + lo .. +hi]`,
+                    // `part_n[it]` and `part_sq[it*t..(it+1)*t]`.
+                    let m = unsafe { &mut sh_mask.get_mut()[trial * n + lo..trial * n + hi] };
+                    let nslot = unsafe { &mut sh_n.get_mut()[it..it + 1] };
+                    let sslot = unsafe { &mut sh_sq.get_mut()[it * t..(it + 1) * t] };
+                    let cnt = scan_block_dispatch::<F>(
+                        &x[lo * d..hi * d],
+                        &y[lo * t..hi * t],
+                        &coef[trial * t * d..(trial + 1) * t * d],
+                        &intercept[trial * t..(trial + 1) * t],
+                        d,
+                        t,
+                        loss,
+                        threshold,
+                        m,
+                        sslot,
+                    );
+                    nslot[0] = cnt;
+                    it += units;
+                }
+            };
+            self.pool.run(&pass);
+        }
+
+        (0..batch)
+            .map(|trial| {
+                let mut n_inliers = 0usize;
+                let mut sq_err = vec![0.0f64; self.t];
+                for b in 0..nb {
+                    let it = trial * nb + b;
+                    n_inliers += part_n[it];
+                    for k in 0..self.t {
+                        sq_err[k] += part_sq[it * self.t + k];
+                    }
+                }
+                TrialScan { n_inliers, sq_err }
+            })
+            .collect()
+    }
+
+    /// The same verdict as [`scan`](Self::scan), for a candidate model whose
+    /// predictions were computed ELSEWHERE — the arbitrary-base-estimator path.
+    ///
+    /// `y_pred` is `n × t` row-major `f64`, exactly what
+    /// `estimator.predict(X)` produced for the whole training design.
+    /// `resid` is `None` for the two string losses (this pass forms them from
+    /// `y_pred`) and `Some(n)` when the caller's `loss` is a CALLABLE, whose
+    /// answer only Python can produce and which is then compared against the
+    /// threshold as sklearn compares it.
+    ///
+    /// ## Why the predictions are narrowed to `F` first
+    /// sklearn's residual is `y − estimator.predict(X)` evaluated in the
+    /// DESIGN's dtype: on an `f32` design its `y_pred` is `f32` and the
+    /// subtraction, the absolute value and the threshold comparison all happen
+    /// there. The bridge hands predictions over as `f64` because that is the one
+    /// width the boundary speaks, so this narrows them back before subtracting —
+    /// otherwise a row within an `f32` ulp of `residual_threshold` could be
+    /// classified differently here than in sklearn, which is a CONTROL-FLOW
+    /// difference and not a rounding one.
+    ///
+    /// The squared errors are accumulated in `f64` from those same `F`
+    /// differences, matching [`scan`](Self::scan)'s own bookkeeping.
+    pub fn scan_pred(
+        &self,
+        y_pred: &[f64],
+        resid: Option<&[f64]>,
+        loss: RansacLoss,
+        threshold: f64,
+        mask: &mut [bool],
+    ) -> TrialScan {
+        debug_assert_eq!(y_pred.len(), self.n * self.t);
         debug_assert_eq!(mask.len(), self.n);
 
-        // Per-block partials, folded in block order by the driver (module docs).
         let nb = self.blocks.len();
         let mut part_n = vec![0usize; nb];
         let mut part_sq = vec![0.0f64; nb * self.t];
@@ -247,27 +418,22 @@ where
             let sh_mask = Shared::new(mask);
             let sh_n = Shared::new(&mut part_n);
             let sh_sq = Shared::new(&mut part_sq);
-            let (d, t, units) = (self.d, self.t, self.units);
+            let (t, units) = (self.t, self.units);
             let blocks = &self.blocks;
-            let (x, y) = (self.x, self.y);
+            let y = self.y;
             let pass = move |u: usize| {
-                // Block `b` is owned by exactly one unit, so the `Shared`
-                // writes below are disjoint by construction.
                 let mut b = u;
                 while b < blocks.len() {
                     let (lo, hi) = blocks[b];
-                    // SAFETY: unit `u` owns block `b` alone (the stride above),
-                    // and each block writes only `mask[lo..hi]`, `part_n[b]`
-                    // and `part_sq[b*t..(b+1)*t]`.
+                    // SAFETY: unit `u` owns block `b` alone (the stride below),
+                    // and each block writes only its own disjoint slices.
                     let m = unsafe { &mut sh_mask.get_mut()[lo..hi] };
                     let nslot = unsafe { &mut sh_n.get_mut()[b..b + 1] };
                     let sslot = unsafe { &mut sh_sq.get_mut()[b * t..(b + 1) * t] };
-                    let cnt = scan_block_dispatch::<F>(
-                        &x[lo * d..hi * d],
+                    let cnt = pred_block_dispatch::<F>(
                         &y[lo * t..hi * t],
-                        coef,
-                        intercept,
-                        d,
+                        &y_pred[lo * t..hi * t],
+                        resid.map(|r| &r[lo..hi]),
                         t,
                         loss,
                         threshold,
@@ -335,11 +501,28 @@ where
                 }
             }
         }
+        self.r2_from_sums(n_inliers, sq_err, &den)
+    }
+
+    /// sklearn's `r2_score` verdict from the two sums that define it, for a
+    /// caller that already has them.
+    ///
+    /// Split out of [`r2_on_mask`](Self::r2_on_mask) so the device arm — whose
+    /// denominator is formed by
+    /// [`ransac_den_block`](mlrs_kernels::ransac::ransac_den_block) against the
+    /// mask it kept resident, precisely so no `n`-length array crosses the bus —
+    /// scores through the SAME arithmetic as the host arm instead of a second
+    /// transcription of sklearn's per-output branch.
+    pub fn r2_from_sums(&self, n_inliers: usize, sq_err: &[f64], den: &[f64]) -> f64 {
+        // sklearn's `r2_score` warns and returns NaN below two samples.
+        if n_inliers < 2 {
+            return f64::NAN;
+        }
         // sklearn's per-output verdict: a zero denominator scores 1.0 when the
         // numerator is zero too (a constant target predicted exactly) and 0.0
         // otherwise; everything else is the ordinary `1 − num/den`.
         let mut acc = 0.0f64;
-        for k in 0..t {
+        for k in 0..self.t {
             acc += match (den[k] != 0.0, sq_err[k] != 0.0) {
                 (true, true) => 1.0 - sq_err[k] / den[k],
                 (true, false) => 1.0,
@@ -347,7 +530,7 @@ where
                 (false, false) => 1.0,
             };
         }
-        acc / t as f64
+        acc / self.t as f64
     }
 
     /// Least-squares fit of the base `LinearRegression` to the rows `idxs`
@@ -383,7 +566,28 @@ where
         fit_intercept: bool,
         sample_weight: Option<&[f64]>,
     ) -> (Vec<f64>, Vec<f64>) {
-        let (m, d, t) = (idxs.len(), self.d, self.t);
+        Self::subset_lstsq_impl(self.x, self.y, self.d, self.t, idxs, fit_intercept, sample_weight)
+    }
+
+    /// The body of [`subset_lstsq`](Self::subset_lstsq), as an associated
+    /// function over the borrowed design rather than a method.
+    ///
+    /// It is spelled this way for one reason:
+    /// [`subset_lstsq_batch`](Self::subset_lstsq_batch) runs these solves
+    /// concurrently, and [`WorkerPool`] is deliberately `!Sync` — so the pass
+    /// closure cannot capture `&self`. It captures the two design slices (which
+    /// ARE `Sync`) and calls this instead.
+    #[allow(clippy::too_many_arguments)]
+    fn subset_lstsq_impl(
+        x: &[F],
+        y: &[F],
+        d: usize,
+        t: usize,
+        idxs: &[i64],
+        fit_intercept: bool,
+        sample_weight: Option<&[f64]>,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let m = idxs.len();
         // COLUMN-major (`a[c·m + r]`, `b[k·m + r]`) for the whole solve. Every
         // consumer wants it that way: the centering and the `√w` rescale are
         // per-column passes, the Householder reflectors walk a column, and the
@@ -399,10 +603,10 @@ where
         for (r, &gi) in idxs.iter().enumerate() {
             let g = gi as usize;
             for c in 0..d {
-                a[c * m + r] = to_f64(self.x[g * d + c]);
+                a[c * m + r] = to_f64(x[g * d + c]);
             }
             for k in 0..t {
-                b[k * m + r] = to_f64(self.y[g * t + k]);
+                b[k * m + r] = to_f64(y[g * t + k]);
             }
         }
         let w: Option<Vec<f64>> =
@@ -500,6 +704,76 @@ where
             }
         }
         (coef, intercept)
+    }
+
+    /// [`subset_lstsq`](Self::subset_lstsq) for `batch` sub-samples at once,
+    /// solved CONCURRENTLY across the pool.
+    ///
+    /// `idxs` is `batch · m` row indices (trial-major); the results are `batch`
+    /// consecutive `t × d` coefficient blocks and `batch` length-`t` intercept
+    /// blocks — exactly the layout
+    /// [`scan_batch`](Self::scan_batch) and
+    /// [`ransac_scan_batch`](mlrs_kernels::ransac::ransac_scan_batch) consume.
+    ///
+    /// Each solve is independent and writes only its own output slice, so the
+    /// answer is bit-identical to solving them one at a time in any order — the
+    /// parallelism here cannot reassociate anything, unlike the row reductions
+    /// this module is careful about.
+    ///
+    /// This is where the `d ≥ 64` batch actually pays: with
+    /// `min_samples = d + 1` a trial's solve is `O(m·d²)` and DOMINATES the fit
+    /// ([[mlrs-ransac]]), and it is the one part of a trial the device arm
+    /// deliberately does not take (a `d`-column Householder QR on `d + 1` rows is
+    /// launch overhead, and the QR's rank verdict decides control flow, so it
+    /// stays exactly where sklearn's `scipy.linalg.lstsq` semantics are already
+    /// reproduced).
+    pub fn subset_lstsq_batch(
+        &self,
+        idxs: &[i64],
+        m: usize,
+        batch: usize,
+        fit_intercept: bool,
+        sample_weight: Option<&[f64]>,
+    ) -> (Vec<f64>, Vec<f64>) {
+        debug_assert_eq!(idxs.len(), batch * m);
+        let (d, t) = (self.d, self.t);
+        let mut coef = vec![0.0f64; batch * t * d];
+        let mut icept = vec![0.0f64; batch * t];
+        if batch == 1 {
+            let (c, b) = self.subset_lstsq(idxs, fit_intercept, sample_weight);
+            coef.copy_from_slice(&c);
+            icept.copy_from_slice(&b);
+            return (coef, icept);
+        }
+        {
+            let sh_c = Shared::new(&mut coef);
+            let sh_b = Shared::new(&mut icept);
+            let units = self.units;
+            let (x, y) = (self.x, self.y);
+            let pass = move |u: usize| {
+                let mut trial = u;
+                while trial < batch {
+                    let (c, b) = Self::subset_lstsq_impl(
+                        x,
+                        y,
+                        d,
+                        t,
+                        &idxs[trial * m..(trial + 1) * m],
+                        fit_intercept,
+                        sample_weight,
+                    );
+                    // SAFETY: unit `u` owns trial `trial` alone (the stride
+                    // below), and writes only that trial's own output block.
+                    let cs = unsafe { &mut sh_c.get_mut()[trial * t * d..(trial + 1) * t * d] };
+                    let bs = unsafe { &mut sh_b.get_mut()[trial * t..(trial + 1) * t] };
+                    cs.copy_from_slice(&c);
+                    bs.copy_from_slice(&b);
+                    trial += units;
+                }
+            };
+            self.pool.run(&pass);
+        }
+        (coef, icept)
     }
 
     /// Gather `X[idxs]` (row-major `m × d`) — what a caller-supplied
@@ -734,6 +1008,179 @@ fn scan_block_inner<T: HostFloat>(
 /// to a heap vector; `t > 8` regressions are not a shape RANSAC is used for.
 const SMALL_T: usize = 8;
 
+/// [`scan_block_dispatch`] for a block whose predictions were computed
+/// elsewhere — the arbitrary-base-estimator path
+/// ([`RansacHostEngine::scan_pred`]).
+#[allow(clippy::too_many_arguments)]
+fn pred_block_dispatch<F: Pod>(
+    y: &[F],
+    y_pred: &[f64],
+    resid: Option<&[f64]>,
+    t: usize,
+    loss: RansacLoss,
+    threshold: f64,
+    mask: &mut [bool],
+    sq_err: &mut [f64],
+) -> usize {
+    /// [`pred_block`] on the machine's REAL vector unit, the
+    /// [`scan_block`] arrangement.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn go<T: HostFloat>(
+        y: &[T],
+        p: &[T],
+        resid: Option<&[f64]>,
+        t: usize,
+        loss: RansacLoss,
+        threshold: f64,
+        mask: &mut [bool],
+        sq_err: &mut [f64],
+    ) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if avx2_available() {
+            // SAFETY: guarded by the runtime detection this branch tests; the
+            // body is the ordinary row loop and contains nothing unsafe.
+            return unsafe { pred_block_avx2(y, p, resid, t, loss, threshold, mask, sq_err) };
+        }
+        pred_block(y, p, resid, t, loss, threshold, mask, sq_err)
+    }
+    match size_of::<F>() {
+        // The predictions are narrowed to the DESIGN's width before the
+        // subtraction, so the residual is the one sklearn would have formed
+        // (`scan_pred`'s docs).
+        4 => {
+            let p: Vec<f32> = y_pred.iter().map(|&v| v as f32).collect();
+            go::<f32>(
+                bytemuck::cast_slice(y),
+                &p,
+                resid,
+                t,
+                loss,
+                threshold,
+                mask,
+                sq_err,
+            )
+        }
+        8 => go::<f64>(
+            bytemuck::cast_slice(y),
+            y_pred,
+            resid,
+            t,
+            loss,
+            threshold,
+            mask,
+            sq_err,
+        ),
+        other => unreachable!("ransac_host is f32/f64 only, got a {other}-byte element"),
+    }
+}
+
+/// [`pred_block`] compiled for AVX2 + FMA. Widening the accumulator lanes
+/// reassociates nothing, so this cannot change a result
+/// ([`host_simd`](super::host_simd)).
+///
+/// # Safety
+/// The caller must have established that the CPU supports `avx2` and `fma`.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn pred_block_avx2<T: HostFloat>(
+    y: &[T],
+    y_pred: &[T],
+    resid: Option<&[f64]>,
+    t: usize,
+    loss: RansacLoss,
+    threshold: f64,
+    mask: &mut [bool],
+    sq_err: &mut [f64],
+) -> usize {
+    pred_block(y, y_pred, resid, t, loss, threshold, mask, sq_err)
+}
+
+/// One block of rows classified against predictions the caller supplied.
+///
+/// `resid` short-circuits the loss: when the caller's `loss` is a CALLABLE it
+/// has already produced the per-row residual, and sklearn compares exactly that
+/// against the threshold. The squared errors still come from `y − y_pred`,
+/// because the R² tie-break is `r2_score`'s and not the loss's.
+///
+/// The `t == 1` case — every 1-D `y`, i.e. essentially every RANSAC — gets its
+/// own branch-free body for the same reason [`scan_block_inner`] does, and it
+/// matters MORE here: this pass is the only per-trial work the arbitrary-base
+/// arm does in Rust, so it is measured directly against numpy's own vectorized
+/// `abs`/`<=`/`sum` on the other side of the comparison. The general arm below
+/// keeps its per-target array and cannot vectorize; at `t == 1` there is nothing
+/// to keep.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn pred_block<T: HostFloat>(
+    y: &[T],
+    y_pred: &[T],
+    resid: Option<&[f64]>,
+    t: usize,
+    loss: RansacLoss,
+    threshold: f64,
+    mask: &mut [bool],
+    sq_err: &mut [f64],
+) -> usize {
+    let mut n_in = 0usize;
+    if t == 1 {
+        let mut acc = 0.0f64;
+        for (r, m) in mask.iter_mut().enumerate() {
+            let diff = y[r] - y_pred[r];
+            let sq = diff * diff;
+            // Branch-free: the mask store and both accumulations are
+            // predicated, not jumped over.
+            let e = match loss {
+                RansacLoss::AbsoluteError => diff.abs().to_f64(),
+                RansacLoss::SquaredError => sq.to_f64(),
+            };
+            let inl = match resid {
+                Some(rv) => rv[r] <= threshold,
+                None => e <= threshold,
+            };
+            *m = inl;
+            n_in += usize::from(inl);
+            acc += if inl { sq.to_f64() } else { 0.0 };
+        }
+        sq_err[0] = acc;
+        return n_in;
+    }
+    for (r, m) in mask.iter_mut().enumerate() {
+        let mut acc = 0.0f64;
+        let mut sq = [0.0f64; SMALL_T];
+        let mut spill: Vec<f64> = Vec::new();
+        if t > SMALL_T {
+            spill = vec![0.0; t];
+        }
+        for k in 0..t {
+            let diff = y[r * t + k] - y_pred[r * t + k];
+            let s = (diff * diff).to_f64();
+            acc += match loss {
+                RansacLoss::AbsoluteError => diff.abs().to_f64(),
+                RansacLoss::SquaredError => s,
+            };
+            if t > SMALL_T {
+                spill[k] = s;
+            } else {
+                sq[k] = s;
+            }
+        }
+        let inl = match resid {
+            Some(rv) => rv[r] <= threshold,
+            None => acc <= threshold,
+        };
+        *m = inl;
+        if inl {
+            n_in += 1;
+            for k in 0..t {
+                sq_err[k] += if t > SMALL_T { spill[k] } else { sq[k] };
+            }
+        }
+    }
+    n_in
+}
+
 /// `Σ row[c]·coef[c]` split across [`DOT_LANES`] INDEPENDENT accumulators —
 /// which is what lets LLVM vectorize it without any fast-math permission
 /// (each lane sums its own subsequence in its own order).
@@ -838,18 +1285,18 @@ fn median_in_place(v: &mut [f64]) -> f64 {
     }
 }
 
-/// Pool width for a scan pass: proportional to the work, capped by the machine
-/// and by the number of blocks there are to hand out.
+/// Pool width for a dispatched pass: proportional to the work THAT pass does
+/// (see [`RansacHostEngine::new`]), capped by the machine and by the number of
+/// blocks there are to hand out.
 ///
 /// `MLRS_RANSAC_UNITS` overrides it for on-target A/B, read through
 /// [`abflag`](crate::abflag) so a test can scope the override to its own thread
 /// rather than racing `environ` ([[mlrs-abflag-test-knobs]]).
-fn plan_units(n: usize, d: usize, t: usize, n_blocks: usize) -> usize {
+fn plan_units(work_per_pass: usize, n_blocks: usize) -> usize {
     if let Some(v) = crate::abflag::var("MLRS_RANSAC_UNITS").and_then(|v| v.parse::<usize>().ok()) {
         return v.max(1);
     }
-    let total = n.saturating_mul(d.max(1)).saturating_mul(t.max(1));
-    let by_work = (total / MIN_WORK_PER_UNIT).max(1);
+    let by_work = (work_per_pass / MIN_WORK_PER_UNIT).max(1);
     let hw = capability::cpu_launch_units() as usize;
     by_work.min(hw).min(n_blocks.max(1)).max(1)
 }

@@ -175,11 +175,13 @@ def test_oracle_case(fixture, case, kwargs, use_sw):
 
 
 def test_ctor_signature_matches_sklearn():
-    """Same parameter NAMES and DEFAULTS as sklearn, plus mlrs' `output_type`."""
+    """Same parameter NAMES and DEFAULTS as sklearn, plus the two mlrs-only
+    parameters (`output_type`, and `device` since RANSAC-02 gave the scan a
+    device arm)."""
     ours = inspect.signature(mlrs.RANSACRegressor.__init__).parameters
     theirs = inspect.signature(SkRANSAC.__init__).parameters
     extra = set(ours) - set(theirs)
-    assert extra == {"output_type"}, f"unexpected extra parameters: {extra}"
+    assert extra == {"output_type", "device"}, f"unexpected extra parameters: {extra}"
     missing = set(theirs) - set(ours)
     assert not missing, f"missing sklearn parameters: {missing}"
     for name, p in theirs.items():
@@ -220,10 +222,13 @@ def test_unknown_loss_string_is_rejected():
 
 
 @requires_f64
-def test_callable_loss_takes_the_python_path_and_still_matches():
-    """A callable ``loss`` is the one RANSAC-own parameter the Rust engine
-    cannot take (it needs a materialized ``y_pred``), so it routes to the shim's
-    Python loop — which must still agree with sklearn index for index."""
+def test_callable_loss_takes_the_bridge_and_still_matches():
+    """A callable ``loss`` cannot be evaluated by the FUSED native scan (which
+    forms each residual and discards it), so it routes through the bridge — the
+    same one an arbitrary base estimator uses — which returns the callable's
+    residual alongside the predictions. The trial loop, the consensus and every
+    stop rule still run in Rust, and the result must still agree with sklearn
+    index for index."""
     z = _load("ransac_f64_seed42")
     x, y, xt, _sw = _design(z, np.float64)
 
@@ -232,7 +237,7 @@ def test_callable_loss_takes_the_python_path_and_still_matches():
 
     ours = mlrs.RANSACRegressor(loss=loss, random_state=SEED).fit(x, y)
     theirs = SkRANSAC(loss=loss, random_state=SEED).fit(x, y)
-    assert ours._from_rust is False
+    assert ours._native_base is False
     assert ours.n_trials_ == theirs.n_trials_
     np.testing.assert_array_equal(
         np.asarray(ours.inlier_mask_), theirs.inlier_mask_
@@ -240,18 +245,21 @@ def test_callable_loss_takes_the_python_path_and_still_matches():
     np.testing.assert_allclose(
         np.ravel(ours.estimator_.coef_), np.ravel(theirs.estimator_.coef_), atol=1e-9
     )
+    np.testing.assert_allclose(
+        np.asarray(ours.predict(xt)), theirs.predict(xt), atol=1e-9
+    )
 
 
 @requires_f64
-def test_fallback_matches_rust_path():
-    """The Python fallback and the Rust engine agree on the same configuration.
+def test_foreign_base_matches_the_native_arm():
+    """The two sub-model arms agree on the same configuration.
 
-    Driven by ``estimator=Ridge(alpha=0)`` — a base the Rust engine declines, so
-    the shim takes its Python loop — against the default ``LinearRegression``
-    base, which it hosts. A ridge with no penalty IS ordinary least squares, so
-    the two must land on the same consensus and (to solver precision) the same
-    coefficients. That is what makes the fallback a fallback and not a second
-    implementation free to disagree.
+    Driven by ``estimator=Ridge(alpha=0)`` — a base Rust does not fit natively,
+    so the shim drives it through the bridge — against the default
+    ``LinearRegression`` base, which it fits itself. A ridge with no penalty IS
+    ordinary least squares, so the two must land on the same consensus and (to
+    solver precision) the same coefficients. That is what makes the bridge a
+    second INGRESS to one loop rather than a second implementation of it.
     """
     from sklearn.linear_model import Ridge
 
@@ -259,22 +267,151 @@ def test_fallback_matches_rust_path():
     x, y, _xt, _sw = _design(z, np.float64)
 
     rust = mlrs.RANSACRegressor(random_state=SEED).fit(x, y)
-    fallback = mlrs.RANSACRegressor(
+    bridged = mlrs.RANSACRegressor(
         estimator=Ridge(alpha=0.0, solver="lsqr"),
         min_samples=N_FEATURES + 1,
         random_state=SEED,
     ).fit(x, y)
-    assert rust._from_rust is True
-    assert fallback._from_rust is False
-    assert rust.n_trials_ == fallback.n_trials_
+    assert rust._native_base is True
+    assert bridged._native_base is False
+    assert rust.n_trials_ == bridged.n_trials_
     np.testing.assert_array_equal(
-        np.asarray(rust.inlier_mask_), np.asarray(fallback.inlier_mask_)
+        np.asarray(rust.inlier_mask_), np.asarray(bridged.inlier_mask_)
     )
     np.testing.assert_allclose(
         np.ravel(rust.estimator_.coef_),
-        np.ravel(fallback.estimator_.coef_),
+        np.ravel(bridged.estimator_.coef_),
         rtol=1e-6,
         atol=1e-6,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Any base regressor (RANSAC-02)
+# --------------------------------------------------------------------------- #
+
+
+BASES = [
+    ("ridge", lambda: __import__("sklearn.linear_model", fromlist=["Ridge"]).Ridge(alpha=1.0)),
+    ("lasso", lambda: __import__("sklearn.linear_model", fromlist=["Lasso"]).Lasso(alpha=0.1)),
+    (
+        "tree",
+        lambda: __import__(
+            "sklearn.tree", fromlist=["DecisionTreeRegressor"]
+        ).DecisionTreeRegressor(max_depth=3, random_state=0),
+    ),
+    (
+        "knn",
+        lambda: __import__(
+            "sklearn.neighbors", fromlist=["KNeighborsRegressor"]
+        ).KNeighborsRegressor(n_neighbors=3),
+    ),
+    (
+        "svr",
+        lambda: __import__("sklearn.svm", fromlist=["SVR"]).SVR(kernel="rbf", C=10.0),
+    ),
+    (
+        "positive_ols",
+        lambda: SkLinearRegression(positive=True),
+    ),
+]
+
+
+@pytest.mark.parametrize("name,make", BASES, ids=[b[0] for b in BASES])
+@requires_f64
+def test_any_base_regressor_matches_sklearn(name, make):
+    """EVERY base estimator, not just the linear ones.
+
+    These are not linear models — a decision tree, a k-NN and an RBF SVR predict
+    through machinery Rust has no coefficients for — and they are exactly the
+    case the bridge exists for. Because the draw sequence is still mlrs's
+    MT19937 reproduction of numpy's, the gate is TRAJECTORY-exact
+    ([[mlrs-ransac]]): the same trial count, the same skip counters and the same
+    consensus set as sklearn, not merely a similar answer.
+    """
+    z = _load("ransac_f64_seed42")
+    x, y, xt, _sw = _design(z, np.float64)
+    kw = dict(min_samples=N_FEATURES + 1, random_state=SEED)
+
+    ours = mlrs.RANSACRegressor(estimator=make(), **kw).fit(x, y)
+    theirs = SkRANSAC(estimator=make(), **kw).fit(x, y)
+
+    assert ours._native_base is False
+    assert (
+        ours.n_trials_,
+        ours.n_skips_no_inliers_,
+        ours.n_skips_invalid_data_,
+        ours.n_skips_invalid_model_,
+    ) == (
+        theirs.n_trials_,
+        theirs.n_skips_no_inliers_,
+        theirs.n_skips_invalid_data_,
+        theirs.n_skips_invalid_model_,
+    )
+    np.testing.assert_array_equal(np.asarray(ours.inlier_mask_), theirs.inlier_mask_)
+    np.testing.assert_allclose(
+        np.asarray(ours.predict(xt)), theirs.predict(xt), rtol=1e-9, atol=1e-9
+    )
+    assert type(ours.estimator_) is type(theirs.estimator_)
+
+
+@requires_f64
+def test_predicates_and_sample_weight_reach_a_foreign_base():
+    """The RANSAC-own parameters keep working when the base is not native.
+
+    ``is_data_valid`` / ``is_model_valid`` are evaluated INSIDE the one bridge
+    call there (rather than as separate crossings), and ``sample_weight`` is
+    forwarded to the sub-estimator's own ``fit`` — sklearn's behaviour, and the
+    place a per-trial protocol is easiest to get subtly wrong.
+    """
+    from sklearn.linear_model import Ridge
+
+    z = _load("ransac_f64_seed42")
+    x, y, _xt, sw = _design(z, np.float64)
+    kw = dict(
+        min_samples=N_FEATURES + 1,
+        random_state=SEED,
+        is_data_valid=lambda X, yy: float(np.abs(X).max()) < 2.5,
+        is_model_valid=lambda m, X, yy: float(np.abs(m.coef_).max()) < 3.0,
+    )
+    ours = mlrs.RANSACRegressor(estimator=Ridge(alpha=1.0), **kw).fit(
+        x, y, sample_weight=sw
+    )
+    theirs = SkRANSAC(estimator=Ridge(alpha=1.0), **kw).fit(x, y, sample_weight=sw)
+    assert ours.n_skips_invalid_data_ == theirs.n_skips_invalid_data_
+    assert ours.n_skips_invalid_model_ == theirs.n_skips_invalid_model_
+    assert ours.n_trials_ == theirs.n_trials_
+    np.testing.assert_array_equal(np.asarray(ours.inlier_mask_), theirs.inlier_mask_)
+
+
+@requires_f64
+def test_a_randomized_base_consumes_the_same_random_state():
+    """A base estimator that DRAWS from the shared generator still interleaves.
+
+    sklearn seeds the sub-estimator with the very ``RandomState`` the trial
+    draws come from, so a randomized base consumes words BETWEEN draws. The Rust
+    loop borrows those words for the fit, which is exactly why the foreign arm
+    is never batched — the estimator's draw has to land between trial `k` and
+    trial `k+1`, not after both. This is what proves it does.
+    """
+    from sklearn.ensemble import RandomForestRegressor
+
+    z = _load("ransac_f64_seed42")
+    x, y, _xt, _sw = _design(z, np.float64)
+    kw = dict(min_samples=N_FEATURES + 1, max_trials=6)
+
+    def base():
+        return RandomForestRegressor(n_estimators=3, max_depth=3)
+
+    draws = []
+    fits = []
+    for cls in (mlrs.RANSACRegressor, SkRANSAC):
+        rs = np.random.RandomState(SEED)
+        fits.append(cls(estimator=base(), random_state=rs, **kw).fit(x, y))
+        draws.append(int(rs.randint(0, 2**31 - 1)))
+    assert draws[0] == draws[1]
+    np.testing.assert_array_equal(
+        np.asarray(fits[0].inlier_mask_), fits[1].inlier_mask_
     )
 
 

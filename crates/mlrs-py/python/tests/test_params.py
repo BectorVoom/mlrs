@@ -133,6 +133,7 @@ EXPECTED_PARAMS = {
         "loss": "absolute_error",
         "random_state": None,
         "output_type": "input",
+        "device": "auto",
     },
     "LogisticRegression": {
         "C": 1.0,

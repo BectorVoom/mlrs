@@ -32,6 +32,28 @@ pass and the copy sklearn avoids paying) and is roughly flat in `max_trials`
 
     .venv/bin/python scripts/bench_ransac_cpu.py [--reps 5] [--check]
                      [--engine mlrs|sklearn|both] [--sweep]
+                     [--base ols|ridge|lasso|tree|knn|svr] [--device auto|cpu|gpu]
+
+`--base` swaps the BASE ESTIMATOR (RANSAC-02). Anything but `ols` is a base mlrs
+does not fit natively, so its sub-model goes back through Python once per trial
+(`RansacBase::Foreign`) while everything else — the loss, the mask, the
+consensus, the R2, the stop rules — still runs in Rust. That is the arm to point
+this at when the question is "what did moving the LOOP buy", separately from
+"what did moving the SUB-MODEL SOLVE buy", because with a foreign base both
+engines call the identical `estimator.fit`/`predict` and the difference is the
+loop around them and nothing else.
+
+Expect PARITY there, not a win, and read a deviation from it as noise unless it
+repeats: measured 0.86x / 1.00x / 0.82x (ridge, `20k x 16` / `50k x 32` /
+`200k x 32`) and 0.82-1.07x for tree and knn bases. Both engines are
+bandwidth-bound at the top rung and mlrs makes one extra streaming pass over the
+predictions there. Run-to-run spread on this box is ~15%, so a single rung means
+nothing on its own — which is why `--engine` exists and why the two engines
+should be run in SEPARATE processes.
+
+`--device gpu` moves the per-trial scan to the batched device kernels. Read
+`batch_width` in the header line to confirm the arm engaged before believing a
+number ([[mlrs-bench-verify-knob-is-live]]).
 
 Two caveats carried from the other cpu probes, both load-bearing:
 
@@ -132,8 +154,35 @@ class Samples:
         return self.wall[0]
 
 
-def _ctor_kwargs(args):
-    return dict(
+def make_base(name, seed):
+    """The `estimator=` object, fresh per construction (sklearn clones it)."""
+    if name == "ols":
+        return None
+    if name == "ridge":
+        from sklearn.linear_model import Ridge
+
+        return Ridge(alpha=1.0)
+    if name == "lasso":
+        from sklearn.linear_model import Lasso
+
+        return Lasso(alpha=0.1, max_iter=200)
+    if name == "tree":
+        from sklearn.tree import DecisionTreeRegressor
+
+        return DecisionTreeRegressor(max_depth=4, random_state=seed)
+    if name == "knn":
+        from sklearn.neighbors import KNeighborsRegressor
+
+        return KNeighborsRegressor(n_neighbors=5)
+    if name == "svr":
+        from sklearn.svm import SVR
+
+        return SVR(kernel="rbf", C=10.0)
+    raise ValueError(f"unknown base estimator {name!r}")
+
+
+def _ctor_kwargs(args, d=None):
+    kw = dict(
         min_samples=args.min_samples,
         residual_threshold=args.residual_threshold,
         max_trials=args.max_trials,
@@ -141,6 +190,14 @@ def _ctor_kwargs(args):
         loss=args.loss,
         random_state=args.seed,
     )
+    if args.base != "ols":
+        kw["estimator"] = make_base(args.base, args.seed)
+        # sklearn REQUIRES an explicit `min_samples` for any base that is not a
+        # `LinearRegression` — `n_features + 1` is only the right default
+        # sub-sample size for a linear model.
+        if kw["min_samples"] is None and d is not None:
+            kw["min_samples"] = d + 1
+    return kw
 
 
 def _agreement(mm, sm):
@@ -164,7 +221,7 @@ def run_ladder(args, MlrsEst, SkEst, dt, configs):
     print(header)
     print("-" * len(header))
     engines = [e for e in ("mlrs", "sklearn") if args.engine in ("both", e)]
-    common = _ctor_kwargs(args)
+    print(f"[base={args.base} device={args.device}]")
 
     for n, d in configs:
         x, y = make_design(n, d, dt)
@@ -172,15 +229,24 @@ def run_ladder(args, MlrsEst, SkEst, dt, configs):
         if args.sample_weight:
             sw = np.abs(np.random.default_rng(7).standard_normal(n)) + 0.25
 
-        def fit_of(Est):
+        common = _ctor_kwargs(args, d)
+
+        def fit_of(Est, is_mlrs):
             def go():
-                m = Est(**common)
+                kw = dict(common)
+                if is_mlrs and args.device != "auto":
+                    kw["device"] = args.device
+                if kw.get("estimator") is not None:
+                    # A fresh base per fit: sklearn `clone`s it, and a
+                    # rep that reused a fitted one would not be timing a fit.
+                    kw["estimator"] = make_base(args.base, args.seed)
+                m = Est(**kw)
                 m.fit(x, y, sample_weight=sw)
                 return m
 
             return go
 
-        fits = {"mlrs": fit_of(MlrsEst), "sklearn": fit_of(SkEst)}
+        fits = {"mlrs": fit_of(MlrsEst, True), "sklearn": fit_of(SkEst, False)}
         samples = {e: Samples() for e in engines}
         failed = {}
 
@@ -204,6 +270,11 @@ def run_ladder(args, MlrsEst, SkEst, dt, configs):
         for eng in ok:
             s = samples[eng]
             tr = int(s.model.n_trials_)
+            if eng == "mlrs":
+                # The arm that actually ran, printed rather than assumed.
+                arm = getattr(s.model._mlrs_obj, "device_used", lambda: "?")()
+                width = getattr(s.model._mlrs_obj, "batch_width", lambda: 1)()
+                print(f"{'':>8} {'':>5} | arm={arm} batch_width={width}")
             print(
                 f"{n:>8} {d:>5} | {eng:>8} "
                 f"{s.best:>10.4f} {s.best_cpu:>10.4f} {s.first:>10.4f} "
@@ -235,7 +306,7 @@ def run_sweep(args, MlrsEst, SkEst, dt):
     # all-in / all-out.
     mad = float(np.median(np.abs(y - np.median(y))))
 
-    base = _ctor_kwargs(args)
+    base = _ctor_kwargs(args, d)
     cases = [
         ("default", {}, False),
         # --- trial-count knobs ------------------------------------------- #
@@ -307,6 +378,19 @@ def main() -> None:
         choices=["absolute_error", "squared_error"],
     )
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--base",
+        default="ols",
+        choices=["ols", "ridge", "lasso", "tree", "knn", "svr"],
+        help="the RANSAC base estimator; anything but `ols` exercises the "
+        "one-call-per-trial bridge arm on the mlrs side",
+    )
+    ap.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "gpu"],
+        help="mlrs execution placement for the per-trial scan",
+    )
     ap.add_argument("--sample-weight", action="store_true")
     ap.add_argument(
         "--check",
