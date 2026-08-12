@@ -21,6 +21,7 @@
 //! Tests live in `crates/mlrs-algos/tests/gaussian_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -35,6 +36,14 @@ use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
     ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL,
+};
+// NB-PERSIST: the safetensors container. `save`/`load` live HERE rather than in
+// `nb_persist` so they can reach the private fitted fields directly — the D-03
+// "independent structs, shared machinery as free functions" split applied to
+// serialization.
+use crate::naive_bayes::nb_persist::{
+    as_f64, as_floats, as_i64, expect_len, shape_1d, shape_2d, AlignedBytes, LoadModel, NbFile,
+    NbWriter, PersistError, SaveModel, TensorRef,
 };
 // Phase 16 (D-02 shape-B trait-swap): the pre-existing builder is UNTOUCHED; the
 // estimator gains the `<F, S = Unfit>` state param and migrates from the legacy
@@ -131,6 +140,176 @@ where
         self.var_
             .as_ref()
             .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
+    }
+}
+
+/// The `estimator` discriminator written into every `GaussianNB` model file,
+/// and checked on load so a sibling NB variant's file cannot be mistaken for
+/// one (see [`nb_persist`](crate::naive_bayes::nb_persist)).
+const PERSIST_TAG: &str = "gaussian_nb";
+
+impl<F> SaveModel for GaussianNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// Five tensors and two scalars, and NOTHING derivable from them:
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `theta_` | `F` (`F32`/`F64`) | `[n_classes, n_features]` |
+    /// | `var_` | `F` | `[n_classes, n_features]` |
+    /// | `classes_` | `I64` | `[n_classes]` |
+    /// | `class_count_` | `F64` | `[n_classes]` |
+    /// | `class_log_prior_` | `F64` | `[n_classes]` |
+    /// | `param:priors` (optional) | `F64` | `[n_classes]` |
+    /// | `param:var_smoothing`, `epsilon_` | `__metadata__` scalars | — |
+    ///
+    /// `theta_`/`var_` are written at the model's OWN float width, so an
+    /// `f32`-fitted model produces a file half the size of an `f64` one for the
+    /// same geometry; `n_classes` and `n_features` are recovered from `theta_`'s
+    /// shape at load rather than stored again.
+    ///
+    /// `theta_`/`var_` live on the device, so this costs one readback each —
+    /// the only copy on the path. `pool` is `&BufferPool` because
+    /// [`DeviceArray::to_host`] only reads.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `NbWriter` borrows every payload so it can
+        // stream them out without a second copy, which means the host buffers
+        // must outlive it.
+        let theta = self
+            .theta_
+            .as_ref()
+            .ok_or_else(|| absent("theta_"))?
+            .to_host(pool);
+        let var = self
+            .var_
+            .as_ref()
+            .ok_or_else(|| absent("var_"))?
+            .to_host(pool);
+        let class_count = self
+            .class_count_
+            .as_deref()
+            .ok_or_else(|| absent("class_count_"))?;
+        let class_log_prior = self
+            .class_log_prior_
+            .as_deref()
+            .ok_or_else(|| absent("class_log_prior_"))?;
+        let epsilon = self.epsilon_.ok_or_else(|| absent("epsilon_"))?;
+
+        let n_classes = self.classes_.len();
+        let n_features = self.n_features;
+        let table = vec![n_classes, n_features];
+
+        let mut w = NbWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:var_smoothing", self.var_smoothing);
+        w.scalar_f64("epsilon_", epsilon);
+        w.tensor("theta_", TensorRef::floats(&theta, table.clone())?);
+        w.tensor("var_", TensorRef::floats(&var, table)?);
+        w.tensor(
+            "classes_",
+            TensorRef::i64s(&self.classes_, vec![n_classes])?,
+        );
+        w.tensor(
+            "class_count_",
+            TensorRef::f64s(class_count, vec![n_classes])?,
+        );
+        w.tensor(
+            "class_log_prior_",
+            TensorRef::f64s(class_log_prior, vec![n_classes])?,
+        );
+        // The constructor `priors` is part of the model's identity (it decides
+        // `class_log_prior_`), so a round-trip must preserve it; `None` writes
+        // no entry at all rather than a sentinel.
+        if let Some(priors) = self.priors.as_deref() {
+            w.tensor("param:priors", TensorRef::f64s(priors, vec![priors.len()])?);
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for GaussianNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `theta_`/`var_` to `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site, either
+    /// by turbofish or by annotating the binding:
+    ///
+    /// ```ignore
+    /// let clf: GaussianNB<f32, Fitted> = GaussianNB::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with: an `f32` model
+    /// loads into a `GaussianNB<f64>` (and back) through
+    /// [`as_floats`](crate::naive_bayes::nb_persist::as_floats), which
+    /// reinterprets when the widths agree and converts only when they do not.
+    ///
+    /// The file is untrusted input, so every extent it declares is checked
+    /// against every other before any value is stored — a header edited to
+    /// claim more classes than `class_count_` holds fails here rather than
+    /// reading out of bounds at predict time.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<GaussianNB<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NbFile::parse(&raw, PERSIST_TAG)?;
+
+        // `theta_` defines the geometry; everything else is measured against it.
+        let theta_v = file.tensor("theta_")?;
+        let (n_classes, n_features) = shape_2d(&theta_v, "theta_")?;
+
+        let var_v = file.tensor("var_")?;
+        let (var_rows, var_cols) = shape_2d(&var_v, "var_")?;
+        expect_len("var_", var_rows, n_classes, "rows")?;
+        expect_len("var_", var_cols, n_features, "columns")?;
+
+        let classes_v = file.tensor("classes_")?;
+        let count_v = file.tensor("class_count_")?;
+        let prior_v = file.tensor("class_log_prior_")?;
+        for (name, view) in [
+            ("classes_", &classes_v),
+            ("class_count_", &count_v),
+            ("class_log_prior_", &prior_v),
+        ] {
+            expect_len(name, shape_1d(view, name)?, n_classes, "entries")?;
+        }
+
+        let priors = match file.tensor_opt("param:priors") {
+            None => None,
+            Some(view) => {
+                let len = shape_1d(&view, "param:priors")?;
+                expect_len("param:priors", len, n_classes, "entries")?;
+                Some(as_f64(&view, "param:priors")?.into_owned())
+            }
+        };
+
+        // `as_floats` borrows the file buffer outright when the dtype matches
+        // `F`, so these two uploads read straight from the bytes `read_exact`
+        // landed — no intermediate `Vec`, no per-element decode.
+        let theta = as_floats::<F>(&theta_v, "theta_")?;
+        let var = as_floats::<F>(&var_v, "var_")?;
+
+        Ok(GaussianNB {
+            priors,
+            var_smoothing: file.scalar_f64("param:var_smoothing")?,
+            classes_: as_i64(&classes_v, "classes_")?.into_owned(),
+            n_features,
+            theta_: Some(DeviceArray::from_host(pool, &theta)),
+            var_: Some(DeviceArray::from_host(pool, &var)),
+            class_log_prior_: Some(as_f64(&prior_v, "class_log_prior_")?.into_owned()),
+            class_count_: Some(as_f64(&count_v, "class_count_")?.into_owned()),
+            epsilon_: Some(file.scalar_f64("epsilon_")?),
+            _state: PhantomData,
+        })
     }
 }
 

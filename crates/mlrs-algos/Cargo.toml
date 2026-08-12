@@ -27,6 +27,10 @@ thiserror = { workspace = true }
 # reduce prim uses the same `log::warn!` convention). Parity depends only on the
 # clipped numeric, not the warning text (Phase-11 A2).
 log = { workspace = true }
+# On-disk model persistence for the Naive Bayes estimators (NB-PERSIST). NOT
+# optional: `naive_bayes::nb_persist` is part of the estimator surface, and the
+# crate is tiny (safetensors + serde_json, no transitive runtime).
+safetensors = { workspace = true }
 
 # OPTIONAL row-container support for `model_selection::container` (MODSEL-RS-03).
 # Both are OFF by default so the four backend wheels — which reach polars and
@@ -64,6 +68,11 @@ env_logger = { workspace = true }
 # workspace `thiserror`/`syn`), legitimacy-audited in RESEARCH § Package
 # Legitimacy Audit; dev-only, no build.rs/postinstall.
 trybuild = "1.0.117"
+# Scratch directories for the NB-PERSIST save/load round-trip tests. Dev-only,
+# and already in the lockfile as one of safetensors' own dev dependencies. A
+# `TempDir` removes itself on drop INCLUDING on a panicking assertion, which a
+# hand-rolled `env::temp_dir()` path would leak on every test failure.
+tempfile = "3"
 
 # Backend selection passthrough. `mlrs-algos` owns NO runtime of its own; each
 # feature forwards to the matching `mlrs-backend` feature so `--features cpu`/

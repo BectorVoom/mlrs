@@ -22,6 +22,7 @@
 //! Tests live in `crates/mlrs-algos/tests/multinomial_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -37,6 +38,12 @@ use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::nb_common::{
     argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
     ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL, non_negative_x_error,
+};
+// NB-PERSIST: the safetensors container. This estimator's fitted state IS the
+// shared discrete core, so `save`/`load` are little more than a call apiece.
+use crate::naive_bayes::nb_persist::{
+    read_discrete_core, AlignedBytes, DiscreteCoreRef, LoadModel, NbFile, NbWriter, PersistError,
+    SaveModel,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -111,6 +118,95 @@ where
         self.feature_log_prob_
             .as_ref()
             .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
+    }
+}
+
+/// The `estimator` discriminator written into every `MultinomialNB` model file
+/// (see [`nb_persist`](crate::naive_bayes::nb_persist)).
+const PERSIST_TAG: &str = "multinomial_nb";
+
+impl<F> SaveModel for MultinomialNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// The plainest of the five: the fitted state is exactly the shared
+    /// discrete core — a `[n_classes, n_features]` `feature_log_prob_` at the
+    /// model's own float width, `classes_`, `class_log_prior_`, an optional
+    /// `param:class_prior`, and the three smoothing scalars in `__metadata__`.
+    /// Every tensor name here is sklearn's own attribute name.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound before the writer, which borrows rather than copies.
+        let feature_log_prob = self
+            .feature_log_prob_
+            .as_ref()
+            .ok_or_else(|| absent("feature_log_prob_"))?
+            .to_host(pool);
+        let class_log_prior = self
+            .class_log_prior_
+            .as_deref()
+            .ok_or_else(|| absent("class_log_prior_"))?;
+
+        let mut w = NbWriter::new(PERSIST_TAG);
+        DiscreteCoreRef {
+            matrix_name: "feature_log_prob_",
+            alpha: self.alpha,
+            force_alpha: self.force_alpha,
+            fit_prior: self.fit_prior,
+            class_prior: self.class_prior.as_deref(),
+            classes: &self.classes_,
+            class_log_prior,
+            feature_log_prob: &feature_log_prob,
+            n_features: self.n_features,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for MultinomialNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `feature_log_prob_` to
+    /// `pool`.
+    ///
+    /// `Fitted` by construction, so the state parameter is named at the call
+    /// site:
+    ///
+    /// ```ignore
+    /// let clf: MultinomialNB<f32, Fitted> = MultinomialNB::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// As for the other variants, `F` need not match the file's dtype — the tag
+    /// makes the width a load-time choice.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<MultinomialNB<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NbFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_discrete_core::<F>(&file, "feature_log_prob_")?;
+
+        Ok(MultinomialNB {
+            alpha: core.alpha,
+            force_alpha: core.force_alpha,
+            fit_prior: core.fit_prior,
+            class_prior: core.class_prior,
+            classes_: core.classes,
+            n_features: core.n_features,
+            // `core.feature_log_prob` still borrows the file buffer when the
+            // dtype matched, so this uploads straight from the bytes `read`
+            // landed.
+            feature_log_prob_: Some(DeviceArray::from_host(pool, &core.feature_log_prob)),
+            class_log_prior_: Some(core.class_log_prior),
+            _state: PhantomData,
+        })
     }
 }
 

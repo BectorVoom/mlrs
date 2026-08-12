@@ -566,8 +566,8 @@ fn parallel_passes_match_serial_reference() {
     for i in 0..n {
         class_count[y[i] as usize] += 1.0;
     }
-    let flp = fitted.feature_log_prob().expect("fitted");
     for j in 0..d {
+        let flp_j = fitted.feature_log_prob_block(j).expect("fitted");
         let n_cat_j = n_cat_ref[j];
         let mut count = vec![0.0f64; n_classes * n_cat_j];
         for i in 0..n {
@@ -577,7 +577,7 @@ fn parallel_passes_match_serial_reference() {
             let denom = class_count[c] + alpha * n_cat_j as f64;
             for k in 0..n_cat_j {
                 let want = ((count[c * n_cat_j + k] + alpha) / denom).ln();
-                let got = flp[j][c * n_cat_j + k];
+                let got = flp_j[c * n_cat_j + k];
                 assert_eq!(
                     got, want,
                     "feature_log_prob_[{j}][{c},{k}] diverged from the serial reference \
@@ -782,9 +782,11 @@ fn weighted_fit_equals_repeated_fit() {
         repeated.n_categories(),
         "n_categories_ diverged"
     );
-    let wflp = weighted.feature_log_prob().expect("fitted");
-    let rflp = repeated.feature_log_prob().expect("fitted");
-    for (j, (a, b)) in wflp.iter().zip(rflp.iter()).enumerate() {
+    // The fitted table is ONE flat buffer; walk it per feature so a divergence
+    // is reported against the feature it belongs to rather than a flat index.
+    for j in 0..weighted.n_categories().expect("fitted").len() {
+        let a = weighted.feature_log_prob_block(j).expect("fitted");
+        let b = repeated.feature_log_prob_block(j).expect("fitted");
         assert_band(a, b, 1e-12, &format!("feature_log_prob_[{j}] weighted vs repeated"));
     }
 }
@@ -814,9 +816,11 @@ fn all_ones_weight_equals_unweighted() {
         .fit_from_host_slice(&x, &y, (n, d), None)
         .expect("unweighted fit");
     assert_eq!(weighted.classes(), plain.classes(), "classes_ diverged");
-    let wflp = weighted.feature_log_prob().expect("fitted");
-    let pflp = plain.feature_log_prob().expect("fitted");
-    for (j, (a, b)) in wflp.iter().zip(pflp.iter()).enumerate() {
+    // The fitted table is ONE flat buffer; walk it per feature so a divergence
+    // is reported against the feature it belongs to rather than a flat index.
+    for j in 0..weighted.n_categories().expect("fitted").len() {
+        let a = weighted.feature_log_prob_block(j).expect("fitted");
+        let b = plain.feature_log_prob_block(j).expect("fitted");
         assert_band(a, b, 1e-12, &format!("feature_log_prob_[{j}] ones vs unweighted"));
     }
 }

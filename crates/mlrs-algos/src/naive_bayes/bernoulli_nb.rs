@@ -28,6 +28,7 @@
 //! Tests live in `crates/mlrs-algos/tests/bernoulli_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -45,6 +46,12 @@ use crate::naive_bayes::multinomial_nb::{
 };
 use crate::naive_bayes::nb_common::{
     argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize, PAR_TABLE_MAX_ENTRIES, non_negative_x_error,
+};
+// NB-PERSIST: the safetensors container. The shared discrete core plus this
+// variant's own `neg_prob_sum_` bias and `binarize` threshold.
+use crate::naive_bayes::nb_persist::{
+    as_f64, expect_len, read_discrete_core, shape_1d, AlignedBytes, DiscreteCoreRef, LoadModel,
+    NbFile, NbWriter, PersistError, SaveModel, TensorRef,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -126,6 +133,135 @@ where
         self.feature_log_prob_
             .as_ref()
             .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
+    }
+}
+
+/// The `estimator` discriminator written into every `BernoulliNB` model file
+/// (see [`nb_persist`](crate::naive_bayes::nb_persist)).
+const PERSIST_TAG: &str = "bernoulli_nb";
+
+/// The tensor name for the fitted `n_classes × n_features` matrix.
+///
+/// The ONE place the format's "bare names are sklearn's fitted attribute names"
+/// convention is deliberately broken. mlrs does not store sklearn's
+/// `feature_log_prob_` (= `log p`); it stores the folded GEMM operand
+/// `log p − log(1 − p)` (Pitfall 5), because that is what makes predict a single
+/// matvec. Writing it under the name `feature_log_prob_` would hand a Python
+/// reader a matrix that is not what the name promises.
+///
+/// The alternative — unfold to `log p` on save and re-fold on load — is
+/// arithmetically possible (`p = σ(delta)`), but every value would take two
+/// transcendental round-trips and the save→load cycle would stop being
+/// bit-exact. A truthful name costs nothing; losing exactness costs the
+/// property the whole format is built to guarantee.
+///
+/// A reader that wants sklearn's attribute can recover it exactly as the fit
+/// does: `log p = delta − log1p(exp(delta))`.
+const MATRIX_NAME: &str = "feature_log_prob_delta_";
+
+impl<F> SaveModel for BernoulliNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// The shared discrete core, plus the two things `BernoulliNB` alone holds:
+    ///
+    /// * `neg_prob_sum_` — the per-class `Σⱼ log(1 − p_cj)` bias that rides
+    ///   alongside `class_log_prior_` in the joint log-likelihood. It is fitted
+    ///   state, NOT derivable from the matrix row sums, so the model does not
+    ///   round-trip without it.
+    /// * `param:binarize` — the predict-time threshold. `None` (binarization
+    ///   disabled) writes no key at all, which is how the `Option` round-trips;
+    ///   `Some(0.0)`, the sklearn default, writes `"0.0"`.
+    ///
+    /// The matrix goes under [`MATRIX_NAME`], not `feature_log_prob_` — see
+    /// there for why.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let feature_log_prob = self
+            .feature_log_prob_
+            .as_ref()
+            .ok_or_else(|| absent("feature_log_prob_"))?
+            .to_host(pool);
+        let class_log_prior = self
+            .class_log_prior_
+            .as_deref()
+            .ok_or_else(|| absent("class_log_prior_"))?;
+        let neg_prob_sum = self
+            .neg_prob_sum_
+            .as_deref()
+            .ok_or_else(|| absent("neg_prob_sum_"))?;
+
+        let n_classes = self.classes_.len();
+        expect_len("neg_prob_sum_", neg_prob_sum.len(), n_classes, "entries")?;
+
+        let mut w = NbWriter::new(PERSIST_TAG);
+        w.scalar_opt_f64("param:binarize", self.binarize);
+        w.tensor(
+            "neg_prob_sum_",
+            TensorRef::f64s(neg_prob_sum, vec![n_classes])?,
+        );
+        DiscreteCoreRef {
+            matrix_name: MATRIX_NAME,
+            alpha: self.alpha,
+            force_alpha: self.force_alpha,
+            fit_prior: self.fit_prior,
+            class_prior: self.class_prior.as_deref(),
+            classes: &self.classes_,
+            class_log_prior,
+            feature_log_prob: &feature_log_prob,
+            n_features: self.n_features,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for BernoulliNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading the fitted matrix to `pool`.
+    ///
+    /// ```ignore
+    /// let clf: BernoulliNB<f32, Fitted> = BernoulliNB::load(&mut pool, path)?;
+    /// ```
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<BernoulliNB<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NbFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_discrete_core::<F>(&file, MATRIX_NAME)?;
+
+        let neg_v = file.tensor("neg_prob_sum_")?;
+        expect_len(
+            "neg_prob_sum_",
+            shape_1d(&neg_v, "neg_prob_sum_")?,
+            core.n_classes,
+            "entries",
+        )?;
+
+        Ok(BernoulliNB {
+            alpha: core.alpha,
+            force_alpha: core.force_alpha,
+            // Absent key means binarization was disabled, which is a real
+            // configuration and not a defaulted one — so it must NOT fall back
+            // to sklearn's `Some(0.0)`.
+            binarize: file.scalar_opt_f64("param:binarize")?,
+            fit_prior: core.fit_prior,
+            class_prior: core.class_prior,
+            classes_: core.classes,
+            n_features: core.n_features,
+            feature_log_prob_: Some(DeviceArray::from_host(pool, &core.feature_log_prob)),
+            neg_prob_sum_: Some(as_f64(&neg_v, "neg_prob_sum_")?.into_owned()),
+            class_log_prior_: Some(core.class_log_prior),
+            _state: PhantomData,
+        })
     }
 }
 

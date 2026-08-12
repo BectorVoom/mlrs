@@ -8,6 +8,40 @@ members = [
     "crates/mlrs-py",
 ]
 
+# The vendored safetensors fork (see `[patch.crates-io]` below) is NOT a
+# workspace member: it is third-party code that must keep building exactly as it
+# does upstream, not pick up this workspace's profiles, lints or feature
+# unification. Excluding it also keeps `cargo test --workspace` from running
+# safetensors' own suite on every mlrs run — `cargo test --manifest-path
+# third_party/safetensors/Cargo.toml` runs it deliberately.
+exclude = ["third_party/safetensors"]
+
+# safetensors 0.8.0 + ONE patch: the `__metadata__` map is a `BTreeMap` rather
+# than a `HashMap`, so a saved model is a deterministic function of its
+# contents.
+#
+# Upstream serializes `__metadata__` straight out of a `std::collections::HashMap`
+# (`Metadata::serialize` -> `map.serialize_entry("__metadata__", metadata)`),
+# and `HashMap`'s iteration order comes from a randomly seeded hasher. Tensor
+# entries are emitted through an index map and stay ordered, so the tensor
+# payload is already stable — but the metadata keys shuffle between runs, which
+# means saving the SAME model twice produces different bytes. That breaks
+# content-addressing, deduplication, and byte-level diffing of model files.
+#
+# It cannot be worked around by a caller: `serialize` / `serialize_to_file` take
+# the `HashMap` by value in their signatures, so there is no way to substitute
+# an ordered map. Hence a patch rather than a local shim.
+#
+# `third_party/safetensors/README.md` carries the exact diff and the upstream
+# status. Drop this block once the change lands in a published release.
+#
+# NOTE: `[patch]` is not inherited by downstream consumers of a published crate.
+# Anything depending on mlrs from crates.io would resolve stock safetensors and
+# lose determinism again; the mlrs wheels are built from this workspace, so they
+# get the fix.
+[patch.crates-io]
+safetensors = { path = "third_party/safetensors" }
+
 # Single source of truth for shared dependency versions (D-10: track latest).
 # Verified latest on crates.io 2026-06-11 via `cargo search`.
 [workspace.dependencies]
@@ -63,3 +97,15 @@ npyz = { version = "0.9", features = ["npz"] }
 # Logging: dtype/backend selection (Criterion 4) and pool counters (D-05).
 log = "0.4"
 env_logger = "0.11"
+
+# safetensors: the on-disk model-persistence container (NB-PERSIST prototype).
+# Chosen over serde/bincode because the payload is almost entirely large numeric
+# arrays: safetensors stores them as a raw little-endian blob behind an 8-byte
+# length + JSON header, so a load is a `&[u8]` -> `&[F]` reinterpret with NO
+# per-element decode, the file carries an explicit dtype tag (an f32-fitted model
+# stays f32 on disk — half the bytes), and the result is readable by
+# `safetensors.numpy.load_file` from Python without any mlrs code. It also has NO
+# code-execution surface, unlike the pickle format sklearn persists through.
+# `default-features = false` would drop `std`, which is what provides the
+# streaming `serialize_to_file` writer, so the default `std` feature stays on.
+safetensors = "0.8"

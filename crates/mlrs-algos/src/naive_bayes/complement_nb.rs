@@ -26,6 +26,7 @@
 //! Tests live in `crates/mlrs-algos/tests/complement_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -45,6 +46,12 @@ use crate::naive_bayes::multinomial_nb::{
 use crate::naive_bayes::nb_common::{
     argmin_decode, class_grouped_stats_host, log_sum_exp_normalize, ClassGroupedStats,
     HostScanCheck, StatsRequest, non_negative_x_error,
+};
+// NB-PERSIST: the safetensors container. The fitted state is the shared discrete
+// core plus the `norm` provenance scalar.
+use crate::naive_bayes::nb_persist::{
+    read_discrete_core, AlignedBytes, DiscreteCoreRef, LoadModel, NbFile, NbWriter, PersistError,
+    SaveModel,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -121,6 +128,86 @@ where
         self.feature_log_prob_
             .as_ref()
             .map(|t| t.to_host(pool).iter().map(|&v| host_to_f64(v)).collect())
+    }
+}
+
+/// The `estimator` discriminator written into every `ComplementNB` model file
+/// (see [`nb_persist`](crate::naive_bayes::nb_persist)).
+const PERSIST_TAG: &str = "complement_nb";
+
+impl<F> SaveModel for ComplementNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// The shared discrete core plus one scalar: `norm`, which selects the
+    /// second L1 normalization of the complement weights. `norm` is baked into
+    /// the fitted `feature_log_prob_` already, so it is stored as provenance —
+    /// the same reason `alpha` and `force_alpha` are.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let feature_log_prob = self
+            .feature_log_prob_
+            .as_ref()
+            .ok_or_else(|| absent("feature_log_prob_"))?
+            .to_host(pool);
+        let class_log_prior = self
+            .class_log_prior_
+            .as_deref()
+            .ok_or_else(|| absent("class_log_prior_"))?;
+
+        let mut w = NbWriter::new(PERSIST_TAG);
+        w.scalar_bool("param:norm", self.norm);
+        DiscreteCoreRef {
+            matrix_name: "feature_log_prob_",
+            alpha: self.alpha,
+            force_alpha: self.force_alpha,
+            fit_prior: self.fit_prior,
+            class_prior: self.class_prior.as_deref(),
+            classes: &self.classes_,
+            class_log_prior,
+            feature_log_prob: &feature_log_prob,
+            n_features: self.n_features,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for ComplementNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `feature_log_prob_` to
+    /// `pool`.
+    ///
+    /// ```ignore
+    /// let clf: ComplementNB<f32, Fitted> = ComplementNB::load(&mut pool, path)?;
+    /// ```
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<ComplementNB<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NbFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_discrete_core::<F>(&file, "feature_log_prob_")?;
+
+        Ok(ComplementNB {
+            alpha: core.alpha,
+            force_alpha: core.force_alpha,
+            fit_prior: core.fit_prior,
+            class_prior: core.class_prior,
+            norm: file.scalar_bool("param:norm")?,
+            classes_: core.classes,
+            n_features: core.n_features,
+            feature_log_prob_: Some(DeviceArray::from_host(pool, &core.feature_log_prob)),
+            class_log_prior_: Some(core.class_log_prior),
+            _state: PhantomData,
+        })
     }
 }
 

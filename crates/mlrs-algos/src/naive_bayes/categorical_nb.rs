@@ -9,7 +9,7 @@
 //! `multinomial_nb.rs` (discrete builder shape) + the `BandwidthSpec` enum
 //! precedent from `density/kernel_density.rs`. SEPARATE struct (D-03).
 //!
-//! `feature_log_prob_` is a RAGGED `Vec<Vec<f64>>` (one matrix per feature,
+//! `feature_log_prob_` is RAGGED (one `n_classes × n_categories_[j]` matrix per
 //! variable category count — Pitfall 7), NOT a single tensor; the non-negative-
 //! integer input validation and the predict-time category-index guard live at
 //! `fit` / `predict` (data-DEPENDENT — [`AlgoError::InvalidCategoricalInput`]),
@@ -28,6 +28,7 @@
 //! Tests live in `crates/mlrs-algos/tests/categorical_nb_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -45,6 +46,13 @@ use crate::naive_bayes::multinomial_nb::{
 use crate::naive_bayes::nb_common::{
     argmax_decode, chunk_rows, host_workers, log_sum_exp_normalize,
     PAR_TABLE_MAX_ENTRIES,
+};
+// NB-PERSIST: the safetensors container. This estimator is the ragged case —
+// `feature_log_prob_` is one matrix PER FEATURE, held (and stored) flat behind
+// the `n_categories_` extent table.
+use crate::naive_bayes::nb_persist::{
+    as_f64, as_i64, as_usizes, expect_len, ragged_block_offsets, ragged_payload_len, shape_1d,
+    AlignedBytes, LoadModel, NbFile, NbWriter, PersistError, SaveModel, TensorRef,
 };
 // Phase 16 (D-02 shape-B trait-swap): builder UNTOUCHED; `<F, S = Unfit>` state
 // param + migration to the consuming-self `typestate` surface. fit/predict math
@@ -74,8 +82,9 @@ pub enum MinCategories {
 
 /// Categorical Naive Bayes (NB-05). Construct via [`CategoricalNB::builder`],
 /// then [`Fit::fit`] + (Wave-1) the predict surface. Fitted `feature_log_prob_`
-/// is a ragged host `Vec<Vec<f64>>` (one matrix per feature); `class_log_prior_`
-/// is host f64 (D-03), `None` until `fit`.
+/// is a ragged host stack (one `n_classes × n_categories_[j]` matrix per
+/// feature) held as ONE flat buffer; `class_log_prior_` is host f64 (D-03),
+/// `None` until `fit`.
 pub struct CategoricalNB<F, S = Unfit> {
     /// Additive smoothing (D-02 default `1.0`).
     alpha: f64,
@@ -97,10 +106,24 @@ pub struct CategoricalNB<F, S = Unfit> {
     /// Per-feature category counts learned at `fit` (length `n_features`), `None`
     /// until `fit`.
     n_categories_: Option<Vec<usize>>,
-    /// Ragged fitted `feature_log_prob_`: `feature_log_prob_[j]` is the
-    /// `n_classes × n_categories_[j]` log-probability matrix for feature `j`
-    /// (Pitfall 7). `None` until `fit`.
-    feature_log_prob_: Option<Vec<Vec<f64>>>,
+    /// Ragged fitted `feature_log_prob_`, held as ONE flat buffer: feature
+    /// `j`'s `n_classes × n_categories_[j]` row-major log-probability matrix
+    /// (Pitfall 7) occupies `offsets[j]..offsets[j + 1]`, where `offsets` is
+    /// [`ragged_block_offsets`] over `n_categories_`. `None` until `fit`.
+    ///
+    /// Flat rather than the `Vec<Vec<f64>>` this used to be, for three reasons
+    /// that all point the same way:
+    ///
+    /// * the fit allocates ONCE instead of once per feature;
+    /// * `save` writes the buffer straight out and `load` fills a single
+    ///   allocation — the on-disk layout is this layout, so neither direction
+    ///   scatters or gathers;
+    /// * predict already indexed `flp_j[c * n_cat_j + k]`, so the inner loop is
+    ///   unchanged apart from adding the block base.
+    ///
+    /// The per-feature view is still available through
+    /// [`CategoricalNB::feature_log_prob_block`].
+    feature_log_prob_: Option<Vec<f64>>,
     /// Per-class log-prior (host f64), `None` until `fit`.
     class_log_prior_: Option<Vec<f64>>,
     /// Per-class sample counts (host f64, length `n_classes`), `None` until
@@ -158,11 +181,273 @@ where
         self.n_categories_.as_deref()
     }
 
-    /// The ragged fitted `feature_log_prob_` (`feature_log_prob_[j]` is the
-    /// `n_classes × n_categories_[j]` row-major log-prob matrix for feature `j`),
-    /// `None` until `fit`.
-    pub fn feature_log_prob(&self) -> Option<&[Vec<f64>]> {
+    /// The ragged fitted `feature_log_prob_` as ONE flat buffer — feature `j`'s
+    /// `n_classes × n_categories_[j]` row-major block occupies
+    /// `offsets[j]..offsets[j + 1]` for `offsets =
+    /// ragged_block_offsets(n_classes, n_categories_)`. `None` until `fit`.
+    ///
+    /// [`CategoricalNB::feature_log_prob_block`] slices out one feature's block
+    /// without the caller redoing that arithmetic.
+    pub fn feature_log_prob(&self) -> Option<&[f64]> {
         self.feature_log_prob_.as_deref()
+    }
+
+    /// Feature `j`'s `n_classes × n_categories_[j]` row-major log-prob block,
+    /// or `None` if unfitted or `j` is out of range.
+    ///
+    /// The per-feature view of [`CategoricalNB::feature_log_prob`]. Computing
+    /// the offsets costs a prefix sum over `n_categories_`, so a caller walking
+    /// every feature is better served by
+    /// [`ragged_block_offsets`] once plus direct slicing; this is the
+    /// convenience for reaching a single block.
+    pub fn feature_log_prob_block(&self, j: usize) -> Option<&[f64]> {
+        let flat = self.feature_log_prob_.as_deref()?;
+        let extents = self.n_categories_.as_deref()?;
+        if j >= extents.len() {
+            return None;
+        }
+        let offsets = ragged_block_offsets(self.classes_.len(), extents);
+        flat.get(offsets[j]..offsets[j + 1])
+    }
+}
+
+/// The `estimator` discriminator written into every `CategoricalNB` model file
+/// (see [`nb_persist`](crate::naive_bayes::nb_persist)).
+const PERSIST_TAG: &str = "categorical_nb";
+
+/// `__metadata__` key carrying the [`MinCategories`] variant tag — `"infer"`,
+/// `"uniform:<n>"`, or `"per_feature"`, the last paired with a
+/// `param:min_categories` `U64` tensor holding the vector. One key per concept:
+/// the tag says which shape to expect, and only the vector form costs a tensor.
+const KEY_MIN_CATEGORIES: &str = "param:min_categories";
+
+impl<F> SaveModel for CategoricalNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `feature_log_prob_` | `F64` | `[n_classes · Σⱼ n_categories_[j]]` |
+    /// | `n_categories_` | `U64` | `[n_features]` |
+    /// | `classes_` | `I64` | `[n_classes]` |
+    /// | `class_count_` | `F64` | `[n_classes]` |
+    /// | `class_log_prior_` | `F64` | `[n_classes]` |
+    /// | `param:class_prior` (optional) | `F64` | `[n_classes]` |
+    /// | `param:min_categories` (optional) | `U64` | `[n_features]` |
+    /// | `param:alpha`, `param:force_alpha`, `param:fit_prior`, `param:min_categories` | `__metadata__` scalars | — |
+    ///
+    /// `feature_log_prob_` is the ragged one — a per-feature stack of
+    /// `n_classes × n_categories_[j]` matrices — stored **flat**, with
+    /// `n_categories_` doing double duty as the block-extent table. That is
+    /// what keeps the ragged encoding free: no padding, and no offsets tensor
+    /// beyond a fitted attribute the file needed regardless.
+    ///
+    /// This path performs **no copy at all**: the estimator holds that same flat
+    /// layout, so the fitted buffer is handed to the writer by reference and
+    /// streamed straight to disk.
+    ///
+    /// `pool` is unused — `CategoricalNB` holds no device buffer, so there is
+    /// nothing to read back. It is in the signature because [`SaveModel`] is one
+    /// uniform surface across all five variants, the same way
+    /// [`Fit`](crate::typestate::Fit) takes a pool for every estimator.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let flat = self
+            .feature_log_prob_
+            .as_deref()
+            .ok_or_else(|| absent("feature_log_prob_"))?;
+        let n_categories = self
+            .n_categories_
+            .as_deref()
+            .ok_or_else(|| absent("n_categories_"))?;
+        let class_count = self
+            .class_count_
+            .as_deref()
+            .ok_or_else(|| absent("class_count_"))?;
+        let class_log_prior = self
+            .class_log_prior_
+            .as_deref()
+            .ok_or_else(|| absent("class_log_prior_"))?;
+
+        let n_classes = self.classes_.len();
+        let n_features = self.n_features;
+
+        // `n_categories_` is the ragged descriptor, so a disagreement with
+        // `n_features` — or with the buffer the extents are supposed to
+        // describe — would silently truncate or overrun the blocks at load.
+        expect_len("n_categories_", n_categories.len(), n_features, "entries")?;
+        expect_len(
+            "feature_log_prob_",
+            flat.len(),
+            ragged_payload_len(n_classes, n_categories, "feature_log_prob_")?,
+            "elements",
+        )?;
+
+        // `usize` is 4 bytes on a 32-bit host and 8 on a 64-bit one, so the
+        // extents widen explicitly rather than being written raw — otherwise
+        // the file would only load back on the architecture that wrote it.
+        let extents: Vec<u64> = n_categories.iter().map(|&n| n as u64).collect();
+        let min_cat_vector: Option<Vec<u64>> = match &self.min_categories {
+            MinCategories::PerFeature(v) => Some(v.iter().map(|&n| n as u64).collect()),
+            MinCategories::Infer | MinCategories::Uniform(_) => None,
+        };
+
+        let mut w = NbWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:alpha", self.alpha);
+        w.scalar_bool("param:force_alpha", self.force_alpha);
+        w.scalar_bool("param:fit_prior", self.fit_prior);
+        w.scalar_str(
+            KEY_MIN_CATEGORIES,
+            &match &self.min_categories {
+                MinCategories::Infer => "infer".to_string(),
+                MinCategories::Uniform(n) => format!("uniform:{n}"),
+                MinCategories::PerFeature(_) => "per_feature".to_string(),
+            },
+        );
+
+        // Borrowed straight from the fitted state — no flatten, no repack.
+        w.tensor(
+            "feature_log_prob_",
+            TensorRef::f64s(flat, vec![flat.len()])?,
+        );
+        w.tensor(
+            "n_categories_",
+            TensorRef::u64s(&extents, vec![n_features])?,
+        );
+        w.tensor(
+            "classes_",
+            TensorRef::i64s(&self.classes_, vec![n_classes])?,
+        );
+        w.tensor(
+            "class_count_",
+            TensorRef::f64s(class_count, vec![n_classes])?,
+        );
+        w.tensor(
+            "class_log_prior_",
+            TensorRef::f64s(class_log_prior, vec![n_classes])?,
+        );
+        if let Some(prior) = self.class_prior.as_deref() {
+            w.tensor(
+                "param:class_prior",
+                TensorRef::f64s(prior, vec![prior.len()])?,
+            );
+        }
+        if let Some(v) = min_cat_vector.as_deref() {
+            w.tensor(KEY_MIN_CATEGORIES, TensorRef::u64s(v, vec![v.len()])?);
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for CategoricalNB<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`.
+    ///
+    /// `Fitted` by construction, so the state parameter is named at the call
+    /// site:
+    ///
+    /// ```ignore
+    /// let clf: CategoricalNB<f64, Fitted> = CategoricalNB::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` is unconstrained by the file: `CategoricalNB` keeps its fitted
+    /// tables in host `f64` regardless of the element type it predicts over, so
+    /// nothing here depends on `F`'s width. `pool` is unused for the same
+    /// reason [`SaveModel::save`] ignores it.
+    ///
+    /// The stored layout IS the in-memory layout, so this fills exactly one
+    /// allocation — no per-feature `Vec`s to build.
+    ///
+    /// The header is untrusted, so [`ragged_payload_len`] recomputes the length
+    /// the extents imply with checked arithmetic and the payload is measured
+    /// against it: a tampered `n_categories_` yields a typed error here rather
+    /// than an out-of-range slice at predict time.
+    fn load(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<CategoricalNB<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NbFile::parse(&raw, PERSIST_TAG)?;
+
+        let classes_v = file.tensor("classes_")?;
+        let n_classes = shape_1d(&classes_v, "classes_")?;
+
+        let count_v = file.tensor("class_count_")?;
+        let prior_v = file.tensor("class_log_prior_")?;
+        for (name, view) in [("class_count_", &count_v), ("class_log_prior_", &prior_v)] {
+            expect_len(name, shape_1d(view, name)?, n_classes, "entries")?;
+        }
+
+        let extents_v = file.tensor("n_categories_")?;
+        let n_features = shape_1d(&extents_v, "n_categories_")?;
+        let n_categories = as_usizes(&extents_v, "n_categories_")?;
+
+        let flat_v = file.tensor("feature_log_prob_")?;
+        expect_len(
+            "feature_log_prob_",
+            shape_1d(&flat_v, "feature_log_prob_")?,
+            ragged_payload_len(n_classes, &n_categories, "feature_log_prob_")?,
+            "elements",
+        )?;
+        // One allocation. `as_f64` borrows the file buffer, and `into_owned`
+        // copies it once into the estimator — the minimum, since the file
+        // buffer is dropped when this returns.
+        let feature_log_prob_ = as_f64(&flat_v, "feature_log_prob_")?.into_owned();
+
+        let class_prior = match file.tensor_opt("param:class_prior") {
+            None => None,
+            Some(view) => {
+                let len = shape_1d(&view, "param:class_prior")?;
+                expect_len("param:class_prior", len, n_classes, "entries")?;
+                Some(as_f64(&view, "param:class_prior")?.into_owned())
+            }
+        };
+
+        let tag = file.scalar_str(KEY_MIN_CATEGORIES)?;
+        let min_categories = match tag {
+            "infer" => MinCategories::Infer,
+            "per_feature" => {
+                let view =
+                    file.tensor_opt(KEY_MIN_CATEGORIES)
+                        .ok_or(PersistError::MissingTensor {
+                            tensor: "param:min_categories",
+                        })?;
+                let len = shape_1d(&view, "param:min_categories")?;
+                expect_len("param:min_categories", len, n_features, "entries")?;
+                MinCategories::PerFeature(as_usizes(&view, "param:min_categories")?)
+            }
+            other => match other.strip_prefix("uniform:").and_then(|n| n.parse().ok()) {
+                Some(n) => MinCategories::Uniform(n),
+                None => {
+                    return Err(PersistError::BadMetadata {
+                        key: KEY_MIN_CATEGORIES,
+                    })
+                }
+            },
+        };
+
+        Ok(CategoricalNB {
+            alpha: file.scalar_f64("param:alpha")?,
+            force_alpha: file.scalar_bool("param:force_alpha")?,
+            fit_prior: file.scalar_bool("param:fit_prior")?,
+            class_prior,
+            min_categories,
+            classes_: as_i64(&classes_v, "classes_")?.into_owned(),
+            n_features,
+            n_categories_: Some(n_categories),
+            feature_log_prob_: Some(feature_log_prob_),
+            class_log_prior_: Some(as_f64(&prior_v, "class_log_prior_")?.into_owned()),
+            class_count_: Some(as_f64(&count_v, "class_count_")?.into_owned()),
+            _marker: std::marker::PhantomData,
+            _state: PhantomData,
+        })
     }
 }
 
@@ -667,20 +952,31 @@ where
         //     denominator smoothing is alpha · n_categories_j). The ragged
         //     per-feature matrices are sliced back out of the flat table. ---
         let alpha = self.alpha;
-        let mut feature_log_prob_: Vec<Vec<f64>> = Vec::with_capacity(n_features);
+        // ONE allocation for the whole ragged stack, laid out block-major:
+        // feature `j`'s `n_classes × n_cat_j` matrix lands contiguously at
+        // `base`. This is both the in-memory and the on-disk layout, so
+        // `SaveModel::save` writes it out with no repacking.
+        //
+        // Note the two layouts in play: the `counts` scratch is CLASS-major
+        // over the concatenated category axis (`counts[c * total + off[j] + k]`)
+        // because the tabulation sweep writes it that way, while the fitted
+        // table is block-major (`[base + c * n_cat_j + k]`) because predict
+        // reads one feature's block at a time. The transpose happens here, once,
+        // as part of the smoothing pass that had to touch every element anyway.
+        let mut feature_log_prob_ = vec![0.0f64; n_classes * total];
+        let mut base = 0usize;
         for j in 0..n_features {
             let n_cat_j = n_categories_[j];
             let o = off[j];
-            let mut flp = vec![0.0f64; n_classes * n_cat_j];
             for c in 0..n_classes {
                 let denom = class_count_[c] + alpha * n_cat_j as f64;
                 let src = &counts[c * total + o..c * total + o + n_cat_j];
-                let dst = &mut flp[c * n_cat_j..(c + 1) * n_cat_j];
+                let dst = &mut feature_log_prob_[base + c * n_cat_j..base + (c + 1) * n_cat_j];
                 for (d, &count) in dst.iter_mut().zip(src.iter()) {
                     *d = ((count + alpha) / denom).ln();
                 }
             }
-            feature_log_prob_.push(flp);
+            base += n_classes * n_cat_j;
         }
 
         // --- class_log_prior_: supplied class_prior (length == n_classes) takes
@@ -803,13 +1099,19 @@ where
         let n_classes = self.classes_.len();
         let x_h = x.to_host(pool);
 
+        // The flat table's per-feature block bounds, computed ONCE for the whole
+        // predict rather than per (row, class) — the inner loop then indexes
+        // `flat[offsets[j] + c * n_cat_j + k]`, which is the same arithmetic the
+        // old `Vec<Vec<f64>>` did after its pointer chase.
+        let offsets = ragged_block_offsets(n_classes, n_categories);
+
         let mut jll = vec![0.0f64; n_query * n_classes];
         for r in 0..n_query {
             for c in 0..n_classes {
                 let mut acc = class_log_prior[c];
                 for j in 0..n_features {
                     let n_cat_j = n_categories[j];
-                    let flp_j = &feature_log_prob[j];
+                    let flp_j = &feature_log_prob[offsets[j]..offsets[j + 1]];
                     let xf = host_to_f64(x_h[r * n_features + j]);
                     // The same sklearn cast `fit` uses: `dtype="int"` TRUNCATES
                     // toward zero, then `check_non_negative` runs on the result

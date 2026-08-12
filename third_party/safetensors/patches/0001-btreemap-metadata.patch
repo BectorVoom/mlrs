@@ -1,0 +1,118 @@
+--- a/safetensors/src/lib.rs
++++ b/safetensors/src/lib.rs
+@@ -19,6 +19,7 @@
+     #[cfg(not(feature = "std"))]
+     mod no_stds {
+         pub use alloc::borrow::Cow;
++        pub use alloc::collections::BTreeMap;
+         pub use alloc::string::{String, ToString};
+         pub use alloc::vec::Vec;
+         pub use hashbrown::HashMap;
+@@ -26,7 +27,7 @@
+     #[cfg(feature = "std")]
+     mod stds {
+         pub use std::borrow::Cow;
+-        pub use std::collections::HashMap;
++        pub use std::collections::{BTreeMap, HashMap};
+         pub use std::string::{String, ToString};
+         pub use std::vec::Vec;
+     }
+--- a/safetensors/src/tensor.rs
++++ b/safetensors/src/tensor.rs
+@@ -1,5 +1,5 @@
+ //! Module Containing the most important structures
+-use crate::lib::{Cow, HashMap, String, ToString, Vec};
++use crate::lib::{BTreeMap, Cow, HashMap, String, ToString, Vec};
+ use crate::slice::{InvalidSlice, SliceIterator, TensorIndexer};
+ use core::fmt::Display;
+ use core::str::Utf8Error;
+@@ -217,7 +217,7 @@
+ 
+ fn prepare<S, V, I>(
+     data: I,
+-    data_info: Option<HashMap<String, String>>,
++    data_info: Option<BTreeMap<String, String>>,
+ ) -> Result<(PreparedData, Vec<V>), SafeTensorError>
+ where
+     S: AsRef<str> + Ord + Display,
+@@ -271,7 +271,7 @@
+     I: IntoIterator<Item = (S, V)>,
+ >(
+     data: I,
+-    data_info: Option<HashMap<String, String>>,
++    data_info: Option<BTreeMap<String, String>>,
+ ) -> Result<Vec<u8>, SafeTensorError> {
+     let (
+         PreparedData {
+@@ -347,7 +347,7 @@
+ #[cfg(feature = "std")]
+ pub fn serialize_to_file<S, V, I>(
+     data: I,
+-    data_info: Option<HashMap<String, String>>,
++    data_info: Option<BTreeMap<String, String>>,
+     filename: &std::path::Path,
+ ) -> Result<(), SafeTensorError>
+ where
+@@ -530,7 +530,7 @@
+ /// indexing into the raw byte-buffer array and how to interpret it.
+ #[derive(Debug, Clone)]
+ pub struct Metadata {
+-    metadata: Option<HashMap<String, String>>,
++    metadata: Option<BTreeMap<String, String>>,
+     tensors: Vec<TensorInfo>,
+     index_map: HashMap<String, usize>,
+ }
+@@ -540,7 +540,7 @@
+ struct HashMetadata {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     #[serde(rename = "__metadata__")]
+-    metadata: Option<HashMap<String, String>>,
++    metadata: Option<BTreeMap<String, String>>,
+     #[serde(flatten)]
+     tensors: HashMap<String, TensorInfo>,
+ }
+@@ -581,7 +581,7 @@
+             names[index] = name;
+         }
+ 
+-        let length = self.metadata.as_ref().map_or(0, HashMap::len);
++        let length = self.metadata.as_ref().map_or(0, BTreeMap::len);
+         let mut map = serializer.serialize_map(Some(self.tensors.len() + length))?;
+ 
+         if let Some(metadata) = &self.metadata {
+@@ -601,7 +601,7 @@
+     /// May fail if there is incorrect data in the Tensor Info.
+     /// Notably the tensors need to be ordered by increasing data_offsets.
+     pub fn new(
+-        metadata: Option<HashMap<String, String>>,
++        metadata: Option<BTreeMap<String, String>>,
+         tensors: Vec<(String, TensorInfo)>,
+     ) -> Result<Self, SafeTensorError> {
+         let mut index_map = HashMap::with_capacity(tensors.len());
+@@ -694,7 +694,7 @@
+     }
+ 
+     /// Gives back the tensor metadata
+-    pub fn metadata(&self) -> &Option<HashMap<String, String>> {
++    pub fn metadata(&self) -> &Option<BTreeMap<String, String>> {
+         &self.metadata
+     }
+ }
+@@ -1140,7 +1140,7 @@
+         );
+         let _parsed = SafeTensors::deserialize(&out).unwrap();
+ 
+-        let metadata: Option<HashMap<String, String>> = Some(
++        let metadata: Option<BTreeMap<String, String>> = Some(
+             [("framework".to_string(), "pt".to_string())]
+                 .into_iter()
+                 .collect(),
+@@ -1595,7 +1595,7 @@
+ 
+     #[test]
+     fn test_invalid_header_size_serialization() {
+-        let mut data_info = HashMap::<String, String>::new();
++        let mut data_info = BTreeMap::<String, String>::new();
+         let tensors: HashMap<String, TensorView> = HashMap::new();
+ 
+         // a char is 1 byte in utf-8, so we can just repeat 'a' to get large metadata
