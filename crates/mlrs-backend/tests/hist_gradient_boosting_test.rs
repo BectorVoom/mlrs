@@ -32,6 +32,7 @@
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -119,7 +120,7 @@ where
     let x_dev = upload::<F>(&mut pool, &xdata());
     let y_dev = upload::<F>(&mut pool, &ydata());
 
-    let model = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &params(1, 2, 0.5))
+    let model = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &params(1, 2, 0.5), Device::Auto)
         .expect("fit hand-oracle regressor");
 
     assert_eq!(model.n_classes(), 1);
@@ -204,7 +205,7 @@ where
     let x_dev = upload::<F>(&mut pool, &xdata());
     let y_dev = upload::<F>(&mut pool, &ydata());
 
-    let model = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &params(60, 3, 0.5))
+    let model = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &params(60, 3, 0.5), Device::Auto)
         .expect("fit convergence regressor");
     let pred = hgb_predict_reg::<F>(&mut pool, &model, &x_dev, (8, 2))
         .expect("predict")
@@ -230,7 +231,7 @@ where
     let x_dev = upload::<F>(&mut pool, &xdata());
     let y_idx: Vec<u32> = vec![0, 0, 0, 0, 1, 1, 1, 1];
 
-    let model = hgb_fit_class::<F>(&mut pool, &x_dev, (8, 2), &y_idx, 2, &params(30, 2, 0.3))
+    let model = hgb_fit_class::<F>(&mut pool, &x_dev, (8, 2), &y_idx, 2, &params(30, 2, 0.3), Device::Auto)
         .expect("fit binary classifier");
     assert_eq!(model.k(), 1, "binary uses ONE raw column");
     assert_eq!(model.n_classes(), 2);
@@ -270,7 +271,7 @@ where
     let x_dev = upload::<F>(&mut pool, &xdata());
     let y_idx: Vec<u32> = vec![0, 0, 0, 0, 1, 1, 2, 2];
 
-    let model = hgb_fit_class::<F>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params(30, 2, 0.3))
+    let model = hgb_fit_class::<F>(&mut pool, &x_dev, (8, 2), &y_idx, 3, &params(30, 2, 0.3), Device::Auto)
         .expect("fit multiclass classifier");
     assert_eq!(model.k(), 3, "multiclass uses n_classes raw columns");
 
@@ -316,8 +317,8 @@ where
     let y_dev = upload::<F>(&mut pool, &ydata());
 
     let p = params(10, 3, 0.1);
-    let m1 = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &p).expect("fit 1");
-    let m2 = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &p).expect("fit 2");
+    let m1 = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &p, Device::Auto).expect("fit 1");
+    let m2 = hgb_fit_reg::<F>(&mut pool, &x_dev, (8, 2), &y_dev, &p, Device::Auto).expect("fit 2");
     let p1 = hgb_predict_reg::<F>(&mut pool, &m1, &x_dev, (8, 2))
         .expect("predict 1")
         .to_host(&pool);
@@ -401,36 +402,36 @@ fn validation_rejects_bad_inputs() {
     let y_dev = upload::<f32>(&mut pool, &[1.0, 2.0, 3.0]);
     let ok = params(1, 2, 0.5);
 
-    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_dev, &ok).is_err());
+    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_dev, &ok, Device::Auto).is_err());
 
     let y_full = upload::<f32>(&mut pool, &ydata());
     let mut bad = ok;
     bad.max_iter = 0;
-    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad).is_err());
+    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad, Device::Auto).is_err());
     let mut bad = ok;
     bad.max_depth = 17;
-    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad).is_err());
+    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad, Device::Auto).is_err());
     let mut bad = ok;
     bad.n_bins = 1;
-    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad).is_err());
+    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad, Device::Auto).is_err());
     let mut bad = ok;
     bad.learning_rate = 0.0;
-    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad).is_err());
+    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad, Device::Auto).is_err());
     let mut bad = ok;
     bad.l2_regularization = -1.0;
-    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad).is_err());
+    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad, Device::Auto).is_err());
     let mut bad = ok;
     bad.min_samples_leaf = 0;
-    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad).is_err());
+    assert!(hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &bad, Device::Auto).is_err());
 
     // Class index out of range + a class absent from the dense index space.
-    assert!(hgb_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &[0, 0, 0, 0, 1, 1, 3, 1], 3, &ok)
+    assert!(hgb_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &[0, 0, 0, 0, 1, 1, 3, 1], 3, &ok, Device::Auto)
         .is_err());
-    assert!(hgb_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &[0, 0, 0, 0, 2, 2, 2, 2], 3, &ok)
+    assert!(hgb_fit_class::<f32>(&mut pool, &x_dev, (8, 2), &[0, 0, 0, 0, 2, 2, 2, 2], 3, &ok, Device::Auto)
         .is_err());
 
     // Predict geometry: wrong feature width.
-    let model = hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &ok).expect("fit");
+    let model = hgb_fit_reg::<f32>(&mut pool, &x_dev, (8, 2), &y_full, &ok, Device::Auto).expect("fit");
     let xq3 = upload::<f32>(&mut pool, &[0.1, 0.2, 0.3]);
     assert!(hgb_predict_reg::<f32>(&mut pool, &model, &xq3, (1, 3)).is_err());
 }

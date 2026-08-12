@@ -168,6 +168,21 @@ pub(super) const MID_COSINE: u32 = 4;
 /// `MLRS_KNN_HOST=1` forces the host arm on REGARDLESS of `tuned_arm_available`
 /// — that is exactly the A/B the caller's table was measured with;
 /// `MLRS_KNN_HOST=0` forces it off, restoring the pre-KNN-HOST dispatch.
+/// Can the host top-k arm run this query AT ALL, ignoring whether it should?
+///
+/// The CAPABILITY half of [`knn_host_applicable`], split out because `device`
+/// (DEVICE-PARAM-01) may override the perf half and must NOT override this one:
+/// the host arm indexes `k` into a length-`n_train` row, so `k > n_train` has
+/// no host implementation to force.
+///
+/// Note this is deliberately a SEPARATE predicate rather than a reordering of
+/// `knn_host_applicable`, whose `MLRS_KNN_HOST` early-return currently short-
+/// circuits ahead of the same conjunction. Reordering that would change what an
+/// existing A/B flag does; adding a predicate changes nothing for `Auto`.
+pub fn knn_host_possible(n_query: usize, n_train: usize, n_features: usize, k: usize) -> bool {
+    n_query > 0 && n_train > 0 && n_features > 0 && k >= 1 && k <= n_train
+}
+
 pub fn knn_host_applicable(
     n_query: usize,
     n_train: usize,

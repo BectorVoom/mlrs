@@ -141,6 +141,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gram_host::centered_gram_xty;
@@ -208,6 +209,13 @@ pub struct BayesianRidge<F, S = Unfit> {
     /// Print the convergence iteration to stderr, as sklearn prints it to
     /// stdout.
     verbose: bool,
+    /// Where to run the heavy phase (DEVICE-PARAM-01). `Auto` keeps the
+    /// `device_fit_preferred` heuristic and is the only value that consults the
+    /// `MLRS_BAYES_FIT_HOST` A/B flag.
+    device: Device,
+    /// The execution arm that ACTUALLY ran (`"cpu"` / `"gpu"`), `None` until
+    /// `fit` — see `Ridge::device` for why a preference must report itself.
+    device_: Option<&'static str>,
     /// Fitted coefficients (length `n_features`), device-resident.
     coef_: Option<DeviceArray<ActiveRuntime, F>>,
     /// Fitted intercept (length 1), device-resident.
@@ -273,6 +281,8 @@ where
             fit_intercept: true,
             copy_x: true,
             verbose: false,
+            device: Device::Auto,
+            device_: None,
             coef_: None,
             intercept_: None,
             alpha_: 0.0,
@@ -308,6 +318,7 @@ where
             lambda_init: self.lambda_init,
             compute_score: self.compute_score,
             fit_intercept: self.fit_intercept,
+            device: self.device,
             copy_x: self.copy_x,
             verbose: self.verbose,
         }
@@ -329,6 +340,7 @@ where
             && self.fit_intercept == other.fit_intercept
             && self.copy_x == other.copy_x
             && self.verbose == other.verbose
+            && self.device == other.device
     }
 
     /// Should `fit` take the host-slice ingress
@@ -352,7 +364,8 @@ where
     ///
     /// `shape` is `(n_samples, n_features)`.
     pub fn host_fit_applicable(&self, shape: (usize, usize)) -> bool {
-        !device_fit_preferred::<F>(shape.0, shape.1)
+        self.device
+            .prefers_host(|| !device_fit_preferred::<F>(shape.0, shape.1))
     }
 
     /// [`Fit::fit`] over HOST slices — the no-upload, no-launch ingress.
@@ -442,7 +455,7 @@ where
 
         self.finish_fit(
             pool, gram, xty, yty, y_var, sw_sum, x_mean, y_mean, n_samples, n_features, profile,
-            t_gram,
+            t_gram, "cpu",
         )
     }
 
@@ -468,6 +481,12 @@ where
         n_features: usize,
         profile: bool,
         t_gram: f64,
+        // The arm that formed the normal equations, threaded in rather than
+        // re-derived: this is the ONLY place a `Fitted` is constructed, so
+        // deriving it here would mean guessing at a decision two call sites
+        // above — including the two silent fallbacks the device path takes when
+        // the backend cannot accumulate in `f64` or the launch fails.
+        device_used: &'static str,
     ) -> Result<BayesianRidge<F, Fitted>, AlgoError> {
         let d = n_features;
         let lap = std::time::Instant::now();
@@ -553,6 +572,8 @@ where
             fit_intercept: self.fit_intercept,
             copy_x: self.copy_x,
             verbose: self.verbose,
+            device: self.device,
+            device_: Some(device_used),
             coef_: Some(upload_coef::<F>(pool, &fit.coef)),
             intercept_: Some(DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)])),
             alpha_: fit.alpha,
@@ -1142,6 +1163,7 @@ pub struct BayesianRidgeBuilder {
     fit_intercept: bool,
     copy_x: bool,
     verbose: bool,
+    device: Device,
 }
 
 impl Default for BayesianRidgeBuilder {
@@ -1224,6 +1246,15 @@ impl BayesianRidgeBuilder {
 
     /// Print the convergence iteration (sklearn's `verbose`; mlrs writes to
     /// stderr rather than stdout).
+    /// Pin the execution arm (DEVICE-PARAM-01). [`Device::Auto`] — the default
+    /// — keeps the `device_fit_preferred` heuristic; `Cpu`/`Gpu` override it.
+    /// The arm that actually formed the normal equations is reported by
+    /// [`BayesianRidge::device`] after `fit`.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     pub fn verbose(mut self, v: bool) -> Self {
         self.verbose = v;
         self
@@ -1308,6 +1339,8 @@ impl BayesianRidgeBuilder {
             fit_intercept: self.fit_intercept,
             copy_x: self.copy_x,
             verbose: self.verbose,
+            device: self.device,
+            device_: None,
             coef_: None,
             intercept_: None,
             alpha_: 0.0,
@@ -1372,6 +1405,18 @@ where
     }
 
     /// sklearn's `n_iter_`: evidence iterations actually run.
+    /// The execution arm that ACTUALLY formed the normal equations, `"cpu"` or
+    /// `"gpu"` (DEVICE-PARAM-01).
+    ///
+    /// Not necessarily the `device` that was asked for: the device arm falls
+    /// back to the host one when the backend cannot accumulate in `f64`
+    /// (`device_gram_applicable`) or the launch fails, and this reports the
+    /// fallback rather than the intent.
+    pub fn device(&self) -> &'static str {
+        self.device_
+            .expect("device_ is Some by construction on BayesianRidge<F, Fitted>")
+    }
+
     pub fn n_iter(&self) -> usize {
         self.n_iter_
     }
@@ -1718,7 +1763,7 @@ where
 
         self.finish_fit(
             pool, gram, xty, yty, y_var, sw_sum, x_mean, y_mean, n_samples, n_features, profile,
-            t_gram,
+            t_gram, "gpu",
         )
     }
 }

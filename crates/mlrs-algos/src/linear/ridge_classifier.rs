@@ -151,6 +151,7 @@ use std::sync::OnceLock;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::cholesky::{cholesky_solve_reg, CHOLESKY_MAX_DIM};
@@ -217,6 +218,9 @@ pub struct RidgeClassifier<F, S = Unfit> {
     positive: bool,
     /// Seed for the `sag`/`saga` sampling order (delegation arm only).
     random_state: Option<u64>,
+    /// Where to run the heavy phase (DEVICE-PARAM-01). Covers BOTH fit and
+    /// predict — see `device_predict_applicable`.
+    device: Device,
     /// The DISTINCT sorted training labels (CR-02). Empty until `fit`.
     classes_: Vec<i64>,
     /// `1` for a binary fit, `classes_.len()` for multiclass — the number of
@@ -257,6 +261,9 @@ pub struct RidgeClassifier<F, S = Unfit> {
     /// target column because the fallback depends only on the shared `X`
     /// Gram, never on which target column is being solved.
     solver_: Option<RidgeSolver>,
+    /// The execution arm that ACTUALLY ran (`"cpu"` / `"gpu"`), `None` until
+    /// `fit`.
+    device_: Option<&'static str>,
     /// Host mirror of `(coef_, intercept_)`, both flattened row-major, for the
     /// no-upload `predict`/`decision_function` host ingress (the [`Ridge`]
     /// `HostMirror` idiom, generalized to `n_targets_ > 1`). Empty until the
@@ -286,6 +293,7 @@ where
             solver: RidgeSolver::Auto,
             positive: false,
             random_state: None,
+            device: Device::Auto,
             classes_: Vec::new(),
             n_targets_: 0,
             n_features_: 0,
@@ -295,6 +303,7 @@ where
             intercept_: None,
             n_iter_: None,
             solver_: None,
+            device_: None,
             predict_mirror: OnceLock::new(),
             _state: PhantomData,
         }
@@ -333,6 +342,7 @@ where
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
         }
     }
 
@@ -343,10 +353,15 @@ where
     /// formation belongs on the host ([`gram_host_applicable`] — the cpu
     /// backend, or below the fixed dispatch-cost floor on any backend).
     pub fn host_fit_applicable(&self, shape: (usize, usize)) -> bool {
+        // `matches!` is a CAPABILITY gate — only the normal-equations solvers
+        // have a host-slice ingress — so `device = Cpu` cannot conjure one for
+        // the rest. Those keep the device route and say so through `device_`.
         matches!(
             self.solver.resolve(self.positive),
             RidgeSolver::Cholesky | RidgeSolver::Lbfgs
-        ) && gram_host_applicable(shape.0, shape.1)
+        ) && self
+            .device
+            .prefers_host(|| gram_host_applicable(shape.0, shape.1))
     }
 
     /// The no-upload HOST fit arm — the fast path this estimator exists for.
@@ -462,6 +477,7 @@ where
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
             classes_,
             n_targets_: n_targets,
             n_features_: n_features,
@@ -471,6 +487,8 @@ where
             intercept_: Some(DeviceArray::from_host(pool, &intercept_f)),
             n_iter_: None,
             solver_: Some(solver_used),
+            // Reached only through `host_fit_applicable`: no upload, no launch.
+            device_: Some("cpu"),
             predict_mirror: OnceLock::new(),
             _state: PhantomData,
         })
@@ -623,6 +641,7 @@ where
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
             classes_,
             n_targets_: n_targets,
             n_features_: n_features,
@@ -632,6 +651,8 @@ where
             intercept_: Some(DeviceArray::from_host(pool, &intercept_flat)),
             n_iter_,
             solver_: solver_used,
+            // The device ingress: `x` arrived as a `DeviceArray`.
+            device_: Some("gpu"),
             predict_mirror: OnceLock::new(),
             _state: PhantomData,
         })
@@ -806,6 +827,7 @@ where
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
             classes_,
             n_targets_: k,
             n_features_: d,
@@ -817,6 +839,7 @@ where
             // (the module-doc table in `ridge.rs`).
             n_iter_: None,
             solver_: Some(solver_used),
+            device_: Some("gpu"),
             predict_mirror: OnceLock::new(),
             _state: PhantomData,
         })
@@ -1063,6 +1086,7 @@ pub struct RidgeClassifierBuilder {
     solver: RidgeSolver,
     positive: bool,
     random_state: Option<u64>,
+    device: Device,
 }
 
 impl Default for RidgeClassifierBuilder {
@@ -1079,6 +1103,15 @@ impl RidgeClassifierBuilder {
     }
 
     /// Set whether to center `X`/`Y` and recover a per-target bias term.
+    /// Pin the execution arm (DEVICE-PARAM-01). Covers BOTH `fit` and the
+    /// host-ingress `predict`; [`Device::Auto`] keeps the existing heuristics
+    /// (and their `MLRS_*` A/B flags). The arm that ran is reported by
+    /// [`RidgeClassifier::device`].
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     pub fn fit_intercept(mut self, v: bool) -> Self {
         self.fit_intercept = v;
         self
@@ -1179,6 +1212,7 @@ impl RidgeClassifierBuilder {
             solver: self.solver,
             positive: self.positive,
             random_state: self.random_state,
+            device: self.device,
             classes_: Vec::new(),
             n_targets_: 0,
             n_features_: 0,
@@ -1188,6 +1222,7 @@ impl RidgeClassifierBuilder {
             intercept_: None,
             n_iter_: None,
             solver_: None,
+            device_: None,
             predict_mirror: OnceLock::new(),
             _state: PhantomData,
         })
@@ -1231,6 +1266,14 @@ where
     }
 
     /// sklearn's `solver_` — the solver that ACTUALLY ran.
+    /// The execution arm that ACTUALLY ran, `"cpu"` or `"gpu"`
+    /// (DEVICE-PARAM-01). A preference the configuration cannot honour — a
+    /// solver with no host-slice ingress — shows up here rather than silently.
+    pub fn device(&self) -> &'static str {
+        self.device_
+            .expect("device_ is Some by construction on RidgeClassifier<F, Fitted>")
+    }
+
     pub fn solver(&self) -> RidgeSolver {
         self.solver_
             .expect("solver_ is Some by construction on RidgeClassifier<F, Fitted>")
@@ -1470,20 +1513,26 @@ where
     /// device-resident has no upload left to amortize, so the gate only
     /// concerns callers whose query starts on the host.
     pub fn device_predict_applicable(&self) -> bool {
-        match mlrs_backend::abflag::var("MLRS_RIDGECLF_PREDICT_DEVICE").as_deref() {
-            Some("0") => return false,
-            Some(_) => return true,
-            None => {}
-        }
-        #[cfg(feature = "cpu")]
-        {
-            false
-        }
-        #[cfg(not(feature = "cpu"))]
-        {
-            self.n_targets_ >= RIDGECLF_DEVICE_PREDICT_MIN_TARGETS
-                && self.n_features_ <= RIDGECLF_DEVICE_PREDICT_MAX_FEATURES
-        }
+        // `device` covers PREDICT as well as fit: a caller who pinned `"cpu"`
+        // to avoid an upload means it for the query matrix too, and splitting
+        // the parameter across the two phases would be a surprise. `Auto` keeps
+        // the original abflag-then-shape ladder verbatim.
+        self.device.prefers_device(|| {
+            match mlrs_backend::abflag::var("MLRS_RIDGECLF_PREDICT_DEVICE").as_deref() {
+                Some("0") => return false,
+                Some(_) => return true,
+                None => {}
+            }
+            #[cfg(feature = "cpu")]
+            {
+                false
+            }
+            #[cfg(not(feature = "cpu"))]
+            {
+                self.n_targets_ >= RIDGECLF_DEVICE_PREDICT_MIN_TARGETS
+                    && self.n_features_ <= RIDGECLF_DEVICE_PREDICT_MAX_FEATURES
+            }
+        })
     }
 }
 

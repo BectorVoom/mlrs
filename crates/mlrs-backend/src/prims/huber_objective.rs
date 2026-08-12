@@ -155,6 +155,7 @@ use mlrs_kernels::huber::{
 use crate::device_array::DeviceArray;
 use crate::prims::host_pool::{Shared, WorkerPool};
 use crate::prims::host_simd::avx2_available;
+use crate::device::Device;
 use crate::pool::BufferPool;
 use crate::runtime::ActiveRuntime;
 
@@ -195,8 +196,8 @@ pub struct HuberEval {
 /// Takes the geometry because the arm is now chosen per fit rather than per
 /// build ([`HuberArm`]): a small fit on a GPU backend runs on the host and
 /// wants the borrow, a large one runs on the device and wants the upload.
-pub fn huber_host_ingress_preferred(n: usize, d: usize) -> bool {
-    !huber_device_applicable(n, d)
+pub fn huber_host_ingress_preferred(n: usize, d: usize, device: Device) -> bool {
+    !huber_device_possible() || device.prefers_host(|| !huber_device_applicable(n, d))
 }
 
 /// Whether an `n × d` Huber fit should run on the DEVICE engine rather than the
@@ -225,8 +226,24 @@ pub fn huber_host_ingress_preferred(n: usize, d: usize) -> bool {
 /// with the problem — while the host arm's cost is proportional to `n·d` from
 /// the first row. Below the crossover the host pass finishes the entire fit in
 /// the time the device spends on its first few launches.
+/// Whether this backend can RUN the device engine at all — a capability, not a
+/// preference.
+///
+/// The cpu backend cannot: `mlrs_kernels::huber::huber_margin_rows` is a
+/// branchy per-row reduction, and cubecl-cpu's MLIR pipeline aborts lowering it
+/// with `operation with block successors must terminate its parent block`,
+/// which panics the compiler thread rather than returning an error.
+///
+/// This is split out from [`huber_device_applicable`] so `device="gpu"` can
+/// override the PERF half of that gate without overriding this one. A caller
+/// that asks for the device arm here does not get a compiler crash — it gets
+/// the host arm, and the unhonoured preference is visible rather than faked.
+pub fn huber_device_possible() -> bool {
+    crate::capability::active_backend_name() != "cpu"
+}
+
 pub fn huber_device_applicable(n: usize, d: usize) -> bool {
-    if crate::capability::active_backend_name() == "cpu" {
+    if !huber_device_possible() {
         return false;
     }
     match crate::abflag::var("MLRS_HUBER_ENGINE").as_deref() {
@@ -468,6 +485,7 @@ where
         targets: Vec<f64>,
         weights: Option<Vec<f64>>,
         fit_intercept: bool,
+        device: Device,
     ) -> Result<Self, PrimError> {
         if n == 0 || d == 0 || n.checked_mul(d).map(|v| v != x.len()).unwrap_or(true) {
             return Err(PrimError::ShapeMismatch {
@@ -501,7 +519,12 @@ where
             None => n as f64,
         };
 
-        let arm = if huber_device_applicable(n, d) {
+        // Preference over the perf gate; `huber_device_applicable`'s own
+        // capability checks (kernel caps, f64 support) stay inside it, so a
+        // `Gpu` preference cannot force an arm the backend cannot compile.
+        let arm = if huber_device_possible()
+            && device.prefers_device(|| huber_device_applicable(n, d))
+        {
             // WR-03: a dimension that does not fit the kernel-launch `u32`
             // would truncate into an out-of-bounds device read.
             guard_u32("n", n)?;
@@ -556,6 +579,14 @@ where
 
     /// The augmented weight length the caller's `w` must have (`n_features + 1`
     /// when fitting an intercept).
+    /// The arm this objective actually built — `"cpu"` or `"gpu"`.
+    ///
+    /// Read off the constructed engine, not re-derived from the gate, so it
+    /// cannot describe an arm the solve did not take.
+    pub fn arm_name(&self) -> &'static str {
+        Device::resolved_name(matches!(self.arm, HuberArm::Host { .. }))
+    }
+
     pub fn d_aug(&self) -> usize {
         self.d_aug
     }

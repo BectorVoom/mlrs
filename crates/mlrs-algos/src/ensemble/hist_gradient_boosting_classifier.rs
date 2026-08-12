@@ -30,6 +30,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::hist_gradient_boosting::{
@@ -62,6 +63,8 @@ where
     F: Float + CubeElement + Pod,
     S: State,
 {
+    /// Where to run the heavy phase (DEVICE-PARAM-01).
+    device: Device,
     max_iter: usize,
     learning_rate: f64,
     max_depth: usize,
@@ -88,6 +91,7 @@ where
     pub fn new() -> Self {
         Self {
             max_iter: HGB_CLF_DEFAULT_MAX_ITER,
+            device: Device::Auto,
             learning_rate: HGB_CLF_DEFAULT_LEARNING_RATE,
             max_depth: HGB_CLF_DEFAULT_MAX_DEPTH,
             n_bins: HGB_CLF_DEFAULT_N_BINS,
@@ -109,6 +113,7 @@ where
     pub fn into_builder(self) -> HistGradientBoostingClassifierBuilder {
         HistGradientBoostingClassifierBuilder {
             max_iter: self.max_iter,
+            device: self.device,
             learning_rate: self.learning_rate,
             max_depth: self.max_depth,
             n_bins: self.n_bins,
@@ -162,6 +167,7 @@ where
 /// (D-08 single source).
 #[derive(Debug, Clone, Copy)]
 pub struct HistGradientBoostingClassifierBuilder {
+    device: Device,
     max_iter: usize,
     learning_rate: f64,
     max_depth: usize,
@@ -177,6 +183,14 @@ impl Default for HistGradientBoostingClassifierBuilder {
 }
 
 impl HistGradientBoostingClassifierBuilder {
+
+    /// Pin the execution arm (DEVICE-PARAM-01). [`Device::Auto`] keeps the
+    /// existing gate and its `MLRS_*` A/B flag; `Cpu`/`Gpu` override its PERF
+    /// half only — each prim keeps its own capability checks inside.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
     /// Set the boosting iteration count `max_iter` (`>= 1`).
     pub fn max_iter(mut self, v: usize) -> Self {
         self.max_iter = v;
@@ -233,6 +247,7 @@ impl HistGradientBoostingClassifierBuilder {
         )?;
         Ok(HistGradientBoostingClassifier {
             max_iter: self.max_iter,
+            device: self.device,
             learning_rate: self.learning_rate,
             max_depth: self.max_depth,
             n_bins: self.n_bins,
@@ -289,10 +304,11 @@ where
             l2_regularization: self.l2_regularization,
             min_samples_leaf: self.min_samples_leaf,
         };
-        let model = hgb_fit_class::<F>(pool, x, shape, &y_idx, n_classes, &params)?;
+        let model = hgb_fit_class::<F>(pool, x, shape, &y_idx, n_classes, &params, self.device)?;
 
         Ok(HistGradientBoostingClassifier {
             max_iter: self.max_iter,
+            device: self.device,
             learning_rate: self.learning_rate,
             max_depth: self.max_depth,
             n_bins: self.n_bins,

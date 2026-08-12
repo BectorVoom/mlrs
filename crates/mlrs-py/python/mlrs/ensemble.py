@@ -273,6 +273,7 @@ class HistGradientBoostingClassifier(ClassifierMixin, MlrsBase):
         n_bins=64,
         l2_regularization=0.0,
         min_samples_leaf=20,
+        device="auto",
         output_type="input",
     ):
         self.max_iter = max_iter
@@ -281,6 +282,7 @@ class HistGradientBoostingClassifier(ClassifierMixin, MlrsBase):
         self.n_bins = n_bins
         self.l2_regularization = l2_regularization
         self.min_samples_leaf = min_samples_leaf
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y):
@@ -293,6 +295,7 @@ class HistGradientBoostingClassifier(ClassifierMixin, MlrsBase):
             self.n_bins,
             self.l2_regularization,
             self.min_samples_leaf,
+            self._device(),
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
@@ -337,6 +340,7 @@ class HistGradientBoostingRegressor(RegressorMixin, MlrsBase):
         n_bins=64,
         l2_regularization=0.0,
         min_samples_leaf=20,
+        device="auto",
         output_type="input",
     ):
         self.max_iter = max_iter
@@ -345,6 +349,7 @@ class HistGradientBoostingRegressor(RegressorMixin, MlrsBase):
         self.n_bins = n_bins
         self.l2_regularization = l2_regularization
         self.min_samples_leaf = min_samples_leaf
+        self.device = device
         self.output_type = output_type
 
     def fit(self, X, y):
@@ -357,6 +362,7 @@ class HistGradientBoostingRegressor(RegressorMixin, MlrsBase):
             self.n_bins,
             self.l2_regularization,
             self.min_samples_leaf,
+            self._device(),
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj

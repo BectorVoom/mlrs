@@ -21,7 +21,9 @@ use mlrs_algos::linear::logistic::LogisticRegression;
 use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
 use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::ridge::{Ridge, RidgeSolver};
+use mlrs_backend::device::Device;
 use mlrs_algos::linear::ridge_classifier::{ClassWeight, RidgeClassifier};
+use mlrs_algos::linear::ridge_cv::{ridge_cv_grid, ridge_gcv, GcvFit, GcvMode, GcvRoute, GridFit};
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
 // Phase 16 (D-01): every estimator in this file now consumes the typestate
 // surface — the legacy trait glob has been removed. The typestate
@@ -36,7 +38,7 @@ use mlrs_algos::typestate::{
 };
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::linear_predict::HostPrediction;
+use mlrs_backend::prims::linear_predict::{linear_predict_multi_host, HostPrediction};
 use mlrs_backend::runtime::ActiveRuntime;
 
 use crate::egress::{f32_vec_to_pyarrow, f64_vec_to_pyarrow, i32_vec_to_pyarrow};
@@ -415,6 +417,7 @@ crate::any_estimator_typestate! {
         solver: String,
         positive: bool,
         random_state: Option<u64>,
+        device: String,
     },
 }
 
@@ -431,6 +434,10 @@ struct RidgeParams {
     solver: String,
     positive: bool,
     random_state: Option<u64>,
+    /// DEVICE-PARAM-01. Stays a STRING until `fit` for the same reason `solver`
+    /// does: the parse and its `UnknownDevice` rejection belong with the rest of
+    /// the `build()` validation (D-09).
+    device: String,
 }
 
 /// sklearn-compatible `Ridge` (L2-penalized least squares).
@@ -444,6 +451,10 @@ pub struct PyRidge {
     /// sklearn's `solver_` — the solver that actually ran, after `auto`
     /// resolution and any singular-Gram fallback.
     solver_used: Option<String>,
+    /// `device_` — the execution arm that actually ran (DEVICE-PARAM-01),
+    /// mirrored here for the same reason as `solver_used`: a `#[pyclass]`
+    /// getter cannot reach through the dtype dispatch generically.
+    device_used: Option<String>,
 }
 
 impl PyRidge {
@@ -460,9 +471,11 @@ impl PyRidge {
                 solver: "auto".to_string(),
                 positive: false,
                 random_state: None,
+                device: "auto".to_string(),
             },
             n_iter: None,
             solver_used: None,
+            device_used: None,
         }
     }
 
@@ -484,6 +497,7 @@ impl PyRidge {
                 solver,
                 positive,
                 random_state,
+                device,
             } => RidgeParams {
                 alpha: *alpha,
                 fit_intercept: *fit_intercept,
@@ -493,6 +507,7 @@ impl PyRidge {
                 solver: solver.clone(),
                 positive: *positive,
                 random_state: *random_state,
+                device: device.clone(),
             },
             // Already fitted: the shim always constructs a fresh wrapper per
             // `fit`, so this arm is unreachable in practice; fall back to
@@ -506,6 +521,7 @@ impl PyRidge {
                 solver: "auto".to_string(),
                 positive: false,
                 random_state: None,
+                device: "auto".to_string(),
             },
         }
     }
@@ -517,6 +533,7 @@ impl PyRidge {
 macro_rules! ridge_build {
     ($float:ty, $p:expr) => {{
         let solver = RidgeSolver::try_from($p.solver.as_str()).map_err(build_err_to_py)?;
+        let device = parse_device(&$p.device)?;
         Ridge::<$float>::builder()
             .alpha($p.alpha)
             .fit_intercept($p.fit_intercept)
@@ -526,9 +543,24 @@ macro_rules! ridge_build {
             .solver(solver)
             .positive($p.positive)
             .random_state($p.random_state)
+            .device(device)
             .build::<$float>()
             .map_err(build_err_to_py)?
     }};
+}
+
+/// Parse the sklearn-style `device` string into the typed [`Device`], turning
+/// an unrecognised value into the same `BuildError`-shaped rejection every other
+/// string hyperparameter uses (D-09).
+///
+/// Shared by every estimator that takes the parameter, so they cannot drift on
+/// which spellings they accept.
+pub(crate) fn parse_device(value: &str) -> PyResult<Device> {
+    Device::from_name(value).ok_or_else(|| {
+        build_err_to_py(mlrs_algos::error::BuildError::UnknownDevice {
+            value: value.to_string(),
+        })
+    })
 }
 
 /// Build the estimator and run whichever `fit` ingress its configuration, shape
@@ -605,6 +637,7 @@ impl PyRidge {
         solver = "auto".to_string(),
         positive = false,
         random_state = None,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -616,6 +649,7 @@ impl PyRidge {
         solver: String,
         positive: bool,
         random_state: Option<u64>,
+        device: String,
     ) -> Self {
         Self {
             inner: AnyRidge::Unfit {
@@ -627,9 +661,11 @@ impl PyRidge {
                 solver,
                 positive,
                 random_state,
+                device,
             },
             n_iter: None,
             solver_used: None,
+            device_used: None,
         }
     }
 
@@ -664,8 +700,8 @@ impl PyRidge {
         let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let p = self.params();
-        let (fitted, n_iter, solver_used) =
-            py.detach(|| -> PyResult<(AnyRidge, Option<usize>, String)> {
+        let (fitted, n_iter, solver_used, device_used) =
+            py.detach(|| -> PyResult<(AnyRidge, Option<usize>, String, String)> {
                 let mut pool = crate::lock_pool();
                 match dt {
                     FloatDtype::F32 => {
@@ -682,7 +718,8 @@ impl PyRidge {
                         };
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
-                        Ok((AnyRidge::F32(fitted), n_iter, used))
+                        let arm = fitted.device().to_string();
+                        Ok((AnyRidge::F32(fitted), n_iter, used, arm))
                     }
                     FloatDtype::F64 => {
                         crate::capability::guard_f64()?;
@@ -699,13 +736,15 @@ impl PyRidge {
                         };
                         let n_iter = fitted.n_iter();
                         let used = fitted.solver().name().to_string();
-                        Ok((AnyRidge::F64(fitted), n_iter, used))
+                        let arm = fitted.device().to_string();
+                        Ok((AnyRidge::F64(fitted), n_iter, used, arm))
                     }
                 }
             })?;
         self.inner = fitted;
         self.n_iter = n_iter;
         self.solver_used = Some(solver_used);
+        self.device_used = Some(device_used);
         Ok(())
     }
 
@@ -718,6 +757,11 @@ impl PyRidge {
     /// sklearn's `solver_` — the solver that actually ran.
     fn solver_used(&self) -> Option<String> {
         self.solver_used.clone()
+    }
+
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    fn device_used(&self) -> Option<String> {
+        self.device_used.clone()
     }
 
     /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shared
@@ -827,6 +871,528 @@ impl PyRidge {
 }
 
 // ---------------------------------------------------------------------------
+// RidgeCV — the GCV / grid ENGINES plus a host predictor
+//   alphas, fit_intercept, scoring, cv, gcv_mode, store_cv_results,
+//   alpha_per_target + fit(..., sample_weight) and the alpha_ / best_score_ /
+//   cv_results_ fitted attributes
+// ---------------------------------------------------------------------------
+
+/// Fitted `(coef_, intercept_)` for `RidgeCV`, at the dtype `fit` saw (D-06).
+///
+/// `coef` is `n_features × n_targets` ROW-MAJOR — the layout
+/// [`linear_predict_multi_host`] consumes and the one `Ridge`'s multi-target arm
+/// already produces, so `predict` is one fused host matvec whatever the target
+/// count.
+enum RidgeCVCoef {
+    F32 {
+        coef: Vec<f32>,
+        intercept: Vec<f32>,
+    },
+    F64 {
+        coef: Vec<f64>,
+        intercept: Vec<f64>,
+    },
+}
+
+/// sklearn-compatible `RidgeCV` — the compiled half.
+///
+/// Unlike the other wrappers in this file, this one is an ENGINE rather than a
+/// one-shot `fit`: `RidgeCV`'s `scoring` may be an arbitrary Python callable and
+/// its `cv` an arbitrary Python splitter, neither of which Rust can call. The
+/// split is the same one `model_selection::search` makes — Rust owns the
+/// `O(n·d²)` decompositions and the per-alpha algebra, the shim owns the scorer
+/// and the splitter — and it costs one boundary crossing per fit, not one per
+/// alpha.
+///
+/// The shim therefore drives three calls: [`PyRidgeCV::gcv`] or
+/// [`PyRidgeCV::grid`] to run the engine, its accessors to read the per-alpha
+/// results back, then [`PyRidgeCV::set_fitted`] with the winning
+/// `(coef_, intercept_)` so `predict` has a home.
+#[pyclass(name = "RidgeCV")]
+pub struct PyRidgeCV {
+    /// The penalty grid, verbatim from the ctor (validated in the engine).
+    alphas: Vec<f64>,
+    /// sklearn's `fit_intercept`.
+    fit_intercept: bool,
+    /// sklearn's `gcv_mode`, still a STRING until `gcv` (the `RidgeSolver`
+    /// precedent: the parse and its `UnknownGcvMode` rejection happen with the
+    /// rest of the validation, D-09).
+    gcv_mode: String,
+    /// The last [`ridge_gcv`] result, held so the shim can read the pieces it
+    /// needs without re-running the decomposition.
+    gcv: Option<GcvFit>,
+    /// The last [`ridge_cv_grid`] result.
+    grid: Option<GridFit>,
+    /// The winning coefficients, once the shim has chosen them.
+    fitted: Option<RidgeCVCoef>,
+    /// `n_features` of the fitted `coef_`.
+    n_features: usize,
+    /// `n_targets` of the fitted `coef_`.
+    n_targets: usize,
+}
+
+impl PyRidgeCV {
+    /// Rust-callable default constructor for the smoke test (the
+    /// [`PyLinearRegression::unfit_default`] convention).
+    pub fn unfit_default() -> Self {
+        Self {
+            alphas: vec![0.1, 1.0, 10.0],
+            fit_intercept: true,
+            gcv_mode: "auto".to_string(),
+            gcv: None,
+            grid: None,
+            fitted: None,
+            n_features: 0,
+            n_targets: 0,
+        }
+    }
+
+    /// Is this wrapper still unfitted?
+    pub fn is_unfit(&self) -> bool {
+        self.fitted.is_none()
+    }
+
+    /// The stored [`GcvFit`], or sklearn's `NotFittedError` shape.
+    fn gcv_ref(&self) -> PyResult<&GcvFit> {
+        self.gcv
+            .as_ref()
+            .ok_or_else(|| not_fitted("ridge_cv", "gcv results (fit has not run)"))
+    }
+}
+
+#[pymethods]
+impl PyRidgeCV {
+    /// `RidgeCV(alphas, fit_intercept=True, gcv_mode='auto')` — the subset of
+    /// sklearn's signature the compiled half needs. `scoring`, `cv`,
+    /// `store_cv_results` and `alpha_per_target` stay in the shim: they select
+    /// which engine call is made and how its output is reduced, not what the
+    /// engine computes.
+    #[new]
+    #[pyo3(signature = (alphas, fit_intercept = true, gcv_mode = "auto".to_string()))]
+    fn new(alphas: Vec<f64>, fit_intercept: bool, gcv_mode: String) -> Self {
+        Self {
+            alphas,
+            fit_intercept,
+            gcv_mode,
+            gcv: None,
+            grid: None,
+            fitted: None,
+            n_features: 0,
+            n_targets: 0,
+        }
+    }
+
+    /// Run the generalized (leave-one-out) CV engine — sklearn's `cv=None` arm.
+    ///
+    /// `y` is `rows × n_targets` row-major. `want_predictions` switches the
+    /// per-alpha output from squared LOO errors (which the engine reduces to
+    /// scores itself) to rescaled LOO predictions, which is what a non-`None`
+    /// `scoring` needs; `store_cv_values` fills the same buffer for
+    /// `store_cv_results=True`.
+    #[pyo3(signature = (
+        x, y, rows, cols, n_targets, sample_weight = None,
+        want_predictions = false, store_cv_values = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn gcv(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+        n_targets: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
+        want_predictions: bool,
+        store_cv_values: bool,
+    ) -> PyResult<()> {
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
+        let dt = float_dtype(&xa)?;
+        let mode = GcvMode::try_from(self.gcv_mode.as_str()).map_err(build_err_to_py)?;
+        let (alphas, fit_intercept) = (self.alphas.clone(), self.fit_intercept);
+        let out = py.detach(|| -> PyResult<GcvFit> {
+            match dt {
+                FloatDtype::F32 => {
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let sw = sample_weight_f64(swa.as_ref(), dt)?;
+                    ridge_gcv::<f32>(
+                        xh,
+                        yh,
+                        rows,
+                        cols,
+                        n_targets,
+                        sw.as_deref(),
+                        &alphas,
+                        fit_intercept,
+                        mode,
+                        want_predictions,
+                        store_cv_values,
+                    )
+                    .map_err(algo_err_to_py)
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let sw = sample_weight_f64(swa.as_ref(), dt)?;
+                    ridge_gcv::<f64>(
+                        xh,
+                        yh,
+                        rows,
+                        cols,
+                        n_targets,
+                        sw.as_deref(),
+                        &alphas,
+                        fit_intercept,
+                        mode,
+                        want_predictions,
+                        store_cv_values,
+                    )
+                    .map_err(algo_err_to_py)
+                }
+            }
+        })?;
+        self.gcv = Some(out);
+        Ok(())
+    }
+
+    /// `n_alphas × n_targets` row-major per-target scores (`−mean(looe²)`).
+    /// Empty when the engine produced predictions instead.
+    fn gcv_scores(&self) -> PyResult<Vec<f64>> {
+        Ok(self.gcv_ref()?.scores.clone())
+    }
+
+    /// `n_alphas × n_features × n_targets` row-major coefficients of the
+    /// CENTERED problem, over Arrow (never a Python list).
+    fn gcv_coefs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        f64_vec_to_pyarrow(py, self.gcv_ref()?.coefs.clone())
+    }
+
+    /// `n_samples × n_alphas × n_targets` row-major squared errors (or
+    /// predictions), over Arrow — this is the one buffer that scales with
+    /// `n_samples`, so it must not become a list.
+    ///
+    /// MOVES the buffer out rather than cloning it: at `n = 100 000` and 200
+    /// alphas it is 160 MiB, and the shim reads it exactly once (for the
+    /// scorer, for `cv_results_`, or for both at once from the same array).
+    /// Cloning would double the peak for no reader. A second call returns an
+    /// empty array, which is why the shim binds it to a local.
+    fn gcv_cv_values<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let taken = std::mem::take(
+            &mut self
+                .gcv
+                .as_mut()
+                .ok_or_else(|| not_fitted("ridge_cv", "gcv results (fit has not run)"))?
+                .cv_values,
+        );
+        f64_vec_to_pyarrow(py, taken)
+    }
+
+    /// The weighted column means (`X_offset`) the intercept is recovered from.
+    fn gcv_x_offset(&self) -> PyResult<Vec<f64>> {
+        Ok(self.gcv_ref()?.x_offset.clone())
+    }
+
+    /// The weighted target means (`y_offset`).
+    fn gcv_y_offset(&self) -> PyResult<Vec<f64>> {
+        Ok(self.gcv_ref()?.y_offset.clone())
+    }
+
+    /// Which Gram the engine decomposed — `"gram"` (`n ≤ d`) or `"cov"`
+    /// (`n > d`). Reported for the perf probe and the route test, not used by
+    /// the shim.
+    fn gcv_route(&self) -> PyResult<&'static str> {
+        Ok(match self.gcv_ref()?.route {
+            GcvRoute::Gram => "gram",
+            GcvRoute::Cov => "cov",
+        })
+    }
+
+    /// Run the explicit-`cv` engine — sklearn's `GridSearchCV(Ridge(), {'alpha':
+    /// alphas}, cv=cv)` arm, with the train Gram hoisted out of the alpha loop.
+    ///
+    /// `train`/`test` are the materialized fold indices, in the splitter's own
+    /// order (`mlrs.model_selection.check_cv` produces sklearn-identical rows).
+    #[pyo3(signature = (
+        x, y, rows, cols, n_targets, train, test, sample_weight = None,
+        want_predictions = false, weighted_score = false,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn grid(
+        &mut self,
+        py: Python<'_>,
+        x: &Bound<'_, PyAny>,
+        y: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+        n_targets: usize,
+        train: Vec<Vec<usize>>,
+        test: Vec<Vec<usize>>,
+        sample_weight: Option<&Bound<'_, PyAny>>,
+        want_predictions: bool,
+        weighted_score: bool,
+    ) -> PyResult<()> {
+        if train.len() != test.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "RidgeCV: train and test index lists must have the same length",
+            ));
+        }
+        let xa = capsule_to_array(x)?;
+        let ya = capsule_to_array(y)?;
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
+        let dt = float_dtype(&xa)?;
+        let splits: Vec<(Vec<usize>, Vec<usize>)> =
+            train.into_iter().zip(test).collect();
+        let (alphas, fit_intercept) = (self.alphas.clone(), self.fit_intercept);
+        let out = py.detach(|| -> PyResult<GridFit> {
+            match dt {
+                FloatDtype::F32 => {
+                    let xh = host_slice_f32(as_f32(&xa)?)?;
+                    let yh = host_slice_f32(as_f32(&ya)?)?;
+                    let sw = sample_weight_f64(swa.as_ref(), dt)?;
+                    ridge_cv_grid::<f32>(
+                        xh,
+                        yh,
+                        rows,
+                        cols,
+                        n_targets,
+                        sw.as_deref(),
+                        &alphas,
+                        fit_intercept,
+                        &splits,
+                        want_predictions,
+                        weighted_score,
+                    )
+                    .map_err(algo_err_to_py)
+                }
+                FloatDtype::F64 => {
+                    crate::capability::guard_f64()?;
+                    let xh = host_slice_f64(as_f64(&xa)?)?;
+                    let yh = host_slice_f64(as_f64(&ya)?)?;
+                    let sw = sample_weight_f64(swa.as_ref(), dt)?;
+                    ridge_cv_grid::<f64>(
+                        xh,
+                        yh,
+                        rows,
+                        cols,
+                        n_targets,
+                        sw.as_deref(),
+                        &alphas,
+                        fit_intercept,
+                        &splits,
+                        want_predictions,
+                        weighted_score,
+                    )
+                    .map_err(algo_err_to_py)
+                }
+            }
+        })?;
+        self.grid = Some(out);
+        Ok(())
+    }
+
+    /// `n_splits × n_alphas` row-major R² test scores (`GridSearchCV`'s default
+    /// regressor scoring, computed in Rust so the common case ships nothing but
+    /// the reduction back).
+    fn grid_scores(&self) -> PyResult<Vec<f64>> {
+        Ok(self
+            .grid
+            .as_ref()
+            .ok_or_else(|| not_fitted("ridge_cv", "grid results (fit has not run)"))?
+            .scores
+            .clone())
+    }
+
+    /// Split-major test predictions for a caller-supplied scorer, over Arrow.
+    ///
+    /// Moved out, not cloned — see [`PyRidgeCV::gcv_cv_values`].
+    fn grid_predictions<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let taken = std::mem::take(
+            &mut self
+                .grid
+                .as_mut()
+                .ok_or_else(|| not_fitted("ridge_cv", "grid results (fit has not run)"))?
+                .predictions,
+        );
+        f64_vec_to_pyarrow(py, taken)
+    }
+
+    /// Install the winning `(coef_, intercept_)` so `predict` works.
+    ///
+    /// `coef` is `n_features × n_targets` row-major and `intercept` is length
+    /// `n_targets`, both in `f64`; `dtype` is the fitted arm the shim saw at
+    /// ingress, and the values are narrowed to it here so `predict` runs at the
+    /// same width as the design it will be handed (D-06).
+    #[pyo3(signature = (coef, intercept, n_features, n_targets, dtype))]
+    fn set_fitted(
+        &mut self,
+        coef: Vec<f64>,
+        intercept: Vec<f64>,
+        n_features: usize,
+        n_targets: usize,
+        dtype: &str,
+    ) -> PyResult<()> {
+        if coef.len() != n_features * n_targets || intercept.len() != n_targets {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "RidgeCV: coef_/intercept_ shape does not match (n_features, n_targets)",
+            ));
+        }
+        self.n_features = n_features;
+        self.n_targets = n_targets;
+        self.fitted = Some(match dtype {
+            "f32" => RidgeCVCoef::F32 {
+                coef: coef.iter().map(|v| *v as f32).collect(),
+                intercept: intercept.iter().map(|v| *v as f32).collect(),
+            },
+            "f64" => RidgeCVCoef::F64 { coef, intercept },
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "RidgeCV: unknown dtype '{other}' (expected 'f32' or 'f64')"
+                )))
+            }
+        });
+        // The per-alpha buffers are only needed until the winner is chosen; a
+        // `store_cv_results` caller has already read `cv_values` back by now, so
+        // holding an `n × n_alphas × n_y` array for the estimator's lifetime
+        // would be pure footprint.
+        if let Some(g) = self.gcv.as_mut() {
+            g.cv_values = Vec::new();
+        }
+        if let Some(g) = self.grid.as_mut() {
+            g.predictions = Vec::new();
+        }
+        Ok(())
+    }
+
+    /// `predict(x)` → an `m × n_targets` row-major **pyarrow** float array
+    /// (`m` when `n_targets == 1`). Host matvec, no upload, no Python list —
+    /// the RIDGE-PREDICT-CUDA-VS-CPU verdict applies verbatim here: `predict` is
+    /// `O(n·d)` compute over an `O(n·d)` transfer, so the device arm never wins.
+    fn predict_f32<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let Some(RidgeCVCoef::F32 { coef, intercept }) = self.fitted.as_ref() else {
+            return Err(not_fitted("ridge_cv", "predict (f32 path)"));
+        };
+        let xa = capsule_to_array(x)?;
+        let out = py.detach(|| -> PyResult<Vec<f32>> {
+            let xh = host_slice_f32(as_f32(&xa)?)?;
+            let pred =
+                linear_predict_multi_host::<f32>(xh, coef, intercept, (rows, cols), self.n_targets)
+                    .map_err(|e| algo_err_to_py(AlgoError::Prim(e)))?;
+            if !pred.operand_finite {
+                return Err(nonfinite_input_err(xh, "float32"));
+            }
+            Ok(pred.values)
+        })?;
+        f32_vec_to_pyarrow(py, out)
+    }
+
+    /// f64 twin of [`PyRidgeCV::predict_f32`].
+    fn predict_f64<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'_, PyAny>,
+        rows: usize,
+        cols: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let Some(RidgeCVCoef::F64 { coef, intercept }) = self.fitted.as_ref() else {
+            return Err(not_fitted("ridge_cv", "predict (f64 path)"));
+        };
+        let xa = capsule_to_array(x)?;
+        let out = py.detach(|| -> PyResult<Vec<f64>> {
+            let xh = host_slice_f64(as_f64(&xa)?)?;
+            let pred =
+                linear_predict_multi_host::<f64>(xh, coef, intercept, (rows, cols), self.n_targets)
+                    .map_err(|e| algo_err_to_py(AlgoError::Prim(e)))?;
+            if !pred.operand_finite {
+                return Err(nonfinite_input_err(xh, "float64"));
+            }
+            Ok(pred.values)
+        })?;
+        f64_vec_to_pyarrow(py, out)
+    }
+
+    /// `n_features × n_targets` row-major fitted `coef_` (the shim reshapes and
+    /// transposes to sklearn's `(n_targets, n_features)`).
+    fn coef_f32(&self) -> PyResult<Vec<f32>> {
+        match self.fitted.as_ref() {
+            Some(RidgeCVCoef::F32 { coef, .. }) => Ok(coef.clone()),
+            _ => Err(not_fitted("ridge_cv", "coef_ (f32)")),
+        }
+    }
+    fn coef_f64(&self) -> PyResult<Vec<f64>> {
+        match self.fitted.as_ref() {
+            Some(RidgeCVCoef::F64 { coef, .. }) => Ok(coef.clone()),
+            _ => Err(not_fitted("ridge_cv", "coef_ (f64)")),
+        }
+    }
+    fn intercept_f32(&self) -> PyResult<Vec<f32>> {
+        match self.fitted.as_ref() {
+            Some(RidgeCVCoef::F32 { intercept, .. }) => Ok(intercept.clone()),
+            _ => Err(not_fitted("ridge_cv", "intercept_ (f32)")),
+        }
+    }
+    fn intercept_f64(&self) -> PyResult<Vec<f64>> {
+        match self.fitted.as_ref() {
+            Some(RidgeCVCoef::F64 { intercept, .. }) => Ok(intercept.clone()),
+            _ => Err(not_fitted("ridge_cv", "intercept_ (f64)")),
+        }
+    }
+
+    fn is_fitted(&self) -> bool {
+        self.fitted.is_some()
+    }
+
+    /// The fitted dtype arm (`MlrsBase._suffix` reads this, D-06).
+    fn dtype(&self) -> Option<&'static str> {
+        match self.fitted.as_ref() {
+            None => None,
+            Some(RidgeCVCoef::F32 { .. }) => Some("f32"),
+            Some(RidgeCVCoef::F64 { .. }) => Some("f64"),
+        }
+    }
+}
+
+/// Borrow an optional `sample_weight` Arrow array as the `f64` vector both
+/// `ridge_cv` engines take.
+///
+/// Widened HERE rather than inside the engine because the engines are generic
+/// over the DESIGN's element type while sklearn's weights are conceptually
+/// `f64` whatever `X` is — and because both engines need the same widening, so
+/// doing it once keeps them from drifting.
+fn sample_weight_f64(
+    swa: Option<&arrow::array::ArrayRef>,
+    dt: FloatDtype,
+) -> PyResult<Option<Vec<f64>>> {
+    let Some(a) = swa else {
+        return Ok(None);
+    };
+    let v: Vec<f64> = match dt {
+        FloatDtype::F32 => host_slice_f32(as_f32(a)?)?
+            .iter()
+            .map(|v| *v as f64)
+            .collect(),
+        FloatDtype::F64 => host_slice_f64(as_f64(a)?)?.to_vec(),
+    };
+    if let Some(bad) = v.iter().position(|w| !w.is_finite() || *w < 0.0) {
+        return Err(algo_err_to_py(AlgoError::InvalidSampleWeight {
+            estimator: "ridge_cv",
+            index: bad,
+            value: v[bad],
+        }));
+    }
+    Ok(Some(v))
+}
+
+// ---------------------------------------------------------------------------
 // RidgeClassifier — Fit + PredictLabels + decision_function; classes_,
 // coef_, intercept_, n_iter_, solver_
 // ---------------------------------------------------------------------------
@@ -873,6 +1439,8 @@ struct RidgeClassifierParams {
     solver: String,
     positive: bool,
     random_state: Option<u64>,
+    /// DEVICE-PARAM-01, a STRING until `fit` (D-09).
+    device: String,
 }
 
 /// Dtype-dispatched fitted/unfit state (D-06) — hand-written like [`AnyRidge`]
@@ -890,6 +1458,7 @@ enum AnyRidgeClassifier {
         solver: String,
         positive: bool,
         random_state: Option<u64>,
+        device: String,
     },
     F32(RidgeClassifier<f32, AlgoFitted>),
     F64(RidgeClassifier<f64, AlgoFitted>),
@@ -918,6 +1487,7 @@ impl PyRidgeClassifier {
                 solver: "auto".to_string(),
                 positive: false,
                 random_state: None,
+                device: "auto".to_string(),
             },
             n_iter: None,
             solver_used: None,
@@ -933,7 +1503,9 @@ impl PyRidgeClassifier {
         match &self.inner {
             AnyRidgeClassifier::Unfit {
                 alpha, fit_intercept, copy_x, max_iter, tol, class_weight, solver, positive, random_state,
+                device,
             } => RidgeClassifierParams {
+                device: device.clone(),
                 alpha: *alpha,
                 fit_intercept: *fit_intercept,
                 copy_x: *copy_x,
@@ -947,6 +1519,7 @@ impl PyRidgeClassifier {
             // Already fitted: the shim always constructs a fresh wrapper per
             // `fit` (WR-02), so this arm is unreachable in practice.
             _ => RidgeClassifierParams {
+                device: "auto".to_string(),
                 alpha: 1.0,
                 fit_intercept: true,
                 copy_x: true,
@@ -966,6 +1539,7 @@ impl PyRidgeClassifier {
 macro_rules! ridge_classifier_build {
     ($float:ty, $p:expr) => {{
         let solver = RidgeSolver::try_from($p.solver.as_str()).map_err(build_err_to_py)?;
+        let device = parse_device($p.device.as_str())?;
         RidgeClassifier::<$float>::builder()
             .alpha($p.alpha)
             .fit_intercept($p.fit_intercept)
@@ -976,6 +1550,7 @@ macro_rules! ridge_classifier_build {
             .solver(solver)
             .positive($p.positive)
             .random_state($p.random_state)
+            .device(device)
             .build::<$float>()
             .map_err(build_err_to_py)?
     }};
@@ -1027,6 +1602,7 @@ impl PyRidgeClassifier {
         solver = "auto".to_string(),
         positive = false,
         random_state = None,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1039,6 +1615,7 @@ impl PyRidgeClassifier {
         solver: String,
         positive: bool,
         random_state: Option<u64>,
+        device: String,
     ) -> PyResult<Self> {
         let class_weight = parse_class_weight(class_weight)?;
         Ok(Self {
@@ -1050,6 +1627,7 @@ impl PyRidgeClassifier {
                 tol,
                 class_weight,
                 solver,
+                device,
                 positive,
                 random_state,
             },
@@ -1254,6 +1832,19 @@ impl PyRidgeClassifier {
     /// sklearn's `solver_` — the solver that ACTUALLY ran.
     fn solver_used(&self) -> Option<String> {
         self.solver_used.clone()
+    }
+
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    ///
+    /// Read off the FITTED estimator rather than mirrored at `fit`: the arm is
+    /// already recorded on it, and re-deriving it here would be a second place
+    /// to get the fallbacks wrong.
+    fn device_used(&self) -> Option<String> {
+        match &self.inner {
+            AnyRidgeClassifier::F32(e) => Some(e.device().to_string()),
+            AnyRidgeClassifier::F64(e) => Some(e.device().to_string()),
+            _ => None,
+        }
     }
 
     fn coef_f32(&self) -> PyResult<Vec<f32>> {
@@ -1835,6 +2426,7 @@ crate::any_estimator_typestate! {
         fit_intercept: bool, max_iter: usize, tol: f64,
         learning_rate: String, eta0: f64, power_t: f64,
         batch_size: usize, shuffle: bool, seed: u64, n_iter_no_change: usize,
+        device: String,
     },
 }
 
@@ -1846,6 +2438,7 @@ crate::any_estimator_typestate! {
         fit_intercept: bool, max_iter: usize, tol: f64,
         learning_rate: String, eta0: f64, power_t: f64, epsilon: f64,
         batch_size: usize, shuffle: bool, seed: u64, n_iter_no_change: usize,
+        device: String,
     },
 }
 
@@ -1880,6 +2473,10 @@ crate::any_estimator_typestate! {
 #[pyclass(name = "MBSGDClassifier")]
 pub struct PyMBSGDClassifier {
     inner: AnyMBSGDClassifier,
+    /// `device_` — the arm that actually ran. Recorded at `fit` because the
+    /// typestate transition consumes the `Unfit` variant the preference was
+    /// read from, and a fitted estimator must still be able to name its arm.
+    device_used: Option<String>,
 }
 
 impl PyMBSGDClassifier {
@@ -1887,6 +2484,7 @@ impl PyMBSGDClassifier {
     /// [`PyLinearRegression::unfit_default`]).
     pub fn unfit_default() -> Self {
         Self {
+            device_used: None,
             inner: AnyMBSGDClassifier::Unfit {
                 loss: "hinge".to_string(),
                 penalty: "l2".to_string(),
@@ -1902,6 +2500,7 @@ impl PyMBSGDClassifier {
                 shuffle: true,
                 seed: 0,
                 n_iter_no_change: 5,
+                device: "auto".to_string(),
             },
         }
     }
@@ -1924,6 +2523,7 @@ impl PyMBSGDClassifier {
         l1_ratio = 0.15, fit_intercept = true, max_iter = 1000, tol = 1e-3,
         learning_rate = "optimal".to_string(), eta0 = 0.01, power_t = 0.5,
         batch_size = 1, shuffle = true, seed = 0, n_iter_no_change = 5,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1941,8 +2541,10 @@ impl PyMBSGDClassifier {
         shuffle: bool,
         seed: u64,
         n_iter_no_change: usize,
+        device: String,
     ) -> Self {
         Self {
+            device_used: None,
             inner: AnyMBSGDClassifier::Unfit {
                 loss,
                 penalty,
@@ -1958,6 +2560,7 @@ impl PyMBSGDClassifier {
                 shuffle,
                 seed,
                 n_iter_no_change,
+                device,
             },
         }
     }
@@ -1992,15 +2595,16 @@ impl PyMBSGDClassifier {
         let (
             loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
             lr_s, eta0, power_t, batch_size, shuffle, seed, n_iter_no_change,
+            device_s,
         ) = match &self.inner {
             AnyMBSGDClassifier::Unfit {
                 loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
                 learning_rate, eta0, power_t, batch_size, shuffle, seed,
-                n_iter_no_change,
+                n_iter_no_change, device,
             } => (
                 loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
                 *max_iter, *tol, learning_rate.clone(), *eta0, *power_t,
-                *batch_size, *shuffle, *seed, *n_iter_no_change,
+                *batch_size, *shuffle, *seed, *n_iter_no_change, device.clone(),
             ),
             _ => return Err(not_fitted("mbsgd_classifier", "re-fit")),
         };
@@ -2008,12 +2612,14 @@ impl PyMBSGDClassifier {
         let loss = Loss::try_from(loss_s.as_str()).map_err(build_err_to_py)?;
         let penalty = Penalty::try_from(penalty_s.as_str()).map_err(build_err_to_py)?;
         let lr = LearningRate::try_from(lr_s.as_str()).map_err(build_err_to_py)?;
-        let host_ingress = mlrs_backend::prims::sgd::sgd_host_available();
+        let host_ingress =
+            mlrs_backend::prims::sgd::sgd_host_available(parse_device(&device_s)?);
         let fitted = py.detach(|| -> PyResult<AnyMBSGDClassifier> {
             let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let est = MBSGDClassifier::<f32>::builder()
+                        .device(parse_device(&device_s)?)
                         .loss(loss)
                         .penalty(penalty)
                         .alpha(alpha)
@@ -2048,6 +2654,7 @@ impl PyMBSGDClassifier {
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let est = MBSGDClassifier::<f64>::builder()
+                        .device(parse_device(&device_s)?)
                         .loss(loss)
                         .penalty(penalty)
                         .alpha(alpha)
@@ -2081,9 +2688,21 @@ impl PyMBSGDClassifier {
                 }
             }
         })?;
+        self.device_used = Some(
+            mlrs_backend::device::Device::resolved_name(host_ingress).to_string(),
+        );
         self.inner = fitted;
         Ok(())
     }
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    ///
+    /// A preference the backend cannot honour is REPORTED here, not faked: the
+    /// capability half of each gate still decides, and this names what carried
+    /// the fit.
+    fn device_used(&self) -> Option<String> {
+        self.device_used.clone()
+    }
+
 
     /// `predict(x)` → length-`rows` host `Vec<i32>` class labels (margin sign).
     fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
@@ -2200,12 +2819,17 @@ impl PyMBSGDClassifier {
 #[pyclass(name = "MBSGDRegressor")]
 pub struct PyMBSGDRegressor {
     inner: AnyMBSGDRegressor,
+    /// `device_` — the arm that actually ran. Recorded at `fit` because the
+    /// typestate transition consumes the `Unfit` variant the preference was
+    /// read from, and a fitted estimator must still be able to name its arm.
+    device_used: Option<String>,
 }
 
 impl PyMBSGDRegressor {
     /// Rust-callable default constructor (smoke test seam).
     pub fn unfit_default() -> Self {
         Self {
+            device_used: None,
             inner: AnyMBSGDRegressor::Unfit {
                 loss: "squared_error".to_string(),
                 penalty: "l2".to_string(),
@@ -2222,6 +2846,7 @@ impl PyMBSGDRegressor {
                 shuffle: true,
                 seed: 0,
                 n_iter_no_change: 5,
+                device: "auto".to_string(),
             },
         }
     }
@@ -2245,6 +2870,7 @@ impl PyMBSGDRegressor {
         learning_rate = "invscaling".to_string(), eta0 = 0.01, power_t = 0.25,
         epsilon = 0.1, batch_size = 1, shuffle = true, seed = 0,
         n_iter_no_change = 5,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2263,8 +2889,10 @@ impl PyMBSGDRegressor {
         shuffle: bool,
         seed: u64,
         n_iter_no_change: usize,
+        device: String,
     ) -> Self {
         Self {
+            device_used: None,
             inner: AnyMBSGDRegressor::Unfit {
                 loss,
                 penalty,
@@ -2281,6 +2909,7 @@ impl PyMBSGDRegressor {
                 shuffle,
                 seed,
                 n_iter_no_change,
+                device,
             },
         }
     }
@@ -2301,15 +2930,16 @@ impl PyMBSGDRegressor {
         let (
             loss_s, penalty_s, alpha, l1_ratio, fit_intercept, max_iter, tol,
             lr_s, eta0, power_t, epsilon, batch_size, shuffle, seed, n_iter_no_change,
+            device_s,
         ) = match &self.inner {
             AnyMBSGDRegressor::Unfit {
                 loss, penalty, alpha, l1_ratio, fit_intercept, max_iter, tol,
                 learning_rate, eta0, power_t, epsilon, batch_size, shuffle, seed,
-                n_iter_no_change,
+                n_iter_no_change, device,
             } => (
                 loss.clone(), penalty.clone(), *alpha, *l1_ratio, *fit_intercept,
                 *max_iter, *tol, learning_rate.clone(), *eta0, *power_t, *epsilon,
-                *batch_size, *shuffle, *seed, *n_iter_no_change,
+                *batch_size, *shuffle, *seed, *n_iter_no_change, device.clone(),
             ),
             _ => return Err(not_fitted("mbsgd_regressor", "re-fit")),
         };
@@ -2323,6 +2953,7 @@ impl PyMBSGDRegressor {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
                     let est = MBSGDRegressor::<f32>::builder()
+                        .device(parse_device(&device_s)?)
                         .loss(loss)
                         .penalty(penalty)
                         .alpha(alpha)
@@ -2349,6 +2980,7 @@ impl PyMBSGDRegressor {
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
                     let est = MBSGDRegressor::<f64>::builder()
+                        .device(parse_device(&device_s)?)
                         .loss(loss)
                         .penalty(penalty)
                         .alpha(alpha)
@@ -2372,9 +3004,24 @@ impl PyMBSGDRegressor {
                 }
             }
         })?;
+        self.device_used = Some(
+            mlrs_backend::device::Device::resolved_name(
+                mlrs_backend::prims::sgd::sgd_host_available(parse_device(&device_s)?),
+            )
+            .to_string(),
+        );
         self.inner = fitted;
         Ok(())
     }
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    ///
+    /// A preference the backend cannot honour is REPORTED here, not faked: the
+    /// capability half of each gate still decides, and this names what carried
+    /// the fit.
+    fn device_used(&self) -> Option<String> {
+        self.device_used.clone()
+    }
+
 
     fn predict_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
         let xa = capsule_to_array(x)?;
@@ -3030,13 +3677,14 @@ crate::any_estimator_typestate! {
         fit_intercept: bool,
         copy_x: bool,
         verbose: bool,
+        device: String,
     },
 }
 
 /// The verbatim ctor hyperparameters, carried from the `Unfit` arm to `fit`
 /// (WR-02: the wrapper rebuilds from these at every `fit`, so a second `fit` of
 /// the same object works).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct BayesianRidgeParams {
     max_iter: usize,
     tol: f64,
@@ -3050,6 +3698,8 @@ struct BayesianRidgeParams {
     fit_intercept: bool,
     copy_x: bool,
     verbose: bool,
+    /// DEVICE-PARAM-01, a STRING until `fit` (the D-09 parse-at-build rule).
+    device: String,
 }
 
 /// sklearn-compatible `BayesianRidge` (evidence-maximized ridge regression).
@@ -3088,6 +3738,7 @@ impl PyBayesianRidge {
                 fit_intercept: true,
                 copy_x: true,
                 verbose: false,
+                device: "auto".to_string(),
             },
             alpha: None,
             lambda: None,
@@ -3120,7 +3771,9 @@ impl PyBayesianRidge {
                 fit_intercept,
                 copy_x,
                 verbose,
+                device,
             } => BayesianRidgeParams {
+                device: device.clone(),
                 max_iter: *max_iter,
                 tol: *tol,
                 alpha_1: *alpha_1,
@@ -3138,6 +3791,7 @@ impl PyBayesianRidge {
             // `fit`, so this arm is unreachable in practice; fall back to
             // sklearn's defaults rather than panicking.
             _ => BayesianRidgeParams {
+                device: "auto".to_string(),
                 max_iter: 300,
                 tol: 1e-3,
                 alpha_1: 1e-6,
@@ -3173,6 +3827,7 @@ macro_rules! bayes_build {
             .fit_intercept($p.fit_intercept)
             .copy_x($p.copy_x)
             .verbose($p.verbose)
+            .device(parse_device($p.device.as_str())?)
             .build::<$float>()
             .map_err(build_err_to_py)?
     }};
@@ -3247,6 +3902,7 @@ impl PyBayesianRidge {
         fit_intercept = true,
         copy_x = true,
         verbose = false,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -3262,6 +3918,7 @@ impl PyBayesianRidge {
         fit_intercept: bool,
         copy_x: bool,
         verbose: bool,
+        device: String,
     ) -> Self {
         Self {
             inner: AnyBayesianRidge::Unfit {
@@ -3277,6 +3934,7 @@ impl PyBayesianRidge {
                 fit_intercept,
                 copy_x,
                 verbose,
+                device,
             },
             alpha: None,
             lambda: None,
@@ -3445,6 +4103,19 @@ impl PyBayesianRidge {
         self.scores.clone()
     }
     /// sklearn's `n_iter_` — evidence iterations actually run.
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    ///
+    /// Read off the FITTED estimator rather than mirrored at `fit`: the arm is
+    /// already recorded on it, and re-deriving it here would be a second place
+    /// to get the fallbacks wrong.
+    fn device_used(&self) -> Option<String> {
+        match &self.inner {
+            AnyBayesianRidge::F32(e) => Some(e.device().to_string()),
+            AnyBayesianRidge::F64(e) => Some(e.device().to_string()),
+            _ => None,
+        }
+    }
+
     fn n_iter(&self) -> Option<usize> {
         self.n_iter
     }
@@ -3492,8 +4163,10 @@ crate::any_estimator_typestate! {
 /// The verbatim ctor hyperparameters, carried from the `Unfit` arm to `fit`
 /// (WR-02: the wrapper rebuilds from these at every `fit`, so a second `fit` of
 /// the same object works).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct HuberParams {
+    /// DEVICE-PARAM-01, a STRING until `build` (D-09).
+    device: String,
     epsilon: f64,
     max_iter: usize,
     alpha: f64,
@@ -3506,6 +4179,11 @@ struct HuberParams {
 #[pyclass(name = "HuberRegressor")]
 pub struct PyHuberRegressor {
     inner: AnyHuberRegressor,
+    /// `device_` — the arm that actually ran. Recorded at `fit` because the
+    /// typestate transition consumes the `Unfit` variant the preference was
+    /// read from, and a fitted estimator must still be able to name its arm.
+    device_used: Option<String>,
+
     /// The ctor hyperparameters, kept OUTSIDE `inner` because a fitted arm no
     /// longer carries an `Unfit { .. }` to read them from and `warm_start`
     /// makes a second `fit` of the same object a supported operation.
@@ -3528,7 +4206,7 @@ pub struct PyHuberRegressor {
 impl PyHuberRegressor {
     /// Rust-callable default constructor (smoke test seam).
     pub fn unfit_default() -> Self {
-        Self::new(1.35, 100, 1e-4, false, true, 1e-5)
+        Self::new(1.35, 100, 1e-4, false, true, 1e-5, "auto".to_string())
     }
 
     /// Is this wrapper in the unfit arm?
@@ -3542,7 +4220,9 @@ impl PyHuberRegressor {
 /// macro so the six builder setters are written once.
 macro_rules! huber_build {
     ($float:ty, $p:expr, $seed:expr) => {{
+        let device = parse_device(&$p.device)?;
         let mut b = HuberRegressor::<$float>::builder()
+            .device(device)
             .epsilon($p.epsilon)
             .max_iter($p.max_iter)
             .alpha($p.alpha)
@@ -3576,7 +4256,11 @@ macro_rules! huber_fit_dispatch {
             Some(a) => Some($host_slice($as(a)?)?),
             None => None,
         };
-        if mlrs_backend::prims::huber_objective::huber_host_ingress_preferred($rows, $cols) {
+        if mlrs_backend::prims::huber_objective::huber_host_ingress_preferred(
+            $rows,
+            $cols,
+            parse_device(&$p.device)?,
+        ) {
             let xh = $host_slice($as(&$xa)?)?;
             let yh = $host_slice($as(&$ya)?)?;
             est.fit_from_host_slice(&mut $pool, xh, yh, ($rows, $cols), sw)
@@ -3600,6 +4284,7 @@ macro_rules! huber_snapshot {
             $fitted.converged(),
             $fitted.outliers().to_vec(),
             $fitted.warm_start_params().to_vec(),
+            $fitted.device_arm(),
         )
     }};
 }
@@ -3618,7 +4303,9 @@ impl PyHuberRegressor {
         warm_start = false,
         fit_intercept = true,
         tol = 1e-5,
+        device = "auto".to_string(),
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         epsilon: f64,
         max_iter: usize,
@@ -3626,8 +4313,10 @@ impl PyHuberRegressor {
         warm_start: bool,
         fit_intercept: bool,
         tol: f64,
+        device: String,
     ) -> Self {
         Self {
+            device_used: None,
             inner: AnyHuberRegressor::Unfit {
                 epsilon,
                 max_iter,
@@ -3637,6 +4326,7 @@ impl PyHuberRegressor {
                 tol,
             },
             params: HuberParams {
+                device,
                 epsilon,
                 max_iter,
                 alpha,
@@ -3675,9 +4365,9 @@ impl PyHuberRegressor {
         let ya = capsule_to_array(y)?;
         let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
-        let p = self.params;
+        let p = self.params.clone();
         let seed = self.warm_params.clone();
-        type Snapshot = (f64, usize, bool, Vec<bool>, Vec<f64>);
+        type Snapshot = (f64, usize, bool, Vec<bool>, Vec<f64>, Option<&'static str>);
         let (fitted, snap) = py.detach(|| -> PyResult<(AnyHuberRegressor, Snapshot)> {
             let mut pool = crate::lock_pool();
             match dt {
@@ -3701,7 +4391,8 @@ impl PyHuberRegressor {
             }
         })?;
         self.inner = fitted;
-        let (scale, n_iter, converged, outliers, warm_params) = snap;
+        let (scale, n_iter, converged, outliers, warm_params, device_arm) = snap;
+        self.device_used = device_arm.map(str::to_string);
         self.scale = Some(scale);
         self.n_iter = Some(n_iter);
         self.converged = converged;
@@ -3709,6 +4400,15 @@ impl PyHuberRegressor {
         self.warm_params = warm_params;
         Ok(())
     }
+    /// `device_` — the execution arm that actually ran (`"cpu"` / `"gpu"`).
+    ///
+    /// A preference the backend cannot honour is REPORTED here, not faked: the
+    /// capability half of each gate still decides, and this names what carried
+    /// the fit.
+    fn device_used(&self) -> Option<String> {
+        self.device_used.clone()
+    }
+
 
     /// `predict(x)` → a length-`rows` **pyarrow** float array (D-03). Shares
     /// [`dense_predict_f32`] with the other dense linear regressors.

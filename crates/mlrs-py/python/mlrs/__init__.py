@@ -51,6 +51,7 @@ from .linear import (
     HuberRegressor,
     Ridge,
     RidgeClassifier,
+    RidgeCV,
 )
 from .manifold import TSNE, UMAP
 from .mixture import BayesianGaussianMixture, GaussianMixture
@@ -109,6 +110,7 @@ from . import feature_selection  # noqa: F401
 __all__ = [
     "LinearRegression",
     "Ridge",
+    "RidgeCV",
     "RidgeClassifier",
     "BayesianRidge",
     "HuberRegressor",

@@ -17,6 +17,7 @@ pub mod runtime;
 // libtest runs concurrently. Prim dispatchers read knobs through `abflag::var`.
 pub mod abflag;
 pub mod capability;
+pub mod device;
 pub mod bridge;
 pub mod device_array;
 pub mod pool;

@@ -105,6 +105,15 @@ use crate::runtime::ActiveRuntime;
 /// deployment would flip. `MLRS_RADIUS_HOST=0` stands it down in favour of the
 /// original tile-readback scan (the "before" column); `MLRS_RADIUS_HOST=1`
 /// forces it even when the device engine is on.
+/// Can the host radius scan run this query AT ALL?
+///
+/// The CAPABILITY half of [`radius_host_applicable`] — see
+/// [`knn_host_possible`](super::knn_host::knn_host_possible) for why the two
+/// halves are kept apart under DEVICE-PARAM-01.
+pub fn radius_host_possible(n_query: usize, n_train: usize, n_features: usize) -> bool {
+    n_query > 0 && n_train > 0 && n_features > 0
+}
+
 pub fn radius_host_applicable(n_query: usize, n_train: usize, n_features: usize) -> bool {
     if !(n_query > 0 && n_train > 0 && n_features > 0) {
         return false;

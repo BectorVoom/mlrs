@@ -34,6 +34,7 @@
 //! D-07 GPU gate; the Phase-2 figures were identical cpu==wgpu and remain so
 //! cpu==rocm, matching the Phase-3 section lower in this file).
 
+use mlrs_backend::device::Device;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -1883,7 +1884,7 @@ fn memory_gate_sgd_bounded() {
     let mut readbacks_after: Vec<u64> = Vec::with_capacity(N);
 
     for _call in 0..N {
-        let (coef, intercept) = sgd::sgd_solve::<f32>(&mut pool, &xd, &yd, (n, d), &params)
+        let (coef, intercept) = sgd::sgd_solve::<f32>(&mut pool, &xd, &yd, (n, d), &params, Device::Auto)
             .expect("sgd_solve accepts the validated shape");
         // Release the returned fitted state so the steady-state footprint conserves
         // (the caller owns it each call) — the iterative-solver release idiom.

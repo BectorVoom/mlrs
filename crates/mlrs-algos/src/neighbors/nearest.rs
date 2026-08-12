@@ -42,6 +42,7 @@ use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 use cubecl::server::Handle;
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::{distance_direct, distance_with_ynorm, metric_distance};
@@ -50,9 +51,9 @@ use mlrs_backend::prims::knn::{
     device_copy, fused_distance_topk, fused_topk_applicable,
 };
 use mlrs_backend::prims::knn_graph::Metric;
-use mlrs_backend::prims::knn_host::{knn_host_applicable, knn_host_topk};
+use mlrs_backend::prims::knn_host::{knn_host_applicable, knn_host_possible, knn_host_topk};
 use mlrs_backend::prims::radius::{radius_device_applicable, radius_scan_device_tile};
-use mlrs_backend::prims::radius_host::{radius_host_applicable, radius_host_scan};
+use mlrs_backend::prims::radius_host::{radius_host_applicable, radius_host_possible, radius_host_scan};
 use mlrs_backend::prims::reduce::{row_reduce, ReducePath, ScalarOp};
 use mlrs_backend::prims::topk::top_k;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -81,6 +82,13 @@ pub struct NearestNeighbors<F, S = Unfit> {
     /// (NEIGH-PARAMS). Defaults to [`Metric::Euclidean`] (D-08), mirroring
     /// `KNeighborsClassifier`/`KNeighborsRegressor`.
     metric: Metric,
+    /// Where to run the neighbour search (DEVICE-PARAM-01). `Auto` keeps the
+    /// existing gate (backend name, tuned-arm availability, `MLRS_KNN_HOST` /
+    /// `MLRS_RADIUS_*`); `Cpu`/`Gpu` override its PERF half only — the
+    /// capability half (`k <= n_train`, non-empty operands) is never
+    /// overridable, so a preference with no implementation falls back and says
+    /// so through `device_`.
+    device: Device,
     /// Device-resident training matrix (`n_train × n_features`, row-major),
     /// `None` until `fit`.
     x_train_: Option<DeviceArray<ActiveRuntime, F>>,
@@ -105,6 +113,7 @@ where
         Self {
             n_neighbors: NN_DEFAULT_N_NEIGHBORS,
             metric: Metric::Euclidean,
+            device: Device::Auto,
             x_train_: None,
             train_shape_: None,
             _state: PhantomData,
@@ -122,6 +131,7 @@ where
     /// the defaults from [`NearestNeighbors::new`] (D-08).
     pub fn into_builder(self) -> NearestNeighborsBuilder {
         NearestNeighborsBuilder {
+            device: self.device,
             n_neighbors: self.n_neighbors,
             metric: self.metric,
         }
@@ -132,6 +142,7 @@ where
     /// `NearestNeighbors::new().hyperparams_eq(&NearestNeighbors::builder().build()?)`.
     pub fn hyperparams_eq(&self, other: &Self) -> bool {
         self.n_neighbors == other.n_neighbors && self.metric == other.metric
+            && self.device == other.device
     }
 
     /// The configured default neighbor count (read pre-fit).
@@ -165,6 +176,7 @@ where
         Ok(NearestNeighbors {
             n_neighbors: self.n_neighbors,
             metric: self.metric,
+            device: self.device,
             x_train_: Some(x),
             train_shape_: Some(shape),
             _state: PhantomData,
@@ -225,6 +237,7 @@ where
             shape,
             radius,
             self.metric,
+            self.device,
         )
     }
 }
@@ -236,6 +249,7 @@ where
 pub struct NearestNeighborsBuilder {
     n_neighbors: usize,
     metric: Metric,
+    device: Device,
 }
 
 impl Default for NearestNeighborsBuilder {
@@ -248,6 +262,14 @@ impl Default for NearestNeighborsBuilder {
 }
 
 impl NearestNeighborsBuilder {
+    /// Pin the execution arm (DEVICE-PARAM-01) for `kneighbors` /
+    /// `radius_neighbors`. [`Device::Auto`] keeps the existing heuristic.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
+
     /// Set the default neighbor count `n_neighbors`.
     pub fn n_neighbors(mut self, v: usize) -> Self {
         self.n_neighbors = v;
@@ -284,6 +306,7 @@ impl NearestNeighborsBuilder {
         Ok(NearestNeighbors {
             n_neighbors: self.n_neighbors,
             metric: self.metric,
+            device: self.device,
             x_train_: None,
             train_shape_: None,
             _state: PhantomData,
@@ -362,6 +385,7 @@ where
             shape,
             k,
             self.metric,
+            self.device,
         )?;
         Ok((distances, indices))
     }
@@ -394,6 +418,7 @@ pub(crate) fn neighbor_indices_metric<F>(
     shape: (usize, usize),
     k: usize,
     metric: Metric,
+    device: Device,
 ) -> Result<
     (
         DeviceArray<ActiveRuntime, F>,
@@ -421,6 +446,7 @@ where
         (n_query, n_features),
         k,
         metric,
+        device,
     )?;
 
     // --- 3. u32 → i32 neighbor indices (D-06). Host-cast the small n_query × k
@@ -488,6 +514,7 @@ pub(crate) fn radius_neighbor_indices_metric<F>(
     shape: (usize, usize),
     radius: f64,
     metric: Metric,
+    device: Device,
 ) -> Result<RadiusNeighbors<F>, AlgoError>
 where
     F: Float + CubeElement + Pod,
@@ -502,7 +529,10 @@ where
     //     backends too because it MEASURED faster there (3-6x over arm 2 on
     //     both wgpu and this machine's integrated rocm device); the table and
     //     the discrete-GPU caveat are on `radius_device_applicable`. ---
-    if radius_host_applicable(n_query, n_train, n_features) {
+    // Capability first, as above.
+    if radius_host_possible(n_query, n_train, n_features)
+        && device.prefers_host(|| radius_host_applicable(n_query, n_train, n_features))
+    {
         let m = radius_host_scan::<F>(
             pool,
             xq,
@@ -691,6 +721,7 @@ pub(crate) fn neighbor_indices_device_metric<F>(
     shape: (usize, usize),
     k: usize,
     metric: Metric,
+    device: Device,
 ) -> Result<
     (
         DeviceArray<ActiveRuntime, F>,
@@ -703,7 +734,7 @@ where
 {
     let (x_train, (n_train, n_features)) =
         validate_kneighbors::<F>(x_train, train_shape, xq, shape, k)?;
-    metric_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k, metric)
+    metric_topk::<F>(pool, x_train, (n_train, n_features), xq, shape, k, metric, device)
 }
 
 /// The `distance → select-k` DISPATCH, in one place: host arm, tuned Euclidean
@@ -765,6 +796,7 @@ fn metric_topk<F>(
     shape: (usize, usize),
     k: usize,
     metric: Metric,
+    device: Device,
 ) -> Result<
     (
         DeviceArray<ActiveRuntime, F>,
@@ -792,7 +824,16 @@ where
         )
         .map_err(AlgoError::Prim);
     }
-    if knn_host_applicable(n_query, n_train, n_features, k, tuned_euclidean) {
+    // CAPABILITY first, preference second (DEVICE-PARAM-01). The host top-k
+    // arm indexes `k` into a length-`n_train` row, so `device = Cpu` cannot
+    // force it when `k > n_train` — there is no host implementation to pick.
+    // Only the PERF half (backend name, tuned-arm availability, the
+    // `MLRS_KNN_HOST` flag) is overridable.
+    if knn_host_possible(n_query, n_train, n_features, k)
+        && device.prefers_host(|| {
+            knn_host_applicable(n_query, n_train, n_features, k, tuned_euclidean)
+        })
+    {
         return knn_host_topk::<F>(
             pool,
             xq,

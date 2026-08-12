@@ -1294,6 +1294,26 @@ pub enum BuildError {
         value: String,
     },
 
+    /// An unrecognised `device` string was supplied (DEVICE-PARAM-01). The
+    /// [`TryFrom<&str>`](core::convert::TryFrom) enum-parse failure folded into
+    /// `BuildError` alongside [`BuildError::UnknownSolver`], so one mapper
+    /// covers every `StrOptions`-shaped rejection.
+    #[error("unknown device '{value}' (expected one of 'auto', 'cpu', 'gpu')")]
+    UnknownDevice {
+        /// The unrecognised placement name the caller supplied.
+        value: String,
+    },
+
+    /// An unrecognised `gcv_mode` string was supplied to `RidgeCV` (the
+    /// [`TryFrom<&str>`](core::convert::TryFrom) enum-parse failure folded into
+    /// `BuildError`, exactly as [`BuildError::UnknownSolver`] is). Mirrors
+    /// sklearn's `StrOptions({"auto", "svd", "eigen"})` rejection.
+    #[error("unknown gcv_mode '{value}' (expected one of 'auto', 'svd', 'eigen')")]
+    UnknownGcvMode {
+        /// The unrecognised mode name the caller supplied.
+        value: String,
+    },
+
     /// `solver='lbfgs'` was requested with `positive=False`. sklearn's
     /// `Ridge.fit` raises exactly this combination (`"'lbfgs' solver can be used
     /// only when positive=True."`) because the L-BFGS arm exists solely to carry

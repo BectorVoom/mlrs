@@ -69,6 +69,16 @@ use mlrs_backend::prims::rng::SplitMix64;
 /// path can run there at all, so the capability check is NOT overridable by the
 /// `MLRS_UMAP_HOST_LAYOUT` A/B knob, which stays a pure perf switch. See
 /// `mlrs_backend::capability::f64_transcendental_supported`.
+/// Can the DEVICE arm run at all for this float width?
+///
+/// The CAPABILITY half of [`host_layout_applicable`], split out under DEVICE-PARAM-01.
+/// `device='gpu'` may override the PERF half of that gate; overriding THIS half
+/// is not a slowdown but a crash — see [`host_layout_applicable`]'s docs for the measured
+/// `ACO ERROR ... signal: 11` shader-compiler segfault.
+pub fn device_layout_possible<F>() -> bool {
+    !(std::mem::size_of::<F>() == 8 && !capability::f64_transcendental_supported())
+}
+
 pub fn host_layout_applicable<F>() -> bool {
     if std::mem::size_of::<F>() == 8 && !capability::f64_transcendental_supported() {
         return true;

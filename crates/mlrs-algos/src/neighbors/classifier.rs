@@ -60,6 +60,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::knn::device_copy;
@@ -103,6 +104,10 @@ pub struct KNeighborsClassifier<F, S = Unfit> {
     /// The distance the neighbor search runs under. Carries the Minkowski
     /// exponent in its own payload — there is no separate `p` field.
     metric: Metric,
+    /// Where to run the neighbour search (DEVICE-PARAM-01). `Auto` keeps the
+    /// existing gate; `Cpu`/`Gpu` override its PERF half only — the capability
+    /// half (`k <= n_train`, non-empty operands) is never overridable.
+    device: Device,
     /// Device-resident training matrix (`n_train × n_features`, row-major),
     /// `None` until `fit`.
     x_train_: Option<DeviceArray<ActiveRuntime, F>>,
@@ -138,6 +143,7 @@ where
             n_neighbors: KNN_CLF_DEFAULT_N_NEIGHBORS,
             weights: KNN_CLF_DEFAULT_WEIGHTS,
             metric: KNN_CLF_DEFAULT_METRIC,
+            device: Device::Auto,
             x_train_: None,
             train_shape_: None,
             y_class_: None,
@@ -161,6 +167,7 @@ where
             n_neighbors: self.n_neighbors,
             weights: self.weights,
             metric: self.metric,
+            device: self.device,
         }
     }
 
@@ -173,6 +180,7 @@ where
         self.n_neighbors == other.n_neighbors
             && self.weights == other.weights
             && self.metric == other.metric
+            && self.device == other.device
     }
 
     /// The configured neighbor count (read pre-fit).
@@ -234,6 +242,7 @@ where
             n_neighbors: self.n_neighbors,
             weights: self.weights,
             metric: self.metric,
+            device: self.device,
             x_train_: Some(x),
             train_shape_: Some(shape),
             n_classes_: labels.classes.len(),
@@ -448,6 +457,7 @@ pub struct KNeighborsClassifierBuilder {
     n_neighbors: usize,
     weights: Weights,
     metric: Metric,
+    device: Device,
 }
 
 impl Default for KNeighborsClassifierBuilder {
@@ -461,6 +471,13 @@ impl Default for KNeighborsClassifierBuilder {
 }
 
 impl KNeighborsClassifierBuilder {
+    /// Pin the execution arm of the neighbour search (DEVICE-PARAM-01).
+    /// [`Device::Auto`] keeps the existing heuristic.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     /// Set the neighbor count `n_neighbors`.
     pub fn n_neighbors(mut self, v: usize) -> Self {
         self.n_neighbors = v;
@@ -520,6 +537,7 @@ impl KNeighborsClassifierBuilder {
             n_neighbors: self.n_neighbors,
             weights: self.weights,
             metric: self.metric,
+            device: self.device,
             x_train_: None,
             train_shape_: None,
             y_class_: None,
@@ -626,6 +644,7 @@ where
             shape,
             k,
             self.metric,
+            self.device,
         )?;
         idx_dev.release_into(pool);
         // The distances are needed ONLY for `1/d` weighting. `val_dev` holds the
@@ -813,6 +832,7 @@ where
             shape,
             k,
             self.metric,
+            self.device,
         )?;
         Ok((distances, indices))
     }

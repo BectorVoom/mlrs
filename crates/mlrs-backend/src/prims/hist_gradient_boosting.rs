@@ -48,6 +48,7 @@ use mlrs_kernels::gbt::{
 use mlrs_kernels::tree::{rf_bin_features, rf_bin_features_t, rf_hist_cum};
 
 use crate::device_array::DeviceArray;
+use crate::device::Device;
 use crate::pool::BufferPool;
 use crate::prims::random_forest::{
     compute_edges, fits_u32, launch_cubes_256, partition_blocks, RF_MAX_DEPTH_CAP,
@@ -241,12 +242,23 @@ where
 
 /// Fit a HistGradientBoosting REGRESSOR (squared error). `y` is the length-`n`
 /// device target; the baseline is its mean (sklearn `fit_intercept_only`).
+/// Which boosting-loop arm `hgb_fit_*` takes for `device` — `"cpu"` or `"gpu"`.
+///
+/// A pure function of `(device, backend)`: the loop's arm does not depend on
+/// the data, so a caller can report `device_` without the fit handing it back.
+/// Exists because `hgb_host::host_fit_applicable` — the capability half — is
+/// crate-private and must stay that way.
+pub fn hgb_device_arm(device: Device) -> &'static str {
+    Device::resolved_name(device.prefers_host(super::hgb_host::host_fit_applicable))
+}
+
 pub fn hgb_fit_reg<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
     shape: (usize, usize),
     y: &DeviceArray<ActiveRuntime, F>,
     params: &HgbParams,
+    device: Device,
 ) -> Result<HgbModel<F>, PrimError>
 where
     F: Float + CubeElement + Pod,
@@ -264,7 +276,7 @@ where
     let y_host = y.to_host(pool);
     let mean = y_host.iter().map(|&v| host_to_f64(v)).sum::<f64>() / n as f64;
     drop(y_host);
-    hgb_fit_impl::<F>(pool, x, shape, HgbTarget::Reg(y), &[mean], 1, params)
+    hgb_fit_impl::<F>(pool, x, shape, HgbTarget::Reg(y), &[mean], 1, params, device)
 }
 
 /// Fit a HistGradientBoosting CLASSIFIER. `y_idx` are DENSE class indices
@@ -279,6 +291,7 @@ pub fn hgb_fit_class<F>(
     y_idx: &[u32],
     n_classes: usize,
     params: &HgbParams,
+    device: Device,
 ) -> Result<HgbModel<F>, PrimError>
 where
     F: Float + CubeElement + Pod,
@@ -339,6 +352,7 @@ where
             &[baseline],
             2,
             params,
+            device,
         )?;
         y_dev.release_into(pool);
         Ok(model)
@@ -360,6 +374,7 @@ where
             &baseline,
             n_classes,
             params,
+            device,
         )?;
         y_dev.release_into(pool);
         Ok(model)
@@ -634,6 +649,7 @@ fn hgb_fit_impl<F>(
     baseline: &[f64],
     n_classes: usize,
     params: &HgbParams,
+    device: Device,
 ) -> Result<HgbModel<F>, PrimError>
 where
     F: Float + CubeElement + Pod,
@@ -668,7 +684,10 @@ where
     //     bit-identically without paying `cubecl-cpu`'s thread-per-unit launch
     //     for every one of the `iters × (depth + 1)` levels. Only the finished
     //     model arrays go to the device, so predict is unchanged. ---
-    if super::hgb_host::host_fit_applicable() {
+    // The host boosting loop is a bit-identical replay, so the preference
+    // only decides WHERE — `hgb_host::host_fit_applicable`'s backend check
+    // stays inside it as the capability half.
+    if hgb_device_arm(device) == "cpu" {
         let (loss, y_f): (super::hgb_host::HostLoss<'_>, Vec<F>) = match &target {
             HgbTarget::Reg(y) => (super::hgb_host::HostLoss::Reg, y.to_host(pool)),
             HgbTarget::Binary(y) => (super::hgb_host::HostLoss::Binary, y.to_host(pool)),

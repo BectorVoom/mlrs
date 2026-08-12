@@ -93,9 +93,12 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::gmm_device::{gmm_device_applicable, GmmDevice};
+use mlrs_backend::prims::gmm_device::{
+    gmm_device_applicable, gmm_device_possible, GmmDevice,
+};
 use mlrs_backend::prims::gmm_host::{
     cholesky_lower_blocks, log_det_cholesky, logsumexp_rows, precisions_cholesky,
     precisions_from_cholesky, weighted_log_prob_biased, CovarianceType, GmmHost,
@@ -278,9 +281,15 @@ where
     /// consuming typestate `fit` cannot keep it on the estimator the way
     /// sklearn does — see [`BayesianGaussianMixture::into_warm_start`]).
     warm: Option<BayesianMixtureParams>,
+    /// Where to run the EM loop (DEVICE-PARAM-01). `Auto` keeps the
+    /// `gmm_device_applicable` gate — backend, `f64` capability, `f64`
+    /// transcendentals, the `MLRS_GMM_DEVICE` flag, then a size floor.
+    device: Device,
 
     // ---- fitted state (`None` / zero while `Unfit`) ----
     params: Option<BayesianMixtureParams>,
+    /// The EM engine that ACTUALLY ran (`"cpu"` / `"gpu"`), `None` until `fit`.
+    device_: Option<&'static str>,
     priors: Option<MixturePriors>,
     converged_: bool,
     n_iter_: usize,
@@ -375,7 +384,9 @@ where
             verbose: 0,
             verbose_interval: 10,
             warm: None,
+            device: Device::Auto,
             params: None,
+            device_: None,
             priors: None,
             converged_: false,
             n_iter_: 0,
@@ -398,6 +409,7 @@ where
     /// hyperparameter (BLDR-01, single source of the defaults).
     pub fn into_builder(self) -> BayesianGaussianMixtureBuilder {
         BayesianGaussianMixtureBuilder {
+            device: self.device,
             n_components: self.n_components,
             covariance_type: self.covariance_type.name().to_string(),
             tol: self.tol,
@@ -442,6 +454,7 @@ where
             && self.warm_start == other.warm_start
             && self.verbose == other.verbose
             && self.verbose_interval == other.verbose_interval
+            && self.device == other.device
     }
 
     /// Should `fit` take [`BayesianGaussianMixture::fit_from_host_slice`]
@@ -470,7 +483,14 @@ where
     /// docs, which this mirrors exactly. `fit_core` consults this ONCE per
     /// fit, before the `n_init` restart loop.
     pub fn device_fit_applicable(&self, shape: (usize, usize)) -> bool {
-        gmm_device_applicable(shape.0, shape.1, self.n_components)
+        // Phrased as "should the DEVICE arm run", so this takes
+        // `prefers_device` rather than the negation of `prefers_host`: the host
+        // EM engine is always available, and the only question is whether the
+        // kernels are worth it.
+        gmm_device_possible()
+            && self
+                .device
+                .prefers_device(|| gmm_device_applicable(shape.0, shape.1, self.n_components))
     }
 
     /// `fit` over a HOST slice — the no-upload-by-default, Python-boundary
@@ -531,6 +551,13 @@ where
 
         // The device EM engine, built ONCE (not per restart) when applicable —
         // mirrors `GaussianMixture::fit_core` exactly (module docs).
+        // Recorded from the gate that actually built the engine, so `device_`
+        // cannot describe an arm the fit did not take.
+        let device_arm = if self.device_fit_applicable(shape) {
+            "gpu"
+        } else {
+            "cpu"
+        };
         let mut device: Option<GmmDevice> = if self.device_fit_applicable(shape) {
             Some(GmmDevice::new(pool, x, n, d, k, ct, self.reg_covar).map_err(AlgoError::Prim)?)
         } else {
@@ -635,6 +662,8 @@ where
         }
 
         Ok(BayesianGaussianMixture {
+            device: self.device,
+            device_: Some(device_arm),
             n_components: self.n_components,
             covariance_type: self.covariance_type,
             tol: self.tol,
@@ -1134,6 +1163,15 @@ where
     }
 
     /// `converged_` — did the best restart hit `|Δ lower_bound| < tol`?
+    /// The EM engine that ACTUALLY ran, `"cpu"` or `"gpu"` (DEVICE-PARAM-01).
+    ///
+    /// `device='gpu'` overrides the SIZE half of `gmm_device_applicable`, not
+    /// its capability half: a backend without `f64` transcendentals cannot run
+    /// the device engine at all, and this reports the host fallback.
+    pub fn device_arm(&self) -> Option<&'static str> {
+        self.device_
+    }
+
     pub fn converged(&self) -> bool {
         self.converged_
     }
@@ -1204,7 +1242,9 @@ where
             verbose: self.verbose,
             verbose_interval: self.verbose_interval,
             warm: self.warm,
+            device: self.device,
             params: None,
+            device_: None,
             priors: None,
             converged_: false,
             n_iter_: 0,
@@ -1732,6 +1772,7 @@ fn validate_covariance_prior(c: &[f64], d: usize, ct: CovarianceType) -> Result<
 /// they become typed enums or a [`BuildError`]).
 #[derive(Debug, Clone)]
 pub struct BayesianGaussianMixtureBuilder {
+    device: Device,
     n_components: usize,
     covariance_type: String,
     tol: f64,
@@ -1764,6 +1805,14 @@ impl Default for BayesianGaussianMixtureBuilder {
 }
 
 impl BayesianGaussianMixtureBuilder {
+    /// Pin the EM engine (DEVICE-PARAM-01). [`Device::Auto`] keeps the
+    /// `gmm_device_applicable` gate; `Cpu`/`Gpu` override its SIZE decision.
+    /// The capability half still applies — see [`BayesianGaussianMixture::device_arm`].
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     /// Set `n_components` — an UPPER BOUND on the number of components, not a
     /// count (see the module docs).
     pub fn n_components(mut self, v: usize) -> Self {
@@ -1951,6 +2000,8 @@ impl BayesianGaussianMixtureBuilder {
         let weight_concentration_prior_type =
             WeightConcentrationPriorType::try_from(self.weight_concentration_prior_type.as_str())?;
         Ok(BayesianGaussianMixture {
+            device: self.device,
+            device_: None,
             n_components: self.n_components,
             covariance_type,
             tol: self.tol,

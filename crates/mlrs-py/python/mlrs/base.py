@@ -36,10 +36,69 @@ class MlrsBase(BaseEstimator):
       - ``fit`` returns ``self`` (PY-01).
       - Fitted attributes end with ``_`` and raise ``NotFittedError`` before
         ``fit`` (via :meth:`_check_fitted`).
+      - Estimators with a real host/device split take ``device='auto'|'cpu'|
+        'gpu'`` and expose ``device_`` (the arm that ran). Those that have only
+        one arm for every configuration do NOT take the parameter, rather than
+        accepting it and ignoring it — see :meth:`_device`.
     """
 
-    def __init__(self, output_type="input"):
+    # The three execution-placement spellings, shared so no shim can invent a
+    # fourth. Mirrors `mlrs_backend::device::Device` one-for-one.
+    _DEVICE_CHOICES = ("auto", "cpu", "gpu")
+
+    def __init__(self, output_type="input", device="auto"):
         self.output_type = output_type
+        self.device = device
+
+    # -- execution placement (DEVICE-PARAM-01) ----------------------------- #
+
+    def _device(self):
+        """Validate ``self.device`` and hand back the string the Rust ctor takes.
+
+        The VALIDATION lives here rather than in each shim, but the ``device``
+        parameter itself still has to appear in every subclass ``__init__``
+        signature: sklearn's ``BaseEstimator._get_param_names`` introspects the
+        CONCRETE class's constructor, so a parameter declared only on this base
+        would be invisible to ``get_params`` and silently dropped by ``clone``.
+        Hoisting the declaration is not available to us; hoisting the logic is,
+        and that is what this is.
+
+        Rejecting here rather than at the Rust boundary keeps the error a plain
+        Python ``ValueError`` naming the estimator, which is what a caller who
+        typo'd ``device='cuda'`` needs to read — the Rust side rejects it too
+        (``BuildError::UnknownDevice``), so a Rust-native caller is not
+        relying on this check.
+        """
+        device = getattr(self, "device", "auto")
+        if device not in self._DEVICE_CHOICES:
+            raise ValueError(
+                f"{type(self).__name__}: device={device!r} is not one of "
+                f"{self._DEVICE_CHOICES}."
+            )
+        return device
+
+    @property
+    def device_(self):
+        """The execution arm that ACTUALLY ran — ``'cpu'`` or ``'gpu'``.
+
+        Not the same thing as the ``device`` you asked for. ``device`` is a
+        preference, and a configuration with only one implementation cannot
+        honour it (``Ridge(solver='lsqr')`` has no host ingress); the fit still
+        runs and this reports what carried it. The estimator never silently
+        substitutes an arm without saying so.
+        """
+        self._check_fitted()
+        used = getattr(self._mlrs_obj, "device_used", None)
+        if used is None:
+            raise AttributeError(
+                f"{type(self).__name__} does not report a single execution arm. "
+                "Either it has one arm for every configuration, or (the "
+                "neighbour estimators) it chooses per QUERY rather than at fit "
+                "- the gate reads `n_query` and `k`, which `fit` has not seen. "
+                "`device` is still honoured; there is simply no one arm for a "
+                "fitted estimator to name."
+            )
+        return used()
 
     # -- ingress (D-02) ---------------------------------------------------- #
 

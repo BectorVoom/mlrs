@@ -105,8 +105,25 @@ use super::sgd::{loss_id, optimal_t0, schedule_eta, SgdParams, SGD_DEFAULT_MAX_I
 /// device boundary; cuda/rocm are left on the device path (untestable in this
 /// environment — do not extrapolate this decision onto them without measuring
 /// on that hardware).
-pub(crate) fn host_solve_applicable() -> bool {
+/// Whether a host-resident SGD solve EXISTS on this backend — a capability,
+/// not a preference.
+///
+/// `sgd_solve_host_slice` is compiled for cpu and wgpu only; on cuda/rocm it
+/// returns `PrimError` rather than falling back, so a caller that forces the
+/// host arm there gets an ERROR, not a slow fit. Split out of
+/// [`host_solve_applicable`] so `device="cpu"` can override the perf half
+/// (`MLRS_SGD_HOST`) without overriding this one.
+///
+/// Found by running the Python device suite on rocm: `device="cpu"` on
+/// `MBSGDClassifier` raised `primitive 'sgd_solve_host_slice': the active
+/// backend does not support a host-resident SGD solve`. A placement preference
+/// must degrade to the other arm, never to an exception.
+pub fn sgd_host_possible() -> bool {
     matches!(crate::capability::active_backend_name(), "cpu" | "wgpu")
+}
+
+pub(crate) fn host_solve_applicable() -> bool {
+    sgd_host_possible()
         && crate::abflag::var("MLRS_SGD_HOST")
             .map(|v| v != "0")
             .unwrap_or(true)

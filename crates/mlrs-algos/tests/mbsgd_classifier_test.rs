@@ -493,7 +493,9 @@ fn host_slice_ingress_matches_device_ingress() {
             .expect("build")
     };
 
-    if !mlrs_backend::prims::sgd::sgd_host_available() {
+    if !mlrs_backend::prims::sgd::sgd_host_available(
+        mlrs_backend::device::Device::Auto,
+    ) {
         let err = build()
             .fit_from_host_slice(&mut pool, x, y, (N_SAMPLES, N_FEATURES))
             .err();
@@ -697,7 +699,9 @@ fn multiclass_ovr_fit_and_predict() {
 /// disjoint row bands vs. a sequential per-class loop).
 #[test]
 fn multiclass_host_slice_matches_device_ingress() {
-    if !mlrs_backend::prims::sgd::sgd_host_available() {
+    if !mlrs_backend::prims::sgd::sgd_host_available(
+        mlrs_backend::device::Device::Auto,
+    ) {
         println!("host-slice ingress is cpu/wgpu-only: SKIPPED");
         return;
     }

@@ -30,6 +30,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{ArrayArg, CubeCount, CubeDim, CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::distance::distance;
@@ -123,6 +124,11 @@ pub enum Init {
 /// `Umap::<F>::new()` lands in the freshly-built state.
 pub struct Umap<F, S = Unfit> {
     // --- UMAP-01 hyperparameter surface (data-independent) ---
+    /// Where to run the kNN graph and the layout epochs (DEVICE-PARAM-01).
+    /// `Auto` keeps the existing `MLRS_UMAP_HOST_*` ladders; `Cpu`/`Gpu`
+    /// override their PERF half only — the `f64`-transcendental capability
+    /// check is never overridable (it guards a shader-compiler segfault).
+    device: Device,
     /// Local neighborhood size (`n_neighbors`, default 15).
     n_neighbors: usize,
     /// Embedding dimensionality (`n_components`, default 2).
@@ -180,6 +186,7 @@ where
     /// trusted valid, so this bypasses [`UmapBuilder::build`]'s validation.
     pub fn new() -> Self {
         Self {
+            device: Device::Auto,
             n_neighbors: 15,
             n_components: 2,
             min_dist: 0.1,
@@ -242,6 +249,7 @@ where
             && self.negative_sample_rate == other.negative_sample_rate
             && self.a == other.a
             && self.b == other.b
+            && self.device == other.device
     }
 
     /// Decompose this (unfit) estimator back into its builder, copying every
@@ -250,6 +258,7 @@ where
     /// constructed estimator before fitting.
     pub fn into_builder(self) -> UmapBuilder {
         UmapBuilder {
+            device: self.device,
             n_neighbors: self.n_neighbors,
             n_components: self.n_components,
             min_dist: self.min_dist,
@@ -284,6 +293,7 @@ where
 /// holding literals.
 #[derive(Debug, Clone, Copy)]
 pub struct UmapBuilder {
+    device: Device,
     n_neighbors: usize,
     n_components: usize,
     min_dist: f64,
@@ -312,6 +322,13 @@ impl Default for UmapBuilder {
 }
 
 impl UmapBuilder {
+    /// Pin the execution arm of the kNN graph and the layout epochs
+    /// (DEVICE-PARAM-01). [`Device::Auto`] keeps the existing heuristics.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     /// Set the local neighborhood size `n_neighbors`.
     pub fn n_neighbors(mut self, v: usize) -> Self {
         self.n_neighbors = v;
@@ -422,6 +439,7 @@ impl UmapBuilder {
             });
         }
         Ok(Umap {
+            device: self.device,
             n_neighbors: self.n_neighbors,
             n_components: self.n_components,
             min_dist: self.min_dist,
@@ -502,6 +520,7 @@ where
         let x_train = DeviceArray::from_host(pool, &x_train_host);
 
         Ok(Umap {
+            device: self.device,
             n_neighbors: self.n_neighbors,
             n_components: self.n_components,
             min_dist: self.min_dist,
@@ -747,6 +766,7 @@ where
         cfg.negative_sample_rate,
         n_epochs,
         seed,
+        cfg.device,
     );
 
     // Extract the m new-point rows (the tail of the combined buffer).
@@ -1009,7 +1029,13 @@ where
     // On the cpu backend the device prim's query-axis tiling costs four orders of
     // magnitude for no benefit (see `umap_host_knn`), so the same graph is built
     // by a direct host scan there. Every other backend keeps the prim.
-    let (knn_idx_host, knn_dist_host) = if umap_host_knn::host_knn_applicable::<F>() {
+    // Capability first (a device kNN with no f64 transcendentals SEGFAULTS the
+    // shader compiler), preference second.
+    let host_knn = !umap_host_knn::device_knn_possible::<F>()
+        || cfg
+            .device
+            .prefers_host(umap_host_knn::host_knn_applicable::<F>);
+    let (knn_idx_host, knn_dist_host) = if host_knn {
         let x_host: Vec<f64> = x.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
         umap_host_knn::host_knn(&x_host, n, d, k, cfg.metric)
     } else {
@@ -1135,6 +1161,7 @@ where
         cfg.negative_sample_rate,
         n_epochs,
         seed,
+        cfg.device,
     );
 
     Ok(init.iter().map(|&v| f64_to_host::<F>(v)).collect())
@@ -1207,10 +1234,14 @@ fn run_epochs<F>(
     negative_sample_rate: usize,
     n_epochs: usize,
     seed: u64,
+    device: Device,
 ) where
     F: Float + CubeElement + Pod,
 {
-    if umap_host_layout::host_layout_applicable::<F>() {
+    // Capability first, as in the kNN gate above.
+    let host_layout = !umap_host_layout::device_layout_possible::<F>()
+        || device.prefers_host(umap_host_layout::host_layout_applicable::<F>);
+    if host_layout {
         let owners =
             umap_host_layout::OwnerIndex::build(head, tail, epochs_per_sample, n_owners);
         let params = umap_host_layout::LayoutParams {

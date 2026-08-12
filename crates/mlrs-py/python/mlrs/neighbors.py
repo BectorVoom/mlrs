@@ -713,6 +713,7 @@ class NearestNeighbors(_NeighborsBase):
         p=2,
         metric_params=None,
         n_jobs=None,
+        device="auto",
     ):
         self.n_neighbors = n_neighbors
         self.output_type = output_type
@@ -723,6 +724,7 @@ class NearestNeighbors(_NeighborsBase):
         self.p = p
         self.metric_params = metric_params
         self.n_jobs = n_jobs
+        self.device = device
 
     def _validate_params_for_fit(self):
         super()._validate_params_for_fit()
@@ -741,7 +743,9 @@ class NearestNeighbors(_NeighborsBase):
         metric_name, device_p = self._device_metric_args(
             effective_metric, effective_p
         )
-        obj = self._ext().NearestNeighbors(self.n_neighbors, metric_name, device_p)
+        obj = self._ext().NearestNeighbors(
+            self.n_neighbors, metric_name, device_p, self._device()
+        )
         obj.fit(xa, rows, cols)
         self._mlrs_obj = obj
 
@@ -804,6 +808,7 @@ class KNeighborsClassifier(ClassifierMixin, _NeighborsBase):
         metric="minkowski",
         metric_params=None,
         n_jobs=None,
+        device="auto",
     ):
         self.n_neighbors = n_neighbors
         self.output_type = output_type
@@ -814,6 +819,7 @@ class KNeighborsClassifier(ClassifierMixin, _NeighborsBase):
         self.metric = metric
         self.metric_params = metric_params
         self.n_jobs = n_jobs
+        self.device = device
 
     # -- fit ----------------------------------------------------------------- #
 
@@ -880,7 +886,7 @@ class KNeighborsClassifier(ClassifierMixin, _NeighborsBase):
         # the device object is built with the (unused) uniform weighting.
         device_weights = "uniform" if callable(self.weights) else self.weights
         obj = self._ext().KNeighborsClassifier(
-            self.n_neighbors, device_weights, metric_name, device_p
+            self.n_neighbors, device_weights, metric_name, device_p, self._device()
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj
@@ -1052,6 +1058,7 @@ class KNeighborsRegressor(RegressorMixin, _NeighborsBase):
         metric="minkowski",
         metric_params=None,
         n_jobs=None,
+        device="auto",
     ):
         self.n_neighbors = n_neighbors
         self.output_type = output_type
@@ -1062,6 +1069,7 @@ class KNeighborsRegressor(RegressorMixin, _NeighborsBase):
         self.metric = metric
         self.metric_params = metric_params
         self.n_jobs = n_jobs
+        self.device = device
 
     # -- fit ----------------------------------------------------------------- #
 
@@ -1087,7 +1095,7 @@ class KNeighborsRegressor(RegressorMixin, _NeighborsBase):
         # `predict` never asks it for a prediction in that case.
         device_weights = "uniform" if callable(self.weights) else self.weights
         obj = self._ext().KNeighborsRegressor(
-            self.n_neighbors, device_weights, metric_name, device_p
+            self.n_neighbors, device_weights, metric_name, device_p, self._device()
         )
         obj.fit(xa, ya, rows, cols)
         self._mlrs_obj = obj

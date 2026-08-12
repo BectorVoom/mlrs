@@ -27,6 +27,8 @@
 
 use pyo3::prelude::*;
 
+use crate::estimators::linear::parse_device;
+
 use mlrs_algos::manifold::umap::{Init, Metric, Umap};
 use mlrs_algos::typestate::{Fit, Transform};
 
@@ -42,6 +44,7 @@ crate::any_estimator_typestate! {
         random_state: Option<u64>, learning_rate: f64, set_op_mix_ratio: f64,
         local_connectivity: f64, repulsion_strength: f64,
         negative_sample_rate: usize, a: Option<f64>, b: Option<f64>,
+        device: String,
     },
 }
 
@@ -84,6 +87,7 @@ impl PyUMAP {
     pub fn unfit_default() -> Self {
         Self {
             inner: AnyUmap::Unfit {
+                device: "auto".to_string(),
                 n_neighbors: 15,
                 n_components: 2,
                 min_dist: 0.1,
@@ -123,18 +127,19 @@ impl PyUMAP {
     fn unfit_hyperparams(
         &self,
     ) -> PyResult<(
-        usize, usize, f64, f64, String, Option<usize>, String, Option<u64>, f64, f64, f64, f64, usize, Option<f64>, Option<f64>,
+        usize, usize, f64, f64, String, Option<usize>, String, Option<u64>, f64, f64, f64, f64, usize, Option<f64>, Option<f64>, String,
     )> {
         match &self.inner {
             AnyUmap::Unfit {
                 n_neighbors, n_components, min_dist, spread, metric, n_epochs,
                 init, random_state, learning_rate, set_op_mix_ratio,
                 local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+                device,
             } => Ok((
                 *n_neighbors, *n_components, *min_dist, *spread, metric.clone(),
                 *n_epochs, init.clone(), *random_state, *learning_rate,
                 *set_op_mix_ratio, *local_connectivity, *repulsion_strength,
-                *negative_sample_rate, *a, *b,
+                *negative_sample_rate, *a, *b, device.clone(),
             )),
             _ => Err(not_fitted("umap", "fit_transform (re-fit)")),
         }
@@ -170,6 +175,7 @@ impl PyUMAP {
         init = "spectral".to_string(), random_state = None, learning_rate = 1.0,
         set_op_mix_ratio = 1.0, local_connectivity = 1.0, repulsion_strength = 1.0,
         negative_sample_rate = 5, a = None, b = None,
+        device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -188,9 +194,11 @@ impl PyUMAP {
         negative_sample_rate: usize,
         a: Option<f64>,
         b: Option<f64>,
+        device: String,
     ) -> Self {
         Self {
             inner: AnyUmap::Unfit {
+                device,
                 n_neighbors,
                 n_components,
                 min_dist,
@@ -223,16 +231,18 @@ impl PyUMAP {
             n_neighbors, n_components, min_dist, spread, metric_s, n_epochs,
             init_s, random_state, learning_rate, set_op_mix_ratio,
             local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+            device_s,
         ) = match &self.inner {
             AnyUmap::Unfit {
                 n_neighbors, n_components, min_dist, spread, metric, n_epochs,
                 init, random_state, learning_rate, set_op_mix_ratio,
                 local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+                device,
             } => (
                 *n_neighbors, *n_components, *min_dist, *spread, metric.clone(),
                 *n_epochs, init.clone(), *random_state, *learning_rate,
                 *set_op_mix_ratio, *local_connectivity, *repulsion_strength,
-                *negative_sample_rate, *a, *b,
+                *negative_sample_rate, *a, *b, device.clone(),
             ),
             _ => return Err(not_fitted("umap", "re-fit")),
         };
@@ -245,6 +255,7 @@ impl PyUMAP {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let est = Umap::<f32>::builder()
+                        .device(parse_device(&device_s)?)
                         .n_neighbors(n_neighbors)
                         .n_components(n_components)
                         .min_dist(min_dist)
@@ -269,6 +280,7 @@ impl PyUMAP {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let est = Umap::<f64>::builder()
+                        .device(parse_device(&device_s)?)
                         .n_neighbors(n_neighbors)
                         .n_components(n_components)
                         .min_dist(min_dist)
@@ -350,6 +362,7 @@ impl PyUMAP {
             n_neighbors, n_components, min_dist, spread, metric_s, n_epochs,
             init_s, random_state, learning_rate, set_op_mix_ratio,
             local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+            device_s,
         ) = self.unfit_hyperparams()?;
         let metric = parse_metric(&metric_s)?;
         let init = parse_init(&init_s)?;
@@ -357,6 +370,7 @@ impl PyUMAP {
             let mut pool = crate::lock_pool();
             let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
             let est = Umap::<f32>::builder()
+                        .device(parse_device(&device_s)?)
                 .n_neighbors(n_neighbors)
                 .n_components(n_components)
                 .min_dist(min_dist)
@@ -386,6 +400,7 @@ impl PyUMAP {
             n_neighbors, n_components, min_dist, spread, metric_s, n_epochs,
             init_s, random_state, learning_rate, set_op_mix_ratio,
             local_connectivity, repulsion_strength, negative_sample_rate, a, b,
+            device_s,
         ) = self.unfit_hyperparams()?;
         let metric = parse_metric(&metric_s)?;
         let init = parse_init(&init_s)?;
@@ -394,6 +409,7 @@ impl PyUMAP {
             crate::capability::guard_f64()?;
             let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
             let est = Umap::<f64>::builder()
+                        .device(parse_device(&device_s)?)
                 .n_neighbors(n_neighbors)
                 .n_components(n_components)
                 .min_dist(min_dist)
@@ -477,6 +493,8 @@ struct TsneParams {
     method: String,
     angle: f64,
     n_jobs: Option<i32>,
+    /// DEVICE-PARAM-01, a STRING until `build` (D-09).
+    device: String,
 }
 
 /// Parse the sklearn-named `init` string. The `"array"` sentinel is emitted by
@@ -538,6 +556,7 @@ impl PyTSNE {
         Self {
             inner: AnyTsne::Unfit {},
             params: TsneParams {
+                device: "auto".to_string(),
                 n_components: 2,
                 perplexity: 30.0,
                 early_exaggeration: 12.0,
@@ -585,7 +604,7 @@ impl PyTSNE {
         metric_p = None, metric_v = None, metric_vi = None,
         init = String::from("pca"), init_array = None, verbose = 0,
         random_state = None, method = String::from("barnes_hut"),
-        angle = 0.5, n_jobs = None,
+        angle = 0.5, n_jobs = None, device = "auto".to_string(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -607,6 +626,7 @@ impl PyTSNE {
         method: String,
         angle: f64,
         n_jobs: Option<i32>,
+        device: String,
     ) -> PyResult<Self> {
         // Data-independent string surface validated AT CONSTRUCTION, so a typo
         // raises where the user wrote it rather than at `fit`.
@@ -616,6 +636,7 @@ impl PyTSNE {
         Ok(Self {
             inner: AnyTsne::Unfit {},
             params: TsneParams {
+                device,
                 n_components,
                 perplexity,
                 early_exaggeration,
@@ -693,6 +714,7 @@ impl PyTSNE {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let est = Tsne::<f32>::builder()
+                        .device(parse_device(&p.device)?)
                         .n_components(n_components)
                         .perplexity(perplexity)
                         .early_exaggeration(early_exaggeration)
@@ -719,6 +741,7 @@ impl PyTSNE {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let est = Tsne::<f64>::builder()
+                        .device(parse_device(&p.device)?)
                         .n_components(n_components)
                         .perplexity(perplexity)
                         .early_exaggeration(early_exaggeration)
@@ -764,6 +787,16 @@ impl PyTSNE {
         }
     }
     /// Final `kl_divergence_`, either dtype arm.
+    /// `device_` — the engine that actually ran (`"cpu"` / `"gpu"`), read off
+    /// the fitted estimator. `None` before `fit`.
+    fn device_used(&self) -> Option<&'static str> {
+        match &self.inner {
+            AnyTsne::F32(e) => e.device_arm(),
+            AnyTsne::F64(e) => e.device_arm(),
+            _ => None,
+        }
+    }
+
     fn kl_divergence_(&self) -> PyResult<f64> {
         match &self.inner {
             AnyTsne::F32(e) => Ok(e.kl_divergence()),

@@ -53,6 +53,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::rng::SplitMix64;
@@ -141,6 +142,19 @@ impl TsneMethod {
 /// pure PERF switch rather than a correctness one — the
 /// [`host_knn_applicable`](super::umap_host_knn::host_knn_applicable)
 /// precedent.
+/// Can the DEVICE engine run at all for this float width?
+///
+/// The CAPABILITY half of [`host_engine_applicable`], split out under
+/// DEVICE-PARAM-01. `device='gpu'` may override the PERF half; overriding this
+/// one is not a slowdown but a CRASH — on a backend without `f64`
+/// transcendentals the device path's `powf`/`exp` does not fail at launch, the
+/// driver's shader compiler segfaults (the measurement is on
+/// `umap_host_knn::host_knn_applicable`, which shares this shape).
+pub fn device_engine_possible<F>() -> bool {
+    !(std::mem::size_of::<F>() == 8
+        && !mlrs_backend::capability::f64_transcendental_supported())
+}
+
 pub fn host_engine_applicable<F>() -> bool {
     if std::mem::size_of::<F>() == 8
         && !mlrs_backend::capability::f64_transcendental_supported()
@@ -190,6 +204,12 @@ where
     verbose: usize,
     /// Seed for the `init='random'` SplitMix64 (sklearn `random_state`).
     seed: u64,
+    /// The engine that ACTUALLY ran (`"cpu"` / `"gpu"`), `None` until `fit`.
+    device_: Option<&'static str>,
+    /// Where to run the gradient descent (DEVICE-PARAM-01). `Auto` keeps the
+    /// `MLRS_TSNE_HOST`-then-backend ladder; `Cpu`/`Gpu` override its PERF half
+    /// only — [`device_engine_possible`] is never overridable.
+    device: Device,
     /// The gradient objective (sklearn `method`, default `'barnes_hut'`).
     method: TsneMethod,
     /// Barnes-Hut summary angle θ (sklearn `angle`, default 0.5). A cell
@@ -237,6 +257,8 @@ where
             init: TsneInit::Pca,
             verbose: 0,
             seed: 0,
+            device: Device::Auto,
+            device_: None,
             method: TsneMethod::BarnesHut,
             angle: 0.5,
             n_jobs: None,
@@ -269,6 +291,7 @@ where
             init: self.init,
             verbose: self.verbose,
             seed: self.seed,
+            device: self.device,
             method: self.method,
             angle: self.angle,
             n_jobs: self.n_jobs,
@@ -293,6 +316,19 @@ where
             && self.method == other.method
             && self.angle == other.angle
             && self.n_jobs == other.n_jobs
+            && self.device == other.device
+    }
+
+    /// Should the HOST t-SNE engine run, honouring `device` (DEVICE-PARAM-01)?
+    ///
+    /// Capability FIRST: with no `f64` transcendentals the device engine cannot
+    /// run at all, so the host arm is forced regardless of preference. Only
+    /// after that does `device` get to override the perf ladder.
+    fn host_engine_arm(&self) -> bool {
+        if !device_engine_possible::<F>() {
+            return true;
+        }
+        self.device.prefers_host(host_engine_applicable::<F>)
     }
 
     /// `fit_transform`: fit to `x` and return the fitted embedding host buffer
@@ -352,6 +388,7 @@ pub struct TsneBuilder {
     method: TsneMethod,
     angle: f64,
     n_jobs: Option<i32>,
+    device: Device,
 }
 
 impl Default for TsneBuilder {
@@ -362,6 +399,13 @@ impl Default for TsneBuilder {
 }
 
 impl TsneBuilder {
+    /// Pin the execution arm of the gradient descent (DEVICE-PARAM-01).
+    /// [`Device::Auto`] keeps the existing `MLRS_TSNE_HOST`-then-backend ladder.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     /// Set the embedding dimensionality `n_components`.
     pub fn n_components(mut self, v: usize) -> Self {
         self.n_components = v;
@@ -541,6 +585,8 @@ impl TsneBuilder {
             init: self.init,
             verbose: self.verbose,
             seed: self.seed,
+            device: self.device,
+            device_: None,
             method: self.method,
             angle: self.angle,
             n_jobs: self.n_jobs,
@@ -708,7 +754,7 @@ where
                 // The euclidean fast path stays on the DEVICE distance prim
                 // when the device arm is serving this backend; every other
                 // metric is host-only either way.
-                let dsq = if self.metric == TsneMetric::Euclidean && !host_engine_applicable::<F>() {
+                let dsq = if self.metric == TsneMetric::Euclidean && !self.host_engine_arm() {
                     let dsq_dev = squared_distance::<F>(pool, x, n, p);
                     let v: Vec<f64> = dsq_dev
                         .to_host(pool)
@@ -721,7 +767,7 @@ where
                     pairwise_squared(&x_host, n, p, self.metric, &rp, units)?
                 };
                 let p_joint = joint_probabilities(&dsq, n, self.perplexity, units);
-                if host_engine_applicable::<F>() {
+                if self.host_engine_arm() {
                     let outcome =
                         tsne_host::tsne_descent(&mut y, TsneP::Dense(&p_joint), &cfg);
                     (outcome.kl_divergence, outcome.n_iter)
@@ -738,6 +784,9 @@ where
         let y_f: Vec<F> = y.iter().map(|&v| f64_to_host::<F>(v)).collect();
         let embedding_ = DeviceArray::from_host(pool, &y_f);
 
+        // Recorded from the SAME predicate the descent branched on, so
+        // `device_` cannot name an engine the fit did not use.
+        let arm = if self.host_engine_arm() { "cpu" } else { "gpu" };
         Ok(Tsne {
             n_components: self.n_components,
             perplexity: self.perplexity,
@@ -751,6 +800,8 @@ where
             init: self.init,
             verbose: self.verbose,
             seed: self.seed,
+            device: self.device,
+            device_: Some(arm),
             method: self.method,
             angle: self.angle,
             n_jobs: self.n_jobs,
@@ -779,6 +830,12 @@ where
 
     /// The final KL divergence (sklearn `kl_divergence_`). `Some` by
     /// construction on the `Fitted` state.
+    /// The engine that ACTUALLY ran, `"cpu"` or `"gpu"` (DEVICE-PARAM-01);
+    /// `None` before `fit`.
+    pub fn device_arm(&self) -> Option<&'static str> {
+        self.device_
+    }
+
     pub fn kl_divergence(&self) -> f64 {
         self.kl_divergence_
             .expect("kl_divergence_ is Some by construction on Tsne<F, Fitted>")

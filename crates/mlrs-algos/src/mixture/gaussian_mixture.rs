@@ -46,9 +46,12 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
-use mlrs_backend::prims::gmm_device::{gmm_device_applicable, GmmDevice};
+use mlrs_backend::prims::gmm_device::{
+    gmm_device_applicable, gmm_device_possible, GmmDevice,
+};
 use mlrs_backend::prims::gmm_host::{
     cholesky_lower_blocks, invert_spd, logsumexp_rows, precisions_cholesky,
     precisions_from_cholesky, weighted_log_prob, CovarianceType, GmmHost, IllConditioned,
@@ -175,9 +178,15 @@ where
     /// (sklearn keeps them on the estimator; the consuming typestate `fit`
     /// cannot, so they ride here — see [`GaussianMixture::into_warm_start`]).
     warm: Option<MixtureParams>,
+    /// Where to run the EM loop (DEVICE-PARAM-01). `Auto` keeps the
+    /// `gmm_device_applicable` gate — backend, `f64` capability, `f64`
+    /// transcendentals, the `MLRS_GMM_DEVICE` flag, then a size floor.
+    device: Device,
 
     // ---- fitted state (`None` / zero while `Unfit`) ----
     params: Option<MixtureParams>,
+    /// The EM engine that ACTUALLY ran (`"cpu"` / `"gpu"`), `None` until `fit`.
+    device_: Option<&'static str>,
     converged_: bool,
     n_iter_: usize,
     lower_bound_: f64,
@@ -259,7 +268,9 @@ where
             verbose: 0,
             verbose_interval: 10,
             warm: None,
+            device: Device::Auto,
             params: None,
+            device_: None,
             converged_: false,
             n_iter_: 0,
             lower_bound_: f64::NEG_INFINITY,
@@ -282,6 +293,7 @@ where
     /// the defaults from [`GaussianMixture::new`] (BLDR-01, single source).
     pub fn into_builder(self) -> GaussianMixtureBuilder {
         GaussianMixtureBuilder {
+            device: self.device,
             n_components: self.n_components,
             covariance_type: self.covariance_type.name().to_string(),
             tol: self.tol,
@@ -317,6 +329,7 @@ where
             && self.warm_start == other.warm_start
             && self.verbose == other.verbose
             && self.verbose_interval == other.verbose_interval
+            && self.device == other.device
     }
 
     /// Should `fit` take [`GaussianMixture::fit_from_host_slice`] rather than
@@ -348,7 +361,14 @@ where
     /// restart loop, since the design and its geometry do not change across
     /// restarts.
     pub fn device_fit_applicable(&self, shape: (usize, usize)) -> bool {
-        gmm_device_applicable(shape.0, shape.1, self.n_components)
+        // Phrased as "should the DEVICE arm run", so this takes
+        // `prefers_device` rather than the negation of `prefers_host`: the host
+        // EM engine is always available, and the only question is whether the
+        // kernels are worth it.
+        gmm_device_possible()
+            && self
+                .device
+                .prefers_device(|| gmm_device_applicable(shape.0, shape.1, self.n_components))
     }
 
     /// `fit` over a HOST slice — the no-upload-by-default, Python-boundary
@@ -423,6 +443,13 @@ where
         // The device EM engine, built ONCE (not per restart) when applicable —
         // `x` is uploaded exactly once and `resp` stays device-resident for
         // every restart's whole `max_iter` loop.
+        // Recorded from the gate that actually built the engine, so `device_`
+        // cannot describe an arm the fit did not take.
+        let device_arm = if self.device_fit_applicable(shape) {
+            "gpu"
+        } else {
+            "cpu"
+        };
         let mut device: Option<GmmDevice> = if self.device_fit_applicable(shape) {
             Some(GmmDevice::new(pool, x, n, d, k, ct, self.reg_covar).map_err(AlgoError::Prim)?)
         } else {
@@ -531,6 +558,8 @@ where
         }
 
         Ok(GaussianMixture {
+            device: self.device,
+            device_: Some(device_arm),
             n_components: self.n_components,
             covariance_type: self.covariance_type,
             tol: self.tol,
@@ -766,6 +795,15 @@ where
     }
 
     /// `converged_` — did the LAST-BEST restart hit `|Δ lower_bound| < tol`?
+    /// The EM engine that ACTUALLY ran, `"cpu"` or `"gpu"` (DEVICE-PARAM-01).
+    ///
+    /// `device='gpu'` overrides the SIZE half of `gmm_device_applicable`, not
+    /// its capability half: a backend without `f64` transcendentals cannot run
+    /// the device engine at all, and this reports the host fallback.
+    pub fn device_arm(&self) -> Option<&'static str> {
+        self.device_
+    }
+
     pub fn converged(&self) -> bool {
         self.converged_
     }
@@ -838,7 +876,9 @@ where
             verbose: self.verbose,
             verbose_interval: self.verbose_interval,
             warm: self.warm,
+            device: self.device,
             params: None,
+            device_: None,
             converged_: false,
             n_iter_: 0,
             lower_bound_: self.lower_bound_,
@@ -1133,6 +1173,7 @@ where
 /// strings until `build`, where they become typed enums or a [`BuildError`]).
 #[derive(Debug, Clone)]
 pub struct GaussianMixtureBuilder {
+    device: Device,
     n_components: usize,
     covariance_type: String,
     tol: f64,
@@ -1165,6 +1206,14 @@ impl Default for GaussianMixtureBuilder {
 }
 
 impl GaussianMixtureBuilder {
+    /// Pin the EM engine (DEVICE-PARAM-01). [`Device::Auto`] keeps the
+    /// `gmm_device_applicable` gate; `Cpu`/`Gpu` override its SIZE decision.
+    /// The capability half still applies — see [`GaussianMixture::device_arm`].
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
+
     /// Set the number of mixture components `k`.
     pub fn n_components(mut self, v: usize) -> Self {
         self.n_components = v;
@@ -1310,6 +1359,8 @@ impl GaussianMixtureBuilder {
         )?;
         let init_params = InitParams::try_from(self.init_params.as_str())?;
         Ok(GaussianMixture {
+            device: self.device,
+            device_: None,
             n_components: self.n_components,
             covariance_type,
             tol: self.tol,

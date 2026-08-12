@@ -36,6 +36,7 @@
 
 #![cfg(not(feature = "cpu"))]
 
+use mlrs_backend::device::Device;
 use mlrs_backend::abflag;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
@@ -135,6 +136,7 @@ fn eval_with(
         f.targets.clone(),
         weighted.then(|| f.weights.clone()),
         fit_intercept,
+        Device::Auto,
     )
     .expect("HuberObjective::new rejected a valid geometry");
     let out = obj
@@ -349,7 +351,7 @@ fn device_ingress_matches_host_ingress() {
             HuberDesign::Device(&xd)
         };
         let obj =
-            HuberObjective::<f32>::new(&mut pool, design, (n, d), f.targets.clone(), None, true)
+            HuberObjective::<f32>::new(&mut pool, design, (n, d), f.targets.clone(), None, true, Device::Auto)
                 .expect("HuberObjective::new rejected a valid geometry");
         let ev = obj.eval(&mut pool, &f.w, 0.9, 1.35).expect("eval");
         let mask = obj

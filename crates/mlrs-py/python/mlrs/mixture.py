@@ -55,6 +55,7 @@ class GaussianMixture(MlrsBase):
         warm_start=False,
         verbose=0,
         verbose_interval=10,
+        device="auto",
         output_type="input",
     ):
         self.n_components = n_components
@@ -71,6 +72,7 @@ class GaussianMixture(MlrsBase):
         self.warm_start = warm_start
         self.verbose = verbose
         self.verbose_interval = verbose_interval
+        self.device = device
         self.output_type = output_type
 
     # -- fit ------------------------------------------------------------- #
@@ -105,6 +107,7 @@ class GaussianMixture(MlrsBase):
             self.warm_start,
             int(self.verbose),
             int(self.verbose_interval),
+            self._device(),
         )
 
     def fit(self, X, y=None):
@@ -330,6 +333,7 @@ class BayesianGaussianMixture(MlrsBase):
         warm_start=False,
         verbose=0,
         verbose_interval=10,
+        device="auto",
         output_type="input",
     ):
         # `n_components` is KEYWORD-ONLY here, matching sklearn's signature
@@ -351,6 +355,7 @@ class BayesianGaussianMixture(MlrsBase):
         self.warm_start = warm_start
         self.verbose = verbose
         self.verbose_interval = verbose_interval
+        self.device = device
         self.output_type = output_type
 
     # -- fit ------------------------------------------------------------- #
@@ -392,6 +397,7 @@ class BayesianGaussianMixture(MlrsBase):
             self.warm_start,
             int(self.verbose),
             int(self.verbose_interval),
+            self._device(),
         )
 
     def fit(self, X, y=None):

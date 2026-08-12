@@ -241,6 +241,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         PyElasticNet, PyLasso, PyLinearRegression, PyLinearSVC, PyLinearSVR,
         PyBayesianRidge, PyHuberRegressor, PyLogisticRegression, PyMBSGDClassifier,
         PyMBSGDRegressor, PyRidge,
+        PyRidgeCV,
         PyRidgeClassifier,
     };
     use estimators::manifold::{PyTSNE, PyUMAP};
@@ -261,6 +262,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRidge>()?;
     // RidgeClassifier (LINEAR-07): Ridge-as-classifier over a {-1,+1}-encoded
     // target, sharing Ridge's cpu shared-Gram fast path across target columns.
+    m.add_class::<PyRidgeCV>()?;
     m.add_class::<PyRidgeClassifier>()?;
     // BayesianRidge (LINEAR-06): the evidence-maximized sibling of Ridge —
     // the penalty is FITTED, not a hyperparameter.

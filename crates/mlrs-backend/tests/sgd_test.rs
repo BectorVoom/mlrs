@@ -20,6 +20,7 @@
 
 use cubecl::prelude::*;
 
+use mlrs_backend::device::Device;
 use mlrs_backend::capability;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
@@ -422,7 +423,7 @@ fn run_convex_objective<F: Float + CubeElement + bytemuck::Pod>(label: &str, tol
     };
 
     let (coef, intercept) =
-        sgd_solve::<F>(&mut pool, &x_dev, &y_dev, (n, d), &params).expect("sgd_solve converges");
+        sgd_solve::<F>(&mut pool, &x_dev, &y_dev, (n, d), &params, Device::Auto).expect("sgd_solve converges");
 
     let coef_h: Vec<f64> = coef.to_host(&pool).iter().map(|&v| from_f::<F>(v)).collect();
     let b_h = from_f::<F>(intercept.to_host(&pool)[0]);
@@ -727,7 +728,7 @@ fn sgd_tol_early_stop_converges() {
     };
 
     let (coef, intercept) =
-        sgd_solve::<f32>(&mut pool, &x_dev, &y_dev, (n, d), &params).expect("sgd_solve runs");
+        sgd_solve::<f32>(&mut pool, &x_dev, &y_dev, (n, d), &params, Device::Auto).expect("sgd_solve runs");
 
     let coef_h: Vec<f64> = coef.to_host(&pool).iter().map(|&v| v as f64).collect();
     let b_h = intercept.to_host(&pool)[0] as f64;

@@ -19,6 +19,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::sgd::sgd_solve;
@@ -39,6 +40,8 @@ use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 /// exist ONLY on `MBSGDRegressor<F, Fitted>` (the compile-time typestate
 /// replaces the old runtime `NotFitted` guard, D-03).
 pub struct MBSGDRegressor<F, S = Unfit> {
+    /// Where to run the heavy phase (DEVICE-PARAM-01).
+    device: Device,
     /// The lowered, validated hyperparameter bundle (D-06).
     config: SgdConfig,
     /// Fitted coefficients (device-resident), `None` until `fit`.
@@ -101,6 +104,7 @@ where
 /// `n_iter_no_change=5`.
 #[derive(Debug, Clone, Copy)]
 pub struct MBSGDRegressorBuilder {
+    device: Device,
     loss: Loss,
     penalty: Penalty,
     alpha: f64,
@@ -121,6 +125,7 @@ pub struct MBSGDRegressorBuilder {
 impl Default for MBSGDRegressorBuilder {
     fn default() -> Self {
         Self {
+            device: Device::Auto,
             loss: Loss::SquaredLoss,
             penalty: Penalty::L2,
             alpha: 1e-4,
@@ -141,6 +146,14 @@ impl Default for MBSGDRegressorBuilder {
 }
 
 impl MBSGDRegressorBuilder {
+
+    /// Pin the execution arm (DEVICE-PARAM-01). [`Device::Auto`] keeps the
+    /// existing gate and its `MLRS_*` A/B flag; `Cpu`/`Gpu` override its PERF
+    /// half only — each prim keeps its own capability checks inside.
+    pub fn device(mut self, v: Device) -> Self {
+        self.device = v;
+        self
+    }
     /// Set the loss family.
     pub fn loss(mut self, loss: Loss) -> Self {
         self.loss = loss;
@@ -302,6 +315,7 @@ impl MBSGDRegressorBuilder {
             n_iter_no_change: self.n_iter_no_change,
         };
         Ok(MBSGDRegressor {
+            device: self.device,
             config,
             coef_: None,
             intercept_: None,
@@ -347,9 +361,10 @@ where
         //     continuous response (no ±1 remap). A device failure is a typed
         //     PrimError wrapped via `?` (never a panic — T-10-03-03). ---
         let params = lower_config(&self.config);
-        let (coef, intercept) = sgd_solve::<F>(pool, x, y, shape, &params)?;
+        let (coef, intercept) = sgd_solve::<F>(pool, x, y, shape, &params, self.device)?;
 
         Ok(MBSGDRegressor {
+            device: self.device,
             config: self.config,
             coef_: Some(coef),
             intercept_: Some(intercept),
