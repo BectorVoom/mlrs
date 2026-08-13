@@ -48,6 +48,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -68,7 +69,25 @@ use crate::error::{AlgoError, BuildError};
 // device math is BYTE-IDENTICAL (D-03); only the signatures, the geometry guard
 // call (now `validate_geometry`), and the construction/reconstruction wrapper
 // change.
+use crate::kernel_persist::{
+    expect_len, read_resolved_gamma, read_x_fit, shape_2d, write_resolved_gamma, write_x_fit,
+    AlignedBytes, KernelFile, KernelWriter, LoadModel, PersistError, SaveModel, TensorRef,
+    KERNEL_KEY,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
+
+/// The `estimator` discriminator written into every `KernelRidge` file.
+///
+/// Load-bearing rather than decorative: a `KernelDensity` file holds an `X_fit_`
+/// of the same shape and dtype and a `param:kernel` under the same key, and the
+/// two vocabularies OVERLAP on `"linear"` while meaning entirely different
+/// functions by it. The tag is what establishes which vocabulary applies before
+/// either is parsed.
+const PERSIST_TAG: &str = "kernel_ridge";
+
+/// The tensor holding the dual coefficients, row-major
+/// `[n_samples, n_targets]` — sklearn's `dual_coef_`.
+const DUAL_COEF_NAME: &str = "dual_coef_";
 
 /// The kernel-family selector accepted at construction (D-01). Mirrors sklearn's
 /// `kernel=` string but typed; the hyperparameters (`gamma`/`degree`/`coef0`) are
@@ -87,13 +106,32 @@ pub enum KernelKind {
 }
 
 impl KernelKind {
-    /// The sklearn kernel name (for the [`AlgoError::InvalidKernel`] diagnostic).
-    fn name(self) -> &'static str {
+    /// The sklearn kernel name (for the [`AlgoError::InvalidKernel`] diagnostic,
+    /// and for the model file, which stores the variant as this string rather
+    /// than as an integer tag so adding a variant later cannot silently renumber
+    /// an existing file's).
+    pub fn name(self) -> &'static str {
         match self {
             KernelKind::Linear => "linear",
             KernelKind::Rbf => "rbf",
             KernelKind::Poly => "poly",
             KernelKind::Sigmoid => "sigmoid",
+        }
+    }
+
+    /// The inverse of [`KernelKind::name`]; `None` for an unrecognised string.
+    ///
+    /// Returns an `Option` rather than a `Result` so each caller frames the
+    /// failure in its own terms — a builder raises an `InvalidKernel` naming the
+    /// argument, while [`KernelRidge::load`] raises a
+    /// [`PersistError::BadMetadata`] naming the key it came from.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "linear" => Some(KernelKind::Linear),
+            "rbf" => Some(KernelKind::Rbf),
+            "poly" => Some(KernelKind::Poly),
+            "sigmoid" => Some(KernelKind::Sigmoid),
+            _ => None,
         }
     }
 }
@@ -310,6 +348,141 @@ where
             .as_ref()
             .expect("dual_coef_ is Some by construction on KernelRidge<F, Fitted>")
             .to_host(pool)
+    }
+}
+
+impl<F> SaveModel for KernelRidge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted regressor to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `X_fit_` | `F` (`F32`/`F64`) | `[n_samples, n_features]` |
+    /// | `dual_coef_` | `F` | `[n_samples, n_targets]` |
+    /// | `param:kernel` / `param:alpha` / `param:degree` / `param:coef0` | `__metadata__` scalar | — |
+    /// | `param:gamma` (optional) / `gamma_` | `__metadata__` scalar | — |
+    ///
+    /// The training matrix has to be here: a kernel method evaluates against
+    /// every training row at predict time, so `X_fit_` is not a fitting artifact
+    /// but the model itself — see [`kernel_persist`](crate::kernel_persist) for
+    /// why no compressed alternative is offered.
+    ///
+    /// `n_samples`/`n_features` come off `X_fit_`'s shape at load and
+    /// `n_targets` off `dual_coef_`'s, so none is stored again.
+    ///
+    /// Both the REQUESTED `gamma` and the RESOLVED one are written. Re-running
+    /// the `None → 1/n_features` resolution at load instead would put the same
+    /// rule in two places with nothing to keep them in step;
+    /// [`write_resolved_gamma`] documents the trade.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let (n_samples, n_features) = self.fit_shape_.ok_or_else(|| absent("fit_shape_"))?;
+        let n_targets = self.n_targets_.ok_or_else(|| absent("n_targets_"))?;
+        // Bound BEFORE the writer: `KernelWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let x_fit = self.x_fit_.as_ref().ok_or_else(|| absent("x_fit_"))?.to_host(pool);
+        let dual_coef = self
+            .dual_coef_
+            .as_ref()
+            .ok_or_else(|| absent("dual_coef_"))?
+            .to_host(pool);
+        // The RESOLVED coefficient, read off the typed kernel the fit baked it
+        // into rather than re-derived here.
+        let resolved_gamma = match self.kernel_.as_ref().ok_or_else(|| absent("kernel_"))? {
+            Kernel::Linear => 0.0,
+            Kernel::Rbf { gamma } => host_to_f64(*gamma),
+            Kernel::Poly { gamma, .. } => host_to_f64(*gamma),
+            Kernel::Sigmoid { gamma, .. } => host_to_f64(*gamma),
+        };
+
+        let mut w = KernelWriter::new(PERSIST_TAG);
+        w.scalar_str(KERNEL_KEY, self.kernel_kind.name());
+        w.scalar_f64("param:alpha", host_to_f64(self.alpha));
+        w.scalar_f64("param:degree", host_to_f64(self.degree));
+        w.scalar_f64("param:coef0", host_to_f64(self.coef0));
+        write_resolved_gamma(&mut w, self.gamma.map(host_to_f64), resolved_gamma);
+        write_x_fit(&mut w, &x_fit, n_samples, n_features)?;
+        w.tensor(
+            DUAL_COEF_NAME,
+            TensorRef::floats(&dual_coef, vec![n_samples, n_targets])?,
+        );
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for KernelRidge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the regressor back from `path`, re-uploading `X_fit_` and
+    /// `dual_coef_` to `pool`.
+    ///
+    /// The typed [`Kernel`] `predict` consumes is REBUILT here from the stored
+    /// kind and the stored RESOLVED coefficient — not re-resolved from
+    /// `param:gamma` and the feature count. That is what makes the file the
+    /// authority on what the saved model computed, rather than the build that
+    /// happens to read it.
+    ///
+    /// The file is untrusted input (T-04-01-01), so `X_fit_` defines
+    /// `n_samples` and `dual_coef_`'s row extent is checked against it before
+    /// any value is stored — a mismatch would otherwise index the training set
+    /// out of range on the first prediction.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<KernelRidge<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = KernelFile::parse(&raw, PERSIST_TAG)?;
+        let (x_fit, n_samples, n_features) = read_x_fit::<F>(&file)?;
+
+        let dual_v = file.tensor(DUAL_COEF_NAME)?;
+        let (dual_rows, n_targets) = shape_2d(&dual_v, DUAL_COEF_NAME)?;
+        expect_len(DUAL_COEF_NAME, dual_rows, n_samples, "rows")?;
+        if n_targets == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{DUAL_COEF_NAME}' declares 0 targets; a fitted \
+                     KernelRidge has at least one"
+                ),
+            });
+        }
+        let dual_coef = crate::kernel_persist::as_floats::<F>(&dual_v, DUAL_COEF_NAME)?;
+
+        let kernel_kind = KernelKind::from_name(file.scalar_str(KERNEL_KEY)?)
+            .ok_or(PersistError::BadMetadata { key: KERNEL_KEY })?;
+        let (gamma_request, gamma_resolved) = read_resolved_gamma(&file)?;
+        let degree = f64_to_host::<F>(file.scalar_f64("param:degree")?);
+        let coef0 = f64_to_host::<F>(file.scalar_f64("param:coef0")?);
+        let gamma = f64_to_host::<F>(gamma_resolved);
+
+        Ok(KernelRidge {
+            kernel_kind,
+            alpha: f64_to_host::<F>(file.scalar_f64("param:alpha")?),
+            gamma: gamma_request.map(f64_to_host::<F>),
+            degree,
+            coef0,
+            kernel_: Some(match kernel_kind {
+                KernelKind::Linear => Kernel::Linear,
+                KernelKind::Rbf => Kernel::Rbf { gamma },
+                KernelKind::Poly => Kernel::Poly {
+                    gamma,
+                    degree,
+                    coef0,
+                },
+                KernelKind::Sigmoid => Kernel::Sigmoid { gamma, coef0 },
+            }),
+            dual_coef_: Some(DeviceArray::from_host(pool, &dual_coef)),
+            x_fit_: Some(DeviceArray::from_host(pool, &x_fit)),
+            fit_shape_: Some((n_samples, n_features)),
+            n_targets_: Some(n_targets),
+            _state: PhantomData,
+        })
     }
 }
 

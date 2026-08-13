@@ -50,6 +50,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::*;
@@ -71,7 +72,32 @@ use crate::error::{AlgoError, BuildError};
 // ADOPTS the typestate `Fit` (its inherent `fit` becomes the consuming-self trait
 // impl on `Unfit`) and moves `ScoreSamples` to the typestate version, gated on
 // `Fitted` — bringing KernelDensity fully onto the SINGLE trait surface.
+use crate::kernel_persist::{
+    read_x_fit, write_x_fit, AlignedBytes, KernelFile, KernelWriter, LoadModel, PersistError,
+    SaveModel, KERNEL_KEY,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, ScoreSamples, Unfit};
+
+/// The `estimator` discriminator written into every `KernelDensity` file. See
+/// [`kernel_ridge`](crate::kernel_ridge)'s tag for why it is load-bearing —
+/// the two estimators' `param:kernel` vocabularies overlap on `"linear"` while
+/// meaning different functions by it.
+const PERSIST_TAG: &str = "kernel_density";
+
+/// The `__metadata__` key holding the bandwidth SPECIFICATION — the constructor
+/// argument, as its sklearn string.
+const BANDWIDTH_SPEC_KEY: &str = "param:bandwidth";
+
+/// The `__metadata__` key holding the RESOLVED numeric bandwidth.
+///
+/// No `param:` prefix: `bandwidth_` is sklearn's fitted attribute. It is stored
+/// alongside the specification rather than re-derived from it, for the reason
+/// [`write_resolved_gamma`](crate::kernel_persist::write_resolved_gamma) gives —
+/// re-running the `'scott'`/`'silverman'` rules at load would put the same
+/// formula in two places with nothing to keep them in step, and a later change
+/// to either would silently give every previously-saved model a different
+/// bandwidth.
+const BANDWIDTH_FITTED_KEY: &str = "bandwidth_";
 
 /// The six sklearn KernelDensity kernels (D-07). Selected at construction; the
 /// resolved numeric `bandwidth_` is computed at `fit` (D-09).
@@ -92,8 +118,11 @@ pub enum KdKernel {
 }
 
 impl KdKernel {
-    /// The sklearn kernel name (for the [`AlgoError::InvalidKernel`] diagnostic).
-    fn name(self) -> &'static str {
+    /// The sklearn kernel name (for the [`AlgoError::InvalidKernel`] diagnostic,
+    /// and for the model file, which stores the variant as this string rather
+    /// than as an integer tag so adding a variant later cannot silently renumber
+    /// an existing file's).
+    pub fn name(self) -> &'static str {
         match self {
             KdKernel::Gaussian => "gaussian",
             KdKernel::Tophat => "tophat",
@@ -101,6 +130,24 @@ impl KdKernel {
             KdKernel::Exponential => "exponential",
             KdKernel::Linear => "linear",
             KdKernel::Cosine => "cosine",
+        }
+    }
+
+    /// The inverse of [`KdKernel::name`]; `None` for an unrecognised string.
+    ///
+    /// Returns an `Option` rather than a `Result` so each caller frames the
+    /// failure in its own terms — a builder raises an `InvalidKernel` naming the
+    /// argument, while [`KernelDensity::load`] raises a
+    /// [`PersistError::BadMetadata`] naming the key it came from.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "gaussian" => Some(KdKernel::Gaussian),
+            "tophat" => Some(KdKernel::Tophat),
+            "epanechnikov" => Some(KdKernel::Epanechnikov),
+            "exponential" => Some(KdKernel::Exponential),
+            "linear" => Some(KdKernel::Linear),
+            "cosine" => Some(KdKernel::Cosine),
+            _ => None,
         }
     }
 
@@ -123,6 +170,40 @@ pub enum BandwidthSpec {
     Scott,
     /// `'silverman'`: `bandwidth_ = (n·(d+2)/4)^(−1/(d+4))`.
     Silverman,
+}
+
+impl BandwidthSpec {
+    /// The sklearn spelling: `'scott'`, `'silverman'`, or the numeric value's
+    /// shortest round-tripping decimal.
+    ///
+    /// One string rather than a number-plus-flag pair, for the reason
+    /// [`write_n_components`](crate::projection::proj_persist::write_n_components)
+    /// gives for `n_components='auto'`: the two rule variants carry no numeric
+    /// value, an optional number would make a dropped key and a deliberate rule
+    /// indistinguishable, and a separate flag is two keys that can contradict
+    /// each other. This reads exactly the way `bandwidth='scott'` versus
+    /// `bandwidth=0.5` does in the sklearn constructor.
+    ///
+    /// `{:?}` rather than `{}` for the numeric arm: both of Rust's float
+    /// formatters emit the shortest decimal that round-trips through
+    /// `str::parse`, but `{:?}` picks the exponent form when it is shorter.
+    pub fn name(self) -> String {
+        match self {
+            BandwidthSpec::Numeric(v) => format!("{v:?}"),
+            BandwidthSpec::Scott => "scott".to_string(),
+            BandwidthSpec::Silverman => "silverman".to_string(),
+        }
+    }
+
+    /// The inverse of [`BandwidthSpec::name`]; `None` for a string that is
+    /// neither rule nor a parsable decimal.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "scott" => Some(BandwidthSpec::Scott),
+            "silverman" => Some(BandwidthSpec::Silverman),
+            other => other.parse::<f64>().ok().map(BandwidthSpec::Numeric),
+        }
+    }
 }
 
 /// Kernel density estimation (KERNEL-02) over the v1 `distance` prim + a
@@ -272,6 +353,102 @@ where
     pub fn bandwidth(&self) -> f64 {
         self.bandwidth_
             .expect("bandwidth_ is Some by construction on KernelDensity<F, Fitted>")
+    }
+}
+
+impl<F> SaveModel for KernelDensity<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted density estimator to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `X_fit_` | `F` (`F32`/`F64`) | `[n_samples, n_features]` |
+    /// | `param:kernel` / `param:bandwidth` / `bandwidth_` | `__metadata__` scalar | — |
+    ///
+    /// ONE tensor and three scalars: `KernelDensity` is the purest case of "the
+    /// training set is the model" in mlrs. There is nothing else to store —
+    /// `score_samples` evaluates the kernel against every training row, so the
+    /// matrix is not an artifact of fitting but the entire fitted state, and the
+    /// file is `X_fit_` plus a header.
+    ///
+    /// Both the bandwidth SPECIFICATION and the RESOLVED value are written: the
+    /// `'scott'` and `'silverman'` rules consume `n_samples`/`n_features` at fit
+    /// time, so the request and the outcome are two different facts and a
+    /// reloaded model reports each.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let (n_samples, n_features) = self.fit_shape_.ok_or_else(|| absent("fit_shape_"))?;
+        let bandwidth = self.bandwidth_.ok_or_else(|| absent("bandwidth_"))?;
+        // Bound BEFORE the writer, which borrows the payload.
+        let x_fit = self.x_fit_.as_ref().ok_or_else(|| absent("x_fit_"))?.to_host(pool);
+
+        let mut w = KernelWriter::new(PERSIST_TAG);
+        w.scalar_str(KERNEL_KEY, self.kernel.name());
+        w.scalar_str(BANDWIDTH_SPEC_KEY, &self.bandwidth_spec.name());
+        w.scalar_f64(BANDWIDTH_FITTED_KEY, bandwidth);
+        write_x_fit(&mut w, &x_fit, n_samples, n_features)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for KernelDensity<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the density estimator back from `path`, re-uploading `X_fit_` to
+    /// `pool`.
+    ///
+    /// Both enum-shaped scalars are PARSED rather than trusted: an unrecognised
+    /// kernel or bandwidth string becomes a [`PersistError::BadMetadata`] naming
+    /// its key. That matters here because a silent fallback would be invisible —
+    /// every one of the six kernels produces a plausible density, so a model
+    /// that loaded `gaussian` where the file said `epanechnikov` would score
+    /// every sample differently with nothing to signal it.
+    ///
+    /// `bandwidth_` is REQUIRED for the same reason. It is the one number
+    /// `score_samples` divides by, and no default could stand in for a value the
+    /// fit derived from the training geometry.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<KernelDensity<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = KernelFile::parse(&raw, PERSIST_TAG)?;
+        let (x_fit, n_samples, n_features) = read_x_fit::<F>(&file)?;
+
+        let kernel = KdKernel::from_name(file.scalar_str(KERNEL_KEY)?)
+            .ok_or(PersistError::BadMetadata { key: KERNEL_KEY })?;
+        let bandwidth_spec = BandwidthSpec::from_name(file.scalar_str(BANDWIDTH_SPEC_KEY)?)
+            .ok_or(PersistError::BadMetadata {
+                key: BANDWIDTH_SPEC_KEY,
+            })?;
+        let bandwidth = file.scalar_f64(BANDWIDTH_FITTED_KEY)?;
+        // A non-positive bandwidth divides by zero (or flips the sign of every
+        // exponent) inside the density map. The fit rejects it; a hand-edited
+        // header must be rejected here too, rather than producing NaN scores on
+        // the first query.
+        if !(bandwidth > 0.0) || !bandwidth.is_finite() {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "'{BANDWIDTH_FITTED_KEY}' is {bandwidth}; a fitted bandwidth is \
+                     finite and strictly positive"
+                ),
+            });
+        }
+
+        Ok(KernelDensity {
+            kernel,
+            bandwidth_spec,
+            x_fit_: Some(DeviceArray::from_host(pool, &x_fit)),
+            bandwidth_: Some(bandwidth),
+            fit_shape_: Some((n_samples, n_features)),
+            _state: PhantomData,
+        })
     }
 }
 

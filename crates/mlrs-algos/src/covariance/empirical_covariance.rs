@@ -32,6 +32,7 @@
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use bytemuck::Pod;
@@ -45,8 +46,20 @@ use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::cov_persist::{
+    read_precision, read_scatter_core, AlignedBytes, CovFile, CovWriter, LoadModel, PersistError,
+    SaveModel, ScatterCoreRef, TensorRef, PRECISION_NAME,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
+
+/// The `estimator` discriminator written into every `EmpiricalCovariance` file.
+///
+/// Load-bearing rather than decorative: a `LedoitWolf` file holds the same
+/// `covariance_` and `location_` at the same shapes and dtypes, and differs only
+/// in that its matrix has been SHRUNK toward a scaled identity. No geometry
+/// check could tell the two apart, so the tag is the only thing that does.
+const PERSIST_TAG: &str = "empirical_covariance";
 
 /// Near-zero floor for the pinvh eigenvalue cutoff (mirrors the
 /// `linear_regression.rs` precedent — below the 1e-5 tolerance so it never
@@ -261,6 +274,130 @@ where
             operation,
         })?;
         Ok(cache.get_or_init(|| arr.to_host(pool)).clone())
+    }
+}
+
+impl<F> SaveModel for EmpiricalCovariance<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted estimator to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `covariance_` | `F` (`F32`/`F64`) | `[n_features, n_features]` |
+    /// | `location_` | `F` | `[n_features]` |
+    /// | `precision_` | `F` | `[n_features, n_features]`, ABSENT when not stored |
+    /// | `param:assume_centered` / `param:store_precision` | `__metadata__` scalar | — |
+    ///
+    /// `n_features` is recovered from `covariance_`'s shape at load, so it is
+    /// not stored again.
+    ///
+    /// `precision_` is written only when the model holds it. That makes
+    /// `store_precision` round-trip as a real size difference rather than only
+    /// as a flag — a `store_precision = false` file is HALF the size, which is
+    /// exactly the saving the sklearn option exists to offer. Recomputing the
+    /// inverse at load instead would be an `O(d³)` eigen-decomposition on a path
+    /// that is otherwise one sequential read, and would silently convert the
+    /// model into a `store_precision = true` one.
+    ///
+    /// The full symmetric matrix is stored rather than a packed triangle — see
+    /// [`cov_persist`](super::cov_persist) for why halving the file is not worth
+    /// an expansion pass on every load.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `CovWriter` borrows every payload so it can
+        // stream them out without a second copy, which means the host buffers
+        // must outlive it.
+        let covariance = self
+            .covariance_
+            .as_ref()
+            .ok_or_else(|| absent("covariance_"))?
+            .to_host(pool);
+        let location = self
+            .location_
+            .as_ref()
+            .ok_or_else(|| absent("location_"))?
+            .to_host(pool);
+        let precision = self.precision_.as_ref().map(|p| p.to_host(pool));
+
+        let mut w = CovWriter::new(PERSIST_TAG);
+        w.scalar_bool("param:assume_centered", self.assume_centered);
+        w.scalar_bool("param:store_precision", self.store_precision);
+        ScatterCoreRef {
+            n_features: location.len(),
+            covariance: &covariance,
+            location: &location,
+        }
+        .write_into(&mut w)?;
+        if let Some(p) = precision.as_ref() {
+            let d = location.len();
+            w.tensor(PRECISION_NAME, TensorRef::floats(p, vec![d, d])?);
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for EmpiricalCovariance<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the estimator back from `path`, re-uploading each stored matrix to
+    /// `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site:
+    ///
+    /// ```ignore
+    /// let cov: EmpiricalCovariance<f32, Fitted> =
+    ///     EmpiricalCovariance::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// The three host memos are NOT restored from the file: they are
+    /// `to_host` caches, not model state, and a freshly loaded estimator refills
+    /// them on first access exactly as a freshly fitted one does.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<EmpiricalCovariance<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = CovFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_scatter_core::<F>(&file)?;
+        let precision = read_precision::<F>(&file, core.n_features)?;
+
+        let store_precision = file.scalar_bool("param:store_precision")?;
+        // The flag and the tensor must agree. Either half alone is well-formed —
+        // a `true` flag is what the default builder produces and an absent
+        // tensor is what a `false` model writes — so only the cross-check
+        // catches a file where one was edited without the other. Without it a
+        // `store_precision = true` model would load with `precision_` silently
+        // `None` and every `precision_()` call would report `NotFitted`.
+        if store_precision != precision.is_some() {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "'param:store_precision' is {store_precision} but the \
+                     '{PRECISION_NAME}' tensor is {}",
+                    if precision.is_some() { "present" } else { "absent" }
+                ),
+            });
+        }
+
+        Ok(EmpiricalCovariance {
+            assume_centered: file.scalar_bool("param:assume_centered")?,
+            store_precision,
+            covariance_: Some(DeviceArray::from_host(pool, &core.covariance)),
+            location_: Some(DeviceArray::from_host(pool, &core.location)),
+            precision_: precision.map(|p| DeviceArray::from_host(pool, &p)),
+            // Memos, not state — refilled on first access, exactly as a freshly
+            // fitted estimator's are.
+            cov_host: OnceLock::new(),
+            loc_host: OnceLock::new(),
+            prec_host: OnceLock::new(),
+            _state: PhantomData,
+        })
     }
 }
 

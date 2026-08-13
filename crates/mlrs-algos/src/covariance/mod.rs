@@ -23,6 +23,10 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — no in-source
 //! `#[cfg(test)] mod tests`).
 
+/// The `mlrs-cov` model-file container — both estimators' `save`/`load` share
+/// the location/scatter core it defines (COV-PERSIST, prototype).
+pub mod cov_persist;
+
 // Phase-7 covariance estimators (filled by plan 07-04 — file-disjoint):
 pub mod empirical_covariance; // EmpiricalCovariance (COV-01), plan 07-04
 pub mod ledoit_wolf; // LedoitWolf (COV-02), plan 07-04

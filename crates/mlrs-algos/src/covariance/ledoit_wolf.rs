@@ -38,6 +38,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use bytemuck::Pod;
@@ -49,8 +50,26 @@ use mlrs_backend::prims::reduce::{column_reduce, ReducePath, ScalarOp};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::cov_persist::{
+    read_scatter_core, AlignedBytes, CovFile, CovWriter, LoadModel, PersistError, SaveModel,
+    ScatterCoreRef,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
+
+/// The `estimator` discriminator written into every `LedoitWolf` file. See
+/// [`empirical_covariance`](super::empirical_covariance)'s tag for why it is
+/// load-bearing.
+const PERSIST_TAG: &str = "ledoit_wolf";
+
+/// The `__metadata__` key holding the FITTED shrinkage coefficient.
+///
+/// No [`PARAM_PREFIX`](super::cov_persist::PARAM_PREFIX): `shrinkage_` is
+/// sklearn's fitted attribute — the value the Ledoit-Wolf formula chose from the
+/// data — not a constructor input. It is not recoverable from `covariance_`
+/// without also holding the unshrunk matrix the estimator never stores, so it
+/// rides as a scalar of its own.
+const SHRINKAGE_KEY: &str = "shrinkage_";
 
 /// Ledoit–Wolf shrinkage covariance estimator (COV-02).
 ///
@@ -218,6 +237,89 @@ where
     pub fn shrinkage_(&self) -> f64 {
         self.shrinkage_
             .expect("shrinkage_ is Some by construction on Fitted")
+    }
+}
+
+impl<F> SaveModel for LedoitWolf<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted estimator to `path` as a safetensors file.
+    ///
+    /// The shared scatter core plus one scalar, and NOTHING else:
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `covariance_` | `F` (`F32`/`F64`) | `[n_features, n_features]` |
+    /// | `location_` | `F` | `[n_features]` |
+    /// | `shrinkage_` | `__metadata__` scalar | — |
+    /// | `param:assume_centered` | `__metadata__` scalar | — |
+    ///
+    /// `LedoitWolf` has no `precision_` — sklearn's `store_precision` is not part
+    /// of its constructor here — so its file is the minimal member of the
+    /// family.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let covariance = self
+            .covariance_
+            .as_ref()
+            .ok_or_else(|| absent("covariance_"))?
+            .to_host(pool);
+        let location = self
+            .location_
+            .as_ref()
+            .ok_or_else(|| absent("location_"))?
+            .to_host(pool);
+        let shrinkage = self.shrinkage_.ok_or_else(|| absent("shrinkage_"))?;
+
+        let mut w = CovWriter::new(PERSIST_TAG);
+        w.scalar_bool("param:assume_centered", self.assume_centered);
+        w.scalar_f64(SHRINKAGE_KEY, shrinkage);
+        ScatterCoreRef {
+            n_features: location.len(),
+            covariance: &covariance,
+            location: &location,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for LedoitWolf<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the estimator back from `path`, re-uploading both matrices to
+    /// `pool`.
+    ///
+    /// `shrinkage_` is REQUIRED. A missing key is a corrupt file, not a request
+    /// for a default: substituting `0.0` would report a model that did no
+    /// shrinkage at all, which is the one claim a `LedoitWolf` must never make
+    /// falsely — and nothing in `covariance_` could contradict it, since the
+    /// unshrunk matrix it was derived from is not stored.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<LedoitWolf<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = CovFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_scatter_core::<F>(&file)?;
+
+        Ok(LedoitWolf {
+            assume_centered: file.scalar_bool("param:assume_centered")?,
+            covariance_: Some(DeviceArray::from_host(pool, &core.covariance)),
+            location_: Some(DeviceArray::from_host(pool, &core.location)),
+            shrinkage_: Some(file.scalar_f64(SHRINKAGE_KEY)?),
+            // Memos, not state — refilled on first access, exactly as a freshly
+            // fitted estimator's are.
+            cov_host: OnceLock::new(),
+            loc_host: OnceLock::new(),
+            _state: PhantomData,
+        })
     }
 }
 

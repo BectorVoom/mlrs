@@ -62,6 +62,13 @@ pub mod error;
 // selector's `transform` is a device column gather; its SCORE is a host `f64`
 // sweep, for the relative-accuracy reason `prims::feature_score` documents.
 pub mod feature_selection;
+// The `mlrs-kernel` model-file container (KERNEL-PERSIST, prototype). It sits
+// at the crate root rather than inside a family module because the family it
+// serves spans two: `KernelRidge` in `kernel_ridge/` and `KernelDensity` in
+// `density/` are separate modules for reasons unrelated to persistence, but one
+// family for it — both are kernel methods whose fitted model IS the training
+// matrix. See the module docs.
+pub mod kernel_persist;
 pub mod kernel_ridge;
 pub mod linear;
 pub mod manifold;
