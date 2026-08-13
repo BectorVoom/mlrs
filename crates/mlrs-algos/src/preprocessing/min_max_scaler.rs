@@ -7,6 +7,7 @@
 //! [`super::common::handle_zeros_in_scale`]).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -17,8 +18,26 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use super::common::{affine_columns_host, column_min_max, handle_zeros_in_scale, zeros_eps};
+use super::prep_persist::{
+    read_columns, read_range, write_columns, write_range, AlignedBytes, LoadModel, PersistError,
+    PrepFile, PrepWriter, SaveModel,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `MinMaxScaler` file.
+const PERSIST_TAG: &str = "min_max_scaler";
+
+/// The four fitted vectors, in the order they are written and read. One list
+/// rather than two so the save and load sides cannot drift — `data_min_` and
+/// `min_` are the same length and similar magnitude, so a reordering on one side
+/// only is exactly the mistake no geometry check could catch.
+const COLUMNS: [&str; 4] = ["data_min_", "data_max_", "scale_", "min_"];
+
+/// The two halves of the `feature_range` constructor pair.
+const RANGE_MIN_KEY: &str = "param:feature_range_min";
+/// See [`RANGE_MIN_KEY`].
+const RANGE_MAX_KEY: &str = "param:feature_range_max";
 
 pub struct MinMaxScaler<F, S = Unfit> {
     feature_range: (f64, f64),
@@ -139,6 +158,86 @@ where
         slot.as_ref()
             .expect("fitted attribute is Some by construction on MinMaxScaler<F, Fitted>")
             .to_host(pool)
+    }
+}
+
+impl<F> SaveModel for MinMaxScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted scaler to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `data_min_` / `data_max_` / `scale_` / `min_` | `F` (`F32`/`F64`) | `[n_features]` |
+    /// | `param:feature_range_min` / `_max`, `param:clip` | `__metadata__` scalar | — |
+    ///
+    /// All four vectors are stored even though `scale_` and `min_` are exactly
+    /// the affine map `transform` applies and `data_min_`/`data_max_` are the
+    /// raw extrema it was derived from. The derivation only runs ONE way —
+    /// `scale_` folds in `feature_range` and the degenerate-column substitution
+    /// [`handle_zeros_in_scale`] makes, so a constant column's `data_min_` and
+    /// `data_max_` cannot be recovered from it. Keeping both pairs is what makes
+    /// a loaded scaler introspect identically to the saved one; the cost is two
+    /// `[n_features]` vectors on a file that is already four of them.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let data_min = self.data_min_.as_ref().ok_or_else(|| absent("data_min_"))?.to_host(pool);
+        let data_max = self.data_max_.as_ref().ok_or_else(|| absent("data_max_"))?.to_host(pool);
+        let scale = self.scale_.as_ref().ok_or_else(|| absent("scale_"))?.to_host(pool);
+        let min = self.min_.as_ref().ok_or_else(|| absent("min_"))?.to_host(pool);
+
+        let mut w = PrepWriter::new(PERSIST_TAG);
+        write_range(&mut w, RANGE_MIN_KEY, RANGE_MAX_KEY, self.feature_range);
+        w.scalar_bool("param:clip", self.clip);
+        write_columns(
+            &mut w,
+            &[
+                (COLUMNS[0], data_min.as_slice()),
+                (COLUMNS[1], data_max.as_slice()),
+                (COLUMNS[2], scale.as_slice()),
+                (COLUMNS[3], min.as_slice()),
+            ],
+        )?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for MinMaxScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a scaler back from `path`, re-uploading all four vectors to `pool`.
+    ///
+    /// `feature_range` is read back but NOT re-validated against
+    /// `MinMaxScalerBuilder`'s `min < max` rule. That check belongs to the
+    /// constructor, where a caller supplied the pair; here the pair is only a
+    /// record of what the saved scaler was built with, and the fitted `scale_` /
+    /// `min_` that `transform` actually applies were computed from it at fit
+    /// time. Re-running the builder check would reject a file rather than the
+    /// input that caused it, and it cannot fire on a file this crate wrote.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<MinMaxScaler<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = PrepFile::parse(&raw, PERSIST_TAG)?;
+        let (cols, n_features) = read_columns::<F>(&file, &COLUMNS)?;
+
+        Ok(MinMaxScaler {
+            feature_range: read_range(&file, RANGE_MIN_KEY, RANGE_MAX_KEY)?,
+            clip: file.scalar_bool("param:clip")?,
+            data_min_: Some(DeviceArray::from_host(pool, &cols[0])),
+            data_max_: Some(DeviceArray::from_host(pool, &cols[1])),
+            scale_: Some(DeviceArray::from_host(pool, &cols[2])),
+            min_: Some(DeviceArray::from_host(pool, &cols[3])),
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 

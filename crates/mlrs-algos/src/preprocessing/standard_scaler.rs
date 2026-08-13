@@ -10,6 +10,7 @@
 //! `scale_ = 1` (PREP-01's degenerate-column gate).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -22,8 +23,25 @@ use mlrs_core::{f64_to_host, PrimError};
 use super::common::{
     affine_columns_host, column_mean_var, handle_zeros_in_scale_masked, is_constant_feature,
 };
+use super::prep_persist::{
+    read_columns, write_columns, AlignedBytes, LoadModel, PersistError, PrepFile, PrepWriter,
+    SaveModel,
+};
 use crate::error::AlgoError;
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `StandardScaler` file, and
+/// checked before any tensor is touched — this is what stops a `MinMaxScaler`
+/// file loading here and being read as a mean/variance pair.
+const PERSIST_TAG: &str = "standard_scaler";
+
+/// The three fitted vectors, in the order they are written and read.
+///
+/// One list rather than two so the save and load sides cannot drift:
+/// [`read_columns`] returns them positionally, so a name reordered on one side
+/// only would silently swap `var_` and `scale_` — two same-length,
+/// same-magnitude vectors that no geometry check could tell apart.
+const COLUMNS: [&str; 3] = ["mean_", "var_", "scale_"];
 
 /// `StandardScaler` (PREP-01): construct with [`StandardScaler::new`] /
 /// [`StandardScaler::builder`], then [`Fit::fit`] / [`Transform::transform`] /
@@ -131,6 +149,98 @@ where
         slot.as_ref()
             .expect("fitted attribute is Some by construction on StandardScaler<F, Fitted>")
             .to_host(pool)
+    }
+}
+
+impl<F> SaveModel for StandardScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted scaler to `path` as a safetensors file.
+    ///
+    /// Three tensors and two scalars, and NOTHING derivable from them:
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `mean_` / `var_` / `scale_` | `F` (`F32`/`F64`) | `[n_features]` |
+    /// | `param:with_mean` / `param:with_std` | `__metadata__` scalar | — |
+    ///
+    /// `n_features_in_` is recovered from `mean_`'s shape at load rather than
+    /// stored again. All three vectors are written at the model's OWN float
+    /// width, so an `f32`-fitted scaler produces a file half the size of the
+    /// `f64` one for the same geometry.
+    ///
+    /// `var_` is written even though `transform` never reads it —
+    /// [`effective_affine`](StandardScaler::effective_affine) needs only `mean_`
+    /// and `scale_`. It is a fitted attribute sklearn exposes, callers
+    /// introspect it through [`StandardScaler::var`], and dropping it would make
+    /// a loaded scaler observably poorer than the one that was saved for the
+    /// sake of one third of a vector that is already the smallest part of the
+    /// file.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `PrepWriter` borrows every payload so it can
+        // stream them out without a second copy, which means the host buffers
+        // must outlive it.
+        let mean = self.mean_.as_ref().ok_or_else(|| absent("mean_"))?.to_host(pool);
+        let var = self.var_.as_ref().ok_or_else(|| absent("var_"))?.to_host(pool);
+        let scale = self.scale_.as_ref().ok_or_else(|| absent("scale_"))?.to_host(pool);
+
+        let mut w = PrepWriter::new(PERSIST_TAG);
+        w.scalar_bool("param:with_mean", self.with_mean);
+        w.scalar_bool("param:with_std", self.with_std);
+        write_columns(
+            &mut w,
+            &[
+                (COLUMNS[0], mean.as_slice()),
+                (COLUMNS[1], var.as_slice()),
+                (COLUMNS[2], scale.as_slice()),
+            ],
+        )?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for StandardScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a scaler back from `path`, re-uploading all three vectors to `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site:
+    ///
+    /// ```ignore
+    /// let sc: StandardScaler<f32, Fitted> = StandardScaler::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with: an `f32` scaler
+    /// loads into a `StandardScaler<f64>` (and back) through
+    /// [`as_floats`](crate::persist::as_floats). On the matching arm every
+    /// upload reads straight out of the bytes `read_exact` landed.
+    ///
+    /// The file is untrusted input (T-04-01-01), so `read_columns` measures
+    /// every vector against `mean_`'s length before a single value is stored.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<StandardScaler<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = PrepFile::parse(&raw, PERSIST_TAG)?;
+        let (cols, n_features) = read_columns::<F>(&file, &COLUMNS)?;
+
+        Ok(StandardScaler {
+            with_mean: file.scalar_bool("param:with_mean")?,
+            with_std: file.scalar_bool("param:with_std")?,
+            mean_: Some(DeviceArray::from_host(pool, &cols[0])),
+            var_: Some(DeviceArray::from_host(pool, &cols[1])),
+            scale_: Some(DeviceArray::from_host(pool, &cols[2])),
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 

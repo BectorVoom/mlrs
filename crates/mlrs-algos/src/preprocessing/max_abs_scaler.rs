@@ -7,6 +7,7 @@
 //! replaced with `1` via [`super::common::handle_zeros_in_scale`].
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -17,8 +18,18 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use super::common::{affine_columns_host, column_min_max, handle_zeros_in_scale, zeros_eps};
+use super::prep_persist::{
+    read_columns, write_columns, AlignedBytes, LoadModel, PersistError, PrepFile, PrepWriter,
+    SaveModel,
+};
 use crate::error::AlgoError;
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `MaxAbsScaler` file.
+const PERSIST_TAG: &str = "max_abs_scaler";
+
+/// The two fitted vectors, in the order they are written and read.
+const COLUMNS: [&str; 2] = ["max_abs_", "scale_"];
 
 pub struct MaxAbsScaler<F, S = Unfit> {
     max_abs_: Option<DeviceArray<ActiveRuntime, F>>,
@@ -66,6 +77,61 @@ where
         slot.as_ref()
             .expect("fitted attribute is Some by construction on MaxAbsScaler<F, Fitted>")
             .to_host(pool)
+    }
+}
+
+impl<F> SaveModel for MaxAbsScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted scaler to `path` as a safetensors file.
+    ///
+    /// Two `[n_features]` tensors — `max_abs_` and `scale_` — and no `param:`
+    /// scalars at all: `MaxAbsScaler` has no constructor arguments. It is the
+    /// smallest file this family produces, and the only estimator anywhere in
+    /// mlrs whose `__metadata__` is nothing but the three discriminators.
+    ///
+    /// The two vectors differ only on an all-zero column, where `scale_` carries
+    /// [`handle_zeros_in_scale`]'s substituted `1` and `max_abs_` keeps the true
+    /// `0`. That is precisely why both are stored: neither is recoverable from
+    /// the other, and `max_abs_` is a fitted attribute sklearn exposes.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let max_abs = self.max_abs_.as_ref().ok_or_else(|| absent("max_abs_"))?.to_host(pool);
+        let scale = self.scale_.as_ref().ok_or_else(|| absent("scale_"))?.to_host(pool);
+
+        let mut w = PrepWriter::new(PERSIST_TAG);
+        write_columns(
+            &mut w,
+            &[(COLUMNS[0], max_abs.as_slice()), (COLUMNS[1], scale.as_slice())],
+        )?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for MaxAbsScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a scaler back from `path`, re-uploading both vectors to `pool`.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<MaxAbsScaler<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = PrepFile::parse(&raw, PERSIST_TAG)?;
+        let (cols, n_features) = read_columns::<F>(&file, &COLUMNS)?;
+
+        Ok(MaxAbsScaler {
+            max_abs_: Some(DeviceArray::from_host(pool, &cols[0])),
+            scale_: Some(DeviceArray::from_host(pool, &cols[1])),
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 

@@ -29,6 +29,10 @@
 
 pub(crate) mod common;
 
+/// The `mlrs-prep` model-file container — the six transformers' `save`/`load`
+/// share the per-column-vector layout it defines (PREP-PERSIST, prototype).
+pub mod prep_persist;
+
 pub mod binarizer;
 pub mod max_abs_scaler;
 pub mod min_max_scaler;

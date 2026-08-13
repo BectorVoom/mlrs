@@ -10,6 +10,7 @@
 //! interpolates between `sorted[floor(h)]` and `sorted[ceil(h)]`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -20,8 +21,23 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use super::common::{affine_columns_host, columns_host_f64, handle_zeros_in_scale, norm_ppf, zeros_eps};
+use super::prep_persist::{
+    read_columns, read_range, write_columns, write_range, AlignedBytes, LoadModel, PersistError,
+    PrepFile, PrepWriter, SaveModel,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `RobustScaler` file.
+const PERSIST_TAG: &str = "robust_scaler";
+
+/// The two fitted vectors, in the order they are written and read.
+const COLUMNS: [&str; 2] = ["center_", "scale_"];
+
+/// The two halves of the `quantile_range` constructor pair.
+const QUANTILE_MIN_KEY: &str = "param:quantile_range_min";
+/// See [`QUANTILE_MIN_KEY`].
+const QUANTILE_MAX_KEY: &str = "param:quantile_range_max";
 
 /// `numpy.percentile(col, q, method="linear")` on an ALREADY-SORTED column.
 fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
@@ -171,6 +187,78 @@ where
         slot.as_ref()
             .expect("fitted attribute is Some by construction on RobustScaler<F, Fitted>")
             .to_host(pool)
+    }
+}
+
+impl<F> SaveModel for RobustScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted scaler to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `center_` / `scale_` | `F` (`F32`/`F64`) | `[n_features]` |
+    /// | `param:with_centering` / `param:with_scaling` / `param:unit_variance` | `__metadata__` scalar | — |
+    /// | `param:quantile_range_min` / `_max` | `__metadata__` scalar | — |
+    ///
+    /// `quantile_range` is stored even though `scale_` has already absorbed it —
+    /// the quantiles were consumed at fit time and the file records what the
+    /// scaler was built with, not what `transform` still needs. Without it a
+    /// loaded scaler could not report its own configuration, which is the point
+    /// of round-tripping a model rather than just its affine map. The same
+    /// applies to `unit_variance`, whose [`norm_ppf`] correction is likewise
+    /// already folded into `scale_`.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let center = self.center_.as_ref().ok_or_else(|| absent("center_"))?.to_host(pool);
+        let scale = self.scale_.as_ref().ok_or_else(|| absent("scale_"))?.to_host(pool);
+
+        let mut w = PrepWriter::new(PERSIST_TAG);
+        w.scalar_bool("param:with_centering", self.with_centering);
+        w.scalar_bool("param:with_scaling", self.with_scaling);
+        w.scalar_bool("param:unit_variance", self.unit_variance);
+        write_range(&mut w, QUANTILE_MIN_KEY, QUANTILE_MAX_KEY, self.quantile_range);
+        write_columns(
+            &mut w,
+            &[(COLUMNS[0], center.as_slice()), (COLUMNS[1], scale.as_slice())],
+        )?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for RobustScaler<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a scaler back from `path`, re-uploading both vectors to `pool`.
+    ///
+    /// `quantile_range` is read back but NOT re-validated against
+    /// `RobustScalerBuilder`'s `0 <= q_min < q_max <= 100` rule, for the reason
+    /// [`MinMaxScaler::load`](super::min_max_scaler::MinMaxScaler) gives: that
+    /// check belongs to the constructor, where a caller supplied the pair.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<RobustScaler<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = PrepFile::parse(&raw, PERSIST_TAG)?;
+        let (cols, n_features) = read_columns::<F>(&file, &COLUMNS)?;
+
+        Ok(RobustScaler {
+            with_centering: file.scalar_bool("param:with_centering")?,
+            with_scaling: file.scalar_bool("param:with_scaling")?,
+            quantile_range: read_range(&file, QUANTILE_MIN_KEY, QUANTILE_MAX_KEY)?,
+            unit_variance: file.scalar_bool("param:unit_variance")?,
+            center_: Some(DeviceArray::from_host(pool, &cols[0])),
+            scale_: Some(DeviceArray::from_host(pool, &cols[1])),
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 
