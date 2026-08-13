@@ -11,7 +11,7 @@
 //! → `i32` at the boundary); [`labels_to_py`] carries that contract so the shim
 //! materializes numpy `int32`.
 
-use arrow::array::{Array, Float32Array, Float64Array, Int32Array, UInt32Array};
+use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array};
 use arrow::pyarrow::ToPyArrow;
 use pyo3::prelude::*;
 
@@ -111,6 +111,23 @@ pub fn f64_vec_to_pyarrow(py: Python<'_>, values: Vec<f64>) -> PyResult<Bound<'_
 /// four bytes per row.
 pub fn i32_vec_to_pyarrow(py: Python<'_>, values: Vec<i32>) -> PyResult<Bound<'_, PyAny>> {
     Int32Array::from(values).to_data().to_pyarrow(py)
+}
+
+/// `i64` twin of [`i32_vec_to_pyarrow`], for ROW-INDEX vectors (MODSEL-EGRESS).
+///
+/// The cross-validation splitters are the heaviest instance of the boxing
+/// pathology in the crate, because their payload IS indices: a `KFold(5)` split
+/// of 200 000 samples hands Python 1 000 000 row indices across the train and
+/// test lists, and as a `Vec<Vec<i64>>` every one of them becomes a separate
+/// `int` object that numpy then has to parse back into an array. Measured at
+/// that shape: 275 ms inside `kfold_split` alone, against 286 ms for
+/// scikit-learn's ENTIRE `cross_val_predict`.
+///
+/// Indices are `i64` rather than `i32` because they are `usize`-derived row
+/// positions and `numpy.intp` is what indexing wants on a 64-bit host — an
+/// `i32` egress would only move the cost into a widening cast.
+pub fn i64_vec_to_pyarrow(py: Python<'_>, values: Vec<i64>) -> PyResult<Bound<'_, PyAny>> {
+    Int64Array::from(values).to_data().to_pyarrow(py)
 }
 
 /// `u32` twin of [`i32_vec_to_pyarrow`], for per-row COUNT vectors.
