@@ -40,6 +40,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -55,8 +56,22 @@ use mlrs_core::PrimError;
 
 use crate::error::{AlgoError, BuildError};
 use crate::neighbors::nearest::{neighbor_indices_device_metric, neighbor_indices_metric};
+use crate::neighbors::neighbors_persist::{
+    expect_k_fits, read_device, read_fit_x, read_metric, read_weights, shape_2d, write_device,
+    write_fit_x, write_metric, write_weights, AlignedBytes, LoadModel, NeighborsFile,
+    NeighborsWriter, PersistError, SaveModel, TensorRef, Y_NAME,
+};
 use crate::neighbors::{Metric, Weights};
 use crate::typestate::{validate_geometry, Fit, Fitted, KNeighbors, Predict, Unfit};
+
+/// The `estimator` discriminator written into every `KNeighborsRegressor` file.
+///
+/// Load-bearing rather than decorative: the classifier's file holds a `_y` under
+/// the SAME name at the same rank. Only the dtype differs — `I64` encoded class
+/// ids against `F` regression targets — which the typed reader would catch, but
+/// as a `DtypeMismatch` that reads like corruption rather than as "this is a
+/// classifier".
+const PERSIST_TAG: &str = "kneighbors_regressor";
 
 /// sklearn `KNeighborsRegressor` default neighbor count.
 const KNN_REG_DEFAULT_N_NEIGHBORS: usize = 5;
@@ -400,6 +415,103 @@ impl KNeighborsRegressorBuilder {
             train_shape_: None,
             y_reg_: None,
             n_outputs_: 0,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SaveModel for KNeighborsRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted regressor to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `_fit_X` | `F` (`F32`/`F64`) | `[n_samples, n_features]` |
+    /// | `_y` | `F` | `[n_samples, n_outputs]` |
+    /// | `param:n_neighbors` / `param:weights` / `param:metric` / `param:device` | `__metadata__` scalar | — |
+    /// | `param:p` | `__metadata__` scalar, Minkowski ONLY | — |
+    ///
+    /// `n_outputs` is recovered from `_y`'s column extent at load, so it is not
+    /// stored again — the same rule the rest of the format follows.
+    ///
+    /// `_y` is written as a rank-2 tensor even for the single-target case, where
+    /// it is `[n_samples, 1]`. A rank-1 special case would be two code paths that
+    /// can disagree, for the ~8 bytes one shape entry costs, and it would make
+    /// `n_outputs` unreadable from the shape exactly when it is 1.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let (n_samples, n_features) = self.train_shape_.ok_or_else(|| absent("train_shape_"))?;
+        // Bound BEFORE the writer, which borrows every payload.
+        let x_train = self
+            .x_train_
+            .as_ref()
+            .ok_or_else(|| absent("x_train_"))?
+            .to_host(pool);
+        let y = self.y_reg_.as_ref().ok_or_else(|| absent("y_reg_"))?.to_host(pool);
+
+        let mut w = NeighborsWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_neighbors", self.n_neighbors);
+        write_weights(&mut w, self.weights);
+        write_metric(&mut w, self.metric);
+        write_device(&mut w, self.device);
+        write_fit_x(&mut w, &x_train, n_samples, n_features)?;
+        w.tensor(
+            Y_NAME,
+            TensorRef::floats(&y, vec![n_samples, self.n_outputs_])?,
+        );
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for KNeighborsRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the regressor back from `path`, re-uploading `_fit_X` and `_y` to
+    /// `pool`.
+    ///
+    /// The file is untrusted input (T-04-01-01), so `_fit_X` defines
+    /// `n_samples` and `_y`'s row extent is checked against it before any value
+    /// is stored — a mismatch would otherwise index the target table out of
+    /// range on the first prediction, since the gather addresses it by neighbor
+    /// index.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<KNeighborsRegressor<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NeighborsFile::parse(&raw, PERSIST_TAG)?;
+        let (x_train, n_samples, n_features) = read_fit_x::<F>(&file)?;
+
+        let y_v = file.tensor(Y_NAME)?;
+        let (y_rows, n_outputs) = shape_2d(&y_v, Y_NAME)?;
+        if y_rows != n_samples || n_outputs == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{Y_NAME}' declares shape [{y_rows}, {n_outputs}], but \
+                     '_fit_X' implies {n_samples} rows and at least one output"
+                ),
+            });
+        }
+        let y = crate::neighbors::neighbors_persist::as_floats::<F>(&y_v, Y_NAME)?;
+
+        let n_neighbors = file.scalar_usize("param:n_neighbors")?;
+        expect_k_fits(n_neighbors, n_samples)?;
+
+        Ok(KNeighborsRegressor {
+            n_neighbors,
+            weights: read_weights(&file)?,
+            metric: read_metric(&file)?,
+            device: read_device(&file)?,
+            x_train_: Some(DeviceArray::from_host(pool, &x_train)),
+            train_shape_: Some((n_samples, n_features)),
+            y_reg_: Some(DeviceArray::from_host(pool, &y)),
+            n_outputs_: n_outputs,
             _state: PhantomData,
         })
     }

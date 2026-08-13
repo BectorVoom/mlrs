@@ -74,6 +74,59 @@ pub enum Metric {
     },
 }
 
+impl Metric {
+    /// The sklearn metric name — `"euclidean"`, `"manhattan"`, `"cosine"`,
+    /// `"chebyshev"` or `"minkowski"`.
+    ///
+    /// Note this is LOSSY for [`Metric::Minkowski`]: the exponent does not
+    /// appear. It is sklearn's own split (`metric='minkowski'` and `p=2` are
+    /// separate constructor arguments), and the callers that need round-tripping
+    /// — the model-file writers — pair this with the exponent from
+    /// [`Metric::p`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Metric::Euclidean => "euclidean",
+            Metric::Manhattan => "manhattan",
+            Metric::Cosine => "cosine",
+            Metric::Chebyshev => "chebyshev",
+            Metric::Minkowski { .. } => "minkowski",
+        }
+    }
+
+    /// The Minkowski exponent, or `None` for every other variant — the other
+    /// half of what [`Metric::name`] does not carry.
+    pub fn p(self) -> Option<f64> {
+        match self {
+            Metric::Minkowski { p } => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Rebuild a metric from the `(name, p)` pair [`Metric::name`] and
+    /// [`Metric::p`] produce; `None` for an unrecognised name.
+    ///
+    /// `"minkowski"` without a `p` is rejected rather than defaulted to 2. A
+    /// silent `p = 2` would be Euclidean, so a file that lost its exponent would
+    /// load as a DIFFERENT metric and every distance it computed would be wrong
+    /// with nothing to signal it.
+    ///
+    /// Returns an `Option` rather than a `Result` so the caller's error type
+    /// carries the rejection — the same shape [`Device::from_name`] uses, which
+    /// keeps `mlrs-backend` free of any dependency on how a caller reports it.
+    ///
+    /// [`Device::from_name`]: crate::device::Device::from_name
+    pub fn from_name(name: &str, p: Option<f64>) -> Option<Self> {
+        match name {
+            "euclidean" => Some(Metric::Euclidean),
+            "manhattan" => Some(Metric::Manhattan),
+            "cosine" => Some(Metric::Cosine),
+            "chebyshev" => Some(Metric::Chebyshev),
+            "minkowski" => p.map(|p| Metric::Minkowski { p }),
+            _ => None,
+        }
+    }
+}
+
 /// Default query-axis tile size (rows per block) for the distance composition
 /// (RESEARCH Open Q2 / A3 — Claude's discretion). A fixed row-block keeps only a
 /// `tile × n` distance block resident at a time, so `peak_bytes` is

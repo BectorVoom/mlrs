@@ -37,6 +37,7 @@
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -60,7 +61,19 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+use crate::neighbors::neighbors_persist::{
+    expect_k_fits, read_device, read_fit_x, read_metric, write_device, write_fit_x, write_metric,
+    AlignedBytes, LoadModel, NeighborsFile, NeighborsWriter, PersistError, SaveModel,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, KNeighbors, Unfit};
+
+/// The `estimator` discriminator written into every `NearestNeighbors` file.
+///
+/// Load-bearing rather than decorative: all three neighbor estimators hold a
+/// `_fit_X` of the same shape and dtype, and this one differs only by the ABSENCE
+/// of a target tensor. Without the tag a `KNeighborsRegressor` file would load
+/// here and quietly discard the targets that make it a regressor.
+const PERSIST_TAG: &str = "nearest_neighbors";
 
 /// sklearn `NearestNeighbors` default neighbor count.
 const NN_DEFAULT_N_NEIGHBORS: usize = 5;
@@ -309,6 +322,93 @@ impl NearestNeighborsBuilder {
             device: self.device,
             x_train_: None,
             train_shape_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SaveModel for NearestNeighbors<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted estimator to `path` as a safetensors file.
+    ///
+    /// ONE tensor and three or four scalars:
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `_fit_X` | `F` (`F32`/`F64`) | `[n_samples, n_features]` |
+    /// | `param:n_neighbors` / `param:metric` / `param:device` | `__metadata__` scalar | — |
+    /// | `param:p` | `__metadata__` scalar, Minkowski ONLY | — |
+    ///
+    /// `NearestNeighbors` is the purest "the training set is the model" case in
+    /// mlrs: it has no targets and no parameters, so the file is `_fit_X` plus a
+    /// header. `n_samples` and `n_features` come off that tensor's shape at
+    /// load, so neither is stored again.
+    ///
+    /// `x_train_` is device-resident, so this costs one readback — the only copy
+    /// on the whole path. `pool` is `&BufferPool` because
+    /// [`DeviceArray::to_host`] only reads.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let (n_samples, n_features) = self.train_shape_.ok_or_else(|| absent("train_shape_"))?;
+        // Bound BEFORE the writer: `NeighborsWriter` borrows every payload so it
+        // can stream them out without a second copy.
+        let x_train = self
+            .x_train_
+            .as_ref()
+            .ok_or_else(|| absent("x_train_"))?
+            .to_host(pool);
+
+        let mut w = NeighborsWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_neighbors", self.n_neighbors);
+        write_metric(&mut w, self.metric);
+        write_device(&mut w, self.device);
+        write_fit_x(&mut w, &x_train, n_samples, n_features)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for NearestNeighbors<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the estimator back from `path`, re-uploading `_fit_X` to `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site:
+    ///
+    /// ```ignore
+    /// let nn: NearestNeighbors<f32, Fitted> = NearestNeighbors::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with. On the matching
+    /// arm the upload reads straight out of the bytes `read_exact` landed — the
+    /// whole model, in one copy-free hand-off.
+    ///
+    /// `n_neighbors` is checked against the training set it will be queried
+    /// over: the file is untrusted input (T-04-01-01), and a `k` larger than
+    /// `n_samples` is unanswerable rather than merely odd.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<NearestNeighbors<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NeighborsFile::parse(&raw, PERSIST_TAG)?;
+        let (x_train, n_samples, n_features) = read_fit_x::<F>(&file)?;
+
+        let n_neighbors = file.scalar_usize("param:n_neighbors")?;
+        expect_k_fits(n_neighbors, n_samples)?;
+
+        Ok(NearestNeighbors {
+            n_neighbors,
+            metric: read_metric(&file)?,
+            device: read_device(&file)?,
+            x_train_: Some(DeviceArray::from_host(pool, &x_train)),
+            train_shape_: Some((n_samples, n_features)),
             _state: PhantomData,
         })
     }

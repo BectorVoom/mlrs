@@ -63,3 +63,36 @@ pub enum Weights {
     /// `inf/inf` is NaN). See `mlrs_kernels::knn::knn_regress_gather`.
     Distance,
 }
+
+impl Weights {
+    /// The sklearn spelling (`'uniform'` / `'distance'`).
+    ///
+    /// The model file stores the variant as this string rather than as an
+    /// integer tag, so `safetensors`' metadata reads the way the sklearn
+    /// constructor argument does — and so adding a variant later cannot silently
+    /// renumber an existing file's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Weights::Uniform => "uniform",
+            Weights::Distance => "distance",
+        }
+    }
+
+    /// The inverse of [`Weights::name`]; `None` for an unrecognised string.
+    ///
+    /// Returns an `Option` rather than a `Result` so each caller frames the
+    /// failure in its own terms — the Python builder raises a `ValueError`
+    /// naming the argument, while a `load` raises a `PersistError::BadMetadata`
+    /// naming the key it came from.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "uniform" => Some(Weights::Uniform),
+            "distance" => Some(Weights::Distance),
+            _ => None,
+        }
+    }
+}
+
+/// The `mlrs-neighbors` model-file container — the three estimators' `save`/
+/// `load` share the training-set core it defines (NEIGH-PERSIST, prototype).
+pub mod neighbors_persist;

@@ -56,6 +56,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -69,6 +70,11 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::neighbors::nearest::neighbor_indices_metric;
+use crate::neighbors::neighbors_persist::{
+    as_i64, expect_k_fits, read_device, read_fit_x, read_metric, read_weights, shape_1d,
+    write_device, write_fit_x, write_metric, write_weights, AlignedBytes, LoadModel, NeighborsFile,
+    NeighborsWriter, PersistError, SaveModel, TensorRef, CLASSES_NAME, Y_NAME,
+};
 use crate::neighbors::{Metric, Weights};
 use crate::typestate::{
     validate_geometry, Fit, Fitted, KNeighbors, PredictLabels, PredictProba, Unfit,
@@ -543,6 +549,162 @@ impl KNeighborsClassifierBuilder {
             y_class_: None,
             classes_: Vec::new(),
             n_classes_: 0,
+            _state: PhantomData,
+        })
+    }
+}
+
+/// The `estimator` discriminator written into every `KNeighborsClassifier` file.
+/// See [`regressor`](super::regressor)'s tag for why it is load-bearing.
+const PERSIST_TAG: &str = "kneighbors_classifier";
+
+impl<F> SaveModel for KNeighborsClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted classifier to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `_fit_X` | `F` (`F32`/`F64`) | `[n_samples, n_features]` |
+    /// | `_y` | `I64` | `[n_samples]` — the ENCODED class ids |
+    /// | `classes_` | `I64` | `[n_classes]` — the decode table |
+    /// | `param:n_neighbors` / `param:weights` / `param:metric` / `param:device` | `__metadata__` scalar | — |
+    /// | `param:p` | `__metadata__` scalar, Minkowski ONLY | — |
+    ///
+    /// Both label tensors are `I64` rather than the model's float width: these
+    /// are label ids, and storing them as floats would make a large label
+    /// silently unrepresentable and would invite a reader to compare them with a
+    /// tolerance. mlrs holds them as `i32` in memory and widens here, because
+    /// `i32` is an internal choice while the file has to survive a model whose
+    /// labels do not fit one.
+    ///
+    /// Storing BOTH is what makes the round-trip faithful. `_y` is the dense
+    /// `0..K` encoding the gather kernel indexes by (CR-02) and `classes_` is
+    /// what turns a prediction back into the label the caller trained with; a
+    /// file with only the former would round-trip its own state perfectly and
+    /// predict `{0, 1, 2}` where training said `{0, 2, 7}`.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let (n_samples, n_features) = self.train_shape_.ok_or_else(|| absent("train_shape_"))?;
+        // Bound BEFORE the writer, which borrows every payload. The two label
+        // vectors are host-side already; widening them to `i64` is the one copy
+        // they cost.
+        let x_train = self
+            .x_train_
+            .as_ref()
+            .ok_or_else(|| absent("x_train_"))?
+            .to_host(pool);
+        let y: Vec<i64> = self
+            .y_class_
+            .as_ref()
+            .ok_or_else(|| absent("y_class_"))?
+            .iter()
+            .map(|&v| i64::from(v))
+            .collect();
+        let classes: Vec<i64> = self.classes_.iter().map(|&v| i64::from(v)).collect();
+
+        let mut w = NeighborsWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_neighbors", self.n_neighbors);
+        write_weights(&mut w, self.weights);
+        write_metric(&mut w, self.metric);
+        write_device(&mut w, self.device);
+        write_fit_x(&mut w, &x_train, n_samples, n_features)?;
+        w.tensor(Y_NAME, TensorRef::i64s(&y, vec![n_samples])?);
+        w.tensor(CLASSES_NAME, TensorRef::i64s(&classes, vec![classes.len()])?);
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for KNeighborsClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the classifier back from `path`, re-uploading `_fit_X` to `pool`.
+    ///
+    /// The file is untrusted input (T-04-01-01), and this estimator needs the
+    /// strictest checks in the family because its two label tensors index each
+    /// other: every entry of `_y` is an index into `classes_`, so a header whose
+    /// encoding reaches past the decode table would read out of range the first
+    /// time a prediction is decoded. Both the LENGTH of `_y` against `_fit_X`
+    /// and the RANGE of its values against `classes_` are validated here.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<KNeighborsClassifier<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = NeighborsFile::parse(&raw, PERSIST_TAG)?;
+        let (x_train, n_samples, n_features) = read_fit_x::<F>(&file)?;
+
+        let classes_v = file.tensor(CLASSES_NAME)?;
+        let n_classes = shape_1d(&classes_v, CLASSES_NAME)?;
+        if n_classes < 2 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{CLASSES_NAME}' holds {n_classes} labels; a fitted \
+                     classifier has at least 2"
+                ),
+            });
+        }
+
+        let y_v = file.tensor(Y_NAME)?;
+        if shape_1d(&y_v, Y_NAME)? != n_samples {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{Y_NAME}' holds {} entries, but '_fit_X' implies {n_samples}",
+                    shape_1d(&y_v, Y_NAME)?
+                ),
+            });
+        }
+
+        // Every `_y` entry is an INDEX into `classes_`, so its range is a
+        // cross-tensor invariant, not a formality: an out-of-range id would
+        // index the class table out of bounds the first time `predict` decodes
+        // a label. Narrowing to `i32` is checked at the same time, since that is
+        // the width the kernel consumes.
+        let y_class: Vec<i32> = as_i64(&y_v, Y_NAME)?
+            .iter()
+            .map(|&v| {
+                let ok = v >= 0 && (v as u64) < n_classes as u64;
+                i32::try_from(v).ok().filter(|_| ok).ok_or_else(|| {
+                    PersistError::InconsistentGeometry {
+                        reason: format!(
+                            "tensor '{Y_NAME}' holds the class id {v}, which is not a \
+                             valid index into the {n_classes} labels in '{CLASSES_NAME}'"
+                        ),
+                    }
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let classes: Vec<i32> = as_i64(&classes_v, CLASSES_NAME)?
+            .iter()
+            .map(|&v| {
+                i32::try_from(v).map_err(|_| PersistError::InconsistentGeometry {
+                    reason: format!(
+                        "tensor '{CLASSES_NAME}' holds the label {v}, which does not fit \
+                         the i32 the classifier's kernels consume"
+                    ),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let n_neighbors = file.scalar_usize("param:n_neighbors")?;
+        expect_k_fits(n_neighbors, n_samples)?;
+
+        Ok(KNeighborsClassifier {
+            n_neighbors,
+            weights: read_weights(&file)?,
+            metric: read_metric(&file)?,
+            device: read_device(&file)?,
+            x_train_: Some(DeviceArray::from_host(pool, &x_train)),
+            train_shape_: Some((n_samples, n_features)),
+            y_class_: Some(y_class),
+            classes_: classes,
+            n_classes_: n_classes,
             _state: PhantomData,
         })
     }
