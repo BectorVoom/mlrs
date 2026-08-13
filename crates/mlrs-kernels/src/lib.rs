@@ -104,6 +104,11 @@ pub mod ridge_gcv;
 // idiom (single-owner, cubecl-cpu MLIR-safe); `sgd.rs` adds its own `pub use`.
 pub mod sgd;
 pub mod smoke;
+// STACK-META-01: the stacking meta-matrix scatter — one launch per prediction
+// block into a shared output handle, driven by `prims/stacking_meta.rs`. Owns
+// its `pub mod` (single-owner, no root re-export — the `gram`/`kmeans`
+// precedent).
+pub mod stacking;
 pub mod topk;
 // Random Forest level-wise tree-building + forest-inference kernels
 // (ENSEMBLE-01): batched all-trees histogram builder (cuML-style row

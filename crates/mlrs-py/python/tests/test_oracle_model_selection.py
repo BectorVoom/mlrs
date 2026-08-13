@@ -496,6 +496,30 @@ def test_cross_val_predict_parity(classification, method):
     )
 
 
+def test_cross_val_predict_keeps_a_multi_output_response_a_list(classification):
+    """A response method that returns one array PER TARGET stays a list.
+
+    ``RandomForestClassifier.predict_proba`` on a multilabel ``y`` returns
+    ``n_targets`` arrays of ``(n_test, n_classes)``. Concatenating the folds
+    with a plain ``np.concatenate`` would glue the target axis onto the sample
+    axis and hand back an array of the wrong rank — which is what
+    ``StackingClassifier`` on a multilabel target consumes, so the defect would
+    surface there as a shape error rather than here.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+
+    X, y = classification
+    Y = np.column_stack([y, 1 - y, (X[:, 0] > 0).astype(int)])
+    forest = RandomForestClassifier(n_estimators=5, random_state=0)
+    mine = ms.cross_val_predict(forest, X, Y, cv=3, method="predict_proba")
+    theirs = skm.cross_val_predict(forest, X, Y, cv=3, method="predict_proba")
+
+    assert isinstance(mine, list) and len(mine) == len(theirs) == 3
+    for got, want in zip(mine, theirs):
+        assert got.shape == want.shape == (len(y), 2)
+        np.testing.assert_allclose(got, want)
+
+
 def test_cross_val_predict_rejects_a_non_partition(regression):
     X, y = regression
     with pytest.raises(ValueError, match="only works for partitions"):

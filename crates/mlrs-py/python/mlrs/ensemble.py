@@ -57,9 +57,11 @@ from sklearn.base import (
     RegressorMixin,
     TransformerMixin,
     clone,
+    is_classifier,
     is_regressor,
 )
 from sklearn.exceptions import NotFittedError
+from sklearn.preprocessing import LabelEncoder
 from sklearn.utils import Bunch, get_tags
 from sklearn.utils.metadata_routing import (
     MetadataRouter,
@@ -68,6 +70,7 @@ from sklearn.utils.metadata_routing import (
     process_routing,
 )
 from sklearn.utils.metaestimators import available_if
+from sklearn.utils.multiclass import check_classification_targets, type_of_target
 from sklearn.utils.validation import check_is_fitted, column_or_1d
 
 from . import _io
@@ -608,17 +611,25 @@ def _shap_values_helper(mlrs_obj, kind, x_train, x_query, has_train_arg):
 #   meta-column layout             Rust (`stacking_meta_layout`)
 #   `get_feature_names_out`        Rust (`stacking_feature_names`)
 #   fold index generation          Rust (`mlrs.model_selection`)
-#   the meta-matrix hstack         numpy (see below)
+#   the meta-matrix copy           numpy by default (see below)
 #   base/final `fit` + `predict`   the composed estimators
 #   =============================  =========================================
 #
-# The hstack stays in numpy deliberately. It is one `n x width` copy that
-# `np.hstack` already performs at C speed; routing `k + 1` host blocks back
-# through the Arrow capsule boundary to perform the identical copy would add FFI
-# round-trips and an f64-only constraint for zero arithmetic. The Rust side
-# still owns the *decision* (widths, order, passthrough placement) and states it
-# executably in `mlrs_algos::ensemble::stacking::concatenate_predictions`, which
-# `crates/mlrs-algos/tests/stacking_test.rs` gates.
+# ## The meta-matrix copy has three arms (STACK-META-01)
+#
+# `MLRS_STACK_META_ENGINE` chooses between `np.hstack` (the default), the Rust
+# host copy (`mlrs_algos::ensemble::stacking::concatenate_predictions`), and the
+# CubeCL scatter (`mlrs_backend::prims::stacking_meta`). All three produce
+# BYTE-IDENTICAL matrices — the operation carries no arithmetic — so the knob
+# moves work and nothing else.
+#
+# numpy stays the default, and that is a measurement rather than an assumption:
+# this is one `n x width` copy of data that is already in host memory, so the
+# host arm pays an Arrow capsule crossing each way and the device arm an upload
+# plus a download on top of that. `docs/stacking.md` carries the ladder and
+# `scripts/bench_stacking_meta.py` re-runs it. `_meta_via_rust` is also the
+# fallback boundary: it DECLINES (returns None) for anything the Rust arms
+# cannot represent, leaving `np.hstack` to handle it exactly as before.
 #
 # ## The default `final_estimator` is sklearn's `RidgeCV`
 #
@@ -725,7 +736,7 @@ def _fit_one(estimator, X, y, fit_params):
     return estimator
 
 
-def _effective_n_jobs(n_jobs, members):
+def _effective_n_jobs(n_jobs, members, owner="StackingRegressor"):
     """``n_jobs``, reduced to serial when a member holds a device handle.
 
     Neither joblib fan-out is worth taking over a fitted mlrs estimator:
@@ -760,7 +771,7 @@ def _effective_n_jobs(n_jobs, members):
     if not any(isinstance(est, MlrsBase) for est in members):
         return n_jobs
     _warnings.warn(
-        "StackingRegressor: n_jobs is ignored because at least one composed "
+        f"{owner}: n_jobs is ignored because at least one composed "
         "estimator is an mlrs estimator holding a device handle. Process-based "
         "joblib backends cannot pickle that handle, and mlrs serializes device "
         "work behind one pool lock, so a threaded fan-out measures ~1.2x at "
@@ -770,6 +781,78 @@ def _effective_n_jobs(n_jobs, members):
         stacklevel=3,
     )
     return 1
+
+
+def _meta_via_rust(blocks, pred_cols, n_features, passthrough, engine):
+    """The meta matrix from ``_mlrs.stacking_concatenate``, or ``None`` for numpy.
+
+    ``blocks`` is the prediction blocks in kept order, with ``X`` appended when
+    ``passthrough``; ``pred_cols`` is the prediction blocks' column counts (the
+    layout's ``n_feature_outs``, so ``X`` is excluded).
+
+    Returns ``None`` — deliberately, rather than raising — for every input the
+    Rust arms cannot represent, leaving ``np.hstack`` to handle it exactly as it
+    did before this arm existed:
+
+    * a non-float block (an integer or object array, or a duck-typed ``X`` like
+      ``estimator_checks``' ``_NotAnArray``, which ``np.hstack`` passes straight
+      through);
+    * a block that is not 2-D, or whose row count disagrees with the others —
+      numpy's own error message for that is the one users already know.
+
+    The dtype handed over is ``np.result_type`` of the blocks, which is the
+    promotion ``np.hstack`` would have applied, so the meta matrix the final
+    estimator is fitted on is bit-identical across all three arms rather than
+    merely close.
+    """
+    import pyarrow as pa
+
+    arrays = [np.asarray(b) for b in blocks]
+    if any(a.ndim != 2 for a in arrays):
+        return None
+    try:
+        dtype = np.result_type(*[a.dtype for a in arrays])
+    except TypeError:
+        return None
+    if dtype != np.float32 and dtype != np.float64:
+        return None
+    n_rows = int(arrays[0].shape[0])
+    if any(int(a.shape[0]) != n_rows for a in arrays):
+        return None
+    if n_rows == 0:
+        # A zero-row meta matrix is a zero-byte device allocation on the device
+        # arm; numpy already produces the right empty shape, and there is
+        # nothing to gain by handing an empty buffer to CubeCL.
+        return None
+
+    arrow_type = pa.float32() if dtype == np.float32 else pa.float64()
+    flats, capsules = [], []
+    for a in arrays:
+        # `ascontiguousarray` is a no-op view when `a` is already C-contiguous in
+        # the promoted dtype, and `py_buffer` does not copy — so a block reaches
+        # Rust without a staging copy, and the arms are compared on the copy
+        # they actually perform rather than on ingress overhead.
+        flat = np.ascontiguousarray(a, dtype=dtype).ravel(order="C")
+        flats.append(flat)
+        capsules.append(
+            pa.Array.from_buffers(arrow_type, flat.size, [None, pa.py_buffer(flat)])
+        )
+
+    x = capsules.pop() if passthrough else None
+    flat_out, width = _stack_ext().stacking_concatenate(
+        capsules,
+        [int(c) for c in pred_cols],
+        n_rows,
+        int(n_features),
+        bool(passthrough),
+        x,
+        engine,
+    )
+    # `flats` is referenced until here on purpose: `py_buffer` borrows those
+    # numpy buffers, and letting one be collected mid-call would free memory
+    # Rust is still reading.
+    del flats
+    return _io.to_output(flat_out, (n_rows, width), "numpy", dtype)
 
 
 def _final_estimator_has(attr):
@@ -795,8 +878,294 @@ def _final_estimator_has(attr):
     return check
 
 
+class _StackComposition:
+    """The composition mechanics :class:`StackingRegressor` and
+    :class:`StackingClassifier` share (STACK-CLF-01).
+
+    Everything here is identical between the two by sklearn's own construction —
+    it is the `_BaseComposition` / `_BaseStacking` half that does not care what
+    the members predict:
+
+    * the parameter surface over ``estimators`` (``get_params`` /
+      ``set_params`` / ``named_estimators``), which is what makes
+      ``set_params(lr="drop")`` and a ``GridSearchCV`` over ``lr__C`` work;
+    * the ``cv="prefit"`` classification, which asks Rust and re-raises under
+      ``InvalidParameterError``;
+    * the ``named_estimators_`` bookkeeping after a fit;
+    * the meta-matrix assembly from already-shaped 2-D blocks — layout in Rust,
+      copy on the arm ``MLRS_STACK_META_ENGINE`` names;
+    * ``n_features_in_``, ``get_feature_names_out``, ``get_metadata_routing``
+      and the derived tags.
+
+    What is NOT here is everything the two classes genuinely disagree about:
+    which sub-estimator type is legal, the default ``final_estimator``, the
+    response method each member is asked for (``stack_method``, classifier
+    only), the label encoding, and the shape of the blocks handed to
+    :meth:`_assemble_meta`. Those live on the two classes, where a reader
+    comparing mlrs against sklearn's source expects to find them.
+
+    Not exported and not an estimator base class in its own right: it carries no
+    ``__init__``, so ``get_params`` still reads each concrete class's own
+    signature.
+    """
+
+    # -- composition parameter handling (sklearn `_BaseComposition`) ------- #
+
+    def get_params(self, deep=True):
+        """Constructor params, plus every named sub-estimator and its params.
+
+        ``deep=True`` adds one ``<name>`` key per entry in ``estimators`` and a
+        ``<name>__<param>`` key per sub-estimator parameter, so ``clone`` and a
+        ``GridSearchCV`` over ``lr__alpha`` both work.
+        """
+        out = super().get_params(deep=deep)
+        if not deep:
+            return out
+        try:
+            out.update(self.estimators)
+        except (TypeError, ValueError):
+            # A malformed `estimators` must not break `get_params` — `set_params`
+            # calls it, and the real complaint belongs to `fit`'s validation.
+            return out
+        for name, estimator in self.estimators:
+            if hasattr(estimator, "get_params"):
+                for key, value in estimator.get_params(deep=True).items():
+                    out[f"{name}__{key}"] = value
+        return out
+
+    def set_params(self, **params):
+        """Set params, including replacing a sub-estimator by name.
+
+        ``set_params(lr="drop")`` disables an entry; ``set_params(lr__alpha=2)``
+        reaches into one. Order matters and is sklearn's: the whole
+        ``estimators`` list first, then whole estimators by name, then
+        individual nested parameters.
+        """
+        if "estimators" in params:
+            self.estimators = params.pop("estimators")
+        items = self.estimators
+        if isinstance(items, list) and items:
+            with _suppress(TypeError):
+                item_names, _ = zip(*items)
+                for name in list(params.keys()):
+                    if "__" not in name and name in item_names:
+                        self._replace_estimator(name, params.pop(name))
+        super().set_params(**params)
+        return self
+
+    def _replace_estimator(self, name, new_val):
+        replaced = list(self.estimators)
+        for i, (estimator_name, _) in enumerate(replaced):
+            if estimator_name == name:
+                replaced[i] = (name, new_val)
+                break
+        self.estimators = replaced
+
+    @property
+    def named_estimators(self):
+        """``name -> estimator`` for the UNFITTED ``estimators`` argument."""
+        return Bunch(**dict(self.estimators))
+
+    # -- validation -------------------------------------------------------- #
+
+    def _validate_composition(self):
+        """``(names, estimators, kept_indices)`` — the Rust-backed structural check.
+
+        The shape check, the name rules and the ``'drop'`` bookkeeping, which
+        both classes run identically. What each class adds on top (a regressor
+        type check for one, nothing for the other — sklearn's
+        ``StackingClassifier`` deliberately accepts regressors for ordinal
+        problems) stays with the class.
+        """
+        estimators = self.estimators
+        if len(estimators) == 0 or not all(
+            isinstance(item, (tuple, list)) and isinstance(item[0], str)
+            for item in estimators
+        ):
+            raise ValueError(
+                "Invalid 'estimators' attribute, 'estimators' should be a "
+                "non-empty list of (string, estimator) tuples."
+            )
+        names, values = zip(*estimators)
+        ext = _stack_ext()
+        ext.stacking_validate_names(list(names), list(self.get_params(deep=False)))
+
+        drop = ext.stacking_drop_sentinel()
+        # The `== 'drop'` comparison itself has to happen here: the value is an
+        # arbitrary object whose `__eq__` may be overloaded. Its CONSEQUENCES
+        # (which slots survive, and whether any do) are Rust's.
+        is_drop = [_is_drop(est, drop) for est in values]
+        kept = ext.stacking_kept_indices(is_drop)
+        return list(names), list(values), list(kept)
+
+    def _cv_is_prefit(self):
+        """Is ``cv`` the ``"prefit"`` string? Classified in Rust.
+
+        A non-string ``cv`` never reaches Rust — it stays here and goes to
+        :func:`mlrs.model_selection.check_cv`. A string that is not ``"prefit"``
+        raises sklearn's ``StrOptions`` message (naming THIS class), re-raised as
+        ``InvalidParameterError`` so that both ``except ValueError`` and
+        ``except TypeError`` callers migrating from sklearn still catch it.
+        """
+        if not isinstance(self.cv, str):
+            return False
+        try:
+            return _stack_ext().stacking_cv_is_prefit(self.cv, type(self).__name__)
+        except ValueError as exc:
+            raise InvalidParameterError(str(exc)) from None
+
+    # -- fitted bookkeeping -------------------------------------------------- #
+
+    def _record_named_estimators(self, names, kept):
+        """``named_estimators_``, with a dropped slot kept as the string ``'drop'``.
+
+        Also lifts ``feature_names_in_`` off whichever fitted member exposes it,
+        which is where sklearn takes it from too.
+        """
+        self.named_estimators_ = Bunch()
+        kept_set = set(kept)
+        fitted_idx = 0
+        for i, name in enumerate(names):
+            if i in kept_set:
+                current = self.estimators_[fitted_idx]
+                self.named_estimators_[name] = current
+                fitted_idx += 1
+                if hasattr(current, "feature_names_in_"):
+                    self.feature_names_in_ = current.feature_names_in_
+            else:
+                self.named_estimators_[name] = _stack_ext().stacking_drop_sentinel()
+
+    # -- meta-feature assembly ---------------------------------------------- #
+
+    def _assemble_meta(self, X, blocks):
+        """One meta matrix from the per-estimator 2-D blocks, in kept order.
+
+        The column LAYOUT (widths, offsets, total width, and the
+        ``_n_feature_outs`` that ``get_feature_names_out`` reads) is computed in
+        Rust; the copy runs on the arm ``MLRS_STACK_META_ENGINE`` names, which
+        is ``np.hstack`` by default. Callers hand over blocks that are already
+        2-D and already sliced — reshaping a 1-D ``predict`` output is the
+        regressor's business and dropping a collinear probability column is the
+        classifier's, and both are decided in Rust before they get here.
+        """
+        # X's width only enters the layout under `passthrough`; skip reading it
+        # otherwise, since `X` here may be any array-LIKE the base estimators
+        # accepted (sklearn's check harness passes duck-typed objects with no
+        # `.shape` at all) and a needless probe would be the only thing that
+        # rejected it.
+        n_features = _n_columns(X) if self.passthrough else 0
+        n_feature_outs, _offsets, _n_meta, _width = _stack_ext().stacking_meta_layout(
+            [int(b.shape[1]) for b in blocks], n_features, bool(self.passthrough)
+        )
+        self._n_feature_outs = list(n_feature_outs)
+
+        if self.passthrough:
+            blocks = list(blocks) + [X]
+            if _is_sparse(X):
+                return _sys.modules["scipy.sparse"].hstack(blocks, format=X.format)
+
+        # STACK-META-01: `np.hstack` is the default arm and the fallback for
+        # everything the Rust arms cannot represent (see `_meta_via_rust`).
+        engine = _stack_ext().stacking_meta_engine()
+        if engine != "numpy":
+            meta = _meta_via_rust(
+                blocks, n_feature_outs, n_features, self.passthrough, engine
+            )
+            if meta is not None:
+                return meta
+        return np.hstack(blocks)
+
+    # -- introspection ------------------------------------------------------ #
+
+    @property
+    def n_features_in_(self):
+        """Feature count of the ORIGINAL ``X`` (read off ``estimators_[0]``)."""
+        try:
+            check_is_fitted(self)
+        except NotFittedError as nfe:
+            raise AttributeError(
+                f"{type(self).__name__} object has no attribute n_features_in_"
+            ) from nfe
+        return self.estimators_[0].n_features_in_
+
+    def get_feature_names_out(self, input_features=None):
+        """Meta-feature names: ``<classname>_<name>`` per kept estimator.
+
+        A multi-column block (a multiclass ``predict_proba``, say) is suffixed
+        with the within-block index and no separator —
+        ``stackingclassifier_lr0``. Under ``passthrough=True`` the input feature
+        names follow. Generated in Rust so the naming rule has one definition.
+        """
+        check_is_fitted(self, "n_features_in_")
+        kept_names = [
+            name
+            for name, est in self.estimators
+            if not _is_drop(est, _stack_ext().stacking_drop_sentinel())
+        ]
+        if self.passthrough:
+            inputs = [
+                str(f) for f in _generate_input_feature_names(self, input_features)
+            ]
+        else:
+            # sklearn still VALIDATES a supplied `input_features` here, it just
+            # does not emit it (`generate_names=False`).
+            if input_features is not None:
+                _generate_input_feature_names(self, input_features)
+            inputs = None
+        names = _stack_ext().stacking_feature_names(
+            type(self).__name__.lower(),
+            kept_names,
+            [int(n) for n in self._n_feature_outs],
+            inputs,
+        )
+        return np.asarray(names, dtype=object)
+
+    def get_metadata_routing(self):
+        """Route ``fit`` metadata to each named estimator, ``predict`` to the final one."""
+        router = MetadataRouter(owner=type(self).__name__)
+        for name, estimator in self.estimators:
+            router.add(
+                **{name: estimator},
+                method_mapping=MethodMapping().add(callee="fit", caller="fit"),
+            )
+        try:
+            final_estimator_ = self.final_estimator_
+        except AttributeError:
+            final_estimator_ = self.final_estimator
+        router.add(
+            final_estimator_=final_estimator_,
+            method_mapping=MethodMapping().add(caller="predict", callee="predict"),
+        )
+        return router
+
+    def __sklearn_tags__(self):
+        """``allow_nan`` / ``sparse`` are the AND over the composed estimators.
+
+        A stack is only as permissive as its least permissive member, so — as in
+        sklearn — these are derived rather than declared. Stacking mlrs
+        estimators therefore reports ``sparse=False`` (they ingest dense Arrow),
+        while stacking sklearn estimators can report ``True``.
+        """
+        tags = super().__sklearn_tags__()
+        try:
+            drop = _stack_ext().stacking_drop_sentinel()
+            tags.input_tags.allow_nan = all(
+                True if _is_drop(est, drop) else get_tags(est).input_tags.allow_nan
+                for _, est in self.estimators
+            )
+            tags.input_tags.sparse = all(
+                True if _is_drop(est, drop) else get_tags(est).input_tags.sparse
+                for _, est in self.estimators
+            )
+        except Exception:
+            # A malformed `estimators` must not break tag computation; `fit`'s
+            # own validation reports it properly.
+            pass
+        return tags
+
+
 class StackingRegressor(
-    RegressorMixin, TransformerMixin, MetaEstimatorMixin, BaseEstimator
+    RegressorMixin, TransformerMixin, MetaEstimatorMixin, _StackComposition, BaseEstimator
 ):
     """Stack of regressors with a final regressor (STACK-01).
 
@@ -888,63 +1257,6 @@ class StackingRegressor(
         self.passthrough = passthrough
         self.verbose = verbose
 
-    # -- composition parameter handling (sklearn `_BaseComposition`) ------- #
-
-    def get_params(self, deep=True):
-        """Constructor params, plus every named sub-estimator and its params.
-
-        ``deep=True`` adds one ``<name>`` key per entry in ``estimators`` and a
-        ``<name>__<param>`` key per sub-estimator parameter, so ``clone`` and a
-        ``GridSearchCV`` over ``lr__alpha`` both work.
-        """
-        out = super().get_params(deep=deep)
-        if not deep:
-            return out
-        try:
-            out.update(self.estimators)
-        except (TypeError, ValueError):
-            # A malformed `estimators` must not break `get_params` — `set_params`
-            # calls it, and the real complaint belongs to `fit`'s validation.
-            return out
-        for name, estimator in self.estimators:
-            if hasattr(estimator, "get_params"):
-                for key, value in estimator.get_params(deep=True).items():
-                    out[f"{name}__{key}"] = value
-        return out
-
-    def set_params(self, **params):
-        """Set params, including replacing a sub-estimator by name.
-
-        ``set_params(lr="drop")`` disables an entry; ``set_params(lr__alpha=2)``
-        reaches into one. Order matters and is sklearn's: the whole
-        ``estimators`` list first, then whole estimators by name, then
-        individual nested parameters.
-        """
-        if "estimators" in params:
-            self.estimators = params.pop("estimators")
-        items = self.estimators
-        if isinstance(items, list) and items:
-            with _suppress(TypeError):
-                item_names, _ = zip(*items)
-                for name in list(params.keys()):
-                    if "__" not in name and name in item_names:
-                        self._replace_estimator(name, params.pop(name))
-        super().set_params(**params)
-        return self
-
-    def _replace_estimator(self, name, new_val):
-        replaced = list(self.estimators)
-        for i, (estimator_name, _) in enumerate(replaced):
-            if estimator_name == name:
-                replaced[i] = (name, new_val)
-                break
-        self.estimators = replaced
-
-    @property
-    def named_estimators(self):
-        """``name -> estimator`` for the UNFITTED ``estimators`` argument."""
-        return Bunch(**dict(self.estimators))
-
     # -- validation -------------------------------------------------------- #
 
     def _validate_estimators(self):
@@ -952,28 +1264,11 @@ class StackingRegressor(
 
         Raises sklearn's own ``ValueError`` texts for a malformed list, a
         duplicate/colliding/``__``-containing name, an all-``'drop'`` list, and a
-        non-regressor entry.
+        non-regressor entry. Only that last rule is the regressor's own: unlike
+        :class:`StackingClassifier`, which accepts regressors as members, a
+        stack of regressors has no use for a classifier.
         """
-        estimators = self.estimators
-        if len(estimators) == 0 or not all(
-            isinstance(item, (tuple, list)) and isinstance(item[0], str)
-            for item in estimators
-        ):
-            raise ValueError(
-                "Invalid 'estimators' attribute, 'estimators' should be a "
-                "non-empty list of (string, estimator) tuples."
-            )
-        names, values = zip(*estimators)
-        ext = _stack_ext()
-        ext.stacking_validate_names(list(names), list(self.get_params(deep=False)))
-
-        drop = ext.stacking_drop_sentinel()
-        # The `== 'drop'` comparison itself has to happen here: the value is an
-        # arbitrary object whose `__eq__` may be overloaded. Its CONSEQUENCES
-        # (which slots survive, and whether any do) are Rust's.
-        is_drop = [_is_drop(est, drop) for est in values]
-        kept = ext.stacking_kept_indices(is_drop)
-
+        names, values, kept = self._validate_composition()
         for i in kept:
             if not is_regressor(values[i]):
                 raise ValueError(
@@ -981,7 +1276,7 @@ class StackingRegressor(
                         type(values[i]).__name__
                     )
                 )
-        return list(names), list(values), list(kept)
+        return names, values, kept
 
     def _resolve_final_estimator(self):
         """Clone ``final_estimator`` (or sklearn's ``RidgeCV()`` default) into
@@ -998,22 +1293,6 @@ class StackingRegressor(
                     self.final_estimator_
                 )
             )
-
-    def _cv_is_prefit(self):
-        """Is ``cv`` the ``"prefit"`` string? Classified in Rust.
-
-        A non-string ``cv`` never reaches Rust — it stays here and goes to
-        :func:`mlrs.model_selection.check_cv`. A string that is not ``"prefit"``
-        raises sklearn's ``StrOptions`` message, re-raised as
-        ``InvalidParameterError`` so that both ``except ValueError`` and
-        ``except TypeError`` callers migrating from sklearn still catch it.
-        """
-        if not isinstance(self.cv, str):
-            return False
-        try:
-            return _stack_ext().stacking_cv_is_prefit(self.cv)
-        except ValueError as exc:
-            raise InvalidParameterError(str(exc)) from None
 
     # -- fit --------------------------------------------------------------- #
 
@@ -1086,18 +1365,7 @@ class StackingRegressor(
                 for i in kept
             )
 
-        self.named_estimators_ = Bunch()
-        kept_set = set(kept)
-        fitted_idx = 0
-        for i, name in enumerate(names):
-            if i in kept_set:
-                current = self.estimators_[fitted_idx]
-                self.named_estimators_[name] = current
-                fitted_idx += 1
-                if hasattr(current, "feature_names_in_"):
-                    self.feature_names_in_ = current.feature_names_in_
-            else:
-                self.named_estimators_[name] = _stack_ext().stacking_drop_sentinel()
+        self._record_named_estimators(names, kept)
 
         # A regressor's only response method is `predict`; sklearn still stores
         # the list so `stack_method_` reads the same on both classes.
@@ -1146,32 +1414,15 @@ class StackingRegressor(
     def _concatenate_predictions(self, X, predictions):
         """The meta matrix: one block per kept estimator, then ``X`` if passthrough.
 
-        The column LAYOUT (widths, offsets, total width, and the
-        ``_n_feature_outs`` that ``get_feature_names_out`` reads) is computed in
-        Rust; the copy itself is ``np.hstack`` — see this module's
-        ``StackingRegressor`` section.
+        A regressor's ``predict`` is 1-D, so every block is one column; that
+        reshape is the only thing this adds to the shared
+        :meth:`_StackComposition._assemble_meta`.
         """
         blocks = []
         for pred in predictions:
             pred = np.asarray(pred)
             blocks.append(pred.reshape(-1, 1) if pred.ndim == 1 else pred)
-
-        # X's width only enters the layout under `passthrough`; skip reading it
-        # otherwise, since `X` here may be any array-LIKE the base estimators
-        # accepted (sklearn's check harness passes duck-typed objects with no
-        # `.shape` at all) and a needless probe would be the only thing that
-        # rejected it.
-        n_features = _n_columns(X) if self.passthrough else 0
-        n_feature_outs, _offsets, _n_meta, _width = _stack_ext().stacking_meta_layout(
-            [int(b.shape[1]) for b in blocks], n_features, bool(self.passthrough)
-        )
-        self._n_feature_outs = list(n_feature_outs)
-
-        if self.passthrough:
-            blocks.append(X)
-            if _is_sparse(X):
-                return _sys.modules["scipy.sparse"].hstack(blocks, format=X.format)
-        return np.hstack(blocks)
+        return self._assemble_meta(X, blocks)
 
     # -- transform / predict ------------------------------------------------ #
 
@@ -1197,95 +1448,479 @@ class StackingRegressor(
         check_is_fitted(self)
         return self.final_estimator_.predict(self.transform(X), **predict_params)
 
-    # -- introspection ------------------------------------------------------ #
 
-    @property
-    def n_features_in_(self):
-        """Feature count of the ORIGINAL ``X`` (read off ``estimators_[0]``)."""
-        try:
-            check_is_fitted(self)
-        except NotFittedError as nfe:
-            raise AttributeError(
-                f"{type(self).__name__} object has no attribute n_features_in_"
-            ) from nfe
-        return self.estimators_[0].n_features_in_
+# =========================================================================== #
+# StackingClassifier (STACK-CLF-01)
+# =========================================================================== #
+#
+# The classifier shares every structural rule with `StackingRegressor` — the
+# `'drop'` bookkeeping, the name validation, the `cv="prefit"` route, the column
+# layout, the feature names — through `_StackComposition`, and adds the three
+# things a classifier needs. All three are decided in Rust:
+#
+#   ==============================  ========================================
+#   what                            where the work happens
+#   ==============================  ========================================
+#   `stack_method` validation       Rust (`stacking_stack_method`)
+#   `"auto"` fallback chain         Rust (`stacking_resolve_stack_methods`)
+#   the dropped-column rule         Rust (`stacking_classifier_meta_slices`)
+#   ==============================  ========================================
+#
+# ## The dropped column is the whole reason the layout differs
+#
+# A binary `predict_proba` returns two columns that sum to one, so sklearn hands
+# the meta learner only the second — otherwise `final_estimator_` gets two
+# perfectly collinear features. A multiclass one is passed whole; a
+# `decision_function` is passed whole (a signed margin has no collinear twin);
+# `predict` is one column of ENCODED labels. Which of those applies is a
+# function of (resolved method, response shape, len(classes_)), and that
+# function is `mlrs_algos::ensemble::stacking::classifier_meta_slices`. The shim
+# only performs the slice it is told to.
+#
+# ## The default `final_estimator` is sklearn's `LogisticRegression`
+#
+# Same reasoning as the regressor's `RidgeCV` default: sklearn's default is
+# `LogisticRegression()`, mlrs ships a `LogisticRegression` whose defaults are
+# its own, and silently substituting it would move every default-constructed
+# stack off the baseline users are migrating from. Pass
+# `final_estimator=mlrs.LogisticRegression()` to put the meta fit on the device.
 
-    def get_feature_names_out(self, input_features=None):
-        """Meta-feature names: ``stackingregressor_<name>`` per kept estimator.
 
-        Under ``passthrough=True`` the input feature names follow. Generated in
-        Rust so the naming rule (including the separator-less index suffix on a
-        multi-column block) has one definition.
+class StackingClassifier(
+    ClassifierMixin, TransformerMixin, MetaEstimatorMixin, _StackComposition, BaseEstimator
+):
+    """Stack of classifiers with a final classifier (STACK-CLF-01).
+
+    ``StackingClassifier(estimators, final_estimator=None, *, cv=None,
+    stack_method="auto", n_jobs=None, passthrough=False, verbose=0)`` — the full
+    :class:`sklearn.ensemble.StackingClassifier` parameter surface, with the
+    cross-validation index generation and the composition bookkeeping in Rust.
+
+    Base estimators are fitted on the whole of ``X`` and exposed as
+    ``estimators_``; ``final_estimator_`` is fitted on their **out-of-fold**
+    responses (:func:`mlrs.model_selection.cross_val_predict`), so the meta
+    learner never sees a base estimator's in-sample fit.
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator)
+        The base estimators. Classifiers normally, but a **regressor is
+        accepted** — sklearn allows it for ordinal problems, and mlrs matches
+        that. An entry's estimator may be the string ``'drop'`` (usually via
+        ``set_params(name='drop')``) to disable it; a dropped entry keeps its
+        slot in ``named_estimators_`` (as ``'drop'``) but contributes no meta
+        column and is never fitted.
+    final_estimator : estimator, default=None
+        The classifier fitted on the meta features. ``None`` means
+        ``sklearn.linear_model.LogisticRegression()``, sklearn's own default —
+        see this module's ``StackingClassifier`` section for why mlrs does not
+        substitute its own.
+    cv : int, cross-validation generator, iterable, or "prefit", default=None
+        Passed to :func:`mlrs.model_selection.cross_val_predict`. ``None`` is
+        5-fold :class:`mlrs.model_selection.StratifiedKFold` (a classifier
+        stratifies). ``"prefit"`` assumes every entry in ``estimators`` is
+        ALREADY fitted: nothing is cloned or refitted, and the meta features are
+        the base estimators' responses on the FULL training set rather than
+        out-of-fold ones — much cheaper and, if those estimators were fitted on
+        this same data, badly overfit.
+    stack_method : {"auto", "predict_proba", "decision_function", "predict"}, \
+default="auto"
+        The response method each base estimator is asked for. ``"auto"`` takes
+        the first of ``predict_proba``, ``decision_function``, ``predict`` that
+        the estimator implements — resolved per estimator, so a stack may mix
+        methods; the choices land in ``stack_method_``. A NAMED method every
+        member must implement, or ``fit`` raises.
+    n_jobs : int, default=None
+        joblib parallelism for the base-estimator fits and for the inner
+        ``cross_val_predict`` calls. ``None`` means 1. Reduced to serial (with a
+        warning) when a member is an mlrs estimator — see
+        :func:`_effective_n_jobs`.
+    passthrough : bool, default=False
+        Append the original ``X`` columns to the meta features.
+    verbose : int, default=0
+        Forwarded to the inner ``cross_val_predict`` calls.
+
+    Attributes
+    ----------
+    classes_ : ndarray of shape (n_classes,) or list of ndarray
+        The class labels, in the order the encoded targets use. A list, one
+        array per column, when ``y`` is a multilabel indicator.
+    estimators_ : list of estimator
+        The fitted base estimators, dropped entries excluded. Under
+        ``cv="prefit"`` these are the caller's own objects, not clones.
+    named_estimators_ : :class:`sklearn.utils.Bunch`
+        ``name -> fitted estimator`` (or the string ``'drop'``).
+    final_estimator_ : estimator
+        The fitted meta classifier.
+    stack_method_ : list of str
+        The response method resolved for each kept estimator.
+    n_features_in_ : int
+        Feature count of the ORIGINAL ``X``, read off ``estimators_[0]``.
+    feature_names_in_ : ndarray of str
+        Present only when a fitted base estimator exposes it.
+
+    Notes
+    -----
+    When a base estimator contributes ``predict_proba`` on a **binary** problem,
+    its first column is dropped: ``p(y=0) = 1 - p(y=1)``, so both columns would
+    be perfectly collinear. This is sklearn's rule and is why a binary stack's
+    meta matrix has one column per estimator while a 3-class one has three.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import mlrs
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.standard_normal((200, 5)).astype(np.float32)
+    >>> y = (X[:, 0] > 0).astype(np.int64)
+    >>> clf = mlrs.StackingClassifier(
+    ...     estimators=[("nb", mlrs.GaussianNB()), ("knn", mlrs.KNeighborsClassifier())],
+    ...     cv=3,
+    ... )
+    >>> clf.fit(X, y).predict(X[:2]).shape
+    (2,)
+    """
+
+    def __init__(
+        self,
+        estimators,
+        final_estimator=None,
+        *,
+        cv=None,
+        stack_method="auto",
+        n_jobs=None,
+        passthrough=False,
+        verbose=0,
+    ):
+        self.estimators = estimators
+        self.final_estimator = final_estimator
+        self.cv = cv
+        self.stack_method = stack_method
+        self.n_jobs = n_jobs
+        self.passthrough = passthrough
+        self.verbose = verbose
+
+    # -- validation -------------------------------------------------------- #
+
+    def _validate_estimators(self):
+        """``(names, estimators, kept_indices)`` — the Rust-backed structural check.
+
+        Deliberately does NOT require the members to be classifiers: sklearn's
+        ``StackingClassifier`` overrides the base check for exactly that reason
+        (a regressor first layer is how ordinal regression is stacked), and a
+        parity shim that tightened it would reject fits sklearn completes.
         """
-        check_is_fitted(self, "n_features_in_")
-        kept_names = [
-            name
-            for name, est in self.estimators
-            if not _is_drop(est, _stack_ext().stacking_drop_sentinel())
+        return self._validate_composition()
+
+    def _resolve_final_estimator(self):
+        """Clone ``final_estimator`` (or sklearn's ``LogisticRegression()``
+        default) into ``final_estimator_``, then require it to be a classifier."""
+        if self.final_estimator is not None:
+            self.final_estimator_ = clone(self.final_estimator)
+        else:
+            from sklearn.linear_model import LogisticRegression
+
+            self.final_estimator_ = clone(LogisticRegression())
+        if not is_classifier(self.final_estimator_):
+            raise ValueError(
+                "'final_estimator' parameter should be a classifier. Got {}".format(
+                    self.final_estimator_
+                )
+            )
+
+    def _resolve_stack_methods(self, names, all_estimators, kept):
+        """``stack_method_`` — one resolved response method per KEPT estimator.
+
+        The ``hasattr`` probes stay here because an ``available_if`` descriptor
+        decides them at access time (``SVC.predict_proba`` exists only under
+        ``probability=True``); the preference order, the ``"auto"`` fallback and
+        the rejection message are Rust's.
+
+        Only the KEPT estimators are resolved. A dropped entry is never asked
+        for a method — sklearn returns ``None`` for it before checking that the
+        method exists — so a stack whose only proba-less member is ``'drop'``
+        fits under ``stack_method="predict_proba"``.
+
+        The ``ValueError`` this can raise is sklearn's *"Underlying estimator
+        {name} does not implement the method {method}."* and propagates as-is;
+        the other thing Rust rejects here, an unrecognized ``stack_method``
+        string, has already been reported by :meth:`_check_stack_method` under
+        ``InvalidParameterError``.
+        """
+        implements = [
+            (
+                hasattr(all_estimators[i], "predict_proba"),
+                hasattr(all_estimators[i], "decision_function"),
+                hasattr(all_estimators[i], "predict"),
+            )
+            for i in kept
         ]
-        if self.passthrough:
-            inputs = [
-                str(f)
-                for f in _generate_input_feature_names(self, input_features)
+        return _stack_ext().stacking_resolve_stack_methods(
+            [names[i] for i in kept], self.stack_method, implements
+        )
+
+    def _check_stack_method(self):
+        """Validate the ``stack_method`` string, at sklearn's point in ``fit``.
+
+        sklearn's ``@validate_params`` runs before ``_validate_estimators``, so
+        an unrecognized ``stack_method`` is reported ahead of anything about the
+        ``estimators`` list — a caller who got both wrong sees the same
+        complaint from both libraries.
+        """
+        try:
+            _stack_ext().stacking_stack_method(self.stack_method)
+        except ValueError as exc:
+            raise InvalidParameterError(str(exc)) from None
+
+    # -- fit --------------------------------------------------------------- #
+
+    def fit(self, X, y, **fit_params):
+        """Fit the base estimators, then the final estimator on their responses.
+
+        ``y`` is label-encoded before anything else — the meta learner and every
+        base estimator see ``0..n_classes-1``, and ``predict`` maps back through
+        ``classes_``. A multilabel-indicator ``y`` is encoded column by column
+        and ``classes_`` becomes a list.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+        **fit_params : dict
+            ``sample_weight`` is forwarded to every sub-estimator's ``fit``.
+            Anything else requires
+            ``sklearn.set_config(enable_metadata_routing=True)``.
+
+        Returns
+        -------
+        self : object
+        """
+        _raise_for_extra_fit_params(fit_params, self, "fit", allow=["sample_weight"])
+        check_classification_targets(y)
+        # Both string-valued CONSTRUCTOR parameters are validated here, at the
+        # point sklearn's `@validate_params` runs — before anything about the
+        # `estimators` list is looked at. A caller who got both wrong therefore
+        # sees the same complaint from both libraries.
+        self._check_stack_method()
+        prefit = self._cv_is_prefit()
+
+        if type_of_target(y) == "multilabel-indicator":
+            y = np.asarray(y)
+            self._label_encoder = [LabelEncoder().fit(col) for col in y.T]
+            self.classes_ = [le.classes_ for le in self._label_encoder]
+            y_encoded = np.array(
+                [le.transform(col) for le, col in zip(self._label_encoder, y.T)]
+            ).T
+        else:
+            y = column_or_1d(y, warn=True)
+            self._label_encoder = LabelEncoder().fit(y)
+            self.classes_ = self._label_encoder.classes_
+            y_encoded = self._label_encoder.transform(y)
+
+        names, all_estimators, kept = self._validate_estimators()
+        self._resolve_final_estimator()
+
+        if _routing_enabled():
+            routed_params = process_routing(self, "fit", **fit_params)
+        else:
+            routed_params = Bunch()
+            for name in names:
+                routed_params[name] = Bunch(fit={})
+                if "sample_weight" in fit_params:
+                    routed_params[name].fit["sample_weight"] = fit_params[
+                        "sample_weight"
+                    ]
+
+        # One decision covers BOTH fan-outs below AND the inner
+        # `cross_val_predict` calls' own `n_jobs`, so it is resolved once here
+        # rather than re-derived at each `Parallel`.
+        members = [all_estimators[i] for i in kept] + [self.final_estimator_]
+        n_jobs = _effective_n_jobs(self.n_jobs, members, type(self).__name__)
+        self._fit_members(
+            X,
+            y_encoded,
+            names,
+            all_estimators,
+            kept,
+            routed_params,
+            prefit,
+            fit_params,
+            n_jobs,
+        )
+        return self
+
+    def _fit_members(
+        self,
+        X,
+        y,
+        names,
+        all_estimators,
+        kept,
+        routed_params,
+        prefit,
+        fit_params,
+        n_jobs,
+    ):
+        """The body of :meth:`fit`, on the ENCODED ``y`` and at the resolved
+        (device-safe) ``n_jobs``."""
+        if prefit:
+            self.estimators_ = []
+            for i in kept:
+                check_is_fitted(all_estimators[i])
+                self.estimators_.append(all_estimators[i])
+        else:
+            self.estimators_ = _parallel(n_jobs, "2*n_jobs")(
+                _delayed(_fit_one)(
+                    clone(all_estimators[i]), X, y, routed_params[names[i]]["fit"]
+                )
+                for i in kept
+            )
+
+        self._record_named_estimators(names, kept)
+        self.stack_method_ = self._resolve_stack_methods(names, all_estimators, kept)
+
+        if prefit:
+            responses = [
+                getattr(all_estimators[i], method)(X)
+                for i, method in zip(kept, self.stack_method_)
             ]
         else:
-            # sklearn still VALIDATES a supplied `input_features` here, it just
-            # does not emit it (`generate_names=False`).
-            if input_features is not None:
-                _generate_input_feature_names(self, input_features)
-            inputs = None
-        names = _stack_ext().stacking_feature_names(
-            type(self).__name__.lower(),
-            kept_names,
-            [int(n) for n in self._n_feature_outs],
-            inputs,
-        )
-        return np.asarray(names, dtype=object)
-
-    def get_metadata_routing(self):
-        """Route ``fit`` metadata to each named estimator, ``predict`` to the final one."""
-        router = MetadataRouter(owner=type(self).__name__)
-        for name, estimator in self.estimators:
-            router.add(
-                **{name: estimator},
-                method_mapping=MethodMapping().add(callee="fit", caller="fit"),
+            cv = check_cv(self.cv, y=y, classifier=True)
+            if hasattr(cv, "random_state") and cv.random_state is None:
+                # sklearn pins a concrete RandomState so every base estimator
+                # sees the SAME folds even under `shuffle=True`. `deepcopy`
+                # below then keeps the per-estimator calls from advancing a
+                # shared generator.
+                cv.random_state = np.random.RandomState()
+            responses = _parallel(n_jobs, "2*n_jobs")(
+                _delayed(cross_val_predict)(
+                    clone(all_estimators[i]),
+                    X,
+                    y,
+                    cv=_deepcopy(cv),
+                    method=method,
+                    n_jobs=n_jobs,
+                    params=routed_params[names[i]]["fit"],
+                    verbose=self.verbose,
+                )
+                for i, method in zip(kept, self.stack_method_)
             )
-        try:
-            final_estimator_ = self.final_estimator_
-        except AttributeError:
-            final_estimator_ = self.final_estimator
-        router.add(
-            final_estimator_=final_estimator_,
-            method_mapping=MethodMapping().add(caller="predict", callee="predict"),
-        )
-        return router
 
-    def __sklearn_tags__(self):
-        """``allow_nan`` / ``sparse`` are the AND over the composed estimators.
+        X_meta = self._concatenate_predictions(X, responses)
+        _fit_one(self.final_estimator_, X_meta, y, fit_params)
 
-        A stack is only as permissive as its least permissive member, so — as in
-        sklearn — these are derived rather than declared. Stacking mlrs
-        estimators therefore reports ``sparse=False`` (they ingest dense Arrow),
-        while stacking sklearn estimators can report ``True``.
+    def fit_transform(self, X, y, **fit_params):
+        """``fit(X, y).transform(X)`` — the meta features for the training rows."""
+        _raise_for_extra_fit_params(fit_params, self, "fit", allow=["sample_weight"])
+        return self.fit(X, y, **fit_params).transform(X)
+
+    # -- meta-feature assembly --------------------------------------------- #
+
+    def _concatenate_predictions(self, X, responses):
+        """The meta matrix, with the collinear probability columns dropped.
+
+        Which columns of which response block survive is
+        ``mlrs_algos::ensemble::stacking::classifier_meta_slices``' answer, a
+        function of the resolved method, the response's shape and
+        ``len(classes_)``. This method performs the slices it is handed and
+        nothing else; the layout and copy are the shared
+        :meth:`_StackComposition._assemble_meta`.
         """
-        tags = super().__sklearn_tags__()
-        try:
-            drop = _stack_ext().stacking_drop_sentinel()
-            tags.input_tags.allow_nan = all(
-                True
-                if _is_drop(est, drop)
-                else get_tags(est).input_tags.allow_nan
-                for _, est in self.estimators
-            )
-            tags.input_tags.sparse = all(
-                True if _is_drop(est, drop) else get_tags(est).input_tags.sparse
-                for _, est in self.estimators
-            )
-        except Exception:
-            # A malformed `estimators` must not break tag computation; `fit`'s
-            # own validation reports it properly.
-            pass
-        return tags
+        kinds, cols, arrays = [], [], []
+        for response in responses:
+            if isinstance(response, list):
+                # A multilabel `predict_proba`: one `(n, n_classes_j)` block per
+                # target. `np.asarray` on the list would build a 3-D array and
+                # lose the per-target shapes, so each is kept separate.
+                blocks = [np.asarray(part) for part in response]
+                kinds.append(2)
+                cols.append([int(b.shape[1]) for b in blocks])
+                arrays.append(blocks)
+            else:
+                arr = np.asarray(response)
+                arrays.append([arr])
+                if arr.ndim == 1:
+                    kinds.append(0)
+                    cols.append([])
+                else:
+                    kinds.append(1)
+                    cols.append([int(arr.shape[1])])
+
+        n_classes = len(self.classes_)
+        slices = _stack_ext().stacking_classifier_meta_slices(
+            list(self.stack_method_), kinds, cols, n_classes
+        )
+
+        blocks = []
+        for block, sub, start_col, n_cols in slices:
+            arr = arrays[block][sub]
+            if arr.ndim == 1:
+                blocks.append(arr.reshape(-1, 1))
+            else:
+                blocks.append(arr[:, start_col : start_col + n_cols])
+        return self._assemble_meta(X, blocks)
+
+    # -- transform / predict ------------------------------------------------ #
+
+    def transform(self, X):
+        """The base estimators' responses for ``X``, as the meta-feature matrix.
+
+        Returns
+        -------
+        y_preds : ndarray of shape (n_samples, n_meta [+ n_features])
+            One column per estimator when every member contributes ``predict``,
+            a ``decision_function`` on a binary problem, or a binary
+            ``predict_proba``; ``n_classes`` columns per estimator otherwise.
+        """
+        check_is_fitted(self)
+        responses = [
+            getattr(est, method)(X)
+            for est, method in zip(self.estimators_, self.stack_method_)
+        ]
+        return self._concatenate_predictions(X, responses)
+
+    @available_if(_final_estimator_has("predict"))
+    def predict(self, X, **predict_params):
+        """Predict class labels for ``X``, mapped back through ``classes_``.
+
+        ``**predict_params`` reach the FINAL estimator only.
+        """
+        check_is_fitted(self)
+        if _routing_enabled():
+            routed_params = process_routing(self, "predict", **predict_params)
+            predict_params = routed_params.final_estimator_["predict"]
+        y_pred = self.final_estimator_.predict(self.transform(X), **predict_params)
+        if isinstance(self._label_encoder, list):
+            return np.array(
+                [
+                    le.inverse_transform(col)
+                    for le, col in zip(self._label_encoder, np.asarray(y_pred).T)
+                ]
+            ).T
+        return self._label_encoder.inverse_transform(y_pred)
+
+    @available_if(_final_estimator_has("predict_proba"))
+    def predict_proba(self, X):
+        """Class probabilities from ``final_estimator_``.
+
+        Returns
+        -------
+        probabilities : ndarray of shape (n_samples, n_classes)
+            For a multilabel ``y`` this is ``(n_samples, n_outputs)`` — the
+            positive-class probability of each output, which is what sklearn
+            reduces the meta learner's per-output list to.
+        """
+        check_is_fitted(self)
+        y_pred = self.final_estimator_.predict_proba(self.transform(X))
+        if isinstance(self._label_encoder, list):
+            return np.array([preds[:, 0] for preds in y_pred]).T
+        return y_pred
+
+    @available_if(_final_estimator_has("decision_function"))
+    def decision_function(self, X):
+        """``final_estimator_``'s decision function over the meta features."""
+        check_is_fitted(self)
+        return self.final_estimator_.decision_function(self.transform(X))
 
 
 def _n_columns(X):

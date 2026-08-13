@@ -36,6 +36,7 @@ from .ensemble import (
     HistGradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
+    StackingClassifier,
     StackingRegressor,
 )
 from .kernel_ridge import KernelRidge
@@ -137,6 +138,7 @@ __all__ = [
     "HistGradientBoostingRegressor",
     "ForestInference",
     "StackingRegressor",
+    "StackingClassifier",
     "KMeans",
     "DBSCAN",
     "HDBSCAN",

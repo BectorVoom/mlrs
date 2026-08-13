@@ -26,10 +26,13 @@ pytest.importorskip("mlrs")
 
 import mlrs  # noqa: E402  (after importorskip)
 from mlrs import _io  # noqa: E402  (after importorskip)
-from sklearn.linear_model import (  # noqa: E402  (StackingRegressor members)
+from mlrs.base import MlrsBase  # noqa: E402  (after importorskip)
+from sklearn.linear_model import (  # noqa: E402  (Stacking* members)
     LinearRegression as SkLinearRegression,
+    LogisticRegression as SkLogisticRegression,
     Ridge as SkRidge,
 )
+from sklearn.naive_bayes import GaussianNB as SkGaussianNB  # noqa: E402
 from sklearn.utils import get_tags  # noqa: E402
 from sklearn.utils.estimator_checks import (  # noqa: E402
     parametrize_with_checks,
@@ -137,6 +140,19 @@ def _estimators():
             estimators=[
                 ("lr", SkLinearRegression()),
                 ("ridge", SkRidge()),
+            ],
+            cv=2,
+        ),
+        # --- STACK-CLF-01: the classifier twin, same shape and same reasoning.
+        # Two cheap host base classifiers, `cv=2`, and `stack_method` left at
+        # `"auto"` — which resolves to `predict_proba` for both members, i.e.
+        # the branch that DROPS a column on a binary target, so the harness's
+        # binary fixtures exercise the rule that distinguishes this class from
+        # the regressor.
+        mlrs.StackingClassifier(
+            estimators=[
+                ("lr", SkLogisticRegression()),
+                ("nb", SkGaussianNB()),
             ],
             cv=2,
         ),
@@ -500,9 +516,27 @@ _DTYPE_PRESERVE_ROCM_REASON = (
 
 
 def _preserves_dtype_check_applies(estimator):
-    """Whether sklearn yields ``check_transformer_preserve_dtypes`` for this
-    estimator (mirrors ``_yield_transformer_checks``'s own gate)."""
+    """Whether the rocm dtype-downcast xfail above applies to this estimator.
+
+    Two conditions. First, sklearn must actually yield
+    ``check_transformer_preserve_dtypes`` for it (this mirrors
+    ``_yield_transformer_checks``'s own gate). Second, the estimator must be one
+    whose ingress performs the downcast at all — i.e. an
+    :class:`~mlrs.base.MlrsBase` shim.
+
+    The second condition exists for the stacking meta-estimators. They are
+    transformers with the default ``preserves_dtype``, but they own no device
+    buffers: the entries in :func:`_estimators` compose scikit-learn members, so
+    nothing crosses the mlrs ingress and float64 flows through untouched. They
+    PASS the check on rocm, and xfailing them there would report an XPASS —
+    exactly the silent drift ``checks_triage.md`` asks this map to avoid. A
+    stack of mlrs members would need the xfail back; that configuration is not
+    in the harness (its base fits would dominate a check suite that fits each
+    entry ~49 times).
+    """
     if not hasattr(estimator, "transform"):
+        return False
+    if not isinstance(estimator, MlrsBase):
         return False
     tags = get_tags(estimator)
     return bool(tags.transformer_tags and tags.transformer_tags.preserves_dtype)
