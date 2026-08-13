@@ -38,6 +38,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -49,8 +50,15 @@ use mlrs_backend::prims::incremental_svd::{merge, IncrementalSvdState};
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::decomp_persist::{
+    read_feature_vec, read_spectral_core, AlignedBytes, DecompFile, DecompWriter, LoadModel,
+    PersistError, SaveModel, SpectralCoreRef, TensorRef, MEAN_NAME, N_SAMPLES_SEEN_KEY, VAR_NAME,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{Fit, Fitted, PartialFit, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `IncrementalPCA` file.
+const PERSIST_TAG: &str = "incremental_pca";
 
 /// Whiten-scale floor: `1/sqrt(explained_variance_)` is guarded against a
 /// (near-)zero variance so a degenerate component never produces a non-finite
@@ -360,6 +368,121 @@ where
         self.state
             .as_ref()
             .expect("state is Some by construction on IncrementalPCA<F, Fitted>")
+    }
+}
+
+impl<F> SaveModel for IncrementalPCA<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the running decomposition to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `components_` | `F64` | `[n_components, n_features]` |
+    /// | `explained_variance_` / `_ratio_` / `singular_values_` | `F64` | `[n_components]` |
+    /// | `mean_` / `var_` | `F64` | `[n_features]` |
+    /// | `n_samples_seen_` | `__metadata__` scalar | — |
+    /// | `param:n_components` / `param:whiten` / `param:batch_size` | `__metadata__` scalar | — |
+    ///
+    /// ## Why this one estimator's file is always `F64`
+    ///
+    /// Everywhere else in mlrs the stored dtype is the MODEL's dtype, which
+    /// halves the file for an `f32` fit. [`IncrementalSvdState`] is `f64`
+    /// regardless of the estimator's `F` — the Chan-Golub-LeVeque running
+    /// mean/variance update loses its accuracy guarantee at `f32`, which is the
+    /// whole reason it is written that way — so an `IncrementalPCA<f32>` file is
+    /// the same size as an `IncrementalPCA<f64>` one. Narrowing it to `F` on
+    /// save would not be a storage decision but a MODEL change: reloading would
+    /// hand back a state that `partial_fit` continues from at lower precision
+    /// than the one that was saved, and the running statistics would drift from
+    /// the un-saved model's on every subsequent batch. The file is a
+    /// continuation point, not just a transform.
+    ///
+    /// `n_samples_seen_` rides as a scalar for that same reason: it is what the
+    /// next `partial_fit` weights its merge by, so a file without it could be
+    /// transformed with but never continued.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let state = self.state.as_ref().ok_or(PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field: "state",
+        })?;
+        // Bound BEFORE the writer, which borrows every payload. Only
+        // `components_` is device-resident; the running statistics are already
+        // host `f64` vectors, so they are borrowed straight out of the state.
+        let components = state.components_.to_host(pool);
+
+        let mut w = DecompWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_components", self.n_components);
+        w.scalar_bool("param:whiten", self.whiten);
+        // `None` writes no key at all rather than a sentinel: sklearn's
+        // `batch_size=None` MEANS "use 5 · n_features at fit", which is not a
+        // number any `0` could stand in for without colliding with a real value.
+        w.scalar_opt_usize("param:batch_size", self.batch_size);
+        w.scalar_usize(N_SAMPLES_SEEN_KEY, state.n_samples_seen_);
+
+        SpectralCoreRef {
+            components: &components,
+            explained_variance: &state.explained_variance_,
+            explained_variance_ratio: &state.explained_variance_ratio_,
+            singular_values: &state.singular_values_,
+            n_components: state.n_components,
+            n_features: state.n_features,
+        }
+        .write_into(&mut w)?;
+        w.tensor(
+            MEAN_NAME,
+            TensorRef::f64s(&state.mean_, vec![state.n_features])?,
+        );
+        w.tensor(VAR_NAME, TensorRef::f64s(&state.var_, vec![state.n_features])?);
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for IncrementalPCA<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the running decomposition back from `path`, re-uploading
+    /// `components_` to `pool`.
+    ///
+    /// The reloaded model is a valid CONTINUATION point, not merely a transform:
+    /// `n_samples_seen_`, `mean_` and `var_` all come back, so a `partial_fit`
+    /// on the loaded model merges exactly as it would have on the un-saved one.
+    /// That is the property the `n_samples_seen_` scalar exists for, and the one
+    /// the round-trip gate in `decomp_persist_test.rs` checks by continuing both
+    /// arms with the same batch.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<IncrementalPCA<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = DecompFile::parse(&raw, PERSIST_TAG)?;
+        // `f64` and not `F`: the state is `f64` by construction (see `save`), so
+        // this reads the file's own bytes with no conversion at all.
+        let core = read_spectral_core::<f64>(&file)?;
+        let mean = read_feature_vec::<f64>(&file, MEAN_NAME, core.n_features)?;
+        let var = read_feature_vec::<f64>(&file, VAR_NAME, core.n_features)?;
+
+        Ok(IncrementalPCA {
+            n_components: file.scalar_usize("param:n_components")?,
+            whiten: file.scalar_bool("param:whiten")?,
+            batch_size: file.scalar_opt_usize("param:batch_size")?,
+            state: Some(IncrementalSvdState {
+                components_: DeviceArray::from_host(pool, &core.components),
+                singular_values_: core.singular_values.into_owned(),
+                explained_variance_: core.explained_variance.into_owned(),
+                explained_variance_ratio_: core.explained_variance_ratio.into_owned(),
+                mean_: mean.into_owned(),
+                var_: var.into_owned(),
+                n_samples_seen_: file.scalar_usize(N_SAMPLES_SEEN_KEY)?,
+                n_features: core.n_features,
+                n_components: core.n_components,
+            }),
+            n_features: core.n_features,
+            _marker: PhantomData,
+            _state: PhantomData,
+        })
     }
 }
 

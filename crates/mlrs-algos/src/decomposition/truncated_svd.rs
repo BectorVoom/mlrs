@@ -31,6 +31,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -43,8 +44,21 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::sign_flip::align_rows;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::decomp_persist::{
+    read_spectral_core, AlignedBytes, DecompFile, DecompWriter, LoadModel, PersistError, SaveModel,
+    SpectralCoreRef,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `TruncatedSvd` file.
+///
+/// Load-bearing rather than decorative: a `Pca` file holds the same four
+/// spectral tensors of the same shapes, and differs only by carrying a `mean_`.
+/// Without this tag a `Pca` file would load here and transform UNCENTERED — the
+/// one difference between the two estimators, and silently wrong output rather
+/// than an error.
+const PERSIST_TAG: &str = "truncated_svd";
 
 /// Truncated SVD (DECOMP-02) fitted by the thin SVD of the UNCENTERED `X`.
 ///
@@ -205,6 +219,94 @@ where
         slot.as_ref()
             .expect("fitted attribute is Some by construction on TruncatedSvd<F, Fitted>")
             .to_host(pool)
+    }
+}
+
+impl<F> SaveModel for TruncatedSvd<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted decomposition to `path` as a safetensors file.
+    ///
+    /// The four shared spectral tensors and one scalar, and NOTHING else — this
+    /// is the minimal member of the family. No `mean_` is written, and that
+    /// absence is the model: `TruncatedSvd` decomposes the UNCENTERED matrix, so
+    /// there is no column mean to store and writing a zero vector would only
+    /// invite a reader to subtract it.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let components = self
+            .components_
+            .as_ref()
+            .ok_or_else(|| absent("components_"))?
+            .to_host(pool);
+        let explained_variance = self
+            .explained_variance_
+            .as_ref()
+            .ok_or_else(|| absent("explained_variance_"))?
+            .to_host(pool);
+        let explained_variance_ratio = self
+            .explained_variance_ratio_
+            .as_ref()
+            .ok_or_else(|| absent("explained_variance_ratio_"))?
+            .to_host(pool);
+        let singular_values = self
+            .singular_values_
+            .as_ref()
+            .ok_or_else(|| absent("singular_values_"))?
+            .to_host(pool);
+
+        let mut w = DecompWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_components", self.n_components);
+        SpectralCoreRef {
+            n_components: singular_values.len(),
+            n_features: self.n_features,
+            components: &components,
+            explained_variance: &explained_variance,
+            explained_variance_ratio: &explained_variance_ratio,
+            singular_values: &singular_values,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for TruncatedSvd<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a decomposition back from `path`, re-uploading all four tensors to
+    /// `pool`.
+    ///
+    /// A `Pca` file is rejected by the `estimator` tag before any tensor is
+    /// fetched, which matters more here than anywhere else in the family: the
+    /// two files' tensor sets overlap completely, so the only structural
+    /// difference is one EXTRA tensor in the `Pca` file — something a
+    /// tensor-by-tensor load would never notice.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<TruncatedSvd<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = DecompFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_spectral_core::<F>(&file)?;
+
+        Ok(TruncatedSvd {
+            n_components: file.scalar_usize("param:n_components")?,
+            components_: Some(DeviceArray::from_host(pool, &core.components)),
+            explained_variance_: Some(DeviceArray::from_host(pool, &core.explained_variance)),
+            explained_variance_ratio_: Some(DeviceArray::from_host(
+                pool,
+                &core.explained_variance_ratio,
+            )),
+            singular_values_: Some(DeviceArray::from_host(pool, &core.singular_values)),
+            n_features: core.n_features,
+            _state: PhantomData,
+        })
     }
 }
 

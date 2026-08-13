@@ -29,6 +29,7 @@
 //! (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -38,9 +39,27 @@ use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::rng;
 use mlrs_backend::runtime::ActiveRuntime;
 
+use super::proj_persist::{
+    read_components, read_n_components, write_components, write_n_components, AlignedBytes,
+    LoadModel, PersistError, ProjFile, ProjWriter, SaveModel,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::projection::gaussian::{johnson_lindenstrauss_min_dim, project, NComponents};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `SparseRandomProjection`
+/// file. See [`gaussian`](super::gaussian)'s tag for why it is load-bearing.
+const PERSIST_TAG: &str = "sparse_random_projection";
+
+/// The `__metadata__` key holding the FITTED density — the value the Achlioptas
+/// draw actually used.
+///
+/// No [`PARAM_PREFIX`](super::proj_persist::PARAM_PREFIX): `density_` is
+/// sklearn's fitted attribute, distinct from the `density` constructor argument
+/// which is optional and, when `None`, means "use `1/sqrt(n_features)`". Both
+/// are stored, because the request and the outcome are different facts and a
+/// reloaded model reports each.
+const DENSITY_FITTED_KEY: &str = "density_";
 
 /// Sparse (Achlioptas) random-projection transformer (PROJ-02), `components_`
 /// stored DENSE (D-12).
@@ -235,6 +254,84 @@ where
     /// The resolved density (`None` → `1/sqrt(n_features)`) after fit.
     pub fn density_(&self) -> f64 {
         self.density_
+    }
+}
+
+impl<F> SaveModel for SparseRandomProjection<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted projection to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `components_` | `F` (`F32`/`F64`) | `[n_components_, n_features]` |
+    /// | `param:n_components` / `param:seed` / `param:eps` | `__metadata__` scalar | — |
+    /// | `param:density` | `__metadata__` scalar, ABSENT when `None` | — |
+    /// | `density_` | `__metadata__` scalar | — |
+    ///
+    /// The matrix is stored DENSE, mostly-zero as it is —
+    /// [`proj_persist`](super::proj_persist) gives the reason: mlrs's projection
+    /// is a dense GEMM (D-12), and the file follows the memory layout so a load
+    /// is one copy-free hand-off rather than a decode.
+    ///
+    /// `param:density` is written only when it was given: `None` MEANS "use
+    /// `1/sqrt(n_features)`", so key-presence carries the `Option` and costs
+    /// zero bytes when absent. `density_` — what that resolved to — is always
+    /// written, since it is not recoverable from `components_` without counting
+    /// the non-zeros and inferring a probability from a sample.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows the payload.
+        let components = self
+            .components_
+            .as_ref()
+            .ok_or(PersistError::MissingState {
+                estimator: PERSIST_TAG,
+                field: "components_",
+            })?
+            .to_host(pool);
+
+        let mut w = ProjWriter::new(PERSIST_TAG);
+        write_n_components(&mut w, self.n_components);
+        w.scalar_u64("param:seed", self.seed);
+        w.scalar_f64("param:eps", self.eps);
+        w.scalar_opt_f64("param:density", self.density);
+        w.scalar_f64(DENSITY_FITTED_KEY, self.density_);
+        write_components(&mut w, &components, self.n_components_, self.n_features)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for SparseRandomProjection<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the projection back from `path`, re-uploading `components_` to
+    /// `pool`.
+    ///
+    /// `param:density` is OPTIONAL and `density_` is REQUIRED, which is the
+    /// asymmetry the two keys exist to express: absence of the former is a
+    /// meaningful `None`, while absence of the latter is a corrupt file — a
+    /// model whose fitted density is unknown cannot report what it actually did.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<SparseRandomProjection<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ProjFile::parse(&raw, PERSIST_TAG)?;
+        let (components, n_components_, n_features) = read_components::<F>(&file)?;
+
+        Ok(SparseRandomProjection {
+            n_components: read_n_components(&file)?,
+            seed: file.scalar_u64("param:seed")?,
+            eps: file.scalar_f64("param:eps")?,
+            density: file.scalar_opt_f64("param:density")?,
+            components_: Some(DeviceArray::from_host(pool, &components)),
+            n_components_,
+            density_: file.scalar_f64(DENSITY_FITTED_KEY)?,
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 

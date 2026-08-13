@@ -32,6 +32,7 @@
 //! in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -45,8 +46,17 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::sign_flip::align_rows;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::decomp_persist::{
+    read_feature_vec, read_spectral_core, AlignedBytes, DecompFile, DecompWriter, LoadModel,
+    PersistError, SaveModel, SpectralCoreRef, MEAN_NAME,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `Pca` file, and checked
+/// before any tensor is touched — this is what stops a `TruncatedSvd` file
+/// loading here and being transformed as though it had been centered.
+const PERSIST_TAG: &str = "pca";
 
 /// Principal component analysis (DECOMP-01) fitted by the SVD of centered `X`.
 ///
@@ -218,6 +228,131 @@ where
         slot.as_ref()
             .expect("fitted attribute is Some by construction on Pca<F, Fitted>")
             .to_host(pool)
+    }
+}
+
+impl<F> SaveModel for Pca<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted decomposition to `path` as a safetensors file.
+    ///
+    /// The four shared spectral tensors plus `mean_`, and one scalar:
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `components_` | `F` (`F32`/`F64`) | `[n_components, n_features]` |
+    /// | `explained_variance_` / `_ratio_` / `singular_values_` | `F` | `[n_components]` |
+    /// | `mean_` | `F` | `[n_features]` |
+    /// | `param:n_components` | `__metadata__` scalar | — |
+    ///
+    /// `mean_` is what separates a `Pca` file from a `TruncatedSvd` one in
+    /// substance — PCA decomposes the CENTERED matrix, so the column mean is
+    /// part of the model rather than a fitting artifact, and `transform` cannot
+    /// reproduce its own output without it.
+    ///
+    /// `param:n_components` is the REQUESTED count and `components_`'s row
+    /// extent is what the fit retained. The two coincide for every fit this
+    /// estimator performs today, and storing the request anyway is what lets a
+    /// reloaded model report the hyperparameter it was built with rather than
+    /// the outcome — see [`decomp_persist`](super::decomp_persist).
+    ///
+    /// All five tensors are device-resident (D-03), so this costs one readback
+    /// each — the only copies on the whole path. `pool` is `&BufferPool` because
+    /// [`DeviceArray::to_host`] only reads.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `DecompWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let components = self
+            .components_
+            .as_ref()
+            .ok_or_else(|| absent("components_"))?
+            .to_host(pool);
+        let explained_variance = self
+            .explained_variance_
+            .as_ref()
+            .ok_or_else(|| absent("explained_variance_"))?
+            .to_host(pool);
+        let explained_variance_ratio = self
+            .explained_variance_ratio_
+            .as_ref()
+            .ok_or_else(|| absent("explained_variance_ratio_"))?
+            .to_host(pool);
+        let singular_values = self
+            .singular_values_
+            .as_ref()
+            .ok_or_else(|| absent("singular_values_"))?
+            .to_host(pool);
+        let mean = self.mean_.as_ref().ok_or_else(|| absent("mean_"))?.to_host(pool);
+
+        let mut w = DecompWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_components", self.n_components);
+        SpectralCoreRef {
+            n_components: singular_values.len(),
+            n_features: mean.len(),
+            components: &components,
+            explained_variance: &explained_variance,
+            explained_variance_ratio: &explained_variance_ratio,
+            singular_values: &singular_values,
+        }
+        .write_into(&mut w)?;
+        w.tensor(
+            MEAN_NAME,
+            crate::persist::TensorRef::floats(&mean, vec![mean.len()])?,
+        );
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for Pca<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a decomposition back from `path`, re-uploading all five tensors to
+    /// `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site:
+    ///
+    /// ```ignore
+    /// let pca: Pca<f32, Fitted> = Pca::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with: an `f32` model
+    /// loads into a `Pca<f64>` (and back) through
+    /// [`as_floats`](crate::persist::as_floats). On the matching arm every
+    /// upload reads straight out of the bytes `read_exact` landed.
+    ///
+    /// The file is untrusted input (T-04-01-01), so `components_` defines the
+    /// geometry and `mean_` and all three spectra are measured against it before
+    /// any value is stored.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<Pca<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = DecompFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_spectral_core::<F>(&file)?;
+        let mean = read_feature_vec::<F>(&file, MEAN_NAME, core.n_features)?;
+
+        Ok(Pca {
+            n_components: file.scalar_usize("param:n_components")?,
+            components_: Some(DeviceArray::from_host(pool, &core.components)),
+            explained_variance_: Some(DeviceArray::from_host(pool, &core.explained_variance)),
+            explained_variance_ratio_: Some(DeviceArray::from_host(
+                pool,
+                &core.explained_variance_ratio,
+            )),
+            singular_values_: Some(DeviceArray::from_host(pool, &core.singular_values)),
+            mean_: Some(DeviceArray::from_host(pool, &mean)),
+            n_features: core.n_features,
+            _state: PhantomData,
+        })
     }
 }
 

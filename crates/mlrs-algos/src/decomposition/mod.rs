@@ -18,6 +18,10 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+/// The `mlrs-decomp` model-file container — the three estimators' `save`/`load`
+/// share the spectral core it defines (DECOMP-PERSIST, prototype).
+pub mod decomp_persist;
+
 pub mod incremental_pca;
 pub mod pca;
 pub mod truncated_svd;

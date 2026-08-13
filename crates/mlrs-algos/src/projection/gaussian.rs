@@ -31,6 +31,7 @@
 //! (AGENTS.md §2 — never an in-source `#[cfg(test)] mod tests`).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -42,8 +43,22 @@ use mlrs_backend::prims::rng;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
 
+use super::proj_persist::{
+    read_components, read_n_components, write_components, write_n_components, AlignedBytes,
+    LoadModel, PersistError, ProjFile, ProjWriter, SaveModel,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
+
+/// The `estimator` discriminator written into every `GaussianRandomProjection`
+/// file.
+///
+/// Load-bearing rather than decorative: a `SparseRandomProjection` file holds a
+/// `components_` of the same shape and dtype, and the two matrices are
+/// distinguishable only by their VALUE distribution — dense Gaussian against a
+/// mostly-zero Achlioptas draw. No geometry check could separate them, so the
+/// tag is the only thing that does.
+const PERSIST_TAG: &str = "gaussian_random_projection";
 
 /// `n_components` selector for the random-projection transformers (D-06 minimal
 /// surface). [`NComponents::Auto`] sizes the embedding via
@@ -257,6 +272,77 @@ where
     /// The resolved embedding dimension (`Auto` → JL value) after fit.
     pub fn n_components_(&self) -> usize {
         self.n_components_
+    }
+}
+
+impl<F> SaveModel for GaussianRandomProjection<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted projection to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `components_` | `F` (`F32`/`F64`) | `[n_components_, n_features]` |
+    /// | `param:n_components` / `param:seed` / `param:eps` | `__metadata__` scalar | — |
+    ///
+    /// The matrix is stored rather than regenerated from `seed` at load —
+    /// [`proj_persist`](super::proj_persist) gives the two reasons, of which the
+    /// decisive one is that regeneration would tie the file's meaning to the
+    /// mlrs build that reads it.
+    ///
+    /// `n_components_` and `n_features` are recovered from `components_`'s shape
+    /// at load, so neither is stored again.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows the payload so it can stream it
+        // out without a second copy.
+        let components = self
+            .components_
+            .as_ref()
+            .ok_or(PersistError::MissingState {
+                estimator: PERSIST_TAG,
+                field: "components_",
+            })?
+            .to_host(pool);
+
+        let mut w = ProjWriter::new(PERSIST_TAG);
+        write_n_components(&mut w, self.n_components);
+        w.scalar_u64("param:seed", self.seed);
+        w.scalar_f64("param:eps", self.eps);
+        write_components(&mut w, &components, self.n_components_, self.n_features)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for GaussianRandomProjection<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the projection back from `path`, re-uploading `components_` to
+    /// `pool`.
+    ///
+    /// `F` need NOT match the dtype the file was written with: an `f32`
+    /// projection loads into a `GaussianRandomProjection<f64>` (and back)
+    /// through [`as_floats`](crate::persist::as_floats). On the matching arm the
+    /// upload reads straight out of the bytes `read_exact` landed — the whole
+    /// model, in one copy-free hand-off.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<GaussianRandomProjection<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ProjFile::parse(&raw, PERSIST_TAG)?;
+        let (components, n_components_, n_features) = read_components::<F>(&file)?;
+
+        Ok(GaussianRandomProjection {
+            n_components: read_n_components(&file)?,
+            seed: file.scalar_u64("param:seed")?,
+            eps: file.scalar_f64("param:eps")?,
+            components_: Some(DeviceArray::from_host(pool, &components)),
+            n_components_,
+            n_features,
+            _state: PhantomData,
+        })
     }
 }
 

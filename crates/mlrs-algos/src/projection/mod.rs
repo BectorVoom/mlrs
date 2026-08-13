@@ -25,6 +25,10 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2 — no in-source
 //! `#[cfg(test)] mod tests`).
 
+/// The `mlrs-proj` model-file container — both projections' `save`/`load` share
+/// the single-matrix layout it defines (PROJ-PERSIST, prototype).
+pub mod proj_persist;
+
 // Phase-7 random-projection estimators (plan 07-06 — file-disjoint):
 pub mod gaussian; // GaussianRandomProjection (PROJ-01) + johnson_lindenstrauss_min_dim
 pub mod sparse; // SparseRandomProjection (PROJ-02, Achlioptas dense)
