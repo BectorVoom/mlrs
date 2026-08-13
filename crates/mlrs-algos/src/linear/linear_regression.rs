@@ -47,6 +47,7 @@ use mlrs_backend::prims::center::center_columns;
 use mlrs_backend::prims::eig::eig;
 use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::gram::gram_xty;
+use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable_for};
 use mlrs_backend::prims::linear_predict::{linear_predict, HostMirror, HostPrediction};
 use mlrs_backend::prims::svd::svd;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -54,6 +55,10 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::elastic_net::predict_linear_from_host;
+// The host Gram+eig solve, shared with `Ridge`'s host arm: OLS is that solve at
+// `alpha = 0`, so the two estimators run the SAME rotation sweep and the same
+// `σ⁺` cutoff rather than two implementations that must be kept in step.
+use crate::linear::ridge_solvers::gram_eig_ridge;
 // LINEAR-PERSIST: the safetensors container. `LinearRegression` is the wired
 // prototype for the dense-linear family — its whole fitted state IS the shared
 // core, so `save`/`load` are that core plus nothing.
@@ -62,6 +67,25 @@ use crate::linear::linear_persist::{
     PersistError, SaveModel,
 };
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
+
+// ## The Gram+eig route has a HOST arm (LINEAR-ARM-CAL, 2026-08-13)
+//
+// [`LinearRegression::fit_from_host_slice`] runs the whole large-`n` fit from
+// host memory — means, centering, Gram, `Xᵀy`, eigen-solve — uploading only the
+// fitted `coef_`/`intercept_`. [`LinearRegression::host_fit_applicable`] picks
+// it, through the same calibrated gate `Ridge` uses.
+//
+// This closes a live regression rather than merely adding a fast path. OLS had
+// no host arm at all, so on the **cpu backend** every fit above
+// `DIRECT_SVD_MAX_ROWS` went through `center_columns`, whose cpu fallback walks
+// the `d` columns one at a time with an upload + launch + blocking readback
+// each — the exact pathology `gram_host`'s module docs describe and that Ridge
+// escaped in RIDGE-POS-PERF-CPU. Measured at `20 000 × 32`, f64: the device
+// route did not finish ONE fit in **600 s**; the host arm takes **5.5 ms**.
+//
+// On the GPU backends it is a large win rather than a bug fix: on rocm the same
+// fit went 3 925 ms (first, including the pipeline compile) / 17-52 ms (warm)
+// to 36 ms / **1.4-1.9 ms**.
 
 /// Dense-eigensolver feature cap for the large-`n_samples` Gram+eig path
 /// (mirrors `mlrs_kernels::jacobi_eig::MAX_DIM` — the spectral-family
@@ -448,6 +472,114 @@ where
             }
             fit_gram_eig::<F>(pool, x, y, n_samples, n_features, self.fit_intercept)?
         };
+
+        Ok(LinearRegression {
+            fit_intercept: self.fit_intercept,
+            coef_: Some(coef),
+            intercept_: Some(intercept_dev),
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> LinearRegression<F, Unfit>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Does the fully-HOST fit arm ([`LinearRegression::fit_from_host_slice`])
+    /// apply to this shape? (LINEAR-ARM-CAL)
+    ///
+    /// Two gates, and the first is about CORRECTNESS rather than speed:
+    ///
+    /// 1. **`n_samples > `[`DIRECT_SVD_MAX_ROWS`]** — below that, [`Fit::fit`]
+    ///    takes the direct-SVD route, and the committed oracle fixtures pin
+    ///    THAT route's numbers. The host arm is a Gram+eig solve, so offering it
+    ///    for a small design would quietly move those fixtures onto different
+    ///    arithmetic. It is only ever an alternative to the Gram+eig path, which
+    ///    is exactly what it reproduces.
+    /// 2. **the calibrated cost model** — the same
+    ///    [`gram_host_applicable_for`] gate `Ridge` uses, so the two estimators
+    ///    cannot drift into disagreeing about which arm this machine prefers.
+    ///
+    /// The [`GRAM_EIG_MAX_FEATURES`] cap is deliberately kept: lifting it on the
+    /// host arm alone would make `d > 64` succeed or fail depending on a
+    /// PERFORMANCE decision, which is not a contract this estimator should
+    /// have.
+    pub fn host_fit_applicable(&self, shape: (usize, usize)) -> bool {
+        let (n_samples, n_features) = shape;
+        n_samples > DIRECT_SVD_MAX_ROWS
+            && n_features <= GRAM_EIG_MAX_FEATURES
+            && gram_host_applicable_for(n_samples, n_features, size_of::<F>())
+    }
+
+    /// [`Fit::fit`] over HOST slices — the no-upload ingress for the Gram+eig
+    /// route (LINEAR-ARM-CAL).
+    ///
+    /// The device route this replaces is `center_columns` → `gram_xty` → `eig`
+    /// → two `gemm`s, i.e. an `n·d` upload plus five launches. This is the same
+    /// mathematics with the `n·d` reduction done by
+    /// [`centered_gram_xty`] — one parallel host pass that never materializes
+    /// the centered design — and the `d × d` eigen-solve by
+    /// [`gram_eig_ridge`]`(.., alpha = 0)`, which is the same Jacobi rotation
+    /// sweep and the same `σ⁺` cutoff the device path applies. Only the fitted
+    /// `coef_`/`intercept_` are uploaded, so `predict` keeps one path.
+    ///
+    /// `alpha = 0` is what makes this a reuse rather than an approximation:
+    /// ridge's host solve at zero penalty IS the OLS normal-equations solve.
+    ///
+    /// Returns [`PrimError::UnsupportedCapability`] when
+    /// [`LinearRegression::host_fit_applicable`] is false, so a caller that
+    /// forgets to branch gets a typed error rather than a silently different
+    /// answer (the `Ridge::fit_from_host_slice` contract).
+    pub fn fit_from_host_slice(
+        self,
+        pool: &mut BufferPool<ActiveRuntime>,
+        x: &[F],
+        y: &[F],
+        shape: (usize, usize),
+    ) -> Result<LinearRegression<F, Fitted>, AlgoError> {
+        let (n_samples, n_features) = shape;
+        if !self.host_fit_applicable(shape) {
+            return Err(AlgoError::Prim(PrimError::UnsupportedCapability {
+                operand: "linear_regression.fit_from_host_slice",
+                capability: "the host fit arm (a Gram+eig solve on a host-Gram backend)",
+            }));
+        }
+        if n_samples == 0 || n_features == 0 || x.len() != n_samples * n_features {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "x",
+                rows: n_samples,
+                cols: n_features,
+                len: x.len(),
+            }));
+        }
+        if y.len() != n_samples {
+            return Err(AlgoError::Prim(PrimError::ShapeMismatch {
+                operand: "y",
+                rows: n_samples,
+                cols: 1,
+                len: y.len(),
+            }));
+        }
+
+        let (x_mean, y_mean, gram, xty) =
+            centered_gram_xty::<F>(x, y, n_samples, n_features, None, self.fit_intercept);
+        let coef64 = gram_eig_ridge(&gram, &xty, n_features, 0.0);
+
+        // intercept_ = ȳ − x̄·coef_ when fit_intercept, else 0 — the same
+        // recovery `fit_gram_eig` performs, from the same means.
+        let intercept = if self.fit_intercept {
+            let dot: f64 = (0..n_features).map(|c| x_mean[c] * coef64[c]).sum();
+            y_mean - dot
+        } else {
+            0.0
+        };
+
+        let coef_host: Vec<F> = coef64.iter().map(|&v| f64_to_host::<F>(v)).collect();
+        let coef = DeviceArray::from_host(pool, &coef_host);
+        let intercept_dev: DeviceArray<ActiveRuntime, F> =
+            DeviceArray::from_host(pool, &[f64_to_host::<F>(intercept)]);
 
         Ok(LinearRegression {
             fit_intercept: self.fit_intercept,

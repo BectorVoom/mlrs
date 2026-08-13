@@ -170,18 +170,60 @@ min of 5:
 | `n_jobs=4` (cv=5) | 0.957 s | 1.065 s | 0.90x |
 
 **Device arm** (mlrs members on rocm gfx1151 vs sklearn members on host),
-min of 3:
+`n=100000`, `d=64`, min of 3, **after LINEAR-ARM-CAL** (see below):
 
-| config | sklearn fit | mlrs fit | ratio |
+| config | sklearn fit | mlrs fit | ratio | was |
+|---|---|---|---|---|
+| `cv=2` | 0.761 s | 0.127 s | **5.98x** | 0.51x |
+| `cv=3` | 1.341 s | 0.159 s | **8.43x** | 0.70x |
+| `cv=5` | 1.545 s | 0.228 s | **6.77x** | 1.01x |
+| `cv=10` | 2.999 s | 0.380 s | **7.90x** | 1.71x |
+| `cv="prefit"` | 0.043 s | 0.026 s | 1.69x | 0.37x |
+| `passthrough=True` (cv=5) | 1.585 s | 0.218 s | **7.27x** | 1.02x |
+| `n_jobs=2` (cv=5) | 1.256 s | 0.246 s | **5.11x** | 0.77x |
+| `n_jobs=4` (cv=5) | 1.060 s | 0.219 s | **4.85x** | 0.64x |
+
+The `was` column is the same ladder on the same machine with the old dispatch
+forced back on (`MLRS_RIDGE_GRAM_HOST=0`), so the two columns are one build and
+one box apart, not two campaigns: 0.96–2.45x before, 4.85–8.43x after.
+
+The **cpu** backend wins by 2.00–9.76x at `n=20000`, `d=32` — and that one is a
+bug fix rather than a speed-up. `LinearRegression` had no host fit arm, so on
+cpu every fold fit went through `center_columns`' per-column round-trip: the old
+route did not complete a SINGLE `20000 × 32` fit in 600 s, against 5.5 ms now.
+
+`predict` is unchanged by this work and is the remaining weak spot at
+`n=100000`: 0.28–0.61x of sklearn, the same 0.31–0.92x the old dispatch
+measured. It is a separate path (`predict_from_host`) and a separate campaign.
+
+### Why the fit numbers moved: the arm was chosen by a constant (LINEAR-ARM-CAL)
+
+Above a fixed dispatch floor, `Ridge` decided host-vs-device from a multiply-add
+constant, and `LinearRegression` had no host arm at all. Both were wrong here:
+the host arm wins EVERY rung of the `ridge_default_perf_test` A/B on both local
+integrated GPUs (rocm 1.6–10x, wgpu 1.8–11x), yet the constant sent 6 of 8 rungs
+to the device.
+
+A bigger constant is not the fix, because the two machines this repo has data
+for disagree at the *same* shape:
+
+| `100 000 × 64` | host arm | device arm | |
 |---|---|---|---|
-| `cv=2` | 0.713 s | 1.399 s | 0.51x |
-| `cv=3` | 1.013 s | 1.455 s | 0.70x |
-| `cv=5` | 1.591 s | 1.575 s | 1.01x |
-| `cv=10` | 3.168 s | 1.850 s | **1.71x** |
-| `cv="prefit"` | 0.046 s | 0.125 s | 0.37x |
-| `passthrough=True` (cv=5) | 1.788 s | 1.748 s | 1.02x |
-| `n_jobs=2` (cv=5) | 1.219 s | 1.577 s | 0.77x |
-| `n_jobs=4` (cv=5) | 1.025 s | 1.596 s | 0.64x |
+| Colab T4 (discrete GPU, **2-vCPU** host) | 58.9 ms | 30.7 ms | device wins 1.9x |
+| this box (integrated GPU, 16-core host) | 4.9 ms | 13.0 ms | host wins 2.7x |
+
+So the floor stays a constant — it is about launch overhead, which really is
+machine-independent — and above it the arm is chosen from rates measured once
+per process on the machine that is running: `macs / host_rate` against
+`bytes / upload_rate + macs / device_rate`. The model picks device on the T4's
+numbers and host on this box's, which is what each one measured.
+
+The probe is two-stage, because a device probe costs a pipeline compile (546 ms
+on rocm here): the host rate is always measured (cheap, no device work), and the
+device is probed only once the host estimate shows more than 25 ms at stake.
+Below that the answer is "host" without touching the device. The bound that
+gives up is explicit — up to ~25 ms left on the table, seen once at rocm
+`100 000 × 128`, where the device arm would have won by 11%.
 
 Reading the ladders:
 

@@ -303,27 +303,50 @@ impl PyLinearRegression {
         let fitted = py.detach(|| -> PyResult<AnyLinearRegression> {
             let mut pool = crate::lock_pool();
             match dt {
+                // The two-arm branch has to happen HERE, before ingress, for the
+                // same reason `ridge_fit_dispatch!` does it: the host arm
+                // borrows the Arrow values (`host_slice_*`) while the device arm
+                // needs an upload (`validated_*`), so on the host arm the `n·d`
+                // design is never copied at all (LINEAR-ARM-CAL).
                 FloatDtype::F32 => {
-                    let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
-                    let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
                     let est = LinearRegression::<f32>::builder()
                         .fit_intercept(fit_intercept)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if est.host_fit_applicable((rows, cols)) {
+                        let xh = host_slice_f32(as_f32(&xa)?)?;
+                        let yh = host_slice_f32(as_f32(&ya)?)?;
+                        est.fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                            .map_err(algo_err_to_py)?
+                    } else {
+                        let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
+                        let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                            .map_err(algo_err_to_py)?
+                    };
                     Ok(AnyLinearRegression::F32(fitted))
                 }
                 FloatDtype::F64 => {
-                    crate::capability::guard_f64()?;
-                    let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
-                    let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
                     let est = LinearRegression::<f64>::builder()
                         .fit_intercept(fit_intercept)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted = TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                        .map_err(algo_err_to_py)?;
+                    let fitted = if est.host_fit_applicable((rows, cols)) {
+                        // The host arm needs no f64 DEVICE support — it only
+                        // uploads the fitted `coef_`/`intercept_` — so the
+                        // capability guard belongs on the device branch, not
+                        // ahead of the dispatch.
+                        let xh = host_slice_f64(as_f64(&xa)?)?;
+                        let yh = host_slice_f64(as_f64(&ya)?)?;
+                        est.fit_from_host_slice(&mut pool, xh, yh, (rows, cols))
+                            .map_err(algo_err_to_py)?
+                    } else {
+                        crate::capability::guard_f64()?;
+                        let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
+                        let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
+                            .map_err(algo_err_to_py)?
+                    };
                     Ok(AnyLinearRegression::F64(fitted))
                 }
             }
