@@ -35,6 +35,12 @@ crate::any_estimator_typestate! {
     unfit: { n_components: usize },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyPca,
+    algo: mlrs_algos::decomposition::pca::Pca,
+    name: "pca",
+}
+
 /// sklearn-compatible `PCA` (SVD-based principal component analysis).
 #[pyclass(name = "PCA")]
 pub struct PyPCA {
@@ -226,6 +232,28 @@ impl PyPCA {
             AnyPca::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +264,12 @@ crate::any_estimator_typestate! {
     any:   AnyTruncatedSvd,
     algo:  mlrs_algos::decomposition::truncated_svd::TruncatedSvd,
     unfit: { n_components: usize },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyTruncatedSvd,
+    algo: mlrs_algos::decomposition::truncated_svd::TruncatedSvd,
+    name: "truncated_svd",
 }
 
 /// sklearn-compatible `TruncatedSVD` (LSA-style truncated SVD).
@@ -384,6 +418,28 @@ impl PyTruncatedSVD {
             AnyTruncatedSvd::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +451,12 @@ crate::any_estimator_typestate! {
     any:   AnyIncrementalPCA,
     algo:  mlrs_algos::decomposition::incremental_pca::IncrementalPCA,
     unfit: { n_components: usize, whiten: bool, batch_size: Option<usize> },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyIncrementalPCA,
+    algo: mlrs_algos::decomposition::incremental_pca::IncrementalPCA,
+    name: "incremental_pca",
 }
 
 /// sklearn-compatible `IncrementalPCA` (streaming PCA via incremental SVD).
@@ -786,5 +848,27 @@ impl PyIncrementalPCA {
             AnyIncrementalPCA::F32(_) => Some("f32"),
             AnyIncrementalPCA::F64(_) => Some("f64"),
         }
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }

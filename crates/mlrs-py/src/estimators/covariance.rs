@@ -31,6 +31,12 @@ crate::any_estimator_typestate! {
     unfit: { assume_centered: bool, store_precision: bool },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyEmpiricalCovariance,
+    algo: mlrs_algos::covariance::empirical_covariance::EmpiricalCovariance,
+    name: "empirical_covariance",
+}
+
 /// sklearn-compatible `EmpiricalCovariance` (MLE / `ddof=0` covariance, COV-01).
 #[pyclass(name = "EmpiricalCovariance")]
 pub struct PyEmpiricalCovariance {
@@ -165,6 +171,28 @@ impl PyEmpiricalCovariance {
             AnyEmpiricalCovariance::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +203,12 @@ crate::any_estimator_typestate! {
     any:   AnyLedoitWolf,
     algo:  mlrs_algos::covariance::ledoit_wolf::LedoitWolf,
     unfit: { assume_centered: bool },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyLedoitWolf,
+    algo: mlrs_algos::covariance::ledoit_wolf::LedoitWolf,
+    name: "ledoit_wolf",
 }
 
 /// sklearn-compatible `LedoitWolf` (shrinkage covariance, COV-02).
@@ -295,5 +329,27 @@ impl PyLedoitWolf {
             AnyLedoitWolf::F32(_) => Some("f32"),
             AnyLedoitWolf::F64(_) => Some("f64"),
         }
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }

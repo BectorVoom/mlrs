@@ -300,6 +300,149 @@ pub trait SaveModel {
     fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError>;
 }
 
+/// Save a model with EXTRA `__metadata__` entries the estimator itself knows
+/// nothing about.
+///
+/// Blanket-implemented for every [`SaveModel`], so no estimator implements it
+/// and none can forget to. It exists for one caller: the PyO3 layer, whose
+/// Python shim owns state the Rust estimator does not — `output_type`, sklearn
+/// parity arguments like `copy`, and the class name a loader needs to rebuild
+/// the right Python object. Without somewhere to put those, a Python
+/// `save`/`load` round-trip would silently drop half of `get_params()`.
+///
+/// ## Why the default body writes twice
+///
+/// The one-pass alternative is to thread the extra map through
+/// [`SaveModel::save`] into every estimator's [`ModelWriter`], which is 57
+/// signatures changed for a feature 57 estimators do not use. The two-pass form
+/// costs one extra read and write of a file that is already in memory, ON THE
+/// SAVE PATH ONLY, and leaves the load path — the one that has to be fast —
+/// completely untouched.
+///
+/// The re-serialization goes back through safetensors rather than patching the
+/// header in place, so the result is byte-identical to what a one-pass writer
+/// would have produced: same tensor order, same padding, same
+/// [`BTreeMap`]-ordered metadata. That is what keeps
+/// `saving_twice_produces_an_identical_model` true for files written this way
+/// too.
+///
+/// An estimator that ever needs the single pass can override this; the default
+/// is the honest general answer, not a limitation of any particular one.
+pub trait SaveModelExt: SaveModel {
+    /// Serialize to `path`, then merge `extra` into the file's `__metadata__`.
+    ///
+    /// Keys in `extra` overwrite same-named entries the estimator wrote, which
+    /// is why callers are expected to namespace theirs (the PyO3 layer uses a
+    /// `py:` prefix). An empty map skips the second pass entirely.
+    fn save_with(
+        &self,
+        pool: &BufferPool<ActiveRuntime>,
+        path: &Path,
+        extra: &BTreeMap<String, String>,
+    ) -> Result<(), PersistError> {
+        self.save(pool, path)?;
+        merge_metadata(path, extra)
+    }
+}
+
+impl<T: SaveModel + ?Sized> SaveModelExt for T {}
+
+/// Merge `extra` into an existing model file's `__metadata__`, rewriting it in
+/// place.
+///
+/// The payload is preserved exactly — every tensor is re-staged from the file's
+/// own bytes — and the write goes through the same temporary-then-rename path
+/// [`ModelWriter::write`] uses, so an interrupted merge cannot leave a
+/// half-written file where a valid model used to be.
+///
+/// An empty `extra` is a no-op that does not touch the file at all, so callers
+/// need not special-case it.
+pub fn merge_metadata(path: &Path, extra: &BTreeMap<String, String>) -> Result<(), PersistError> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    // Bound the buffer for the whole function: every `TensorView` below borrows
+    // it, and `serialize_to_file` streams them out of it.
+    let raw = AlignedBytes::read(path)?;
+    let bytes = raw.as_slice();
+
+    let (_, header): (usize, Metadata) = SafeTensors::read_metadata(bytes)?;
+    let mut meta = header.metadata().clone().unwrap_or_default();
+    for (k, v) in extra {
+        meta.insert(k.clone(), v.clone());
+    }
+
+    let parsed = SafeTensors::deserialize(bytes)?;
+    let tensors = parsed.tensors();
+
+    let tmp = temp_sibling(path);
+    serialize_to_file(tensors, Some(meta), &tmp).map_err(|e| match e {
+        SafeTensorError::IoError(io) => PersistError::io(&tmp, io),
+        other => PersistError::Container(other),
+    })?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        PersistError::io(path, e)
+    })
+}
+
+/// Read a model file's whole `__metadata__` map WITHOUT knowing its family.
+///
+/// Every typed reader in this format goes through
+/// [`ModelFile::parse`], which validates the [`Container`] discriminator before
+/// anything else — deliberately, so a `GaussianNB` file cannot reach a linear
+/// model's geometry checks. That is exactly wrong for a caller whose job is to
+/// find out WHAT a file is: it has no container to name yet.
+///
+/// This is the one sanctioned way in, and it is read-only. It returns the raw
+/// map — `format`, `version`, `estimator`, every `param:` entry, and anything
+/// [`merge_metadata`] added — and interprets none of it. The PyO3 loader uses it
+/// to map `estimator` to a Python class before constructing anything; a tooling
+/// caller can use it to list what a file holds without loading the model.
+///
+/// It reads the header only in the sense that matters — the tensor payload is
+/// never parsed — but it does read the whole file, because
+/// [`AlignedBytes::read`] is one sequential `read_exact` and a model file is
+/// small enough that seeking to save the tail is not worth a second code path.
+pub fn read_raw_metadata(path: &Path) -> Result<BTreeMap<String, String>, PersistError> {
+    let raw = AlignedBytes::read(path)?;
+    let (_, header): (usize, Metadata) = SafeTensors::read_metadata(raw.as_slice())?;
+    Ok(header.metadata().clone().unwrap_or_default())
+}
+
+/// The float width a model file's arrays are stored at — 4 for `F32`, 8 for
+/// `F64`, `None` for a file that holds no float tensor at all.
+///
+/// A loader that does not yet have an estimator has to choose a
+/// monomorphization before it can call [`LoadModel::load`], and the file is the
+/// only thing that knows. [`as_floats`] would happily widen or narrow, but a
+/// load that picked the other width would stop being a bit-exact round-trip for
+/// no reason — so the caller matches the file.
+///
+/// The `None` case is real and not an error: `Binarizer` and `Normalizer` store
+/// no arrays (their whole model is `__metadata__`), and `IncrementalPCA` and the
+/// mixtures store `F64` regardless of the estimator's own `F`. A caller seeing
+/// `None` should fall back to whatever default it would use for fresh data;
+/// seeing `Some(8)` on an f64-incapable backend should refuse, exactly as `fit`
+/// would.
+///
+/// The first FLOAT tensor decides. Files mix widths deliberately — a
+/// classifier's `classes_` is `I64` beside an `F32` `coef_` — so scanning for a
+/// float is the question that has an answer, where "the first tensor's dtype"
+/// would report the label table's.
+pub fn model_float_width(path: &Path) -> Result<Option<usize>, PersistError> {
+    let raw = AlignedBytes::read(path)?;
+    let (_, header): (usize, Metadata) = SafeTensors::read_metadata(raw.as_slice())?;
+    for (_name, info) in header.tensors() {
+        match info.dtype {
+            Dtype::F32 => return Ok(Some(4)),
+            Dtype::F64 => return Ok(Some(8)),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 /// Read a fitted estimator back from a safetensors file.
 ///
 /// The counterpart of [`SaveModel`]. Implemented on the `Fitted`-tagged

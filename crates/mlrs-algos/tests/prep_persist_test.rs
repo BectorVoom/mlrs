@@ -885,3 +885,133 @@ fn save_leaves_no_temporary_behind() {
     );
     assert!(Path::new(&path).exists(), "the model file must exist");
 }
+
+// ---------------------------------------------------------------------------
+// The caller-metadata channel (MODEL-PERSIST) — used by the PyO3 layer
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extra_metadata_merges_without_touching_the_payload() {
+    use mlrs_algos::persist::{merge_metadata, read_raw_metadata, SaveModelExt};
+
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let plain = dir.path().join("plain.safetensors");
+    let tagged = dir.path().join("tagged.safetensors");
+    let mut p = pool();
+
+    // A binding layer has state the estimator knows nothing about — the Python
+    // shim's `output_type`, its class name, its own fitted attributes. It rides
+    // in the same file's `__metadata__`, so a saved model stays ONE file that is
+    // still a valid safetensors.
+    let fitted = fit_standard::<f32>(&mut p, true);
+    fitted.save(&p, &plain).expect("save succeeds");
+
+    let extra: std::collections::BTreeMap<String, String> = [
+        ("py:class".to_string(), "mlrs.preprocessing:StandardScaler".to_string()),
+        ("py:params".to_string(), r#"{"with_mean": true}"#.to_string()),
+    ]
+    .into_iter()
+    .collect();
+    fitted
+        .save_with(&p, &tagged, &extra)
+        .expect("save_with succeeds");
+
+    // The extra entries are readable, and so is everything the estimator wrote.
+    let meta = read_raw_metadata(&tagged).expect("metadata reads back");
+    assert_eq!(
+        meta.get("py:class").map(String::as_str),
+        Some("mlrs.preprocessing:StandardScaler"),
+        "the caller's entries must survive the merge"
+    );
+    assert_eq!(
+        meta.get("estimator").map(String::as_str),
+        Some("standard_scaler"),
+        "and the estimator's own discriminators must be untouched"
+    );
+    assert!(
+        meta.contains_key("param:with_mean"),
+        "as must its hyperparameters"
+    );
+
+    // The MODEL is unchanged — merging metadata must not perturb a single
+    // fitted value, which is the property that makes the two-pass write safe.
+    let loaded: StandardScaler<f32, Fitted> =
+        StandardScaler::load(&mut p, &tagged).expect("a tagged file still loads");
+    assert_eq!(loaded.mean(&p), fitted.mean(&p), "mean_ survives the merge");
+    assert_eq!(loaded.scale(&p), fitted.scale(&p), "scale_ survives the merge");
+
+    // An empty map is a no-op that does not rewrite the file at all.
+    let before = std::fs::read(&plain).expect("read");
+    merge_metadata(&plain, &std::collections::BTreeMap::new()).expect("no-op merge");
+    assert_eq!(
+        std::fs::read(&plain).expect("read"),
+        before,
+        "merging nothing must leave the file byte-identical"
+    );
+}
+
+#[test]
+fn a_merged_file_is_still_byte_deterministic() {
+    use mlrs_algos::persist::SaveModelExt;
+
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let first = dir.path().join("a.safetensors");
+    let second = dir.path().join("b.safetensors");
+    let mut p = pool();
+
+    // The merge re-serializes through safetensors rather than patching the
+    // header in place, precisely so the result is what a one-pass writer would
+    // have produced: same tensor order, same padding, same BTreeMap-ordered
+    // metadata. That is what keeps a model file content-addressable even when a
+    // binding layer added to it.
+    let extra: std::collections::BTreeMap<String, String> =
+        [("py:class".to_string(), "X".to_string())].into_iter().collect();
+    let fitted = fit_robust::<f32>(&mut p);
+    fitted.save_with(&p, &first, &extra).expect("save succeeds");
+    fitted.save_with(&p, &second, &extra).expect("save succeeds");
+    assert_eq!(
+        std::fs::read(&first).expect("read"),
+        std::fs::read(&second).expect("read"),
+        "a merged file must still be a deterministic function of the model"
+    );
+}
+
+#[test]
+fn the_stored_float_width_is_readable_without_loading() {
+    use mlrs_algos::persist::model_float_width;
+
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut p = pool();
+
+    // A loader has to pick a monomorphization BEFORE it has a model to ask, and
+    // the file is the only thing that knows. The scaler stores at the model's
+    // own width...
+    let narrow = dir.path().join("f32.safetensors");
+    fit_standard::<f32>(&mut p, true).save(&p, &narrow).expect("save succeeds");
+    assert_eq!(
+        model_float_width(&narrow).expect("width reads back"),
+        Some(4),
+        "an f32 model's file must report 4 bytes"
+    );
+
+    if !capability::skip_f64_with_log() {
+        let wide = dir.path().join("f64.safetensors");
+        fit_standard::<f64>(&mut p, true).save(&p, &wide).expect("save succeeds");
+        assert_eq!(
+            model_float_width(&wide).expect("width reads back"),
+            Some(8),
+            "an f64 model's file must report 8 bytes"
+        );
+    }
+
+    // ...and the tensorless transformers have NO width to report, which is a
+    // real answer rather than an error: their whole model is `__metadata__`, so
+    // a loader is free to pick whichever arm the backend prefers.
+    let none = dir.path().join("binarizer.safetensors");
+    fit_binarizer::<f32>(&mut p).save(&p, &none).expect("save succeeds");
+    assert_eq!(
+        model_float_width(&none).expect("width reads back"),
+        None,
+        "a model with no float tensor has no width to match"
+    );
+}

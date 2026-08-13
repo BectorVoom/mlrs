@@ -79,6 +79,12 @@ crate::any_estimator_typestate! {
     unfit: { var_smoothing: f64, priors: Option<Vec<f64>> },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyGaussianNB,
+    algo: mlrs_algos::naive_bayes::gaussian_nb::GaussianNB,
+    name: "gaussian_nb",
+}
+
 crate::any_estimator_typestate! {
     any:   AnyMultinomialNB,
     algo:  mlrs_algos::naive_bayes::multinomial_nb::MultinomialNB,
@@ -86,6 +92,12 @@ crate::any_estimator_typestate! {
         alpha: f64, force_alpha: bool, fit_prior: bool,
         class_prior: Option<Vec<f64>>,
     },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyMultinomialNB,
+    algo: mlrs_algos::naive_bayes::multinomial_nb::MultinomialNB,
+    name: "multinomial_nb",
 }
 
 crate::any_estimator_typestate! {
@@ -97,6 +109,12 @@ crate::any_estimator_typestate! {
     },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyBernoulliNB,
+    algo: mlrs_algos::naive_bayes::bernoulli_nb::BernoulliNB,
+    name: "bernoulli_nb",
+}
+
 crate::any_estimator_typestate! {
     any:   AnyComplementNB,
     algo:  mlrs_algos::naive_bayes::complement_nb::ComplementNB,
@@ -106,6 +124,12 @@ crate::any_estimator_typestate! {
     },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyComplementNB,
+    algo: mlrs_algos::naive_bayes::complement_nb::ComplementNB,
+    name: "complement_nb",
+}
+
 crate::any_estimator_typestate! {
     any:   AnyCategoricalNB,
     algo:  mlrs_algos::naive_bayes::categorical_nb::CategoricalNB,
@@ -113,6 +137,12 @@ crate::any_estimator_typestate! {
         alpha: f64, force_alpha: bool, fit_prior: bool,
         class_prior: Option<Vec<f64>>, min_categories: MinCategories,
     },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyCategoricalNB,
+    algo: mlrs_algos::naive_bayes::categorical_nb::CategoricalNB,
+    name: "categorical_nb",
 }
 
 // ===========================================================================
@@ -475,6 +505,28 @@ impl PyGaussianNB {
     fn dtype(&self) -> Option<&'static str> {
         g_dtype(&self.inner)
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -649,6 +701,28 @@ impl PyMultinomialNB {
     fn dtype(&self) -> Option<&'static str> {
         m_dtype(&self.inner)
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -822,6 +896,28 @@ impl PyBernoulliNB {
     fn dtype(&self) -> Option<&'static str> {
         b_dtype(&self.inner)
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -992,6 +1088,28 @@ impl PyComplementNB {
     }
     fn dtype(&self) -> Option<&'static str> {
         c_dtype(&self.inner)
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }
 
@@ -1221,5 +1339,27 @@ impl PyCategoricalNB {
     }
     fn dtype(&self) -> Option<&'static str> {
         k_dtype(&self.inner)
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }

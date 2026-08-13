@@ -67,6 +67,9 @@ pub mod metrics;
 // halving schedules, CV aggregation and decision-threshold tuning, over
 // `mlrs_algos::model_selection`. Host-only, like `metrics`.
 pub mod model_selection;
+/// Model save/load (FSEL-PERSIST .. ENSEMBLE-PERSIST) — the PyO3 half of the
+/// safetensors persistence surface `mlrs_algos::persist` defines.
+pub mod persist;
 // The stacking meta-estimator's structural PyO3 free-function surface
 // (STACK-BIND-01): name validation, `'drop'` bookkeeping, meta-feature column
 // layout, `get_feature_names_out` strings and the `cv="prefit"` sentinel, over
@@ -224,6 +227,14 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The driver is present: register the low-level surface.
     m.add_function(wrap_pyfunction!(backend_supports_f64, m)?)?;
     m.add_function(wrap_pyfunction!(backend_supports_f64_transcendental, m)?)?;
+
+    // Model persistence (MODEL-PERSIST). Two free functions, both read-only and
+    // container-agnostic: every per-estimator `save`/`load` is a method on the
+    // estimator's own `#[pyclass]`, but a LOADER has to identify a file before
+    // it has an estimator to call, and the typed readers all validate their
+    // container first by design.
+    m.add_function(wrap_pyfunction!(crate::persist::read_metadata, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::persist::model_dtype, m)?)?;
 
     // The `model_selection` surface (MODSEL-BIND-01) — one call, since it
     // registers ~33 free functions plus the `NumpyRandomState` class.

@@ -52,6 +52,12 @@ crate::any_estimator_typestate! {
     unfit: { n_components: usize },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyGaussianMixture,
+    algo: mlrs_algos::mixture::gaussian_mixture::GaussianMixture,
+    name: "gaussian_mixture",
+}
+
 /// The verbatim sklearn-named ctor hyperparameters, persisted in the wrapper so
 /// a SECOND `fit` of the same object rebuilds correctly (WR-02).
 #[derive(Clone)]
@@ -551,6 +557,28 @@ impl PyGaussianMixture {
             AnyGaussianMixture::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +589,12 @@ crate::any_estimator_typestate! {
     any:   AnyBayesianGaussianMixture,
     algo:  mlrs_algos::mixture::bayesian_gaussian_mixture::BayesianGaussianMixture,
     unfit: { n_components: usize },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyBayesianGaussianMixture,
+    algo: mlrs_algos::mixture::bayesian_gaussian_mixture::BayesianGaussianMixture,
+    name: "bayesian_gaussian_mixture",
 }
 
 /// The verbatim sklearn-named ctor hyperparameters, persisted so a SECOND `fit`
@@ -1088,5 +1122,27 @@ impl PyBayesianGaussianMixture {
             AnyBayesianGaussianMixture::F32(_) => Some("f32"),
             AnyBayesianGaussianMixture::F64(_) => Some("f64"),
         }
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }

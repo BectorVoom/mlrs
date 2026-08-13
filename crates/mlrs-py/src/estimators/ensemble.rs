@@ -163,6 +163,12 @@ crate::any_estimator_typestate! {
     },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyRandomForestClassifier,
+    algo: mlrs_algos::ensemble::random_forest_classifier::RandomForestClassifier,
+    name: "random_forest_classifier",
+}
+
 /// sklearn-compatible `RandomForestClassifier`. Defaults mirror
 /// `RandomForestClassifierBuilder`'s own defaults verbatim (D-08 single
 /// source): `n_estimators=100, max_depth=10, n_bins=32, max_features="sqrt",
@@ -575,6 +581,28 @@ impl PyRandomForestClassifier {
             AnyRandomForestClassifier::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -599,6 +627,12 @@ crate::any_estimator_typestate! {
         max_features: MaxFeaturesArg, min_samples_split: f64,
         min_samples_leaf: f64, bootstrap: bool, oob_score: bool, seed: u64,
     },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyRandomForestRegressor,
+    algo: mlrs_algos::ensemble::random_forest_regressor::RandomForestRegressor,
+    name: "random_forest_regressor",
 }
 
 /// sklearn-compatible `RandomForestRegressor`. Defaults mirror
@@ -948,6 +982,28 @@ impl PyRandomForestRegressor {
             AnyRandomForestRegressor::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -975,6 +1031,12 @@ crate::any_estimator_typestate! {
         l2_regularization: f64, min_samples_leaf: usize,
         device: String,
     },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyHistGradientBoostingClassifier,
+    algo: mlrs_algos::ensemble::hist_gradient_boosting_classifier::HistGradientBoostingClassifier,
+    name: "hist_gradient_boosting_classifier",
 }
 
 /// sklearn-compatible `HistGradientBoostingClassifier`. Defaults mirror
@@ -1269,6 +1331,28 @@ impl PyHistGradientBoostingClassifier {
             AnyHistGradientBoostingClassifier::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -1291,6 +1375,12 @@ crate::any_estimator_typestate! {
         l2_regularization: f64, min_samples_leaf: usize,
         device: String,
     },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyHistGradientBoostingRegressor,
+    algo: mlrs_algos::ensemble::hist_gradient_boosting_regressor::HistGradientBoostingRegressor,
+    name: "hist_gradient_boosting_regressor",
 }
 
 /// sklearn-compatible `HistGradientBoostingRegressor`. Defaults mirror
@@ -1536,6 +1626,28 @@ impl PyHistGradientBoostingRegressor {
             AnyHistGradientBoostingRegressor::F32(_) => Some("f32"),
             AnyHistGradientBoostingRegressor::F64(_) => Some("f64"),
         }
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }
 

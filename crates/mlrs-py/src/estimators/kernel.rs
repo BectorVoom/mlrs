@@ -110,6 +110,12 @@ crate::any_estimator_typestate! {
     unfit: { kernel: String, alpha: f64, gamma: Option<f64>, degree: f64, coef0: f64 },
 }
 
+crate::impl_persistable_any! {
+    any:  AnyKernelRidge,
+    algo: mlrs_algos::kernel_ridge::kernel_ridge::KernelRidge,
+    name: "kernel_ridge",
+}
+
 /// sklearn-compatible `KernelRidge` (kernel ridge regression, KERNEL-01).
 ///
 /// The kernel NAME + raw `alpha`/`gamma`/`degree`/`coef0` are stored in the
@@ -309,6 +315,28 @@ impl PyKernelRidge {
             AnyKernelRidge::F64(_) => Some("f64"),
         }
     }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +347,12 @@ crate::any_estimator_typestate! {
     any:   AnyKernelDensity,
     algo:  mlrs_algos::density::kernel_density::KernelDensity,
     unfit: { kernel: String, bandwidth_rule: String, bandwidth: f64 },
+}
+
+crate::impl_persistable_any! {
+    any:  AnyKernelDensity,
+    algo: mlrs_algos::density::kernel_density::KernelDensity,
+    name: "kernel_density",
 }
 
 /// sklearn-compatible `KernelDensity` (kernel density estimation, KERNEL-02).
@@ -518,5 +552,27 @@ impl PyKernelDensity {
             AnyKernelDensity::F32(_) => Some("f32"),
             AnyKernelDensity::F64(_) => Some("f64"),
         }
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }

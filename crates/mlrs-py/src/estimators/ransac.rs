@@ -109,6 +109,50 @@ enum AnyRansac {
     F64(Box<RansacRegressor<f64, AlgoFitted>>),
 }
 
+// `AnyRansac` cannot use `impl_persistable_any!`: its fitted arms are BOXED (the
+// estimator is large enough that an unboxed enum would inflate every wrapper),
+// so the macro's `Self::F32(m)` / `Ok(Self::F32(m))` shapes do not line up. The
+// body is otherwise the macro's, and MUST be kept in step with it.
+impl crate::persist::PersistableAny for AnyRansac {
+    const NAME: &'static str = "ransac";
+
+    fn save_arm(
+        &self,
+        pool: &mlrs_backend::pool::BufferPool<mlrs_backend::runtime::ActiveRuntime>,
+        path: &std::path::Path,
+        extra: &std::collections::BTreeMap<String, String>,
+    ) -> pyo3::PyResult<()> {
+        use mlrs_algos::persist::SaveModelExt as _;
+        match self {
+            // The `Box` derefs to the estimator, so the call is the macro's.
+            Self::F32(m) => m.save_with(pool, path, extra),
+            Self::F64(m) => m.save_with(pool, path, extra),
+            Self::Unfit => return Err(crate::errors::not_fitted("ransac", "save")),
+        }
+        .map_err(crate::persist::persist_err_to_py)
+    }
+
+    fn load_arm(
+        pool: &mut mlrs_backend::pool::BufferPool<mlrs_backend::runtime::ActiveRuntime>,
+        path: &std::path::Path,
+    ) -> pyo3::PyResult<Self> {
+        if crate::persist::load_wants_f64(path)? {
+            crate::capability::guard_f64()?;
+            let m = <RansacRegressor<f64, AlgoFitted> as mlrs_algos::persist::LoadModel>::load(
+                pool, path,
+            )
+                .map_err(crate::persist::persist_err_to_py)?;
+            Ok(Self::F64(Box::new(m)))
+        } else {
+            let m = <RansacRegressor<f32, AlgoFitted> as mlrs_algos::persist::LoadModel>::load(
+                pool, path,
+            )
+                .map_err(crate::persist::persist_err_to_py)?;
+            Ok(Self::F32(Box::new(m)))
+        }
+    }
+}
+
 /// The fitted attributes a `#[pyclass]` getter cannot reach through the dtype
 /// dispatch generically. All are `f64`/`usize`/`bool` on both arms — the
 /// sub-sample solve runs in `f64` whatever the design's width.
@@ -506,6 +550,28 @@ impl PyRANSACRegressor {
             AnyRansac::F32(_) => Some("f32"),
             AnyRansac::F64(_) => Some("f64"),
         }
+    }
+
+    /// Serialize the fitted model to `path` (MODEL-PERSIST).
+    ///
+    /// `extra` carries the Python shim's own state — `get_params()`, the class
+    /// name, the fitted attributes the Rust estimator does not hold — merged
+    /// into the file's `__metadata__` under a `py:` prefix. The shim supplies
+    /// it; a caller using this `#[pyclass]` directly can pass an empty list and
+    /// gets a plain mlrs model file.
+    #[pyo3(signature = (path, extra = Vec::new()))]
+    fn save(&self, py: Python<'_>, path: &str, extra: Vec<(String, String)>) -> PyResult<()> {
+        crate::persist::save_impl(py, &self.inner, path, extra)
+    }
+
+    /// Replace this wrapper's fitted state with the model in `path`.
+    ///
+    /// An instance method rather than a constructor, mirroring `fit`: the
+    /// wrapper keeps its hyperparameters beside `inner`, and the Python shim has
+    /// already rebuilt them from the file's `py:` metadata before calling this.
+    fn load(&mut self, py: Python<'_>, path: &str) -> PyResult<()> {
+        self.inner = crate::persist::load_impl(py, path)?;
+        Ok(())
     }
 }
 
