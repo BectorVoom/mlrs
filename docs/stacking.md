@@ -232,10 +232,20 @@ Reading the ladders:
   base fits the design predicts. `cv="prefit"` costs 0.017 s: ~90x cheaper than
   `cv=5`, because it performs no base fits at all. If a stack is too slow, `cv`
   is the parameter to look at first.
-* **The device arm crosses over with `k`.** mlrs's per-fit device overhead is
-  fixed, so it loses at `cv=2` (0.51x) and wins at `cv=10` (1.71x): more folds
-  amortize the same setup over more arithmetic. `cv=5` is the break-even point
-  at this size.
+* **What the `cv="prefit"` ratio actually reports is how expensive the MEMBERS
+  are, not anything about the stacking layer.** `prefit` removes the base fits
+  and leaves the composition, so the gap between it and `cv=5` is the members'
+  own cost. It is ~90x here with `LinearRegression`/`Ridge` at `n=100000`; the
+  same parameter measures ~6x in
+  [stacking_classifier.md](stacking_classifier.md), whose ladder composes two
+  `GaussianNB`s. Both are correct and neither is a property of this estimator —
+  do not read the two pages as contradicting each other.
+* **The device arm crossed over with `k` before LINEAR-ARM-CAL** — it lost at
+  `cv=2` (0.51x) and won at `cv=10` (1.71x), because a fixed per-fit device
+  overhead amortizes over more folds. That crossover is GONE now that the arm is
+  chosen by measurement: the ladder above wins at every `k`, and the win is
+  flattest at `cv="prefit"` precisely because that is the cell with the fewest
+  fits for the fix to apply to.
 * **`passthrough` is nearly free at fit time** (+3–4% on both implementations)
   but **~3.5x on predict** on the host arm (0.009 → 0.030 s) — that is the extra
   `n x d` copy, and it is the same on both sides.
@@ -279,6 +289,17 @@ verdict is not a load artefact: the host/numpy ratios came out identical.
   repay is the two extra buffer traversals the boundary costs. numpy needs one
   pass over each block; the Rust arms need one to hand the blocks over and one
   to bring the matrix back, on top of the same write.
+* **Every ratio above is at ONE column per member**, which is what a regressor
+  contributes. Widen the blocks and the fixed cost amortizes exactly as that
+  explanation predicts: at 10 columns per block (a 10-class `predict_proba`
+  stack, `bench_stacking_meta.py --cols 10`, same machine) the host arm measures
+  0.49–1.06x and *beats* `np.hstack` in two cells, and the device arm improves
+  to 0.08–0.49x while staying bus-bound. So "the host arm loses" is a statement
+  about narrow meta matrices, not about the arm. The default does not change —
+  parity in two cells is not a reason to give up the numpy fallback path that
+  handles sparse, duck-typed and non-float blocks — but a caller whose members
+  are wide should not read the 1-column ladder as their number. The classifier's
+  ladder is in [stacking_classifier.md](stacking_classifier.md).
 * **The device arm is bus-bound, exactly as a zero-arithmetic kernel must be.**
   It uploads `n x width`, writes it once, and downloads `n x width`. There is no
   arithmetic to amortize that against, so it trails at every size; the best it
