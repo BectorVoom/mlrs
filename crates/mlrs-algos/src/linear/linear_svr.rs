@@ -23,6 +23,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -290,6 +291,98 @@ impl LinearSVRBuilder {
             intercept_scaling: self.intercept_scaling,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+// LINEAR-PERSIST: the safetensors container. LinearSVR is the shared core, the
+// fifteen `SgdConfig` scalars, and the two knobs it holds OUTSIDE that config
+// -- `C` and `intercept_scaling`.
+use crate::linear::linear_persist::{
+    read_linear_core, read_sgd_config, write_sgd_config, AlignedBytes, LinearCoreRef, LinearFile,
+    LinearWriter, LoadModel, PersistError, SaveModel,
+};
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+const PERSIST_TAG: &str = "linear_svr";
+
+impl<F> SaveModel for LinearSVR<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path`: the shared dense-linear core
+    /// (`coef_` as `[1, n_features]`, `intercept_` as `[1]`), the fifteen
+    /// [`SgdConfig`] scalars, and
+    /// `param:C` / `param:intercept_scaling`.
+    ///
+    /// Those last two sit OUTSIDE the shared config because they are sklearn
+    /// `LinearSVR` constructor arguments rather than solver settings — `C` is
+    /// lowered INTO `config.alpha` at fit, so storing only the lowered value
+    /// would lose the number the user actually passed.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        write_sgd_config(&mut w, &self.config);
+        w.scalar_f64("param:C", self.c);
+        w.scalar_f64("param:intercept_scaling", self.intercept_scaling);
+        LinearCoreRef {
+            n_features: coef.len(),
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: 1,
+            fit_intercept: self.config.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for LinearSVR<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`. `F` need NOT match the dtype the file was written with — see
+    /// [`as_floats`](crate::persist::as_floats).
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<LinearSVR<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        if core.n_targets != 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "linear_svr is single-target, but 'coef_' declares {} target rows",
+                    core.n_targets
+                ),
+            });
+        }
+        Ok(LinearSVR {
+            config: read_sgd_config(&file)?,
+            c: file.scalar_f64("param:C")?,
+            intercept_scaling: file.scalar_f64("param:intercept_scaling")?,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            // The mirror is a `predict_from_host` memo, not model state.
             predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })

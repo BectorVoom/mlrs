@@ -107,6 +107,7 @@
 //! Tests live in `crates/mlrs-algos/tests/ransac_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -934,6 +935,192 @@ where
             device_: if on_device { "gpu" } else { "cpu" },
             batch_width_: width,
             has_model_: foreign.is_none(),
+            _state: PhantomData,
+        })
+    }
+}
+
+// LINEAR-PERSIST: the safetensors container. RANSAC is the only fully
+// HOST-resident member of the family — `coef_`/`intercept_` are plain `f64`
+// vectors, never device arrays — so its core is written at `f64` regardless of
+// the estimator's `F`, which is a `PhantomData` marker here.
+use crate::linear::linear_persist::{
+    as_bools, pack_bools, read_linear_core, shape_1d, AlignedBytes, LinearCoreRef, LinearFile,
+    LinearWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+const PERSIST_TAG: &str = "ransac";
+
+/// `__metadata__` key for the [`MinSamples`] enum. Its `Absolute`/`Fraction`
+/// arms carry a payload, encoded into the tag itself (`"absolute:5"`) rather
+/// than a companion tensor — unlike `RidgeClassifier`'s `class_weight`, the
+/// payload here is a SINGLE number, so a tensor would cost ~60 bytes of header
+/// for 8 bytes of data.
+const KEY_MIN_SAMPLES: &str = "param:min_samples";
+
+impl<F> SaveModel for RansacRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path`.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `coef_` | `F64` | `[n_targets_, n_features_]` |
+    /// | `intercept_` | `F64` | `[n_targets_]` |
+    /// | `inlier_mask_` | `BOOL` | `[n_samples]` |
+    /// | the ten `param:*` and the eight fitted counters | `__metadata__` | — |
+    ///
+    /// `coef_` is `F64` and not the model's own width because RANSAC holds it
+    /// as `Vec<f64>` on the host — the `F` parameter is a
+    /// [`PhantomData`] marker for API uniformity, not a storage type, since the
+    /// consensus engine is host-resident on every backend.
+    ///
+    /// The base estimator is NOT stored, and does not need to be: `RansacConfig`
+    /// retains only `base_fit_intercept`, because a fitted RANSAC keeps the
+    /// winning model's COEFFICIENTS rather than the estimator that produced
+    /// them. The `Foreign` base — a borrowed `&dyn RansacTrialBridge`, typically
+    /// a Python callback — exists only for the duration of `fit` and is
+    /// unreachable from the fitted value, so there is nothing here that could
+    /// fail to serialize.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        if !self.has_model_ {
+            return Err(PersistError::MissingState {
+                estimator: PERSIST_TAG,
+                field: "coef_ (no consensus model was found)",
+            });
+        }
+        // `bool` is not `Pod`; bound here so the writer can borrow it.
+        let mask = pack_bools(&self.inlier_mask_);
+        let cfg = &self.config;
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        match cfg.min_samples {
+            MinSamples::Auto => w.scalar_str(KEY_MIN_SAMPLES, "auto"),
+            MinSamples::Absolute(n) => w.scalar_str(KEY_MIN_SAMPLES, &format!("absolute:{n}")),
+            MinSamples::Fraction(f) => w.scalar_str(KEY_MIN_SAMPLES, &format!("fraction:{f:?}")),
+        }
+        w.scalar_opt_f64("param:residual_threshold", cfg.residual_threshold);
+        w.scalar_usize("param:max_trials", cfg.max_trials);
+        // These three default to `f64::INFINITY`. Rust's float formatter emits
+        // `inf` and its parser accepts it, so the sentinel survives the
+        // round-trip without a special case.
+        w.scalar_f64("param:max_skips", cfg.max_skips);
+        w.scalar_f64("param:stop_n_inliers", cfg.stop_n_inliers);
+        w.scalar_f64("param:stop_score", cfg.stop_score);
+        w.scalar_f64("param:stop_probability", cfg.stop_probability);
+        w.scalar_str("param:loss", cfg.loss.as_str());
+        w.scalar_bool("param:base_fit_intercept", cfg.base_fit_intercept);
+        w.scalar_str("param:device", cfg.device.name());
+
+        w.scalar_usize("n_trials_", self.n_trials_);
+        w.scalar_usize("n_skips_no_inliers_", self.n_skips_no_inliers_);
+        w.scalar_usize("n_skips_invalid_data_", self.n_skips_invalid_data_);
+        w.scalar_usize("n_skips_invalid_model_", self.n_skips_invalid_model_);
+        w.scalar_bool("exceeded_max_skips_", self.exceeded_max_skips_);
+        w.scalar_usize("min_samples_", self.min_samples_);
+        w.scalar_f64("residual_threshold_", self.residual_threshold_);
+        w.scalar_usize("batch_width_", self.batch_width_);
+        w.scalar_str("device_", self.device_);
+
+        w.tensor("inlier_mask_", TensorRef::bools(&mask, vec![mask.len()])?);
+        LinearCoreRef::<f64> {
+            coef: &self.coef_,
+            intercept: &self.intercept_,
+            n_targets: self.n_targets_,
+            n_features: self.n_features_,
+            fit_intercept: cfg.base_fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for RansacRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`. Nothing is uploaded — the fitted state is
+    /// host-resident, so `pool` is unused, exactly as it is on the save side.
+    ///
+    /// The core is read back at `f64` (see [`SaveModel::save`]) rather than at
+    /// `F`, so the file this estimator writes is width-independent: a
+    /// `RansacRegressor<f32>` and a `RansacRegressor<f64>` produce and consume
+    /// byte-identical files.
+    fn load(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<RansacRegressor<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<f64>(&file)?;
+
+        let mask_v = file.tensor("inlier_mask_")?;
+        shape_1d(&mask_v, "inlier_mask_")?;
+        let inlier_mask_ = as_bools(&mask_v, "inlier_mask_")?;
+
+        let tag = file.scalar_str(KEY_MIN_SAMPLES)?;
+        let min_samples = match tag {
+            "auto" => MinSamples::Auto,
+            other => {
+                let absolute = other
+                    .strip_prefix("absolute:")
+                    .and_then(|n| n.parse().ok())
+                    .map(MinSamples::Absolute);
+                let fraction = other
+                    .strip_prefix("fraction:")
+                    .and_then(|f| f.parse().ok())
+                    .map(MinSamples::Fraction);
+                absolute.or(fraction).ok_or(PersistError::BadMetadata {
+                    key: KEY_MIN_SAMPLES,
+                })?
+            }
+        };
+        let loss = match file.scalar_str("param:loss")? {
+            "absolute_error" => RansacLoss::AbsoluteError,
+            "squared_error" => RansacLoss::SquaredError,
+            _ => return Err(PersistError::BadMetadata { key: "param:loss" }),
+        };
+        let device = Device::from_name(file.scalar_str("param:device")?).ok_or(
+            PersistError::BadMetadata {
+                key: "param:device",
+            },
+        )?;
+        let device_ = Device::from_name(file.scalar_str("device_")?)
+            .ok_or(PersistError::BadMetadata { key: "device_" })?
+            .name();
+
+        Ok(RansacRegressor {
+            config: RansacConfig {
+                min_samples,
+                residual_threshold: file.scalar_opt_f64("param:residual_threshold")?,
+                max_trials: file.scalar_usize("param:max_trials")?,
+                max_skips: file.scalar_f64("param:max_skips")?,
+                stop_n_inliers: file.scalar_f64("param:stop_n_inliers")?,
+                stop_score: file.scalar_f64("param:stop_score")?,
+                stop_probability: file.scalar_f64("param:stop_probability")?,
+                loss,
+                base_fit_intercept: core.fit_intercept,
+                device,
+            },
+            coef_: core.coef.into_owned(),
+            intercept_: core.intercept.into_owned(),
+            inlier_mask_,
+            n_trials_: file.scalar_usize("n_trials_")?,
+            n_skips_no_inliers_: file.scalar_usize("n_skips_no_inliers_")?,
+            n_skips_invalid_data_: file.scalar_usize("n_skips_invalid_data_")?,
+            n_skips_invalid_model_: file.scalar_usize("n_skips_invalid_model_")?,
+            exceeded_max_skips_: file.scalar_bool("exceeded_max_skips_")?,
+            min_samples_: file.scalar_usize("min_samples_")?,
+            residual_threshold_: file.scalar_f64("residual_threshold_")?,
+            n_features_: core.n_features,
+            n_targets_: core.n_targets,
+            device_,
+            batch_width_: file.scalar_usize("batch_width_")?,
+            // A file is only ever written from a fitted model that HAS one
+            // (`save` refuses otherwise), so this is true by construction.
+            has_model_: true,
             _state: PhantomData,
         })
     }

@@ -169,8 +169,9 @@ use crate::error::{AlgoError, BuildError};
 // enum with a payload, a per-target `n_iter_`, and two DERIVED device arrays
 // (`coef_t_`, `classes_dev_`) that are rebuilt on load rather than stored.
 use crate::linear::linear_persist::{
-    as_usizes, read_classes, read_linear_core, shape_1d, write_classes, AlignedBytes, LinearCoreRef,
-    LinearFile, LinearWriter, LoadModel, PersistError, SaveModel, TensorRef,
+    as_usizes, expect_ovr_geometry, read_classes, read_linear_core, shape_1d, write_classes,
+    AlignedBytes, LinearCoreRef, LinearFile, LinearWriter, LoadModel, PersistError, SaveModel,
+    TensorRef,
 };
 use crate::linear::ridge::{validate_sample_weight, Ridge, RidgeSolver};
 use crate::linear::ridge_solvers;
@@ -1399,22 +1400,9 @@ where
         let classes_ = read_classes(&file)?;
 
         // sklearn's binary encoding: two classes share ONE decision column
-        // (sign of the score), three or more get one column each.
-        let expected_targets = if classes_.len() == 2 {
-            1
-        } else {
-            classes_.len()
-        };
-        if core.n_targets != expected_targets {
-            return Err(PersistError::InconsistentGeometry {
-                reason: format!(
-                    "'classes_' holds {} labels, which implies {expected_targets} target \
-                     column(s), but 'coef_' declares {}",
-                    classes_.len(),
-                    core.n_targets
-                ),
-            });
-        }
+        // (sign of the score), three or more get one column each. Shared with
+        // `MBSGDClassifier`/`LinearSVC`, which encode the identical rule.
+        expect_ovr_geometry(classes_.len(), core.n_targets)?;
 
         let n_iter_ = match file.tensor_opt("n_iter_") {
             None => None,

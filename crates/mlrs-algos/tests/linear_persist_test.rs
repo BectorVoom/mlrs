@@ -79,15 +79,23 @@ use std::path::Path;
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
 
+use mlrs_algos::linear::bayesian_ridge::BayesianRidge;
 use mlrs_algos::linear::elastic_net::ElasticNet;
+use mlrs_algos::linear::huber::HuberRegressor;
 use mlrs_algos::linear::lasso::Lasso;
 use mlrs_algos::linear::linear_persist::{
     AlignedBytes, LinearFile, LinearWriter, LoadModel, PersistError, SaveModel, TensorRef,
 };
 use mlrs_algos::linear::linear_regression::LinearRegression;
+use mlrs_algos::linear::linear_svc::LinearSVC;
+use mlrs_algos::linear::linear_svr::LinearSVR;
 use mlrs_algos::linear::logistic::LogisticRegression;
+use mlrs_algos::linear::mbsgd_classifier::MBSGDClassifier;
+use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
+use mlrs_algos::linear::ransac::{MinSamples, RansacDriver, RansacRegressor};
 use mlrs_algos::linear::ridge::{Ridge, RidgeSolver};
 use mlrs_algos::linear::ridge_classifier::{ClassWeight, RidgeClassifier};
+use mlrs_algos::model_selection::rng::NumpyRandomState;
 use mlrs_algos::naive_bayes::GaussianNB;
 use mlrs_algos::typestate::{Fit, Fitted, Predict, PredictLabels, PredictProba};
 use mlrs_backend::capability;
@@ -1407,6 +1415,485 @@ fn a_ridge_file_does_not_load_as_a_ridge_classifier() {
             &err,
             PersistError::WrongEstimator { expected, found }
                 if *expected == "ridge_classifier" && found == "ridge"
+        ),
+        "expected WrongEstimator, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The robust regressors — bool masks, derived vectors, and a d x d posterior
+// ---------------------------------------------------------------------------
+
+fn fit_huber<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    fit_intercept: bool,
+) -> HuberRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, y) = fixture::<F>();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y);
+    HuberRegressor::<F>::builder()
+        .epsilon(1.35)
+        .alpha(1e-3)
+        .max_iter(200)
+        .fit_intercept(fit_intercept)
+        .build::<F>()
+        .expect("HuberRegressor builds with valid hyperparameters")
+        .fit_with_sample_weight(pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES), None)
+        .expect("HuberRegressor fits the fixture")
+}
+
+fn fit_bayesian_ridge<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    compute_score: bool,
+) -> BayesianRidge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, y) = fixture::<F>();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y);
+    BayesianRidge::<F>::builder()
+        .compute_score(compute_score)
+        .max_iter(150)
+        .tol(1e-5)
+        .build::<F>()
+        .expect("BayesianRidge builds with valid hyperparameters")
+        .fit_with_sample_weight(pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES), None)
+        .expect("BayesianRidge fits the fixture")
+}
+
+fn fit_ransac<F>(pool: &mut BufferPool<ActiveRuntime>) -> RansacRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, y) = fixture::<F>();
+    let driver = RansacDriver::default();
+    let mut rng = NumpyRandomState::from_seed(42);
+    RansacRegressor::<F>::builder()
+        .min_samples(MinSamples::Absolute(5))
+        .max_trials(30)
+        .build::<F>()
+        .expect("RansacRegressor builds with valid hyperparameters")
+        .fit_from_host_slice(
+            pool,
+            &x,
+            &y,
+            (N_SAMPLES, N_FEATURES),
+            1,
+            None,
+            &mut rng,
+            &driver,
+        )
+        .expect("RansacRegressor fits the fixture")
+}
+
+#[test]
+fn huber_roundtrip_is_bit_exact() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("huber.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let fitted = fit_huber::<f32>(&mut pool, true);
+    fitted.save(&pool, &path).expect("save succeeds");
+    let loaded: HuberRegressor<f32, Fitted> =
+        HuberRegressor::load(&mut pool, &path).expect("load succeeds");
+
+    assert_eq!(
+        loaded.coef(&pool),
+        fitted.coef(&pool),
+        "coef_ must round-trip"
+    );
+    assert_eq!(
+        loaded.intercept(&pool),
+        fitted.intercept(&pool),
+        "intercept_ must round-trip"
+    );
+    assert_eq!(loaded.scale(), fitted.scale(), "scale_ must round-trip");
+    assert_eq!(loaded.n_iter(), fitted.n_iter(), "n_iter_ must round-trip");
+    assert_eq!(
+        loaded.converged(),
+        fitted.converged(),
+        "converged_ must round-trip"
+    );
+    assert_eq!(
+        loaded.device_arm(),
+        fitted.device_arm(),
+        "device_ must round-trip"
+    );
+    // The BOOL tensor. `outliers_` is n_samples long and is the payload that
+    // dominates a real robust fit, so a mask that round-tripped shifted or
+    // truncated would be the most consequential silent corruption here.
+    assert_eq!(
+        loaded.outliers(),
+        fitted.outliers(),
+        "the outliers_ bool mask must round-trip element for element"
+    );
+    assert_eq!(
+        loaded.outliers().len(),
+        N_SAMPLES,
+        "and keep its n_samples length"
+    );
+}
+
+#[test]
+fn huber_warm_start_params_survive_at_full_precision() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // `params_` is the packed `[coef…, intercept?, σ]` a warm start seeds from,
+    // and it is `f64` while `coef_`/`intercept_` are the model's own `F`.
+    //
+    // This assertion caught a real defect: the first implementation re-packed
+    // `params_` from coef_/intercept_/scale_ at load instead of storing it,
+    // which for an `f32` model handed back the f32-ROUNDED seed
+    // (`[1.5, -2.0, …]` against the true `[1.4999999976955367, …]`). Every
+    // other accessor still compared equal, so only comparing `params_` itself
+    // exposes it -- and only at `f32`, which is why this fixture is `f32`.
+    //
+    // BOTH intercept arms are checked because the packing branches on
+    // `fit_intercept`: get that wrong and the vector is off by one element from
+    // the intercept onward, which a single-arm test would miss entirely.
+    for (name, fit_intercept) in [("with", true), ("without", false)] {
+        let path = dir.path().join(format!("huber_{name}.safetensors"));
+        let fitted = fit_huber::<f32>(&mut pool, fit_intercept);
+        let want = fitted.warm_start_params().to_vec();
+        assert_eq!(
+            want.len(),
+            N_FEATURES + usize::from(fit_intercept) + 1,
+            "[coef, intercept?, sigma] sets the expected length ({name} intercept)"
+        );
+        fitted.save(&pool, &path).expect("save succeeds");
+
+        let loaded: HuberRegressor<f32, Fitted> =
+            HuberRegressor::load(&mut pool, &path).expect("load succeeds");
+        assert_eq!(
+            loaded.warm_start_params(),
+            want.as_slice(),
+            "params_ must round-trip at full f64 precision ({name} intercept)"
+        );
+    }
+}
+
+#[test]
+fn bayesian_ridge_roundtrip_is_bit_exact() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("bayes.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let fitted = fit_bayesian_ridge::<f32>(&mut pool, true);
+    assert!(
+        !fitted.scores().is_empty(),
+        "compute_score=true must produce a scores_ vector to round-trip"
+    );
+    fitted.save(&pool, &path).expect("save succeeds");
+    let loaded: BayesianRidge<f32, Fitted> =
+        BayesianRidge::load(&mut pool, &path).expect("load succeeds");
+
+    assert_eq!(
+        loaded.coef(&pool),
+        fitted.coef(&pool),
+        "coef_ must round-trip"
+    );
+    assert_eq!(
+        loaded.intercept(&pool),
+        fitted.intercept(&pool),
+        "intercept_ must round-trip"
+    );
+    assert_eq!(loaded.alpha(), fitted.alpha(), "alpha_ must round-trip");
+    assert_eq!(loaded.lambda(), fitted.lambda(), "lambda_ must round-trip");
+    assert_eq!(loaded.n_iter(), fitted.n_iter(), "n_iter_ must round-trip");
+    assert_eq!(
+        loaded.sigma(),
+        fitted.sigma(),
+        "the d x d sigma_ must round-trip"
+    );
+    assert_eq!(loaded.scores(), fitted.scores(), "scores_ must round-trip");
+    assert_eq!(
+        loaded.x_offset(),
+        fitted.x_offset(),
+        "X_offset_ must round-trip"
+    );
+    assert_eq!(
+        loaded.x_scale(),
+        fitted.x_scale(),
+        "X_scale_ must round-trip"
+    );
+}
+
+#[test]
+fn bayesian_ridge_predict_std_survives_the_roundtrip() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("bayes.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // The gate on storing `sigma_sqrt_t_` rather than re-deriving it. `Σ = M·Mᵀ`
+    // does not determine `M`, so a load that re-factorized `sigma_` would get an
+    // equally valid but DIFFERENT factor -- coef_/sigma_ would still compare
+    // equal above, and only the predictive standard deviation would drift. This
+    // is the only assertion that would catch that.
+    let (x, _) = fixture::<f32>();
+    let fitted = fit_bayesian_ridge::<f32>(&mut pool, false);
+    let want = fitted
+        .predict_std_from_host(&mut pool, &x, (N_SAMPLES, N_FEATURES))
+        .expect("predict_std_from_host succeeds");
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let loaded: BayesianRidge<f32, Fitted> =
+        BayesianRidge::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        loaded
+            .predict_std_from_host(&mut pool, &x, (N_SAMPLES, N_FEATURES))
+            .expect("predict_std_from_host succeeds"),
+        want,
+        "predict_std must be bit-identical, which requires the SAME sigma factor"
+    );
+    assert!(
+        fitted.scores().is_empty(),
+        "compute_score=false writes no scores_ tensor at all"
+    );
+}
+
+#[test]
+fn ransac_roundtrip_is_bit_exact() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("ransac.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let fitted = fit_ransac::<f32>(&mut pool);
+    fitted.save(&pool, &path).expect("save succeeds");
+    let loaded: RansacRegressor<f32, Fitted> =
+        RansacRegressor::load(&mut pool, &path).expect("load succeeds");
+
+    assert_eq!(loaded.coef(), fitted.coef(), "coef_ must round-trip");
+    assert_eq!(
+        loaded.intercept(),
+        fitted.intercept(),
+        "intercept_ must round-trip"
+    );
+    assert_eq!(
+        loaded.inlier_mask(),
+        fitted.inlier_mask(),
+        "the inlier_mask_ bool mask must round-trip element for element"
+    );
+    // Every skip counter, not just n_trials_: these are sklearn attributes a
+    // caller inspects to understand WHY a fit behaved as it did, and they are
+    // exactly the kind of bookkeeping a save is most likely to forget.
+    assert_eq!(loaded.n_trials(), fitted.n_trials(), "n_trials_");
+    assert_eq!(
+        loaded.n_skips_no_inliers(),
+        fitted.n_skips_no_inliers(),
+        "n_skips_no_inliers_"
+    );
+    assert_eq!(
+        loaded.n_skips_invalid_data(),
+        fitted.n_skips_invalid_data(),
+        "n_skips_invalid_data_"
+    );
+    assert_eq!(
+        loaded.n_skips_invalid_model(),
+        fitted.n_skips_invalid_model(),
+        "n_skips_invalid_model_"
+    );
+    assert_eq!(
+        loaded.exceeded_max_skips(),
+        fitted.exceeded_max_skips(),
+        "exceeded_max_skips_"
+    );
+    assert_eq!(
+        loaded.min_samples_used(),
+        fitted.min_samples_used(),
+        "min_samples_ (the RESOLVED count, not the enum)"
+    );
+    assert_eq!(
+        loaded.residual_threshold_used(),
+        fitted.residual_threshold_used(),
+        "residual_threshold_ (the RESOLVED MAD, not the Option)"
+    );
+    assert_eq!(loaded.loss(), fitted.loss(), "the RansacLoss enum");
+    assert_eq!(loaded.device_arm(), fitted.device_arm(), "device_");
+    assert!(loaded.has_linear_model(), "a saved model always has one");
+
+    // The ten `param:*` keys -- including the `MinSamples` enum, whose payload
+    // rides in its own tag string, and the three `f64::INFINITY` stop criteria
+    // -- have no accessors on the fitted state, so byte-stability is what gates
+    // them. `inf` survives because Rust's float formatter emits it and its
+    // parser accepts it; nothing here special-cases the sentinel.
+    let resaved = dir.path().join("ransac_resaved.safetensors");
+    loaded.save(&pool, &resaved).expect("re-save succeeds");
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        std::fs::read(&resaved).expect("read"),
+        "save -> load -> save must be byte-stable across the whole RansacConfig"
+    );
+}
+
+#[test]
+fn ransac_stores_its_host_coefficients_at_f64_whatever_f_is() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("f32.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // RANSAC is the one estimator whose `F` is a PhantomData marker: the
+    // consensus engine is host-resident on every backend and holds `coef_` as
+    // `Vec<f64>` regardless. So its tensors are written at F64 even for a
+    // `RansacRegressor<f32>` -- narrowing them to the type parameter would
+    // discard precision the estimator actually has.
+    //
+    // Note this is about the STORED WIDTH, not about the fitted values: those
+    // still depend on `F`, because the design matrix handed to `fit` is
+    // `&[F]`. An f32 and an f64 RANSAC fitted on the same nominal data do NOT
+    // produce identical files, and asserting they would was simply wrong.
+    let fitted = fit_ransac::<f32>(&mut pool);
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let raw = AlignedBytes::read(&path).expect("read succeeds");
+    let file = LinearFile::parse(&raw, "ransac").expect("parse succeeds");
+    for name in ["coef_", "intercept_"] {
+        let view = file.tensor(name).expect("the tensor is present");
+        assert!(
+            bytemuck::try_cast_slice::<u8, f64>(view.data()).is_ok(),
+            "'{name}' must be stored (and readable) as f64 even for a <f32> model"
+        );
+    }
+
+    // And the host f64 values survive exactly -- no narrowing anywhere.
+    let loaded: RansacRegressor<f32, Fitted> =
+        RansacRegressor::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        loaded.coef(),
+        fitted.coef(),
+        "the f64 host coefficients must round-trip bit-exactly"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The SGD/SVM family — four estimators sharing fifteen config keys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sgd_family_roundtrips_and_is_byte_stable() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let (x, y) = fixture::<f32>();
+    let labels = labels_as::<f32>(&labels_multiclass());
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+    let l_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &labels);
+    let shape = (N_SAMPLES, N_FEATURES);
+
+    // All four share `write_sgd_config`'s fifteen keys, and NONE of the fifteen
+    // has an accessor pair that makes a field-by-field comparison practical --
+    // so save -> load -> save byte-stability is the gate, per estimator.
+    macro_rules! roundtrip {
+        ($name:literal, $ty:ty, $fitted:expr, $coef:expr) => {{
+            let first = dir.path().join(concat!($name, "_a.safetensors"));
+            let second = dir.path().join(concat!($name, "_b.safetensors"));
+            let fitted = $fitted;
+            fitted.save(&pool, &first).expect("save succeeds");
+            let loaded: $ty = <$ty>::load(&mut pool, &first).expect("load succeeds");
+            loaded.save(&pool, &second).expect("re-save succeeds");
+            assert_eq!(
+                std::fs::read(&first).expect("read"),
+                std::fs::read(&second).expect("read"),
+                concat!($name, ": save -> load -> save must be byte-stable")
+            );
+            let f = $coef(&fitted);
+            let l = $coef(&loaded);
+            assert_eq!(l, f, concat!($name, ": coef_ must round-trip exactly"));
+        }};
+    }
+
+    roundtrip!(
+        "mbsgd_regressor",
+        MBSGDRegressor<f32, Fitted>,
+        MBSGDRegressor::<f32>::builder()
+            .build::<f32>()
+            .expect("builds")
+            .fit(&mut pool, &x_dev, Some(&y_dev), shape)
+            .expect("fits"),
+        |m: &MBSGDRegressor<f32, Fitted>| m.coef(&pool)
+    );
+    roundtrip!(
+        "mbsgd_classifier",
+        MBSGDClassifier<f32, Fitted>,
+        MBSGDClassifier::<f32>::builder()
+            .build::<f32>()
+            .expect("builds")
+            .fit(&mut pool, &x_dev, Some(&l_dev), shape)
+            .expect("fits"),
+        |m: &MBSGDClassifier<f32, Fitted>| m.coef(&pool)
+    );
+    roundtrip!(
+        "linear_svr",
+        LinearSVR<f32, Fitted>,
+        LinearSVR::<f32>::builder()
+            .build::<f32>()
+            .expect("builds")
+            .fit(&mut pool, &x_dev, Some(&y_dev), shape)
+            .expect("fits"),
+        |m: &LinearSVR<f32, Fitted>| m.coef(&pool)
+    );
+    roundtrip!(
+        "linear_svc",
+        LinearSVC<f32, Fitted>,
+        LinearSVC::<f32>::builder()
+            .build::<f32>()
+            .expect("builds")
+            .fit(&mut pool, &x_dev, Some(&l_dev), shape)
+            .expect("fits"),
+        |m: &LinearSVC<f32, Fitted>| m.coef(&pool)
+    );
+}
+
+#[test]
+fn sgd_family_files_do_not_cross_load() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("svr.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let (x, y) = fixture::<f32>();
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+    LinearSVR::<f32>::builder()
+        .build::<f32>()
+        .expect("builds")
+        .fit(&mut pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("fits")
+        .save(&pool, &path)
+        .expect("save succeeds");
+
+    // A LinearSVR file and an MBSGDRegressor file carry the SAME fifteen config
+    // keys over the SAME core -- `LinearSVR` adds only `C`/`intercept_scaling`,
+    // and nothing structural would stop the other reading it. Only the
+    // discriminator does, and it fires before any tensor is fetched.
+    let err = match MBSGDRegressor::<f32, Fitted>::load(&mut pool, &path) {
+        Ok(_) => panic!("a LinearSVR file must not load as an MBSGDRegressor"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            &err,
+            PersistError::WrongEstimator { expected, found }
+                if *expected == "mbsgd_regressor" && found == "linear_svr"
         ),
         "expected WrongEstimator, got {err:?}"
     );

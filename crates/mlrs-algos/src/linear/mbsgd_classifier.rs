@@ -14,6 +14,7 @@
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -556,6 +557,106 @@ where
             n_coef_rows,
             coef_: Some(DeviceArray::from_host(pool, &coef_host)),
             intercept_: Some(DeviceArray::from_host(pool, &intercept_host)),
+            _state: PhantomData,
+        })
+    }
+}
+
+// LINEAR-PERSIST: the safetensors container. MBSGDClassifier is the shared
+// core, `classes_`, and the fifteen `SgdConfig` scalars. Its `n_coef_rows` is
+// the one-vs-rest column count, which is 1 for a binary fit --
+// `expect_ovr_geometry` is the shared statement of that rule.
+use crate::linear::linear_persist::{
+    expect_ovr_geometry, read_classes, read_linear_core, read_sgd_config, write_classes,
+    write_sgd_config, AlignedBytes, LinearCoreRef, LinearFile, LinearWriter, LoadModel,
+    PersistError, SaveModel,
+};
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+const PERSIST_TAG: &str = "mbsgd_classifier";
+
+impl<F> SaveModel for MBSGDClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path`: the shared dense-linear core
+    /// (`coef_` as `[n_coef_rows, n_features]`, `intercept_` as
+    /// `[n_coef_rows]`), the `classes_` label table, the fifteen
+    /// [`SgdConfig`] scalars and the
+    /// `device` preference.
+    ///
+    /// `n_coef_rows` is the ONE-VS-REST sub-problem count — 1 for a binary fit,
+    /// `n_classes` otherwise — so it is the core's `n_targets` and is recovered
+    /// from `coef_`'s row extent rather than stored. `n_features` likewise.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+        if self.classes_.is_empty() {
+            return Err(absent("classes_"));
+        }
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        write_sgd_config(&mut w, &self.config);
+        w.scalar_str("param:device", self.device.name());
+        write_classes(&mut w, &self.classes_)?;
+        LinearCoreRef {
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: self.n_coef_rows,
+            n_features: self.n_features,
+            fit_intercept: self.config.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for MBSGDClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The file is untrusted (T-04-01-01), and the load-bearing check is the
+    /// one-vs-rest cross-check: `classes_` and `coef_`'s row extent are
+    /// independently plausible but must agree, or the label decode indexes out
+    /// of range on the first prediction.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<MBSGDClassifier<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        let classes_ = read_classes(&file)?;
+        expect_ovr_geometry(classes_.len(), core.n_targets)?;
+
+        Ok(MBSGDClassifier {
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            config: read_sgd_config(&file)?,
+            classes_,
+            n_features: core.n_features,
+            n_coef_rows: core.n_targets,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
             _state: PhantomData,
         })
     }

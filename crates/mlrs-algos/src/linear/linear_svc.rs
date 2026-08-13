@@ -43,6 +43,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -567,6 +568,103 @@ impl LinearSVCBuilder {
             n_coef_rows: 0,
             coef_: None,
             intercept_: None,
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+// LINEAR-PERSIST: the safetensors container. LinearSVC is the shared core,
+// `classes_`, the fifteen `SgdConfig` scalars, and the two constructor knobs
+// outside that config (`C`, `intercept_scaling`).
+use crate::linear::linear_persist::{
+    expect_ovr_geometry, read_classes, read_linear_core, read_sgd_config, write_classes,
+    write_sgd_config, AlignedBytes, LinearCoreRef, LinearFile, LinearWriter, LoadModel,
+    PersistError, SaveModel,
+};
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+const PERSIST_TAG: &str = "linear_svc";
+
+impl<F> SaveModel for LinearSVC<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path`: the shared dense-linear core
+    /// (`coef_` as `[n_coef_rows, n_features]`, `intercept_` as
+    /// `[n_coef_rows]`), the `classes_` label table, the fifteen
+    /// [`SgdConfig`] scalars, and
+    /// `param:C` / `param:intercept_scaling`.
+    ///
+    /// `n_coef_rows` is the ONE-VS-REST sub-problem count — 1 for a binary fit,
+    /// `n_classes` otherwise — so it is the core's `n_targets`, recovered from
+    /// `coef_`'s row extent rather than stored.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+        if self.classes_.is_empty() {
+            return Err(absent("classes_"));
+        }
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        write_sgd_config(&mut w, &self.config);
+        w.scalar_f64("param:C", self.c);
+        w.scalar_f64("param:intercept_scaling", self.intercept_scaling);
+        write_classes(&mut w, &self.classes_)?;
+        LinearCoreRef {
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: self.n_coef_rows,
+            n_features: self.n_features,
+            fit_intercept: self.config.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for LinearSVC<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The file is untrusted (T-04-01-01); [`expect_ovr_geometry`] is the
+    /// load-bearing cross-check between `classes_` and `coef_`'s row extent.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<LinearSVC<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        let classes_ = read_classes(&file)?;
+        expect_ovr_geometry(classes_.len(), core.n_targets)?;
+
+        Ok(LinearSVC {
+            config: read_sgd_config(&file)?,
+            c: file.scalar_f64("param:C")?,
+            intercept_scaling: file.scalar_f64("param:intercept_scaling")?,
+            classes_,
+            n_features: core.n_features,
+            n_coef_rows: core.n_targets,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            // The mirror is a host-ingress predict memo, not model state.
             predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })

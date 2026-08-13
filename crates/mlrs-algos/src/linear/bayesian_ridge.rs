@@ -137,6 +137,7 @@
 //! Tests live in `crates/mlrs-algos/tests/bayesian_ridge_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -1605,6 +1606,215 @@ where
             }));
         }
         Ok(mt)
+    }
+}
+
+// LINEAR-PERSIST: the safetensors container. BayesianRidge carries the widest
+// FITTED state in the family -- two d x d posterior matrices plus four host
+// vectors -- and thirteen hyperparameters.
+use crate::linear::linear_persist::{
+    as_f64, expect_len, read_linear_core, shape_1d, shape_2d, AlignedBytes, LinearCoreRef,
+    LinearFile, LinearWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+const PERSIST_TAG: &str = "bayesian_ridge";
+
+impl<F> SaveModel for BayesianRidge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path`.
+    ///
+    /// | name | dtype | shape | notes |
+    /// |---|---|---|---|
+    /// | `coef_` / `intercept_` | `F` | `[1, d]` / `[1]` | the shared core |
+    /// | `sigma_` | `F64` | `[d, d]` | the posterior covariance |
+    /// | `sigma_sqrt_t_` | `F64` | `[d, d]` | its factor `Mᵀ`, `Σ = M·Mᵀ` |
+    /// | `X_offset_` / `X_scale_` | `F64` | `[d]` | sklearn's centering attributes |
+    /// | `scores_` | `F64` | `[n_iter+1]` | OPTIONAL — only when `compute_score` |
+    /// | thirteen `param:*`, `alpha_`, `lambda_`, `n_iter_`, `device_` | `__metadata__` | — | |
+    ///
+    /// ## Why `sigma_sqrt_t_` is stored despite `sigma_` being present
+    ///
+    /// It is the only piece of state in this whole format that looks derivable
+    /// and is not. `Σ = M·Mᵀ` does not determine `M`: any factor times an
+    /// orthogonal matrix is another valid one, so recovering it would mean a
+    /// fresh `O(d³)` eigendecomposition of `sigma_` that returns a DIFFERENT
+    /// (equally correct) factor — and `predict_std` evaluates through it, so a
+    /// reloaded model would return predictive standard deviations differing in
+    /// the last bits from the model that was saved. The field's own doc already
+    /// says `predict` must not depend on fit-time scratch; that argument
+    /// applies verbatim to reconstructing it at load.
+    ///
+    /// `sigma_` itself is kept because it is sklearn's `sigma_` attribute and is
+    /// read at the Python boundary.
+    ///
+    /// `scores_` is written only when non-empty, so `compute_score = false`
+    /// (the default) costs no header entry at all rather than a zero-length
+    /// tensor.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+        let sigma = self.sigma_.as_deref().ok_or_else(|| absent("sigma_"))?;
+        let sigma_sqrt_t = self
+            .sigma_sqrt_t_
+            .as_deref()
+            .ok_or_else(|| absent("sigma_sqrt_t_"))?;
+        let device_ = self.device_.ok_or_else(|| absent("device_"))?;
+        let d = coef.len();
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:max_iter", self.max_iter);
+        w.scalar_f64("param:tol", self.tol);
+        w.scalar_f64("param:alpha_1", self.alpha_1);
+        w.scalar_f64("param:alpha_2", self.alpha_2);
+        w.scalar_f64("param:lambda_1", self.lambda_1);
+        w.scalar_f64("param:lambda_2", self.lambda_2);
+        w.scalar_opt_f64("param:alpha_init", self.alpha_init);
+        w.scalar_opt_f64("param:lambda_init", self.lambda_init);
+        w.scalar_bool("param:compute_score", self.compute_score);
+        w.scalar_bool("param:copy_X", self.copy_x);
+        w.scalar_bool("param:verbose", self.verbose);
+        w.scalar_str("param:device", self.device.name());
+        w.scalar_f64("alpha_", self.alpha_);
+        w.scalar_f64("lambda_", self.lambda_);
+        w.scalar_usize("n_iter_", self.n_iter_);
+        w.scalar_str("device_", device_);
+
+        w.tensor("sigma_", TensorRef::f64s(sigma, vec![d, d])?);
+        w.tensor("sigma_sqrt_t_", TensorRef::f64s(sigma_sqrt_t, vec![d, d])?);
+        w.tensor(
+            "X_offset_",
+            TensorRef::f64s(&self.x_offset_, vec![self.x_offset_.len()])?,
+        );
+        w.tensor(
+            "X_scale_",
+            TensorRef::f64s(&self.x_scale_, vec![self.x_scale_.len()])?,
+        );
+        if !self.scores_.is_empty() {
+            w.tensor(
+                "scores_",
+                TensorRef::f64s(&self.scores_, vec![self.scores_.len()])?,
+            );
+        }
+        LinearCoreRef {
+            n_features: d,
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: 1,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for BayesianRidge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The file is untrusted (T-04-01-01): both `d × d` matrices and both
+    /// length-`d` vectors are measured against `coef_`'s feature extent before
+    /// any value is stored, because `predict_std` indexes `sigma_sqrt_t_` by
+    /// that extent and a short matrix would read out of range.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<BayesianRidge<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        if core.n_targets != 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "bayesian_ridge is single-target, but 'coef_' declares {} target rows",
+                    core.n_targets
+                ),
+            });
+        }
+        let d = core.n_features;
+
+        let square = |name: &'static str| -> Result<Vec<f64>, PersistError> {
+            let v = file.tensor(name)?;
+            let (rows, cols) = shape_2d(&v, name)?;
+            expect_len(name, rows, d, "rows")?;
+            expect_len(name, cols, d, "columns")?;
+            Ok(as_f64(&v, name)?.into_owned())
+        };
+        let sigma_ = square("sigma_")?;
+        let sigma_sqrt_t_ = square("sigma_sqrt_t_")?;
+
+        let vector = |name: &'static str| -> Result<Vec<f64>, PersistError> {
+            let v = file.tensor(name)?;
+            expect_len(name, shape_1d(&v, name)?, d, "entries")?;
+            Ok(as_f64(&v, name)?.into_owned())
+        };
+        let x_offset_ = vector("X_offset_")?;
+        let x_scale_ = vector("X_scale_")?;
+
+        // Absent means `compute_score = false`, which is the default and the
+        // common case — not a corrupt file.
+        let scores_ = match file.tensor_opt("scores_") {
+            None => Vec::new(),
+            Some(v) => {
+                shape_1d(&v, "scores_")?;
+                as_f64(&v, "scores_")?.into_owned()
+            }
+        };
+
+        Ok(BayesianRidge {
+            max_iter: file.scalar_usize("param:max_iter")?,
+            tol: file.scalar_f64("param:tol")?,
+            alpha_1: file.scalar_f64("param:alpha_1")?,
+            alpha_2: file.scalar_f64("param:alpha_2")?,
+            lambda_1: file.scalar_f64("param:lambda_1")?,
+            lambda_2: file.scalar_f64("param:lambda_2")?,
+            alpha_init: file.scalar_opt_f64("param:alpha_init")?,
+            lambda_init: file.scalar_opt_f64("param:lambda_init")?,
+            compute_score: file.scalar_bool("param:compute_score")?,
+            fit_intercept: core.fit_intercept,
+            copy_x: file.scalar_bool("param:copy_X")?,
+            verbose: file.scalar_bool("param:verbose")?,
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            device_: Some(
+                Device::from_name(file.scalar_str("device_")?)
+                    .ok_or(PersistError::BadMetadata { key: "device_" })?
+                    .name(),
+            ),
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            alpha_: file.scalar_f64("alpha_")?,
+            lambda_: file.scalar_f64("lambda_")?,
+            sigma_: Some(sigma_),
+            sigma_sqrt_t_: Some(sigma_sqrt_t_),
+            scores_,
+            n_iter_: file.scalar_usize("n_iter_")?,
+            x_offset_,
+            x_scale_,
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
     }
 }
 

@@ -15,6 +15,7 @@
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -319,6 +320,100 @@ impl MBSGDRegressorBuilder {
             config,
             coef_: None,
             intercept_: None,
+            _state: PhantomData,
+        })
+    }
+}
+
+// LINEAR-PERSIST: the safetensors container. MBSGDRegressor is the shared core
+// plus the fifteen `SgdConfig` scalars.
+use crate::linear::linear_persist::{
+    read_linear_core, read_sgd_config, write_sgd_config, AlignedBytes, LinearCoreRef, LinearFile,
+    LinearWriter, LoadModel, PersistError, SaveModel,
+};
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`]. All four members of the SGD/SVM family share the same
+/// fifteen-key solver configuration, so this is what keeps their files apart.
+const PERSIST_TAG: &str = "mbsgd_regressor";
+
+impl<F> SaveModel for MBSGDRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path`: the shared dense-linear core
+    /// (`coef_` as `[1, n_features]`, `intercept_` as `[1]`) plus the fifteen
+    /// [`SgdConfig`] scalars and the
+    /// `device` preference. Single-target, no fitted diagnostics.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: it borrows every payload so it can stream
+        // them out without a second copy.
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        write_sgd_config(&mut w, &self.config);
+        w.scalar_str("param:device", self.device.name());
+        LinearCoreRef {
+            n_features: coef.len(),
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: 1,
+            // `SgdConfig` owns `fit_intercept`; the core records it too, which
+            // is the one deliberate duplication in this file. Keeping the core
+            // uniform across all eleven estimators is worth ~20 bytes, and
+            // `load` reads it back from the config so the two cannot diverge in
+            // what the model actually does.
+            fit_intercept: self.config.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for MBSGDRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`. `F` need NOT match the dtype the file was written with — see
+    /// [`as_floats`](crate::persist::as_floats).
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<MBSGDRegressor<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        if core.n_targets != 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "mbsgd_regressor is single-target, but 'coef_' declares {} target rows",
+                    core.n_targets
+                ),
+            });
+        }
+        Ok(MBSGDRegressor {
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            config: read_sgd_config(&file)?,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
             _state: PhantomData,
         })
     }

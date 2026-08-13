@@ -74,19 +74,27 @@
 //! [`naive_bayes`](crate::naive_bayes) uses, and the reason neither family
 //! needed a `Serialize` derive across every estimator struct.
 //!
-//! Six estimators are wired, and between them they cover every shape the
-//! format has to handle:
+//! EVERY estimator in this module is wired — thirteen of them — and between
+//! them they cover every shape the format has to handle:
 //!
 //! | estimator | what it adds to the core |
 //! |---|---|
 //! | [`LinearRegression`](linear_regression::LinearRegression) | nothing — its whole fitted state IS the core |
-//! | [`Lasso`](lasso::Lasso) | the shared [`CdScalars`](linear_persist::CdScalars) |
-//! | [`ElasticNet`](elastic_net::ElasticNet) | those plus `param:l1_ratio` |
-//! | [`Ridge`](ridge::Ridge) | eight hyperparameters (two `Option`s, two enums), three fitted diagnostics (`n_iter_`/`solver_`/`device_`), multi-target `coef_` |
+//! | [`Lasso`](lasso::Lasso) / [`ElasticNet`](elastic_net::ElasticNet) | the shared [`CdScalars`](linear_persist::CdScalars) (+ `l1_ratio`) |
+//! | [`Ridge`](ridge::Ridge) | eight hyperparameters, three fitted diagnostics, multi-target `coef_` |
 //! | [`LogisticRegression`](logistic::LogisticRegression) | `classes_` |
-//! | [`RidgeClassifier`](ridge_classifier::RidgeClassifier) | `classes_`, ten hyperparameters incl. a payload-carrying enum, a per-target `n_iter_`, two DERIVED tables |
+//! | [`RidgeClassifier`](ridge_classifier::RidgeClassifier) | `classes_`, ten hyperparameters incl. a payload-carrying enum, two DERIVED tables |
+//! | [`MBSGDRegressor`](mbsgd_regressor::MBSGDRegressor) / [`MBSGDClassifier`](mbsgd_classifier::MBSGDClassifier) | the shared [`write_sgd_config`](linear_persist::write_sgd_config) fifteen |
+//! | [`LinearSVR`](linear_svr::LinearSVR) / [`LinearSVC`](linear_svc::LinearSVC) | those plus `C` / `intercept_scaling` |
+//! | [`HuberRegressor`](huber::HuberRegressor) | an `n_samples` BOOL mask, and `params_` at `f64` |
+//! | [`BayesianRidge`](bayesian_ridge::BayesianRidge) | two `d × d` posterior matrices and four host vectors |
+//! | [`RansacRegressor`](ransac::RansacRegressor) | fully host-resident; a BOOL mask and eight skip counters |
 //!
-//! Four things are worth knowing before adding the seventh:
+//! [`ridge_cv`] is absent by construction, not by omission: it is a
+//! free-function surface (`ridge_gcv` / `ridge_cv_grid`), with no `Fitted`
+//! estimator value to persist.
+//!
+//! Six things are worth knowing before extending this:
 //!
 //! * **Layout.** Ridge and RidgeClassifier hold `coef_` FEATURES-major for
 //!   their fused predict kernels while the file stores sklearn's TARGETS-major
@@ -94,20 +102,23 @@
 //!   borrow, not a copy, for every single-target model. LogisticRegression
 //!   needs no hop: D-12 gives it K full weight vectors, so `W` is already K×d.
 //! * **The discriminator is load bearing.** `Lasso` IS `ElasticNet` at
-//!   `l1_ratio == 1`, so those two files differ by one header key; a `Ridge`
-//!   file gets most of the way through `RidgeClassifier::load` before the
-//!   missing `classes_` would surface as something that merely looks like
-//!   corruption. Only `estimator` separates them cleanly.
+//!   `l1_ratio == 1`; the four SGD/SVM members share all fifteen config keys
+//!   over the same core. Only `estimator` separates those files.
 //! * **`classes_` is NOT part of the core** ([`linear_persist::write_classes`]).
-//!   `n_classes` equals the core's `n_targets` for LogisticRegression but not
-//!   for RidgeClassifier, whose binary fit has two classes and ONE decision
-//!   column. A core owning `classes_` would have to encode both rules, so each
-//!   classifier validates its own.
-//! * **Derived state is rebuilt, never stored.** RidgeClassifier's `coef_t_`
-//!   and `classes_dev_` are a transpose and an `i32` narrowing of data already
-//!   in the file; `load` reconstructs them through the fit path's own
-//!   `stage_fitted_state`, so the relationship has one definition and no file
-//!   can carry a transpose that disagrees with its own `coef_`.
+//!   `n_classes == n_targets` for LogisticRegression, but the discriminative
+//!   classifiers solve two classes as ONE column —
+//!   [`linear_persist::expect_ovr_geometry`] is the shared statement of that.
+//! * **Derived state is rebuilt, never stored** — RidgeClassifier's `coef_t_`
+//!   and `classes_dev_` come back through the fit path's own
+//!   `stage_fitted_state`.
+//! * **…except where "derived" is a lie.** Huber's `params_` is `f64` while
+//!   `coef_` is the model's `F`, so re-packing it degrades an `f32` warm-start
+//!   seed; BayesianRidge's `sigma_sqrt_t_` is a factor `Σ = M·Mᵀ` does not
+//!   determine. Both are stored, and both have a test that fails if they are
+//!   not.
+//! * **RANSAC is width-independent.** Its `F` is a `PhantomData` marker — the
+//!   consensus engine is host-`f64` on every backend — so its tensors are `F64`
+//!   whatever `F` says.
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 

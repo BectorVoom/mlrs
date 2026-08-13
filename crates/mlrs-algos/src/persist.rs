@@ -354,6 +354,34 @@ impl<'a> TensorRef<'a> {
         Self::new(Dtype::U64, shape, values)
     }
 
+    /// Stage a boolean MASK — one byte per element, `Dtype::BOOL`.
+    ///
+    /// Takes `&[u8]` rather than `&[bool]` because `bool` is not
+    /// [`Pod`]: not every bit pattern is a valid `bool`, so
+    /// bytemuck refuses to reinterpret a byte slice as one. [`pack_bools`]
+    /// does the (unavoidable) conversion, and callers bind its result before
+    /// constructing the writer, the same way they bind a device readback.
+    ///
+    /// ## One byte per flag, not one bit
+    ///
+    /// The live cases are `HuberRegressor::outliers_` and
+    /// `RansacRegressor::inlier_mask_`, both length `n_samples` — which for a
+    /// robust regressor is usually the DOMINANT payload, since `n >> d`. Bit
+    /// packing would be 8× smaller and is deliberately not done: a packed mask
+    /// is a `U8` array that `safetensors.numpy.load_file(path)` cannot
+    /// interpret without knowing mlrs's private scheme, and it would need
+    /// `n_samples` stored somewhere to know where the padding starts — a value
+    /// nothing else in the file carries. `Dtype::BOOL` reads back in Python as
+    /// a plain `bool` array of the right length.
+    ///
+    /// That is the same tie-break the rest of this format makes: where size
+    /// trades against the "a model file is sklearn-shaped in Python" contract,
+    /// the contract wins. It is a defensible thing to revisit for a
+    /// million-sample fit; it is not defensible to do silently.
+    pub fn bools(values: &'a [u8], shape: Vec<usize>) -> Result<Self, PersistError> {
+        Self::new(Dtype::BOOL, shape, values)
+    }
+
     /// Stage a generic-float array at ITS OWN width — `F32` for an `f32` model,
     /// `F64` for an `f64` one. This is the decision that halves the file for
     /// every f32-fitted model; going through an estimator's `f64` accessors
@@ -690,6 +718,16 @@ impl<'a, C: Container> ModelFile<'a, C> {
             .ok_or(PersistError::BadMetadata { key })
     }
 
+    /// Read a required `u64` scalar (an RNG seed). Distinct from
+    /// [`ModelFile::scalar_usize`] because a seed must survive a round-trip on a
+    /// 32-bit host, where `usize` would truncate it.
+    pub fn scalar_u64(&self, key: &'static str) -> Result<u64, PersistError> {
+        self.meta
+            .get(key)
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(PersistError::BadMetadata { key })
+    }
+
     /// Read a required `bool` scalar.
     pub fn scalar_bool(&self, key: &'static str) -> Result<bool, PersistError> {
         self.meta
@@ -809,6 +847,30 @@ pub fn as_usizes(view: &TensorView<'_>, tensor: &'static str) -> Result<Vec<usiz
             })
         })
         .collect()
+}
+
+/// Convert a `&[bool]` mask into the one-byte-per-flag form
+/// [`TensorRef::bools`] stages.
+///
+/// A copy, and an unavoidable one: `bool` is not [`Pod`], so there is no
+/// zero-cost reinterpretation of `&[bool]` as bytes. The result must be bound
+/// before the writer is constructed, since the writer borrows it.
+pub fn pack_bools(mask: &[bool]) -> Vec<u8> {
+    mask.iter().map(|&b| u8::from(b)).collect()
+}
+
+/// Read a `BOOL` tensor back into a `Vec<bool>`.
+///
+/// Owned rather than borrowed for the same reason the write side copies —
+/// `bool` is not [`Pod`], so the bytes cannot become a `&[bool]` in place.
+///
+/// Any non-zero byte reads as `true`. The format only ever writes 0 or 1, but
+/// the file is untrusted and there is no useful way to reject a 2: treating
+/// non-zero as set is what every C-family bool cast does, and erroring would
+/// reject a file some other tool wrote in good faith.
+pub fn as_bools(view: &TensorView<'_>, tensor: &'static str) -> Result<Vec<bool>, PersistError> {
+    expect_dtype(view, tensor, Dtype::BOOL)?;
+    Ok(view.data().iter().map(|&b| b != 0).collect())
 }
 
 /// Read a float tensor as `&[F]`, converting only across a width change.

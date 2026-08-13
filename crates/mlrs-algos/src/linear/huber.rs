@@ -83,6 +83,7 @@
 //! an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -441,6 +442,186 @@ impl HuberRegressorBuilder {
             converged_: false,
             outliers_: Vec::new(),
             params_: Vec::new(),
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+// LINEAR-PERSIST: the safetensors container. HuberRegressor stores the sklearn
+// attributes (`coef_`/`intercept_`/`scale_`) and REBUILDS the packed `params_`
+// warm-start vector from them, since that packing is exactly `[coef,
+// intercept?, sigma]`.
+use crate::linear::linear_persist::{
+    as_bools, as_f64, expect_len, pack_bools, read_linear_core, shape_1d, AlignedBytes,
+    LinearCoreRef, LinearFile, LinearWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+const PERSIST_TAG: &str = "huber";
+
+impl<F> SaveModel for HuberRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path`.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `coef_` | `F` | `[1, n_features]` |
+    /// | `intercept_` | `F` | `[1]` |
+    /// | `outliers_` | `BOOL` | `[n_samples]` |
+    /// | `param:*`, `scale_`, `n_iter_`, `converged_`, `device_` | `__metadata__` | — |
+    ///
+    /// ## `params_` IS written, despite looking derivable
+    ///
+    /// It is the packed `[coef…, intercept?, σ]` a warm start seeds from, which
+    /// is `coef_`, `intercept_` (present iff `fit_intercept`) and `scale_`
+    /// concatenated — so re-packing it at load looks free. That is wrong at
+    /// `f32`, and wrong in the direction that matters. `params_` is `f64`: it is
+    /// the solver's own parameter vector. `coef_`/`intercept_` are
+    /// `DeviceArray<F>`, so for an `f32` model they are stored — and were
+    /// already held — at `f32`. Re-packing would hand the next warm start a
+    /// seed rounded to `f32`, which is the one use `params_` has, and it would
+    /// do so silently: every accessor would still compare equal.
+    ///
+    /// So it gets its own `F64` tensor. The duplication is real (`n_features + 2`
+    /// doubles) and accepted; a warm start that resumes from degraded
+    /// parameters is a worse outcome than a slightly larger file.
+    ///
+    /// `init_params` is genuinely absent: `fit` always clears it on the value it
+    /// returns (the seed is consumed), so a fitted model's copy is `None` by
+    /// construction and storing it would only ever record that.
+    ///
+    /// `outliers_` is `n_samples` long — usually the DOMINANT payload here,
+    /// since a robust regressor runs with `n >> d`. See [`TensorRef::bools`] for
+    /// why it is one byte per flag rather than bit-packed.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+        let device_ = self.device_.ok_or_else(|| absent("device_"))?;
+        // `bool` is not `Pod`, so the mask has to be widened to one byte per
+        // flag; bound here so the writer can borrow it.
+        let outliers = pack_bools(&self.outliers_);
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:epsilon", self.epsilon);
+        w.scalar_usize("param:max_iter", self.max_iter);
+        w.scalar_f64("param:alpha", self.alpha);
+        w.scalar_bool("param:warm_start", self.warm_start);
+        w.scalar_f64("param:tol", self.tol);
+        w.scalar_str("param:device", self.device.name());
+        w.scalar_f64("scale_", self.scale_);
+        w.scalar_usize("n_iter_", self.n_iter_);
+        w.scalar_bool("converged_", self.converged_);
+        w.scalar_str("device_", device_);
+        w.tensor(
+            "outliers_",
+            TensorRef::bools(&outliers, vec![outliers.len()])?,
+        );
+        w.tensor(
+            "params_",
+            TensorRef::f64s(&self.params_, vec![self.params_.len()])?,
+        );
+        LinearCoreRef {
+            n_features: coef.len(),
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: 1,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for HuberRegressor<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool` and re-packing `params_`.
+    ///
+    /// The re-pack is the inverse of the fit path's own layout: `coef` (length
+    /// `n_features`), then the intercept IFF `fit_intercept`, then `σ`. That
+    /// ordering is the single thing tying this back to `solve`'s parameter
+    /// vector, so it is stated once here and gated by
+    /// `huber_warm_start_params_are_rebuilt` in the test suite.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<HuberRegressor<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        if core.n_targets != 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "huber is single-target, but 'coef_' declares {} target rows",
+                    core.n_targets
+                ),
+            });
+        }
+
+        let outliers_v = file.tensor("outliers_")?;
+        shape_1d(&outliers_v, "outliers_")?;
+        let outliers_ = as_bools(&outliers_v, "outliers_")?;
+
+        let scale_ = file.scalar_f64("scale_")?;
+        let fit_intercept = core.fit_intercept;
+
+        // `[coef…, intercept?, σ]` at FULL `f64` precision — read back rather
+        // than re-packed from the (possibly `f32`) core. The length the packing
+        // implies is checked here, so a truncated `params_` cannot reach a warm
+        // start that would index past it.
+        let params_v = file.tensor("params_")?;
+        let params_ = as_f64(&params_v, "params_")?.into_owned();
+        expect_len(
+            "params_",
+            params_.len(),
+            core.n_features + usize::from(fit_intercept) + 1,
+            "entries for [coef, intercept?, sigma]",
+        )?;
+
+        Ok(HuberRegressor {
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            device_: Some(
+                Device::from_name(file.scalar_str("device_")?)
+                    .ok_or(PersistError::BadMetadata { key: "device_" })?
+                    .name(),
+            ),
+            epsilon: file.scalar_f64("param:epsilon")?,
+            max_iter: file.scalar_usize("param:max_iter")?,
+            alpha: file.scalar_f64("param:alpha")?,
+            warm_start: file.scalar_bool("param:warm_start")?,
+            fit_intercept,
+            tol: file.scalar_f64("param:tol")?,
+            // Always `None` on a fitted value — `fit` consumes the seed.
+            init_params: None,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            scale_,
+            n_iter_: file.scalar_usize("n_iter_")?,
+            converged_: file.scalar_bool("converged_")?,
+            outliers_,
+            params_,
             predict_mirror: HostMirror::new(),
             _state: PhantomData,
         })

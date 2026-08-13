@@ -66,13 +66,16 @@ use std::borrow::Cow;
 
 use bytemuck::Pod;
 
+use crate::linear::sgd_config::{LearningRate, Loss, Penalty, SgdConfig};
+
 // The container is shared with the Naive Bayes family; only the discriminator
 // and the linear-shaped helpers below are local. Re-exported (not just
 // imported) so `linear::linear_persist::{AlignedBytes, SaveModel, …}` is the
 // single import path for a linear estimator's `save`/`load`.
 pub use crate::persist::{
-    as_f64, as_floats, as_i64, as_usizes, expect_len, shape_1d, shape_2d, AlignedBytes, Container,
-    LoadModel, ModelFile, ModelWriter, PersistError, SaveModel, TensorRef, PARAM_PREFIX,
+    as_bools, as_f64, as_floats, as_i64, as_usizes, expect_len, pack_bools, shape_1d, shape_2d,
+    AlignedBytes, Container, LoadModel, ModelFile, ModelWriter, PersistError, SaveModel, TensorRef,
+    PARAM_PREFIX,
 };
 
 /// The dense-linear container discriminator (`format = "mlrs-linear"`).
@@ -423,4 +426,115 @@ pub fn read_classes(file: &LinearFile<'_>) -> Result<Vec<i64>, PersistError> {
         });
     }
     Ok(as_i64(&view, CLASSES_NAME)?.into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// The SGD/SVM family's shared solver configuration
+// ---------------------------------------------------------------------------
+
+/// Stage the fifteen [`SgdConfig`] fields `MBSGDClassifier`, `MBSGDRegressor`,
+/// `LinearSVC` and `LinearSVR` all carry identically.
+///
+/// The argument for factoring this is the same one [`CdScalars`] makes, and
+/// stronger: fifteen keys across FOUR estimators is sixty spellings of
+/// `"param:learning_rate"` and friends if each writes its own, and a key
+/// mistyped on one side of one estimator produces a file that saves fine and
+/// loads a default. Here each key exists once.
+///
+/// The three enum-shaped fields ride as their sklearn strings via
+/// [`Loss::name`] / [`Penalty::name`] / [`LearningRate::name`], which round-trip
+/// through the `TryFrom<&str>` impls those types already carry for the builder.
+/// `seed` is `u64` and goes through [`ModelWriter::scalar_u64`] rather than
+/// `scalar_usize` — a seed must survive a round-trip on a 32-bit host, where
+/// `usize` would truncate it.
+///
+/// Note this stages the SOLVER configuration only. `LinearSVC`/`LinearSVR` hold
+/// `c` and `intercept_scaling` outside it, and the classifiers hold `classes_`;
+/// those stay with their own estimators.
+pub fn write_sgd_config(w: &mut LinearWriter<'_>, cfg: &SgdConfig) {
+    w.scalar_str("param:loss", cfg.loss.name());
+    w.scalar_str("param:penalty", cfg.penalty.name());
+    w.scalar_f64("param:alpha", cfg.alpha);
+    w.scalar_f64("param:l1_ratio", cfg.l1_ratio);
+    w.scalar_bool("param:fit_intercept", cfg.fit_intercept);
+    w.scalar_usize("param:max_iter", cfg.max_iter);
+    w.scalar_f64("param:tol", cfg.tol);
+    w.scalar_usize("param:n_iter_no_change", cfg.n_iter_no_change);
+    w.scalar_str("param:learning_rate", cfg.learning_rate.name());
+    w.scalar_f64("param:eta0", cfg.eta0);
+    w.scalar_f64("param:power_t", cfg.power_t);
+    w.scalar_f64("param:epsilon", cfg.epsilon);
+    w.scalar_usize("param:batch_size", cfg.batch_size);
+    w.scalar_bool("param:shuffle", cfg.shuffle);
+    w.scalar_u64("param:seed", cfg.seed);
+}
+
+/// Read back everything [`write_sgd_config`] staged.
+///
+/// Every field is REQUIRED. An absent key is a corrupt file, not a request for
+/// the default: silently substituting `penalty = l2` or `eta0 = 0.0` would hand
+/// back a model whose solver configuration differs from the one that produced
+/// the coefficients, with nothing to signal it.
+///
+/// The three enums are parsed rather than trusted, and an unrecognised string
+/// becomes a [`PersistError::BadMetadata`] naming its key — their own
+/// `TryFrom<&str>` yields a [`BuildError`](crate::error::BuildError), which is
+/// right for a constructor argument and wrong for a file, where the caller wants
+/// to know WHICH key was bad.
+pub fn read_sgd_config(file: &LinearFile<'_>) -> Result<SgdConfig, PersistError> {
+    fn enum_of<T>(file: &LinearFile<'_>, key: &'static str) -> Result<T, PersistError>
+    where
+        T: for<'s> TryFrom<&'s str>,
+    {
+        T::try_from(file.scalar_str(key)?).map_err(|_| PersistError::BadMetadata { key })
+    }
+
+    Ok(SgdConfig {
+        loss: enum_of::<Loss>(file, "param:loss")?,
+        penalty: enum_of::<Penalty>(file, "param:penalty")?,
+        alpha: file.scalar_f64("param:alpha")?,
+        l1_ratio: file.scalar_f64("param:l1_ratio")?,
+        fit_intercept: file.scalar_bool("param:fit_intercept")?,
+        max_iter: file.scalar_usize("param:max_iter")?,
+        tol: file.scalar_f64("param:tol")?,
+        n_iter_no_change: file.scalar_usize("param:n_iter_no_change")?,
+        learning_rate: enum_of::<LearningRate>(file, "param:learning_rate")?,
+        eta0: file.scalar_f64("param:eta0")?,
+        power_t: file.scalar_f64("param:power_t")?,
+        epsilon: file.scalar_f64("param:epsilon")?,
+        batch_size: file.scalar_usize("param:batch_size")?,
+        shuffle: file.scalar_bool("param:shuffle")?,
+        seed: file.scalar_u64("param:seed")?,
+    })
+}
+
+/// Validate the one-vs-rest geometry the DISCRIMINATIVE linear classifiers
+/// share: two classes are solved as ONE sub-problem (the sign of a single
+/// score), three or more get one per class.
+///
+/// `RidgeClassifier`, `MBSGDClassifier` and `LinearSVC` all encode exactly this,
+/// which is why it is here rather than repeated three times — and why it is NOT
+/// folded into [`read_linear_core`]. `LogisticRegression` follows a DIFFERENT
+/// rule (D-12: K full weight vectors, binary included, so `n_classes ==
+/// n_targets` always), so a core that assumed either rule would be wrong for the
+/// other.
+///
+/// This is a load-bearing check, not a formality. Both extents come from an
+/// untrusted header and neither is wrong on its own — a 1-row `coef_` is what a
+/// binary fit produces and a 3-entry `classes_` is what a 3-class fit produces.
+/// Only the cross-check catches the mismatch, and the label decode in `predict`
+/// indexes the class table off the argmax column, so without it the first
+/// prediction reads out of range (T-04-01-01).
+pub fn expect_ovr_geometry(n_classes: usize, n_targets: usize) -> Result<(), PersistError> {
+    let expected = if n_classes == 2 { 1 } else { n_classes };
+    if n_targets == expected {
+        Ok(())
+    } else {
+        Err(PersistError::InconsistentGeometry {
+            reason: format!(
+                "'classes_' holds {n_classes} labels, which implies {expected} target \
+                 column(s), but 'coef_' declares {n_targets}"
+            ),
+        })
+    }
 }
