@@ -74,4 +74,41 @@ impl MaxFeatures {
             MaxFeatures::Value(v) => v,
         }
     }
+
+    /// The sklearn spelling: `'sqrt'`, `'log2'`, `'1.0'` for the all-features
+    /// policy, or the explicit count's decimal.
+    ///
+    /// One string rather than a tag-plus-number pair, for the reason
+    /// [`NComponents`](crate::projection::NComponents) gives for
+    /// `n_components='auto'`: the three policy variants carry no number, an
+    /// optional integer would make a dropped key and a deliberate policy
+    /// indistinguishable, and a separate flag is two keys that can contradict
+    /// each other.
+    ///
+    /// `All` renders as `"1.0"` because that is what sklearn's
+    /// `max_features=1.0` means — the whole feature set — and a decimal cannot
+    /// collide with the integer form, which never has a point.
+    pub fn name(self) -> String {
+        match self {
+            MaxFeatures::Sqrt => "sqrt".to_string(),
+            MaxFeatures::Log2 => "log2".to_string(),
+            MaxFeatures::All => "1.0".to_string(),
+            MaxFeatures::Value(v) => v.to_string(),
+        }
+    }
+
+    /// The inverse of [`MaxFeatures::name`]; `None` for an unrecognised string.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "sqrt" => Some(MaxFeatures::Sqrt),
+            "log2" => Some(MaxFeatures::Log2),
+            "1.0" => Some(MaxFeatures::All),
+            other => other.parse::<usize>().ok().map(MaxFeatures::Value),
+        }
+    }
 }
+
+/// The `mlrs-ensemble` model-file container — the four tree ensembles'
+/// `save`/`load` share the complete-layout node tables it defines
+/// (ENSEMBLE-PERSIST, prototype).
+pub mod ensemble_persist;

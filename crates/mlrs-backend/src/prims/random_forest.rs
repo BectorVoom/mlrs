@@ -279,6 +279,58 @@ where
         })
     }
 
+    /// Assemble a forest from host arrays INCLUDING the per-node impurity
+    /// decrease — the model-file load path (`rf_persist`).
+    ///
+    /// [`RfModel::from_parts`] zero-fills `node_decrease` because an IMPORTED
+    /// forest genuinely has none: impurity decrease is a product of fitting, and
+    /// a forest arriving from Treelite or ONNX never went through one. A forest
+    /// arriving from an mlrs model file DID, so it carries the array and this is
+    /// the constructor that takes it.
+    ///
+    /// Keeping the two separate rather than making `node_decrease` an `Option`
+    /// on one constructor is what makes the distinction visible at the call
+    /// site: `from_parts` says "there was no fit", this says "there was, and
+    /// here is what it found".
+    ///
+    /// Geometry is validated exactly as `from_parts` does, plus the extra array.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_saved_parts(
+        pool: &mut BufferPool<ActiveRuntime>,
+        split_feature: &[u32],
+        threshold: &[F],
+        is_leaf: &[u32],
+        leaf_dist: &[F],
+        node_decrease: &[F],
+        n_trees: usize,
+        max_depth: usize,
+        n_features: usize,
+        n_values: usize,
+    ) -> Result<Self, PrimError> {
+        let mut model = Self::from_parts(
+            pool,
+            split_feature,
+            threshold,
+            is_leaf,
+            leaf_dist,
+            n_trees,
+            max_depth,
+            n_features,
+            n_values,
+        )?;
+        let tn = n_trees * model.total_nodes;
+        if node_decrease.len() != tn {
+            return Err(PrimError::ShapeMismatch {
+                operand: "node_decrease",
+                rows: n_trees,
+                cols: model.total_nodes,
+                len: node_decrease.len(),
+            });
+        }
+        model.node_decrease = DeviceArray::from_host(pool, node_decrease);
+        Ok(model)
+    }
+
     /// Number of trees in the forest.
     pub fn n_trees(&self) -> usize {
         self.n_trees

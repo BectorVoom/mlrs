@@ -21,6 +21,7 @@
 //! (AGENTS.md §2 — no in-source `#[cfg(test)]` module).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -32,12 +33,32 @@ use mlrs_backend::prims::random_forest::{
 };
 use mlrs_backend::runtime::ActiveRuntime;
 
-use mlrs_core::{host_to_f64, PrimError};
+use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, PredictProba, State, Unfit};
 
+use super::ensemble_persist::{
+    as_floats, as_i64, expect_len, read_leaf_table, read_node_tables, shape_1d, widen_nodes,
+    write_node_tables, AlignedBytes, EnsembleFile, EnsembleWriter, LoadModel, PersistError,
+    SaveModel, TensorRef, LEAF_DIST_NAME, NODE_DECREASE_NAME,
+};
 use super::MaxFeatures;
+
+/// The `estimator` discriminator written into every `RandomForestClassifier`
+/// file.
+///
+/// Load-bearing rather than decorative: the regressor's file holds the SAME four
+/// node tables at the same shapes and dtypes, differing only by carrying no
+/// `classes_` and by what its `leaf_dist` MEANS — a class distribution against a
+/// regression value. A cross-load would produce a model that predicts confident
+/// nonsense rather than an error.
+const PERSIST_TAG: &str = "random_forest_classifier";
+
+/// The tensor holding the distinct sorted training labels, `[n_classes]`.
+const CLASSES_NAME: &str = "classes_";
+/// The tensor holding the normalized per-feature importances, `[n_features]`.
+const IMPORTANCES_NAME: &str = "feature_importances_";
 
 /// sklearn defaults (single source, D-08): `n_estimators=100`,
 /// `min_samples_split=2`, `min_samples_leaf=1`, `bootstrap=true`,
@@ -424,6 +445,215 @@ where
         })
         .collect();
     Ok((classes, y_idx))
+}
+
+impl<F> SaveModel for RandomForestClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted forest to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `split_feature` / `is_leaf` | `U64` | `[n_trees, total_nodes]` |
+    /// | `threshold` | `F` (`F32`/`F64`) | `[n_trees, total_nodes]` |
+    /// | `leaf_dist` | `F` | `[n_trees, total_nodes, n_classes]` |
+    /// | `node_decrease` | `F` | `[n_trees, total_nodes]` |
+    /// | `classes_` | `I64` | `[n_classes]` |
+    /// | `feature_importances_` | `F` | `[n_features]` |
+    /// | `oob_score_` | `__metadata__` scalar, optional | — |
+    /// | nine `param:*` scalars | `__metadata__` | — |
+    ///
+    /// The trees are stored in the COMPLETE layout the traversal kernel indexes
+    /// directly — see [`ensemble_persist`](super::ensemble_persist) for the size
+    /// trade that makes, and why a ragged encoding would move unbounded work
+    /// onto the read path.
+    ///
+    /// `node_decrease` is written even though `feature_importances_` (the
+    /// reduced, normalized form callers actually read) is written beside it.
+    /// The two are not redundant: the per-node array is what a future per-tree
+    /// or per-subset importance query would need, and it is what
+    /// [`RfModel::from_saved_parts`] restores so a reloaded forest is
+    /// indistinguishable from the fitted one rather than merely equivalent at
+    /// predict time.
+    ///
+    /// `max_depth` is NOT stored — it is recovered from `total_nodes`, which
+    /// must be `2^(d+1) − 1` for the child arithmetic to be in bounds at all.
+    /// Storing it would be a second copy of the same fact that a hand-edited
+    /// header could contradict.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let model = self.model_.as_ref().ok_or(PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field: "model_",
+        })?;
+        // Bound BEFORE the writer: `EnsembleWriter` borrows every payload so it
+        // can stream them out without a second copy.
+        let split_feature = widen_nodes(&model.split_feature_host(pool));
+        let is_leaf = widen_nodes(&model.is_leaf_host(pool));
+        let threshold = model.threshold_host(pool);
+        let leaf_dist = model.leaf_dist_host(pool);
+        let node_decrease = model.node_decrease_host(pool);
+        let classes: Vec<i64> = self.classes_.iter().map(|&v| i64::from(v)).collect();
+
+        let (n_trees, total_nodes) = (model.n_trees(), model.total_nodes());
+        let n_values = model.n_values();
+
+        let mut w = EnsembleWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_estimators", self.n_estimators);
+        w.scalar_usize("param:max_depth", self.max_depth);
+        w.scalar_usize("param:n_bins", self.n_bins);
+        w.scalar_str("param:max_features", &self.max_features.name());
+        w.scalar_f64("param:min_samples_split", self.min_samples_split);
+        w.scalar_f64("param:min_samples_leaf", self.min_samples_leaf);
+        w.scalar_bool("param:bootstrap", self.bootstrap);
+        w.scalar_bool("param:oob_score", self.oob_score);
+        w.scalar_u64("param:seed", self.seed);
+        w.scalar_usize("n_features_in_", model.n_features());
+        w.scalar_opt_f64("oob_score_", self.oob_score_.map(host_to_f64));
+
+        write_node_tables(
+            &mut w,
+            &split_feature,
+            &threshold,
+            &is_leaf,
+            n_trees,
+            total_nodes,
+        )?;
+        w.tensor(
+            LEAF_DIST_NAME,
+            TensorRef::floats(&leaf_dist, vec![n_trees, total_nodes, n_values])?,
+        );
+        w.tensor(
+            NODE_DECREASE_NAME,
+            TensorRef::floats(&node_decrease, vec![n_trees, total_nodes])?,
+        );
+        w.tensor(CLASSES_NAME, TensorRef::i64s(&classes, vec![classes.len()])?);
+        w.tensor(
+            IMPORTANCES_NAME,
+            TensorRef::floats(
+                &self.feature_importances_,
+                vec![self.feature_importances_.len()],
+            )?,
+        );
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for RandomForestClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the forest back from `path`, re-uploading every node table to
+    /// `pool`.
+    ///
+    /// The file is untrusted input (T-04-01-01), and this estimator has the
+    /// strictest checks in the crate because its traversal kernel indexes two
+    /// different axes off stored values: `2i+1`/`2i+2` into the node table, and
+    /// `split_feature[node]` into the query row. So
+    /// [`read_node_tables`] establishes both the complete-layout invariant and
+    /// every split feature's range before the model exists, and `leaf_dist`'s
+    /// per-node width is cross-checked against `classes_`.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<RandomForestClassifier<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = EnsembleFile::parse(&raw, PERSIST_TAG)?;
+        let n_features = file.scalar_usize("n_features_in_")?;
+        if n_features == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: "'n_features_in_' is 0; a fitted forest has at least one feature"
+                    .to_string(),
+            });
+        }
+        let tables = read_node_tables::<F>(&file, n_features)?;
+
+        let classes_v = file.tensor(CLASSES_NAME)?;
+        let n_classes = shape_1d(&classes_v, CLASSES_NAME)?;
+        if n_classes < 2 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{CLASSES_NAME}' holds {n_classes} labels; a fitted classifier \
+                     has at least 2"
+                ),
+            });
+        }
+        let classes_: Vec<i32> = as_i64(&classes_v, CLASSES_NAME)?
+            .iter()
+            .map(|&v| {
+                i32::try_from(v).map_err(|_| PersistError::InconsistentGeometry {
+                    reason: format!(
+                        "tensor '{CLASSES_NAME}' holds the label {v}, which does not fit the \
+                         i32 the forest's kernels consume"
+                    ),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // `leaf_dist` holds one entry per CLASS per node, so its length is the
+        // cross-check that ties the node tables to the label table.
+        let leaf_dist = read_leaf_table::<F>(
+            &file,
+            LEAF_DIST_NAME,
+            tables.n_trees,
+            tables.total_nodes,
+            n_classes,
+        )?;
+        let node_decrease = read_leaf_table::<F>(
+            &file,
+            NODE_DECREASE_NAME,
+            tables.n_trees,
+            tables.total_nodes,
+            1,
+        )?;
+
+        let importances_v = file.tensor(IMPORTANCES_NAME)?;
+        expect_len(
+            IMPORTANCES_NAME,
+            shape_1d(&importances_v, IMPORTANCES_NAME)?,
+            n_features,
+            "entries",
+        )?;
+        let feature_importances_ = as_floats::<F>(&importances_v, IMPORTANCES_NAME)?.into_owned();
+
+        let model_ = RfModel::from_saved_parts(
+            pool,
+            &tables.split_feature,
+            &tables.threshold,
+            &tables.is_leaf,
+            &leaf_dist,
+            &node_decrease,
+            tables.n_trees,
+            tables.max_depth,
+            n_features,
+            n_classes,
+        )
+        .map_err(|e| PersistError::InconsistentGeometry {
+            reason: format!("the node tables do not assemble into a forest: {e}"),
+        })?;
+
+        Ok(RandomForestClassifier {
+            n_estimators: file.scalar_usize("param:n_estimators")?,
+            max_depth: file.scalar_usize("param:max_depth")?,
+            n_bins: file.scalar_usize("param:n_bins")?,
+            max_features: MaxFeatures::from_name(file.scalar_str("param:max_features")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:max_features",
+                },
+            )?,
+            min_samples_split: file.scalar_f64("param:min_samples_split")?,
+            min_samples_leaf: file.scalar_f64("param:min_samples_leaf")?,
+            bootstrap: file.scalar_bool("param:bootstrap")?,
+            oob_score: file.scalar_bool("param:oob_score")?,
+            seed: file.scalar_u64("param:seed")?,
+            model_: Some(model_),
+            classes_,
+            n_classes_: n_classes,
+            feature_importances_,
+            oob_score_: file.scalar_opt_f64("oob_score_")?.map(f64_to_host::<F>),
+            _state: PhantomData,
+        })
+    }
 }
 
 impl<F> Fit<F> for RandomForestClassifier<F, Unfit>

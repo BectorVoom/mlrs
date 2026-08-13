@@ -188,6 +188,79 @@ impl<F> HgbModel<F>
 where
     F: Float + CubeElement + Pod,
 {
+    /// Assemble a device-resident booster from HOST complete-layout arrays —
+    /// the model-file load path (`ensemble_persist`).
+    ///
+    /// Each tree array is `n_iters · k × total_nodes` with
+    /// `total_nodes = 2^(max_depth+1) − 1`; `baseline` is length `k`. The
+    /// traversal contract is the fitted-booster one (`x < threshold → 2i+1`,
+    /// bounded `max_depth` walk, `is_leaf != 0` stops advancement).
+    ///
+    /// Geometry is validated host-side BEFORE any upload: `total_nodes` must
+    /// equal `2^(max_depth+1) − 1` and every array length must match. Violations
+    /// return [`PrimError::ShapeMismatch`], which is what turns a hand-edited
+    /// model file into a typed error rather than an out-of-bounds traversal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        pool: &mut BufferPool<ActiveRuntime>,
+        split_feature: &[u32],
+        threshold: &[F],
+        is_leaf: &[u32],
+        leaf_value: &[F],
+        baseline: &[F],
+        n_iters: usize,
+        k: usize,
+        n_classes: usize,
+        max_depth: usize,
+        n_features: usize,
+    ) -> Result<Self, PrimError> {
+        let total_nodes = (1usize << (max_depth + 1)) - 1;
+        let trees = n_iters.checked_mul(k).ok_or(PrimError::Overflow {
+            operand: "n_trees",
+            lhs: n_iters,
+            rhs: k,
+        })?;
+        let tn = trees.checked_mul(total_nodes).ok_or(PrimError::Overflow {
+            operand: "total_nodes",
+            lhs: trees,
+            rhs: total_nodes,
+        })?;
+        for (operand, len, expect) in [
+            ("split_feature", split_feature.len(), tn),
+            ("threshold", threshold.len(), tn),
+            ("is_leaf", is_leaf.len(), tn),
+            ("leaf_value", leaf_value.len(), tn),
+            ("baseline", baseline.len(), k),
+        ] {
+            if len != expect {
+                return Err(PrimError::ShapeMismatch {
+                    operand,
+                    rows: trees,
+                    cols: total_nodes,
+                    len,
+                });
+            }
+        }
+        Ok(Self {
+            split_feature: DeviceArray::from_host(pool, split_feature),
+            threshold: DeviceArray::from_host(pool, threshold),
+            is_leaf: DeviceArray::from_host(pool, is_leaf),
+            leaf_value: DeviceArray::from_host(pool, leaf_value),
+            baseline: DeviceArray::from_host(pool, baseline),
+            n_iters,
+            k,
+            n_classes,
+            max_depth,
+            total_nodes,
+            n_features,
+        })
+    }
+
+    /// The bounded traversal depth (complete-layout `max_depth`).
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
     /// Boosting iterations fitted.
     pub fn n_iters(&self) -> usize {
         self.n_iters
