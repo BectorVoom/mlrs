@@ -49,6 +49,7 @@
 //! `crates/mlrs-algos/tests/tsne_params_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -69,7 +70,25 @@ use crate::manifold::tsne_knn::{bh_n_neighbors, joint_probabilities_nn, knn_grap
 use crate::manifold::tsne_metric::{
     pairwise_squared, resolve_metric_params, validate_metric_geometry, MetricParams, TsneMetric,
 };
+use crate::manifold::manifold_persist::{
+    read_embedding, read_opt_f64_vec, write_embedding, write_opt_f64_vec, AlignedBytes, LoadModel,
+    ManifoldFile, ManifoldWriter, PersistError, SaveModel,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, State, Unfit};
+
+/// The `estimator` discriminator written into every `Tsne` file.
+///
+/// Load-bearing rather than decorative: a `Umap` file holds an `embedding_` of
+/// the same shape and dtype under the same name, and differs only by carrying a
+/// `_raw_data`. Without the tag a `Umap` file would load here and quietly
+/// discard the training matrix that makes it able to transform new rows.
+const PERSIST_TAG: &str = "tsne";
+
+/// The tensor holding an EXPLICIT `init` embedding, when the model was built
+/// with one. Under `param:` because it is a constructor argument — the fitted
+/// embedding it seeded is `embedding_`, and the two are different arrays of the
+/// same shape.
+const INIT_ARRAY_NAME: &str = "param:init_array";
 
 /// Embedding initialization (sklearn `init`).
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +132,56 @@ impl TsneMethod {
             "barnes_hut" => Some(Self::BarnesHut),
             "exact" => Some(Self::Exact),
             _ => None,
+        }
+    }
+
+    /// The sklearn `method=` string — the inverse of
+    /// [`TsneMethod::from_sklearn_name`], and what the model file stores so the
+    /// variant cannot be silently renumbered by a later addition.
+    pub fn sklearn_name(self) -> &'static str {
+        match self {
+            Self::BarnesHut => "barnes_hut",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+impl LearningRate {
+    /// The sklearn spelling: `'auto'` or the value's shortest round-tripping
+    /// decimal.
+    ///
+    /// One string rather than a number-plus-flag pair, for the reason
+    /// [`BandwidthSpec::name`](crate::density::kernel_density::BandwidthSpec::name)
+    /// gives: `Auto` carries no numeric value, an optional number would make a
+    /// dropped key and a deliberate `'auto'` indistinguishable, and a separate
+    /// flag is two keys that can contradict each other.
+    pub fn name(self) -> String {
+        match self {
+            LearningRate::Auto => "auto".to_string(),
+            LearningRate::Value(v) => format!("{v:?}"),
+        }
+    }
+
+    /// The inverse of [`LearningRate::name`]; `None` for a string that is
+    /// neither `'auto'` nor a parsable decimal.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(LearningRate::Auto),
+            other => other.parse::<f64>().ok().map(LearningRate::Value),
+        }
+    }
+}
+
+impl TsneInit {
+    /// The sklearn `init=` string. The array form has no sklearn string
+    /// spelling; it renders as `"array"` and its payload rides in a companion
+    /// tensor — the same split [`KMeansInit`](crate::cluster::kmeans::KMeansInit)
+    /// makes.
+    pub fn name(&self) -> &'static str {
+        match self {
+            TsneInit::Pca => "pca",
+            TsneInit::Random => "random",
+            TsneInit::Array(_) => "array",
         }
     }
 }
@@ -594,6 +663,201 @@ impl TsneBuilder {
             kl_divergence_: None,
             n_iter_: 0,
             n_features_in_: 0,
+            _float: PhantomData,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SaveModel for Tsne<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted embedding to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `embedding_` | `F` (`F32`/`F64`) | `[n_samples, n_components]` |
+    /// | `param:init_array` | `F64` | `[n_samples, n_components]`, explicit init only |
+    /// | `param:metric_v` / `param:metric_vi` / `param:metric_w` | `F64` | optional |
+    /// | `kl_divergence_` / `n_iter_` / `n_features_in_` / `device_` | `__metadata__` | — |
+    /// | fifteen `param:*` scalars | `__metadata__` | — |
+    ///
+    /// t-SNE has NO out-of-sample extension — sklearn's `TSNE` exposes
+    /// `fit_transform` and no `transform` — so the embedding is the whole model
+    /// and no training matrix is kept. That is why this file is `O(n · k)` while
+    /// `Umap`'s is `O(n · d)`: the two estimators differ in what they can do,
+    /// not merely in what they store.
+    ///
+    /// `kl_divergence_` and `n_iter_` are FITTED diagnostics that describe how
+    /// the descent went, and neither is recoverable from the embedding without
+    /// the training data. They carry no `param:` prefix for that reason.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `ManifoldWriter` borrows every payload so it
+        // can stream them out without a second copy.
+        let embedding = self
+            .embedding_
+            .as_ref()
+            .ok_or_else(|| absent("embedding_"))?
+            .to_host(pool);
+        let n_samples = embedding.len() / self.n_components.max(1);
+
+        let mut w = ManifoldWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_components", self.n_components);
+        w.scalar_f64("param:perplexity", self.perplexity);
+        w.scalar_f64("param:early_exaggeration", self.early_exaggeration);
+        w.scalar_str("param:learning_rate", &self.learning_rate.name());
+        w.scalar_usize("param:max_iter", self.max_iter);
+        w.scalar_usize(
+            "param:n_iter_without_progress",
+            self.n_iter_without_progress,
+        );
+        w.scalar_f64("param:min_grad_norm", self.min_grad_norm);
+        w.scalar_str("param:metric", self.metric.sklearn_name());
+        w.scalar_opt_f64("param:metric_p", self.metric_params.p);
+        w.scalar_str("param:init", self.init.name());
+        w.scalar_usize("param:verbose", self.verbose);
+        w.scalar_u64("param:seed", self.seed);
+        w.scalar_str("param:method", self.method.sklearn_name());
+        w.scalar_f64("param:angle", self.angle);
+        w.scalar_str("param:device", self.device.name());
+        if let Some(j) = self.n_jobs {
+            w.scalar_str("param:n_jobs", &j.to_string());
+        }
+
+        w.scalar_opt_f64("kl_divergence_", self.kl_divergence_);
+        w.scalar_usize("n_iter_", self.n_iter_);
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+        if let Some(arm) = self.device_ {
+            w.scalar_str("device_", arm);
+        }
+
+        write_embedding(&mut w, &embedding, n_samples, self.n_components)?;
+        // The explicit-init array, when there is one. Stored at `F64` because it
+        // is a constructor argument the builder takes as `f64`, not a fitted
+        // quantity whose width follows the model's.
+        if let TsneInit::Array(a) = &self.init {
+            w.tensor(
+                INIT_ARRAY_NAME,
+                crate::persist::TensorRef::f64s(a, vec![a.len()])?,
+            );
+        }
+        write_opt_f64_vec(&mut w, "param:metric_v", self.metric_params.v.as_ref())?;
+        write_opt_f64_vec(&mut w, "param:metric_vi", self.metric_params.vi.as_ref())?;
+        write_opt_f64_vec(&mut w, "param:metric_w", self.metric_params.w.as_ref())?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for Tsne<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the embedding back from `path`, re-uploading it to `pool`.
+    ///
+    /// The `init` string and the `param:init_array` tensor must AGREE — an
+    /// `'array'` init with no array, or an array with a non-`'array'` init, is a
+    /// file whose two halves describe different models.
+    ///
+    /// Every enum-shaped scalar is PARSED rather than trusted: an unrecognised
+    /// `metric`, `method`, `init` or `learning_rate` becomes a
+    /// [`PersistError::BadMetadata`] naming its key, because each one changes
+    /// what the saved model was and none is safe to default.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<Tsne<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ManifoldFile::parse(&raw, PERSIST_TAG)?;
+        let (embedding, n_samples, n_components) = read_embedding::<F>(&file)?;
+
+        let init_name = file.scalar_str("param:init")?;
+        let init_array = read_opt_f64_vec(&file, INIT_ARRAY_NAME)?;
+        let init = match (init_name, init_array) {
+            ("pca", None) => TsneInit::Pca,
+            ("random", None) => TsneInit::Random,
+            ("array", Some(a)) => {
+                if a.len() != n_samples * n_components {
+                    return Err(PersistError::InconsistentGeometry {
+                        reason: format!(
+                            "tensor '{INIT_ARRAY_NAME}' holds {} entries, but 'embedding_' \
+                             implies {}",
+                            a.len(),
+                            n_samples * n_components
+                        ),
+                    });
+                }
+                TsneInit::Array(a)
+            }
+            (name, arr) => {
+                return Err(PersistError::InconsistentGeometry {
+                    reason: format!(
+                        "'param:init' is '{name}' but the '{INIT_ARRAY_NAME}' tensor is {}",
+                        if arr.is_some() { "present" } else { "absent" }
+                    ),
+                })
+            }
+        };
+
+        let n_jobs = match file.metadata().get("param:n_jobs") {
+            None => None,
+            Some(s) => Some(s.parse::<i32>().map_err(|_| PersistError::BadMetadata {
+                key: "param:n_jobs",
+            })?),
+        };
+        let device_ = match file.metadata().get("device_").map(String::as_str) {
+            None => None,
+            Some("cpu") => Some("cpu"),
+            Some("gpu") => Some("gpu"),
+            Some(_) => return Err(PersistError::BadMetadata { key: "device_" }),
+        };
+
+        Ok(Tsne {
+            n_components,
+            perplexity: file.scalar_f64("param:perplexity")?,
+            early_exaggeration: file.scalar_f64("param:early_exaggeration")?,
+            learning_rate: LearningRate::from_name(file.scalar_str("param:learning_rate")?)
+                .ok_or(PersistError::BadMetadata {
+                    key: "param:learning_rate",
+                })?,
+            max_iter: file.scalar_usize("param:max_iter")?,
+            n_iter_without_progress: file.scalar_usize("param:n_iter_without_progress")?,
+            min_grad_norm: file.scalar_f64("param:min_grad_norm")?,
+            metric: TsneMetric::from_sklearn_name(file.scalar_str("param:metric")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:metric",
+                },
+            )?,
+            metric_params: MetricParams {
+                p: file.scalar_opt_f64("param:metric_p")?,
+                v: read_opt_f64_vec(&file, "param:metric_v")?,
+                vi: read_opt_f64_vec(&file, "param:metric_vi")?,
+                w: read_opt_f64_vec(&file, "param:metric_w")?,
+            },
+            init,
+            verbose: file.scalar_usize("param:verbose")?,
+            seed: file.scalar_u64("param:seed")?,
+            device_,
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            method: TsneMethod::from_sklearn_name(file.scalar_str("param:method")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:method",
+                },
+            )?,
+            angle: file.scalar_f64("param:angle")?,
+            n_jobs,
+            embedding_: Some(DeviceArray::from_host(pool, &embedding)),
+            kl_divergence_: file.scalar_opt_f64("kl_divergence_")?,
+            n_iter_: file.scalar_usize("n_iter_")?,
+            n_features_in_: file.scalar_usize("n_features_in_")?,
             _float: PhantomData,
             _state: PhantomData,
         })

@@ -6,6 +6,10 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+/// The `mlrs-timeseries` model-file container — `Arima`'s `save`/`load` write
+/// through it (TS-PERSIST, prototype).
+pub mod ts_persist;
+
 pub mod arima;
 
 pub use arima::{Arima, AutoArima};

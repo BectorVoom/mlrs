@@ -17,6 +17,10 @@
 // owns the 22-string `metric=` surface and `metric_params`; `tsne_knn` owns the
 // Barnes-Hut front-end (k-NN graph + sparse `P`). The descent itself lives in
 // `mlrs_backend::prims::tsne_host`.
+/// The `mlrs-manifold` model-file container — both estimators' `save`/`load`
+/// share the embedding layout it defines (MANIFOLD-PERSIST, prototype).
+pub mod manifold_persist;
+
 pub mod tsne;
 pub mod tsne_knn;
 pub mod tsne_metric;

@@ -26,6 +26,7 @@
 //! Tests live in `crates/mlrs-algos/tests/umap_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{ArrayArg, CubeCount, CubeDim, CubeElement, Float};
@@ -42,6 +43,14 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use mlrs_kernels::{chebyshev_dist, manhattan_dist, minkowski_dist, umap_layout_step};
 
 use crate::error::{AlgoError, BuildError};
+use crate::manifold::manifold_persist::{
+    as_floats, read_embedding, shape_2d, write_embedding, AlignedBytes, LoadModel, ManifoldFile,
+    ManifoldWriter, PersistError, SaveModel, TensorRef, RAW_DATA_NAME,
+};
+
+/// The `estimator` discriminator written into every `Umap` file. See
+/// [`tsne`](super::tsne)'s tag for why it is load-bearing.
+const PERSIST_TAG: &str = "umap";
 use crate::manifold::{umap_host_knn, umap_host_layout, umap_init, umap_internals};
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
@@ -101,6 +110,46 @@ pub enum Metric {
     },
 }
 
+impl Metric {
+    /// The umap-learn metric name.
+    ///
+    /// LOSSY for [`Metric::Minkowski`], whose exponent rides separately — the
+    /// same `(metric, p)` split sklearn and umap-learn both make, and the same
+    /// one [`knn_graph::Metric`](mlrs_backend::prims::knn_graph::Metric) uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Metric::Euclidean => "euclidean",
+            Metric::Manhattan => "manhattan",
+            Metric::Cosine => "cosine",
+            Metric::Chebyshev => "chebyshev",
+            Metric::Minkowski { .. } => "minkowski",
+        }
+    }
+
+    /// The Minkowski exponent, or `None` for every other variant.
+    pub fn p(self) -> Option<f64> {
+        match self {
+            Metric::Minkowski { p } => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Rebuild a metric from the `(name, p)` pair. `'minkowski'` without a `p`
+    /// is REJECTED rather than defaulted to 2: a silent `p = 2` is Euclidean, so
+    /// a file that lost its exponent would load as a different metric and every
+    /// distance it computed would be wrong with nothing to signal it.
+    pub fn from_name(name: &str, p: Option<f64>) -> Option<Self> {
+        match name {
+            "euclidean" => Some(Metric::Euclidean),
+            "manhattan" => Some(Metric::Manhattan),
+            "cosine" => Some(Metric::Cosine),
+            "chebyshev" => Some(Metric::Chebyshev),
+            "minkowski" => p.map(|p| Metric::Minkowski { p }),
+            _ => None,
+        }
+    }
+}
+
 /// Initialization strategy for the low-dimensional embedding (UMAP-01 subset).
 /// Ignored by the Phase-12 trivial fit (which always emits zeros); retained so
 /// the builder surface matches umap-learn's `init=` parameter for Phase 14.
@@ -111,6 +160,29 @@ pub enum Init {
     Spectral,
     /// Uniform-random init in the embedding box — umap-learn's `init='random'`.
     Random,
+}
+
+impl Init {
+    /// The umap-learn spelling (`'spectral'` / `'random'`).
+    ///
+    /// The model file stores the variant as this string rather than as an
+    /// integer tag, so a later addition cannot silently renumber an existing
+    /// file's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Init::Spectral => "spectral",
+            Init::Random => "random",
+        }
+    }
+
+    /// The inverse of [`Init::name`]; `None` for an unrecognised string.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "spectral" => Some(Init::Spectral),
+            "random" => Some(Init::Random),
+            _ => None,
+        }
+    }
 }
 
 /// UMAP manifold-learning estimator shell (UMAP-01). Construct via
@@ -458,6 +530,148 @@ impl UmapBuilder {
             embedding_: None,
             x_train_: None,
             n_features_in_: 0,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SaveModel for Umap<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted embedding to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `embedding_` | `F` (`F32`/`F64`) | `[n_samples, n_components]` |
+    /// | `_raw_data` | `F` | `[n_samples, n_features]` |
+    /// | `n_features_in_` | `__metadata__` scalar | — |
+    /// | sixteen `param:*` scalars | `__metadata__` | — |
+    ///
+    /// Unlike `Tsne`, UMAP GENERALIZES — it can embed a row it never saw — and
+    /// it does so by scanning the retained training matrix. So `_raw_data` is
+    /// part of the model rather than a fitting artifact, and it is what makes
+    /// this file `O(n · d)` where the t-SNE one is `O(n · k)`. Dropping it would
+    /// produce a model that still reports its embedding and can no longer
+    /// transform, which is a different estimator.
+    ///
+    /// `a` and `b` are stored as the OPTIONAL constructor arguments they are:
+    /// `None` means "derive from `min_dist`/`spread` at fit", so key-presence
+    /// carries the `Option` and costs zero bytes when absent.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let embedding = self
+            .embedding_
+            .as_ref()
+            .ok_or_else(|| absent("embedding_"))?
+            .to_host(pool);
+        let raw = self
+            .x_train_
+            .as_ref()
+            .ok_or_else(|| absent("x_train_"))?
+            .to_host(pool);
+        let n_samples = embedding.len() / self.n_components.max(1);
+
+        let mut w = ManifoldWriter::new(PERSIST_TAG);
+        w.scalar_str("param:device", self.device.name());
+        w.scalar_usize("param:n_neighbors", self.n_neighbors);
+        w.scalar_usize("param:n_components", self.n_components);
+        w.scalar_f64("param:min_dist", self.min_dist);
+        w.scalar_f64("param:spread", self.spread);
+        w.scalar_str("param:metric", self.metric.name());
+        w.scalar_opt_f64("param:metric_p", self.metric.p());
+        w.scalar_opt_usize("param:n_epochs", self.n_epochs);
+        w.scalar_str("param:init", self.init.name());
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_f64("param:learning_rate", self.learning_rate);
+        w.scalar_f64("param:set_op_mix_ratio", self.set_op_mix_ratio);
+        w.scalar_f64("param:local_connectivity", self.local_connectivity);
+        w.scalar_f64("param:repulsion_strength", self.repulsion_strength);
+        w.scalar_usize("param:negative_sample_rate", self.negative_sample_rate);
+        w.scalar_opt_f64("param:a", self.a);
+        w.scalar_opt_f64("param:b", self.b);
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+
+        write_embedding(&mut w, &embedding, n_samples, self.n_components)?;
+        w.tensor(
+            RAW_DATA_NAME,
+            TensorRef::floats(&raw, vec![n_samples, self.n_features_in_])?,
+        );
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for Umap<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the embedding back from `path`, re-uploading `embedding_` and
+    /// `_raw_data` to `pool`.
+    ///
+    /// The file is untrusted input (T-04-01-01), so `embedding_` fixes
+    /// `n_samples` and `_raw_data`'s row extent is checked against it before any
+    /// value is stored — the two describe the same rows, and a mismatch would
+    /// index the training matrix out of range on the first `transform`.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<Umap<F, Fitted>, PersistError> {
+        let raw_bytes = AlignedBytes::read(path)?;
+        let file = ManifoldFile::parse(&raw_bytes, PERSIST_TAG)?;
+        let (embedding, n_samples, n_components) = read_embedding::<F>(&file)?;
+
+        let raw_v = file.tensor(RAW_DATA_NAME)?;
+        let (raw_rows, n_features) = shape_2d(&raw_v, RAW_DATA_NAME)?;
+        if raw_rows != n_samples || n_features == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{RAW_DATA_NAME}' declares shape [{raw_rows}, {n_features}], but \
+                     'embedding_' implies {n_samples} rows and at least one feature"
+                ),
+            });
+        }
+        let raw = as_floats::<F>(&raw_v, RAW_DATA_NAME)?;
+
+        let metric = Metric::from_name(
+            file.scalar_str("param:metric")?,
+            file.scalar_opt_f64("param:metric_p")?,
+        )
+        .ok_or(PersistError::BadMetadata {
+            key: "param:metric",
+        })?;
+
+        Ok(Umap {
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            n_neighbors: file.scalar_usize("param:n_neighbors")?,
+            n_components,
+            min_dist: file.scalar_f64("param:min_dist")?,
+            spread: file.scalar_f64("param:spread")?,
+            metric,
+            n_epochs: file.scalar_opt_usize("param:n_epochs")?,
+            init: Init::from_name(file.scalar_str("param:init")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:init",
+                },
+            )?,
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            learning_rate: file.scalar_f64("param:learning_rate")?,
+            set_op_mix_ratio: file.scalar_f64("param:set_op_mix_ratio")?,
+            local_connectivity: file.scalar_f64("param:local_connectivity")?,
+            repulsion_strength: file.scalar_f64("param:repulsion_strength")?,
+            negative_sample_rate: file.scalar_usize("param:negative_sample_rate")?,
+            a: file.scalar_opt_f64("param:a")?,
+            b: file.scalar_opt_f64("param:b")?,
+            embedding_: Some(DeviceArray::from_host(pool, &embedding)),
+            x_train_: Some(DeviceArray::from_host(pool, &raw)),
+            n_features_in_: n_features,
             _state: PhantomData,
         })
     }

@@ -65,6 +65,7 @@
 //! Tests live in `crates/mlrs-algos/tests/arima_test.rs` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -75,8 +76,152 @@ use mlrs_backend::prims::lbfgs::{lbfgs_minimize, LbfgsStopReason, LBFGS_FTOL, LB
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{host_to_f64, PrimError};
 
+use super::ts_persist::{
+    as_f64, read_f64_vec, shape_1d, shape_2d, AlignedBytes, LoadModel, PersistError, SaveModel,
+    TensorRef, TimeSeriesFile, TimeSeriesWriter,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{Fitted, State, Unfit};
+
+/// The `estimator` discriminator written into every `Arima` file.
+const PERSIST_TAG: &str = "arima";
+
+impl<F> SaveModel for Arima<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// Five short `f64` vectors and eleven scalars — the smallest model file
+    /// mlrs writes, since ARIMA holds no matrix bigger than the Kalman state
+    /// covariance.
+    ///
+    /// `final_state_` and `final_cov_` are what make this file a RESUMPTION
+    /// point rather than a description: `forecast` continues the Kalman
+    /// recursion from exactly there, so a file that stored only the
+    /// coefficients would load, report every information criterion correctly,
+    /// and forecast from a zero state. See
+    /// [`ts_persist`](super::ts_persist) for the full rationale.
+    ///
+    /// `pool` is unused: every fitted quantity is a host `f64` vector, because
+    /// the Kalman pass and the Gaussian MLE both lose their conditioning at
+    /// `f32`. The parameter is present because [`SaveModel`] is one signature
+    /// for every estimator.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // The state covariance is square by construction — the Kalman filter's
+        // state dimension on both axes — so its shape is derived rather than
+        // stored, and `TensorRef::new` checks the derivation against the payload.
+        let state_dim = self.final_state_.len();
+        if state_dim * state_dim != self.final_cov_.len() {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "'final_state_' has {state_dim} entries so 'final_cov_' must have {}, \
+                     but it has {}",
+                    state_dim * state_dim,
+                    self.final_cov_.len()
+                ),
+            });
+        }
+
+        let mut w = TimeSeriesWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:p", self.p);
+        w.scalar_usize("param:d", self.d);
+        w.scalar_usize("param:q", self.q);
+        w.scalar_f64("sigma2_", self.sigma2_);
+        w.scalar_f64("loglik_", self.loglik_);
+        w.scalar_f64("aic_", self.aic_);
+        w.scalar_f64("aicc_", self.aicc_);
+        w.scalar_f64("bic_", self.bic_);
+        w.scalar_usize("nobs_", self.nobs_);
+        w.scalar_bool("converged_", self.converged_);
+
+        w.tensor("arparams_", TensorRef::f64s(&self.ar_, vec![self.ar_.len()])?);
+        w.tensor("maparams_", TensorRef::f64s(&self.ma_, vec![self.ma_.len()])?);
+        w.tensor(
+            "diff_last_",
+            TensorRef::f64s(&self.diff_last_, vec![self.diff_last_.len()])?,
+        );
+        w.tensor(
+            "final_state_",
+            TensorRef::f64s(&self.final_state_, vec![state_dim])?,
+        );
+        w.tensor(
+            "final_cov_",
+            TensorRef::f64s(&self.final_cov_, vec![state_dim, state_dim])?,
+        );
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for Arima<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the model back from `path`.
+    ///
+    /// The three order scalars are the schema, and each is CROSS-CHECKED against
+    /// the array it sizes: `arparams_` must hold `p` entries, `maparams_` `q`,
+    /// and `diff_last_` `d`. The file is untrusted input (T-04-01-01), and
+    /// `forecast` indexes the coefficient blocks by lag without a bound of its
+    /// own, so a short array would read past its end on the first horizon step.
+    ///
+    /// An EMPTY `arparams_` or `maparams_` is accepted: `p = 0` and `q = 0` are
+    /// ordinary ARIMA orders, so zero-length is a legitimate value rather than a
+    /// malformed tensor.
+    fn load(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<Arima<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = TimeSeriesFile::parse(&raw, PERSIST_TAG)?;
+
+        let p = file.scalar_usize("param:p")?;
+        let d = file.scalar_usize("param:d")?;
+        let q = file.scalar_usize("param:q")?;
+
+        let ar_ = read_f64_vec(&file, "arparams_", p)?;
+        let ma_ = read_f64_vec(&file, "maparams_", q)?;
+        let diff_last_ = read_f64_vec(&file, "diff_last_", d)?;
+
+        // The state covariance's squareness is the one geometry rule the order
+        // scalars do not imply, so it is read off `final_state_` and checked.
+        let state_v = file.tensor("final_state_")?;
+        let state_dim = shape_1d(&state_v, "final_state_")?;
+        let final_state_ = as_f64(&state_v, "final_state_")?.into_owned();
+
+        let cov_v = file.tensor("final_cov_")?;
+        let (rows, cols) = shape_2d(&cov_v, "final_cov_")?;
+        if rows != state_dim || cols != state_dim {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor 'final_cov_' declares shape [{rows}, {cols}], but 'final_state_' \
+                     implies [{state_dim}, {state_dim}]"
+                ),
+            });
+        }
+        let final_cov_ = as_f64(&cov_v, "final_cov_")?.into_owned();
+
+        Ok(Arima {
+            p,
+            d,
+            q,
+            ar_,
+            ma_,
+            sigma2_: file.scalar_f64("sigma2_")?,
+            loglik_: file.scalar_f64("loglik_")?,
+            aic_: file.scalar_f64("aic_")?,
+            aicc_: file.scalar_f64("aicc_")?,
+            bic_: file.scalar_f64("bic_")?,
+            nobs_: file.scalar_usize("nobs_")?,
+            converged_: file.scalar_bool("converged_")?,
+            diff_last_,
+            final_state_,
+            final_cov_,
+            _float: PhantomData,
+            _state: PhantomData,
+        })
+    }
+}
 
 /// The `(p, d, q)` component bound (keeps the Kalman state dimension and the
 /// differencing pass tractable — a documented mlrs v1 scope cap, not a
