@@ -136,6 +136,7 @@
 //! per AGENTS.md §2 — never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -150,8 +151,26 @@ use mlrs_backend::prims::kmeans::{
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::cluster_persist::{
+    as_f64, read_labels, shape_2d, widen_labels, write_labels, AlignedBytes, ClusterFile,
+    ClusterWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, Unfit};
+
+/// The `estimator` discriminator written into every `KMeans` file.
+const PERSIST_TAG: &str = "kmeans";
+
+/// The tensor holding the centroid matrix, row-major
+/// `[n_clusters, n_features]` — sklearn's `cluster_centers_`.
+const CENTERS_NAME: &str = "cluster_centers_";
+
+/// The tensor holding an EXPLICIT `init` array, when the model was built with
+/// one. Under [`PARAM_PREFIX`](super::cluster_persist::PARAM_PREFIX) because it
+/// is a constructor argument, not a fitted attribute — the fitted centroids it
+/// seeded are `cluster_centers_`, and the two are different arrays of the same
+/// shape.
+const INIT_ARRAY_NAME: &str = "param:init_array";
 
 /// sklearn's default `max_iter` for `KMeans` (Pitfall 6).
 const DEFAULT_MAX_ITER: usize = 300;
@@ -1130,6 +1149,199 @@ where
         inertia,
         n_iter: iters_run,
     })
+}
+
+impl<F> SaveModel for KMeans<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted clustering to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `cluster_centers_` | `F` (`F32`/`F64`) | `[n_clusters, n_features]` |
+    /// | `labels_` | `I64` | `[n_samples]` |
+    /// | `param:init_array` | `F64` | `[n_clusters, n_features]`, only for an explicit `init` |
+    /// | `inertia_` / `n_iter_` | `__metadata__` scalar | — |
+    /// | nine `param:*` scalars | `__metadata__` | — |
+    ///
+    /// `KMeans` is the one member of this family that GENERALIZES —
+    /// `cluster_centers_` labels a row it never saw — so its file is a model in
+    /// the ordinary sense, and `labels_` rides alongside as the fitted attribute
+    /// sklearn exposes rather than as the whole of the output.
+    ///
+    /// An explicit `init` array is stored at `F64` rather than `F`: the
+    /// estimator holds it as `KMeansInit<F>` but the builder takes `f64`, and it
+    /// is a constructor argument that a reload must return verbatim rather than
+    /// a fitted quantity whose width follows the model's.
+    ///
+    /// `inertia_` and `n_iter_` are FITTED diagnostics, so they carry no
+    /// `param:` prefix. Neither is recoverable from the centroids without the
+    /// training data, which this file does not hold.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `ClusterWriter` borrows every payload so it
+        // can stream them out without a second copy.
+        let centers = self
+            .cluster_centers_
+            .as_ref()
+            .ok_or_else(|| absent("cluster_centers_"))?
+            .to_host(pool);
+        let labels_i32 = self
+            .labels_
+            .as_ref()
+            .ok_or_else(|| absent("labels_"))?
+            .to_host(pool);
+        let labels = widen_labels(&labels_i32);
+        let init_array: Option<Vec<f64>> = match &self.init {
+            KMeansInit::Array(a) => Some(a.iter().map(|&v| host_to_f64(v)).collect()),
+            _ => None,
+        };
+
+        let mut w = ClusterWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_clusters", self.n_clusters);
+        w.scalar_usize("param:max_iter", self.max_iter);
+        w.scalar_f64("param:tol", self.tol);
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_str("param:init", self.init.name());
+        w.scalar_str("param:algorithm", self.algorithm.name());
+        w.scalar_bool("param:verbose", self.verbose);
+        w.scalar_bool("param:copy_x", self.copy_x);
+        match self.n_init {
+            NInit::Auto => w.scalar_str("param:n_init", "auto"),
+            NInit::Fixed(v) => w.scalar_usize("param:n_init", v),
+        }
+        w.scalar_f64("inertia_", host_to_f64(self.inertia_.ok_or_else(|| absent("inertia_"))?));
+        w.scalar_opt_usize("n_iter_", self.n_iter_);
+
+        w.tensor(
+            CENTERS_NAME,
+            TensorRef::floats(&centers, vec![self.n_clusters, self.n_features_])?,
+        );
+        write_labels(&mut w, &labels)?;
+        if let Some(a) = init_array.as_ref() {
+            w.tensor(
+                INIT_ARRAY_NAME,
+                TensorRef::f64s(a, vec![self.n_clusters, self.n_features_])?,
+            );
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for KMeans<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the clustering back from `path`, re-uploading the centroids and the
+    /// label vector to `pool`.
+    ///
+    /// `n_clusters` and `n_features_` are recovered from `cluster_centers_`'s
+    /// shape, and the `param:n_clusters` scalar is cross-checked against the row
+    /// extent rather than trusted: both are individually well-formed, so only
+    /// the cross-check catches a header where one was edited without the other,
+    /// and `predict_labels` indexes the centroid table by the argmax column.
+    ///
+    /// The `init` string and the `param:init_array` tensor must AGREE — an
+    /// `'array'` init with no array, or an array with a non-`'array'` init, is a
+    /// file whose two halves describe different models.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<KMeans<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ClusterFile::parse(&raw, PERSIST_TAG)?;
+
+        let centers_v = file.tensor(CENTERS_NAME)?;
+        let (n_clusters, n_features) = shape_2d(&centers_v, CENTERS_NAME)?;
+        if n_clusters == 0 || n_features == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{CENTERS_NAME}' declares shape [{n_clusters}, {n_features}]; \
+                     a fitted KMeans has at least one cluster over at least one feature"
+                ),
+            });
+        }
+        if file.scalar_usize("param:n_clusters")? != n_clusters {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "'param:n_clusters' is {}, but '{CENTERS_NAME}' declares {n_clusters} \
+                     centroid rows",
+                    file.scalar_usize("param:n_clusters")?
+                ),
+            });
+        }
+        let centers = super::cluster_persist::as_floats::<F>(&centers_v, CENTERS_NAME)?;
+        let labels = read_labels(&file)?;
+
+        // The `init` string and the array tensor are two halves of one field, so
+        // they are reconciled here rather than read independently.
+        let init_name = file.scalar_str("param:init")?;
+        let init_tensor = file.tensor_opt(INIT_ARRAY_NAME);
+        let init = match (init_name, init_tensor) {
+            ("k-means++", None) => KMeansInit::KMeansPlusPlus,
+            ("random", None) => KMeansInit::Random,
+            ("array", Some(view)) => {
+                let (rows, cols) = shape_2d(&view, INIT_ARRAY_NAME)?;
+                if rows != n_clusters || cols != n_features {
+                    return Err(PersistError::InconsistentGeometry {
+                        reason: format!(
+                            "tensor '{INIT_ARRAY_NAME}' declares shape [{rows}, {cols}], but \
+                             '{CENTERS_NAME}' implies [{n_clusters}, {n_features}]"
+                        ),
+                    });
+                }
+                KMeansInit::Array(
+                    as_f64(&view, INIT_ARRAY_NAME)?
+                        .iter()
+                        .map(|&v| f64_to_host::<F>(v))
+                        .collect(),
+                )
+            }
+            (name, tensor) => {
+                return Err(PersistError::InconsistentGeometry {
+                    reason: format!(
+                        "'param:init' is '{name}' but the '{INIT_ARRAY_NAME}' tensor is {}",
+                        if tensor.is_some() { "present" } else { "absent" }
+                    ),
+                })
+            }
+        };
+
+        let n_init = match file.scalar_str("param:n_init")? {
+            "auto" => NInit::Auto,
+            other => NInit::Fixed(other.parse::<usize>().map_err(|_| {
+                PersistError::BadMetadata {
+                    key: "param:n_init",
+                }
+            })?),
+        };
+        let algorithm = KMeansAlgorithm::try_from(file.scalar_str("param:algorithm")?)
+            .map_err(|_| PersistError::BadMetadata {
+                key: "param:algorithm",
+            })?;
+
+        Ok(KMeans {
+            n_clusters,
+            max_iter: file.scalar_usize("param:max_iter")?,
+            tol: file.scalar_f64("param:tol")?,
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            init,
+            n_init,
+            algorithm,
+            verbose: file.scalar_bool("param:verbose")?,
+            copy_x: file.scalar_bool("param:copy_x")?,
+            cluster_centers_: Some(DeviceArray::from_host(pool, &centers)),
+            labels_: Some(DeviceArray::from_host(pool, &labels)),
+            inertia_: Some(f64_to_host::<F>(file.scalar_f64("inertia_")?)),
+            n_iter_: file.scalar_opt_usize("n_iter_")?,
+            n_features_: n_features,
+            _state: PhantomData,
+        })
+    }
 }
 
 impl<F> Fit<F> for KMeans<F, Unfit>

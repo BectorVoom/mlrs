@@ -93,6 +93,7 @@
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -104,8 +105,15 @@ use mlrs_core::{f64_to_host, host_to_f64};
 
 use crate::cluster::spectral_embedding::EIGEN_SOLVERS;
 use crate::cluster::spectral_host::{self, AssignLabels, Csr, HostAffinity, SpectralPlan};
+use crate::cluster::cluster_persist::{
+    read_affinity, read_labels, widen_labels, write_labels, AffinityStaging, AlignedBytes,
+    ClusterFile, ClusterWriter, LoadModel, PersistError, SaveModel,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{Fit, Fitted, Unfit};
+
+/// The `estimator` discriminator written into every `SpectralClustering` file.
+const PERSIST_TAG: &str = "spectral_clustering";
 
 /// Spectral clustering (SPECTRAL-02): the spectral embedding of an affinity
 /// graph, discretized into `n_clusters` labels.
@@ -735,6 +743,151 @@ where
     /// binding layer to act on instead.
     pub fn verbose(&self) -> bool {
         self.verbose
+    }
+}
+
+impl<F> SaveModel for SpectralClustering<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted clustering to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `labels_` | `I64` | `[n_samples]` |
+    /// | the affinity graph | `F64` (+ `U64` indices) | see [`AffinityStaging`] |
+    /// | `n_graph_components_` / `n_features_in_` | `__metadata__` scalar | — |
+    /// | fourteen `param:*` scalars | `__metadata__` | — |
+    ///
+    /// The affinity graph is the substantial part of this file and is stored in
+    /// WHICHEVER layout the fit produced — dense for a kernel affinity, CSR for
+    /// a neighborhood graph. Those are different models of the same data, not
+    /// two encodings of one, so the layout round-trips alongside the values;
+    /// [`AffinityStaging::write_into`] carries the reasoning.
+    ///
+    /// `n_graph_components_` is a fitted attribute worth storing rather than
+    /// recomputing: it is the connected-component count of the affinity graph,
+    /// and while it IS derivable from the stored graph, re-deriving it means a
+    /// union-find sweep over every edge on a load path that is otherwise one
+    /// sequential read. It is also the diagnostic that explains a degenerate
+    /// embedding, so a reload that silently recomputed it could disagree with
+    /// what the fit reported.
+    ///
+    /// `pool` is unused: this estimator keeps a host mirror of its labels
+    /// (`labels_host_`) precisely so the accessor path needs no readback, and
+    /// `save` reads that. The parameter is present because [`SaveModel`] is one
+    /// signature for every estimator.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let affinity = self
+            .affinity_matrix_
+            .as_ref()
+            .ok_or_else(|| absent("affinity_matrix_"))?;
+        // Bound BEFORE the writer, which borrows every payload. `AffinityStaging`
+        // exists for exactly this: the CSR index arrays widen `u32 → u64`, and
+        // the widened copies must outlive the writer.
+        let labels = widen_labels(
+            self.labels_host_
+                .as_ref()
+                .ok_or_else(|| absent("labels_"))?,
+        );
+        let staging = AffinityStaging::prepare(affinity);
+
+        let mut w = ClusterWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_clusters", self.n_clusters);
+        w.scalar_str("param:eigen_solver", self.eigen_solver.as_deref().unwrap_or("auto"));
+        w.scalar_opt_usize("param:n_components", self.n_components);
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_usize("param:n_init", self.n_init);
+        w.scalar_f64("param:gamma", host_to_f64(self.gamma));
+        w.scalar_str("param:affinity", &self.affinity);
+        w.scalar_usize("param:n_neighbors", self.n_neighbors);
+        w.scalar_opt_f64("param:eigen_tol", self.eigen_tol);
+        w.scalar_str("param:assign_labels", &self.assign_labels);
+        w.scalar_f64("param:degree", self.degree);
+        w.scalar_f64("param:coef0", self.coef0);
+        w.scalar_bool("param:verbose", self.verbose);
+        if let Some(j) = self.n_jobs {
+            w.scalar_str("param:n_jobs", &j.to_string());
+        }
+        w.scalar_usize("n_graph_components_", self.n_graph_components_);
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+
+        write_labels(&mut w, &labels)?;
+        staging.write_into(&mut w, affinity, self.n_samples_)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for SpectralClustering<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the clustering back from `path`, re-uploading the label vector to
+    /// `pool`.
+    ///
+    /// The affinity graph's every CSR invariant is validated by
+    /// [`read_affinity`] against the sample count `labels_` establishes — the
+    /// file is untrusted input (T-04-01-01), and a malformed `indptr` would
+    /// index out of bounds inside the Lanczos matvec rather than report a bad
+    /// file.
+    ///
+    /// `labels_host_` is repopulated alongside the device copy, because it is
+    /// not a memo here: the accessor reads it directly, so a load that left it
+    /// `None` would produce a model whose labels are unreachable without a
+    /// readback the estimator is built to avoid.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<SpectralClustering<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ClusterFile::parse(&raw, PERSIST_TAG)?;
+        let labels = read_labels(&file)?;
+        let n_samples = labels.len();
+        let affinity = read_affinity(&file, n_samples)?;
+
+        // `n_jobs` is `Option<i64>` and rides as a string, so absence is a
+        // meaningful `None` (sklearn's "unset") rather than a sentinel.
+        let n_jobs = match file.metadata().get("param:n_jobs") {
+            None => None,
+            Some(s) => Some(s.parse::<i64>().map_err(|_| PersistError::BadMetadata {
+                key: "param:n_jobs",
+            })?),
+        };
+        // `eigen_solver` is `Option<String>` whose `None` MEANS "auto"; the
+        // string is written unconditionally, so `"auto"` reads back as `None`
+        // and every other value as itself.
+        let eigen_solver = match file.scalar_str("param:eigen_solver")? {
+            "auto" => None,
+            other => Some(other.to_string()),
+        };
+
+        Ok(SpectralClustering {
+            n_clusters: file.scalar_usize("param:n_clusters")?,
+            eigen_solver,
+            n_components: file.scalar_opt_usize("param:n_components")?,
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            n_init: file.scalar_usize("param:n_init")?,
+            gamma: f64_to_host::<F>(file.scalar_f64("param:gamma")?),
+            affinity: file.scalar_str("param:affinity")?.to_string(),
+            n_neighbors: file.scalar_usize("param:n_neighbors")?,
+            eigen_tol: file.scalar_opt_f64("param:eigen_tol")?,
+            assign_labels: file.scalar_str("param:assign_labels")?.to_string(),
+            degree: file.scalar_f64("param:degree")?,
+            coef0: file.scalar_f64("param:coef0")?,
+            n_jobs,
+            verbose: file.scalar_bool("param:verbose")?,
+            labels_: Some(DeviceArray::from_host(pool, &labels)),
+            labels_host_: Some(labels),
+            affinity_matrix_: Some(affinity),
+            n_graph_components_: file.scalar_usize("n_graph_components_")?,
+            n_features_in_: file.scalar_usize("n_features_in_")?,
+            n_samples_: n_samples,
+            _state: PhantomData,
+        })
     }
 }
 

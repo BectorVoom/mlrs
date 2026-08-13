@@ -61,6 +61,7 @@
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -71,8 +72,19 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64};
 
 use crate::cluster::spectral_host::{self, Csr, HostAffinity, SpectralPlan};
+use crate::cluster::cluster_persist::{
+    as_floats, read_affinity, shape_2d, AffinityStaging, AlignedBytes, ClusterFile, ClusterWriter,
+    LoadModel, PersistError, SaveModel, TensorRef,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{Fit, Fitted, Unfit};
+
+/// The `estimator` discriminator written into every `SpectralEmbedding` file.
+const PERSIST_TAG: &str = "spectral_embedding";
+
+/// The tensor holding the embedding, row-major
+/// `[n_samples, n_components]` — sklearn's `embedding_`.
+const EMBEDDING_NAME: &str = "embedding_";
 
 /// The `eigen_solver` values sklearn accepts alongside `None`.
 pub(crate) const EIGEN_SOLVERS: [&str; 3] = ["arpack", "lobpcg", "amg"];
@@ -479,6 +491,138 @@ where
     /// Number of training samples (the `embedding_` row count).
     pub fn n_samples(&self) -> usize {
         self.n_samples_
+    }
+}
+
+impl<F> SaveModel for SpectralEmbedding<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted embedding to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `embedding_` | `F` (`F32`/`F64`) | `[n_samples, n_components]` |
+    /// | the affinity graph | `F64` (+ `U64` indices) | see [`AffinityStaging`] |
+    /// | `n_neighbors_` / `gamma_` / `n_graph_components_` / `n_features_in_` | `__metadata__` scalar | — |
+    /// | eight `param:*` scalars | `__metadata__` | — |
+    ///
+    /// This is the one member of the cluster family with no `labels_` — it
+    /// produces coordinates, not an assignment — which is why its file omits the
+    /// tensor every sibling writes. That absence is also what the `estimator`
+    /// discriminator protects: a `SpectralClustering` file carries the same
+    /// affinity graph under the same names, and only the tag separates a
+    /// clustering from an embedding of the same data.
+    ///
+    /// `n_neighbors_` and `gamma_` are the RESOLVED values (both `Option`), kept
+    /// distinct from the `param:` requests they came from: sklearn's
+    /// `n_neighbors=None` resolves to `n_samples / 10` and `gamma=None` to
+    /// `1/n_features`, so the request and the outcome are different facts —
+    /// the same split [`kernel_persist`](crate::kernel_persist) makes for the
+    /// kernel coefficient, and for the same reason.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let affinity = self
+            .affinity_matrix_
+            .as_ref()
+            .ok_or_else(|| absent("affinity_matrix_"))?;
+        // Bound BEFORE the writer, which borrows every payload.
+        let embedding = self
+            .embedding_
+            .as_ref()
+            .ok_or_else(|| absent("embedding_"))?
+            .to_host(pool);
+        let staging = AffinityStaging::prepare(affinity);
+
+        let mut w = ClusterWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_components", self.n_components);
+        w.scalar_str("param:affinity", &self.affinity);
+        w.scalar_opt_f64("param:gamma", self.gamma.map(host_to_f64));
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_str("param:eigen_solver", self.eigen_solver.as_deref().unwrap_or("auto"));
+        w.scalar_opt_f64("param:eigen_tol", self.eigen_tol);
+        w.scalar_opt_usize("param:n_neighbors", self.n_neighbors);
+        if let Some(j) = self.n_jobs {
+            w.scalar_str("param:n_jobs", &j.to_string());
+        }
+        w.scalar_opt_usize("n_neighbors_", self.n_neighbors_);
+        w.scalar_opt_f64("gamma_", self.gamma_);
+        w.scalar_usize("n_graph_components_", self.n_graph_components_);
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+
+        w.tensor(
+            EMBEDDING_NAME,
+            TensorRef::floats(&embedding, vec![self.n_samples_, self.n_components])?,
+        );
+        staging.write_into(&mut w, affinity, self.n_samples_)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for SpectralEmbedding<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the embedding back from `path`, re-uploading `embedding_` to
+    /// `pool`.
+    ///
+    /// `n_samples` comes off `embedding_`'s row extent here rather than off a
+    /// `labels_` this estimator does not have, and the affinity graph is then
+    /// validated against it — so a file whose graph and embedding describe
+    /// different sample counts is rejected rather than producing a model whose
+    /// two halves disagree.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<SpectralEmbedding<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ClusterFile::parse(&raw, PERSIST_TAG)?;
+
+        let emb_v = file.tensor(EMBEDDING_NAME)?;
+        let (n_samples, n_components) = shape_2d(&emb_v, EMBEDDING_NAME)?;
+        if n_samples == 0 || n_components == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{EMBEDDING_NAME}' declares shape [{n_samples}, {n_components}]; \
+                     a fitted embedding has at least one sample and one component"
+                ),
+            });
+        }
+        let embedding = as_floats::<F>(&emb_v, EMBEDDING_NAME)?;
+        let affinity = read_affinity(&file, n_samples)?;
+
+        let n_jobs = match file.metadata().get("param:n_jobs") {
+            None => None,
+            Some(s) => Some(s.parse::<i64>().map_err(|_| PersistError::BadMetadata {
+                key: "param:n_jobs",
+            })?),
+        };
+        let eigen_solver = match file.scalar_str("param:eigen_solver")? {
+            "auto" => None,
+            other => Some(other.to_string()),
+        };
+
+        Ok(SpectralEmbedding {
+            n_components: file.scalar_usize("param:n_components")?,
+            affinity: file.scalar_str("param:affinity")?.to_string(),
+            gamma: file.scalar_opt_f64("param:gamma")?.map(f64_to_host::<F>),
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            eigen_solver,
+            eigen_tol: file.scalar_opt_f64("param:eigen_tol")?,
+            n_neighbors: file.scalar_opt_usize("param:n_neighbors")?,
+            n_jobs,
+            embedding_: Some(DeviceArray::from_host(pool, &embedding)),
+            affinity_matrix_: Some(affinity),
+            n_neighbors_: file.scalar_opt_usize("n_neighbors_")?,
+            gamma_: file.scalar_opt_f64("gamma_")?,
+            n_graph_components_: file.scalar_usize("n_graph_components_")?,
+            n_features_in_: file.scalar_usize("n_features_in_")?,
+            n_samples_: n_samples,
+            _state: PhantomData,
+        })
     }
 }
 

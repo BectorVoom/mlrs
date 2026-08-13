@@ -31,6 +31,7 @@
 //! [`Transform`]: crate::typestate::Transform
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -42,8 +43,42 @@ use mlrs_backend::prims::mutual_reachability::mutual_reachability_device;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::cluster_persist::{
+    as_f64, expect_len, read_labels, read_opt_floats, shape_2d, widen_labels, write_labels,
+    AlignedBytes, ClusterFile, ClusterWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
+
+/// The `estimator` discriminator written into every `Hdbscan` file.
+const PERSIST_TAG: &str = "hdbscan";
+
+/// The tensor holding per-point membership strengths, `[n_samples]`.
+const PROBABILITIES_NAME: &str = "probabilities_";
+/// The tensor holding cluster centroids, `[n_clusters, n_features]`.
+const CENTROIDS_NAME: &str = "centroids_";
+/// The tensor holding cluster medoids, `[n_clusters, n_features]`.
+const MEDOIDS_NAME: &str = "medoids_";
+
+/// The single-linkage hierarchy, `[n_samples - 1, 4]` — one row per merge,
+/// columns `[left, right, distance, size]`.
+///
+/// One `F64` tensor rather than four parallel arrays, and rather than the
+/// obvious `[left, right, size]` as `U64` beside a separate `F64` distance.
+/// scipy's linkage matrix is EXACTLY this `(n-1) × 4` float layout, so
+/// `safetensors.numpy.load_file(path)["single_linkage_"]` hands Python an array
+/// that `scipy.cluster.hierarchy.dendrogram` accepts directly — which is the
+/// whole naming contract of this format applied to the one attribute that has a
+/// widely-used external representation. The three integer columns are exact in
+/// `f64` for any `n_samples` this crate can address, so nothing is lost.
+const SINGLE_LINKAGE_NAME: &str = "single_linkage_";
+
+/// The `__metadata__` key naming which source the lazy GLOSH scores derive from
+/// — `"features"`, `"precomputed"`, or absent when the model carries neither.
+const GLOSH_SOURCE_KEY: &str = "glosh_source";
+/// The tensor holding the GLOSH source matrix: the `[n, p]` design under
+/// `"features"`, the raw `[n, n]` distance matrix under `"precomputed"`.
+const GLOSH_MATRIX_NAME: &str = "glosh_matrix";
 
 // Host back-end submodules (HDBS-02, plan 15-03). Pure scalar Rust — the
 // deliberate GPU-tree-atomics dodge (RESEARCH). `mst` holds both oracle Prim
@@ -250,6 +285,107 @@ impl Algorithm {
             Algorithm::Brute => "brute",
             Algorithm::KdTree => "kd_tree",
             Algorithm::BallTree => "ball_tree",
+        }
+    }
+
+    /// sklearn's spelling, for the model file. Public where [`Algorithm::as_str`]
+    /// is not, because a saved model has to name its own configuration; the two
+    /// deliberately share a body so the file and the diagnostics can never
+    /// disagree about what a variant is called.
+    pub fn name(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// The inverse of [`Algorithm::name`]; `None` for an unrecognised string.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(Algorithm::Auto),
+            "brute" => Some(Algorithm::Brute),
+            "kd_tree" => Some(Algorithm::KdTree),
+            "ball_tree" => Some(Algorithm::BallTree),
+            _ => None,
+        }
+    }
+}
+
+impl ClusterSelectionMethod {
+    /// sklearn's spelling (`'eom'` / `'leaf'`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ClusterSelectionMethod::Eom => "eom",
+            ClusterSelectionMethod::Leaf => "leaf",
+        }
+    }
+
+    /// The inverse of [`ClusterSelectionMethod::name`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "eom" => Some(ClusterSelectionMethod::Eom),
+            "leaf" => Some(ClusterSelectionMethod::Leaf),
+            _ => None,
+        }
+    }
+}
+
+impl StoreCenters {
+    /// sklearn's spelling (`'centroid'` / `'medoid'` / `'both'`).
+    pub fn name(self) -> &'static str {
+        match self {
+            StoreCenters::Centroid => "centroid",
+            StoreCenters::Medoid => "medoid",
+            StoreCenters::Both => "both",
+        }
+    }
+
+    /// The inverse of [`StoreCenters::name`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "centroid" => Some(StoreCenters::Centroid),
+            "medoid" => Some(StoreCenters::Medoid),
+            "both" => Some(StoreCenters::Both),
+            _ => None,
+        }
+    }
+}
+
+impl Metric {
+    /// The sklearn metric name.
+    ///
+    /// LOSSY for [`Metric::Minkowski`], whose exponent rides separately — the
+    /// same split sklearn itself makes between `metric` and `p`, and the same one
+    /// [`knn_graph::Metric`](mlrs_backend::prims::knn_graph::Metric) uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Metric::Euclidean => "euclidean",
+            Metric::Manhattan => "manhattan",
+            Metric::Cosine => "cosine",
+            Metric::Chebyshev => "chebyshev",
+            Metric::Minkowski { .. } => "minkowski",
+            Metric::Precomputed => "precomputed",
+        }
+    }
+
+    /// The Minkowski exponent, or `None` for every other variant.
+    pub fn p(self) -> Option<f64> {
+        match self {
+            Metric::Minkowski { p } => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Rebuild a metric from the `(name, p)` pair. `'minkowski'` without a `p` is
+    /// REJECTED rather than defaulted to 2: a silent `p = 2` is Euclidean, so a
+    /// file that lost its exponent would load as a different metric and every
+    /// distance it computed would be wrong with nothing to signal it.
+    pub fn from_name(name: &str, p: Option<f64>) -> Option<Self> {
+        match name {
+            "euclidean" => Some(Metric::Euclidean),
+            "manhattan" => Some(Metric::Manhattan),
+            "cosine" => Some(Metric::Cosine),
+            "chebyshev" => Some(Metric::Chebyshev),
+            "precomputed" => Some(Metric::Precomputed),
+            "minkowski" => p.map(|p| Metric::Minkowski { p }),
+            _ => None,
         }
     }
 }
@@ -708,6 +844,358 @@ impl HdbscanBuilder {
             medoids_: None,
             single_linkage_: None,
             n_features_in_: 0,
+            _float: PhantomData,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SaveModel for Hdbscan<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted clustering to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `labels_` | `I64` | `[n_samples]` |
+    /// | `probabilities_` | `F` | `[n_samples]`, optional |
+    /// | `centroids_` / `medoids_` | `F` | `[n_clusters, n_features]`, optional |
+    /// | `single_linkage_` | `F64` | `[n_samples - 1, 4]`, optional |
+    /// | `glosh_matrix` | `F64` | see [`GLOSH_MATRIX_NAME`], optional |
+    /// | `n_features_in_` / `glosh_source` | `__metadata__` scalar | — |
+    /// | twelve `param:*` scalars | `__metadata__` | — |
+    ///
+    /// This is the largest and most conditional file in the cluster family, and
+    /// every optional tensor is optional for a reason the model itself carries:
+    /// `centroids_`/`medoids_` exist only for the matching `store_centers`,
+    /// `probabilities_` only for the paths that compute them, and the GLOSH
+    /// source only when the fit retained one.
+    ///
+    /// ## The GLOSH source is stored, and it is the expensive part
+    ///
+    /// `outlier_scores_` is computed LAZILY from a retained copy of either the
+    /// design matrix or the raw distance matrix ([`GloshSource`]) — the whole
+    /// point of that design being that callers who never ask do not pay. Writing
+    /// it makes this file `O(n · p)` or `O(n²)` rather than `O(n)`, which is by
+    /// far the dominant term.
+    ///
+    /// It is stored anyway, because the alternative is worse in a way that is
+    /// hard to see: a reloaded model that dropped it would still label, still
+    /// report probabilities, and would return `None` from `outlier_scores` —
+    /// silently losing an attribute the saved model had, with no error anywhere.
+    /// A model file that cannot answer what the model answered is not a
+    /// round-trip. Callers who want the small file can fit with
+    /// `metric=Precomputed` on a smaller matrix, or drop the attribute
+    /// deliberately rather than by accident.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `ClusterWriter` borrows every payload so it
+        // can stream them out without a second copy.
+        let labels_i32 = self
+            .labels_
+            .as_ref()
+            .ok_or_else(|| absent("labels_"))?
+            .to_host(pool);
+        let labels = widen_labels(&labels_i32);
+        let n_samples = labels.len();
+        let probabilities = self.probabilities_.as_ref().map(|d| d.to_host(pool));
+        let centroids = self.centroids_.as_ref().map(|d| d.to_host(pool));
+        let medoids = self.medoids_.as_ref().map(|d| d.to_host(pool));
+
+        // scipy's `(n-1) × 4` linkage layout, flattened.
+        let linkage: Option<Vec<f64>> = self.single_linkage_.as_ref().map(|edges| {
+            edges
+                .iter()
+                .flat_map(|e| {
+                    [
+                        e.left as f64,
+                        e.right as f64,
+                        e.distance,
+                        e.size as f64,
+                    ]
+                })
+                .collect()
+        });
+
+        let mut w = ClusterWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:min_cluster_size", self.min_cluster_size);
+        w.scalar_opt_usize("param:min_samples", self.min_samples);
+        w.scalar_f64(
+            "param:cluster_selection_epsilon",
+            self.cluster_selection_epsilon,
+        );
+        w.scalar_str(
+            "param:cluster_selection_method",
+            self.cluster_selection_method.name(),
+        );
+        w.scalar_str("param:metric", self.metric.name());
+        w.scalar_opt_f64("param:p", self.metric.p());
+        w.scalar_f64("param:alpha", self.alpha);
+        w.scalar_usize("param:max_cluster_size", self.max_cluster_size);
+        if let Some(sc) = self.store_centers {
+            w.scalar_str("param:store_centers", sc.name());
+        }
+        w.scalar_bool("param:allow_single_cluster", self.allow_single_cluster);
+        w.scalar_str("param:algorithm", self.algorithm.name());
+        w.scalar_usize("param:leaf_size", self.leaf_size);
+        if let Some(j) = self.n_jobs {
+            w.scalar_str("param:n_jobs", &j.to_string());
+        }
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+
+        // The GLOSH source: a discriminator plus one matrix, whose SHAPE says
+        // which arm it is (`[n, p]` against `[n, n]`) but whose meaning does not
+        // follow from the shape when `p == n`, so the discriminator is explicit.
+        match self.glosh_.as_ref() {
+            None => {}
+            Some(GloshSource::Features { n, p, .. }) => {
+                w.scalar_str(GLOSH_SOURCE_KEY, "features");
+                w.scalar_usize("glosh_rows", *n);
+                w.scalar_usize("glosh_cols", *p);
+            }
+            Some(GloshSource::Precomputed { n, .. }) => {
+                w.scalar_str(GLOSH_SOURCE_KEY, "precomputed");
+                w.scalar_usize("glosh_rows", *n);
+                w.scalar_usize("glosh_cols", *n);
+            }
+        }
+
+        write_labels(&mut w, &labels)?;
+        if let Some(p) = probabilities.as_ref() {
+            expect_len(PROBABILITIES_NAME, p.len(), n_samples, "entries")?;
+            w.tensor(PROBABILITIES_NAME, TensorRef::floats(p, vec![n_samples])?);
+        }
+        for (name, values) in [
+            (CENTROIDS_NAME, centroids.as_ref()),
+            (MEDOIDS_NAME, medoids.as_ref()),
+        ] {
+            if let Some(v) = values {
+                let rows = v.len() / self.n_features_in_.max(1);
+                w.tensor(
+                    name,
+                    TensorRef::floats(v, vec![rows, self.n_features_in_])?,
+                );
+            }
+        }
+        if let Some(l) = linkage.as_ref() {
+            w.tensor(
+                SINGLE_LINKAGE_NAME,
+                TensorRef::f64s(l, vec![l.len() / 4, 4])?,
+            );
+        }
+        match self.glosh_.as_ref() {
+            None => {}
+            Some(GloshSource::Features { x, n, p, .. }) => {
+                w.tensor(GLOSH_MATRIX_NAME, TensorRef::f64s(x, vec![*n, *p])?);
+            }
+            Some(GloshSource::Precomputed { dist, n, .. }) => {
+                w.tensor(GLOSH_MATRIX_NAME, TensorRef::f64s(dist, vec![*n, *n])?);
+            }
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for Hdbscan<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the clustering back from `path`, re-uploading the device-resident
+    /// tensors to `pool`.
+    ///
+    /// Every optional tensor round-trips as key-presence, so a reloaded model
+    /// reports exactly the attributes the saved one did — including the `None`s.
+    /// The `outlier_scores_` memo is NOT restored: it is a
+    /// computed-on-first-access cache, not model state, and a freshly loaded
+    /// model refills it from the GLOSH source exactly as a freshly fitted one
+    /// does. That is what makes storing the source, rather than the scores,
+    /// the faithful choice — the scores are a function of it.
+    ///
+    /// The file is untrusted input (T-04-01-01), so the linkage tree's node ids
+    /// are bounds-checked against `2n - 1` (a binary merge tree over `n` leaves
+    /// has no node beyond that) and every optional tensor's length is measured
+    /// against the geometry `labels_` establishes.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<Hdbscan<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ClusterFile::parse(&raw, PERSIST_TAG)?;
+        let labels = read_labels(&file)?;
+        let n_samples = labels.len();
+        let n_features_in = file.scalar_usize("n_features_in_")?;
+
+        let probabilities = read_opt_floats::<F>(&file, PROBABILITIES_NAME, n_samples)?;
+
+        // The two center tables are `[n_clusters, n_features]`, and `n_clusters`
+        // is NOT otherwise stored — it comes off the row extent. The column
+        // extent is what must agree with the rest of the model.
+        let mut centers: Vec<Option<Vec<F>>> = Vec::with_capacity(2);
+        for name in [CENTROIDS_NAME, MEDOIDS_NAME] {
+            centers.push(match file.tensor_opt(name) {
+                None => None,
+                Some(view) => {
+                    let (_, cols) = shape_2d(&view, name)?;
+                    if cols != n_features_in {
+                        return Err(PersistError::InconsistentGeometry {
+                            reason: format!(
+                                "tensor '{name}' declares {cols} columns, but the model has \
+                                 {n_features_in} features"
+                            ),
+                        });
+                    }
+                    Some(
+                        super::cluster_persist::as_floats::<F>(&view, name)?.into_owned(),
+                    )
+                }
+            });
+        }
+        let medoids = centers.pop().expect("two entries were pushed");
+        let centroids = centers.pop().expect("two entries were pushed");
+
+        let single_linkage = match file.tensor_opt(SINGLE_LINKAGE_NAME) {
+            None => None,
+            Some(view) => {
+                let (rows, cols) = shape_2d(&view, SINGLE_LINKAGE_NAME)?;
+                if cols != 4 || rows != n_samples - 1 {
+                    return Err(PersistError::InconsistentGeometry {
+                        reason: format!(
+                            "tensor '{SINGLE_LINKAGE_NAME}' declares shape [{rows}, {cols}]; a \
+                             single-linkage hierarchy over {n_samples} points has [{}, 4]",
+                            n_samples - 1
+                        ),
+                    });
+                }
+                let flat = as_f64(&view, SINGLE_LINKAGE_NAME)?;
+                let max_node = (2 * n_samples - 1) as f64;
+                let mut edges = Vec::with_capacity(rows);
+                for row in flat.chunks_exact(4) {
+                    let (left, right, distance, size) = (row[0], row[1], row[2], row[3]);
+                    if !(0.0..max_node).contains(&left) || !(0.0..max_node).contains(&right) {
+                        return Err(PersistError::InconsistentGeometry {
+                            reason: format!(
+                                "tensor '{SINGLE_LINKAGE_NAME}' merges nodes ({left}, {right}), \
+                                 out of range for a hierarchy over {n_samples} points"
+                            ),
+                        });
+                    }
+                    edges.push(single_linkage::SingleLinkageEdge {
+                        left: left as usize,
+                        right: right as usize,
+                        distance,
+                        size: size as usize,
+                    });
+                }
+                Some(edges)
+            }
+        };
+
+        // The GLOSH source, if the saved model retained one.
+        let glosh = match file.metadata().get(GLOSH_SOURCE_KEY).map(String::as_str) {
+            None => None,
+            Some(kind) => {
+                let view = file.tensor(GLOSH_MATRIX_NAME)?;
+                let (rows, cols) = shape_2d(&view, GLOSH_MATRIX_NAME)?;
+                expect_len(GLOSH_MATRIX_NAME, rows, n_samples, "rows")?;
+                let matrix = as_f64(&view, GLOSH_MATRIX_NAME)?.into_owned();
+                let alpha = file.scalar_f64("param:alpha")?;
+                let metric = Metric::from_name(
+                    file.scalar_str("param:metric")?,
+                    file.scalar_opt_f64("param:p")?,
+                )
+                .ok_or(PersistError::BadMetadata {
+                    key: "param:metric",
+                })?;
+                match kind {
+                    "features" => Some(GloshSource::Features {
+                        x: matrix,
+                        n: rows,
+                        p: cols,
+                        metric,
+                        alpha,
+                    }),
+                    "precomputed" => {
+                        if cols != rows {
+                            return Err(PersistError::InconsistentGeometry {
+                                reason: format!(
+                                    "a precomputed GLOSH source must be square, but \
+                                     '{GLOSH_MATRIX_NAME}' declares [{rows}, {cols}]"
+                                ),
+                            });
+                        }
+                        Some(GloshSource::Precomputed {
+                            dist: matrix,
+                            n: rows,
+                            alpha,
+                        })
+                    }
+                    other => {
+                        return Err(PersistError::InconsistentGeometry {
+                            reason: format!(
+                                "'{GLOSH_SOURCE_KEY}' is '{other}'; the GLOSH source is either \
+                                 'features' or 'precomputed'"
+                            ),
+                        })
+                    }
+                }
+            }
+        };
+
+        let n_jobs = match file.metadata().get("param:n_jobs") {
+            None => None,
+            Some(s) => Some(s.parse::<i32>().map_err(|_| PersistError::BadMetadata {
+                key: "param:n_jobs",
+            })?),
+        };
+        let store_centers = match file.metadata().get("param:store_centers") {
+            None => None,
+            Some(s) => Some(StoreCenters::from_name(s).ok_or(PersistError::BadMetadata {
+                key: "param:store_centers",
+            })?),
+        };
+
+        Ok(Hdbscan {
+            min_cluster_size: file.scalar_usize("param:min_cluster_size")?,
+            min_samples: file.scalar_opt_usize("param:min_samples")?,
+            cluster_selection_epsilon: file.scalar_f64("param:cluster_selection_epsilon")?,
+            cluster_selection_method: ClusterSelectionMethod::from_name(
+                file.scalar_str("param:cluster_selection_method")?,
+            )
+            .ok_or(PersistError::BadMetadata {
+                key: "param:cluster_selection_method",
+            })?,
+            metric: Metric::from_name(
+                file.scalar_str("param:metric")?,
+                file.scalar_opt_f64("param:p")?,
+            )
+            .ok_or(PersistError::BadMetadata {
+                key: "param:metric",
+            })?,
+            alpha: file.scalar_f64("param:alpha")?,
+            max_cluster_size: file.scalar_usize("param:max_cluster_size")?,
+            store_centers,
+            allow_single_cluster: file.scalar_bool("param:allow_single_cluster")?,
+            algorithm: Algorithm::from_name(file.scalar_str("param:algorithm")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:algorithm",
+                },
+            )?,
+            leaf_size: file.scalar_usize("param:leaf_size")?,
+            n_jobs,
+            labels_: Some(DeviceArray::from_host(pool, &labels)),
+            probabilities_: probabilities.map(|p| DeviceArray::from_host(pool, &p)),
+            glosh_: glosh,
+            // A computed-on-first-access memo, not model state — refilled from
+            // the GLOSH source exactly as a freshly fitted model's is.
+            outlier_scores_: std::sync::OnceLock::new(),
+            centroids_: centroids.map(|c| DeviceArray::from_host(pool, &c)),
+            medoids_: medoids.map(|m| DeviceArray::from_host(pool, &m)),
+            single_linkage_: single_linkage,
+            n_features_in_: n_features_in,
             _float: PhantomData,
             _state: PhantomData,
         })

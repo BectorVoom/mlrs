@@ -42,6 +42,7 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -61,6 +62,12 @@ use mlrs_backend::runtime::ActiveRuntime;
 
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
+use super::mixture_persist::{
+    as_f64, as_i64, read_device_arm, read_mixture_params, read_opt_vec, shape_1d,
+    write_mixture_params, write_opt_vec, AlignedBytes, LoadModel, MixtureFile, MixtureWriter,
+    PersistError, SaveModel, TensorRef, FITTED_NAMES, LOWER_BOUNDS_NAME, TRAIN_LABELS_NAME,
+    WARM_NAMES,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{
     validate_geometry, Fit, Fitted, PredictLabels, PredictLogProba, PredictProba, ScoreSamples,
@@ -695,6 +702,254 @@ where
             means,
             covariances,
             precisions_cholesky,
+        })
+    }
+}
+
+/// The `estimator` discriminator written into every `GaussianMixture` file.
+///
+/// Load-bearing rather than decorative: a `BayesianGaussianMixture` file holds
+/// `means_` and `covariances_` of the same shapes and dtypes under the same
+/// names. Its density is parameterized by a POSTERIOR the frequentist mixture
+/// has no notion of, so a cross-load would produce a model that scores every
+/// sample differently with nothing structural to signal it.
+const PERSIST_TAG: &str = "gaussian_mixture";
+
+impl<F> SaveModel for GaussianMixture<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted mixture to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `weights_` | `F64` | `[n_components]` |
+    /// | `means_` | `F64` | `[n_components, n_features]` |
+    /// | `covariances_` / `precisions_cholesky_` | `F64` | flat, `param_len(k, d)` |
+    /// | `lower_bounds_` | `F64` | `[n_iter]` |
+    /// | `train_labels` | `I64` | `[n_samples]`, optional |
+    /// | `warm_*` | `F64` | the `warm_start` resumption block, optional |
+    /// | `param:weights_init` / `_means_init` / `_precisions_init` | `F64` | optional |
+    /// | `converged_` / `n_iter_` / `lower_bound_` / `device_` / … | `__metadata__` | — |
+    ///
+    /// Everything is `F64` regardless of the estimator's `F` — see
+    /// [`mixture_persist`](super::mixture_persist) for why that is a model
+    /// property here rather than a storage choice.
+    ///
+    /// `precisions_cholesky_` is stored alongside `covariances_` rather than
+    /// re-derived, and `lower_bounds_` is stored in full rather than reduced to
+    /// its last value: the trace is what a caller inspects to see whether the EM
+    /// loop plateaued or was cut off by `max_iter`, and it is not recoverable
+    /// from anything else in the file.
+    ///
+    /// `pool` is unused: the EM engine is host-resident on EVERY backend
+    /// (MIX-01), so there is nothing device-resident to read back. The parameter
+    /// is present because [`SaveModel`] is one signature for every estimator.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let params = self.params.as_ref().ok_or(PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field: "params",
+        })?;
+        // The training labels widen `i32 → i64`; bound BEFORE the writer, which
+        // borrows every payload.
+        let train_labels: Option<Vec<i64>> = self
+            .train_labels
+            .as_ref()
+            .map(|l| l.iter().map(|&v| i64::from(v)).collect());
+
+        let mut w = MixtureWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_components", self.n_components);
+        w.scalar_str("param:covariance_type", self.covariance_type.name());
+        w.scalar_f64("param:tol", self.tol);
+        w.scalar_f64("param:reg_covar", self.reg_covar);
+        w.scalar_usize("param:max_iter", self.max_iter);
+        w.scalar_usize("param:n_init", self.n_init);
+        w.scalar_str("param:init_params", self.init_params.name());
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_bool("param:warm_start", self.warm_start);
+        w.scalar_usize("param:verbose", self.verbose);
+        w.scalar_usize("param:verbose_interval", self.verbose_interval);
+        w.scalar_str("param:device", self.device.name());
+
+        w.scalar_bool("converged_", self.converged_);
+        w.scalar_usize("n_iter_", self.n_iter_);
+        w.scalar_f64("lower_bound_", self.lower_bound_);
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+        w.scalar_usize("n_samples_", self.n_samples_);
+        if let Some(arm) = self.device_ {
+            w.scalar_str("device_", arm);
+        }
+
+        write_mixture_params(
+            &mut w,
+            &FITTED_NAMES,
+            &params.weights,
+            &params.means,
+            &params.covariances,
+            &params.precisions_cholesky,
+            self.covariance_type,
+        )?;
+        // The `warm_start` resumption block, when the model carries one. Storing
+        // it is what makes a reloaded model a valid continuation rather than
+        // merely a scorer — the same distinction `IncrementalPCA` draws.
+        if let Some(warm) = self.warm.as_ref() {
+            write_mixture_params(
+                &mut w,
+                &WARM_NAMES,
+                &warm.weights,
+                &warm.means,
+                &warm.covariances,
+                &warm.precisions_cholesky,
+                self.covariance_type,
+            )?;
+        }
+        write_opt_vec(&mut w, "param:weights_init", self.weights_init.as_ref())?;
+        write_opt_vec(&mut w, "param:means_init", self.means_init.as_ref())?;
+        write_opt_vec(&mut w, "param:precisions_init", self.precisions_init.as_ref())?;
+        w.tensor(
+            LOWER_BOUNDS_NAME,
+            TensorRef::f64s(&self.lower_bounds_, vec![self.lower_bounds_.len()])?,
+        );
+        if let Some(l) = train_labels.as_ref() {
+            w.tensor(TRAIN_LABELS_NAME, TensorRef::i64s(l, vec![l.len()])?);
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for GaussianMixture<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the mixture back from `path`.
+    ///
+    /// `covariance_type` is read FIRST, because it determines the flat length
+    /// both parameter blocks must have — the file is untrusted input
+    /// (T-04-01-01), and a `tied` model whose `covariances_` is `full`-length
+    /// would otherwise index past the end of the shared matrix on the first
+    /// `score_samples`.
+    ///
+    /// `n_components` and `n_features_in_` are recovered from `weights_` and
+    /// `means_`, and the `param:n_components` scalar is cross-checked against
+    /// them rather than trusted.
+    fn load(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<GaussianMixture<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = MixtureFile::parse(&raw, PERSIST_TAG)?;
+
+        let covariance_type = CovarianceType::try_from(file.scalar_str("param:covariance_type")?)
+            .map_err(|_| PersistError::BadMetadata {
+            key: "param:covariance_type",
+        })?;
+        let fitted = read_mixture_params(&file, &FITTED_NAMES, covariance_type)?;
+        if file.scalar_usize("param:n_components")? != fitted.n_components {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "'param:n_components' is {}, but 'weights_' holds {} components",
+                    file.scalar_usize("param:n_components")?,
+                    fitted.n_components
+                ),
+            });
+        }
+
+        // The warm block is present only for a model saved mid-`warm_start`, and
+        // is read under the same geometry rules as the fitted one.
+        let warm = if file.tensor_opt(WARM_NAMES.weights).is_some() {
+            let w = read_mixture_params(&file, &WARM_NAMES, covariance_type)?;
+            if w.n_components != fitted.n_components || w.n_features != fitted.n_features {
+                return Err(PersistError::InconsistentGeometry {
+                    reason: format!(
+                        "the warm-start block is [{}, {}] but the fitted block is [{}, {}]",
+                        w.n_components, w.n_features, fitted.n_components, fitted.n_features
+                    ),
+                });
+            }
+            Some(MixtureParams {
+                weights: w.weights,
+                means: w.means,
+                covariances: w.covariances,
+                precisions_cholesky: w.precisions_cholesky,
+            })
+        } else {
+            None
+        };
+
+        let lower_bounds_v = file.tensor(LOWER_BOUNDS_NAME)?;
+        shape_1d(&lower_bounds_v, LOWER_BOUNDS_NAME)?;
+        let lower_bounds_ = as_f64(&lower_bounds_v, LOWER_BOUNDS_NAME)?.into_owned();
+
+        let n_samples_ = file.scalar_usize("n_samples_")?;
+        let train_labels = match file.tensor_opt(TRAIN_LABELS_NAME) {
+            None => None,
+            Some(view) => {
+                let len = shape_1d(&view, TRAIN_LABELS_NAME)?;
+                if len != n_samples_ {
+                    return Err(PersistError::InconsistentGeometry {
+                        reason: format!(
+                            "tensor '{TRAIN_LABELS_NAME}' holds {len} entries, but the model \
+                             was fitted on {n_samples_} samples"
+                        ),
+                    });
+                }
+                Some(
+                    as_i64(&view, TRAIN_LABELS_NAME)?
+                        .iter()
+                        .map(|&v| {
+                            i32::try_from(v).map_err(|_| PersistError::InconsistentGeometry {
+                                reason: format!(
+                                    "tensor '{TRAIN_LABELS_NAME}' holds the component id {v}, \
+                                     which does not fit an i32"
+                                ),
+                            })
+                        })
+                        .collect::<Result<Vec<i32>, _>>()?,
+                )
+            }
+        };
+
+        Ok(GaussianMixture {
+            n_components: fitted.n_components,
+            covariance_type,
+            tol: file.scalar_f64("param:tol")?,
+            reg_covar: file.scalar_f64("param:reg_covar")?,
+            max_iter: file.scalar_usize("param:max_iter")?,
+            n_init: file.scalar_usize("param:n_init")?,
+            init_params: InitParams::try_from(file.scalar_str("param:init_params")?).map_err(
+                |_| PersistError::BadMetadata {
+                    key: "param:init_params",
+                },
+            )?,
+            weights_init: read_opt_vec(&file, "param:weights_init")?,
+            means_init: read_opt_vec(&file, "param:means_init")?,
+            precisions_init: read_opt_vec(&file, "param:precisions_init")?,
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            warm_start: file.scalar_bool("param:warm_start")?,
+            verbose: file.scalar_usize("param:verbose")?,
+            verbose_interval: file.scalar_usize("param:verbose_interval")?,
+            warm,
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            params: Some(MixtureParams {
+                weights: fitted.weights,
+                means: fitted.means,
+                covariances: fitted.covariances,
+                precisions_cholesky: fitted.precisions_cholesky,
+            }),
+            device_: read_device_arm(&file, "device_")?,
+            converged_: file.scalar_bool("converged_")?,
+            n_iter_: file.scalar_usize("n_iter_")?,
+            lower_bound_: file.scalar_f64("lower_bound_")?,
+            lower_bounds_,
+            n_features_in_: file.scalar_usize("n_features_in_")?,
+            n_samples_,
+            train_labels,
+            _float: PhantomData,
+            _state: PhantomData,
         })
     }
 }

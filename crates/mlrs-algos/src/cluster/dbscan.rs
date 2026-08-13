@@ -48,6 +48,7 @@
 //! an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -57,8 +58,19 @@ use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::dbscan::eps_core_mask;
 use mlrs_backend::runtime::ActiveRuntime;
 
+use super::cluster_persist::{
+    as_i64, read_labels, shape_1d, widen_labels, write_labels, AlignedBytes, ClusterFile,
+    ClusterWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, Unfit};
+
+/// The `estimator` discriminator written into every `DBSCAN` file.
+const PERSIST_TAG: &str = "dbscan";
+
+/// The tensor holding the indices of the core samples, `[n_core]` — sklearn's
+/// `core_sample_indices_`.
+const CORE_INDICES_NAME: &str = "core_sample_indices_";
 
 /// Density-based spatial clustering (CLUSTER-02) via the device eps-core mask +
 /// the host index-ordered DFS.
@@ -258,6 +270,117 @@ where
         let labels = fitted.labels(pool);
         let labels_dev = DeviceArray::from_host(pool, &labels);
         Ok((fitted, labels_dev))
+    }
+}
+
+impl<F> SaveModel for DBSCAN<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted clustering to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `labels_` | `I64` | `[n_samples]` |
+    /// | `core_sample_indices_` | `I64` | `[n_core]` |
+    /// | `param:eps` / `param:min_samples` | `__metadata__` scalar | — |
+    ///
+    /// `DBSCAN` does not generalize: it has no `predict`, so the labeling of the
+    /// rows it was fitted on IS its output, and this file is that labeling plus
+    /// the two hyperparameters that produced it. There is nothing else to store,
+    /// and in particular no training matrix — a reloaded `DBSCAN` can report
+    /// what it found, not re-derive it.
+    ///
+    /// `core_sample_indices_` is stored rather than recomputed. It is not
+    /// derivable from `labels_` alone — a border point and a core point of the
+    /// same cluster carry the same label — and recomputing it would need the
+    /// training data and a second `eps`-neighborhood pass.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let labels_i32 = self
+            .labels_
+            .as_ref()
+            .ok_or_else(|| absent("labels_"))?
+            .to_host(pool);
+        let labels = widen_labels(&labels_i32);
+        let core_i32 = self
+            .core_sample_indices_
+            .as_ref()
+            .ok_or_else(|| absent("core_sample_indices_"))?
+            .to_host(pool);
+        let core = widen_labels(&core_i32);
+
+        let mut w = ClusterWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:eps", self.eps);
+        w.scalar_usize("param:min_samples", self.min_samples);
+        write_labels(&mut w, &labels)?;
+        w.tensor(CORE_INDICES_NAME, TensorRef::i64s(&core, vec![core.len()])?);
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for DBSCAN<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the clustering back from `path`, re-uploading both index vectors to
+    /// `pool`.
+    ///
+    /// Every core index is checked against `labels_`'s length: the file is
+    /// untrusted input (T-04-01-01), and `core_sample_indices_` is by definition
+    /// a set of row positions, so an entry past the end would index the sample
+    /// axis out of range for any caller that used it to select rows.
+    ///
+    /// An EMPTY `core_sample_indices_` is accepted, and deliberately: it is what
+    /// a fit produces when every point is noise, which is a legitimate outcome
+    /// rather than a malformed file.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<DBSCAN<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ClusterFile::parse(&raw, PERSIST_TAG)?;
+        let labels = read_labels(&file)?;
+        let n_samples = labels.len();
+
+        let core_v = file.tensor(CORE_INDICES_NAME)?;
+        let n_core = shape_1d(&core_v, CORE_INDICES_NAME)?;
+        if n_core > n_samples {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{CORE_INDICES_NAME}' holds {n_core} entries, more than the \
+                     {n_samples} samples '{}' labels",
+                    super::cluster_persist::LABELS_NAME
+                ),
+            });
+        }
+        let core: Vec<i32> = as_i64(&core_v, CORE_INDICES_NAME)?
+            .iter()
+            .map(|&v| {
+                let ok = v >= 0 && (v as u64) < n_samples as u64;
+                i32::try_from(v).ok().filter(|_| ok).ok_or_else(|| {
+                    PersistError::InconsistentGeometry {
+                        reason: format!(
+                            "tensor '{CORE_INDICES_NAME}' holds the row index {v}, out of \
+                             range for {n_samples} samples"
+                        ),
+                    }
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        Ok(DBSCAN {
+            eps: file.scalar_f64("param:eps")?,
+            min_samples: file.scalar_usize("param:min_samples")?,
+            labels_: Some(DeviceArray::from_host(pool, &labels)),
+            core_sample_indices_: Some(DeviceArray::from_host(pool, &core)),
+            _marker: PhantomData,
+            _state: PhantomData,
+        })
     }
 }
 

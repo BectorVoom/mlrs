@@ -21,6 +21,11 @@
 // AGGLO-01 — single-linkage AgglomerativeClustering (cuML-parity scope:
 // linkage='single' only). Reuses the HDBSCAN fresh-label union-find
 // (`hdbscan::single_linkage`) for the sklearn fast-path labelling.
+/// The `mlrs-cluster` model-file container — the six estimators' `save`/`load`
+/// share the label vector and affinity-graph layouts it defines
+/// (CLUSTER-PERSIST, prototype).
+pub mod cluster_persist;
+
 pub mod agglomerative;
 pub mod dbscan;
 // Phase-12 convention-foundation HDBSCAN shell (HDBS-01, plan 12-02). Born

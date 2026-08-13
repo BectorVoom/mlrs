@@ -41,6 +41,7 @@
 //! children equality — the port is deterministic, no permutation matching).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -51,8 +52,20 @@ use mlrs_backend::prims::tsne::squared_distance;
 use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{host_to_f64, PrimError};
 
+use super::cluster_persist::{
+    as_i64, read_labels, shape_2d, widen_labels, write_labels, AlignedBytes, ClusterFile,
+    ClusterWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
 use crate::error::{AlgoError, BuildError};
 use crate::typestate::{validate_geometry, Fit, Fitted, State, Unfit};
+
+/// The `estimator` discriminator written into every `AgglomerativeClustering`
+/// file.
+const PERSIST_TAG: &str = "agglomerative_clustering";
+
+/// The tensor holding the merge tree, `[n_samples - 1, 2]` — sklearn's
+/// `children_`.
+const CHILDREN_NAME: &str = "children_";
 
 use super::hdbscan::single_linkage;
 
@@ -68,6 +81,32 @@ pub enum Metric {
     /// Cosine distance `1 − x̂·ŷ` — sklearn's `metric='cosine'` (routes through
     /// the scipy labelling convention, see the module docs).
     Cosine,
+}
+
+impl Metric {
+    /// The sklearn metric name.
+    ///
+    /// Unlike [`knn_graph::Metric`](mlrs_backend::prims::knn_graph::Metric) this
+    /// enum has no payload-carrying variant, so the name is the WHOLE value —
+    /// there is no companion `p` to pair it with, and the model file stores one
+    /// key rather than two.
+    pub fn name(self) -> &'static str {
+        match self {
+            Metric::Euclidean => "euclidean",
+            Metric::Manhattan => "manhattan",
+            Metric::Cosine => "cosine",
+        }
+    }
+
+    /// The inverse of [`Metric::name`]; `None` for an unrecognised string.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "euclidean" => Some(Metric::Euclidean),
+            "manhattan" => Some(Metric::Manhattan),
+            "cosine" => Some(Metric::Cosine),
+            _ => None,
+        }
+    }
 }
 
 /// Single-linkage agglomerative clustering (AGGLO-01), builder-fronted +
@@ -190,6 +229,135 @@ impl AgglomerativeClusteringBuilder {
             children_: None,
             n_leaves_: 0,
             n_features_in_: 0,
+            _float: PhantomData,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F> SaveModel for AgglomerativeClustering<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted clustering to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `labels_` | `I64` | `[n_samples]` |
+    /// | `children_` | `I64` | `[n_samples - 1, 2]` |
+    /// | `n_features_in_` | `__metadata__` scalar | — |
+    /// | `param:n_clusters` / `param:metric` | `__metadata__` scalar | — |
+    ///
+    /// Like `DBSCAN` this estimator does not generalize, so the labeling is the
+    /// output. `children_` rides alongside it as the merge tree sklearn exposes
+    /// — the dendrogram the labeling was CUT from, which the labels alone cannot
+    /// reconstruct: a cut at `n_clusters` throws away every merge above it.
+    ///
+    /// `n_features_in_` is a fitted attribute (no `param:` prefix) and has to be
+    /// stored: this file holds no training matrix to recover it from, and unlike
+    /// `n_samples` it is not implied by any tensor's shape.
+    ///
+    /// `children_` is `[n_samples - 1, 2]` because a binary merge tree over `n`
+    /// leaves has exactly `n - 1` internal nodes. That relation is checked on
+    /// load rather than assumed.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer, which borrows every payload.
+        let labels_i32 = self
+            .labels_
+            .as_ref()
+            .ok_or_else(|| absent("labels_"))?
+            .to_host(pool);
+        let labels = widen_labels(&labels_i32);
+        // `Vec<[i64; 2]>` is already the file's element type and layout — a
+        // merge tree is row-major `[left, right]` pairs — so this flattens
+        // without converting.
+        let children: Vec<i64> = self
+            .children_
+            .as_ref()
+            .ok_or_else(|| absent("children_"))?
+            .iter()
+            .flat_map(|pair| pair.iter().copied())
+            .collect();
+
+        let mut w = ClusterWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_clusters", self.n_clusters);
+        w.scalar_str("param:metric", self.metric.name());
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+        write_labels(&mut w, &labels)?;
+        w.tensor(
+            CHILDREN_NAME,
+            TensorRef::i64s(&children, vec![children.len() / 2, 2])?,
+        );
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for AgglomerativeClustering<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the clustering back from `path`, re-uploading the label vector to
+    /// `pool`.
+    ///
+    /// The `n - 1` merge relation is CHECKED against `labels_`'s length. Neither
+    /// extent is wrong on its own — a 12-row `children_` and a 20-entry
+    /// `labels_` are each well-formed — so only the cross-check catches a
+    /// truncated tree, and a caller walking the dendrogram from the labels would
+    /// otherwise index past its end.
+    ///
+    /// Every child id is checked against `2n - 1`, the total node count of a
+    /// binary merge tree over `n` leaves: ids below `n` are leaves and ids at or
+    /// above it are internal nodes, so anything past `2n - 2` addresses a node
+    /// that cannot exist.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<AgglomerativeClustering<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = ClusterFile::parse(&raw, PERSIST_TAG)?;
+        let labels = read_labels(&file)?;
+        let n_samples = labels.len();
+
+        let children_v = file.tensor(CHILDREN_NAME)?;
+        let (rows, cols) = shape_2d(&children_v, CHILDREN_NAME)?;
+        if cols != 2 || rows != n_samples - 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{CHILDREN_NAME}' declares shape [{rows}, {cols}]; a binary \
+                     merge tree over {n_samples} leaves has [{}, 2]",
+                    n_samples - 1
+                ),
+            });
+        }
+        let max_node = 2 * n_samples as i64 - 1;
+        let flat = as_i64(&children_v, CHILDREN_NAME)?;
+        if let Some(&bad) = flat.iter().find(|&&v| v < 0 || v >= max_node) {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{CHILDREN_NAME}' holds the node id {bad}, out of range for a \
+                     merge tree over {n_samples} leaves"
+                ),
+            });
+        }
+        let children: Vec<[i64; 2]> = flat.chunks_exact(2).map(|c| [c[0], c[1]]).collect();
+
+        let metric = Metric::from_name(file.scalar_str("param:metric")?).ok_or(
+            PersistError::BadMetadata {
+                key: "param:metric",
+            },
+        )?;
+
+        Ok(AgglomerativeClustering {
+            n_clusters: file.scalar_usize("param:n_clusters")?,
+            metric,
+            labels_: Some(DeviceArray::from_host(pool, &labels)),
+            children_: Some(children),
+            n_leaves_: n_samples,
+            n_features_in_: file.scalar_usize("n_features_in_")?,
             _float: PhantomData,
             _state: PhantomData,
         })

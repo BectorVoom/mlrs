@@ -89,6 +89,7 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -108,6 +109,12 @@ use mlrs_backend::prims::special::{betaln, digamma, lgamma};
 use mlrs_backend::runtime::ActiveRuntime;
 
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
+
+use crate::mixture::mixture_persist::{
+    as_f64, as_i64, expect_len, read_device_arm, read_opt_vec, shape_1d, write_opt_vec,
+    AlignedBytes, LoadModel, MixtureFile, MixtureWriter, PersistError, SaveModel, TensorRef,
+    LOWER_BOUNDS_NAME, TRAIN_LABELS_NAME,
+};
 
 use crate::error::{AlgoError, BuildError};
 use crate::mixture::gaussian_mixture::{
@@ -1012,6 +1019,361 @@ where
 
         let log_beta: f64 = p.mean_precision.iter().map(|v| v.ln()).sum();
         -resp_log_resp - log_wishart - log_norm_weight - 0.5 * d as f64 * log_beta
+    }
+}
+
+/// The `estimator` discriminator written into every `BayesianGaussianMixture`
+/// file. See [`gaussian_mixture`](super::gaussian_mixture)'s tag for why it is
+/// load-bearing.
+const PERSIST_TAG: &str = "bayesian_gaussian_mixture";
+
+/// The seven posterior blocks a variational mixture holds, in the order they are
+/// written and read.
+///
+/// One list rather than two so the save and load sides cannot drift:
+/// `weight_concentration_a`/`_b`, `mean_precision` and `degrees_of_freedom` are
+/// all length-`k` `f64` vectors, so a name reordered on one side only would
+/// produce a file that round-trips its own geometry perfectly and scores
+/// everything wrongly — exactly the failure no length check can catch.
+const POSTERIOR_NAMES: [&str; 7] = [
+    "weight_concentration_a_",
+    "weight_concentration_b_",
+    "mean_precision_",
+    "means_",
+    "degrees_of_freedom_",
+    "covariances_",
+    "precisions_cholesky_",
+];
+
+/// The five PRIOR values, which are hyperparameters resolved at fit rather than
+/// posterior state. Two are vectors and three are scalars, so they are staged
+/// individually rather than through a shared helper.
+const PRIOR_MEAN_NAME: &str = "mean_prior_";
+/// See [`PRIOR_MEAN_NAME`].
+const PRIOR_COVARIANCE_NAME: &str = "covariance_prior_";
+
+impl<F> SaveModel for BayesianGaussianMixture<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted mixture to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | the seven posterior blocks | `F64` | see [`POSTERIOR_NAMES`] |
+    /// | `mean_prior_` | `F64` | `[n_features]` |
+    /// | `covariance_prior_` | `F64` | flat, `param_len(1, d)` |
+    /// | `weight_concentration_prior_` / `mean_precision_prior_` / `degrees_of_freedom_prior_` | `__metadata__` | — |
+    /// | `lower_bounds_` / `train_labels` | `F64` / `I64` | as `GaussianMixture` |
+    /// | seventeen `param:*` scalars | `__metadata__` | — |
+    ///
+    /// ## Why the RESOLVED priors are stored, not just the requests
+    ///
+    /// Every one of sklearn's five `*_prior` arguments defaults to `None` and
+    /// resolves at fit against the DATA: `mean_prior` becomes the sample mean,
+    /// `covariance_prior` the sample covariance, `degrees_of_freedom_prior` the
+    /// feature count, and so on. The request and the outcome are therefore
+    /// different facts, and both round-trip — the same split
+    /// [`kernel_persist`](crate::kernel_persist) makes for the kernel
+    /// coefficient, and here it matters more: a reloaded model that re-derived
+    /// its priors would need the training data, which this file does not hold.
+    ///
+    /// `mean_prior_` and `covariance_prior_` are ARRAYS, so they ride as tensors
+    /// (under their fitted names, no `param:` prefix); the three scalar priors
+    /// ride in `__metadata__` beside them.
+    ///
+    /// Everything is `F64` regardless of the estimator's `F`, for the reason
+    /// [`mixture_persist`](super::mixture_persist) gives.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        let params = self.params.as_ref().ok_or_else(|| absent("params"))?;
+        let priors = self.priors.as_ref().ok_or_else(|| absent("priors"))?;
+        let k = params.means.len() / self.n_features_in_.max(1);
+        let param_len = self.covariance_type.param_len(k, self.n_features_in_);
+        // Bound BEFORE the writer, which borrows every payload.
+        let train_labels: Option<Vec<i64>> = self
+            .train_labels
+            .as_ref()
+            .map(|l| l.iter().map(|&v| i64::from(v)).collect());
+
+        let mut w = MixtureWriter::new(PERSIST_TAG);
+        w.scalar_usize("param:n_components", self.n_components);
+        w.scalar_str("param:covariance_type", self.covariance_type.name());
+        w.scalar_f64("param:tol", self.tol);
+        w.scalar_f64("param:reg_covar", self.reg_covar);
+        w.scalar_usize("param:max_iter", self.max_iter);
+        w.scalar_usize("param:n_init", self.n_init);
+        w.scalar_str("param:init_params", self.init_params.name());
+        w.scalar_str(
+            "param:weight_concentration_prior_type",
+            self.weight_concentration_prior_type.name(),
+        );
+        w.scalar_opt_f64(
+            "param:weight_concentration_prior",
+            self.weight_concentration_prior,
+        );
+        w.scalar_opt_f64("param:mean_precision_prior", self.mean_precision_prior);
+        w.scalar_opt_f64(
+            "param:degrees_of_freedom_prior",
+            self.degrees_of_freedom_prior,
+        );
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_bool("param:warm_start", self.warm_start);
+        w.scalar_usize("param:verbose", self.verbose);
+        w.scalar_usize("param:verbose_interval", self.verbose_interval);
+        w.scalar_str("param:device", self.device.name());
+
+        // The three RESOLVED scalar priors — distinct from the `param:` requests
+        // above, which are `Option` and usually absent.
+        w.scalar_f64("weight_concentration_prior_", priors.weight_concentration);
+        w.scalar_f64("mean_precision_prior_", priors.mean_precision);
+        w.scalar_f64("degrees_of_freedom_prior_", priors.degrees_of_freedom);
+
+        w.scalar_bool("converged_", self.converged_);
+        w.scalar_usize("n_iter_", self.n_iter_);
+        w.scalar_f64("lower_bound_", self.lower_bound_);
+        w.scalar_usize("n_features_in_", self.n_features_in_);
+        w.scalar_usize("n_samples_", self.n_samples_);
+        if let Some(arm) = self.device_ {
+            w.scalar_str("device_", arm);
+        }
+
+        // The seven posterior blocks, staged in `POSTERIOR_NAMES` order with
+        // each one's own expected length.
+        let blocks: [(&'static str, &[f64], usize); 7] = [
+            (POSTERIOR_NAMES[0], &params.weight_concentration_a, k),
+            (POSTERIOR_NAMES[1], &params.weight_concentration_b, k),
+            (POSTERIOR_NAMES[2], &params.mean_precision, k),
+            (
+                POSTERIOR_NAMES[3],
+                &params.means,
+                k * self.n_features_in_,
+            ),
+            (POSTERIOR_NAMES[4], &params.degrees_of_freedom, k),
+            (POSTERIOR_NAMES[5], &params.covariances, param_len),
+            (
+                POSTERIOR_NAMES[6],
+                &params.precisions_cholesky,
+                param_len,
+            ),
+        ];
+        for (name, values, expected) in blocks {
+            expect_len(name, values.len(), expected, "entries")?;
+            // `means_` alone is rank-2 — it is the one block whose two extents
+            // carry separate meaning, and storing it `[k, d]` is what lets a
+            // Python reader index it by component the way sklearn's attribute
+            // does. The rest are flat by construction (see `param_len`).
+            let shape = if name == POSTERIOR_NAMES[3] {
+                vec![k, self.n_features_in_]
+            } else {
+                vec![values.len()]
+            };
+            w.tensor(name, TensorRef::f64s(values, shape)?);
+        }
+
+        w.tensor(
+            PRIOR_MEAN_NAME,
+            TensorRef::f64s(&priors.mean, vec![priors.mean.len()])?,
+        );
+        w.tensor(
+            PRIOR_COVARIANCE_NAME,
+            TensorRef::f64s(&priors.covariance, vec![priors.covariance.len()])?,
+        );
+        write_opt_vec(&mut w, "param:mean_prior", self.mean_prior.as_ref())?;
+        write_opt_vec(
+            &mut w,
+            "param:covariance_prior",
+            self.covariance_prior.as_ref(),
+        )?;
+        w.tensor(
+            LOWER_BOUNDS_NAME,
+            TensorRef::f64s(&self.lower_bounds_, vec![self.lower_bounds_.len()])?,
+        );
+        if let Some(l) = train_labels.as_ref() {
+            w.tensor(TRAIN_LABELS_NAME, TensorRef::i64s(l, vec![l.len()])?);
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for BayesianGaussianMixture<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the mixture back from `path`.
+    ///
+    /// `covariance_type` and `n_features_in_` are read first, because together
+    /// they fix the flat length every parameter block must have. The file is
+    /// untrusted input (T-04-01-01), so each of the seven posterior blocks is
+    /// measured against that length before a single value is stored: they index
+    /// each other component-wise inside the variational E-step, and a short one
+    /// would read past its end on the first `score_samples`.
+    ///
+    /// The `warm` resumption block is NOT restored. Unlike `GaussianMixture`'s,
+    /// it is a `BayesianMixtureParams` whose seven arrays would double this
+    /// file, and a `warm_start` continuation of a variational fit re-derives it
+    /// from the posterior the file already holds — so storing it would be a
+    /// second copy of recoverable state, which this format does not do.
+    fn load(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<BayesianGaussianMixture<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = MixtureFile::parse(&raw, PERSIST_TAG)?;
+
+        let covariance_type = CovarianceType::try_from(file.scalar_str("param:covariance_type")?)
+            .map_err(|_| PersistError::BadMetadata {
+            key: "param:covariance_type",
+        })?;
+        let n_features_in_ = file.scalar_usize("n_features_in_")?;
+        if n_features_in_ == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: "'n_features_in_' is 0; a fitted mixture has at least one feature"
+                    .to_string(),
+            });
+        }
+
+        // `k` comes off the first length-`k` posterior, and every other block is
+        // measured against it.
+        let first = file.tensor(POSTERIOR_NAMES[0])?;
+        let k = shape_1d(&first, POSTERIOR_NAMES[0])?;
+        if k == 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "tensor '{}' is empty; a fitted mixture has at least one component",
+                    POSTERIOR_NAMES[0]
+                ),
+            });
+        }
+        let param_len = covariance_type.param_len(k, n_features_in_);
+
+        let mut blocks: Vec<Vec<f64>> = Vec::with_capacity(7);
+        for (i, name) in POSTERIOR_NAMES.iter().enumerate() {
+            let expected = match i {
+                3 => k * n_features_in_,
+                5 | 6 => param_len,
+                _ => k,
+            };
+            let view = file.tensor(name)?;
+            let len: usize = view.shape().iter().product();
+            expect_len(name, len, expected, "entries")?;
+            blocks.push(as_f64(&view, name)?.into_owned());
+        }
+        let mut drain = blocks.into_iter();
+        let params = BayesianMixtureParams {
+            weight_concentration_a: drain.next().expect("seven blocks were read"),
+            weight_concentration_b: drain.next().expect("seven blocks were read"),
+            mean_precision: drain.next().expect("seven blocks were read"),
+            means: drain.next().expect("seven blocks were read"),
+            degrees_of_freedom: drain.next().expect("seven blocks were read"),
+            covariances: drain.next().expect("seven blocks were read"),
+            precisions_cholesky: drain.next().expect("seven blocks were read"),
+        };
+
+        let mean_prior_v = file.tensor(PRIOR_MEAN_NAME)?;
+        expect_len(
+            PRIOR_MEAN_NAME,
+            shape_1d(&mean_prior_v, PRIOR_MEAN_NAME)?,
+            n_features_in_,
+            "entries",
+        )?;
+        let cov_prior_v = file.tensor(PRIOR_COVARIANCE_NAME)?;
+        expect_len(
+            PRIOR_COVARIANCE_NAME,
+            shape_1d(&cov_prior_v, PRIOR_COVARIANCE_NAME)?,
+            covariance_type.param_len(1, n_features_in_),
+            "entries",
+        )?;
+        let priors = MixturePriors {
+            weight_concentration: file.scalar_f64("weight_concentration_prior_")?,
+            mean_precision: file.scalar_f64("mean_precision_prior_")?,
+            mean: as_f64(&mean_prior_v, PRIOR_MEAN_NAME)?.into_owned(),
+            degrees_of_freedom: file.scalar_f64("degrees_of_freedom_prior_")?,
+            covariance: as_f64(&cov_prior_v, PRIOR_COVARIANCE_NAME)?.into_owned(),
+        };
+
+        let lower_bounds_v = file.tensor(LOWER_BOUNDS_NAME)?;
+        shape_1d(&lower_bounds_v, LOWER_BOUNDS_NAME)?;
+        let lower_bounds_ = as_f64(&lower_bounds_v, LOWER_BOUNDS_NAME)?.into_owned();
+
+        let n_samples_ = file.scalar_usize("n_samples_")?;
+        let train_labels = match file.tensor_opt(TRAIN_LABELS_NAME) {
+            None => None,
+            Some(view) => {
+                expect_len(
+                    TRAIN_LABELS_NAME,
+                    shape_1d(&view, TRAIN_LABELS_NAME)?,
+                    n_samples_,
+                    "entries",
+                )?;
+                Some(
+                    as_i64(&view, TRAIN_LABELS_NAME)?
+                        .iter()
+                        .map(|&v| {
+                            i32::try_from(v).map_err(|_| PersistError::InconsistentGeometry {
+                                reason: format!(
+                                    "tensor '{TRAIN_LABELS_NAME}' holds the component id {v}, \
+                                     which does not fit an i32"
+                                ),
+                            })
+                        })
+                        .collect::<Result<Vec<i32>, _>>()?,
+                )
+            }
+        };
+
+        Ok(BayesianGaussianMixture {
+            n_components: file.scalar_usize("param:n_components")?,
+            covariance_type,
+            tol: file.scalar_f64("param:tol")?,
+            reg_covar: file.scalar_f64("param:reg_covar")?,
+            max_iter: file.scalar_usize("param:max_iter")?,
+            n_init: file.scalar_usize("param:n_init")?,
+            init_params: InitParams::try_from(file.scalar_str("param:init_params")?).map_err(
+                |_| PersistError::BadMetadata {
+                    key: "param:init_params",
+                },
+            )?,
+            weight_concentration_prior_type: WeightConcentrationPriorType::try_from(
+                file.scalar_str("param:weight_concentration_prior_type")?,
+            )
+            .map_err(|_| PersistError::BadMetadata {
+                key: "param:weight_concentration_prior_type",
+            })?,
+            weight_concentration_prior: file
+                .scalar_opt_f64("param:weight_concentration_prior")?,
+            mean_precision_prior: file.scalar_opt_f64("param:mean_precision_prior")?,
+            mean_prior: read_opt_vec(&file, "param:mean_prior")?,
+            degrees_of_freedom_prior: file.scalar_opt_f64("param:degrees_of_freedom_prior")?,
+            covariance_prior: read_opt_vec(&file, "param:covariance_prior")?,
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            warm_start: file.scalar_bool("param:warm_start")?,
+            verbose: file.scalar_usize("param:verbose")?,
+            verbose_interval: file.scalar_usize("param:verbose_interval")?,
+            // Re-derived from the posterior on the next `warm_start` fit rather
+            // than stored — see this impl's docs.
+            warm: None,
+            device: Device::from_name(file.scalar_str("param:device")?).ok_or(
+                PersistError::BadMetadata {
+                    key: "param:device",
+                },
+            )?,
+            params: Some(params),
+            device_: read_device_arm(&file, "device_")?,
+            priors: Some(priors),
+            converged_: file.scalar_bool("converged_")?,
+            n_iter_: file.scalar_usize("n_iter_")?,
+            lower_bound_: file.scalar_f64("lower_bound_")?,
+            lower_bounds_,
+            n_features_in_,
+            n_samples_,
+            train_labels,
+            _float: PhantomData,
+            _state: PhantomData,
+        })
     }
 }
 

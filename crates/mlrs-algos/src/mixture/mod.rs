@@ -30,6 +30,10 @@
 //! `crates/mlrs-algos/tests/bayesian_mixture_test.rs` and their `*_perf_test`
 //! siblings (AGENTS.md §2).
 
+/// The `mlrs-mixture` model-file container — both estimators' `save`/`load`
+/// share the parameter-block layout it defines (MIX-PERSIST, prototype).
+pub mod mixture_persist;
+
 pub mod bayesian_gaussian_mixture;
 pub mod gaussian_mixture;
 
