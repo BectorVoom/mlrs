@@ -177,6 +177,11 @@ pub mod reduce;
 // mlrs-algos).
 pub mod sgd;
 pub(crate) mod sgd_host;
+// STACK-META-01: the device arm of `StackingRegressor`'s meta-matrix assembly,
+// plus the `MLRS_STACK_META_ENGINE` knob that chooses between it, the algos
+// host arm, and the shim's `np.hstack`. The copy carries no arithmetic, so the
+// default arm is a MEASUREMENT (docs/stacking.md), not an assumption.
+pub mod stacking_meta;
 pub mod svd;
 // Linear-SVM primal objective evaluator (SVM-FIT-CPU perf lever): the margin
 // matvec + per-sample loss + `X̃ᵀg` gradient the `LinearSVC`/`LinearSVR` L-BFGS

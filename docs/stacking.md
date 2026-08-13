@@ -33,16 +33,41 @@ the same split `model_selection` uses.
 | meta-column layout / `_n_feature_outs` | Rust (`stacking_meta_layout`) |
 | `get_feature_names_out` strings | Rust (`stacking_feature_names`) |
 | fold index generation | Rust (`mlrs.model_selection`) |
-| the meta-matrix hstack | numpy |
+| the meta-matrix copy | numpy by default; Rust host / CubeCL device on request |
 | base / final `fit` and `predict` | the composed estimators |
 
-The hstack stays in numpy deliberately. It is one `n x width` copy that
-`np.hstack` already does at C speed; routing `k + 1` host blocks back through
-the Arrow capsule boundary to do the identical copy would add FFI round-trips
-and an f64-only constraint for zero arithmetic. Rust still owns the *decision*
-and states it executably in
-`mlrs_algos::ensemble::stacking::concatenate_predictions`, gated by
-`crates/mlrs-algos/tests/stacking_test.rs`.
+## The meta-matrix arms (STACK-META-01)
+
+The meta matrix — `k` prediction blocks side by side, plus `X` under
+`passthrough` — can be assembled three ways, selected by the
+`MLRS_STACK_META_ENGINE` A/B knob:
+
+| value | arm |
+|---|---|
+| unset (**default**) | `np.hstack` in the shim |
+| `numpy` | the same, forced |
+| `host` | `mlrs_algos::ensemble::stacking::concatenate_predictions`, reached through the Arrow capsule |
+| `device` | `mlrs_kernels::stacking::stack_meta_block`, one CubeCL launch per block |
+
+All three produce **byte-identical** matrices — the operation has no arithmetic,
+so `test_stacking_meta_engine.py` asserts exact equality, not a tolerance, and
+`crates/mlrs-backend/tests/stacking_meta_test.rs` does the same against an
+independently written host reference. The knob only moves work between them.
+
+`numpy` is the shipping default, and that is a **measurement** (the ladder
+below), not an assumption. The two Rust arms start in debt: this is one
+`n x width` strided copy of data that is already in host memory (the blocks
+arrive as whatever numpy arrays the composed estimators' `predict` returned), so
+the host arm adds a capsule crossing each way and the device arm adds an upload
+and a download on top of that. The arms exist because that debt is not obviously
+unrepayable at large `n`, and because a claim about which copy is faster should
+be a number.
+
+The numpy arm also remains the **fallback** for everything the Rust arms cannot
+represent: a non-float block, a duck-typed `X` (sklearn's `estimator_checks`
+passes one), a block that is not 2-D, or row counts that disagree.
+`_meta_via_rust` returns `None` for those rather than raising, so `np.hstack`
+handles them exactly as it did before the arms existed.
 
 ## Parameters
 
@@ -111,6 +136,13 @@ string:
 * `estimators=[(name, "drop")]` — no fit, no meta column, no feature name, but
   the slot survives in `named_estimators_` as the literal `'drop'`.
 
+`crates/mlrs-py/python/tests/test_stacking_meta_engine.py` adds 68 more cells
+that re-run both string parameters — and the layout equivalences — **once per
+meta-assembly arm**, so `host` and `device` are never covered only by synthetic
+block data. 147 cells green on cpu, wgpu and rocm, zero skips on all three
+(rocm included: the scatter needs no f64 matmul, so it runs there at f64 where
+`backend_supports_f64()` alone would have wrongly skipped it).
+
 `mlrs.StackingRegressor` also passes sklearn's `parametrize_with_checks` sweep
 (57 passed / 1 skipped) at the default `passthrough=False`. At
 `passthrough=True` sklearn's **own** `StackingRegressor` fails
@@ -171,3 +203,54 @@ Reading the ladders:
   regression.
 * **The orchestration layer itself is at parity**: on the host arm, where every
   base fit is identical, mlrs is 0.90–1.08x of sklearn across the whole sweep.
+
+## Measured: the meta-matrix arms (STACK-META-01)
+
+`scripts/bench_stacking_meta.py --level copy`, min of 5 fresh subprocesses,
+five in-process reps each, arms interleaved rather than blocked. Cells are the
+assembly ALONE — the numpy arm is `np.hstack`, the Rust arms are the same call
+the shim makes, ingress and egress included, because that is what a user pays.
+Blocks are one-column predictions (`k` of them); `d > 0` means `passthrough`
+with that many `X` columns. **rocm, gfx1151 iGPU, f64, loadavg 3.8:**
+
+| copy | numpy | host | device | host/np | dev/np |
+|---|---|---|---|---|---|
+| n=1 000, k=2 | **0.003 ms** | 0.027 ms | 0.243 ms | 0.11x | 0.01x |
+| n=10 000, k=2 | **0.009 ms** | 0.092 ms | 0.280 ms | 0.10x | 0.03x |
+| n=100 000, k=2 | **0.062 ms** | 0.796 ms | 0.733 ms | 0.08x | 0.08x |
+| n=1 000 000, k=2 | **0.644 ms** | 4.788 ms | 4.281 ms | 0.13x | 0.15x |
+| n=100 000, k=8 | **0.242 ms** | 1.408 ms | 1.819 ms | 0.17x | 0.13x |
+| n=100 000, k=2, d=32 | **0.714 ms** | 1.161 ms | 5.211 ms | 0.61x | 0.14x |
+| n=1 000 000, k=2, d=32 | **15.1 ms** | 20.5 ms | 45.8 ms | 0.74x | 0.33x |
+| n=100 000, k=2, d=128 | **5.60 ms** | 7.98 ms | 18.4 ms | 0.70x | 0.30x |
+
+cpu and wgpu land in the same place (host 0.12–0.70x, device 0.01–0.23x), and
+the cpu ladder was re-run with `--cpu-time` on a contended box to confirm the
+verdict is not a load artefact: the host/numpy ratios came out identical.
+
+**`np.hstack` wins every cell, so it stays the default.** Reading the ladder:
+
+* **The host arm's floor is a fixed cost, not a slope.** At narrow widths it
+  sits at a flat ~0.1x — that is the Arrow capsule crossing and the egress copy,
+  which do not shrink with `n`. As the copy grows (`d=32`, `d=128`) the ratio
+  climbs toward ~0.7x, i.e. the *copy itself* is competitive; what it cannot
+  repay is the two extra buffer traversals the boundary costs. numpy needs one
+  pass over each block; the Rust arms need one to hand the blocks over and one
+  to bring the matrix back, on top of the same write.
+* **The device arm is bus-bound, exactly as a zero-arithmetic kernel must be.**
+  It uploads `n x width`, writes it once, and downloads `n x width`. There is no
+  arithmetic to amortize that against, so it trails at every size; the best it
+  reaches is 0.33x, at the largest passthrough copy where the kernel's bandwidth
+  is at its most useful. It would only turn favourable for a caller whose blocks
+  are ALREADY device-resident — which today's shim, receiving numpy arrays back
+  from each member's `predict`, never is.
+* **At fit level the choice is invisible.** `--level fit` ratios bounce between
+  0.83x and 1.66x in both directions and do not reproduce run to run: at
+  `n=100 000, d=32` the copy is ~1.1 ms against a ~155 ms fit, i.e. under 1%, so
+  what that ladder measures is base-fit noise. The copy-level ladder above is
+  the discriminating one, which is why it is the one quoted.
+
+The arms remain in the tree because they are cheap to keep (one kernel, one
+prim, one dispatcher), because they make the "numpy is faster here" claim a
+number that can be re-checked on new hardware with one command, and because the
+device arm is the piece a future device-resident stacking path would need.

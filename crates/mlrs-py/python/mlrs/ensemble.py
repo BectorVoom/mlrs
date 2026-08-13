@@ -608,17 +608,25 @@ def _shap_values_helper(mlrs_obj, kind, x_train, x_query, has_train_arg):
 #   meta-column layout             Rust (`stacking_meta_layout`)
 #   `get_feature_names_out`        Rust (`stacking_feature_names`)
 #   fold index generation          Rust (`mlrs.model_selection`)
-#   the meta-matrix hstack         numpy (see below)
+#   the meta-matrix copy           numpy by default (see below)
 #   base/final `fit` + `predict`   the composed estimators
 #   =============================  =========================================
 #
-# The hstack stays in numpy deliberately. It is one `n x width` copy that
-# `np.hstack` already performs at C speed; routing `k + 1` host blocks back
-# through the Arrow capsule boundary to perform the identical copy would add FFI
-# round-trips and an f64-only constraint for zero arithmetic. The Rust side
-# still owns the *decision* (widths, order, passthrough placement) and states it
-# executably in `mlrs_algos::ensemble::stacking::concatenate_predictions`, which
-# `crates/mlrs-algos/tests/stacking_test.rs` gates.
+# ## The meta-matrix copy has three arms (STACK-META-01)
+#
+# `MLRS_STACK_META_ENGINE` chooses between `np.hstack` (the default), the Rust
+# host copy (`mlrs_algos::ensemble::stacking::concatenate_predictions`), and the
+# CubeCL scatter (`mlrs_backend::prims::stacking_meta`). All three produce
+# BYTE-IDENTICAL matrices — the operation carries no arithmetic — so the knob
+# moves work and nothing else.
+#
+# numpy stays the default, and that is a measurement rather than an assumption:
+# this is one `n x width` copy of data that is already in host memory, so the
+# host arm pays an Arrow capsule crossing each way and the device arm an upload
+# plus a download on top of that. `docs/stacking.md` carries the ladder and
+# `scripts/bench_stacking_meta.py` re-runs it. `_meta_via_rust` is also the
+# fallback boundary: it DECLINES (returns None) for anything the Rust arms
+# cannot represent, leaving `np.hstack` to handle it exactly as before.
 #
 # ## The default `final_estimator` is sklearn's `RidgeCV`
 #
@@ -770,6 +778,78 @@ def _effective_n_jobs(n_jobs, members):
         stacklevel=3,
     )
     return 1
+
+
+def _meta_via_rust(blocks, pred_cols, n_features, passthrough, engine):
+    """The meta matrix from ``_mlrs.stacking_concatenate``, or ``None`` for numpy.
+
+    ``blocks`` is the prediction blocks in kept order, with ``X`` appended when
+    ``passthrough``; ``pred_cols`` is the prediction blocks' column counts (the
+    layout's ``n_feature_outs``, so ``X`` is excluded).
+
+    Returns ``None`` — deliberately, rather than raising — for every input the
+    Rust arms cannot represent, leaving ``np.hstack`` to handle it exactly as it
+    did before this arm existed:
+
+    * a non-float block (an integer or object array, or a duck-typed ``X`` like
+      ``estimator_checks``' ``_NotAnArray``, which ``np.hstack`` passes straight
+      through);
+    * a block that is not 2-D, or whose row count disagrees with the others —
+      numpy's own error message for that is the one users already know.
+
+    The dtype handed over is ``np.result_type`` of the blocks, which is the
+    promotion ``np.hstack`` would have applied, so the meta matrix the final
+    estimator is fitted on is bit-identical across all three arms rather than
+    merely close.
+    """
+    import pyarrow as pa
+
+    arrays = [np.asarray(b) for b in blocks]
+    if any(a.ndim != 2 for a in arrays):
+        return None
+    try:
+        dtype = np.result_type(*[a.dtype for a in arrays])
+    except TypeError:
+        return None
+    if dtype != np.float32 and dtype != np.float64:
+        return None
+    n_rows = int(arrays[0].shape[0])
+    if any(int(a.shape[0]) != n_rows for a in arrays):
+        return None
+    if n_rows == 0:
+        # A zero-row meta matrix is a zero-byte device allocation on the device
+        # arm; numpy already produces the right empty shape, and there is
+        # nothing to gain by handing an empty buffer to CubeCL.
+        return None
+
+    arrow_type = pa.float32() if dtype == np.float32 else pa.float64()
+    flats, capsules = [], []
+    for a in arrays:
+        # `ascontiguousarray` is a no-op view when `a` is already C-contiguous in
+        # the promoted dtype, and `py_buffer` does not copy — so a block reaches
+        # Rust without a staging copy, and the arms are compared on the copy
+        # they actually perform rather than on ingress overhead.
+        flat = np.ascontiguousarray(a, dtype=dtype).ravel(order="C")
+        flats.append(flat)
+        capsules.append(
+            pa.Array.from_buffers(arrow_type, flat.size, [None, pa.py_buffer(flat)])
+        )
+
+    x = capsules.pop() if passthrough else None
+    flat_out, width = _stack_ext().stacking_concatenate(
+        capsules,
+        [int(c) for c in pred_cols],
+        n_rows,
+        int(n_features),
+        bool(passthrough),
+        x,
+        engine,
+    )
+    # `flats` is referenced until here on purpose: `py_buffer` borrows those
+    # numpy buffers, and letting one be collected mid-call would free memory
+    # Rust is still reading.
+    del flats
+    return _io.to_output(flat_out, (n_rows, width), "numpy", dtype)
 
 
 def _final_estimator_has(attr):
@@ -1171,6 +1251,14 @@ class StackingRegressor(
             blocks.append(X)
             if _is_sparse(X):
                 return _sys.modules["scipy.sparse"].hstack(blocks, format=X.format)
+
+        # STACK-META-01: `np.hstack` is the default arm and the fallback for
+        # everything the Rust arms cannot represent (see `_meta_via_rust`).
+        engine = _stack_ext().stacking_meta_engine()
+        if engine != "numpy":
+            meta = _meta_via_rust(blocks, n_feature_outs, n_features, self.passthrough, engine)
+            if meta is not None:
+                return meta
         return np.hstack(blocks)
 
     # -- transform / predict ------------------------------------------------ #

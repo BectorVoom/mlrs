@@ -11,14 +11,15 @@
 //! established by [`crate::model_selection`]: index/layout logic in Rust, the
 //! array gathers and the estimator calls in Python.
 //!
-//! ## What is deliberately NOT here
+//! ## The meta-feature copy itself (STACK-META-01)
 //!
-//! The meta-feature **hstack itself** stays in numpy on the Python side. Routing
-//! `k + 1` already-materialized host blocks through the Arrow capsule boundary
-//! only to perform the same single `n × width` copy that `np.hstack` performs
-//! would add FFI round-trips and an f64-only constraint for exactly zero
-//! arithmetic. [`MetaLayout`] hands the shim the offsets that copy needs and
-//! keeps the *decision* (widths, order, passthrough placement) testable in Rust.
+//! [`concatenate_predictions`] performs the copy on the host, and
+//! [`concatenate_meta`] dispatches between it and the CubeCL scatter in
+//! [`mlrs_backend::prims::stacking_meta`]. Neither is the DEFAULT: the shim
+//! still reaches for `np.hstack` unless `MLRS_STACK_META_ENGINE` says otherwise,
+//! because the operation carries no arithmetic and both Rust arms therefore
+//! start an Arrow capsule round-trip in debt. The ladder that settles it is in
+//! `docs/stacking.md`; [`MetaLayout`] is what all three arms agree on.
 //!
 //! ## sklearn parity
 //!
@@ -37,7 +38,13 @@
 //! Tests live in `crates/mlrs-algos/tests/stacking_test.rs` (AGENTS.md §2 — never
 //! an in-source `#[cfg(test)] mod tests`).
 
+use bytemuck::Pod;
+use cubecl::prelude::{CubeElement, Float};
 use thiserror::Error;
+
+use mlrs_backend::pool::BufferPool;
+use mlrs_backend::prims::stacking_meta::{concat_meta_device, MetaEngine};
+use mlrs_backend::runtime::ActiveRuntime;
 
 /// The string sentinel a caller puts in `estimators` to disable an entry
 /// (`set_params(lr="drop")`). sklearn compares against this literal, and so
@@ -308,12 +315,42 @@ pub fn meta_feature_names(
 /// `blocks[i]` is `(data, n_cols)` with `data.len() == n_rows * n_cols`, in
 /// [`kept_indices`] order. `x` is `(data, n_features)` and is required exactly
 /// when `layout.width > layout.n_meta`.
-pub fn concatenate_predictions(
+pub fn concatenate_predictions<F: Copy + Default>(
     layout: &MetaLayout,
-    blocks: &[(&[f64], usize)],
+    blocks: &[(&[F], usize)],
     n_rows: usize,
-    x: Option<(&[f64], usize)>,
-) -> Result<Vec<f64>> {
+    x: Option<(&[F], usize)>,
+) -> Result<Vec<F>> {
+    check_blocks(layout, blocks, n_rows, x)?;
+    let passthrough = layout.width > layout.n_meta;
+
+    let mut out = vec![F::default(); n_rows * layout.width];
+    for r in 0..n_rows {
+        let row = &mut out[r * layout.width..(r + 1) * layout.width];
+        for (b, (data, cols)) in blocks.iter().enumerate() {
+            let off = layout.offsets[b];
+            row[off..off + cols].copy_from_slice(&data[r * cols..(r + 1) * cols]);
+        }
+        if let (true, Some((data, cols))) = (passthrough, x) {
+            row[layout.n_meta..].copy_from_slice(&data[r * cols..(r + 1) * cols]);
+        }
+    }
+    Ok(out)
+}
+
+/// The shape contract [`concatenate_predictions`] and [`concatenate_meta`]'s
+/// device arm both hold callers to.
+///
+/// Factored out so the two arms reject identically: a kernel cannot return an
+/// error, so the device route has to be told "no" here or not at all, and if it
+/// were told by a different validator it would report a different message for
+/// the same mistake.
+fn check_blocks<F>(
+    layout: &MetaLayout,
+    blocks: &[(&[F], usize)],
+    n_rows: usize,
+    x: Option<(&[F], usize)>,
+) -> Result<()> {
     if blocks.len() != layout.n_feature_outs.len() {
         return Err(value_err(format!(
             "layout describes {} blocks but {} were given",
@@ -360,17 +397,52 @@ pub fn concatenate_predictions(
         }
         (false, _) => {}
     }
+    Ok(())
+}
 
-    let mut out = vec![0.0f64; n_rows * layout.width];
-    for r in 0..n_rows {
-        let row = &mut out[r * layout.width..(r + 1) * layout.width];
-        for (b, (data, cols)) in blocks.iter().enumerate() {
-            let off = layout.offsets[b];
-            row[off..off + cols].copy_from_slice(&data[r * cols..(r + 1) * cols]);
+/// Assemble the meta matrix on the arm `engine` names (STACK-META-01).
+///
+/// [`MetaEngine::Host`] runs [`concatenate_predictions`] above;
+/// [`MetaEngine::Device`] runs the CubeCL scatter in
+/// [`mlrs_backend::prims::stacking_meta`]. [`MetaEngine::Numpy`] never reaches
+/// here — it is the shim's own `np.hstack` and is resolved before the FFI
+/// boundary is crossed at all — so it is treated as `Host`, which is what a
+/// Rust-native caller asking for "not the device" means.
+///
+/// Both arms produce the same bytes: the device kernel writes each block to the
+/// same offsets this host loop copies them to, and neither performs arithmetic,
+/// so the equality is bit-exact rather than within a tolerance
+/// (`crates/mlrs-backend/tests/stacking_meta_test.rs` asserts exactly that).
+pub fn concatenate_meta<F>(
+    engine: MetaEngine,
+    pool: &mut BufferPool<ActiveRuntime>,
+    layout: &MetaLayout,
+    blocks: &[(&[F], usize)],
+    n_rows: usize,
+    x: Option<(&[F], usize)>,
+) -> Result<Vec<F>>
+where
+    F: Float + CubeElement + Pod + Default,
+{
+    match engine {
+        MetaEngine::Numpy | MetaEngine::Host => {
+            concatenate_predictions(layout, blocks, n_rows, x)
         }
-        if let (true, Some((data, cols))) = (passthrough, x) {
-            row[layout.n_meta..].copy_from_slice(&data[r * cols..(r + 1) * cols]);
+        MetaEngine::Device => {
+            // The host arm's validation runs FIRST even on the device route, so
+            // a mis-shaped block reports the same sklearn-shaped `ValueError`
+            // text on both arms instead of a `PrimError` on one of them.
+            check_blocks(layout, blocks, n_rows, x)?;
+            concat_meta_device(
+                pool,
+                blocks,
+                &layout.offsets,
+                n_rows,
+                layout.n_meta,
+                layout.width,
+                x,
+            )
+            .map_err(|e| value_err(e.to_string()))
         }
     }
-    Ok(out)
 }

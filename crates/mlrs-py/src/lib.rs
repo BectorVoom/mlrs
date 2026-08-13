@@ -188,6 +188,23 @@ fn backend_supports_f64() -> bool {
     capability::supports_f64()
 }
 
+/// Can this wheel's backend launch a PLAIN f64 device kernel — no
+/// transcendentals, no matmul, just arithmetic and memory traffic?
+///
+/// The widest of the three f64 predicates, and the one a data-movement kernel
+/// needs. It differs from [`backend_supports_f64`] where the advertised flag
+/// UNDER-reports: cubecl's rocm and cuda backends do not advertise f64 (their
+/// matmul rejects f64 operands) yet run ordinary f64 kernels fine, so a caller
+/// gated on the advertised flag would refuse work the device can do.
+///
+/// Exposed so pytest can gate the f64 device cases of an arm that moves data
+/// rather than computing with it — `test_stacking_meta_engine.py`'s `device`
+/// cells are the current example.
+#[pyfunction]
+fn backend_f64_device_kernels() -> bool {
+    mlrs_backend::capability::f64_device_kernels_available()
+}
+
 /// Does this wheel's backend evaluate f64 transcendentals in device code?
 ///
 /// The narrower companion to [`backend_supports_f64`] — see
@@ -226,6 +243,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // The driver is present: register the low-level surface.
     m.add_function(wrap_pyfunction!(backend_supports_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(backend_f64_device_kernels, m)?)?;
     m.add_function(wrap_pyfunction!(backend_supports_f64_transcendental, m)?)?;
 
     // Model persistence (MODEL-PERSIST). Two free functions, both read-only and
