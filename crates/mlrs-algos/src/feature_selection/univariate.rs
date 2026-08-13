@@ -40,6 +40,7 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -52,7 +53,154 @@ use mlrs_core::{host_to_f64, PrimError};
 use crate::error::AlgoError;
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
+use super::fsel_persist::{
+    pack_bools, read_f64_vec, read_opt_f64_vec, read_score_func, read_selection_mode, read_support,
+    write_f64_vec, write_score_func, write_selection_mode, write_support, AlignedBytes, FselFile,
+    FselWriter, LoadModel, PersistError, SaveModel, TensorRef, DISCRETE_MASK_NAME,
+};
+use super::mutual_info::DiscreteFeatures;
 use super::score::{ScoreFunc, ScoreResult};
+
+/// The `estimator` discriminator written into every `UnivariateFilter` file.
+const PERSIST_TAG: &str = "univariate_filter";
+
+/// The tensor holding the per-column score, `[n_features]`.
+const SCORES_NAME: &str = "scores_";
+/// The tensor holding the per-column p-value, `[n_features]` — absent for the
+/// three score functions that produce none.
+const PVALUES_NAME: &str = "pvalues_";
+
+impl<F> SaveModel for UnivariateFilter<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted filter to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `support_` | `BOOL` | `[n_features]` |
+    /// | `scores_` | `F64` | `[n_features]` |
+    /// | `pvalues_` | `F64` | `[n_features]`, ABSENT for the score functions that produce none |
+    /// | `param:score_func` + its payload | `__metadata__` (+ one `BOOL` tensor) | — |
+    /// | `param:mode` / `param:mode_param` | `__metadata__` scalar | — |
+    /// | `param:estimator` | `__metadata__` scalar | — |
+    ///
+    /// `pvalues_`' absence is MEANINGFUL rather than a saving:
+    /// `r_regression` and both mutual-information functions produce scores only,
+    /// so an absent tensor round-trips as the `None` the estimator holds. A
+    /// zero-filled array would claim p-values the fit never computed.
+    ///
+    /// ## The one thing that cannot be saved
+    ///
+    /// [`ScoreFunc::Custom`] wraps a caller-supplied closure, which has no
+    /// on-disk representation. `save` FAILS on it rather than writing a file
+    /// that would load as `f_classif` and score every column differently —
+    /// [`write_score_func`] carries the refusal.
+    ///
+    /// `param:estimator` is the sklearn class name this filter is acting as
+    /// (`SelectKBest`, `SelectPercentile`, …). It is a `&'static str` chosen by
+    /// the constructor, not derivable from `mode` alone — `GenericUnivariateSelect`
+    /// and `SelectKBest` share a mode — so it is stored and matched on load.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows every payload.
+        let packed = pack_bools(&self.support);
+        let discrete_mask = match &self.score_func {
+            ScoreFunc::MutualInfoClassif(p) | ScoreFunc::MutualInfoRegression(p) => {
+                match &p.discrete_features {
+                    DiscreteFeatures::Mask(m) => Some(pack_bools(m)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        let mut w = FselWriter::new(PERSIST_TAG);
+        w.scalar_str("param:estimator", self.estimator);
+        write_score_func(&mut w, &self.score_func)?;
+        write_selection_mode(&mut w, &self.mode);
+        write_support(&mut w, &packed)?;
+        write_f64_vec(&mut w, SCORES_NAME, &self.scores, packed.len())?;
+        if let Some(pv) = self.pvalues.as_ref() {
+            write_f64_vec(&mut w, PVALUES_NAME, pv, packed.len())?;
+        }
+        if let Some(m) = discrete_mask.as_ref() {
+            w.tensor(
+                DISCRETE_MASK_NAME,
+                TensorRef::bools(m, vec![m.len()])?,
+            );
+        }
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for UnivariateFilter<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the filter back from `path`.
+    ///
+    /// Both enum-shaped hyperparameters are PARSED rather than trusted: an
+    /// unrecognised `score_func` or `mode` becomes a
+    /// [`PersistError::BadMetadata`] naming its key. Neither is safe to default
+    /// — the five score functions rank columns completely differently, and the
+    /// five modes turn a ranking into a different mask.
+    ///
+    /// `param:estimator` is matched against the known class names for the same
+    /// reason, since it is what a caller sees in an error message.
+    fn load(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<UnivariateFilter<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = FselFile::parse(&raw, PERSIST_TAG)?;
+        let support = read_support(&file)?;
+        let scores = read_f64_vec(&file, SCORES_NAME, support.len())?;
+        let pvalues = read_opt_f64_vec(&file, PVALUES_NAME, support.len())?;
+        let score_func = read_score_func(&file)?;
+
+        // `pvalues_`' presence is determined by the score function, so the two
+        // halves are cross-checked: a file claiming `r_regression` AND carrying
+        // p-values describes a fit that cannot have happened.
+        if pvalues.is_some() != score_func.yields_pvalues() {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "the score function {score_func:?} {} p-values, but the \'{PVALUES_NAME}\' \
+                     tensor is {}",
+                    if score_func.yields_pvalues() { "produces" } else { "does not produce" },
+                    if pvalues.is_some() { "present" } else { "absent" }
+                ),
+            });
+        }
+
+        // Matched against the closed set of tags the constructors use, and
+        // re-BORROWED as a `&'static str` from that set rather than leaked from
+        // the file: the field is `&'static str` because it is one of six known
+        // values, and a file naming a seventh is a file from a different build.
+        let estimator = match file.scalar_str("param:estimator")? {
+            "select_k_best" => "select_k_best",
+            "select_percentile" => "select_percentile",
+            "select_fpr" => "select_fpr",
+            "select_fdr" => "select_fdr",
+            "select_fwe" => "select_fwe",
+            "generic_univariate_select" => "generic_univariate_select",
+            _ => {
+                return Err(PersistError::BadMetadata {
+                    key: "param:estimator",
+                })
+            }
+        };
+
+        Ok(UnivariateFilter {
+            score_func,
+            mode: read_selection_mode(&file)?,
+            estimator,
+            scores,
+            pvalues,
+            support,
+            _state: PhantomData,
+        })
+    }
+}
 use super::selector::{
     clean_nans, inverse_transform_selected, percentile_linear, transform_selected, Selector,
 };

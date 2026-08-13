@@ -62,6 +62,10 @@
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+/// The `mlrs-fsel` model-file container — the six selectors' `save`/`load`
+/// share the support-mask layout it defines (FSEL-PERSIST, prototype).
+pub mod fsel_persist;
+
 pub mod meta;
 pub mod mutual_info;
 pub mod numpy_rng;

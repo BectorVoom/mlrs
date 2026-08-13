@@ -33,7 +33,7 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
 
 use super::ensemble_persist::{
-    as_floats, as_i64, expect_len, read_leaf_table, read_node_tables, shape_1d, widen_nodes,
+    as_floats, expect_len, read_leaf_table, read_node_tables, shape_1d, widen_nodes,
     write_node_tables, AlignedBytes, EnsembleFile, EnsembleWriter, LoadModel, PersistError,
     SaveModel, TensorRef, BASELINE_NAME, LEAF_VALUE_NAME,
 };

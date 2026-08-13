@@ -95,6 +95,35 @@ impl Default for DiscreteFeatures {
 }
 
 impl DiscreteFeatures {
+    /// The sklearn spelling of the non-mask arms: `'auto'`, `'true'` or
+    /// `'false'`.
+    ///
+    /// [`DiscreteFeatures::Mask`] renders as `"mask"` and its payload rides in a
+    /// companion `BOOL` tensor — the same split
+    /// [`KMeansInit`](crate::cluster::kmeans::KMeansInit) makes for an explicit
+    /// init array, and for the same reason: an array is not a scalar and putting
+    /// it in `__metadata__` would mean encoding a vector as text.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DiscreteFeatures::Auto => "auto",
+            DiscreteFeatures::All(true) => "true",
+            DiscreteFeatures::All(false) => "false",
+            DiscreteFeatures::Mask(_) => "mask",
+        }
+    }
+
+    /// The inverse of [`DiscreteFeatures::name`] for the three scalar arms;
+    /// `None` for an unrecognised string AND for `"mask"`, whose payload the
+    /// caller must supply from the companion tensor.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(DiscreteFeatures::Auto),
+            "true" => Some(DiscreteFeatures::All(true)),
+            "false" => Some(DiscreteFeatures::All(false)),
+            _ => None,
+        }
+    }
+
     /// Resolve to a length-`d` mask, `AlgoError` if an explicit mask has the
     /// wrong length.
     fn resolve(&self, d: usize) -> Result<Vec<bool>, AlgoError> {

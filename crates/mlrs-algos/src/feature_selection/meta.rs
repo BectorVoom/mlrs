@@ -38,6 +38,7 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -50,6 +51,14 @@ use mlrs_core::{host_to_f64, PrimError};
 use crate::error::AlgoError;
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
+use super::fsel_persist::{
+    pack_bools, read_cv, read_cv_results, read_direction, read_n_features,
+    read_rfe_step, read_sfs_target, read_support, read_threshold, reject_custom_getter,
+    write_direction, write_importance_getter, write_n_features, write_rfe_step, write_sfs_target,
+    write_support, write_threshold, AlignedBytes, CvResultsStaging, CvStaging, FselFile,
+    FselWriter, PersistError, SaveModel,
+};
+use super::fsel_persist::{read_ranking, write_ranking};
 use super::selector::{inverse_transform_selected, transform_selected, Selector};
 
 // ===========================================================================
@@ -1730,5 +1739,322 @@ where
         shape: (usize, usize),
     ) -> Result<DeviceArray<ActiveRuntime, F>, AlgoError> {
         inverse_transform_selected(self, pool, z, shape)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence (FSEL-PERSIST) — see `fsel_persist` for why the four selectors in
+// this module implement `SaveModel` but NOT `LoadModel`.
+// ---------------------------------------------------------------------------
+
+/// The `estimator` discriminator written into every `SelectFromModel` file.
+const SFM_TAG: &str = "select_from_model";
+/// The `estimator` discriminator written into every `Rfe` file.
+const RFE_TAG: &str = "rfe";
+/// The `estimator` discriminator written into every `Rfecv` file.
+const RFECV_TAG: &str = "rfecv";
+/// The `estimator` discriminator written into every `SequentialFeatureSelector`
+/// file.
+const SFS_TAG: &str = "sequential_feature_selector";
+
+impl<F, E> SaveModel for SelectFromModel<F, E, Fitted> {
+    /// Write the fitted selector to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `support_` | `BOOL` | `[n_features]` |
+    /// | `threshold_` | `__metadata__` scalar | — |
+    /// | `param:threshold` / `param:prefit` / `param:norm_order` / `param:max_features` | `__metadata__` | — |
+    /// | `importance_getter_is_custom` | `__metadata__` scalar | — |
+    ///
+    /// The INNER ESTIMATOR is not written, and cannot be: it is a caller-supplied
+    /// trait object. What this file holds is the SELECTION it produced, which is
+    /// everything `transform` needs — see
+    /// [`SelectFromModel::load_with`] for how the missing half comes back.
+    ///
+    /// `threshold_` (the resolved numeric cutoff) is stored separately from
+    /// `param:threshold` (the request), because `"mean"` and `"1.25*median"`
+    /// resolve against importances this file does not hold. The request and the
+    /// outcome are two facts, and a reloaded selector reports each.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows every payload.
+        let packed = pack_bools(&self.support);
+
+        let mut w = FselWriter::new(SFM_TAG);
+        write_threshold(&mut w, &self.threshold);
+        w.scalar_bool("param:prefit", self.prefit);
+        w.scalar_f64("param:norm_order", self.norm_order);
+        w.scalar_opt_usize("param:max_features", self.max_features);
+        write_importance_getter(&mut w, &self.importance_getter);
+        w.scalar_f64("threshold_", self.threshold_value);
+        write_support(&mut w, &packed)?;
+        w.write(path)
+    }
+}
+
+impl<F, E> SelectFromModel<F, E, Fitted>
+where
+    F: Float + CubeElement + Pod,
+    E: ImportanceEstimator,
+{
+    /// Read the selector back from `path`, taking the inner estimator from the
+    /// caller.
+    ///
+    /// This is why `SelectFromModel` does not implement
+    /// [`LoadModel`](crate::persist::LoadModel): that trait's
+    /// `load(pool, path)` has no slot for `estimator`, and the estimator is a
+    /// trait object with no on-disk representation. Requiring it here makes the
+    /// gap explicit at the call site rather than filling it with a `Default`
+    /// that would silently pair one model's `support_` with another model.
+    ///
+    /// The reloaded selector can `transform` immediately — that only reads
+    /// `support_`. The estimator matters on a subsequent `fit`, which is exactly
+    /// the operation the caller is asserting they want it for.
+    ///
+    /// A selector fitted with a custom `importance_getter` is REFUSED, because
+    /// that getter is a closure too and substituting `Auto` would change what a
+    /// re-fit selects.
+    pub fn load_with(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+        estimator: E,
+    ) -> Result<Self, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = FselFile::parse(&raw, SFM_TAG)?;
+        reject_custom_getter(&file)?;
+        let support = read_support(&file)?;
+
+        Ok(SelectFromModel {
+            estimator,
+            threshold: read_threshold(&file)?,
+            prefit: file.scalar_bool("param:prefit")?,
+            norm_order: file.scalar_f64("param:norm_order")?,
+            max_features: file.scalar_opt_usize("param:max_features")?,
+            importance_getter: ImportanceGetter::Auto,
+            threshold_value: file.scalar_f64("threshold_")?,
+            support,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F, E> SaveModel for Rfe<F, E, Fitted> {
+    /// Write the fitted selector to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `support_` | `BOOL` | `[n_features]` |
+    /// | `ranking_` | `U64` | `[n_features]` |
+    /// | `param:n_features_to_select` / `param:step` / `param:verbose` | `__metadata__` | — |
+    /// | `importance_getter_is_custom` | `__metadata__` scalar | — |
+    ///
+    /// `ranking_` carries strictly more than `support_` — a rank of 1 means
+    /// selected and higher ranks record the ORDER features were eliminated in —
+    /// so it is stored rather than derived. The two are cross-checked on load,
+    /// since a file where they disagree describes two different selections.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows every payload.
+        let packed = pack_bools(&self.support);
+        let ranking: Vec<u64> = self.ranking.iter().map(|&v| v as u64).collect();
+
+        let mut w = FselWriter::new(RFE_TAG);
+        write_n_features(&mut w, "param:n_features_to_select", &self.n_features_to_select);
+        write_rfe_step(&mut w, &self.step);
+        w.scalar_usize("param:verbose", self.verbose as usize);
+        write_importance_getter(&mut w, &self.importance_getter);
+        write_support(&mut w, &packed)?;
+        write_ranking(&mut w, &ranking, packed.len())?;
+        w.write(path)
+    }
+}
+
+impl<F, E> Rfe<F, E, Fitted>
+where
+    F: Float + CubeElement + Pod,
+    E: ImportanceEstimator,
+{
+    /// Read the selector back from `path`, taking the inner estimator from the
+    /// caller. See
+    /// [`SelectFromModel::load_with`] for why the estimator is a parameter.
+    pub fn load_with(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+        estimator: E,
+    ) -> Result<Self, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = FselFile::parse(&raw, RFE_TAG)?;
+        reject_custom_getter(&file)?;
+        let support = read_support(&file)?;
+        let ranking = read_ranking(&file, &support)?;
+
+        Ok(Rfe {
+            estimator,
+            n_features_to_select: read_n_features(&file, "param:n_features_to_select")?,
+            step: read_rfe_step(&file)?,
+            verbose: file.scalar_usize("param:verbose")? as u32,
+            importance_getter: ImportanceGetter::Auto,
+            support,
+            ranking,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F, E, C> SaveModel for Rfecv<F, E, C, Fitted> {
+    /// Write the fitted selector to `path` as a safetensors file.
+    ///
+    /// The `Rfe` layout plus the CV specification and the full `cv_results_`
+    /// table:
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `support_` / `ranking_` | `BOOL` / `U64` | `[n_features]` |
+    /// | `cv_results_*` | `U64` / `F64` / `BOOL` | see [`CvResultsStaging`] |
+    /// | `param:cv*` | `__metadata__` (+ four `U64` tensors when explicit) | — |
+    /// | `param:step` / `param:min_features_to_select` / `param:verbose` / `param:n_jobs` | `__metadata__` | — |
+    ///
+    /// `cv_results_` is stored in full rather than reduced to the winning
+    /// subset: it is what a caller plots to see whether the score curve was flat
+    /// or peaked, and none of it is recoverable from `support_`.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows every payload. Both staging
+        // types exist for exactly this — they widen and flatten into buffers the
+        // writer can borrow.
+        let packed = pack_bools(&self.support);
+        let ranking: Vec<u64> = self.ranking.iter().map(|&v| v as u64).collect();
+        let cv_staging = CvStaging::prepare(&self.cv);
+        let results = CvResultsStaging::prepare(&self.cv_results, packed.len());
+
+        let mut w = FselWriter::new(RFECV_TAG);
+        write_rfe_step(&mut w, &self.step);
+        w.scalar_usize("param:min_features_to_select", self.min_features_to_select);
+        w.scalar_usize("param:verbose", self.verbose as usize);
+        w.scalar_opt_usize("param:n_jobs", self.n_jobs);
+        write_importance_getter(&mut w, &self.importance_getter);
+        cv_staging.write_into(&mut w, &self.cv)?;
+        write_support(&mut w, &packed)?;
+        write_ranking(&mut w, &ranking, packed.len())?;
+        results.write_into(&mut w, &self.cv_results)?;
+        w.write(path)
+    }
+}
+
+impl<F, E, C> Rfecv<F, E, C, Fitted>
+where
+    F: Float + CubeElement + Pod,
+    E: ImportanceEstimator + Clone,
+    C: FoldScorer,
+{
+    /// Read the selector back from `path`, taking the inner estimator AND the
+    /// fold scorer from the caller.
+    ///
+    /// Two non-serializable halves rather than one — `Rfecv` fits the estimator
+    /// and scores with the scorer — so both are parameters. See
+    /// [`SelectFromModel::load_with`] for the reasoning.
+    pub fn load_with(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+        estimator: E,
+        scorer: C,
+    ) -> Result<Self, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = FselFile::parse(&raw, RFECV_TAG)?;
+        reject_custom_getter(&file)?;
+        let support = read_support(&file)?;
+        let ranking = read_ranking(&file, &support)?;
+        let cv_results = read_cv_results(&file, support.len())?;
+
+        Ok(Rfecv {
+            estimator,
+            scorer,
+            step: read_rfe_step(&file)?,
+            min_features_to_select: file.scalar_usize("param:min_features_to_select")?,
+            cv: read_cv(&file)?,
+            verbose: file.scalar_usize("param:verbose")? as u32,
+            n_jobs: file.scalar_opt_usize("param:n_jobs")?,
+            importance_getter: ImportanceGetter::Auto,
+            support,
+            ranking,
+            cv_results,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<F, C> SaveModel for SequentialFeatureSelector<F, C, Fitted> {
+    /// Write the fitted selector to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `support_` | `BOOL` | `[n_features]` |
+    /// | `n_features_to_select_` | `__metadata__` scalar | — |
+    /// | `param:n_features_to_select` / `param:tol` / `param:direction` / `param:cv*` / `param:n_jobs` | `__metadata__` | — |
+    ///
+    /// The simplest of the four: SFS produces no ranking (it adds or removes one
+    /// feature at a time without scoring the ones it kept against each other) and
+    /// no per-subset table, so the mask plus the resolved count is the whole
+    /// fitted state.
+    ///
+    /// `n_features_to_select_` is the RESOLVED count, distinct from the
+    /// `param:` request — `'auto'` resolves against `tol` and the feature count
+    /// at fit time, so the two are different facts.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows every payload.
+        let packed = pack_bools(&self.support);
+        let cv_staging = CvStaging::prepare(&self.cv);
+
+        let mut w = FselWriter::new(SFS_TAG);
+        write_sfs_target(&mut w, &self.n_features_to_select);
+        w.scalar_opt_f64("param:tol", self.tol);
+        write_direction(&mut w, self.direction);
+        w.scalar_opt_usize("param:n_jobs", self.n_jobs);
+        w.scalar_usize("n_features_to_select_", self.n_features_selected);
+        cv_staging.write_into(&mut w, &self.cv)?;
+        write_support(&mut w, &packed)?;
+        w.write(path)
+    }
+}
+
+impl<F, C> SequentialFeatureSelector<F, C, Fitted>
+where
+    F: Float + CubeElement + Pod,
+    C: FoldScorer,
+{
+    /// Read the selector back from `path`, taking the fold scorer from the
+    /// caller. See [`SelectFromModel::load_with`] for why it is a parameter.
+    ///
+    /// The resolved `n_features_to_select_` is cross-checked against the mask:
+    /// it is the count of selected columns by definition, so a file where the
+    /// two disagree describes a selection that cannot have been produced.
+    pub fn load_with(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+        scorer: C,
+    ) -> Result<Self, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = FselFile::parse(&raw, SFS_TAG)?;
+        let support = read_support(&file)?;
+        let n_features_selected = file.scalar_usize("n_features_to_select_")?;
+        let kept = support.iter().filter(|&&b| b).count();
+        if n_features_selected != kept {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "'n_features_to_select_' is {n_features_selected} but 'support_' keeps \
+                     {kept} columns"
+                ),
+            });
+        }
+
+        Ok(SequentialFeatureSelector {
+            scorer,
+            n_features_to_select: read_sfs_target(&file)?,
+            tol: file.scalar_opt_f64("param:tol")?,
+            direction: read_direction(&file)?,
+            cv: read_cv(&file)?,
+            n_jobs: file.scalar_opt_usize("param:n_jobs")?,
+            support,
+            n_features_selected,
+            _state: PhantomData,
+        })
     }
 }

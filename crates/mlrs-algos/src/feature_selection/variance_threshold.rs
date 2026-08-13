@@ -30,6 +30,7 @@
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -43,7 +44,86 @@ use mlrs_core::host_to_f64;
 use crate::error::AlgoError;
 use crate::typestate::{validate_geometry, Fit, Fitted, Transform, Unfit};
 
+use super::fsel_persist::{
+    pack_bools, read_f64_vec, read_support, write_f64_vec, write_support, AlignedBytes, FselFile,
+    FselWriter, LoadModel, PersistError, SaveModel,
+};
 use super::selector::{inverse_transform_selected, transform_selected, Selector};
+
+/// The `estimator` discriminator written into every `VarianceThreshold` file.
+const PERSIST_TAG: &str = "variance_threshold";
+
+/// The tensor holding the per-column variance, `[n_features]`.
+const VARIANCES_NAME: &str = "variances_";
+
+impl<F> SaveModel for VarianceThreshold<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted selector to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `support_` | `BOOL` | `[n_features]` |
+    /// | `variances_` | `F64` | `[n_features]` |
+    /// | `param:threshold` | `__metadata__` scalar | — |
+    ///
+    /// `support_` is what `transform` gathers by, and `variances_` is the
+    /// evidence behind it — stored rather than left to be re-derived, because
+    /// re-deriving would need the training data this file does not hold.
+    ///
+    /// The two are NOT redundant: `support_` is `variances_ > threshold`, so it
+    /// is derivable, but only under the exact comparison the fit used. Storing
+    /// the mask directly means a reloaded selector gathers the same columns even
+    /// if that comparison is ever tightened — and the cross-check on load is
+    /// what would catch a file where the two disagree.
+    ///
+    /// `variances_` is `F64` regardless of the estimator's `F`: the column
+    /// moments are accumulated in `f64` (see `col_moments`), so the file stores
+    /// what the model holds.
+    ///
+    /// `pool` is unused — both fitted arrays are host `Vec`s. The parameter is
+    /// present because [`SaveModel`] is one signature for every estimator.
+    fn save(&self, _pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        // Bound BEFORE the writer, which borrows every payload. `bool` is not
+        // `Pod`, so the pack is the one copy this save costs.
+        let packed = pack_bools(&self.support);
+
+        let mut w = FselWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:threshold", self.threshold);
+        write_support(&mut w, &packed)?;
+        write_f64_vec(&mut w, VARIANCES_NAME, &self.variances, packed.len())?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for VarianceThreshold<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read the selector back from `path`.
+    ///
+    /// `support_` establishes `n_features` and `variances_` is measured against
+    /// it — the file is untrusted input (T-04-01-01), and `transform` gathers
+    /// columns by the mask's indices, so a mask longer than the data it
+    /// describes would read past the end of a row.
+    fn load(
+        _pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<VarianceThreshold<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = FselFile::parse(&raw, PERSIST_TAG)?;
+        let support = read_support(&file)?;
+        let variances = read_f64_vec(&file, VARIANCES_NAME, support.len())?;
+
+        Ok(VarianceThreshold {
+            threshold: file.scalar_f64("param:threshold")?,
+            variances,
+            support,
+            _state: PhantomData,
+        })
+    }
+}
 
 /// `VarianceThreshold`'s whole `fit`, over a row-major `f64` HOST slice:
 /// `(variances_, support_mask)`.
