@@ -446,7 +446,7 @@ where
 /// `nblocks · d²`) and chunked over targets in windows of
 /// [`XTY_MULTI_MAX_TARGETS`] so the kernel's per-unit accumulator stays a
 /// comptime-sized register array. Every realistic class count is ONE window.
-fn xty_multi<F>(
+pub(crate) fn xty_multi<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     x: &DeviceArray<ActiveRuntime, F>,
     y: &DeviceArray<ActiveRuntime, F>,

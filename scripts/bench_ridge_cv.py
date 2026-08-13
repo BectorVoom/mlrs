@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """``RidgeCV`` wall-clock comparison: mlrs (cpu backend) vs scikit-learn.
 
-    python3 scripts/bench_ridge_cv.py                 # the whole suite
-    python3 scripts/bench_ridge_cv.py --only alphas   # one section
+    python3 scripts/bench_ridge_cv.py                  # the whole suite
+    python3 scripts/bench_ridge_cv.py --only alphas    # one section
+    python3 scripts/bench_ridge_cv.py --device gpu     # mlrs on the device arm
     MLRS_BENCH_REPS=9 python3 scripts/bench_ridge_cv.py
 
 ``RidgeCV``'s cost is dominated by ONE parameter — ``len(alphas)`` — and by
@@ -22,6 +23,11 @@ around the design shape alone:
   which costs a per-alpha callback and an ``n``-vector crossing the boundary).
 * **targets / weights / store_cv_results** — the remaining parameters, to show
   which ones actually move the number.
+
+``--device`` picks the mlrs execution arm (RIDGECV-02). The run PRINTS the
+``device_`` a probe fit reports, because a ``--device gpu`` sweep against a
+backend where the arm declined is a host-against-host comparison that looks
+like a result ([[mlrs-bench-verify-knob-is-live]]).
 
 ## Each library is timed in its OWN PROCESS, and that is not fussiness
 
@@ -54,6 +60,14 @@ import numpy as np
 
 REPS = int(os.environ.get("MLRS_BENCH_REPS", "7"))
 
+# Element width both libraries are fed. `float64` is the default and the one
+# every published RidgeCV number in this repo was taken at; `--dtype float32`
+# exists because a GPU backend without `f64` REJECTS an `f64` design at the
+# Python boundary (`capability::guard_f64`), so a device-arm ladder cannot be
+# run in `f64` there at all. sklearn preserves `float32` through `RidgeCV`, so
+# the comparison stays like-for-like either way.
+DTYPE = os.environ.get("MLRS_BENCH_DTYPE", "float64")
+
 
 def _splitmix64_block(seed: int, count: int) -> np.ndarray:
     """Counter-based splitmix64 — the workspace's shared deterministic stream,
@@ -79,9 +93,8 @@ def make_regression(n: int, d: int, n_targets: int = 1, seed: int = 42):
     y = x @ coef + 0.5 + 0.05 * noise
     if n_targets == 1:
         y = y[:, 0]
-    return np.ascontiguousarray(x, dtype=np.float64), np.ascontiguousarray(
-        y, dtype=np.float64
-    )
+    dt = np.dtype(DTYPE)
+    return np.ascontiguousarray(x, dtype=dt), np.ascontiguousarray(y, dtype=dt)
 
 
 def measure(fn, reps: int = REPS) -> float:
@@ -271,24 +284,36 @@ def foreign_share(before, after):
     return max(0.0, (busy - own)) / (wall * cores)
 
 
-def run_one(lib: str, names) -> dict:
+def run_one(lib: str, names, device: str = "auto") -> dict:
     """One library, this process. Brackets the timings with a cpu sample."""
+    arm = None
     if lib == "mlrs":
+        import functools
+
         import mlrs
 
-        RidgeCV = mlrs.RidgeCV
+        RidgeCV = functools.partial(mlrs.RidgeCV, device=device)
+        # Which arm actually carried a fit of the shape these ladders use. A
+        # `--device gpu` run on a backend that declined would otherwise be
+        # reported as a device result.
+        Xp, yp = make_regression(2_000, 16)
+        arm = RidgeCV().fit(Xp, yp).device_
     else:
         from sklearn.linear_model import RidgeCV
     before = _cpu_sample()
     out = {n: SECTIONS[n](RidgeCV, REPS) for n in names}
-    return {"timings": out, "foreign": foreign_share(before, _cpu_sample())}
+    return {
+        "timings": out,
+        "foreign": foreign_share(before, _cpu_sample()),
+        "arm": arm,
+    }
 
 
-def child(lib: str, names) -> dict:
+def child(lib: str, names, device: str = "auto") -> dict:
     env = dict(os.environ, MLRS_BENCH_CHILD=lib)
     proc = subprocess.run(
         [sys.executable, __file__, *sum((["--only", n] for n in names), []),
-         "--_child", lib],
+         "--device", device, "--_child", lib],
         env=env,
         capture_output=True,
         text=True,
@@ -346,23 +371,46 @@ def main() -> int:
         action="store_true",
         help="time both libraries in ONE process (the arrangement that lies)",
     )
+    ap.add_argument(
+        "--device",
+        choices=("auto", "cpu", "gpu"),
+        default="auto",
+        help="mlrs execution arm (RIDGECV-02); the run prints the arm that ran",
+    )
+    ap.add_argument(
+        "--dtype",
+        choices=("float64", "float32"),
+        default=DTYPE,
+        help="element width fed to BOTH libraries (default float64)",
+    )
     ap.add_argument("--_child", choices=("mlrs", "sklearn"), help=argparse.SUPPRESS)
     args = ap.parse_args()
     names = args.only or list(SECTIONS)
+    globals()["DTYPE"] = args.dtype
+    os.environ["MLRS_BENCH_DTYPE"] = args.dtype
 
     if args._child:
-        json.dump(run_one(args._child, names), sys.stdout)
+        json.dump(run_one(args._child, names, args.device), sys.stdout)
         return 0
 
-    print(f"reps: {REPS}   numpy {np.__version__}   cores: {os.cpu_count()}")
+    print(
+        f"reps: {REPS}   dtype: {args.dtype}   numpy {np.__version__}   "
+        f"cores: {os.cpu_count()}"
+    )
     print(f"load: {os.getloadavg()}")
     if args.same_process:
         print("MODE: both libraries in one process (results are NOT trustworthy)")
         sk = run_one("sklearn", names)
-        me = run_one("mlrs", names)
+        me = run_one("mlrs", names, args.device)
     else:
         sk = child("sklearn", names)
-        me = child("mlrs", names)
+        me = child("mlrs", names, args.device)
+    print(f"mlrs device={args.device!r} -> device_={me.get('arm')!r}")
+    if args.device == "gpu" and me.get("arm") != "gpu":
+        print(
+            "*** the device arm DECLINED on this backend: the mlrs column below "
+            "is the HOST arm, not a device result ***"
+        )
     report(names, sk["timings"], me["timings"], [sk["foreign"], me["foreign"]])
     return 0
 

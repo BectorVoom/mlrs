@@ -554,7 +554,7 @@ fn column_sums_scaled(
 
 /// One [`widen_elem`] launch producing a fresh `f64` copy of an `F`-width
 /// operand (module docs, constraint 1).
-fn widen_to_f64<F>(
+pub(crate) fn widen_to_f64<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     a: &DeviceArray<ActiveRuntime, F>,
 ) -> DeviceArray<ActiveRuntime, f64>

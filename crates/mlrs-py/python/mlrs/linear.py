@@ -319,6 +319,21 @@ class RidgeCV(_SkMultiOutputMixin, RegressorMixin, MlrsBase):
     eigendecomposition — of whichever Gram is smaller — so unlike sklearn they
     are one code path and return identical values; see the Rust module docs for
     the derivation and for the conditioning caveat that comes with it.
+
+    ``device`` (``'auto'`` / ``'cpu'`` / ``'gpu'``, DEVICE-PARAM-01) places the
+    heavy phase of the ``cv=None`` engine. The device arm carries the
+    ``O(n*d^2)`` normal equations and the whole ``O(n_alphas*n*d)`` sweep in two
+    kernel launches; the ``O(d^3)`` eigendecomposition between them stays on the
+    host on either arm. It applies to the DEFAULT engine only, and only at
+    ``n > d`` with ``d <= 256`` on a backend with ``f64`` device kernels —
+    everything else (the ``n <= d`` route, an explicit ``cv``) has one arm, and
+    :attr:`device_` then reports the ``'cpu'`` that actually carried the fit
+    rather than the preference it could not honour.
+
+    ``device='auto'`` keeps the host arm on every backend measured so far: the
+    ingress upload dominates (measured 1.1 GB/s on an integrated adapter, a
+    third of a whole device fit), and the host arm already beats sklearn several
+    times over. See ``prims::ridge_gcv::gcv_device_preferred`` for the ladders.
     """
 
     def __init__(
@@ -331,6 +346,7 @@ class RidgeCV(_SkMultiOutputMixin, RegressorMixin, MlrsBase):
         gcv_mode=None,
         store_cv_results=False,
         alpha_per_target=False,
+        device="auto",
         output_type="input",
     ):
         self.alphas = alphas
@@ -340,6 +356,7 @@ class RidgeCV(_SkMultiOutputMixin, RegressorMixin, MlrsBase):
         self.gcv_mode = gcv_mode
         self.store_cv_results = store_cv_results
         self.alpha_per_target = alpha_per_target
+        self.device = device
         self.output_type = output_type
 
     # -- parameter resolution ------------------------------------------- #
@@ -412,6 +429,7 @@ class RidgeCV(_SkMultiOutputMixin, RegressorMixin, MlrsBase):
             [float(a) for a in alphas],
             self.fit_intercept,
             "auto" if self.gcv_mode is None else self.gcv_mode,
+            self._device(),
         )
 
         if self.cv is None:

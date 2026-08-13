@@ -94,6 +94,10 @@ pub mod radius;
 // single-owner — the `radius`/`dbscan` precedent).
 pub mod ransac;
 pub mod reduce;
+// `RidgeCV`'s generalized-CV streaming sweep (RIDGECV-02) — the one kernel that
+// carries the whole `O(n·d² + n·n_alphas·d)` part of a `cv=None` fit. Owns its
+// `pub mod` (file-disjoint, single-owner — the `ransac` precedent).
+pub mod ridge_gcv;
 // Phase-10 SGD kernels (Wave-0 scaffold plan 10-01 owns this registration; the
 // Wave-1 plan drives them from `prims/sgd.rs` — file-disjoint, parallel-safe).
 // `sgd_margin` (pass 1) + `sgd_weight_update` (pass 2) are the two-pass GATHER

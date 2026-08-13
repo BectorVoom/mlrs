@@ -49,6 +49,11 @@ pub mod gmm_device;
 // cannot tolerate; this module widens on the device and keeps the whole
 // reduction there, so the design never round-trips to the host.
 pub mod normal_eq;
+// DEVICE arm of `RidgeCV`'s generalized-CV engine (RIDGECV-02) — the uploaded
+// design, the `f64` normal-equation phase, and the one-launch streaming sweep
+// that carries the alpha grid. Its `f64` pinning is `normal_eq`'s, for the
+// stronger reason: the LOO denominator is a cancellation that is DIVIDED by.
+pub mod ridge_gcv;
 // Phase-7 prim stubs (Wave-0 scaffold owns these registrations; plans 07-02
 // (rng) / 07-03 (incremental_svd) fill their own file body — file-disjoint,
 // parallel-safe). Each is an empty compiling module until its plan adds the

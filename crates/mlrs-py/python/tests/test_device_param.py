@@ -13,10 +13,13 @@ it. ``BayesianRidge`` is the live example on this backend: its device Gram is
 gated on an ``f64`` capability that a small ``d`` does not clear, so
 ``device='gpu'`` legitimately comes back ``device_ == 'cpu'``.
 
-Only estimators with a REAL two-arm split take the parameter. Spectral*,
-RidgeCV and friends deliberately do not — advertising a choice that does not
+Only estimators with a REAL two-arm split take the parameter. Spectral* and
+``LinearRegression`` deliberately do not — advertising a choice that does not
 exist would be worse than omitting it — and ``test_single_arm_estimators_have_
-no_device`` holds that line.
+no_device`` holds that line. ``RidgeCV`` moved OFF that list in RIDGECV-02 when
+its GCV engine gained a device arm; the configurations that still have one arm
+(the ``n <= d`` route, an explicit ``cv``) are covered by
+``test_ridge_cv_single_arm_configurations_report_the_host``.
 """
 
 import numpy as np
@@ -152,6 +155,15 @@ CASES = [
         lambda d: mlrs.HistGradientBoostingClassifier(max_iter=5, device=d),
         "labels",
         None,
+    ),
+    (
+        # RIDGECV-02. `n > d` on the `design()` fixture, so this is the route
+        # that HAS two arms; whether the device one is reachable depends on the
+        # backend, which is exactly what `device_` reports.
+        "RidgeCV",
+        lambda d: mlrs.RidgeCV(alphas=(0.1, 1.0, 10.0), device=d),
+        True,
+        "coef_",
     ),
 ]
 IDS = [c[0] for c in CASES]
@@ -376,15 +388,49 @@ def test_single_arm_estimators_have_no_device():
 
     ``SpectralEmbedding``/``SpectralClustering`` return ``True`` unconditionally
     from ``host_fit_applicable`` — their own docs say the predicate is kept only
-    "if a device arm ever returns" — and ``RidgeCV``'s engines are host-only.
-    Accepting ``device`` there and ignoring it would be a lie in the API.
+    "if a device arm ever returns". Accepting ``device`` there and ignoring it
+    would be a lie in the API.
     """
     for est in (
         mlrs.SpectralEmbedding(n_components=2),
         mlrs.SpectralClustering(n_clusters=2),
-        mlrs.RidgeCV(),
         mlrs.LinearRegression(),
     ):
         assert "device" not in est.get_params(), (
             f"{type(est).__name__} has one arm but advertises `device`"
         )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        # `n <= d`: the wide route's cost is a SERIAL O(n^3) `sym_eig` of the
+        # n x n Gram, which no kernel here addresses.
+        lambda d: ("wide", mlrs.RidgeCV(alphas=(0.1, 1.0), device=d)),
+        # An explicit `cv` is a per-split Cholesky grid — a different engine
+        # entirely, and a host-only one.
+        lambda d: ("cv", mlrs.RidgeCV(alphas=(0.1, 1.0), cv=3, device=d)),
+    ],
+    ids=["wide-route", "explicit-cv"],
+)
+def test_ridge_cv_single_arm_configurations_report_the_host(factory):
+    """``device`` is a PREFERENCE, and the configurations of ``RidgeCV`` that
+    have one arm must say so rather than report the arm that was asked for.
+
+    This is the ``solver_`` precedent: sklearn's own ``Ridge`` accepts
+    ``solver='auto'`` and then tells you what ran. Without it the parameter
+    would be silently inert in exactly the configurations where a user most
+    wants to know.
+    """
+    dtype = default_float_dtype()
+    kind, est = factory("gpu")
+    if kind == "wide":
+        rs = np.random.RandomState(3)
+        X = np.ascontiguousarray(rs.normal(size=(20, 40)), dtype=dtype)
+        y = np.ascontiguousarray(rs.normal(size=20), dtype=dtype)
+    else:
+        X, y = design()
+    est.fit(X, y)
+    assert est.device_ == "cpu", (
+        f"RidgeCV({kind}) has no device arm but reported {est.device_!r}"
+    )

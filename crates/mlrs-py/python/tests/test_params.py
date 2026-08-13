@@ -57,6 +57,7 @@ EXPECTED_PARAMS = {
         "gcv_mode": None,
         "store_cv_results": False,
         "alpha_per_target": False,
+        "device": "auto",
         "output_type": "input",
     },
     # RidgeClassifier carries sklearn's FULL RidgeClassifier signature
