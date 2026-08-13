@@ -319,6 +319,15 @@ Reading the ladder:
   headline. It is not a defect in the stacking layer, and nothing in this
   document's parity section depends on it.
 
+  **FIXED (PERF-GNB-01).** `mlrs.GaussianNB.predict_proba` now runs at
+  **1.6–4.0x of sklearn** rather than 0.25x — 3.6–8.0x faster than the numbers in
+  the table above — after hoisting a per-element `ln` out of the
+  joint-log-likelihood loop, halving the softmax's transcendental work, and
+  moving the NB predict surface off the Python-list egress. The two inverted
+  cells above therefore no longer describe the current tree; the *reasoning* is
+  kept because the attribution technique (swap one component, then time a single
+  member at the ladder's shape) is what found it.
+
 > The margin-pair rows use `mlrs.RidgeClassifier`, whose dispatch is being
 > reworked on a parallel branch (a measured host/device cost model in place of a
 > constant floor). Treat those cells as a **pre-fix lower bound**; re-measure

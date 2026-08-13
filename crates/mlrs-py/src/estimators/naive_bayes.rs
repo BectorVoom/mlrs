@@ -61,6 +61,14 @@ use mlrs_algos::typestate::{
     PredictProba as TypestatePredictProba,
 };
 
+// PERF-GNB-01: the whole predict surface egresses as Arrow rather than as a
+// Python `list`. Returning a `Vec<F>` from a `#[pymethods]` function makes PyO3
+// box one Python object PER ELEMENT, which `np.asarray` then converts a second
+// time — 16.2 ms for a 1 000 000-element result against 0.001 ms for the arrow
+// view (see `egress::f32_vec_to_pyarrow`). A `predict_proba` returns
+// `rows x n_classes` of them, so the boxing was the single largest term in a
+// multiclass NB predict.
+use crate::egress::{f32_vec_to_pyarrow, f64_vec_to_pyarrow, i32_vec_to_pyarrow};
 use crate::errors::{
     algo_err_to_py, build_err_to_py, dtype_mismatch, nonfinite_input_err, not_fitted,
 };
@@ -166,6 +174,9 @@ macro_rules! nb_surface_fns {
     ($any:ident, $name:literal,
      $labels:ident, $pf32:ident, $pf64:ident, $lpf32:ident, $lpf64:ident,
      $score:ident, $classes:ident, $fitted:ident, $dtype:ident) => {
+        // Returns the labels on the HOST rather than as arrow: `$score`
+        // consumes them directly, and the arrow conversion belongs at the
+        // `#[pymethods]` boundary that actually hands them to Python.
         fn $labels(
             inner: &$any,
             py: Python<'_>,
@@ -196,15 +207,15 @@ macro_rules! nb_surface_fns {
             })
         }
 
-        fn $pf32(
+        fn $pf32<'py>(
             inner: &$any,
-            py: Python<'_>,
+            py: Python<'py>,
             x: &Bound<'_, PyAny>,
             rows: usize,
             cols: usize,
-        ) -> PyResult<Vec<f32>> {
+        ) -> PyResult<Bound<'py, PyAny>> {
             let xa = capsule_to_array(x)?;
-            py.detach(|| {
+            let values = py.detach(|| -> PyResult<Vec<f32>> {
                 let mut pool = crate::lock_pool();
                 match inner {
                     $any::F32(est) => {
@@ -220,17 +231,18 @@ macro_rules! nb_surface_fns {
                     $any::F64(_) => Err(dtype_mismatch($name, "f32", "f64")),
                     _ => Err(not_fitted($name, "predict_proba (f32 path)")),
                 }
-            })
+            })?;
+            f32_vec_to_pyarrow(py, values)
         }
-        fn $pf64(
+        fn $pf64<'py>(
             inner: &$any,
-            py: Python<'_>,
+            py: Python<'py>,
             x: &Bound<'_, PyAny>,
             rows: usize,
             cols: usize,
-        ) -> PyResult<Vec<f64>> {
+        ) -> PyResult<Bound<'py, PyAny>> {
             let xa = capsule_to_array(x)?;
-            py.detach(|| {
+            let values = py.detach(|| -> PyResult<Vec<f64>> {
                 let mut pool = crate::lock_pool();
                 match inner {
                     $any::F64(est) => {
@@ -244,18 +256,19 @@ macro_rules! nb_surface_fns {
                     $any::F32(_) => Err(dtype_mismatch($name, "f64", "f32")),
                     _ => Err(not_fitted($name, "predict_proba (f64 path)")),
                 }
-            })
+            })?;
+            f64_vec_to_pyarrow(py, values)
         }
 
-        fn $lpf32(
+        fn $lpf32<'py>(
             inner: &$any,
-            py: Python<'_>,
+            py: Python<'py>,
             x: &Bound<'_, PyAny>,
             rows: usize,
             cols: usize,
-        ) -> PyResult<Vec<f32>> {
+        ) -> PyResult<Bound<'py, PyAny>> {
             let xa = capsule_to_array(x)?;
-            py.detach(|| {
+            let values = py.detach(|| -> PyResult<Vec<f32>> {
                 let mut pool = crate::lock_pool();
                 match inner {
                     $any::F32(est) => {
@@ -269,17 +282,18 @@ macro_rules! nb_surface_fns {
                     $any::F64(_) => Err(dtype_mismatch($name, "f32", "f64")),
                     _ => Err(not_fitted($name, "predict_log_proba (f32 path)")),
                 }
-            })
+            })?;
+            f32_vec_to_pyarrow(py, values)
         }
-        fn $lpf64(
+        fn $lpf64<'py>(
             inner: &$any,
-            py: Python<'_>,
+            py: Python<'py>,
             x: &Bound<'_, PyAny>,
             rows: usize,
             cols: usize,
-        ) -> PyResult<Vec<f64>> {
+        ) -> PyResult<Bound<'py, PyAny>> {
             let xa = capsule_to_array(x)?;
-            py.detach(|| {
+            let values = py.detach(|| -> PyResult<Vec<f64>> {
                 let mut pool = crate::lock_pool();
                 match inner {
                     $any::F64(est) => {
@@ -293,7 +307,8 @@ macro_rules! nb_surface_fns {
                     $any::F32(_) => Err(dtype_mismatch($name, "f64", "f32")),
                     _ => Err(not_fitted($name, "predict_log_proba (f64 path)")),
                 }
-            })
+            })?;
+            f64_vec_to_pyarrow(py, values)
         }
 
         fn $score(
@@ -478,19 +493,19 @@ impl PyGaussianNB {
         Ok(())
     }
 
-    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
-        g_labels(&self.inner, py, x, rows, cols)
+    fn predict_labels<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        i32_vec_to_pyarrow(py, g_labels(&self.inner, py, x, rows, cols)?)
     }
-    fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         g_pf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         g_pf64(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_log_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         g_lpf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_log_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         g_lpf64(&self.inner, py, x, rows, cols)
     }
     fn score(&self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<f64> {
@@ -674,19 +689,19 @@ impl PyMultinomialNB {
         Ok(())
     }
 
-    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
-        m_labels(&self.inner, py, x, rows, cols)
+    fn predict_labels<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        i32_vec_to_pyarrow(py, m_labels(&self.inner, py, x, rows, cols)?)
     }
-    fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         m_pf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         m_pf64(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_log_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         m_lpf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_log_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         m_lpf64(&self.inner, py, x, rows, cols)
     }
     fn score(&self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<f64> {
@@ -869,19 +884,19 @@ impl PyBernoulliNB {
         Ok(())
     }
 
-    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
-        b_labels(&self.inner, py, x, rows, cols)
+    fn predict_labels<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        i32_vec_to_pyarrow(py, b_labels(&self.inner, py, x, rows, cols)?)
     }
-    fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         b_pf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         b_pf64(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_log_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         b_lpf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_log_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         b_lpf64(&self.inner, py, x, rows, cols)
     }
     fn score(&self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<f64> {
@@ -1062,19 +1077,19 @@ impl PyComplementNB {
         Ok(())
     }
 
-    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
-        c_labels(&self.inner, py, x, rows, cols)
+    fn predict_labels<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        i32_vec_to_pyarrow(py, c_labels(&self.inner, py, x, rows, cols)?)
     }
-    fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         c_pf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         c_pf64(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_log_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         c_lpf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_log_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         c_lpf64(&self.inner, py, x, rows, cols)
     }
     fn score(&self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<f64> {
@@ -1313,19 +1328,19 @@ impl PyCategoricalNB {
         Ok(())
     }
 
-    fn predict_labels(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<i32>> {
-        k_labels(&self.inner, py, x, rows, cols)
+    fn predict_labels<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
+        i32_vec_to_pyarrow(py, k_labels(&self.inner, py, x, rows, cols)?)
     }
-    fn predict_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         k_pf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         k_pf64(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f32(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f32>> {
+    fn predict_log_proba_f32<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         k_lpf32(&self.inner, py, x, rows, cols)
     }
-    fn predict_log_proba_f64(&self, py: Python<'_>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Vec<f64>> {
+    fn predict_log_proba_f64<'py>(&self, py: Python<'py>, x: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<Bound<'py, PyAny>> {
         k_lpf64(&self.inner, py, x, rows, cols)
     }
     fn score(&self, py: Python<'_>, x: &Bound<'_, PyAny>, y: &Bound<'_, PyAny>, rows: usize, cols: usize) -> PyResult<f64> {
