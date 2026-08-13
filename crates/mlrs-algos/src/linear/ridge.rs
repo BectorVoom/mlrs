@@ -222,6 +222,7 @@
 //! an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -247,6 +248,14 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+// LINEAR-PERSIST: the safetensors container. Ridge rides the SAME dense-linear
+// core as `LinearRegression` and adds only its own scalars — plus the one
+// genuine difference in the family, the features-major `coef_` layout the
+// `to_targets_major` / `to_features_major` pair reconciles at the file boundary.
+use crate::linear::linear_persist::{
+    read_linear_core, to_features_major, to_targets_major, AlignedBytes, LinearCoreRef, LinearFile,
+    LinearWriter, LoadModel, PersistError, SaveModel,
+};
 use crate::linear::ridge_solvers;
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
@@ -1627,6 +1636,210 @@ where
             n_targets,
         )?)
     }
+}
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`] — what stops a `Ridge` file loading as a
+/// `LinearRegression`, which matters precisely because the two are the same
+/// `mlrs-linear` container with the same two tensors and would otherwise
+/// cross-load, silently dropping every hyperparameter below.
+const PERSIST_TAG: &str = "ridge";
+
+/// `__metadata__` keys for the state Ridge carries beyond the shared core.
+///
+/// Spelled as constants rather than inline literals only where the same key is
+/// read and written in two places — the file's schema is small enough that a
+/// typo in one half and not the other is the realistic failure, and these are
+/// the keys where `save` and `load` sit ~100 lines apart.
+const KEY_SOLVER: &str = "param:solver";
+const KEY_DEVICE: &str = "param:device";
+const KEY_SOLVER_FITTED: &str = "solver_";
+const KEY_DEVICE_FITTED: &str = "device_";
+
+impl<F> SaveModel for Ridge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// The shared dense-linear core — `coef_` as `[n_targets, n_features]`,
+    /// `intercept_` as `[n_targets]`, both at the model's own float width —
+    /// plus Ridge's own scalars, all in `__metadata__`:
+    ///
+    /// | key | what |
+    /// |---|---|
+    /// | `param:alpha`, `param:tol` | the two float knobs |
+    /// | `param:copy_X`, `param:positive` | the two bool knobs |
+    /// | `param:max_iter`, `param:random_state` | OPTIONAL — absent means `None`, which is a distinct value from any number |
+    /// | `param:solver`, `param:device` | the enum knobs, by their sklearn/mlrs names |
+    /// | `n_iter_`, `solver_`, `device_` | the FITTED diagnostics: what actually ran |
+    ///
+    /// `solver_`/`device_` are fitted attributes, not inputs, and are stored for
+    /// the same reason sklearn exposes them: `param:solver` may be `auto` and
+    /// `param:device` may be `Auto`, so neither one tells a reloaded model's
+    /// user what produced the numbers. Round-tripping the resolved pair is what
+    /// keeps [`Ridge::solver`] and [`Ridge::device`] answering truthfully after
+    /// a load.
+    ///
+    /// ## The layout hop
+    ///
+    /// Ridge holds `coef_` FEATURES-major (`n_features × n_targets`) for its
+    /// fused predict GEMM, while the file stores sklearn's TARGETS-major
+    /// orientation. [`to_targets_major`] bridges the two and borrows outright
+    /// for `n_targets == 1` — which is every model `fit` itself produces — so
+    /// the single-target save is still one device readback and nothing else.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `LinearWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let coef_host = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+        let solver_ = self.solver_.ok_or_else(|| absent("solver_"))?;
+        let device_ = self.device_.ok_or_else(|| absent("device_"))?;
+
+        // `n_targets` is `intercept_.len()` — the same derivation
+        // [`Ridge::n_targets`] makes, so the two cannot drift — and
+        // `n_features` follows from `coef_`. Checked rather than assumed
+        // because a `save` that emitted a shape disagreeing with its payload
+        // would put a corrupt file on disk that only fails at LOAD time.
+        let n_targets = intercept.len();
+        if n_targets == 0 || coef_host.len() % n_targets != 0 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "fitted coef_ holds {} elements, which is not a whole number of \
+                     {n_targets}-target rows",
+                    coef_host.len()
+                ),
+            });
+        }
+        let n_features = coef_host.len() / n_targets;
+        let coef = to_targets_major(&coef_host, n_features, n_targets);
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:alpha", host_to_f64(self.alpha));
+        // sklearn spells this one with a capital X; the `param:` names are its
+        // CONSTRUCTOR names, so this follows sklearn rather than the Rust field.
+        w.scalar_bool("param:copy_X", self.copy_x);
+        w.scalar_opt_usize("param:max_iter", self.max_iter);
+        w.scalar_f64("param:tol", self.tol);
+        w.scalar_str(KEY_SOLVER, self.solver.name());
+        w.scalar_bool("param:positive", self.positive);
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_str(KEY_DEVICE, self.device.name());
+        w.scalar_opt_usize("n_iter_", self.n_iter_);
+        w.scalar_str(KEY_SOLVER_FITTED, solver_.name());
+        w.scalar_str(KEY_DEVICE_FITTED, device_);
+
+        LinearCoreRef {
+            coef: &coef,
+            intercept: &intercept,
+            n_targets,
+            n_features,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for Ridge<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site, either
+    /// by turbofish or by annotating the binding:
+    ///
+    /// ```ignore
+    /// let est: Ridge<f32, Fitted> = Ridge::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with: an `f32` model
+    /// loads into a `Ridge<f64>` (and back) through
+    /// [`as_floats`](crate::persist::as_floats). Note that this widens `alpha`
+    /// too — it is stored as a decimal `__metadata__` scalar, which round-trips
+    /// EXACTLY through `f32` and `f64` alike, so a reloaded model's penalty is
+    /// the one that was fitted with, not a re-rounded approximation of it.
+    ///
+    /// The file is untrusted input (T-04-01-01), so every extent it declares is
+    /// checked against every other, and every enum-shaped scalar is parsed
+    /// rather than trusted — an unrecognised `solver` is a
+    /// [`PersistError::BadMetadata`] naming the key, not a silent fallback to
+    /// `auto` that would change what the model computes.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<Ridge<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+
+        // Back to Ridge's own features-major layout; a no-op borrow for the
+        // single-target models `fit` produces.
+        let coef_host = to_features_major(&core.coef, core.n_targets, core.n_features);
+
+        let solver = parse_solver(&file, KEY_SOLVER)?;
+        let solver_ = parse_solver(&file, KEY_SOLVER_FITTED)?;
+        let device = parse_device(&file, KEY_DEVICE)?;
+        // `device_` is a `&'static str` in the struct, so it cannot come from
+        // the file's `String` directly — round-tripping it through `Device`
+        // both validates it and yields the `'static` name.
+        let device_ = parse_device(&file, KEY_DEVICE_FITTED)?.name();
+
+        Ok(Ridge {
+            alpha: f64_to_host::<F>(file.scalar_f64("param:alpha")?),
+            fit_intercept: core.fit_intercept,
+            copy_x: file.scalar_bool("param:copy_X")?,
+            max_iter: file.scalar_opt_usize("param:max_iter")?,
+            tol: file.scalar_f64("param:tol")?,
+            solver,
+            positive: file.scalar_bool("param:positive")?,
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            device,
+            coef_: Some(DeviceArray::from_host(pool, &coef_host)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            n_iter_: file.scalar_opt_usize("n_iter_")?,
+            solver_: Some(solver_),
+            device_: Some(device_),
+            // The mirrors are `predict_from_host` memos, not model state — a
+            // freshly loaded model refills them on first use, exactly as a
+            // freshly fitted one does.
+            predict_mirror: HostMirror::new(),
+            predict_mirror_multi: HostMirrorMulti::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+/// Read a `RidgeSolver` out of a `__metadata__` string scalar.
+///
+/// [`RidgeSolver`]'s own `TryFrom<&str>` yields a [`BuildError`], which is the
+/// right error for a *constructor* argument and the wrong one for a file: a
+/// caller of `load` wants to know WHICH key in the file was bad, which is what
+/// [`PersistError::BadMetadata`] carries.
+fn parse_solver(file: &LinearFile<'_>, key: &'static str) -> Result<RidgeSolver, PersistError> {
+    RidgeSolver::try_from(file.scalar_str(key)?).map_err(|_| PersistError::BadMetadata { key })
+}
+
+/// Read a [`Device`] out of a `__metadata__` string scalar, for the same reason
+/// [`parse_solver`] exists — `Device::from_name` returns a bare `Option`.
+fn parse_device(file: &LinearFile<'_>, key: &'static str) -> Result<Device, PersistError> {
+    Device::from_name(file.scalar_str(key)?).ok_or(PersistError::BadMetadata { key })
 }
 
 impl<F> Fit<F> for Ridge<F, Unfit>

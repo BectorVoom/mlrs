@@ -34,6 +34,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -48,6 +49,13 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::coordinate_descent::{cd_fit, CD_DEFAULT_MAX_ITER, CD_DEFAULT_TOL};
+// LINEAR-PERSIST: the safetensors container. ElasticNet is the shared
+// dense-linear core plus the coordinate-descent knobs it holds identically with
+// `Lasso`, plus the ONE field that distinguishes the two — `l1_ratio`.
+use crate::linear::linear_persist::{
+    read_linear_core, AlignedBytes, CdScalars, LinearCoreRef, LinearFile, LinearWriter, LoadModel,
+    PersistError, SaveModel,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// L1+L2-penalized least squares (LINEAR-04) fitted by the shared
@@ -296,6 +304,126 @@ where
             x,
             shape,
         )
+    }
+}
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`]. See [`lasso`](crate::linear::lasso)'s counterpart for
+/// why it is what stops these two near-identical files cross-loading.
+const PERSIST_TAG: &str = "elastic_net";
+
+/// The `__metadata__` key for the one field that distinguishes an `ElasticNet`
+/// file from a `Lasso` one. Named as a constant precisely because it is the
+/// whole difference — `save` and `load` disagreeing on it would produce a model
+/// that silently reverts to the `l1_ratio = 0.5` default.
+const KEY_L1_RATIO: &str = "param:l1_ratio";
+
+impl<F> SaveModel for ElasticNet<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// The shared dense-linear core — `coef_` as `[1, n_features]`,
+    /// `intercept_` as `[1]`, both at the model's own float width — plus the
+    /// three [`CdScalars`] and `param:l1_ratio`, all in `__metadata__`.
+    /// ElasticNet is single-target and reports no fitted diagnostics, so that is
+    /// the whole file: byte for byte a `Lasso` file with one extra header key.
+    ///
+    /// `coef_`/`intercept_` are device-resident, so this costs one readback
+    /// each — the only copies on the path.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `LinearWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        CdScalars {
+            alpha: host_to_f64(self.alpha),
+            max_iter: self.max_iter,
+            tol: self.tol,
+        }
+        .write_into(&mut w);
+        w.scalar_f64(KEY_L1_RATIO, host_to_f64(self.l1_ratio));
+        LinearCoreRef {
+            n_features: coef.len(),
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: 1,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for ElasticNet<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site, either
+    /// by turbofish or by annotating the binding:
+    ///
+    /// ```ignore
+    /// let est: ElasticNet<f32, Fitted> = ElasticNet::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with — see
+    /// [`as_floats`](crate::persist::as_floats). `l1_ratio` is REQUIRED rather
+    /// than defaulted: a file missing it is corrupt, and quietly substituting
+    /// `0.5` would hand back a model with a different penalty than the one that
+    /// was fitted.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<ElasticNet<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        let cd = CdScalars::read(&file)?;
+
+        // ElasticNet is single-target — same reasoning as `Lasso::load`.
+        if core.n_targets != 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "elastic_net is single-target, but 'coef_' declares {} target rows",
+                    core.n_targets
+                ),
+            });
+        }
+
+        Ok(ElasticNet {
+            alpha: f64_to_host::<F>(cd.alpha),
+            l1_ratio: f64_to_host::<F>(file.scalar_f64(KEY_L1_RATIO)?),
+            fit_intercept: core.fit_intercept,
+            max_iter: cd.max_iter,
+            tol: cd.tol,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            // The mirror is a `predict_from_host` memo, not model state — a
+            // freshly loaded model refills it on first use, exactly as a
+            // freshly fitted one does.
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
     }
 }
 

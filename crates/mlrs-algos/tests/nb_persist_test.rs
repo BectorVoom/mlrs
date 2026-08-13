@@ -1065,8 +1065,8 @@ fn a_foreign_safetensors_file_is_rejected() {
         Err(e) => e,
     };
     assert!(
-        matches!(&err, PersistError::NotAnNbModel { .. }),
-        "expected NotAnNbModel, got {err:?}"
+        matches!(&err, PersistError::NotAnMlrsModel { .. }),
+        "expected NotAnMlrsModel, got {err:?}"
     );
 }
 

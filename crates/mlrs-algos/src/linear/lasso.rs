@@ -25,6 +25,7 @@
 //! in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -38,6 +39,14 @@ use mlrs_core::{f64_to_host, host_to_f64};
 use crate::error::{AlgoError, BuildError};
 use crate::linear::coordinate_descent::{cd_fit, CD_DEFAULT_MAX_ITER, CD_DEFAULT_TOL};
 use crate::linear::elastic_net::{predict_linear, predict_linear_from_host};
+// LINEAR-PERSIST: the safetensors container. Lasso is the shared dense-linear
+// core plus the coordinate-descent knobs it holds identically with
+// `ElasticNet` — nothing else, since `Lasso` IS `ElasticNet` at `l1_ratio == 1`
+// and does not even carry that field.
+use crate::linear::linear_persist::{
+    read_linear_core, AlignedBytes, CdScalars, LinearCoreRef, LinearFile, LinearWriter, LoadModel,
+    PersistError, SaveModel,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// L1-penalized least squares (LINEAR-03) — the `l1_ratio == 1` case of
@@ -259,6 +268,125 @@ where
             x,
             shape,
         )
+    }
+}
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+///
+/// It carries real weight here: a `Lasso` file and an `ElasticNet` file with
+/// `l1_ratio = 1` describe the SAME model and hold the same core, differing only
+/// by that one key. Without the discriminator each would load as the other, and
+/// an `ElasticNet` file with any other `l1_ratio` would load as a `Lasso` that
+/// silently ignores the L2 half of the penalty it was fitted with.
+const PERSIST_TAG: &str = "lasso";
+
+impl<F> SaveModel for Lasso<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// The shared dense-linear core — `coef_` as `[1, n_features]`,
+    /// `intercept_` as `[1]`, both at the model's own float width — plus the
+    /// three [`CdScalars`] in `__metadata__` (`param:alpha`,
+    /// `param:max_iter`, `param:tol`). Lasso is single-target and reports no
+    /// fitted diagnostics, so that is the whole file.
+    ///
+    /// `coef_`/`intercept_` are device-resident, so this costs one readback
+    /// each — the only copies on the path.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `LinearWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        CdScalars {
+            alpha: host_to_f64(self.alpha),
+            max_iter: self.max_iter,
+            tol: self.tol,
+        }
+        .write_into(&mut w);
+        LinearCoreRef {
+            n_features: coef.len(),
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: 1,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for Lasso<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site, either
+    /// by turbofish or by annotating the binding:
+    ///
+    /// ```ignore
+    /// let est: Lasso<f32, Fitted> = Lasso::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with — see
+    /// [`as_floats`](crate::persist::as_floats). The file is untrusted input
+    /// (T-04-01-01), so every extent it declares is checked against every other
+    /// before any value is stored.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<Lasso<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        let cd = CdScalars::read(&file)?;
+
+        // Lasso is single-target. The shared core admits `n_targets > 1` for the
+        // multi-output members of the family, so a file claiming more targets
+        // than this estimator can hold is rejected HERE rather than silently
+        // loading a matrix whose extra rows `predict` would never read.
+        if core.n_targets != 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "lasso is single-target, but 'coef_' declares {} target rows",
+                    core.n_targets
+                ),
+            });
+        }
+
+        Ok(Lasso {
+            alpha: f64_to_host::<F>(cd.alpha),
+            fit_intercept: core.fit_intercept,
+            max_iter: cd.max_iter,
+            tol: cd.tol,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            // The mirror is a `predict_from_host` memo, not model state — a
+            // freshly loaded model refills it on first use, exactly as a
+            // freshly fitted one does.
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
     }
 }
 

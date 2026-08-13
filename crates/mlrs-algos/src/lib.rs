@@ -85,6 +85,13 @@ pub mod mixture;
 pub mod model_selection;
 pub mod naive_bayes;
 pub mod neighbors;
+// The estimator-agnostic safetensors model container (`SaveModel`/`LoadModel`,
+// the aligned zero-copy read path, the typed tensor accessors). Each estimator
+// family pins its own `Container` discriminator on top — `naive_bayes::
+// nb_persist` (`mlrs-nb`) and `linear::linear_persist` (`mlrs-linear`) — and
+// each estimator implements `save`/`load` in its OWN module, which is what
+// keeps the fitted fields private.
+pub mod persist;
 // The sklearn `preprocessing` scaler family (PREP-01, Phase 24): `StandardScaler`
 // / `MinMaxScaler` / `MaxAbsScaler` / `RobustScaler` / `Normalizer` /
 // `Binarizer`, each `Fit` + `Transform` (`typestate`) over host-computed column

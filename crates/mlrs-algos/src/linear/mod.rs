@@ -61,7 +61,43 @@
 //! and create the matching file; they do NOT edit `lib.rs` (owned by 04-01),
 //! keeping the estimator plans file-disjoint and parallel-safe.
 //!
+//! ## Persistence (LINEAR-PERSIST, prototype)
+//!
+//! [`linear_persist`] pins the `mlrs-linear` discriminator on the shared
+//! [`persist`](crate::persist) safetensors container and owns the dense-linear
+//! core — one row-major `[n_targets, n_features]` `coef_` tensor plus an
+//! `[n_targets]` `intercept_`, with every constructor scalar in `__metadata__`
+//! and nothing derivable written twice. Each estimator implements
+//! [`SaveModel`](crate::persist::SaveModel) /
+//! [`LoadModel`](crate::persist::LoadModel) in its OWN file against that core,
+//! which is what keeps the fitted fields private — the same shape
+//! [`naive_bayes`](crate::naive_bayes) uses, and the reason neither family
+//! needed a `Serialize` derive across every estimator struct.
+//!
+//! Four estimators are wired, and between them they cover every shape the
+//! format has to handle:
+//!
+//! | estimator | what it adds to the core |
+//! |---|---|
+//! | [`LinearRegression`](linear_regression::LinearRegression) | nothing — its whole fitted state IS the core |
+//! | [`Ridge`](ridge::Ridge) | eight hyperparameters (two `Option`s, two enums), three fitted diagnostics (`n_iter_`/`solver_`/`device_`), multi-target `coef_` |
+//! | [`Lasso`](lasso::Lasso) | the shared [`CdScalars`](linear_persist::CdScalars) |
+//! | [`ElasticNet`](elastic_net::ElasticNet) | those plus `param:l1_ratio` |
+//!
+//! Two of those are worth knowing about before adding the fifth. Ridge holds
+//! `coef_` FEATURES-major for its fused predict GEMM while the file stores
+//! sklearn's TARGETS-major orientation, which
+//! [`linear_persist::to_targets_major`] reconciles at the boundary — a borrow,
+//! not a copy, for every single-target model. And `Lasso`/`ElasticNet` are near
+//! duplicates on disk (`Lasso` IS `ElasticNet` at `l1_ratio == 1`), which is
+//! what makes the `estimator` discriminator load bearing: it is the only thing
+//! stopping an `ElasticNet` file loading as a `Lasso` that quietly drops the L2
+//! half of the penalty. Whatever the remaining members need is a subset of
+//! these four.
+//!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
+
+pub mod linear_persist;
 
 pub mod bayesian_ridge;
 pub mod coordinate_descent;

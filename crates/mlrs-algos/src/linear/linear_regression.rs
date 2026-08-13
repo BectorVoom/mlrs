@@ -36,6 +36,7 @@
 //! (AGENTS.md §2), never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -53,6 +54,13 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
 use crate::linear::elastic_net::predict_linear_from_host;
+// LINEAR-PERSIST: the safetensors container. `LinearRegression` is the wired
+// prototype for the dense-linear family — its whole fitted state IS the shared
+// core, so `save`/`load` are that core plus nothing.
+use crate::linear::linear_persist::{
+    read_linear_core, AlignedBytes, LinearCoreRef, LinearFile, LinearWriter, LoadModel,
+    PersistError, SaveModel,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, Predict, Unfit};
 
 /// Dense-eigensolver feature cap for the large-`n_samples` Gram+eig path
@@ -265,6 +273,130 @@ where
             x,
             shape,
         )
+    }
+}
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`] — what stops a `Ridge` file loading here once the rest of
+/// the family is wired, even though both are `mlrs-linear` containers with the
+/// same two tensors.
+const PERSIST_TAG: &str = "linear_regression";
+
+impl<F> SaveModel for LinearRegression<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// Two tensors and one scalar, and NOTHING derivable from them:
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `coef_` | `F` (`F32`/`F64`) | `[1, n_features]` |
+    /// | `intercept_` | `F` | `[1]` |
+    /// | `param:fit_intercept` | `__metadata__` scalar | — |
+    ///
+    /// OLS is single-target, so `n_targets` is 1; `n_features` is recovered from
+    /// `coef_`'s shape at load rather than stored again. Both tensors are
+    /// written at the model's OWN float width, so an `f32`-fitted model produces
+    /// a file half the size of the `f64` one for the same geometry — see
+    /// [`linear_persist`](crate::linear::linear_persist) for why the intercept
+    /// is its own tensor rather than folded into `coef_` as an augmented
+    /// column.
+    ///
+    /// `coef_`/`intercept_` are device-resident (D-03), so this costs one
+    /// readback each — the only copies on the path, and both are `n_features`
+    /// and 1 element respectively. `pool` is `&BufferPool` because
+    /// [`DeviceArray::to_host`] only reads.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `LinearWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        LinearCoreRef {
+            n_features: coef.len(),
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: 1,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for LinearRegression<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site, either
+    /// by turbofish or by annotating the binding:
+    ///
+    /// ```ignore
+    /// let est: LinearRegression<f32, Fitted> = LinearRegression::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with: an `f32` model
+    /// loads into a `LinearRegression<f64>` (and back) through
+    /// [`as_floats`](crate::persist::as_floats), which reinterprets when the
+    /// widths agree and converts only when they do not. On the matching arm both
+    /// uploads read straight out of the bytes `read_exact` landed — no
+    /// intermediate `Vec`, no per-element decode.
+    ///
+    /// The file is untrusted input (T-04-01-01), so every extent it declares is
+    /// checked against every other before any value is stored.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<LinearRegression<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+
+        // OLS is single-target. The shared core admits `n_targets > 1` for the
+        // multi-output/one-vs-rest members of the family, so a file claiming
+        // more targets than this estimator can hold is rejected HERE rather
+        // than silently loading a matrix whose extra rows `predict` would never
+        // read.
+        if core.n_targets != 1 {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "linear_regression is single-target, but 'coef_' declares \
+                     {} target rows",
+                    core.n_targets
+                ),
+            });
+        }
+
+        Ok(LinearRegression {
+            fit_intercept: core.fit_intercept,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            // The mirror is a `predict_from_host` memo, not model state — a
+            // freshly loaded model refills it on first use, exactly as a
+            // freshly fitted one does.
+            predict_mirror: HostMirror::new(),
+            _state: PhantomData,
+        })
     }
 }
 
