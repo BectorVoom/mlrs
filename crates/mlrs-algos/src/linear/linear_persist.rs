@@ -15,17 +15,20 @@
 //! ## The on-disk shape
 //!
 //! Every dense linear model in this family — `LinearRegression`, `Ridge`,
-//! `Lasso` and `ElasticNet` today, and the shape `RidgeClassifier` would add its
-//! own `classes_` to — is the same two fitted arrays:
+//! `Lasso`, `ElasticNet`, `LogisticRegression` and `RidgeClassifier` — is the
+//! same two fitted arrays, plus a third for the classifiers:
 //!
 //! | name | dtype | shape | what |
 //! |---|---|---|---|
 //! | `coef_` | `F` (`F32`/`F64`) | `[n_targets, n_features]` | the weight matrix, row-major |
 //! | `intercept_` | `F` | `[n_targets]` | the per-target bias |
+//! | `classes_` | `I64` | `[n_classes]` | classifiers only — see [`write_classes`] |
 //! | `param:*` | `__metadata__` | — | every constructor scalar (`fit_intercept`, `alpha`, …) |
 //!
 //! and NOTHING else: `n_targets` and `n_features` are recovered from `coef_`'s
-//! shape at load, never written twice.
+//! shape at load, `n_classes` from `classes_`'s, and anything an estimator keeps
+//! only as a cached derivative of those (`RidgeClassifier`'s `coef_t_` and
+//! `classes_dev_`) is rebuilt on load rather than written.
 //!
 //! ### Why `coef_` is one fused block
 //!
@@ -368,4 +371,56 @@ impl CdScalars {
             tol: file.scalar_f64("param:tol")?,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Class labels — the classifiers' one addition to the core
+// ---------------------------------------------------------------------------
+
+/// The tensor holding the distinct sorted training labels, `[n_classes]`.
+/// Named for sklearn's fitted attribute, like every other bare name here.
+pub const CLASSES_NAME: &str = "classes_";
+
+/// Stage the `classes_` label table.
+///
+/// `I64` rather than the model's float width: these are label ids, and mlrs
+/// holds them as `i64` throughout (`CR-02`). Storing them as floats would make
+/// a large label silently unrepresentable and would invite a reader to compare
+/// them with a tolerance.
+///
+/// Deliberately NOT folded into [`LinearCoreRef`]: `n_classes` and the core's
+/// `n_targets` are the same number for
+/// [`LogisticRegression`](crate::linear::logistic::LogisticRegression) (K weight
+/// vectors, binary included) but NOT for
+/// [`RidgeClassifier`](crate::linear::ridge_classifier::RidgeClassifier), whose
+/// binary fit has two classes and ONE target column. A core that owned
+/// `classes_` would have to encode both rules, so each classifier validates its
+/// own relation on load instead — see [`read_classes`].
+pub fn write_classes<'a>(w: &mut LinearWriter<'a>, classes: &'a [i64]) -> Result<(), PersistError> {
+    w.tensor(CLASSES_NAME, TensorRef::i64s(classes, vec![classes.len()])?);
+    Ok(())
+}
+
+/// Read the `classes_` label table back.
+///
+/// Owned rather than borrowed because every estimator holds `Vec<i64>`, so a
+/// `Cow` would be converted at the call site regardless.
+///
+/// Rejects fewer than two classes: a classifier fitted on a single label cannot
+/// discriminate, sklearn refuses to fit one, and a zero-length table would make
+/// the label decode in `predict` index out of range on the FIRST query rather
+/// than fail here. What it does NOT check is the relation to `n_targets` — that
+/// rule differs per estimator, so the caller owns it (see [`write_classes`]).
+pub fn read_classes(file: &LinearFile<'_>) -> Result<Vec<i64>, PersistError> {
+    let view = file.tensor(CLASSES_NAME)?;
+    let n_classes = shape_1d(&view, CLASSES_NAME)?;
+    if n_classes < 2 {
+        return Err(PersistError::InconsistentGeometry {
+            reason: format!(
+                "tensor '{CLASSES_NAME}' holds {n_classes} labels; a fitted \
+                 classifier has at least 2"
+            ),
+        });
+    }
+    Ok(as_i64(&view, CLASSES_NAME)?.into_owned())
 }

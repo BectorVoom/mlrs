@@ -146,6 +146,7 @@
 //! §2), never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use bytemuck::Pod;
@@ -163,6 +164,14 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+// LINEAR-PERSIST: the safetensors container. This estimator is the widest case
+// in the family — the shared core, `classes_`, ten hyperparameters including an
+// enum with a payload, a per-target `n_iter_`, and two DERIVED device arrays
+// (`coef_t_`, `classes_dev_`) that are rebuilt on load rather than stored.
+use crate::linear::linear_persist::{
+    as_usizes, read_classes, read_linear_core, shape_1d, write_classes, AlignedBytes, LinearCoreRef,
+    LinearFile, LinearWriter, LoadModel, PersistError, SaveModel, TensorRef,
+};
 use crate::linear::ridge::{validate_sample_weight, Ridge, RidgeSolver};
 use crate::linear::ridge_solvers;
 use crate::typestate::{validate_geometry, Fitted, PredictLabels, Unfit};
@@ -1226,6 +1235,304 @@ impl RidgeClassifierBuilder {
             predict_mirror: OnceLock::new(),
             _state: PhantomData,
         })
+    }
+}
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`] — what stops a [`Ridge`] file loading here, even though
+/// both are `mlrs-linear` containers sharing most of a hyperparameter set.
+const PERSIST_TAG: &str = "ridge_classifier";
+
+/// `__metadata__` keys read and written ~100 lines apart, where a one-sided
+/// typo would not be caught by the compiler.
+const KEY_SOLVER: &str = "param:solver";
+const KEY_DEVICE: &str = "param:device";
+const KEY_CLASS_WEIGHT: &str = "param:class_weight";
+const KEY_SOLVER_FITTED: &str = "solver_";
+const KEY_DEVICE_FITTED: &str = "device_";
+/// The `Map` arm's payload rides in two parallel tensors rather than the
+/// metadata map: the labels are `i64` and the weights `f64`, and encoding a
+/// variable-length pair list into a single string would invent a private
+/// mini-format inside a binary container that already has typed arrays.
+const KEY_CW_LABELS: &str = "param:class_weight_labels";
+const KEY_CW_VALUES: &str = "param:class_weight_values";
+
+impl<F> SaveModel for RidgeClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape | notes |
+    /// |---|---|---|---|
+    /// | `coef_` | `F` | `[n_targets_, n_features_]` | sklearn's layout |
+    /// | `intercept_` | `F` | `[n_targets_]` | |
+    /// | `classes_` | `I64` | `[n_classes]` | `n_classes != n_targets_` when binary |
+    /// | `n_iter_` | `U64` | `[n_targets_]` | OPTIONAL — only the solvers that report it |
+    /// | `param:class_weight_labels` / `_values` | `I64` / `F64` | `[n]` | only the `Map` arm |
+    /// | the ten `param:*` scalars, `solver_`, `device_` | `__metadata__` | — | |
+    ///
+    /// ## What is deliberately NOT written
+    ///
+    /// `coef_t_` and `classes_dev_` are DERIVED — the transpose of `coef_` and
+    /// the `i32` narrowing of `classes_`, both kept only because the fused
+    /// predict kernels index them directly. Storing them would roughly double
+    /// the payload to hold a second copy of data already present, and a
+    /// hand-edited file could then carry a `coef_t_` that disagrees with its
+    /// own `coef_` — a corruption the reader could not detect but `predict`
+    /// would silently act on. `load` rebuilds both through the same
+    /// `stage_fitted_state` the fit path uses, so there is exactly one
+    /// definition of that relationship.
+    ///
+    /// `n_targets_`/`n_features_` are likewise implied by `coef_`'s shape, and
+    /// `n_classes` by `classes_`'s.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `LinearWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+        let solver_ = self.solver_.ok_or_else(|| absent("solver_"))?;
+        let device_ = self.device_.ok_or_else(|| absent("device_"))?;
+        if self.classes_.is_empty() {
+            return Err(absent("classes_"));
+        }
+        // `usize` -> `u64` explicitly: `usize` is 4 bytes on a 32-bit host, so
+        // writing it raw would produce a file that only loads back on the
+        // architecture that wrote it (`TensorRef::u64s`).
+        let n_iter: Option<Vec<u64>> = self
+            .n_iter_
+            .as_ref()
+            .map(|v| v.iter().map(|&n| n as u64).collect());
+        let cw_labels: Vec<i64>;
+        let cw_values: Vec<f64>;
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:alpha", host_to_f64(self.alpha));
+        // sklearn spells this one with a capital X; the `param:` names are its
+        // CONSTRUCTOR names, so this follows sklearn rather than the Rust field.
+        w.scalar_bool("param:copy_X", self.copy_x);
+        w.scalar_opt_usize("param:max_iter", self.max_iter);
+        w.scalar_f64("param:tol", self.tol);
+        w.scalar_str(KEY_SOLVER, self.solver.name());
+        w.scalar_bool("param:positive", self.positive);
+        w.scalar_opt_u64("param:random_state", self.random_state);
+        w.scalar_str(KEY_DEVICE, self.device.name());
+        w.scalar_str(KEY_SOLVER_FITTED, solver_.name());
+        w.scalar_str(KEY_DEVICE_FITTED, device_);
+
+        // The enum-with-payload knob: a tag in `__metadata__` says which shape
+        // to expect, and only the `Map` arm costs tensors — the same split
+        // `CategoricalNB`'s `min_categories` makes.
+        match &self.class_weight {
+            ClassWeight::Uniform => w.scalar_str(KEY_CLASS_WEIGHT, "uniform"),
+            ClassWeight::Balanced => w.scalar_str(KEY_CLASS_WEIGHT, "balanced"),
+            ClassWeight::Map(pairs) => {
+                w.scalar_str(KEY_CLASS_WEIGHT, "map");
+                cw_labels = pairs.iter().map(|&(l, _)| l).collect();
+                cw_values = pairs.iter().map(|&(_, v)| v).collect();
+                let n = cw_labels.len();
+                w.tensor(KEY_CW_LABELS, TensorRef::i64s(&cw_labels, vec![n])?);
+                w.tensor(KEY_CW_VALUES, TensorRef::f64s(&cw_values, vec![n])?);
+            }
+        }
+
+        if let Some(counts) = n_iter.as_deref() {
+            w.tensor("n_iter_", TensorRef::u64s(counts, vec![counts.len()])?);
+        }
+        write_classes(&mut w, &self.classes_)?;
+        LinearCoreRef {
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: self.n_targets_,
+            n_features: self.n_features_,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for RidgeClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading every device-resident table
+    /// to `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site, either
+    /// by turbofish or by annotating the binding:
+    ///
+    /// ```ignore
+    /// let clf: RidgeClassifier<f32, Fitted> = RidgeClassifier::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with — see
+    /// [`as_floats`](crate::persist::as_floats).
+    ///
+    /// The file is untrusted input (T-04-01-01), and the load-bearing check is
+    /// the binary/multiclass invariant: a two-class fit has ONE target column,
+    /// any other class count has one column per class. Both `classes_` and
+    /// `coef_`'s row extent are attacker-controlled, and the fused classify
+    /// kernel indexes the label table off the argmax column, so a file where
+    /// those two disagree would read out of range on the first prediction.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<RidgeClassifier<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        let classes_ = read_classes(&file)?;
+
+        // sklearn's binary encoding: two classes share ONE decision column
+        // (sign of the score), three or more get one column each.
+        let expected_targets = if classes_.len() == 2 {
+            1
+        } else {
+            classes_.len()
+        };
+        if core.n_targets != expected_targets {
+            return Err(PersistError::InconsistentGeometry {
+                reason: format!(
+                    "'classes_' holds {} labels, which implies {expected_targets} target \
+                     column(s), but 'coef_' declares {}",
+                    classes_.len(),
+                    core.n_targets
+                ),
+            });
+        }
+
+        let n_iter_ = match file.tensor_opt("n_iter_") {
+            None => None,
+            Some(view) => {
+                let len = shape_1d(&view, "n_iter_")?;
+                if len != core.n_targets {
+                    return Err(PersistError::InconsistentGeometry {
+                        reason: format!(
+                            "tensor 'n_iter_' has {len} entries but 'coef_' declares {} \
+                             target column(s)",
+                            core.n_targets
+                        ),
+                    });
+                }
+                Some(as_usizes(&view, "n_iter_")?)
+            }
+        };
+
+        let class_weight = read_class_weight(&file)?;
+        let solver = parse_solver(&file, KEY_SOLVER)?;
+        let solver_ = parse_solver(&file, KEY_SOLVER_FITTED)?;
+        let device = parse_device(&file, KEY_DEVICE)?;
+        // `device_` is a `&'static str` in the struct, so it cannot come from
+        // the file's `String` directly — round-tripping it through `Device`
+        // both validates it and yields the `'static` name.
+        let device_ = parse_device(&file, KEY_DEVICE_FITTED)?.name();
+
+        // Rebuild the two DERIVED tables through the fit path's own helper, so
+        // the `coef_ <-> coef_t_` relationship has exactly one definition and a
+        // loaded model cannot hold a transpose that disagrees with its
+        // coefficients.
+        let (coef_dev, coef_t_dev, classes_dev) =
+            stage_fitted_state::<F>(pool, &core.coef, &classes_, core.n_targets, core.n_features);
+
+        Ok(RidgeClassifier {
+            alpha: f64_to_host::<F>(file.scalar_f64("param:alpha")?),
+            fit_intercept: core.fit_intercept,
+            copy_x: file.scalar_bool("param:copy_X")?,
+            max_iter: file.scalar_opt_usize("param:max_iter")?,
+            tol: file.scalar_f64("param:tol")?,
+            class_weight,
+            solver,
+            positive: file.scalar_bool("param:positive")?,
+            random_state: file.scalar_opt_u64("param:random_state")?,
+            device,
+            classes_,
+            n_targets_: core.n_targets,
+            n_features_: core.n_features,
+            coef_: Some(coef_dev),
+            coef_t_: Some(coef_t_dev),
+            classes_dev_: Some(classes_dev),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            n_iter_,
+            solver_: Some(solver_),
+            device_: Some(device_),
+            // The mirror is a host-ingress predict memo, not model state — a
+            // freshly loaded model refills it on first use, exactly as a
+            // freshly fitted one does.
+            predict_mirror: OnceLock::new(),
+            _state: PhantomData,
+        })
+    }
+}
+
+/// Read a [`RidgeSolver`] out of a `__metadata__` string scalar.
+///
+/// `RidgeSolver`'s own `TryFrom<&str>` yields a [`BuildError`], which is the
+/// right error for a *constructor* argument and the wrong one for a file: a
+/// caller of `load` wants to know WHICH key in the file was bad, which is what
+/// [`PersistError::BadMetadata`] carries.
+fn parse_solver(file: &LinearFile<'_>, key: &'static str) -> Result<RidgeSolver, PersistError> {
+    RidgeSolver::try_from(file.scalar_str(key)?).map_err(|_| PersistError::BadMetadata { key })
+}
+
+/// Read a [`Device`] out of a `__metadata__` string scalar, for the same reason
+/// [`parse_solver`] exists — `Device::from_name` returns a bare `Option`.
+fn parse_device(file: &LinearFile<'_>, key: &'static str) -> Result<Device, PersistError> {
+    Device::from_name(file.scalar_str(key)?).ok_or(PersistError::BadMetadata { key })
+}
+
+/// Recover the [`ClassWeight`] knob: a tag from `__metadata__`, plus the two
+/// companion tensors for the `Map` arm.
+///
+/// An unrecognised tag is a typed error, never a fallback to `Uniform` —
+/// silently dropping a `balanced` weighting would change what the model was
+/// fitted to mean with no way for a caller to tell.
+fn read_class_weight(file: &LinearFile<'_>) -> Result<ClassWeight, PersistError> {
+    match file.scalar_str(KEY_CLASS_WEIGHT)? {
+        "uniform" => Ok(ClassWeight::Uniform),
+        "balanced" => Ok(ClassWeight::Balanced),
+        "map" => {
+            let labels_v = file
+                .tensor_opt(KEY_CW_LABELS)
+                .ok_or(PersistError::MissingTensor {
+                    tensor: KEY_CW_LABELS,
+                })?;
+            let values_v = file
+                .tensor_opt(KEY_CW_VALUES)
+                .ok_or(PersistError::MissingTensor {
+                    tensor: KEY_CW_VALUES,
+                })?;
+            let n = shape_1d(&labels_v, KEY_CW_LABELS)?;
+            if shape_1d(&values_v, KEY_CW_VALUES)? != n {
+                return Err(PersistError::InconsistentGeometry {
+                    reason: format!(
+                        "'{KEY_CW_LABELS}' and '{KEY_CW_VALUES}' must be the same length"
+                    ),
+                });
+            }
+            let labels = crate::linear::linear_persist::as_i64(&labels_v, KEY_CW_LABELS)?;
+            let values = crate::linear::linear_persist::as_f64(&values_v, KEY_CW_VALUES)?;
+            Ok(ClassWeight::Map(
+                labels.iter().copied().zip(values.iter().copied()).collect(),
+            ))
+        }
+        _ => Err(PersistError::BadMetadata {
+            key: KEY_CLASS_WEIGHT,
+        }),
     }
 }
 

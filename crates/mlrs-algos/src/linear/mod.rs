@@ -74,26 +74,40 @@
 //! [`naive_bayes`](crate::naive_bayes) uses, and the reason neither family
 //! needed a `Serialize` derive across every estimator struct.
 //!
-//! Four estimators are wired, and between them they cover every shape the
+//! Six estimators are wired, and between them they cover every shape the
 //! format has to handle:
 //!
 //! | estimator | what it adds to the core |
 //! |---|---|
 //! | [`LinearRegression`](linear_regression::LinearRegression) | nothing — its whole fitted state IS the core |
-//! | [`Ridge`](ridge::Ridge) | eight hyperparameters (two `Option`s, two enums), three fitted diagnostics (`n_iter_`/`solver_`/`device_`), multi-target `coef_` |
 //! | [`Lasso`](lasso::Lasso) | the shared [`CdScalars`](linear_persist::CdScalars) |
 //! | [`ElasticNet`](elastic_net::ElasticNet) | those plus `param:l1_ratio` |
+//! | [`Ridge`](ridge::Ridge) | eight hyperparameters (two `Option`s, two enums), three fitted diagnostics (`n_iter_`/`solver_`/`device_`), multi-target `coef_` |
+//! | [`LogisticRegression`](logistic::LogisticRegression) | `classes_` |
+//! | [`RidgeClassifier`](ridge_classifier::RidgeClassifier) | `classes_`, ten hyperparameters incl. a payload-carrying enum, a per-target `n_iter_`, two DERIVED tables |
 //!
-//! Two of those are worth knowing about before adding the fifth. Ridge holds
-//! `coef_` FEATURES-major for its fused predict GEMM while the file stores
-//! sklearn's TARGETS-major orientation, which
-//! [`linear_persist::to_targets_major`] reconciles at the boundary — a borrow,
-//! not a copy, for every single-target model. And `Lasso`/`ElasticNet` are near
-//! duplicates on disk (`Lasso` IS `ElasticNet` at `l1_ratio == 1`), which is
-//! what makes the `estimator` discriminator load bearing: it is the only thing
-//! stopping an `ElasticNet` file loading as a `Lasso` that quietly drops the L2
-//! half of the penalty. Whatever the remaining members need is a subset of
-//! these four.
+//! Four things are worth knowing before adding the seventh:
+//!
+//! * **Layout.** Ridge and RidgeClassifier hold `coef_` FEATURES-major for
+//!   their fused predict kernels while the file stores sklearn's TARGETS-major
+//!   orientation; [`linear_persist::to_targets_major`] reconciles it — a
+//!   borrow, not a copy, for every single-target model. LogisticRegression
+//!   needs no hop: D-12 gives it K full weight vectors, so `W` is already K×d.
+//! * **The discriminator is load bearing.** `Lasso` IS `ElasticNet` at
+//!   `l1_ratio == 1`, so those two files differ by one header key; a `Ridge`
+//!   file gets most of the way through `RidgeClassifier::load` before the
+//!   missing `classes_` would surface as something that merely looks like
+//!   corruption. Only `estimator` separates them cleanly.
+//! * **`classes_` is NOT part of the core** ([`linear_persist::write_classes`]).
+//!   `n_classes` equals the core's `n_targets` for LogisticRegression but not
+//!   for RidgeClassifier, whose binary fit has two classes and ONE decision
+//!   column. A core owning `classes_` would have to encode both rules, so each
+//!   classifier validates its own.
+//! * **Derived state is rebuilt, never stored.** RidgeClassifier's `coef_t_`
+//!   and `classes_dev_` are a transpose and an `i32` narrowing of data already
+//!   in the file; `load` reconstructs them through the fit path's own
+//!   `stage_fitted_state`, so the relationship has one definition and no file
+//!   can carry a transpose that disagrees with its own `coef_`.
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 

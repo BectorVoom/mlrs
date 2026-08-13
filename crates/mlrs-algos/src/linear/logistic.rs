@@ -46,6 +46,7 @@
 //! never an in-source `#[cfg(test)] mod tests`.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
 use bytemuck::Pod;
 use cubecl::prelude::{CubeElement, Float};
@@ -60,6 +61,13 @@ use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 
 use crate::error::{AlgoError, BuildError};
+// LINEAR-PERSIST: the safetensors container. The softmax weights `W` are
+// already K×d — the TARGETS-major layout the file stores — so this estimator
+// needs no layout hop at all, unlike `Ridge`/`RidgeClassifier`.
+use crate::linear::linear_persist::{
+    expect_len, read_classes, read_linear_core, write_classes, AlignedBytes, LinearCoreRef,
+    LinearFile, LinearWriter, LoadModel, PersistError, SaveModel,
+};
 use crate::typestate::{validate_geometry, Fit, Fitted, PredictLabels, PredictProba, Unfit};
 
 /// Default `max_iter` — the L-BFGS iteration cap. sklearn's `LogisticRegression`
@@ -316,6 +324,132 @@ where
     /// range) to honour the sklearn `classes_`/`predict` consistency contract.
     pub fn classes(&self) -> &[i64] {
         &self.classes_
+    }
+}
+
+/// The `estimator` discriminator written into every saved file and required by
+/// [`LoadModel::load`].
+const PERSIST_TAG: &str = "logistic_regression";
+
+impl<F> SaveModel for LogisticRegression<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Write the fitted model to `path` as a safetensors file.
+    ///
+    /// | name | dtype | shape |
+    /// |---|---|---|
+    /// | `coef_` | `F` (`F32`/`F64`) | `[n_classes, n_features]` |
+    /// | `intercept_` | `F` | `[n_classes]` |
+    /// | `classes_` | `I64` | `[n_classes]` |
+    /// | `param:C`, `param:tol`, `param:max_iter`, `param:fit_intercept` | `__metadata__` scalars | — |
+    ///
+    /// `n_classes` and `n_features` come back off `coef_`'s shape;
+    /// `self.n_classes` and `self.n_features` are NOT written, because both are
+    /// already implied and a second copy could only ever disagree with the
+    /// first.
+    ///
+    /// The weights need no layout hop: D-12 gives this estimator K full weight
+    /// vectors — binary is simply the K=2 case, not a folded single column — so
+    /// `W` is `n_classes × n_features` in memory, which IS the file's
+    /// targets-major layout. Contrast
+    /// [`RidgeClassifier`](crate::linear::ridge_classifier::RidgeClassifier),
+    /// whose binary fit has one target column for two classes.
+    ///
+    /// `coef_`/`intercept_` are device-resident, so this costs one readback
+    /// each — the only copies on the path.
+    fn save(&self, pool: &BufferPool<ActiveRuntime>, path: &Path) -> Result<(), PersistError> {
+        let absent = |field| PersistError::MissingState {
+            estimator: PERSIST_TAG,
+            field,
+        };
+        // Bound BEFORE the writer: `LinearWriter` borrows every payload so it
+        // can stream them out without a second copy, which means the host
+        // buffers must outlive it.
+        let coef = self
+            .coef_
+            .as_ref()
+            .ok_or_else(|| absent("coef_"))?
+            .to_host(pool);
+        let intercept = self
+            .intercept_
+            .as_ref()
+            .ok_or_else(|| absent("intercept_"))?
+            .to_host(pool);
+        if self.classes_.is_empty() {
+            return Err(absent("classes_"));
+        }
+
+        let mut w = LinearWriter::new(PERSIST_TAG);
+        w.scalar_f64("param:C", host_to_f64(self.c));
+        w.scalar_usize("param:max_iter", self.max_iter);
+        w.scalar_f64("param:tol", host_to_f64(self.tol));
+        write_classes(&mut w, &self.classes_)?;
+        LinearCoreRef {
+            coef: &coef,
+            intercept: &intercept,
+            n_targets: self.n_classes,
+            n_features: self.n_features,
+            fit_intercept: self.fit_intercept,
+        }
+        .write_into(&mut w)?;
+        w.write(path)
+    }
+}
+
+impl<F> LoadModel for LogisticRegression<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    /// Read a model back from `path`, re-uploading `coef_`/`intercept_` to
+    /// `pool`.
+    ///
+    /// The result is `Fitted` by construction — a file only ever holds a fitted
+    /// model — so the state parameter has to be named at the call site, either
+    /// by turbofish or by annotating the binding:
+    ///
+    /// ```ignore
+    /// let clf: LogisticRegression<f32, Fitted> = LogisticRegression::load(&mut pool, path)?;
+    /// ```
+    ///
+    /// `F` need NOT match the dtype the file was written with — see
+    /// [`as_floats`](crate::persist::as_floats).
+    ///
+    /// The file is untrusted input (T-04-01-01). The load-bearing check here is
+    /// `classes_.len() == n_targets`: `predict_labels` maps each argmax COLUMN
+    /// through `classes_`, so a file whose label table is shorter than the
+    /// weight matrix has rows would index out of range on the first prediction.
+    /// It fails here instead.
+    fn load(
+        pool: &mut BufferPool<ActiveRuntime>,
+        path: &Path,
+    ) -> Result<LogisticRegression<F, Fitted>, PersistError> {
+        let raw = AlignedBytes::read(path)?;
+        let file = LinearFile::parse(&raw, PERSIST_TAG)?;
+        let core = read_linear_core::<F>(&file)?;
+        let classes_ = read_classes(&file)?;
+
+        // One label per fitted class column — D-12's "K full weight vectors,
+        // binary included" stated as a checkable invariant.
+        expect_len(
+            "classes_",
+            classes_.len(),
+            core.n_targets,
+            "labels for the fitted class columns",
+        )?;
+
+        Ok(LogisticRegression {
+            c: f64_to_host::<F>(file.scalar_f64("param:C")?),
+            fit_intercept: core.fit_intercept,
+            max_iter: file.scalar_usize("param:max_iter")?,
+            tol: f64_to_host::<F>(file.scalar_f64("param:tol")?),
+            n_classes: core.n_targets,
+            classes_,
+            n_features: core.n_features,
+            coef_: Some(DeviceArray::from_host(pool, &core.coef)),
+            intercept_: Some(DeviceArray::from_host(pool, &core.intercept)),
+            _state: PhantomData,
+        })
     }
 }
 

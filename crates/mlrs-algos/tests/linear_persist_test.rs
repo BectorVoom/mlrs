@@ -1,5 +1,6 @@
-//! LINEAR-PERSIST (prototype) — safetensors save/load round-trips for the dense
-//! linear estimators: `LinearRegression`, `Ridge`, `Lasso` and `ElasticNet`.
+//! LINEAR-PERSIST (prototype) — safetensors save/load round-trips for the six
+//! dense linear estimators: `LinearRegression`, `Ridge`, `Lasso`, `ElasticNet`,
+//! `LogisticRegression` and `RidgeClassifier`.
 //!
 //! Each exercises a different corner of the shared core. `LinearRegression` is
 //! the minimal case — its whole fitted state IS the core, one target, no extra
@@ -10,7 +11,10 @@
 //! FEATURES-major while the file stores sklearn's TARGETS-major orientation.
 //! `Lasso` and `ElasticNet` are the near-duplicate pair: two files that differ
 //! by exactly one header key, which makes the `estimator` discriminator load
-//! bearing rather than decorative.
+//! bearing rather than decorative. The two classifiers add `classes_` and the
+//! label-decode contract that rides on it — `LogisticRegression` with one column
+//! per class, `RidgeClassifier` with TWO classes sharing ONE column when binary,
+//! plus two derived tables it must rebuild rather than store.
 //!
 //! The gates, in the order they matter:
 //!
@@ -49,6 +53,18 @@
 //!   - `an_elastic_net_file_without_l1_ratio_is_rejected` — that key is
 //!     REQUIRED, never defaulted: silently substituting `0.5` would hand back a
 //!     model with a different penalty than the one that was saved.
+//!   - `logistic_regression_non_contiguous_labels_roundtrip` — the CR-02
+//!     contract: the kernel sees a dense `0..K`, so a file that stored THOSE
+//!     would round-trip its own coefficients perfectly and still predict
+//!     `{0,1,2}` where training said `{0,2,7}`.
+//!   - `ridge_classifier_binary_roundtrip_is_bit_exact` and
+//!     `a_ridge_classifier_file_with_inconsistent_classes_is_rejected` — the
+//!     asymmetric case, where `classes_.len()` and `coef_`'s row extent
+//!     genuinely differ and only a CROSS-check catches a mismatch.
+//!   - `ridge_classifier_rebuilds_its_derived_tables_rather_than_storing_them` —
+//!     `coef_t_`/`classes_dev_` are absent from the file AND the reload predicts
+//!     identically, which is what proves the rebuild is faithful rather than
+//!     merely cheap.
 //!   - `save_leaves_no_temporary_behind` — the write-then-rename path.
 //!
 //! Fixtures are generated in-test rather than loaded from an oracle `.npz`:
@@ -69,9 +85,11 @@ use mlrs_algos::linear::linear_persist::{
     AlignedBytes, LinearFile, LinearWriter, LoadModel, PersistError, SaveModel, TensorRef,
 };
 use mlrs_algos::linear::linear_regression::LinearRegression;
+use mlrs_algos::linear::logistic::LogisticRegression;
 use mlrs_algos::linear::ridge::{Ridge, RidgeSolver};
+use mlrs_algos::linear::ridge_classifier::{ClassWeight, RidgeClassifier};
 use mlrs_algos::naive_bayes::GaussianNB;
-use mlrs_algos::typestate::{Fit, Fitted, Predict};
+use mlrs_algos::typestate::{Fit, Fitted, Predict, PredictLabels, PredictProba};
 use mlrs_backend::capability;
 use mlrs_backend::device::Device;
 use mlrs_backend::device_array::DeviceArray;
@@ -827,6 +845,570 @@ fn an_elastic_net_file_without_l1_ratio_is_rejected() {
     assert!(
         matches!(&err, PersistError::BadMetadata { key } if *key == "param:l1_ratio"),
         "expected BadMetadata naming param:l1_ratio, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The classifiers — classes_, and the binary/multiclass target-count split
+// ---------------------------------------------------------------------------
+
+/// Three balanced classes, bucketed off feature 0 of the shared design.
+fn labels_multiclass() -> Vec<i64> {
+    let (x, _) = fixture::<f64>();
+    (0..N_SAMPLES)
+        .map(|r| {
+            let x0 = x[r * N_FEATURES];
+            if x0 < -0.5 {
+                0
+            } else if x0 < 0.9 {
+                1
+            } else {
+                2
+            }
+        })
+        .collect()
+}
+
+/// Two classes — the arm where `RidgeClassifier` keeps ONE decision column for
+/// TWO labels, which is the invariant its `load` has to enforce.
+fn labels_binary() -> Vec<i64> {
+    let (x, _) = fixture::<f64>();
+    (0..N_SAMPLES)
+        .map(|r| i64::from(x[r * N_FEATURES] >= 0.0))
+        .collect()
+}
+
+/// The same three classes relabelled `{0, 2, 7}` — non-contiguous, so a
+/// round-trip that quietly re-encodes to a dense `0..K` is visible (CR-02).
+fn labels_non_contiguous() -> Vec<i64> {
+    labels_multiclass()
+        .iter()
+        .map(|&c| [0i64, 2, 7][c as usize])
+        .collect()
+}
+
+fn labels_as<F: Pod>(labels: &[i64]) -> Vec<F> {
+    labels
+        .iter()
+        .map(|&c| mlrs_core::f64_to_host::<F>(c as f64))
+        .collect()
+}
+
+/// Fit a `LogisticRegression` on the shared design with the given labels.
+///
+/// Every hyperparameter is off its default, for two reasons. The load-bearing
+/// one is `c`: the labels below are a hard threshold on feature 0, so the
+/// classes are perfectly SEPARABLE and at sklearn's default `C = 1.0` the
+/// weights diverge — the L-BFGS arm returns `NotConverged` at any iteration cap,
+/// because there is no finite optimum to converge to. A stronger penalty
+/// (`C = 0.05`) puts the optimum back in finite range. The bonus is that `C`,
+/// `max_iter` and `tol` have no accessor on the fitted estimator, so holding
+/// them at their defaults would let a `save` that dropped one still pass
+/// `logistic_regression_every_persisted_field_roundtrips`.
+fn fit_logreg<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    labels: &[i64],
+) -> LogisticRegression<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, _) = fixture::<F>();
+    let y = labels_as::<F>(labels);
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y);
+    LogisticRegression::<F>::builder()
+        .c(0.05)
+        .max_iter(500)
+        .tol(1e-6)
+        .build::<F>()
+        .expect("LogisticRegression builds with valid hyperparameters")
+        .fit(pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES))
+        .expect("LogisticRegression fits the fixture")
+}
+
+fn fit_ridge_clf<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    labels: &[i64],
+) -> RidgeClassifier<F, Fitted>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, _) = fixture::<F>();
+    let y = labels_as::<F>(labels);
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &y);
+    RidgeClassifier::<F>::builder()
+        .build::<F>()
+        .expect("RidgeClassifier builds with default hyperparameters")
+        .fit_with_sample_weight(pool, &x_dev, Some(&y_dev), (N_SAMPLES, N_FEATURES), None)
+        .expect("RidgeClassifier fits the fixture")
+}
+
+/// `predict_labels` over the fixture's own rows.
+fn logreg_labels<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    model: &LogisticRegression<F, Fitted>,
+) -> Vec<i32>
+where
+    F: Float + CubeElement + Pod,
+{
+    let (x, _) = fixture::<F>();
+    let x_dev: DeviceArray<ActiveRuntime, F> = DeviceArray::from_host(pool, &x);
+    model
+        .predict_labels(pool, &x_dev, (N_SAMPLES, N_FEATURES))
+        .expect("predict_labels succeeds on the training geometry")
+        .to_host(pool)
+}
+
+#[test]
+fn logistic_regression_roundtrip_is_bit_exact() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("logreg.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let fitted = fit_logreg::<f32>(&mut pool, &labels_multiclass());
+    assert_eq!(fitted.n_classes(), 3, "the fixture is genuinely multiclass");
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let loaded: LogisticRegression<f32, Fitted> =
+        LogisticRegression::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        loaded.coef(&pool),
+        fitted.coef(&pool),
+        "the K x d weight matrix must round-trip exactly"
+    );
+    assert_eq!(
+        loaded.intercept(&pool),
+        fitted.intercept(&pool),
+        "the per-class intercept must round-trip exactly"
+    );
+    assert_eq!(
+        loaded.classes(),
+        fitted.classes(),
+        "classes_ must round-trip"
+    );
+    assert_eq!(
+        loaded.n_classes(),
+        fitted.n_classes(),
+        "n_classes is recovered from coef_'s row extent, not stored"
+    );
+}
+
+#[test]
+fn logistic_regression_roundtrip_preserves_predictions() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("logreg.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let (x, _) = fixture::<f32>();
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+
+    let fitted = fit_logreg::<f32>(&mut pool, &labels_multiclass());
+    let want_labels = logreg_labels(&mut pool, &fitted);
+    let want_proba = fitted
+        .predict_proba(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
+        .expect("predict_proba succeeds")
+        .to_host(&pool);
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let loaded: LogisticRegression<f32, Fitted> =
+        LogisticRegression::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        logreg_labels(&mut pool, &loaded),
+        want_labels,
+        "a reloaded model must predict the same labels"
+    );
+    assert_eq!(
+        loaded
+            .predict_proba(&mut pool, &x_dev, (N_SAMPLES, N_FEATURES))
+            .expect("predict_proba succeeds")
+            .to_host(&pool),
+        want_proba,
+        "and the same probabilities, bit for bit"
+    );
+}
+
+#[test]
+fn logistic_regression_non_contiguous_labels_roundtrip() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("logreg_sparse_labels.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // CR-02: the softmax kernel only ever sees the dense remapped index
+    // `0..K`, and `predict_labels` maps the argmax column back through
+    // `classes_`. A file that stored the DENSE indices instead of the original
+    // ids would round-trip its own coefficients perfectly and still predict
+    // `{0,1,2}` where the training data said `{0,2,7}` — so the label table has
+    // to be checked directly, not just inferred from prediction equality.
+    let labels = labels_non_contiguous();
+    let fitted = fit_logreg::<f32>(&mut pool, &labels);
+    assert_eq!(
+        fitted.classes(),
+        &[0i64, 2, 7],
+        "the fixture's labels are non-contiguous"
+    );
+    let want = logreg_labels(&mut pool, &fitted);
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let loaded: LogisticRegression<f32, Fitted> =
+        LogisticRegression::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        loaded.classes(),
+        &[0i64, 2, 7],
+        "the ORIGINAL label ids must survive, not a dense 0..K re-encoding"
+    );
+    assert_eq!(
+        logreg_labels(&mut pool, &loaded),
+        want,
+        "and the decoded predictions must be unchanged"
+    );
+}
+
+#[test]
+fn logistic_regression_every_persisted_field_roundtrips() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let first = dir.path().join("a.safetensors");
+    let second = dir.path().join("b.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // `C`, `max_iter` and `tol` have no accessor on the fitted estimator, so
+    // save -> load -> save byte-stability is the only way to gate them. All
+    // three are off their defaults in `fit_logreg`, so a `load` that dropped one
+    // and fell back to the default changes the header and fails here.
+    let fitted = fit_logreg::<f32>(&mut pool, &labels_multiclass());
+    fitted.save(&pool, &first).expect("save succeeds");
+    let loaded: LogisticRegression<f32, Fitted> =
+        LogisticRegression::load(&mut pool, &first).expect("load succeeds");
+    loaded.save(&pool, &second).expect("re-save succeeds");
+
+    assert_eq!(
+        std::fs::read(&first).expect("read"),
+        std::fs::read(&second).expect("read"),
+        "save -> load -> save must be byte-stable"
+    );
+}
+
+#[test]
+fn ridge_classifier_binary_roundtrip_is_bit_exact() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("rc_binary.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // The asymmetric case: TWO classes, ONE decision column. `classes_.len()`
+    // and `coef_`'s row extent genuinely differ here, which is exactly the
+    // invariant `load` has to encode rather than assume.
+    let fitted = fit_ridge_clf::<f32>(&mut pool, &labels_binary());
+    assert_eq!(fitted.classes().len(), 2, "two classes");
+    assert_eq!(fitted.n_targets(), 1, "but only one decision column");
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let loaded: RidgeClassifier<f32, Fitted> =
+        RidgeClassifier::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        loaded.classes(),
+        fitted.classes(),
+        "classes_ must round-trip"
+    );
+    assert_eq!(
+        loaded.n_targets(),
+        1,
+        "n_targets_ must stay 1 for a binary fit"
+    );
+    assert_eq!(
+        loaded.coef(&pool),
+        fitted.coef(&pool),
+        "coef_ must round-trip"
+    );
+    assert_eq!(
+        loaded.intercept(&pool),
+        fitted.intercept(&pool),
+        "intercept_ must round-trip"
+    );
+    assert_eq!(loaded.solver(), fitted.solver(), "solver_ must round-trip");
+    assert_eq!(loaded.device(), fitted.device(), "device_ must round-trip");
+    assert_eq!(loaded.n_iter(), fitted.n_iter(), "n_iter_ must round-trip");
+}
+
+#[test]
+fn ridge_classifier_multiclass_roundtrip_is_bit_exact() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("rc_multi.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let fitted = fit_ridge_clf::<f32>(&mut pool, &labels_multiclass());
+    assert_eq!(fitted.n_targets(), 3, "three classes, three columns");
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let loaded: RidgeClassifier<f32, Fitted> =
+        RidgeClassifier::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        loaded.classes(),
+        fitted.classes(),
+        "classes_ must round-trip"
+    );
+    assert_eq!(loaded.n_targets(), 3, "n_targets_ must round-trip");
+    assert_eq!(
+        loaded.coef(&pool),
+        fitted.coef(&pool),
+        "coef_ must round-trip"
+    );
+    assert_eq!(
+        loaded.intercept(&pool),
+        fitted.intercept(&pool),
+        "intercept_ must round-trip"
+    );
+}
+
+#[test]
+fn ridge_classifier_rebuilds_its_derived_tables_rather_than_storing_them() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("rc_multi.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    let (x, _) = fixture::<f32>();
+    let fitted = fit_ridge_clf::<f32>(&mut pool, &labels_multiclass());
+    let want = fitted
+        .predict_labels_from_host(&pool, &x, (N_SAMPLES, N_FEATURES))
+        .expect("predict_labels_from_host succeeds")
+        .labels;
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    // `coef_t_` (the transpose) and `classes_dev_` (the i32 narrowing) are kept
+    // in memory only because the fused predict kernels index them directly.
+    // Writing them would roughly double the payload to store a second copy of
+    // data already present, AND would let a hand-edited file carry a transpose
+    // disagreeing with its own coef_ — a corruption the reader could not detect
+    // but predict would act on.
+    let raw = AlignedBytes::read(&path).expect("read succeeds");
+    let file = LinearFile::parse(&raw, "ridge_classifier").expect("parse succeeds");
+    for derived in ["coef_t_", "classes_dev_"] {
+        assert!(
+            file.tensor_opt(derived).is_none(),
+            "'{derived}' is derived and must not be in the file"
+        );
+    }
+
+    // The payload is exactly coef_ + intercept_ + classes_, nothing more.
+    let n_targets = 3;
+    let payload = n_targets * N_FEATURES * size_of::<f32>()   // coef_
+        + n_targets * size_of::<f32>()                        // intercept_
+        + n_targets * size_of::<i64>(); // classes_
+    let total = std::fs::metadata(&path).unwrap().len() as usize;
+    assert!(
+        total - payload < 640,
+        "the non-payload bytes must be the header alone, got {} B over a {payload} B payload",
+        total - payload
+    );
+
+    // And the rebuild is CORRECT, not merely absent: the reloaded model's fused
+    // predict path reads `coef_t_`/`classes_dev_`, so identical predictions are
+    // what proves `stage_fitted_state` reconstructed both faithfully.
+    let loaded: RidgeClassifier<f32, Fitted> =
+        RidgeClassifier::load(&mut pool, &path).expect("load succeeds");
+    assert_eq!(
+        loaded
+            .predict_labels_from_host(&pool, &x, (N_SAMPLES, N_FEATURES))
+            .expect("predict_labels_from_host succeeds")
+            .labels,
+        want,
+        "the rebuilt derived tables must give identical predictions"
+    );
+}
+
+#[test]
+fn ridge_classifier_class_weight_map_roundtrips() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("rc_cw.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // The enum-with-payload knob. `Uniform`/`Balanced` ride entirely in
+    // `__metadata__`; only `Map` costs tensors, and it is the arm where a
+    // dropped payload would silently revert the model to uniform weighting.
+    let (x, _) = fixture::<f32>();
+    let y = labels_as::<f32>(&labels_multiclass());
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+    let fitted = RidgeClassifier::<f32>::builder()
+        .class_weight(ClassWeight::Map(vec![(0, 2.5), (2, 0.25)]))
+        .build::<f32>()
+        .expect("RidgeClassifier builds")
+        .fit_with_sample_weight(
+            &mut pool,
+            &x_dev,
+            Some(&y_dev),
+            (N_SAMPLES, N_FEATURES),
+            None,
+        )
+        .expect("RidgeClassifier fits");
+    fitted.save(&pool, &path).expect("save succeeds");
+
+    let a = dir.path().join("resave.safetensors");
+    let loaded: RidgeClassifier<f32, Fitted> =
+        RidgeClassifier::load(&mut pool, &path).expect("load succeeds");
+    loaded.save(&pool, &a).expect("re-save succeeds");
+    assert_eq!(
+        std::fs::read(&path).expect("read"),
+        std::fs::read(&a).expect("read"),
+        "the class_weight Map payload must round-trip: label ids AND weights"
+    );
+
+    // And the tag/payload really are in the file rather than reconstructed.
+    let raw = AlignedBytes::read(&path).expect("read succeeds");
+    let file = LinearFile::parse(&raw, "ridge_classifier").expect("parse succeeds");
+    assert_eq!(
+        file.metadata()
+            .get("param:class_weight")
+            .map(String::as_str),
+        Some("map"),
+        "the variant tag rides in __metadata__"
+    );
+    assert!(
+        file.tensor_opt("param:class_weight_labels").is_some()
+            && file.tensor_opt("param:class_weight_values").is_some(),
+        "and only the Map arm costs its two companion tensors"
+    );
+}
+
+#[test]
+fn ridge_classifier_every_persisted_field_roundtrips() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let first = dir.path().join("a.safetensors");
+    let second = dir.path().join("b.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Ten hyperparameters, several with no accessor on the fitted value, so
+    // save -> load -> save byte-stability is the gate — the same argument
+    // `ridge_every_persisted_field_roundtrips` makes.
+    let (x, _) = fixture::<f32>();
+    let y = labels_as::<f32>(&labels_multiclass());
+    let x_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &x);
+    let y_dev: DeviceArray<ActiveRuntime, f32> = DeviceArray::from_host(&mut pool, &y);
+    RidgeClassifier::<f32>::builder()
+        .alpha(2.5)
+        .fit_intercept(false)
+        .copy_x(false)
+        .max_iter(Some(77))
+        .tol(1e-6)
+        .class_weight(ClassWeight::Balanced)
+        .solver(RidgeSolver::Svd)
+        .positive(false)
+        .random_state(Some(12_345))
+        .device(Device::Gpu)
+        .build::<f32>()
+        .expect("RidgeClassifier builds")
+        .fit_with_sample_weight(
+            &mut pool,
+            &x_dev,
+            Some(&y_dev),
+            (N_SAMPLES, N_FEATURES),
+            None,
+        )
+        .expect("RidgeClassifier fits")
+        .save(&pool, &first)
+        .expect("save succeeds");
+
+    let loaded: RidgeClassifier<f32, Fitted> =
+        RidgeClassifier::load(&mut pool, &first).expect("load succeeds");
+    loaded.save(&pool, &second).expect("re-save succeeds");
+    assert_eq!(
+        std::fs::read(&first).expect("read"),
+        std::fs::read(&second).expect("read"),
+        "save -> load -> save must be byte-stable across all ten hyperparameters"
+    );
+}
+
+#[test]
+fn a_ridge_classifier_file_with_inconsistent_classes_is_rejected() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("bad_classes.safetensors");
+
+    // THREE labels against ONE decision column. Neither extent is wrong on its
+    // own — a 1-column `coef_` is what a binary fit produces and a 3-entry
+    // `classes_` is what a 3-class fit produces — so only the CROSS-check
+    // catches it. The fused classify kernel indexes the label table off the
+    // argmax column, so without this guard the mismatch would be an
+    // out-of-range read on the first prediction (T-04-01-01).
+    let coef = vec![0.5f32; N_FEATURES];
+    let intercept = vec![0.25f32];
+    let classes = vec![0i64, 1, 2];
+    let mut w = LinearWriter::new("ridge_classifier");
+    w.scalar_bool("param:fit_intercept", true);
+    w.scalar_f64("param:alpha", 1.0);
+    w.scalar_bool("param:copy_X", true);
+    w.scalar_f64("param:tol", 1e-4);
+    w.scalar_str("param:solver", "cholesky");
+    w.scalar_bool("param:positive", false);
+    w.scalar_str("param:device", "auto");
+    w.scalar_str("param:class_weight", "uniform");
+    w.scalar_str("solver_", "cholesky");
+    w.scalar_str("device_", "cpu");
+    w.tensor("classes_", TensorRef::i64s(&classes, vec![3]).unwrap());
+    w.tensor(
+        "coef_",
+        TensorRef::floats(&coef, vec![1, N_FEATURES]).unwrap(),
+    );
+    w.tensor(
+        "intercept_",
+        TensorRef::floats(&intercept, vec![1]).unwrap(),
+    );
+    w.write(&path).expect("write succeeds");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let err = match RidgeClassifier::<f32, Fitted>::load(&mut pool, &path) {
+        Ok(_) => panic!("3 labels against 1 decision column must not load"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, PersistError::InconsistentGeometry { .. }),
+        "expected InconsistentGeometry, got {err:?}"
+    );
+}
+
+#[test]
+fn a_ridge_file_does_not_load_as_a_ridge_classifier() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("ridge.safetensors");
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    fit_ridge::<f32>(&mut pool)
+        .save(&pool, &path)
+        .expect("save succeeds");
+
+    // These two share most of a hyperparameter set and the same core, so a
+    // Ridge file gets a long way into `RidgeClassifier::load` before anything
+    // structural would notice — it would fail only on the missing `classes_`,
+    // which reads like corruption rather than "wrong estimator".
+    let err = match RidgeClassifier::<f32, Fitted>::load(&mut pool, &path) {
+        Ok(_) => panic!("a Ridge file must not load as a RidgeClassifier"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            &err,
+            PersistError::WrongEstimator { expected, found }
+                if *expected == "ridge_classifier" && found == "ridge"
+        ),
+        "expected WrongEstimator, got {err:?}"
     );
 }
 
