@@ -13,8 +13,10 @@
 //! suite runs identically on every backend.
 
 use mlrs_algos::ensemble::stacking::{
-    concatenate_predictions, cv_route_from_str, kept_indices, meta_feature_names, meta_layout,
-    CvRoute, MetaLayout, StackingError, DROP, PREFIT,
+    classifier_meta_slices, concatenate_predictions, cv_route_from_str, kept_indices,
+    meta_feature_names, meta_layout, resolve_stack_method, stack_method_request, CvRoute,
+    MetaLayout, MetaSlice, PredShape, StackMethod, StackMethodRequest, StackingError, DROP, PREFIT,
+    STACK_METHODS,
 };
 
 fn s(items: &[&str]) -> Vec<String> {
@@ -147,13 +149,16 @@ fn drop_sentinel_is_the_sklearn_literal() {
 
 #[test]
 fn cv_prefit_selects_the_prefit_route() {
-    assert_eq!(cv_route_from_str(PREFIT).unwrap(), CvRoute::Prefit);
+    assert_eq!(
+        cv_route_from_str(PREFIT, "StackingRegressor").unwrap(),
+        CvRoute::Prefit
+    );
     assert_eq!(PREFIT, "prefit");
 }
 
 #[test]
 fn cv_rejects_any_other_string_with_sklearn_message() {
-    let err = cv_route_from_str("bogus").unwrap_err();
+    let err = cv_route_from_str("bogus", "StackingRegressor").unwrap_err();
     assert_eq!(
         msg(err),
         "The 'cv' parameter of StackingRegressor must be an int in the range [2, inf), \
@@ -163,9 +168,17 @@ fn cv_rejects_any_other_string_with_sklearn_message() {
 }
 
 #[test]
+fn cv_message_names_the_calling_class() {
+    // The rule is shared; the message is not. A `StackingClassifier` user must
+    // not be told their `StackingRegressor` is at fault.
+    let err = cv_route_from_str("bogus", "StackingClassifier").unwrap_err();
+    assert!(msg(err).starts_with("The 'cv' parameter of StackingClassifier must be an int"));
+}
+
+#[test]
 fn cv_string_match_is_case_sensitive() {
     // sklearn's StrOptions is an exact set membership test; "Prefit" is not in it.
-    assert!(cv_route_from_str("Prefit").is_err());
+    assert!(cv_route_from_str("Prefit", "StackingRegressor").is_err());
 }
 
 // --------------------------------------------------------------------------- //
@@ -259,11 +272,28 @@ fn feature_names_append_input_features_under_passthrough() {
 }
 
 #[test]
-fn feature_names_reject_a_length_mismatch() {
-    let err = meta_feature_names("stackingregressor", &s(&["a"]), &[1, 1], None).unwrap_err();
+fn extra_feature_out_counts_truncate_like_sklearns_zip() {
+    // sklearn zips `non_dropped_estimators` with `_n_feature_outs`, so a
+    // multilabel `predict_proba` — which contributes one meta block PER TARGET
+    // and therefore outruns the names — emits the SHORT list rather than
+    // raising. Verified against sklearn 1.9: a one-estimator, three-target
+    // stack reports exactly `['stackingclassifier_rf']`.
+    let names = meta_feature_names("stackingclassifier", &s(&["rf"]), &[1, 1, 1], None).unwrap();
+    assert_eq!(names, s(&["stackingclassifier_rf"]));
+}
+
+#[test]
+fn extra_names_are_rejected_because_they_would_shift_every_later_name() {
+    // The mirror case is NOT symmetric. More names than counts means a kept
+    // estimator contributed no block, and truncating would leave `transform`
+    // emitting columns that no name describes — the silent shift
+    // `meta_layout`'s zero-column rejection also exists to prevent. sklearn
+    // cannot reach this state, so rejecting it costs nothing in parity.
+    let err = meta_feature_names("stackingregressor", &s(&["a", "b"]), &[1], None).unwrap_err();
     assert_eq!(
         msg(err),
-        "have 1 kept estimator names but 2 feature-out counts"
+        "have 2 kept estimator names but only 1 feature-out counts; a kept \
+         estimator produced no prediction block"
     );
 }
 
@@ -326,4 +356,253 @@ fn concatenate_rejects_a_block_count_mismatch() {
     let layout = meta_layout(&[1, 1], 0, false).unwrap();
     let err = concatenate_predictions(&layout, &[(&a, 1)], 2, None).unwrap_err();
     assert_eq!(msg(err), "layout describes 2 blocks but 1 were given");
+}
+
+// --------------------------------------------------------------------------- //
+// stack_method — the classifier's response-method selection (STACK-CLF-01)
+// --------------------------------------------------------------------------- //
+
+const ALL: [bool; 3] = [true, true, true];
+const NONE: [bool; 3] = [false, false, false];
+/// A `LinearSVC`-shaped estimator: `decision_function` + `predict`, no proba.
+const SVC_LIKE: [bool; 3] = [false, true, true];
+/// A `GaussianNB`-shaped estimator: `predict_proba` + `predict`.
+const NB_LIKE: [bool; 3] = [true, false, true];
+/// A regressor: `predict` only. Legal here — sklearn allows regressors as base
+/// estimators of a `StackingClassifier` (ordinal regression).
+const PREDICT_ONLY: [bool; 3] = [false, false, true];
+
+fn auto() -> StackMethodRequest {
+    StackMethodRequest::Auto
+}
+
+fn fixed(name: &str) -> StackMethodRequest {
+    StackMethodRequest::Fixed(StackMethod::parse(name).unwrap())
+}
+
+#[test]
+fn stack_method_accepts_the_four_sklearn_options() {
+    assert_eq!(
+        stack_method_request("auto").unwrap(),
+        StackMethodRequest::Auto
+    );
+    for name in STACK_METHODS {
+        assert_eq!(
+            stack_method_request(name).unwrap(),
+            StackMethodRequest::Fixed(StackMethod::parse(name).unwrap())
+        );
+    }
+}
+
+#[test]
+fn stack_method_rejects_anything_else_with_sklearns_message() {
+    let err = stack_method_request("proba").unwrap_err();
+    // The OPTION ORDER inside the braces is sklearn's set-iteration order and
+    // changes with PYTHONHASHSEED, so the oracle test compares option SETS;
+    // everything outside the braces is fixed text and is asserted here.
+    let text = msg(err);
+    assert!(text.starts_with(
+        "The 'stack_method' parameter of StackingClassifier must be a str among {"
+    ));
+    assert!(text.ends_with("}. Got 'proba' instead."));
+    for name in ["auto", "predict_proba", "decision_function", "predict"] {
+        assert!(text.contains(&format!("'{name}'")), "missing option {name}");
+    }
+}
+
+#[test]
+fn stack_method_is_case_sensitive() {
+    assert!(stack_method_request("Auto").is_err());
+    assert!(stack_method_request("Predict").is_err());
+}
+
+#[test]
+fn auto_prefers_proba_then_decision_then_predict() {
+    assert_eq!(
+        resolve_stack_method("lr", auto(), ALL).unwrap(),
+        StackMethod::PredictProba
+    );
+    assert_eq!(
+        resolve_stack_method("svc", auto(), SVC_LIKE).unwrap(),
+        StackMethod::DecisionFunction
+    );
+    assert_eq!(
+        resolve_stack_method("ridge", auto(), PREDICT_ONLY).unwrap(),
+        StackMethod::Predict
+    );
+}
+
+#[test]
+fn auto_rejects_an_estimator_with_no_response_method() {
+    let err = resolve_stack_method("weird", auto(), NONE).unwrap_err();
+    assert_eq!(
+        msg(err),
+        "Underlying estimator weird does not implement the method \
+         ['predict_proba', 'decision_function', 'predict']."
+    );
+}
+
+#[test]
+fn a_named_method_is_taken_verbatim_when_available() {
+    assert_eq!(
+        resolve_stack_method("nb", fixed("predict"), NB_LIKE).unwrap(),
+        StackMethod::Predict
+    );
+    assert_eq!(
+        resolve_stack_method("lr", fixed("decision_function"), ALL).unwrap(),
+        StackMethod::DecisionFunction
+    );
+}
+
+#[test]
+fn a_named_method_the_estimator_lacks_is_sklearns_value_error() {
+    let err = resolve_stack_method("svc", fixed("predict_proba"), SVC_LIKE).unwrap_err();
+    assert_eq!(
+        msg(err),
+        "Underlying estimator svc does not implement the method predict_proba."
+    );
+    let err = resolve_stack_method("nb", fixed("decision_function"), NB_LIKE).unwrap_err();
+    assert_eq!(
+        msg(err),
+        "Underlying estimator nb does not implement the method decision_function."
+    );
+}
+
+// --------------------------------------------------------------------------- //
+// classifier_meta_slices — the column-dropping rule
+// --------------------------------------------------------------------------- //
+
+fn slice(block: usize, sub: usize, start_col: usize, n_cols: usize) -> MetaSlice {
+    MetaSlice {
+        block,
+        sub,
+        start_col,
+        n_cols,
+    }
+}
+
+#[test]
+fn binary_proba_drops_the_first_column() {
+    // p(y=0) = 1 - p(y=1): both columns are perfectly collinear, so sklearn
+    // hands the final estimator only the second.
+    let slices =
+        classifier_meta_slices(&[StackMethod::PredictProba], &[PredShape::Matrix(2)], 2).unwrap();
+    assert_eq!(slices, vec![slice(0, 0, 1, 1)]);
+}
+
+#[test]
+fn multiclass_proba_keeps_every_column() {
+    let slices =
+        classifier_meta_slices(&[StackMethod::PredictProba], &[PredShape::Matrix(3)], 3).unwrap();
+    assert_eq!(slices, vec![slice(0, 0, 0, 3)]);
+}
+
+#[test]
+fn a_binary_decision_function_is_one_column_and_is_not_dropped() {
+    // `decision_function` on a binary problem returns `(n,)`, and the drop rule
+    // is `predict_proba`-only — a signed margin has no collinear twin.
+    let slices =
+        classifier_meta_slices(&[StackMethod::DecisionFunction], &[PredShape::Column], 2).unwrap();
+    assert_eq!(slices, vec![slice(0, 0, 0, 1)]);
+
+    // A multiclass one is `(n, K)` and stays whole.
+    let slices =
+        classifier_meta_slices(&[StackMethod::DecisionFunction], &[PredShape::Matrix(3)], 3)
+            .unwrap();
+    assert_eq!(slices, vec![slice(0, 0, 0, 3)]);
+}
+
+#[test]
+fn predict_is_always_a_single_column() {
+    for n_classes in [2usize, 5] {
+        let slices =
+            classifier_meta_slices(&[StackMethod::Predict], &[PredShape::Column], n_classes)
+                .unwrap();
+        assert_eq!(slices, vec![slice(0, 0, 0, 1)]);
+    }
+}
+
+#[test]
+fn a_multi_output_response_contributes_one_dropped_block_per_target() {
+    // The multilabel `predict_proba` shape: a list of per-target `(n, 2)`
+    // blocks, each reduced to its second column.
+    let slices = classifier_meta_slices(
+        &[StackMethod::PredictProba],
+        &[PredShape::MultiOutput(vec![2, 2, 2])],
+        3,
+    )
+    .unwrap();
+    assert_eq!(
+        slices,
+        vec![slice(0, 0, 1, 1), slice(0, 1, 1, 1), slice(0, 2, 1, 1)]
+    );
+}
+
+#[test]
+fn mixed_members_keep_estimator_order() {
+    let slices = classifier_meta_slices(
+        &[
+            StackMethod::PredictProba,
+            StackMethod::DecisionFunction,
+            StackMethod::Predict,
+        ],
+        &[PredShape::Matrix(4), PredShape::Matrix(4), PredShape::Column],
+        4,
+    )
+    .unwrap();
+    assert_eq!(
+        slices,
+        vec![slice(0, 0, 0, 4), slice(1, 0, 0, 4), slice(2, 0, 0, 1)]
+    );
+
+    // …and the widths those slices imply are what the layout is built from.
+    let widths: Vec<usize> = slices.iter().map(|s| s.n_cols).collect();
+    let layout = meta_layout(&widths, 0, false).unwrap();
+    assert_eq!(layout.offsets, vec![0, 4, 8]);
+    assert_eq!(layout.width, 9);
+}
+
+#[test]
+fn slices_reject_a_methods_shapes_length_mismatch() {
+    let err = classifier_meta_slices(
+        &[StackMethod::Predict],
+        &[PredShape::Column, PredShape::Column],
+        2,
+    )
+    .unwrap_err();
+    assert_eq!(
+        msg(err),
+        "have 1 resolved stack methods but 2 prediction shapes"
+    );
+}
+
+#[test]
+fn slices_reject_an_empty_multi_output_list() {
+    let err = classifier_meta_slices(
+        &[StackMethod::PredictProba],
+        &[PredShape::MultiOutput(vec![])],
+        2,
+    )
+    .unwrap_err();
+    assert_eq!(
+        msg(err),
+        "estimator at position 0 returned an empty list of prediction blocks"
+    );
+}
+
+#[test]
+fn a_degenerate_single_column_proba_is_rejected_by_the_layout() {
+    // A one-column `predict_proba` on a binary problem slices down to zero
+    // columns. `classifier_meta_slices` reports it as a width, and
+    // `meta_layout` is the single place that rejects a zero-width block — so
+    // both estimators report it identically.
+    let slices =
+        classifier_meta_slices(&[StackMethod::PredictProba], &[PredShape::Matrix(1)], 2).unwrap();
+    assert_eq!(slices, vec![slice(0, 0, 1, 0)]);
+    let widths: Vec<usize> = slices.iter().map(|s| s.n_cols).collect();
+    let err = meta_layout(&widths, 0, false).unwrap_err();
+    assert_eq!(
+        msg(err),
+        "estimator at position 0 produced a prediction block with 0 columns"
+    );
 }

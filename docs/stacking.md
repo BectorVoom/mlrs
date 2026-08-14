@@ -19,6 +19,12 @@ reg.fit(X, y).predict(X_test)
 Members may be mlrs estimators, scikit-learn estimators, or a mix — the
 composition only requires `fit`/`predict` and `is_regressor`.
 
+For classification see [stacking_classifier.md](stacking_classifier.md): the
+same composition, plus the `stack_method` parameter and the column-dropping rule
+that comes with it. Everything below that is not about `predict` being a
+regressor's only response method applies to both classes, which share their
+structure through one Rust core and one Python mixin.
+
 ## Where the work happens
 
 Stacking is a *composition*: the arithmetic already runs inside the composed
@@ -136,12 +142,14 @@ string:
 * `estimators=[(name, "drop")]` — no fit, no meta column, no feature name, but
   the slot survives in `named_estimators_` as the literal `'drop'`.
 
-`crates/mlrs-py/python/tests/test_stacking_meta_engine.py` adds 68 more cells
-that re-run both string parameters — and the layout equivalences — **once per
-meta-assembly arm**, so `host` and `device` are never covered only by synthetic
-block data. 147 cells green on cpu, wgpu and rocm, zero skips on all three
-(rocm included: the scatter needs no f64 matmul, so it runs there at f64 where
-`backend_supports_f64()` alone would have wrongly skipped it).
+`crates/mlrs-py/python/tests/test_stacking_meta_engine.py` re-runs both string
+parameters — and the layout equivalences — **once per meta-assembly arm**, so
+`host` and `device` are never covered only by synthetic block data: 68 cells for
+this estimator, plus 38 added by
+[stacking_classifier.md](stacking_classifier.md) in the multi-column shape
+(106 in the file). 185 cells green with this suite on cpu, wgpu and rocm, zero
+skips on all three (rocm included: the scatter needs no f64 matmul, so it runs
+there at f64 where `backend_supports_f64()` alone would have wrongly skipped it).
 
 `mlrs.StackingRegressor` also passes sklearn's `parametrize_with_checks` sweep
 (57 passed / 1 skipped) at the default `passthrough=False`. At

@@ -2538,8 +2538,21 @@ def cross_val_predict(
         )
         for train, test in splits
     )
+    order = np.asarray(inverse, dtype=np.intp)
+    if predictions and isinstance(predictions[0], list):
+        # A MULTI-OUTPUT response method: each fold returned one array PER
+        # TARGET (`RandomForestClassifier.predict_proba` on a multilabel `y`,
+        # and every `MultiOutputClassifier`). Stacking those folds with a plain
+        # `np.concatenate` would glue the target axis to the sample axis and
+        # return an array of the wrong rank — so, as sklearn does, the folds are
+        # concatenated WITHIN each target and the list shape is preserved.
+        n_targets = len(predictions[0])
+        return [
+            np.concatenate([np.asarray(fold[t]) for fold in predictions], axis=0)[order]
+            for t in range(n_targets)
+        ]
     stacked = np.concatenate([np.asarray(p) for p in predictions], axis=0)
-    return stacked[np.asarray(inverse, dtype=np.intp)]
+    return stacked[order]
 
 
 # --------------------------------------------------------------------------- #

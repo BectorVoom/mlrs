@@ -71,14 +71,126 @@ pub fn stacking_kept_indices(is_drop: Vec<bool>) -> PyResult<Vec<usize>> {
 /// Whether a STRING `cv` selects the prefit route.
 ///
 /// Returns `true` for `"prefit"` and raises for any other string, carrying
-/// sklearn's `StrOptions` message. The shim re-raises it as
+/// sklearn's `StrOptions` message — with `owner` (the caller's class name)
+/// interpolated into it, since `StackingRegressor` and `StackingClassifier`
+/// share the rule but not the text. The shim re-raises it as
 /// `InvalidParameterError` (which subclasses both `ValueError` and `TypeError`)
 /// so `except TypeError` callers migrating from sklearn still catch it — the
 /// same reasoning `ModelSelectionError` splits its two variants for.
 #[pyfunction]
-pub fn stacking_cv_is_prefit(cv: &str) -> PyResult<bool> {
-    stk::cv_route_from_str(cv)
+pub fn stacking_cv_is_prefit(cv: &str, owner: &str) -> PyResult<bool> {
+    stk::cv_route_from_str(cv, owner)
         .map(|route| route == stk::CvRoute::Prefit)
+        .map_err(stacking_err_to_py)
+}
+
+/// Validate the `stack_method` constructor argument (STACK-CLF-01).
+///
+/// Echoes the value back when it is one of sklearn's four options and raises
+/// its `StrOptions` message otherwise; the shim re-raises that as
+/// `InvalidParameterError`, as it does for `cv`. Called at the TOP of `fit`,
+/// where sklearn's `@validate_params` runs, so a bad `stack_method` is reported
+/// before anything about the `estimators` list is.
+#[pyfunction]
+pub fn stacking_stack_method(value: &str) -> PyResult<String> {
+    stk::stack_method_request(value)
+        .map(|req| match req {
+            stk::StackMethodRequest::Auto => "auto".to_string(),
+            stk::StackMethodRequest::Fixed(m) => m.as_str().to_string(),
+        })
+        .map_err(stacking_err_to_py)
+}
+
+/// sklearn `_BaseStacking._method_name` for every KEPT estimator at once.
+///
+/// `implements[i]` is `(has_predict_proba, has_decision_function, has_predict)`
+/// for `names[i]` — the `hasattr` calls stay in Python because an
+/// `available_if` descriptor decides them at access time. Returns the resolved
+/// method name per estimator, which is what `stack_method_` reports.
+///
+/// One crossing for the whole list rather than one per estimator: the answer is
+/// three booleans in and a short string out, so the FFI overhead would dominate
+/// a per-estimator call by orders of magnitude.
+#[pyfunction]
+pub fn stacking_resolve_stack_methods(
+    names: Vec<String>,
+    stack_method: &str,
+    implements: Vec<(bool, bool, bool)>,
+) -> PyResult<Vec<String>> {
+    if names.len() != implements.len() {
+        return Err(PyValueError::new_err(format!(
+            "have {} estimator names but {} method-availability triples",
+            names.len(),
+            implements.len()
+        )));
+    }
+    let request = stk::stack_method_request(stack_method).map_err(stacking_err_to_py)?;
+    names
+        .iter()
+        .zip(&implements)
+        .map(|(name, &(proba, decision, predict))| {
+            stk::resolve_stack_method(name, request, [proba, decision, predict])
+                .map(|m| m.as_str().to_string())
+                .map_err(stacking_err_to_py)
+        })
+        .collect()
+}
+
+/// The classifier's meta blocks: `(block, sub, start_col, n_cols)` per block
+/// (STACK-CLF-01).
+///
+/// `methods` is the resolved `stack_method_`; `kinds[i]` describes the shape of
+/// estimator `i`'s raw response — `0` = 1-D `(n,)`, `1` = 2-D with `cols[i][0]`
+/// columns, `2` = a LIST of `cols[i].len()` blocks (the multilabel
+/// `predict_proba` shape). `n_classes` is `len(classes_)`.
+///
+/// The shim slices `pred[:, start_col : start_col + n_cols]` (selecting list
+/// element `sub` first) and feeds the resulting widths to
+/// [`stacking_meta_layout`].
+#[pyfunction]
+pub fn stacking_classifier_meta_slices(
+    methods: Vec<String>,
+    kinds: Vec<u8>,
+    cols: Vec<Vec<usize>>,
+    n_classes: usize,
+) -> PyResult<Vec<(usize, usize, usize, usize)>> {
+    if kinds.len() != cols.len() {
+        return Err(PyValueError::new_err(format!(
+            "have {} shape kinds but {} column lists",
+            kinds.len(),
+            cols.len()
+        )));
+    }
+    let parsed: Vec<stk::StackMethod> = methods
+        .iter()
+        .map(|m| {
+            stk::StackMethod::parse(m)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown stack method {m:?}")))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let shapes: Vec<stk::PredShape> = kinds
+        .iter()
+        .zip(&cols)
+        .map(|(&kind, c)| match kind {
+            0 => Ok(stk::PredShape::Column),
+            1 => c
+                .first()
+                .copied()
+                .map(stk::PredShape::Matrix)
+                .ok_or_else(|| PyValueError::new_err("a 2-D shape needs a column count")),
+            2 => Ok(stk::PredShape::MultiOutput(c.clone())),
+            other => Err(PyValueError::new_err(format!(
+                "unknown prediction-shape kind {other}"
+            ))),
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    stk::classifier_meta_slices(&parsed, &shapes, n_classes)
+        .map(|slices| {
+            slices
+                .into_iter()
+                .map(|s| (s.block, s.sub, s.start_col, s.n_cols))
+                .collect()
+        })
         .map_err(stacking_err_to_py)
 }
 
@@ -254,6 +366,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stacking_validate_names, m)?)?;
     m.add_function(wrap_pyfunction!(stacking_kept_indices, m)?)?;
     m.add_function(wrap_pyfunction!(stacking_cv_is_prefit, m)?)?;
+    m.add_function(wrap_pyfunction!(stacking_stack_method, m)?)?;
+    m.add_function(wrap_pyfunction!(stacking_resolve_stack_methods, m)?)?;
+    m.add_function(wrap_pyfunction!(stacking_classifier_meta_slices, m)?)?;
     m.add_function(wrap_pyfunction!(stacking_meta_layout, m)?)?;
     m.add_function(wrap_pyfunction!(stacking_feature_names, m)?)?;
     m.add_function(wrap_pyfunction!(stacking_meta_engine, m)?)?;

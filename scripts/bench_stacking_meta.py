@@ -75,6 +75,11 @@ ARMS = ["numpy", "host", "device"]
 #: ``(n_rows, k_blocks, n_features)`` — ``n_features = 0`` means
 #: ``passthrough=False``. The ladder walks the copy from "smaller than the FFI
 #: crossing" to "big enough for bandwidth to matter".
+#:
+#: Columns per block are ``--cols`` (default 1, the regressor's shape). A
+#: ``StackingClassifier`` contributes ``n_classes`` columns per member under
+#: ``predict_proba``, so ``--cols 10`` is the shape a 10-class stack assembles
+#: and the one where the scatter has the most to move (STACK-CLF-01).
 COPY_LADDER = [
     (1_000, 2, 0),
     (10_000, 2, 0),
@@ -94,15 +99,15 @@ FIT_LADDER = [
 ]
 
 
-def blocks_for(n, k, d, dtype):
-    """``k`` single-column prediction blocks, plus ``X`` when ``d > 0``."""
+def blocks_for(n, k, d, dtype, cols=1):
+    """``k`` prediction blocks of ``cols`` columns, plus ``X`` when ``d > 0``."""
     rng = np.random.default_rng(SEED)
-    preds = [rng.standard_normal((n, 1)).astype(dtype) for _ in range(k)]
+    preds = [rng.standard_normal((n, cols)).astype(dtype) for _ in range(k)]
     X = rng.standard_normal((n, d)).astype(dtype) if d else None
     return preds, X
 
 
-def time_copy(arm, n, k, d, dtype, reps):
+def time_copy(arm, n, k, d, dtype, reps, cols=1):
     """Seconds for one meta-matrix assembly on `arm`, min over `reps` in-cell.
 
     The in-cell minimum is on top of the across-process minimum, not instead of
@@ -111,9 +116,9 @@ def time_copy(arm, n, k, d, dtype, reps):
     """
     import mlrs
 
-    preds, X = blocks_for(n, k, d, dtype)
+    preds, X = blocks_for(n, k, d, dtype, cols)
     given = preds + ([X] if X is not None else [])
-    pred_cols = [1] * k
+    pred_cols = [cols] * k
     passthrough = X is not None
     n_features = d if passthrough else 0
 
@@ -189,7 +194,7 @@ def cell(args):
     dtype = np.float64 if mlrs.backend_supports_f64() else np.float32
     if args.level == "copy":
         seconds, cpu_seconds, checksum = time_copy(
-            args.arm, args.n, args.k, args.d, dtype, args.inner
+            args.arm, args.n, args.k, args.d, dtype, args.inner, args.cols
         )
     else:
         seconds, cpu_seconds, checksum = time_fit(
@@ -212,13 +217,13 @@ def cell(args):
     return 0
 
 
-def spawn(arm, level, n, k, d, cv, inner):
+def spawn(arm, level, n, k, d, cv, inner, cols=1):
     """Run one cell in a FRESH interpreter and parse its JSON line."""
     argv = [
         sys.executable, __file__, "--cell",
         "--arm", arm, "--level", level,
         "--n", str(n), "--k", str(k), "--d", str(d),
-        "--cv", str(cv), "--inner", str(inner),
+        "--cv", str(cv), "--inner", str(inner), "--cols", str(cols),
     ]
     out = subprocess.run(argv, capture_output=True, text=True)
     if out.returncode != 0:
@@ -260,7 +265,7 @@ def sweep(args):
         if args.level == "copy":
             n, k, d = row
             cv = 0
-            label = f"n={n:,} k={k} d={d}"
+            label = f"n={n:,} k={k}x{args.cols} d={d}"
         else:
             n, d, cv = row
             k = 2
@@ -270,7 +275,7 @@ def sweep(args):
         checks = {}
         for _ in range(args.repeat):
             for arm in ARMS:  # interleaved, not blocked
-                got = spawn(arm, args.level, n, k, d, cv, args.inner)
+                got = spawn(arm, args.level, n, k, d, cv, args.inner, args.cols)
                 if got is None:
                     continue
                 best[arm] = min(best[arm], got[clock])
@@ -310,6 +315,15 @@ def main():
     p.add_argument("--level", choices=["copy", "fit"], default="copy")
     p.add_argument("--n", type=int, default=100_000)
     p.add_argument("--k", type=int, default=0, help="blocks (copy level)")
+    p.add_argument(
+        "--cols",
+        type=int,
+        default=1,
+        help=(
+            "columns per prediction block (copy level). 1 is a regressor's "
+            "shape; n_classes is a StackingClassifier's under predict_proba"
+        ),
+    )
     p.add_argument("--d", type=int, default=0, help="passthrough width; 0 = off")
     p.add_argument("--cv", type=int, default=5)
     p.add_argument("--repeat", type=int, default=3, help="fresh processes per cell")

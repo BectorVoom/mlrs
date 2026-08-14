@@ -15,10 +15,33 @@
 //! | `None` (the DEFAULT) | [`ridge_gcv`] — generalized (leave-one-out) CV in closed form off ONE symmetric eigendecomposition | one `O(n·d²)` Gram + one `O(d³)` eig + one `O(n·d²)` projection, then `O(n·d)` PER ALPHA |
 //! | anything else | [`ridge_cv_grid`] — an explicit `GridSearchCV(Ridge(), {'alpha': alphas}, cv=cv)` | one `O(n_train·d²)` Gram PER SPLIT, then `O(d³/3)` per alpha |
 //!
-//! Neither engine touches a device: both are host-only on every backend, for
-//! the reason `ridge.rs::fit_from_host_slice` documents (the normal-equations
-//! formation belongs on the host on cpu, and the `O(d³)`/`O(d²)` algebra after
-//! it is a scalar recurrence, not a data-parallel kernel).
+//! ## Where the work runs (RIDGECV-02)
+//! The GCV engine's `n > d` route has TWO arms, chosen by [`gcv_device_arm`]
+//! from the `device` hyperparameter and reported by the estimator's `device_`:
+//!
+//! | phase | host arm | device arm |
+//! |---|---|---|
+//! | means + `X̃ᵀX̃` + `X̃ᵀ[ỹ ǀ √w]`, `O(n·d²)` | `gram_host` | `prims::ridge_gcv::GcvDevice::normal_equations` |
+//! | `sym_eig` + spectral weights + coefficients, `O(d³ + n_alphas·d²·n_y)` | HOST | HOST (the same code — [`spectral_weights`]) |
+//! | the streaming sweep, `O(n·d² + n_alphas·n·d·(n_y+2))` | [`cov_sweep`] | `prims::ridge_gcv::GcvDevice::sweep` |
+//!
+//! The `O(d³)` middle runs on the host on BOTH arms, and not for lack of a
+//! kernel: it is a serial scalar recurrence three to five orders below the two
+//! passes around it, which is the one shape a GPU is worst at
+//! (`bayesian_ridge.rs` makes the same split for the same reason). Because it is
+//! literally the same code on both arms, the two cannot disagree about the LOO
+//! algebra — only about summation order.
+//!
+//! Everything else stays host-only and says why: the `n ≤ d` route (its cost IS
+//! a serial `O(n³)` eigendecomposition — see below), and the explicit-`cv` grid
+//! engine (a per-split `O(d³/3)` Cholesky, not a data-parallel kernel). Both
+//! report `device_ == "cpu"` rather than the preference they could not honour.
+//!
+//! `device='auto'` keeps the HOST arm on every backend measured so far — the
+//! ingress upload dominates a device fit, and the host arm already beats sklearn
+//! several times over. The ladders, the crossover and the reasons the crossover
+//! is not shipped as a threshold are in
+//! [`gcv_device_preferred`](mlrs_backend::prims::ridge_gcv::gcv_device_preferred).
 //!
 //! ## The LOO identity, and why the alpha loop is nearly free
 //! For ridge, the leave-one-out residual has a closed form that needs no
@@ -182,9 +205,14 @@
 //! in-source `#[cfg(test)] mod tests`.
 
 use bytemuck::Pod;
+use cubecl::prelude::{CubeElement, Float};
 
 use mlrs_backend::capability::cpu_launch_units;
+use mlrs_backend::device::Device;
+use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::gram_host::centered_gram_multi_xty;
+use mlrs_backend::prims::ridge_gcv::{gcv_device_possible, gcv_device_preferred, GcvDevice};
+use mlrs_backend::runtime::ActiveRuntime;
 use mlrs_core::PrimError;
 
 use crate::error::{AlgoError, BuildError};
@@ -445,7 +473,59 @@ fn ridge_gcv_t<T: Elem>(
     want_predictions: bool,
     store_cv_values: bool,
 ) -> Result<GcvFit, AlgoError> {
-    validate_geometry(x.len(), y.len(), n, d, n_y)?;
+    let (sqrt_sw, sw_sum) = validate_gcv(x.len(), y.len(), n, d, n_y, sw, alphas)?;
+
+    let emit_values = store_cv_values || want_predictions;
+    match resolve_route(mode, n, d) {
+        GcvRoute::Cov => gcv_cov::<T>(
+            x,
+            y,
+            n,
+            d,
+            n_y,
+            sw,
+            &sqrt_sw,
+            sw_sum,
+            alphas,
+            fit_intercept,
+            want_predictions,
+            emit_values,
+        ),
+        GcvRoute::Gram => gcv_gram::<T>(
+            x,
+            y,
+            n,
+            d,
+            n_y,
+            sw,
+            &sqrt_sw,
+            sw_sum,
+            alphas,
+            fit_intercept,
+            want_predictions,
+            emit_values,
+        ),
+    }
+}
+
+/// The shape/alpha/weight validation both `"cov"` arms run before either one
+/// allocates, returning the two derived quantities the sweep needs: `√w` (ones
+/// when unweighted, as sklearn's `sqrt_sw`) and `Σw`.
+///
+/// Extracted rather than duplicated because the device arm must reject exactly
+/// what the host arm rejects — a `RidgeCV` that accepted `alpha = 0` on one
+/// backend and not another would be a placement parameter changing behaviour,
+/// which is the one thing `device` promises not to do.
+fn validate_gcv(
+    x_len: usize,
+    y_len: usize,
+    n: usize,
+    d: usize,
+    n_y: usize,
+    sw: Option<&[f64]>,
+    alphas: &[f64],
+) -> Result<(Vec<f64>, f64), AlgoError> {
+    validate_geometry(x_len, y_len, n, d, n_y)?;
     if alphas.is_empty() {
         return Err(AlgoError::Prim(PrimError::ShapeMismatch {
             operand: "alphas",
@@ -484,38 +564,202 @@ fn ridge_gcv_t<T: Elem>(
             estimator: "ridge_cv",
         });
     }
+    Ok((sqrt_sw, sw_sum))
+}
 
-    let emit_values = store_cv_values || want_predictions;
-    match resolve_route(mode, n, d) {
-        GcvRoute::Cov => gcv_cov::<T>(
-            x,
-            y,
-            n,
-            d,
-            n_y,
-            sw,
-            &sqrt_sw,
-            sw_sum,
-            alphas,
-            fit_intercept,
-            want_predictions,
-            emit_values,
-        ),
-        GcvRoute::Gram => gcv_gram::<T>(
-            x,
-            y,
-            n,
-            d,
-            n_y,
-            sw,
-            &sqrt_sw,
-            sw_sum,
-            alphas,
-            fit_intercept,
-            want_predictions,
-            emit_values,
-        ),
+// ---------------------------------------------------------------------------
+// GCV engine — arm placement (RIDGECV-02)
+// ---------------------------------------------------------------------------
+
+/// Will [`ridge_gcv_auto`] take the DEVICE arm for this configuration?
+///
+/// Public so a caller can report `device_` and a perf probe can assert that the
+/// arm it is timing is the arm it asked for (`mlrs-bench-verify-knob-is-live`:
+/// a sweep against a gate that silently declined is vacuous).
+///
+/// Three questions in the order the `mlrs-device-param` rule requires —
+/// CAPABILITY first, and `device = "gpu"` may override only the last:
+///
+/// 1. **Is this the `"cov"` route?** The `n ≤ d` route's cost is a serial
+///    `O(n³)` eigendecomposition of the `n × n` Gram (module docs), which is the
+///    shape a GPU is worst at and which no kernel here addresses. It has ONE
+///    arm.
+/// 2. **Can the device engine run at all?** `f64` device kernels, `d` inside the
+///    sweep's shared-memory tile, a fused Gram at this `d`
+///    ([`gcv_device_possible`]).
+/// 3. **Is it worth the upload?** [`gcv_device_preferred`] — the only overridable
+///    half, and the only one that reads `MLRS_RIDGECV_DEVICE`.
+pub fn gcv_device_arm(
+    device: Device,
+    mode: GcvMode,
+    n_samples: usize,
+    n_features: usize,
+    n_alphas: usize,
+    n_targets: usize,
+) -> bool {
+    if resolve_route(mode, n_samples, n_features) != GcvRoute::Cov {
+        return false;
     }
+    if !gcv_device_possible(n_features) {
+        return false;
+    }
+    device.prefers_device(|| gcv_device_preferred(n_samples, n_features, n_alphas, n_targets))
+}
+
+/// [`ridge_gcv`] with the arm chosen by [`gcv_device_arm`], reporting which one
+/// ran.
+///
+/// The returned `&'static str` is what the estimator publishes as `device_`
+/// (`"cpu"` / `"gpu"`). It is derived from the SAME boolean the branch below
+/// takes, not recomputed, so the estimator cannot report one arm and run another
+/// (`Device::resolved_name`'s contract).
+///
+/// Both arms produce the same [`GcvFit`] to within summation order — see
+/// `prims::ridge_gcv`'s module docs for what that means and
+/// `ridge_cv_device_test.rs` for the gate that holds it.
+#[allow(clippy::too_many_arguments)]
+pub fn ridge_gcv_auto<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &[F],
+    y: &[F],
+    n_samples: usize,
+    n_features: usize,
+    n_targets: usize,
+    sample_weight: Option<&[f64]>,
+    alphas: &[f64],
+    fit_intercept: bool,
+    mode: GcvMode,
+    want_predictions: bool,
+    store_cv_values: bool,
+    device: Device,
+) -> Result<(GcvFit, &'static str), AlgoError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let on_device = gcv_device_arm(
+        device,
+        mode,
+        n_samples,
+        n_features,
+        alphas.len(),
+        n_targets,
+    );
+    if !on_device {
+        let fit = ridge_gcv::<F>(
+            x,
+            y,
+            n_samples,
+            n_features,
+            n_targets,
+            sample_weight,
+            alphas,
+            fit_intercept,
+            mode,
+            want_predictions,
+            store_cv_values,
+        )?;
+        return Ok((fit, Device::resolved_name(true)));
+    }
+
+    let (sqrt_sw, sw_sum) = validate_gcv(
+        x.len(),
+        y.len(),
+        n_samples,
+        n_features,
+        n_targets,
+        sample_weight,
+        alphas,
+    )?;
+    let dev = GcvDevice::from_host::<F>(
+        pool,
+        x,
+        y,
+        n_samples,
+        n_features,
+        n_targets,
+        &sqrt_sw,
+        sample_weight.is_some(),
+    )
+    .map_err(AlgoError::Prim)?;
+    let fit = gcv_cov_device(
+        pool,
+        &dev,
+        n_samples,
+        n_features,
+        n_targets,
+        sw_sum,
+        alphas,
+        fit_intercept,
+        want_predictions,
+        store_cv_values || want_predictions,
+    );
+    dev.release_into(pool);
+    Ok((fit?, Device::resolved_name(false)))
+}
+
+/// The device `"cov"` body, once the design is uploaded.
+///
+/// Split from [`ridge_gcv_auto`] so the upload has exactly ONE release path: an
+/// error anywhere in here still returns the `n × d` device buffer to the pool.
+///
+/// Structurally it is [`gcv_cov`] with two substitutions — the normal-equation
+/// sweep becomes [`GcvDevice::normal_equations`] and the streaming sweep becomes
+/// [`GcvDevice::sweep`] — and the `O(d³)` middle is shared verbatim
+/// ([`sym_eig`] + [`spectral_weights`]). That is deliberate: the LOO algebra
+/// exists once, so the arms cannot disagree about anything except summation
+/// order.
+#[allow(clippy::too_many_arguments)]
+fn gcv_cov_device(
+    pool: &mut BufferPool<ActiveRuntime>,
+    dev: &GcvDevice,
+    n: usize,
+    d: usize,
+    n_y: usize,
+    sw_sum: f64,
+    alphas: &[f64],
+    fit_intercept: bool,
+    want_predictions: bool,
+    emit_values: bool,
+) -> Result<GcvFit, AlgoError> {
+    let (x_offset, y_offset, gram, xty, xtsw) = dev
+        .normal_equations(pool, fit_intercept)
+        .map_err(AlgoError::Prim)?;
+
+    let (lam, v) = sym_eig(&gram, d);
+    let sp = spectral_weights(&lam, &v, &xty, &xtsw, alphas, d, n_y);
+
+    let out = dev
+        .sweep(
+            pool,
+            &x_offset,
+            &y_offset,
+            &v,
+            &sp.g,
+            &sp.gz,
+            &sp.gzsw,
+            alphas.len(),
+            sw_sum,
+            fit_intercept,
+            want_predictions,
+            emit_values,
+        )
+        .map_err(AlgoError::Prim)?;
+
+    let inv_n = 1.0 / n as f64;
+    let scores = if want_predictions {
+        Vec::new()
+    } else {
+        out.score_sums.iter().map(|s| -s * inv_n).collect()
+    };
+
+    Ok(GcvFit {
+        scores,
+        coefs: sp.coefs,
+        cv_values: out.cv_values,
+        x_offset,
+        y_offset,
+        route: GcvRoute::Cov,
+    })
 }
 
 /// The `n > d` route: eigendecompose the `d × d` Gram `X̃ᵀX̃`, then stream the
@@ -558,55 +802,14 @@ fn gcv_cov<T: Elem>(
     //        `j` of eigenvector `k` (columns). ---
     let (lam, v) = sym_eig(&gram, d);
 
-    // `z = Vᵀ·Xᵀy` (d × n_y) and `zsw = Vᵀ·Xᵀ√w` (d) — the alpha loop's only
-    // `y`-dependent operands, formed once.
-    let mut z = vec![0.0f64; d * n_y];
-    for k in 0..d {
-        for t in 0..n_y {
-            let mut acc = 0.0;
-            for j in 0..d {
-                acc += v[j * d + k] * xty[j * n_y + t];
-            }
-            z[k * n_y + t] = acc;
-        }
-    }
-    let mut zsw = vec![0.0f64; d];
-    for k in 0..d {
-        let mut acc = 0.0;
-        for j in 0..d {
-            acc += v[j * d + k] * xtsw[j];
-        }
-        zsw[k] = acc;
-    }
-
     // --- 3. Per-alpha spectral weights, all precomputed so the streaming sweep
-    //        never divides. `g[a·d + k] = 1/(λₖ + α)`. ---
-    let mut g = vec![0.0f64; n_alphas * d];
-    let mut gz = vec![0.0f64; n_alphas * d * n_y];
-    let mut gzsw = vec![0.0f64; n_alphas * d];
-    let mut coefs = vec![0.0f64; n_alphas * d * n_y];
-    for (a, &alpha) in alphas.iter().enumerate() {
-        for k in 0..d {
-            let gk = 1.0 / (lam[k] + alpha);
-            g[a * d + k] = gk;
-            gzsw[a * d + k] = gk * zsw[k];
-            for t in 0..n_y {
-                gz[(a * d + k) * n_y + t] = gk * z[k * n_y + t];
-            }
-        }
-        // coef = V·diag(1/(λ+α))·Vᵀ·Xᵀy — the eigenbasis form of
-        // `(XᵀX + αI)⁻¹Xᵀy`, so the singular-Gram case degrades smoothly
-        // instead of failing a Cholesky pivot.
-        for j in 0..d {
-            for t in 0..n_y {
-                let mut acc = 0.0;
-                for k in 0..d {
-                    acc += v[j * d + k] * gz[(a * d + k) * n_y + t];
-                }
-                coefs[(a * d + j) * n_y + t] = acc;
-            }
-        }
-    }
+    //        never divides. ---
+    let Spectral {
+        g,
+        gz,
+        gzsw,
+        coefs,
+    } = spectral_weights(&lam, &v, &xty, &xtsw, alphas, d, n_y);
 
     // --- 4. The streaming sweep: project each row block into the eigenbasis
     //        ONCE and contract it against every alpha. ---
@@ -715,6 +918,97 @@ fn gcv_cov<T: Elem>(
         y_offset,
         route: GcvRoute::Cov,
     })
+}
+
+/// The per-alpha operands both `"cov"` arms contract against `W`'s rows.
+///
+/// One struct rather than a four-tuple because the host sweep and the device
+/// launch each take all four and would otherwise thread them positionally
+/// through two long argument lists.
+struct Spectral {
+    /// `n_alphas × d`, `1/(λₖ + α)`.
+    g: Vec<f64>,
+    /// `n_alphas × d × n_y`, `g ⊙ (Vᵀ·X̃ᵀỹ)`.
+    gz: Vec<f64>,
+    /// `n_alphas × d`, `g ⊙ (Vᵀ·X̃ᵀ√w)`.
+    gzsw: Vec<f64>,
+    /// `n_alphas × d × n_y`, `V·diag(g)·Vᵀ·X̃ᵀỹ` — EVERY alpha's coefficients
+    /// (`alpha_per_target` picks a different winner per column).
+    coefs: Vec<f64>,
+}
+
+/// Everything the alpha loop needs, from the spectrum and the `y`-side
+/// projections — the `O(n_alphas · d² · n_y)` block that sits between the
+/// eigendecomposition and the sweep.
+///
+/// Shared verbatim by the host and device `"cov"` arms. It is the reason the
+/// two arms cannot drift on the LOO algebra: only the SWEEP differs between
+/// them, and the sweep consumes exactly this.
+fn spectral_weights(
+    lam: &[f64],
+    v: &[f64],
+    xty: &[f64],
+    xtsw: &[f64],
+    alphas: &[f64],
+    d: usize,
+    n_y: usize,
+) -> Spectral {
+    let n_alphas = alphas.len();
+
+    // `z = Vᵀ·Xᵀy` (d × n_y) and `zsw = Vᵀ·Xᵀ√w` (d) — the alpha loop's only
+    // `y`-dependent operands, formed once.
+    let mut z = vec![0.0f64; d * n_y];
+    for k in 0..d {
+        for t in 0..n_y {
+            let mut acc = 0.0;
+            for j in 0..d {
+                acc += v[j * d + k] * xty[j * n_y + t];
+            }
+            z[k * n_y + t] = acc;
+        }
+    }
+    let mut zsw = vec![0.0f64; d];
+    for k in 0..d {
+        let mut acc = 0.0;
+        for j in 0..d {
+            acc += v[j * d + k] * xtsw[j];
+        }
+        zsw[k] = acc;
+    }
+
+    let mut g = vec![0.0f64; n_alphas * d];
+    let mut gz = vec![0.0f64; n_alphas * d * n_y];
+    let mut gzsw = vec![0.0f64; n_alphas * d];
+    let mut coefs = vec![0.0f64; n_alphas * d * n_y];
+    for (a, &alpha) in alphas.iter().enumerate() {
+        for k in 0..d {
+            let gk = 1.0 / (lam[k] + alpha);
+            g[a * d + k] = gk;
+            gzsw[a * d + k] = gk * zsw[k];
+            for t in 0..n_y {
+                gz[(a * d + k) * n_y + t] = gk * z[k * n_y + t];
+            }
+        }
+        // coef = V·diag(1/(λ+α))·Vᵀ·Xᵀy — the eigenbasis form of
+        // `(XᵀX + αI)⁻¹Xᵀy`, so the singular-Gram case degrades smoothly
+        // instead of failing a Cholesky pivot.
+        for j in 0..d {
+            for t in 0..n_y {
+                let mut acc = 0.0;
+                for k in 0..d {
+                    acc += v[j * d + k] * gz[(a * d + k) * n_y + t];
+                }
+                coefs[(a * d + j) * n_y + t] = acc;
+            }
+        }
+    }
+
+    Spectral {
+        g,
+        gz,
+        gzsw,
+        coefs,
+    }
 }
 
 /// One worker's share of the `"cov"` streaming sweep.

@@ -933,6 +933,12 @@ def test_rust_drop_sentinel_is_the_string_the_estimator_accepts():
 
 def test_rust_cv_is_prefit_classifies_the_string():
     ext = pytest.importorskip("mlrs")._load_ext()
-    assert ext.stacking_cv_is_prefit("prefit") is True
+    assert ext.stacking_cv_is_prefit("prefit", "StackingRegressor") is True
     with pytest.raises(ValueError, match=re.escape("must be an int in the range")):
-        ext.stacking_cv_is_prefit("nope")
+        ext.stacking_cv_is_prefit("nope", "StackingRegressor")
+    # The owner name is interpolated, so a `StackingClassifier` caller is not
+    # told its `StackingRegressor` is at fault.
+    with pytest.raises(
+        ValueError, match=re.escape("'cv' parameter of StackingClassifier")
+    ):
+        ext.stacking_cv_is_prefit("nope", "StackingClassifier")

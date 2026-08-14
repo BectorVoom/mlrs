@@ -1,5 +1,6 @@
 //! `stacking` — the structural core of the stacked-generalization meta-estimator
-//! (STACK-01), shared by `mlrs.ensemble.StackingRegressor`.
+//! (STACK-01), shared by `mlrs.ensemble.StackingRegressor` and
+//! `mlrs.ensemble.StackingClassifier` (STACK-CLF-01).
 //!
 //! Stacking is a *composition*: the arithmetic that matters (each base
 //! estimator's `fit`/`predict`, the final estimator's `fit`) already runs on the
@@ -34,6 +35,12 @@
 //!   `_n_feature_outs` + column order
 //! - [`meta_feature_names`] — `_BaseStacking.get_feature_names_out`
 //! - [`CvRoute`] — the `cv == "prefit"` branch of `_BaseStacking.fit`
+//! - [`stack_method_request`] / [`resolve_stack_method`] —
+//!   `StackingClassifier`'s `stack_method` constraint and
+//!   `_BaseStacking._method_name`'s `"auto"` fallback chain
+//! - [`classifier_meta_slices`] — the *column-dropping* half of
+//!   `_BaseStacking._concatenate_predictions`, which is what makes the
+//!   classifier's layout differ from the regressor's
 //!
 //! Tests live in `crates/mlrs-algos/tests/stacking_test.rs` (AGENTS.md §2 — never
 //! an in-source `#[cfg(test)] mod tests`).
@@ -187,16 +194,267 @@ pub enum CvRoute {
 /// `InvalidParameterError` sklearn's `StrOptions({"prefit"})` constraint
 /// produces. A non-string `cv` never reaches here — the shim keeps it in
 /// Python and hands it to `check_cv`.
-pub fn cv_route_from_str(cv: &str) -> Result<CvRoute> {
+///
+/// `owner` is the meta-estimator's class name, which sklearn interpolates into
+/// the message (`StackingRegressor` / `StackingClassifier`); it is a parameter
+/// rather than a constant because both classes share this rule and a caller
+/// grepping the message must see its OWN class named.
+pub fn cv_route_from_str(cv: &str, owner: &str) -> Result<CvRoute> {
     if cv == PREFIT {
         Ok(CvRoute::Prefit)
     } else {
         Err(value_err(format!(
-            "The 'cv' parameter of StackingRegressor must be an int in the range \
+            "The 'cv' parameter of {owner} must be an int in the range \
              [2, inf), an object implementing 'split' and 'get_n_splits', an \
              iterable or None or a str among {{'prefit'}}. Got '{cv}' instead."
         )))
     }
+}
+
+// --------------------------------------------------------------------------- //
+// `stack_method` — the classifier's response-method selection (STACK-CLF-01)
+// --------------------------------------------------------------------------- //
+
+/// The response methods a stacked classifier can draw meta features from, in
+/// sklearn's `stack_method="auto"` PREFERENCE order.
+///
+/// The order is the semantics: `"auto"` walks this list and takes the first
+/// method the estimator implements, so a classifier that exposes both
+/// `predict_proba` and `decision_function` contributes probabilities.
+pub const STACK_METHODS: [&str; 3] = ["predict_proba", "decision_function", "predict"];
+
+/// One response method of a base estimator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackMethod {
+    /// `predict_proba` — `(n, n_classes)`, and the only method whose block is
+    /// column-dropped in the binary case (see [`classifier_meta_slices`]).
+    PredictProba,
+    /// `decision_function` — `(n,)` when binary, `(n, n_classes)` otherwise.
+    DecisionFunction,
+    /// `predict` — always one column, of ENCODED labels.
+    Predict,
+}
+
+impl StackMethod {
+    /// The Python method name, which is also what `stack_method_` reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StackMethod::PredictProba => STACK_METHODS[0],
+            StackMethod::DecisionFunction => STACK_METHODS[1],
+            StackMethod::Predict => STACK_METHODS[2],
+        }
+    }
+
+    /// Position in [`STACK_METHODS`] — the index into the `implements` flags
+    /// [`resolve_stack_method`] takes.
+    pub fn index(self) -> usize {
+        match self {
+            StackMethod::PredictProba => 0,
+            StackMethod::DecisionFunction => 1,
+            StackMethod::Predict => 2,
+        }
+    }
+
+    /// Parse a method name, `None` when it is not one of the three.
+    pub fn parse(name: &str) -> Option<StackMethod> {
+        match name {
+            "predict_proba" => Some(StackMethod::PredictProba),
+            "decision_function" => Some(StackMethod::DecisionFunction),
+            "predict" => Some(StackMethod::Predict),
+            _ => None,
+        }
+    }
+}
+
+/// What the caller's `stack_method` string asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackMethodRequest {
+    /// `"auto"` — take the first of [`STACK_METHODS`] the estimator has.
+    Auto,
+    /// A named method, which the estimator is then REQUIRED to implement.
+    Fixed(StackMethod),
+}
+
+/// Validate the `stack_method` constructor argument.
+///
+/// sklearn declares it as
+/// `StrOptions({"auto", "predict_proba", "decision_function", "predict"})`, so
+/// an unrecognized value is an `InvalidParameterError` — the shim re-raises
+/// this `ValueError` under that class, exactly as it does for `cv`.
+///
+/// **The option ORDER in the message is not part of parity.** sklearn renders
+/// the constraint by iterating a Python `set`, whose iteration order for these
+/// strings changes with `PYTHONHASHSEED` — the same call produces
+/// `{'decision_function', 'auto', …}` in one process and `{'predict_proba', …}`
+/// in the next. This function emits the declaration order; the oracle test
+/// compares the two messages with the option set parsed out rather than as raw
+/// text, because comparing them literally would be a coin flip.
+pub fn stack_method_request(value: &str) -> Result<StackMethodRequest> {
+    if value == "auto" {
+        return Ok(StackMethodRequest::Auto);
+    }
+    match StackMethod::parse(value) {
+        Some(method) => Ok(StackMethodRequest::Fixed(method)),
+        None => Err(value_err(format!(
+            "The 'stack_method' parameter of StackingClassifier must be a str \
+             among {{'auto', 'predict_proba', 'decision_function', 'predict'}}. \
+             Got '{value}' instead."
+        ))),
+    }
+}
+
+/// sklearn `_BaseStacking._method_name`: which method this estimator will be
+/// asked for.
+///
+/// `implements[i]` answers "does the estimator have `STACK_METHODS[i]`?" — the
+/// `hasattr` has to happen in Python (an `available_if` descriptor decides it at
+/// access time, e.g. `SVC.predict_proba` behind `probability=True`), the
+/// CONSEQUENCE does not.
+///
+/// [`StackMethodRequest::Auto`] takes the first available method and only fails
+/// when the estimator has none of the three. A [`StackMethodRequest::Fixed`]
+/// request fails when that one method is missing. Both produce sklearn's single
+/// message, whose `{method}` renders as a Python list repr on the `"auto"`
+/// branch because that is the value sklearn's f-string interpolates there.
+pub fn resolve_stack_method(
+    name: &str,
+    request: StackMethodRequest,
+    implements: [bool; 3],
+) -> Result<StackMethod> {
+    match request {
+        StackMethodRequest::Auto => {
+            for (i, &has) in implements.iter().enumerate() {
+                if has {
+                    return Ok(StackMethod::parse(STACK_METHODS[i]).expect("static name"));
+                }
+            }
+            Err(value_err(format!(
+                "Underlying estimator {name} does not implement the method \
+                 ['predict_proba', 'decision_function', 'predict']."
+            )))
+        }
+        StackMethodRequest::Fixed(method) => {
+            if implements[method.index()] {
+                Ok(method)
+            } else {
+                Err(value_err(format!(
+                    "Underlying estimator {name} does not implement the method {}.",
+                    method.as_str()
+                )))
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// classifier meta blocks — the column-dropping rule (STACK-CLF-01)
+// --------------------------------------------------------------------------- //
+
+/// The shape of one kept estimator's RAW response, before any column is
+/// dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredShape {
+    /// A 1-D `(n,)` response — `predict`, or a binary `decision_function`.
+    Column,
+    /// A 2-D `(n, cols)` response.
+    Matrix(usize),
+    /// A LIST of `(n, cols_j)` responses, one per target: what `predict_proba`
+    /// returns for a multilabel `y` from estimators that fit one classifier per
+    /// column (`RandomForestClassifier`, `MultiOutputClassifier`).
+    MultiOutput(Vec<usize>),
+}
+
+/// Which columns of which raw response block become one meta block.
+///
+/// The shim slices `pred[:, start_col : start_col + n_cols]` — for a
+/// [`PredShape::MultiOutput`] response, `sub` selects the list element first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetaSlice {
+    /// Index into the KEPT estimator list (`stack_method_` order).
+    pub block: usize,
+    /// Index within a [`PredShape::MultiOutput`] list; `0` otherwise.
+    pub sub: usize,
+    /// First source column taken — `1` exactly where a probability column is
+    /// dropped, `0` everywhere else.
+    pub start_col: usize,
+    /// How many source columns are taken; this is the meta block's width.
+    pub n_cols: usize,
+}
+
+/// sklearn `_BaseStacking._concatenate_predictions`, minus the copy: the meta
+/// blocks each kept estimator contributes.
+///
+/// Three rules, in sklearn's own order:
+///
+/// 1. A [`PredShape::MultiOutput`] response contributes one block per target,
+///    each with its FIRST column dropped — unconditionally, whatever the
+///    method, because those columns are the per-target probabilities and sum
+///    to one.
+/// 2. A 1-D response becomes a single column.
+/// 3. A 2-D `predict_proba` response drops its first column when
+///    `n_classes == 2`: `p(y=0) = 1 - p(y=1)`, so keeping both would hand the
+///    final estimator two perfectly collinear features. Every other 2-D
+///    response is taken whole.
+///
+/// `n_classes` is `len(classes_)`, passed in as sklearn uses it. Note that for
+/// a multilabel `y` sklearn's `classes_` is a LIST OF PER-TARGET ARRAYS, so
+/// `len(classes_)` counts TARGETS there, not classes — rule 3 therefore reads
+/// "two targets" in that case. That is sklearn's behaviour, quirk included, and
+/// rule 1 makes it unobservable for the estimators that actually return a list.
+///
+/// A zero-column meta block (a `predict_proba` that returned a single column,
+/// say) is left for [`meta_layout`] to reject, so both classes report that the
+/// same way.
+pub fn classifier_meta_slices(
+    methods: &[StackMethod],
+    shapes: &[PredShape],
+    n_classes: usize,
+) -> Result<Vec<MetaSlice>> {
+    if methods.len() != shapes.len() {
+        return Err(value_err(format!(
+            "have {} resolved stack methods but {} prediction shapes",
+            methods.len(),
+            shapes.len()
+        )));
+    }
+    let mut slices = Vec::with_capacity(shapes.len());
+    for (block, shape) in shapes.iter().enumerate() {
+        match shape {
+            PredShape::MultiOutput(cols) => {
+                if cols.is_empty() {
+                    return Err(value_err(format!(
+                        "estimator at position {block} returned an empty list of \
+                         prediction blocks"
+                    )));
+                }
+                for (sub, &c) in cols.iter().enumerate() {
+                    slices.push(MetaSlice {
+                        block,
+                        sub,
+                        start_col: 1,
+                        n_cols: c.saturating_sub(1),
+                    });
+                }
+            }
+            PredShape::Column => slices.push(MetaSlice {
+                block,
+                sub: 0,
+                start_col: 0,
+                n_cols: 1,
+            }),
+            PredShape::Matrix(c) => {
+                let drop_first =
+                    methods[block] == StackMethod::PredictProba && n_classes == 2;
+                slices.push(MetaSlice {
+                    block,
+                    sub: 0,
+                    start_col: usize::from(drop_first),
+                    n_cols: if drop_first { c.saturating_sub(1) } else { *c },
+                });
+            }
+        }
+    }
+    Ok(slices)
 }
 
 /// The column layout of the meta-feature matrix handed to `final_estimator_`.
@@ -273,15 +531,33 @@ pub fn meta_layout(
 /// A single-column block is named `"{class}_{name}"`; a multi-column one is
 /// suffixed with the within-block index, `"{class}_{name}{i}"`. Note there is
 /// no separator before the index — `stackingclassifier_lr0`, not `..._lr_0`.
+///
+/// The two lists are ZIPPED, as sklearn's `zip(non_dropped_estimators,
+/// self._n_feature_outs)` is — but only in the ONE direction where a mismatch
+/// can legitimately occur:
+///
+/// * **more counts than names** is the multilabel case: a `predict_proba` that
+///   returns one array per target contributes one meta block PER TARGET (see
+///   [`classifier_meta_slices`]), so `n_feature_outs` outruns the estimator
+///   names and sklearn silently names only the first block of each. Parity
+///   means truncating too; raising would reject a fit sklearn completes.
+/// * **more names than counts** cannot happen on either class — it would mean a
+///   kept estimator contributed no block at all. Truncating there would drop
+///   that estimator's columns from the names while `transform` still emits
+///   them, so every name after the gap would silently describe the wrong
+///   column. That is the same silent shift [`meta_layout`]'s zero-column
+///   rejection exists to prevent, so it is rejected here rather than papered
+///   over.
 pub fn meta_feature_names(
     class_name: &str,
     kept_names: &[String],
     n_feature_outs: &[usize],
     input_features: Option<&[String]>,
 ) -> Result<Vec<String>> {
-    if kept_names.len() != n_feature_outs.len() {
+    if kept_names.len() > n_feature_outs.len() {
         return Err(value_err(format!(
-            "have {} kept estimator names but {} feature-out counts",
+            "have {} kept estimator names but only {} feature-out counts; a \
+             kept estimator produced no prediction block",
             kept_names.len(),
             n_feature_outs.len()
         )));

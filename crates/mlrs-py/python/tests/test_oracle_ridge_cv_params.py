@@ -594,3 +594,118 @@ def test_near_singular_design_is_close_but_looser():
     assert np.allclose(p, ref, atol=1e-4 * scale, rtol=0.0), (
         f"near-singular predict differs (max {np.abs(p - ref).max():.3e})"
     )
+
+
+# ---------------------------------------------------------------------------
+# device -- the string parameter added by RIDGECV-02
+#
+# `device` is VALUE-NEUTRAL, so there is nothing about it for an oracle to
+# compare against sklearn (sklearn has no such parameter). What the oracle CAN
+# do, and what these cases do, is re-run the two value-bearing string
+# parameters on the DEVICE arm and demand the same agreement with sklearn the
+# host arm gives -- because "the arms agree with each other" (the Rust gate in
+# `ridge_cv_device_test.rs`) and "the arms agree with sklearn" are different
+# claims, and only the second one is what a user gets.
+#
+# Every case here SKIPS with a reason when the backend has no device arm, and
+# it establishes that by fitting and reading `device_` rather than by guessing
+# from the backend name -- a `device='gpu'` that silently fell back would
+# otherwise re-run the host suite and report a pass.
+# ---------------------------------------------------------------------------
+
+
+def _device_arm_or_skip():
+    """Fit a `device='gpu'` probe on a small tall design, or skip the case."""
+    X, y = regression(n=300, d=8)
+    probe = mlrs.RidgeCV(alphas=ALPHAS, device="gpu").fit(X, y)
+    if probe.device_ != "gpu":
+        pytest.skip(
+            "no RidgeCV device arm on this backend "
+            f"(device='gpu' reported device_={probe.device_!r})"
+        )
+
+
+@pytest.mark.parametrize("gcv_mode", [None, "auto", "svd", "eigen"])
+def test_device_arm_gcv_mode(gcv_mode):
+    _device_arm_or_skip()
+    X, y = regression()
+    est = mlrs.RidgeCV(alphas=ALPHAS, gcv_mode=gcv_mode, device="gpu").fit(X, y)
+    assert est.device_ == "gpu"
+    sk = SkRidgeCV(alphas=ALPHAS, gcv_mode=gcv_mode).fit(X, y)
+    assert_matches(est, sk, f"device='gpu' gcv_mode={gcv_mode!r}")
+    assert_predict_matches(est, sk, X, f"device='gpu' gcv_mode={gcv_mode!r}")
+
+
+@pytest.mark.parametrize("scoring", REGRESSION_SCORERS)
+def test_device_arm_scoring_string(scoring):
+    _device_arm_or_skip()
+    X, y = regression()
+    try:
+        sk = SkRidgeCV(alphas=ALPHAS, scoring=scoring).fit(X, y)
+    except ValueError as exc:
+        pytest.skip(f"sklearn cannot score this design with {scoring!r}: {exc}")
+    est = mlrs.RidgeCV(alphas=ALPHAS, scoring=scoring, device="gpu").fit(X, y)
+    assert est.device_ == "gpu"
+    assert_matches(est, sk, f"device='gpu' scoring={scoring!r}")
+
+
+def test_device_rejects_an_unknown_string():
+    """`device` is validated in the shim with the same `StrOptions` shape every
+    other string hyperparameter uses, so a typo is a `ValueError` naming the
+    estimator rather than a silent fallback. Backend-independent: the rejection
+    happens before any arm is chosen."""
+    X, y = regression(n=120, d=5)
+    with pytest.raises(ValueError, match="device"):
+        mlrs.RidgeCV(alphas=ALPHAS, device="cuda").fit(X, y)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"fit_intercept": False},
+        {"store_cv_results": True},
+        {"alpha_per_target": True},
+    ],
+    ids=["default", "no-intercept", "store-cv-results", "alpha-per-target"],
+)
+def test_device_arm_matches_sklearn_across_the_surface(kwargs):
+    """The rest of the parameter surface on the device arm.
+
+    `alpha_per_target` needs a 2-D `y`, so the design follows the parameter.
+    """
+    _device_arm_or_skip()
+    multi = kwargs.get("alpha_per_target", False)
+    X, y = regression(n_targets=3) if multi else regression()
+    est = mlrs.RidgeCV(alphas=ALPHAS, device="gpu", **kwargs).fit(X, y)
+    assert est.device_ == "gpu"
+    sk = SkRidgeCV(alphas=ALPHAS, **kwargs).fit(X, y)
+    assert_matches(est, sk, f"device='gpu' {kwargs}")
+    assert_predict_matches(est, sk, X, f"device='gpu' {kwargs}")
+
+
+def test_device_arm_with_sample_weight():
+    _device_arm_or_skip()
+    X, y = regression()
+    rs = np.random.RandomState(11)
+    w = np.abs(rs.normal(size=X.shape[0])) + 0.05
+    est = mlrs.RidgeCV(alphas=ALPHAS, device="gpu").fit(X, y, sample_weight=w)
+    assert est.device_ == "gpu"
+    sk = SkRidgeCV(alphas=ALPHAS).fit(X, y, sample_weight=w)
+    assert_matches(est, sk, "device='gpu' + sample_weight")
+
+
+def test_device_arm_store_cv_results_values_match_sklearn():
+    """`cv_results_` is the one output the sweep writes per ROW, so it is the
+    one place a device indexing bug would show up without moving `alpha_`."""
+    _device_arm_or_skip()
+    X, y = regression()
+    est = mlrs.RidgeCV(alphas=ALPHAS, store_cv_results=True, device="gpu").fit(X, y)
+    sk = SkRidgeCV(alphas=ALPHAS, store_cv_results=True).fit(X, y)
+    got = np.asarray(est.cv_results_, dtype=np.float64)
+    ref = np.asarray(sk.cv_results_, dtype=np.float64)
+    assert got.shape == ref.shape, f"cv_results_ shape {got.shape} != {ref.shape}"
+    scale = max(1.0, float(np.abs(ref).max()))
+    assert np.allclose(got, ref, atol=live_atol() * scale, rtol=0.0), (
+        f"device cv_results_ differs (max {np.abs(got - ref).max():.3e})"
+    )

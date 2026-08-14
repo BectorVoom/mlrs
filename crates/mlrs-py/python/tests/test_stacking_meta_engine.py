@@ -346,3 +346,135 @@ def test_mlrs_members_compose_on_every_arm(engine):
     a.fit(X, y)
     b.fit(X, y)
     np.testing.assert_allclose(a.predict(X), b.predict(X), atol=conftest.live_atol(), rtol=0)
+
+
+# =========================================================================== #
+# StackingClassifier on every arm (STACK-CLF-01)
+# =========================================================================== #
+#
+# The classifier is the harder exercise of the same scatter, and the reason
+# these cells exist rather than being assumed covered by the regressor's:
+#
+# * its blocks are MULTI-COLUMN (one per class under `predict_proba` /
+#   a multiclass `decision_function`), so a wrong row stride or a transposed
+#   block shows up here and cannot show up in a stack of one-column blocks;
+# * the binary `predict_proba` block handed to Rust is a SLICE VIEW
+#   (`proba[:, 1:]`), i.e. non-contiguous with a non-zero offset — exactly the
+#   shape an ingress path can get wrong while passing on contiguous input.
+
+
+def clf_design(dtype=np.float64, n_classes=2, n_samples=N_SAMPLES):
+    rng = np.random.default_rng(SEED)
+    X = rng.standard_normal((n_samples, N_FEATURES)).astype(dtype)
+    score = X @ np.array([3.0, -1.5, 0.0, 0.75, 2.0], dtype=dtype)
+    score = score + (0.5 * rng.standard_normal(n_samples)).astype(dtype)
+    if n_classes == 2:
+        return X, (score > 0).astype(np.int64)
+    cuts = np.quantile(score, np.linspace(0, 1, n_classes + 1)[1:-1])
+    return X, np.digitize(score, cuts).astype(np.int64)
+
+
+def clf_estimators():
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.linear_model import LogisticRegression
+
+    return [("lr", LogisticRegression()), ("nb", GaussianNB())]
+
+
+@pytest.mark.parametrize("engine", RUST_ENGINES, indirect=True)
+@pytest.mark.parametrize(
+    "stack_method", ["auto", "predict_proba", "decision_function", "predict"]
+)
+@pytest.mark.parametrize("n_classes", [2, 3])
+@pytest.mark.parametrize("passthrough", [False, True])
+def test_classifier_matches_sklearn_on_every_arm(
+    engine, stack_method, n_classes, passthrough
+):
+    """Every ``stack_method``, both class counts, both passthrough settings.
+
+    Exact: the arm only moves the blocks, so any difference from sklearn's
+    ``np.hstack`` answer is a scatter bug rather than arithmetic.
+    """
+    from sklearn.ensemble import StackingClassifier as SkStackingClassifier
+
+    skip_if_no_device_f64(engine, np.float64)
+    if stack_method == "decision_function":
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.svm import LinearSVC
+
+        members = [("lr", LogisticRegression()), ("svc", LinearSVC())]
+    else:
+        members = clf_estimators()
+
+    X, y = clf_design(n_classes=n_classes)
+    kwargs = dict(stack_method=stack_method, cv=3, passthrough=passthrough)
+    a = mlrs.StackingClassifier(members, **kwargs).fit(X, y)
+    b = SkStackingClassifier(members, **kwargs).fit(X, y)
+
+    np.testing.assert_allclose(a.transform(X), b.transform(X), atol=0, rtol=0)
+    np.testing.assert_array_equal(a.predict(X), b.predict(X))
+    assert a._n_feature_outs == b._n_feature_outs
+
+
+@pytest.mark.parametrize("engine", RUST_ENGINES, indirect=True)
+def test_the_dropped_probability_column_is_sliced_identically_on_every_arm(engine):
+    """The binary ``predict_proba`` block is a slice view — pin the bytes.
+
+    The meta column must be ``p(y=1)``, not ``p(y=0)`` and not a strided
+    mixture of the two. Compared against the base estimator's own output under
+    ``cv="prefit"``, where the meta feature is exactly that column.
+    """
+    from sklearn.naive_bayes import GaussianNB
+
+    skip_if_no_device_f64(engine, np.float64)
+    X, y = clf_design()
+    fitted = [("nb", GaussianNB().fit(X, y))]
+    est = mlrs.StackingClassifier(
+        fitted, cv="prefit", stack_method="predict_proba"
+    ).fit(X, y)
+
+    expected = fitted[0][1].predict_proba(X)[:, 1]
+    np.testing.assert_array_equal(est.transform(X)[:, 0], expected)
+
+
+@pytest.mark.parametrize("engine", RUST_ENGINES, indirect=True)
+def test_classifier_arms_agree_bit_for_bit_with_numpy(engine, monkeypatch):
+    """The same fit on the forced arm and on ``numpy``, byte for byte.
+
+    A three-class ``predict_proba`` stack: two 3-column blocks plus a 5-column
+    passthrough, so every offset in the layout is non-trivial.
+    """
+    skip_if_no_device_f64(engine, np.float64)
+    X, y = clf_design(n_classes=3)
+    kwargs = dict(stack_method="predict_proba", cv=3, passthrough=True)
+    rust = mlrs.StackingClassifier(clf_estimators(), **kwargs).fit(X, y)
+    rust_meta = rust.transform(X)
+
+    monkeypatch.setenv(KNOB, "numpy")
+    assert mlrs._load_ext().stacking_meta_engine() == "numpy"
+    numpy_arm = mlrs.StackingClassifier(clf_estimators(), **kwargs).fit(X, y)
+
+    np.testing.assert_array_equal(rust_meta, numpy_arm.transform(X))
+    assert rust_meta.shape == (N_SAMPLES, 3 + 3 + N_FEATURES)
+
+
+@pytest.mark.parametrize("engine", RUST_ENGINES, indirect=True)
+def test_mlrs_classifier_members_compose_on_every_arm(engine):
+    """Device-fitted classifier members feeding each meta arm."""
+    from sklearn.ensemble import StackingClassifier as SkStackingClassifier
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.neighbors import KNeighborsClassifier
+
+    dtype = conftest.default_float_dtype()
+    skip_if_no_device_f64(engine, dtype)
+    X, y = clf_design(dtype=dtype)
+    a = mlrs.StackingClassifier(
+        [("nb", mlrs.GaussianNB()), ("knn", mlrs.KNeighborsClassifier())], cv=3
+    ).fit(X, y)
+    b = SkStackingClassifier(
+        [("nb", GaussianNB()), ("knn", KNeighborsClassifier())], cv=3
+    ).fit(X, y)
+    assert a.stack_method_ == b.stack_method_
+    np.testing.assert_allclose(
+        a.transform(X), b.transform(X), atol=conftest.live_atol(), rtol=0
+    )

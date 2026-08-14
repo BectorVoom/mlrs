@@ -49,6 +49,11 @@ pub mod gmm_device;
 // cannot tolerate; this module widens on the device and keeps the whole
 // reduction there, so the design never round-trips to the host.
 pub mod normal_eq;
+// DEVICE arm of `RidgeCV`'s generalized-CV engine (RIDGECV-02) — the uploaded
+// design, the `f64` normal-equation phase, and the one-launch streaming sweep
+// that carries the alpha grid. Its `f64` pinning is `normal_eq`'s, for the
+// stronger reason: the LOO denominator is a cancellation that is DIVIDED by.
+pub mod ridge_gcv;
 // Phase-7 prim stubs (Wave-0 scaffold owns these registrations; plans 07-02
 // (rng) / 07-03 (incremental_svd) fill their own file body — file-disjoint,
 // parallel-safe). Each is an empty compiling module until its plan adds the
@@ -177,10 +182,10 @@ pub mod reduce;
 // mlrs-algos).
 pub mod sgd;
 pub(crate) mod sgd_host;
-// STACK-META-01: the device arm of `StackingRegressor`'s meta-matrix assembly,
-// plus the `MLRS_STACK_META_ENGINE` knob that chooses between it, the algos
-// host arm, and the shim's `np.hstack`. The copy carries no arithmetic, so the
-// default arm is a MEASUREMENT (docs/stacking.md), not an assumption.
+// STACK-META-01: the device arm of the stacking meta-matrix assembly, plus the
+// `MLRS_STACK_META_ENGINE` knob that chooses between it, the algos host arm,
+// and the shim's `np.hstack`. The copy carries no arithmetic, so the default
+// arm is a MEASUREMENT (docs/stacking.md), not an assumption.
 pub mod stacking_meta;
 pub mod svd;
 // Linear-SVM primal objective evaluator (SVM-FIT-CPU perf lever): the margin

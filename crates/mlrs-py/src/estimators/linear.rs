@@ -23,7 +23,9 @@ use mlrs_algos::linear::mbsgd_regressor::MBSGDRegressor;
 use mlrs_algos::linear::ridge::{Ridge, RidgeSolver};
 use mlrs_backend::device::Device;
 use mlrs_algos::linear::ridge_classifier::{ClassWeight, RidgeClassifier};
-use mlrs_algos::linear::ridge_cv::{ridge_cv_grid, ridge_gcv, GcvFit, GcvMode, GcvRoute, GridFit};
+use mlrs_algos::linear::ridge_cv::{
+    ridge_cv_grid, ridge_gcv_auto, GcvFit, GcvMode, GcvRoute, GridFit,
+};
 use mlrs_algos::linear::sgd_config::{LearningRate, Loss, Penalty};
 // Phase 16 (D-01): every estimator in this file now consumes the typestate
 // surface — the legacy trait glob has been removed. The typestate
@@ -997,6 +999,14 @@ pub struct PyRidgeCV {
     /// precedent: the parse and its `UnknownGcvMode` rejection happen with the
     /// rest of the validation, D-09).
     gcv_mode: String,
+    /// Execution placement (DEVICE-PARAM-01), still a STRING for the same
+    /// reason `gcv_mode` is. It reaches only the GCV engine: the explicit-`cv`
+    /// grid arm has one arm (see [`PyRidgeCV::grid`]).
+    device: String,
+    /// The arm that actually carried the last `gcv` (`"cpu"` / `"gpu"`), which
+    /// is what `device_` reports. `None` until a GCV fit has run — including
+    /// after a `grid` fit, which never consults `device` at all.
+    device_used: Option<String>,
     /// The last [`ridge_gcv`] result, held so the shim can read the pieces it
     /// needs without re-running the decomposition.
     gcv: Option<GcvFit>,
@@ -1018,6 +1028,8 @@ impl PyRidgeCV {
             alphas: vec![0.1, 1.0, 10.0],
             fit_intercept: true,
             gcv_mode: "auto".to_string(),
+            device: "auto".to_string(),
+            device_used: None,
             gcv: None,
             grid: None,
             fitted: None,
@@ -1047,12 +1059,17 @@ impl PyRidgeCV {
     /// which engine call is made and how its output is reduced, not what the
     /// engine computes.
     #[new]
-    #[pyo3(signature = (alphas, fit_intercept = true, gcv_mode = "auto".to_string()))]
-    fn new(alphas: Vec<f64>, fit_intercept: bool, gcv_mode: String) -> Self {
+    #[pyo3(signature = (
+        alphas, fit_intercept = true, gcv_mode = "auto".to_string(),
+        device = "auto".to_string(),
+    ))]
+    fn new(alphas: Vec<f64>, fit_intercept: bool, gcv_mode: String, device: String) -> Self {
         Self {
             alphas,
             fit_intercept,
             gcv_mode,
+            device,
+            device_used: None,
             gcv: None,
             grid: None,
             fitted: None,
@@ -1090,14 +1107,21 @@ impl PyRidgeCV {
         let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
         let mode = GcvMode::try_from(self.gcv_mode.as_str()).map_err(build_err_to_py)?;
+        let device = parse_device(&self.device)?;
         let (alphas, fit_intercept) = (self.alphas.clone(), self.fit_intercept);
-        let out = py.detach(|| -> PyResult<GcvFit> {
+        let (out, arm) = py.detach(|| -> PyResult<(GcvFit, &'static str)> {
+            // The pool is acquired INSIDE the detach — its `MutexGuard` is not
+            // `Send`, so it cannot cross the boundary, and taking it after the
+            // GIL is released is the ordering every other device fit in this
+            // file uses (`PyLinearRegression::fit`).
+            let mut pool = crate::lock_pool();
             match dt {
                 FloatDtype::F32 => {
                     let xh = host_slice_f32(as_f32(&xa)?)?;
                     let yh = host_slice_f32(as_f32(&ya)?)?;
                     let sw = sample_weight_f64(swa.as_ref(), dt)?;
-                    ridge_gcv::<f32>(
+                    ridge_gcv_auto::<f32>(
+                        &mut pool,
                         xh,
                         yh,
                         rows,
@@ -1109,6 +1133,7 @@ impl PyRidgeCV {
                         mode,
                         want_predictions,
                         store_cv_values,
+                        device,
                     )
                     .map_err(algo_err_to_py)
                 }
@@ -1117,7 +1142,8 @@ impl PyRidgeCV {
                     let xh = host_slice_f64(as_f64(&xa)?)?;
                     let yh = host_slice_f64(as_f64(&ya)?)?;
                     let sw = sample_weight_f64(swa.as_ref(), dt)?;
-                    ridge_gcv::<f64>(
+                    ridge_gcv_auto::<f64>(
+                        &mut pool,
                         xh,
                         yh,
                         rows,
@@ -1129,13 +1155,26 @@ impl PyRidgeCV {
                         mode,
                         want_predictions,
                         store_cv_values,
+                        device,
                     )
                     .map_err(algo_err_to_py)
                 }
             }
         })?;
         self.gcv = Some(out);
+        self.device_used = Some(arm.to_string());
         Ok(())
+    }
+
+    /// `device_` — the execution arm that actually carried the GCV fit
+    /// (`"cpu"` / `"gpu"`).
+    ///
+    /// `None` only before any fit. An explicit-`cv` fit reports `"cpu"`: that
+    /// arm is a per-split Cholesky grid with no device kernel, so the host
+    /// genuinely carried it and a `device='gpu'` there is a preference the
+    /// configuration cannot honour (`Ridge`'s `solver_` precedent).
+    fn device_used(&self) -> Option<String> {
+        self.device_used.clone()
     }
 
     /// `n_alphas × n_targets` row-major per-target scores (`−mean(looe²)`).
@@ -1270,6 +1309,12 @@ impl PyRidgeCV {
             }
         })?;
         self.grid = Some(out);
+        // The explicit-`cv` engine is a per-split Cholesky grid with no device
+        // kernel, so it ran on the host — reported rather than left `None`,
+        // because "the host carried it" is the true answer and a `device='gpu'`
+        // a configuration cannot honour is exactly what `device_` exists to
+        // surface (the `solver_` precedent).
+        self.device_used = Some("cpu".to_string());
         Ok(())
     }
 
