@@ -78,6 +78,11 @@ const HOST_MACS_PER_UNIT: usize = 1 << 19;
 
 /// Multiply-adds below which the DEVICE arm cannot win on any backend.
 ///
+/// NOTE (RIDGE-ARM-CAL): this is now only the FLOOR. Above it the arm is chosen
+/// by the calibrated cost model further down this file, not by this constant —
+/// the paragraph below about "the next rung up the local ladder" described the
+/// old all-or-nothing rule.
+///
 /// The Gram is `n·d²/2` multiply-adds; at 8.4 M of them the host pass costs
 /// ~0.2 ms on a 16-core desktop. The device arm has to upload the design and
 /// issue four launches before it computes anything, and that fixed cost is
@@ -114,6 +119,19 @@ const HOST_FIT_MAX_ELEMS: usize = 1 << 20;
 /// `std::env` so a test can scope the override without an environment data
 /// race.
 pub fn gram_host_applicable(n: usize, d: usize) -> bool {
+    // Legacy shape-only entry point: assumes an f64 design, which is the
+    // widest (and so most device-favourable) element size. Prefer
+    // [`gram_host_applicable_for`], which knows the dtype the fit will
+    // actually upload.
+    gram_host_applicable_for(n, d, 8)
+}
+
+/// [`gram_host_applicable`] for a design of `elem_bytes`-wide elements
+/// (RIDGE-ARM-CAL).
+///
+/// Above the fixed-cost floor the answer is no longer a constant: it is
+/// [`prefers_host_calibrated`]'s verdict, from rates measured on THIS machine.
+pub fn gram_host_applicable_for(n: usize, d: usize, elem_bytes: usize) -> bool {
     if let Some(v) = crate::abflag::var("MLRS_RIDGE_GRAM_HOST") {
         return v != "0";
     }
@@ -121,7 +139,266 @@ pub fn gram_host_applicable(n: usize, d: usize) -> bool {
         return true;
     }
     let macs = n.saturating_mul(d).saturating_mul(d) / 2;
-    macs <= HOST_FIT_MAX_MACS && n.saturating_mul(d) <= HOST_FIT_MAX_ELEMS
+    if macs <= HOST_FIT_MAX_MACS && n.saturating_mul(d) <= HOST_FIT_MAX_ELEMS {
+        return true;
+    }
+    prefers_host_calibrated(n, d, elem_bytes)
+}
+
+// =========================================================================== //
+// RIDGE-ARM-CAL — which arm wins is a property of the MACHINE, so measure it
+// =========================================================================== //
+//
+// Above the dispatch floor the old rule was a pair of constants, and constants
+// cannot express this decision, because the two machines this repo has data for
+// disagree at the SAME shape:
+//
+// | 100 000 × 64 | host arm | device arm | |
+// |---|---|---|---|
+// | Colab T4 (discrete GPU, **2-vCPU** host) | 58.9 ms | 30.7 ms | device wins 1.9x |
+// | this box (integrated GPU, 16-core host) | 4.9 ms | 13.0 ms | host wins 2.7x |
+//
+// Neither number is wrong; they are different hardware. A constant tuned on one
+// is a regression on the other, and `ridge.rs`'s own T4 write-up already says as
+// much ("against THAT cpu the T4 does not win at any rung on this ladder").
+//
+// So the floor stays a constant — it is about dispatch cost, which really is
+// machine-independent — and above it the arm is chosen from THREE rates
+// measured once per process, per dtype, on the machine that is running:
+//
+//   host_time(n, d)   ≈ macs / host_macs_per_s
+//   device_time(n, d) ≈ bytes / upload_bytes_per_s + macs / device_macs_per_s
+//
+// Each term scales linearly in the quantity it is measured against, so the
+// extrapolation from the small calibration shape to a real fit is structural
+// rather than fitted. Checked against both machines above: the model picks
+// device on the T4's numbers and host on this box's, which is what each one
+// measured.
+//
+// The calibration costs one small host Gram plus one small upload + launch
+// (~2-6 ms), paid ONCE per process and only by a fit that is already above the
+// floor — i.e. one whose own cost is far larger. `MLRS_RIDGE_GRAM_HOST` still
+// short-circuits the whole thing, so an A/B never pays for it either.
+
+/// ## The probe must not cost more than it can save
+/// Measuring the device side means LAUNCHING a device kernel, and the first
+/// launch in a process compiles the pipeline: **546 ms** on this machine's rocm
+/// adapter, against the ~2 ms fit the calibration then correctly routed to the
+/// host. Paying a device JIT to discover that the device should not be used is
+/// strictly worse than the constant it replaced.
+///
+/// So the two sides are measured separately and lazily:
+///
+/// * the HOST rate is cheap (one small in-process Gram, no device work at all)
+///   and is always measured — it is also the axis that varies most between
+///   machines, and the one that explains the T4/this-box disagreement above (2
+///   vCPUs against 16 cores);
+/// * the DEVICE rates are measured only once the host estimate shows there is
+///   more than [`DEVICE_PROBE_MIN_SECONDS`] on the table — i.e. only when the
+///   device arm could plausibly save more than the probe costs. Below that the
+///   answer is "host" without ever touching the device.
+///
+/// The bound this gives up is explicit: on a shape whose host fit is under the
+/// threshold, mlrs may leave up to that much on the table (measured: rocm at
+/// `100 000 × 128`, where the device arm would have won by 11%). It never loses
+/// more than the threshold, and it never pays a JIT it does not use.
+/// The device rates [`prefers_host_calibrated`] compares against, measured on
+/// this machine at [`CAL_N`] × [`CAL_D`].
+#[derive(Debug, Clone, Copy)]
+struct DeviceRates {
+    /// Host→device transfer rate for the design, bytes per second.
+    upload_bytes_per_s: f64,
+    /// Device Gram throughput, multiply-adds per second. Launch overhead is
+    /// folded in here, which biases the estimate slightly TOWARD the host arm
+    /// at large shapes — the safe direction, since an over-estimated device
+    /// cost loses throughput while an under-estimated one loses the fit's whole
+    /// advantage.
+    device_macs_per_s: f64,
+}
+
+/// Host-fit seconds below which the device arm is not even probed — the probe's
+/// own one-time cost (a device pipeline compile, 546 ms measured on rocm here)
+/// dwarfs anything it could save on a fit this small.
+const DEVICE_PROBE_MIN_SECONDS: f64 = 0.025;
+
+/// Rows in the calibration design. Big enough that the host pass is not timer
+/// noise and the device launch is not pure overhead, small enough that the
+/// whole probe is a few milliseconds.
+const CAL_N: usize = 20_000;
+/// Columns in the calibration design.
+const CAL_D: usize = 32;
+
+static HOST_RATE_F32: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+static HOST_RATE_F64: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+static DEVICE_RATES_F32: std::sync::OnceLock<DeviceRates> = std::sync::OnceLock::new();
+static DEVICE_RATES_F64: std::sync::OnceLock<DeviceRates> = std::sync::OnceLock::new();
+
+/// Would the host arm be faster than the device arm for this shape, according
+/// to rates measured on this machine?
+///
+/// Falls back to `true` (the host arm) if the calibration cannot run — the
+/// device arm's advantage depends on hardware we then know nothing about, and
+/// the host arm is the one that cannot fail for want of a device feature.
+fn prefers_host_calibrated(n: usize, d: usize, elem_bytes: usize) -> bool {
+    let host_rate = match elem_bytes {
+        4 => *HOST_RATE_F32.get_or_init(measure_host_rate::<f32>),
+        _ => *HOST_RATE_F64.get_or_init(measure_host_rate::<f64>),
+    };
+    if host_rate <= 0.0 {
+        return true;
+    }
+    let macs = (n as f64) * (d as f64) * (d as f64) / 2.0;
+    let host_s = macs / host_rate;
+
+    // Stage 1 — free: too small for the device arm to repay even a free
+    // upload, so do not pay a pipeline compile to find that out.
+    if host_s < DEVICE_PROBE_MIN_SECONDS {
+        log::debug!(
+            "ridge arm calibration: n={n} d={d} host={:.3}ms below probe floor -> host",
+            host_s * 1e3
+        );
+        return true;
+    }
+
+    // Stage 2 — one-time: now the stakes are worth a device probe.
+    let rates = match elem_bytes {
+        4 => *DEVICE_RATES_F32.get_or_init(measure_device_rates::<f32>),
+        _ => *DEVICE_RATES_F64.get_or_init(measure_device_rates::<f64>),
+    };
+    if rates.upload_bytes_per_s <= 0.0 || rates.device_macs_per_s <= 0.0 {
+        return true;
+    }
+    let bytes = (n as f64) * (d as f64) * (elem_bytes as f64);
+    let device_s = bytes / rates.upload_bytes_per_s + macs / rates.device_macs_per_s;
+    log::debug!(
+        "ridge arm calibration: n={n} d={d} host={:.3}ms device={:.3}ms -> {}",
+        host_s * 1e3,
+        device_s * 1e3,
+        if host_s <= device_s { "host" } else { "device" }
+    );
+    host_s <= device_s
+}
+
+/// The calibration design. The VALUES are irrelevant — both arms do the same
+/// dense arithmetic whatever they are — but they must not be denormal, which
+/// would time the host FPU's slow path rather than its normal one.
+fn calibration_design<F>() -> (Vec<F>, Vec<F>)
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + Pod,
+{
+    let x: Vec<F> = (0..CAL_N * CAL_D)
+        .map(|i| F::from_int(((i % 17) as i64) - 8))
+        .collect();
+    let y: Vec<F> = (0..CAL_N)
+        .map(|i| F::from_int(((i % 13) as i64) - 6))
+        .collect();
+    (x, y)
+}
+
+/// Time the HOST arm on this machine — no device work, so no pipeline compile.
+fn measure_host_rate<F>() -> f64
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + Pod,
+{
+    use std::time::Instant;
+
+    let (x, y) = calibration_design::<F>();
+    let macs = (CAL_N as f64) * (CAL_D as f64) * (CAL_D as f64) / 2.0;
+
+    // One warm pass first: the worker pool spawns its threads on first use, and
+    // charging that to the rate would understate the host arm on every later
+    // fit in the process.
+    let _ = centered_gram_xty::<F>(&x, &y, CAL_N, CAL_D, None, true);
+    let t0 = Instant::now();
+    let _ = centered_gram_xty::<F>(&x, &y, CAL_N, CAL_D, None, true);
+    let host_s = t0.elapsed().as_secs_f64();
+
+    let rate = if host_s > 0.0 { macs / host_s } else { 0.0 };
+    log::info!(
+        "ridge arm calibration ({}): host {:.1} GMAC/s",
+        if size_of::<F>() == 4 { "f32" } else { "f64" },
+        rate / 1e9
+    );
+    rate
+}
+
+/// Time the DEVICE arm on this machine. Pays a one-time pipeline compile, which
+/// is why [`prefers_host_calibrated`] only reaches this once the host estimate
+/// says there is more than [`DEVICE_PROBE_MIN_SECONDS`] at stake.
+fn measure_device_rates<F>() -> DeviceRates
+where
+    F: cubecl::prelude::Float + cubecl::prelude::CubeElement + Pod,
+{
+    use std::time::Instant;
+
+    use crate::device_array::DeviceArray;
+    use crate::pool::BufferPool;
+    use crate::runtime::{self, ActiveRuntime};
+
+    let macs = (CAL_N as f64) * (CAL_D as f64) * (CAL_D as f64) / 2.0;
+    let bytes = (CAL_N as f64) * (CAL_D as f64) * (size_of::<F>() as f64);
+    let (x, y) = calibration_design::<F>();
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+
+    // Warm the runtime first: the FIRST allocation and the FIRST launch on a
+    // fresh client carry pipeline creation that no later fit repeats, and
+    // charging it to these rates would make every shape look host-favourable.
+    let warm = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, &y);
+    let _ = warm.to_host(&pool);
+    warm.release_into(&mut pool);
+
+    let t1 = Instant::now();
+    let x_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, &x);
+    let y_dev = DeviceArray::<ActiveRuntime, F>::from_host(&mut pool, &y);
+    // `to_host` of one element drains the queue, so the upload is timed to
+    // COMPLETION rather than to submission (the `drain_profile_probe` idiom).
+    let _ = y_dev.to_host(&pool);
+    let upload_s = t1.elapsed().as_secs_f64();
+
+    let t2 = Instant::now();
+    let gram = super::gram::gram_xty::<F>(&mut pool, &x_dev, &y_dev, CAL_N, CAL_D);
+    let device_s = match gram {
+        Ok((g, xty)) => {
+            let _ = g.to_host(&pool);
+            g.release_into(&mut pool);
+            xty.release_into(&mut pool);
+            t2.elapsed().as_secs_f64()
+        }
+        // A device that cannot form this Gram at all has no device arm to
+        // choose: report an unusable rate, which `prefers_host_calibrated`
+        // reads as "host".
+        Err(e) => {
+            log::debug!("ridge arm calibration: device gram unavailable ({e:?})");
+            x_dev.release_into(&mut pool);
+            y_dev.release_into(&mut pool);
+            return DeviceRates {
+                upload_bytes_per_s: 0.0,
+                device_macs_per_s: 0.0,
+            };
+        }
+    };
+    x_dev.release_into(&mut pool);
+    y_dev.release_into(&mut pool);
+
+    let rates = DeviceRates {
+        upload_bytes_per_s: if upload_s > 0.0 { bytes / upload_s } else { 0.0 },
+        device_macs_per_s: if device_s > 0.0 { macs / device_s } else { 0.0 },
+    };
+    log::info!(
+        "ridge arm calibration ({}): upload {:.2} GB/s, device {:.1} GMAC/s",
+        if size_of::<F>() == 4 { "f32" } else { "f64" },
+        rates.upload_bytes_per_s / 1e9,
+        rates.device_macs_per_s / 1e9,
+    );
+    rates
+}
+
+/// The calibrated verdict, exposed for the perf probes and the tests that gate
+/// this dispatch (`gram_host_test.rs`). Runs the calibration on first use.
+pub fn calibrated_prefers_host(n: usize, d: usize, elem_bytes: usize) -> bool {
+    prefers_host_calibrated(n, d, elem_bytes)
 }
 
 /// Column means, target mean, centered Gram and centered `Xᵀy` from host slices.

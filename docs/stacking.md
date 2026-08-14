@@ -178,18 +178,60 @@ min of 5:
 | `n_jobs=4` (cv=5) | 0.957 s | 1.065 s | 0.90x |
 
 **Device arm** (mlrs members on rocm gfx1151 vs sklearn members on host),
-min of 3:
+`n=100000`, `d=64`, min of 3, **after LINEAR-ARM-CAL** (see below):
 
-| config | sklearn fit | mlrs fit | ratio |
+| config | sklearn fit | mlrs fit | ratio | was |
+|---|---|---|---|---|
+| `cv=2` | 0.761 s | 0.127 s | **5.98x** | 0.51x |
+| `cv=3` | 1.341 s | 0.159 s | **8.43x** | 0.70x |
+| `cv=5` | 1.545 s | 0.228 s | **6.77x** | 1.01x |
+| `cv=10` | 2.999 s | 0.380 s | **7.90x** | 1.71x |
+| `cv="prefit"` | 0.043 s | 0.026 s | 1.69x | 0.37x |
+| `passthrough=True` (cv=5) | 1.585 s | 0.218 s | **7.27x** | 1.02x |
+| `n_jobs=2` (cv=5) | 1.256 s | 0.246 s | **5.11x** | 0.77x |
+| `n_jobs=4` (cv=5) | 1.060 s | 0.219 s | **4.85x** | 0.64x |
+
+The `was` column is the same ladder on the same machine with the old dispatch
+forced back on (`MLRS_RIDGE_GRAM_HOST=0`), so the two columns are one build and
+one box apart, not two campaigns: 0.96–2.45x before, 4.85–8.43x after.
+
+The **cpu** backend wins by 2.00–9.76x at `n=20000`, `d=32` — and that one is a
+bug fix rather than a speed-up. `LinearRegression` had no host fit arm, so on
+cpu every fold fit went through `center_columns`' per-column round-trip: the old
+route did not complete a SINGLE `20000 × 32` fit in 600 s, against 5.5 ms now.
+
+`predict` is unchanged by this work and is the remaining weak spot at
+`n=100000`: 0.28–0.61x of sklearn, the same 0.31–0.92x the old dispatch
+measured. It is a separate path (`predict_from_host`) and a separate campaign.
+
+### Why the fit numbers moved: the arm was chosen by a constant (LINEAR-ARM-CAL)
+
+Above a fixed dispatch floor, `Ridge` decided host-vs-device from a multiply-add
+constant, and `LinearRegression` had no host arm at all. Both were wrong here:
+the host arm wins EVERY rung of the `ridge_default_perf_test` A/B on both local
+integrated GPUs (rocm 1.6–10x, wgpu 1.8–11x), yet the constant sent 6 of 8 rungs
+to the device.
+
+A bigger constant is not the fix, because the two machines this repo has data
+for disagree at the *same* shape:
+
+| `100 000 × 64` | host arm | device arm | |
 |---|---|---|---|
-| `cv=2` | 0.713 s | 1.399 s | 0.51x |
-| `cv=3` | 1.013 s | 1.455 s | 0.70x |
-| `cv=5` | 1.591 s | 1.575 s | 1.01x |
-| `cv=10` | 3.168 s | 1.850 s | **1.71x** |
-| `cv="prefit"` | 0.046 s | 0.125 s | 0.37x |
-| `passthrough=True` (cv=5) | 1.788 s | 1.748 s | 1.02x |
-| `n_jobs=2` (cv=5) | 1.219 s | 1.577 s | 0.77x |
-| `n_jobs=4` (cv=5) | 1.025 s | 1.596 s | 0.64x |
+| Colab T4 (discrete GPU, **2-vCPU** host) | 58.9 ms | 30.7 ms | device wins 1.9x |
+| this box (integrated GPU, 16-core host) | 4.9 ms | 13.0 ms | host wins 2.7x |
+
+So the floor stays a constant — it is about launch overhead, which really is
+machine-independent — and above it the arm is chosen from rates measured once
+per process on the machine that is running: `macs / host_rate` against
+`bytes / upload_rate + macs / device_rate`. The model picks device on the T4's
+numbers and host on this box's, which is what each one measured.
+
+The probe is two-stage, because a device probe costs a pipeline compile (546 ms
+on rocm here): the host rate is always measured (cheap, no device work), and the
+device is probed only once the host estimate shows more than 25 ms at stake.
+Below that the answer is "host" without touching the device. The bound that
+gives up is explicit — up to ~25 ms left on the table, seen once at rocm
+`100 000 × 128`, where the device arm would have won by 11%.
 
 Reading the ladders:
 
@@ -198,10 +240,20 @@ Reading the ladders:
   base fits the design predicts. `cv="prefit"` costs 0.017 s: ~90x cheaper than
   `cv=5`, because it performs no base fits at all. If a stack is too slow, `cv`
   is the parameter to look at first.
-* **The device arm crosses over with `k`.** mlrs's per-fit device overhead is
-  fixed, so it loses at `cv=2` (0.51x) and wins at `cv=10` (1.71x): more folds
-  amortize the same setup over more arithmetic. `cv=5` is the break-even point
-  at this size.
+* **What the `cv="prefit"` ratio actually reports is how expensive the MEMBERS
+  are, not anything about the stacking layer.** `prefit` removes the base fits
+  and leaves the composition, so the gap between it and `cv=5` is the members'
+  own cost. It is ~90x here with `LinearRegression`/`Ridge` at `n=100000`; the
+  same parameter measures ~6x in
+  [stacking_classifier.md](stacking_classifier.md), whose ladder composes two
+  `GaussianNB`s. Both are correct and neither is a property of this estimator —
+  do not read the two pages as contradicting each other.
+* **The device arm crossed over with `k` before LINEAR-ARM-CAL** — it lost at
+  `cv=2` (0.51x) and won at `cv=10` (1.71x), because a fixed per-fit device
+  overhead amortizes over more folds. That crossover is GONE now that the arm is
+  chosen by measurement: the ladder above wins at every `k`, and the win is
+  flattest at `cv="prefit"` precisely because that is the cell with the fewest
+  fits for the fix to apply to.
 * **`passthrough` is nearly free at fit time** (+3–4% on both implementations)
   but **~3.5x on predict** on the host arm (0.009 → 0.030 s) — that is the extra
   `n x d` copy, and it is the same on both sides.
@@ -245,6 +297,17 @@ verdict is not a load artefact: the host/numpy ratios came out identical.
   repay is the two extra buffer traversals the boundary costs. numpy needs one
   pass over each block; the Rust arms need one to hand the blocks over and one
   to bring the matrix back, on top of the same write.
+* **Every ratio above is at ONE column per member**, which is what a regressor
+  contributes. Widen the blocks and the fixed cost amortizes exactly as that
+  explanation predicts: at 10 columns per block (a 10-class `predict_proba`
+  stack, `bench_stacking_meta.py --cols 10`, same machine) the host arm measures
+  0.49–1.06x and *beats* `np.hstack` in two cells, and the device arm improves
+  to 0.08–0.49x while staying bus-bound. So "the host arm loses" is a statement
+  about narrow meta matrices, not about the arm. The default does not change —
+  parity in two cells is not a reason to give up the numpy fallback path that
+  handles sparse, duck-typed and non-float blocks — but a caller whose members
+  are wide should not read the 1-column ladder as their number. The classifier's
+  ladder is in [stacking_classifier.md](stacking_classifier.md).
 * **The device arm is bus-bound, exactly as a zero-arithmetic kernel must be.**
   It uploads `n x width`, writes it once, and downloads `n x width`. There is no
   arithmetic to amortize that against, so it trails at every size; the best it

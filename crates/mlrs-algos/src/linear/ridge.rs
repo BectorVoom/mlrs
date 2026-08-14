@@ -183,6 +183,18 @@
 //! per-call allocation cost rather than a slow link). Nothing here changes it,
 //! and on this hardware it is the only lever left.
 //!
+//! ## The arm above the floor is now MEASURED, not assumed (RIDGE-ARM-CAL,
+//! ## 2026-08-13)
+//! The T4 table above and the local integrated GPUs disagree at the SAME shape
+//! — `100 000 × 64` is a 1.9x device win on that 2-vCPU Colab VM and a 2.7x
+//! device LOSS on this 16-core box — so no constant can serve both, and the
+//! caveat two paragraphs down ("against THAT cpu the T4 does not win at any
+//! rung") was already saying so. `gram_host_applicable_for` therefore keeps the
+//! dispatch-cost floor as a constant and, above it, compares rates measured on
+//! the running machine; see `prims::gram_host` for the model, the two-stage
+//! probe that keeps it from paying a device pipeline compile it will not use,
+//! and the ~25 ms bound that stage gives up.
+//!
 //! ## Both normal-equations arms have a second, fully-HOST route
 //! [`Ridge::fit_from_host_slice`] runs the whole fit — means, centering, Gram,
 //! `Xᵀy`, solve — from host memory, uploading only the fitted `coef_` and
@@ -237,7 +249,7 @@ use mlrs_backend::prims::gemm::gemm;
 use mlrs_backend::prims::gram::{
     column_means, fused_centering_available, gram_xty, gram_xty_centered,
 };
-use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable};
+use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable_for};
 use mlrs_backend::prims::linear_predict::{
     linear_predict, linear_predict_from_host_forced_host, linear_predict_multi,
     linear_predict_multi_from_host_forced_host, HostMirror, HostMirrorMulti, HostPrediction,
@@ -1051,9 +1063,13 @@ where
         // which is why the fitted attribute exists — an inert preference that
         // says so is very different from one that lies.
         self.solver.resolve(self.positive).consumes_gram_only()
-            && self
-                .device
-                .prefers_host(|| gram_host_applicable(shape.0, shape.1))
+            && self.device.prefers_host(|| {
+                // The element size is passed because above the dispatch floor
+                // the arm is chosen by a measured cost model, and the upload
+                // term is in BYTES — an f64 design ships twice the f32 one for
+                // the same multiply-add count (RIDGE-ARM-CAL).
+                gram_host_applicable_for(shape.0, shape.1, size_of::<F>())
+            })
     }
 
     /// [`Fit::fit`] over HOST slices — the no-upload, no-launch ingress for the

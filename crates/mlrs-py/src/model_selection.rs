@@ -31,6 +31,7 @@
 //! `InvalidParameterError` cases before calling in. See
 //! `crates/mlrs-py/python/mlrs/model_selection.py`.
 
+use arrow::array::Array;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -48,23 +49,55 @@ fn ms_err_to_py(err: ModelSelectionError) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
-/// The wire form of a splitter result: `(train_index_lists, test_index_lists,
-/// warning_messages)`.
+/// The wire form of a splitter result: `(train_index_arrays,
+/// test_index_arrays, warning_messages)`, where each index array is a **pyarrow
+/// `Int64Array`**, not a Python list (MODSEL-EGRESS).
+///
+/// ## Why a newtype rather than a tuple alias
+/// Every splitter binding in this file returns this type, and the Arrow
+/// conversion needs a `Python<'py>` token that a plain `(Vec, Vec, Vec)` alias
+/// has no way to obtain. Implementing [`IntoPyObject`] on a newtype keeps the
+/// conversion in ONE place and leaves all fourteen `#[pyfunction]` signatures —
+/// and every Python call site — exactly as they were.
+///
+/// ## Why it is worth doing at all
+/// The payload here IS indices, which is the worst case for PyO3's default
+/// `Vec<i64>` → `list[int]` conversion: a `KFold(5)` over 200 000 samples ships
+/// 1 000 000 row indices, one boxed `int` each, which the shim then parses back
+/// into numpy arrays. That cost `275 ms` inside `kfold_split` alone at that
+/// shape — against `286 ms` for scikit-learn's whole `cross_val_predict` — and
+/// it is per-sample, so it grows with the data rather than with the fold count.
+/// See [`crate::egress::i64_vec_to_pyarrow`] for the shared rationale.
 ///
 /// The warnings ride along rather than being emitted here because a Rust-side
 /// `log::warn!` is invisible to `pytest.warns` and to a user's
 /// `warnings.simplefilter("error")` — the shim re-raises them through
 /// `warnings.warn` so sklearn-compatible warning behavior is preserved.
-type SplitsOut = (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<String>);
+struct SplitsOut(Splits);
 
-fn unpack(splits: Splits) -> SplitsOut {
-    let mut trains = Vec::with_capacity(splits.splits.len());
-    let mut tests = Vec::with_capacity(splits.splits.len());
-    for s in splits.splits {
-        trains.push(s.train);
-        tests.push(s.test);
+impl<'py> IntoPyObject<'py> for SplitsOut {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let splits = self.0;
+        let mut trains = Vec::with_capacity(splits.splits.len());
+        let mut tests = Vec::with_capacity(splits.splits.len());
+        for s in splits.splits {
+            trains.push(crate::egress::i64_vec_to_pyarrow(py, s.train)?);
+            tests.push(crate::egress::i64_vec_to_pyarrow(py, s.test)?);
+        }
+        // `Vec<Bound<PyAny>>` becomes a `list` of arrow arrays — the LIST is
+        // per-split (a handful of entries), never per-index.
+        Ok((trains, tests, splits.warnings).into_pyobject(py)?.into_any())
     }
-    (trains, tests, splits.warnings)
+}
+
+/// Wrap a core `Splits` for the boundary. Named `unpack` still, so the fourteen
+/// `.map(unpack)` call sites read unchanged.
+fn unpack(splits: Splits) -> SplitsOut {
+    SplitsOut(splits)
 }
 
 /// Rebuild a [`SizeSpec`] from the shim's "exactly one of these is set" pair.
@@ -655,9 +688,48 @@ pub fn permutation_pvalue(score: f64, permutation_scores: Vec<f64>) -> f64 {
 /// `cross_val_predict`'s scatter map: for each row, its position in the
 /// fold-order concatenation of predictions. Errors if the splits are not a
 /// partition.
+///
+/// Both ends of this call are `n`-sized index vectors, so both cross as
+/// **pyarrow `Int64Array`s** rather than Python lists (MODSEL-EGRESS):
+/// `test_sets` is one array per fold — together exactly `n` indices, since the
+/// test folds partition the rows — and the returned scatter map is another `n`.
+/// As lists that was `2n` boxed integers per call, on a function that performs
+/// one pass of pure bookkeeping.
+///
+/// The shim wraps its numpy fold indices with `pa.py_buffer`, which is
+/// zero-copy, so nothing is materialized on either side of the boundary.
 #[pyfunction]
-pub fn partition_inverse(test_sets: Vec<Vec<i64>>, n_samples: usize) -> PyResult<Vec<usize>> {
-    mval::partition_inverse(&test_sets, n_samples).map_err(ms_err_to_py)
+pub fn partition_inverse<'py>(
+    py: Python<'py>,
+    test_sets: Vec<Bound<'py, PyAny>>,
+    n_samples: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let arrays = test_sets
+        .iter()
+        .map(crate::ingress::capsule_to_array)
+        .collect::<PyResult<Vec<_>>>()?;
+    let mut folds: Vec<Vec<i64>> = Vec::with_capacity(arrays.len());
+    for array in &arrays {
+        let view = array
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| {
+                PyValueError::new_err(
+                    "partition_inverse: fold indices must be an int64 arrow array",
+                )
+            })?;
+        if view.null_count() != 0 || view.offset() != 0 {
+            return Err(PyValueError::new_err(
+                "partition_inverse: fold indices must be a contiguous, null-free \
+                 int64 arrow array",
+            ));
+        }
+        // One bulk copy per FOLD (not per index) into the shape the core takes.
+        folds.push(view.values().to_vec());
+    }
+    let inverse = mval::partition_inverse(&folds, n_samples).map_err(ms_err_to_py)?;
+    let widened: Vec<i64> = inverse.into_iter().map(|v| v as i64).collect();
+    crate::egress::i64_vec_to_pyarrow(py, widened)
 }
 
 // =========================================================================

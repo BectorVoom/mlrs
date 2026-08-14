@@ -649,7 +649,31 @@ _ROCM_GAUSSIAN_NB_LOG_PROBA_NOISE = (
 # to 7.6). No rocm-only xfail entry for UMAP remains — both checks pass
 # outright, same as cpu/wgpu.
 
+# `check_regressor_multioutput` asserts `y_pred.dtype == float64` outright
+# ("Multioutput predictions by a regressor are expected to be floating-point
+# precision"), with no tolerance and no tag to opt out of. That is the SAME
+# harness downcast as `_DTYPE_PRESERVE_ROCM_REASON`, surfacing through a
+# different assertion: the check's float64 fixtures are forced to float32 at
+# ingress on rocm, so the predictions come back float32.
+#
+# `RidgeCV` is the only estimator in the sweep that reaches this check at all —
+# sklearn yields it only for regressors whose tags claim multioutput support,
+# and RidgeCV is currently mlrs's only one — which is why there is a single
+# entry here rather than a computed gate like `_preserves_dtype_check_applies`.
+# If a second multioutput regressor is added, this becomes the third case
+# worth mirroring sklearn's own yield condition for.
+_ROCM_MULTIOUTPUT_DTYPE_REASON = (
+    "check_regressor_multioutput asserts predict() returns float64 exactly. On "
+    "an f64-incapable backend (rocm) this harness downcasts the check's float64 "
+    "fixtures to float32 at ingress (see _DTYPE_PRESERVE_ROCM_REASON), so the "
+    "predictions are float32 by construction. Not a RidgeCV bug: the check "
+    "passes, and is NOT xfailed, on an f64-capable backend (cpu/wgpu)."
+)
+
 _ROCM_ONLY = {
+    "RidgeCV": {
+        "check_regressor_multioutput": _ROCM_MULTIOUTPUT_DTYPE_REASON,
+    },
     "LogisticRegression": {
         "check_fit_idempotent": _ROCM_F32_NOT_CONVERGED,
         "check_fit_check_is_fitted": _ROCM_F32_NOT_CONVERGED,

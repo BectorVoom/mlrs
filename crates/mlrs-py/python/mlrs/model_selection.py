@@ -324,8 +324,27 @@ def _emit(warnings_from_rust):
 
 
 def _as_index(indices):
-    """A Rust index list as a numpy ``intp`` array (numpy's own index dtype)."""
-    return np.asarray(indices, dtype=np.intp)
+    """A Rust index array as a numpy ``intp`` array (numpy's own index dtype).
+
+    The compiled splitters hand indices over as a **pyarrow** ``Int64Array``
+    rather than a Python list (MODSEL-EGRESS): the payload is one integer per
+    SAMPLE, so a list meant one boxed ``int`` per row and a second full pass to
+    parse them back — 275 ms inside ``kfold_split`` alone for a 5-fold split of
+    200 000 samples. ``np.asarray`` over the arrow buffer is a view instead.
+
+    The view is READ-ONLY (Arrow owns the memory) and sklearn's splitters yield
+    writable index arrays, so this copies once when it has to. That copy is a
+    single ``memcpy`` of ``8 · n`` bytes — microseconds where the boxing was
+    milliseconds — and it keeps ``for train, test in cv.split(X)`` behaving
+    exactly as it does with sklearn, including for a caller that sorts or
+    shuffles the indices it was handed.
+
+    Still accepts a plain sequence: several compiled entry points return small
+    index lists where the boxing is irrelevant, and those arrive writable
+    already, so the copy is skipped.
+    """
+    out = np.asarray(indices, dtype=np.intp)
+    return out if out.flags.writeable else out.copy()
 
 
 def _codes(values, *, name="y"):
@@ -999,9 +1018,28 @@ def _warn_unused_groups(splitter, groups):
 
 
 def _yield_splits(trains, tests):
-    """Yield the Rust index lists as numpy arrays, split by split."""
+    """Yield the Rust index arrays as numpy arrays, split by split."""
     for train, test in zip(trains, tests):
         yield _as_index(train), _as_index(test)
+
+
+def _as_arrow_index(indices):
+    """A numpy index array as a zero-copy pyarrow ``Int64Array`` for the FFI.
+
+    The mirror of :func:`_as_index`, for the direction that hands indices TO
+    Rust. ``pa.py_buffer`` borrows the numpy buffer rather than copying it, and
+    ``from_buffers`` wraps it without a validity bitmap, which is what makes the
+    compiled side able to read it as a plain slice.
+
+    The contiguous ``int64`` cast is a no-op for the arrays the splitters
+    produce (``intp`` IS ``int64`` on a 64-bit host); it exists for the
+    iterable-of-index-pairs ``cv`` form, where the caller supplies the arrays
+    and may hand over anything sliceable.
+    """
+    import pyarrow as pa
+
+    flat = np.ascontiguousarray(np.asarray(indices), dtype=np.int64)
+    return pa.Array.from_buffers(pa.int64(), flat.size, [None, pa.py_buffer(flat)])
 
 
 # --------------------------------------------------------------------------- #
@@ -2476,8 +2514,11 @@ def cross_val_predict(
     n_samples = _num_samples(X)
 
     # Rust validates the partition and hands back the scatter map in one pass.
+    # The fold indices cross as zero-copy arrow views over the numpy arrays the
+    # splitter already produced, and the scatter map comes back as an arrow
+    # array — `2n` boxed integers per call became none (MODSEL-EGRESS).
     inverse = _ext().partition_inverse(
-        [np.asarray(test).astype(np.int64).tolist() for _, test in splits], n_samples
+        [_as_arrow_index(test) for _, test in splits], n_samples
     )
 
     all_classes = None

@@ -12,7 +12,9 @@
 //! in `src/`.
 
 use mlrs_backend::abflag;
-use mlrs_backend::prims::gram_host::{centered_gram_xty, gram_host_applicable};
+use mlrs_backend::prims::gram_host::{
+    centered_gram_xty, gram_host_applicable, gram_host_applicable_for,
+};
 use mlrs_core::{assert_slice_close, F64_TOL};
 
 /// Deterministic, reproducible pseudo-random design (splitmix64), so a failure
@@ -263,9 +265,9 @@ fn gram_host_applicable_honours_the_ab_knob() {
     }
 }
 
-/// Without an override, a tiny problem takes the host arm on EVERY backend
-/// (the fixed-dispatch-cost floor), and a large one takes the host arm only on
-/// cpu.
+/// Without an override, a tiny problem takes the host arm on EVERY backend —
+/// the fixed-dispatch-cost floor, which is about launch overhead and so really
+/// is machine-independent.
 #[test]
 fn gram_host_applicable_floor_is_backend_independent() {
     let _g = abflag::clear("MLRS_RIDGE_GRAM_HOST");
@@ -273,10 +275,45 @@ fn gram_host_applicable_floor_is_backend_independent() {
         gram_host_applicable(1_000, 8),
         "a 1000x8 design is below the dispatch floor on every backend"
     );
-    let big = gram_host_applicable(1_000_000, 256);
-    assert_eq!(
-        big,
-        mlrs_backend::capability::active_backend_name() == "cpu",
-        "above the floor the host arm is the cpu backend's alone"
+    assert!(
+        gram_host_applicable(1, 1),
+        "a degenerate design is below the floor on every backend"
+    );
+}
+
+/// ABOVE the floor the answer is no longer a constant: it is the calibrated
+/// cost model's verdict (RIDGE-ARM-CAL), measured on the machine running the
+/// test. What can be asserted portably is that the verdict is a DECISION rather
+/// than a coin flip — stable across calls, because the rates are measured once
+/// and cached — and that cpu still always answers "host".
+#[test]
+fn gram_host_applicable_above_the_floor_is_calibrated_and_stable() {
+    let _g = abflag::clear("MLRS_RIDGE_GRAM_HOST");
+
+    let first = gram_host_applicable(1_000_000, 256);
+    for _ in 0..3 {
+        assert_eq!(
+            gram_host_applicable(1_000_000, 256),
+            first,
+            "the calibrated verdict must be cached, not re-measured per call"
+        );
+    }
+
+    if mlrs_backend::capability::active_backend_name() == "cpu" {
+        assert!(first, "the cpu backend has no device arm to prefer");
+    }
+
+    // The model must also be MONOTONE in the direction that matters: the host
+    // arm's advantage comes from not transferring the design, so a design that
+    // is wider (more bytes per multiply-add is FALSE here — wider d means more
+    // arithmetic per byte, which favours the device). Assert the weaker,
+    // always-true property instead: an f64 design ships twice the bytes of the
+    // f32 one for identical arithmetic, so it can never be LESS
+    // host-favourable.
+    let f32_verdict = gram_host_applicable_for(500_000, 64, 4);
+    let f64_verdict = gram_host_applicable_for(500_000, 64, 8);
+    assert!(
+        !f32_verdict || f64_verdict,
+        "if f32 prefers the host arm, the byte-heavier f64 design must too"
     );
 }

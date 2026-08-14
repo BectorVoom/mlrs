@@ -157,7 +157,7 @@ use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::prims::cholesky::{cholesky_solve_reg, CHOLESKY_MAX_DIM};
 use mlrs_backend::prims::gram::{center_scale, column_means_multi, gram_xty_multi, transpose};
-use mlrs_backend::prims::gram_host::{centered_gram_multi_xty, gram_host_applicable};
+use mlrs_backend::prims::gram_host::{centered_gram_multi_xty, gram_host_applicable_for};
 use mlrs_backend::prims::linear_predict::{linear_predict_labels, linear_predict_multi};
 use mlrs_backend::prims::nnls::ridge_intercept_multi_device;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -371,7 +371,7 @@ where
             RidgeSolver::Cholesky | RidgeSolver::Lbfgs
         ) && self
             .device
-            .prefers_host(|| gram_host_applicable(shape.0, shape.1))
+            .prefers_host(|| gram_host_applicable_for(shape.0, shape.1, size_of::<F>()))
     }
 
     /// The no-upload HOST fit arm — the fast path this estimator exists for.
