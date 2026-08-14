@@ -204,6 +204,30 @@ oracle-tested against a **live** sklearn in the same process:
   `check_estimator` suite, entered **twice** (once per `voting` value), because
   the two routes reach different checks.
 
+### Verified on a real GPU, not only on the cpu backend
+
+The whole set above was re-run on **rocm** (gfx1151), where it passes
+identically: 46 Rust tests, 224 classifier + 145 regressor Python tests, and 175
+`check_estimator` tests.
+
+Two things that only a real GPU can confirm:
+
+* **Hard voting is bit-exact on device there too.**
+  `hard_voting_on_the_device_equals_the_host_bincount_argmax_exactly` is an
+  EQUALITY assertion, and it holds on hardware that genuinely contracts
+  multiply-adds — which is the evidence for the claim above that a scalar-into-bin
+  add has nothing to contract. The regressor's `vote_average` is 1 ULP off on the
+  same hardware, from the same test file.
+* **The f64 device gate is the right one.** rocm reports
+  `backend_supports_f64() == False` (its matmul rejects f64 operands) but
+  `backend_f64_device_kernels() == True`. The device arms gate on the SECOND flag,
+  so they run f64 probability blocks on rocm rather than refusing them — which is
+  the ordinary case, since sklearn members return f64. Gating on the advertised
+  flag is what made the stacking device arm raise there (STACK-META-01). The
+  engine suite's only skip on rocm is the *negative* test that asserts the
+  refusal, which correctly does not apply — so every `device` cell genuinely ran
+  on the GPU rather than silently falling back.
+
 ### Landmine: sklearn's `StrOptions` message is not deterministic
 
 `The 'voting' parameter … must be a str among {…}` renders its options by
