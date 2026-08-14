@@ -196,6 +196,104 @@ pub fn vote_write_col<F: Float + CubeElement>(
 }
 
 // ------------------------------------------------------------------------- //
+// The PACKED regressor arms (VOTE-GPU-01)
+// ------------------------------------------------------------------------- //
+//
+// The two kernels above form a CHAIN: one launch per member, each reading and
+// writing the whole `n`-long accumulator, then a separate divide pass. That
+// costs `(3k + 2) · n` of device memory traffic — `k` column reads, `2k` on the
+// accumulator, and `2n` more to divide it.
+//
+// Measured on rocm (gfx1151) it is also what makes `predict` SLOWER than
+// `transform` at the same shape while moving fewer bytes across the bus
+// (8.1 ms against 5.3 ms at n = 10⁶, k = 3, for 16 MB against 24 MB) — the
+// giveaway that the arm is bound by accumulator traffic rather than by the
+// crossing it was designed around.
+//
+// The kernels below collapse that to ONE launch over ONE upload:
+// `(k + 1) · n` — every column read once, the answer written once, no
+// accumulator round-trip and no separate divide. 2.75x less traffic at k = 3.
+//
+// ## Why a packed buffer rather than a k-ary kernel
+//
+// CubeCL fixes `Array` arguments at kernel-definition time, so a kernel cannot
+// take a caller-chosen `k` of them (the constraint `vote_add_weighted` and
+// `stack_meta_block` both document). The usual workaround is a family of
+// fixed-arity kernels — `_2`, `_4`, `_8` — plus chaining for the remainder.
+// Packing the members into one `k × n` buffer host-side instead handles EVERY
+// `k` with ONE kernel and no arity ladder, and costs nothing extra on the host:
+// the chained arm already performed `k` separate host copies of `n` elements
+// each (`bridge::upload` owns its bytes), so the same `k · n` is copied either
+// way — just into one allocation and one transfer instead of `k`.
+//
+// ## What is NOT allowed to change
+//
+// The summation stays left-to-right in member order and the divide stays a
+// DIVISION, because `np.average` parity is asserted bit-for-bit against the host
+// arm. `acc` is still SEEDED from member 0's weighted value rather than from a
+// zeroed buffer, for the `-0.0` reason `vote_init_weighted` documents.
+
+/// `out[r] = (Σⱼ cols[j, r]·weights[j]) / denom` — the whole `predict`
+/// aggregation in one launch.
+///
+/// `cols` is the members packed member-major (`k × n`, member `j` occupying
+/// `[j·n, (j+1)·n)`), `weights` is `k` long, and `out` is `n` long. `n` is taken
+/// from `out.len()` rather than passed, so the stride and the bound cannot
+/// disagree.
+///
+/// Every unit reads the same `weights[j]` at the same moment — a broadcast that
+/// stays in cache — so the weight array costs bandwidth only once, not `n · k`
+/// times.
+#[cube(launch)]
+pub fn vote_average_packed<F: Float + CubeElement>(
+    cols: &Array<F>,
+    weights: &Array<F>,
+    out: &mut Array<F>,
+    k: u32,
+    denom: F,
+) {
+    let tid = ABSOLUTE_POS;
+    let n = out.len();
+    if tid < n {
+        // Seeded from member 0, not from zero: `0 + (-0.0)` is `+0.0`, and an
+        // all-negative-zero row must keep its sign to match `np.average`.
+        let mut acc = cols[tid] * weights[0];
+        let mut j = 1u32;
+        while j < k {
+            acc = acc + cols[j as usize * n + tid] * weights[j as usize];
+            j += 1u32;
+        }
+        // A DIVISION, not a reciprocal multiply — `x / s` and `x * (1/s)` are
+        // different floating-point numbers and the oracle compares bit for bit.
+        out[tid] = acc / denom;
+    }
+}
+
+/// `mat[r, j] = cols[j, r]` — the whole `transform` transpose in one launch.
+///
+/// The packed counterpart of [`vote_write_col`]: one unit per ROW writes that
+/// row's `k` entries contiguously, reading each member with a stride of `n`.
+/// That inverts the chained arm's access pattern (contiguous read, strided
+/// write) into a strided read and a contiguous write, which is the better half
+/// to make contiguous — the write is the one that must not be re-read.
+#[cube(launch)]
+pub fn vote_transform_packed<F: Float + CubeElement>(
+    cols: &Array<F>,
+    mat: &mut Array<F>,
+    k: u32,
+    n: u32,
+) {
+    let tid = ABSOLUTE_POS;
+    if tid < n as usize {
+        let mut j = 0u32;
+        while j < k {
+            mat[tid * k as usize + j as usize] = cols[j as usize * n as usize + tid];
+            j += 1u32;
+        }
+    }
+}
+
+// ------------------------------------------------------------------------- //
 // VotingClassifier (VOTE-CLF-01)
 // ------------------------------------------------------------------------- //
 

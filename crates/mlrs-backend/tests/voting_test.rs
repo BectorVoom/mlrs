@@ -617,3 +617,76 @@ fn the_classifier_arms_run_at_f64_where_the_backend_has_f64_kernels() {
     assert_eq!(got, expected);
     println!("voting-clf f64 backend={backend}: device hard vote matches the host tally exactly");
 }
+
+// --------------------------------------------------------------------------- //
+// The packed vs chained device shapes (VOTE-GPU-01)
+// --------------------------------------------------------------------------- //
+
+use mlrs_backend::prims::voting::DEVICE_CHAINED_KNOB;
+
+/// Both device shapes compute the SAME bytes.
+///
+/// `vote_average_device` runs one packed launch by default and the original
+/// per-member chain under [`DEVICE_CHAINED_KNOB`]. They are two spellings of one
+/// reduction — same member order, same division — so equality is the assertion,
+/// not a tolerance: any gap would mean one of them reassociated the sum.
+///
+/// The knob is forced through `abflag` rather than `std::env::set_var`, which is
+/// the project rule for A/B knobs under test (`mlrs-abflag-test-knobs`).
+#[test]
+fn the_packed_and_chained_device_shapes_agree_bit_for_bit() {
+    let backend = capability::active_backend_name();
+    for case in cases() {
+        let raw: Vec<Vec<f64>> = (0..case.k).map(|j| column_values(j, case.n_rows)).collect();
+
+        let packed = {
+            let _g = mlrs_backend::abflag::force(DEVICE_CHAINED_KNOB, "0");
+            run_average::<f32>(&case, &raw)
+        };
+        let chained = {
+            let _g = mlrs_backend::abflag::force(DEVICE_CHAINED_KNOB, "1");
+            run_average::<f32>(&case, &raw)
+        };
+        assert_eq!(
+            packed, chained,
+            "packed and chained disagree at k={}, n={}",
+            case.k, case.n_rows
+        );
+    }
+    println!("voting-gpu backend={backend}: packed and chained device shapes are bit-identical");
+}
+
+/// The same, for `transform` — a pure scatter, so equality on both shapes.
+#[test]
+fn the_packed_and_chained_transforms_agree_bit_for_bit() {
+    for case in cases() {
+        let raw: Vec<Vec<f64>> = (0..case.k).map(|j| column_values(j, case.n_rows)).collect();
+        let packed = {
+            let _g = mlrs_backend::abflag::force(DEVICE_CHAINED_KNOB, "0");
+            run_transform::<f32>(&case, &raw)
+        };
+        let chained = {
+            let _g = mlrs_backend::abflag::force(DEVICE_CHAINED_KNOB, "1");
+            run_transform::<f32>(&case, &raw)
+        };
+        assert_eq!(packed, chained, "transform shapes disagree at k={}", case.k);
+    }
+}
+
+/// The default shape is PACKED — an unset knob must not select the old chain.
+///
+/// A knob that silently defaulted the other way would make the ladder in
+/// `docs/voting.md` a measurement of the arm nobody runs.
+#[test]
+fn the_device_arm_defaults_to_the_packed_shape() {
+    assert_eq!(DEVICE_CHAINED_KNOB, "MLRS_VOTING_DEVICE_CHAINED");
+    if mlrs_backend::abflag::var(DEVICE_CHAINED_KNOB).is_none() {
+        // Unset in the test process, so this is what a user gets: the packed
+        // shape, which is what the shipped ladder measured.
+        let case = Case { n_rows: 64, k: 3, weights: vec![1.0, 2.0, 3.0] };
+        let raw: Vec<Vec<f64>> = (0..case.k).map(|j| column_values(j, case.n_rows)).collect();
+        let default_shape = run_average::<f32>(&case, &raw);
+        let _g = mlrs_backend::abflag::force(DEVICE_CHAINED_KNOB, "0");
+        assert_eq!(default_shape, run_average::<f32>(&case, &raw));
+    }
+}

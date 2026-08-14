@@ -271,6 +271,7 @@ being quiet — a contended box has inverted a verdict on this project before).
 (see `mlrs-cubecl-cpu-execution-model`), so its numbers say nothing about GPU
 bandwidth and are reported only for completeness. The `host` column is the one
 this table is for — and it is where the largest effect in this document lives.
+The real-GPU ladder is [below](#measured-the-device-arm-on-a-real-gpu-vote-gpu-01).
 
 | n, k | numpy | host | device | host/np | dev/np |
 |---|---|---|---|---|---|
@@ -338,6 +339,100 @@ member `predict`s dominate. Making the default a size-and-weights heuristic
 would trade a predictable code path for a fraction of a percent of a real
 `predict`. So `numpy` ships, and a caller aggregating millions of rows has
 `MLRS_VOTING_ENGINE=host`.
+
+## Measured: the device arm on a real GPU (VOTE-GPU-01)
+
+Everything above is the **cpu backend**. Until this section existed, so was every
+`device` number ever recorded for this estimator — which meant the standing
+"device loses" verdict rested on cubecl-cpu, a backend that is not a GPU and that
+the table above explicitly disclaims. Concluding a GPU arm's fate from another
+backend's measurement is the mistake `mlrs-feedback-verify-on-target-hardware`
+exists to prevent, so here is the arm on actual hardware.
+
+**rocm gfx1151 (integrated), f32, quiet box, min of 3 fresh subprocesses.**
+`predict`, weighted:
+
+| n, k | numpy | host | device | host/np | dev/np |
+|---|---|---|---|---|---|
+| n=1 000, k=3 | **0.011 ms** | 0.014 ms | 0.057 ms | 0.82x | 0.20x |
+| n=10 000, k=3 | **0.023 ms** | 0.035 ms | 0.127 ms | 0.65x | 0.18x |
+| n=100 000, k=3 | **0.158 ms** | 0.244 ms | 0.609 ms | 0.65x | 0.26x |
+| n=1 000 000, k=3 | 3.781 ms | **3.450 ms** | 8.827 ms | 1.10x | 0.43x |
+| n=100 000, k=2 | **0.120 ms** | 0.179 ms | 0.403 ms | 0.67x | 0.30x |
+| n=100 000, k=8 | **0.403 ms** | 0.711 ms | 1.846 ms | 0.57x | 0.22x |
+| n=1 000 000, k=8 | **8.974 ms** | 9.025 ms | 19.214 ms | 0.99x | 0.47x |
+
+**The verdict survives contact with real hardware: `numpy` stays the default.**
+The device arm is 0.18-0.47x — it loses by 2 to 5x at every shape. The cpu-backend
+table was directionally right about the outcome even though it could not be
+trusted about the reason.
+
+### Why this arm cannot win here, which is a property of the problem
+
+A weighted row mean is an **elementwise reduction with roughly one flop per four
+bytes**. numpy reads the members' predictions *in place*. The device arm must
+copy `k · n` into a staging buffer, hand it across, compute, and bring `n` back —
+and on an integrated GPU "device memory" IS system RAM, so that hand-across is
+itself a memcpy. It therefore performs strictly MORE memory traffic than numpy to
+produce the same answer, with no arithmetic worth amortising against.
+
+The measurement bears that out. At n = 10⁶, k = 3 the packed kernel touches 4M
+elements in and 1M out — 20 MB, under 0.4 ms even at a conservative 50 GB/s —
+against 8.8 ms measured. **Over 95% of the arm's time is copying, transferring and
+synchronising, not computing.** No kernel change reaches that 95%; only a design
+where the members' predictions were ALREADY device-resident would, and this
+estimator's members hand back host arrays by construction.
+
+### The packed rewrite (what did change)
+
+The arm originally ran a CHAIN — one upload and one accumulate launch per member,
+each reading and writing the whole `n`-long accumulator, then a separate divide:
+`(3k + 2) · n` of device traffic. It now runs ONE launch of
+`vote_average_packed` over ONE upload of the members concatenated: `(k + 1) · n`,
+every column read once and the answer written once, divide folded in.
+
+Measured against the chained shape it replaced, interleaved across fresh
+subprocesses (`MLRS_VOTING_DEVICE_CHAINED=1` selects the old shape):
+
+| n, k | chained | packed | packed/chained |
+|---|---|---|---|
+| n=1 000, k=3 | 0.101 ms | **0.063 ms** | **1.60x** |
+| n=10 000, k=3 | 0.177 ms | **0.108 ms** | **1.64x** |
+| n=100 000, k=3 | 0.668 ms | **0.599 ms** | 1.12x |
+| n=100 000, k=2 | 0.607 ms | **0.392 ms** | **1.55x** |
+| n=1 000 000, k=3 | **7.331 ms** | 8.125 ms | 0.90x |
+| n=1 000 000, k=8 | **17.580 ms** | 19.015 ms | 0.92x |
+| n=2 000 000, k=8 | 37.733 ms | **29.858 ms** | 1.26x |
+
+Packed wins where there is something to win — small `n`, where launch count and
+allocation count dominate — and is a **wash at large `n`**, where both shapes move
+identical bytes and the arm is bandwidth-bound. The large-`n` column disagrees
+with itself (0.90x, 0.92x, 1.26x) precisely because it is measuring noise around
+parity. Packed ships because it wins the half that is winnable.
+
+### Two methodology traps this section walked into
+
+Both are recorded because each produced a *confident wrong answer* first.
+
+1. **Comparing across builds.** The first packed-versus-chained comparison ran
+   two separate binaries minutes apart and reported that packing had regressed
+   large `n`. Re-run interleaved, it had not. The run-to-run spread on this box is
+   comparable to the effect. Build one binary containing both shapes behind a
+   knob, and alternate.
+2. **…but not interleaved IN ONE PROCESS, for device buffers.** The obvious fix —
+   alternate the two shapes inside one interpreter — made the rocm backend
+   **SIGSEGV** ("Memory page 0 doesn't exist") and inflated every surviving cell.
+   The two shapes allocate differently (`k` buffers of `n` versus one of `k · n`),
+   so the pool's free-list can satisfy neither request from the other's leftovers
+   and the working set doubles until GTT is exhausted. Each shape run alone
+   completes the same sizes fine. Interleave across **fresh subprocesses**, which
+   is what `scripts/bench_voting.py` already does and what these tables use.
+
+A third, smaller one: the first packed implementation built a packed `Vec` and
+then called `DeviceArray::from_host`, which copies again — two host copies of
+`k · n` where the chained arm made one. That alone cost 1.8 ms at n = 10⁶.
+`DeviceArray::from_host_chunks` packs directly into the buffer that becomes
+`Bytes`, restoring the single copy.
 
 ## Measured: `n_jobs`
 

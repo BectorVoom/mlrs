@@ -106,6 +106,53 @@ impl<R: cubecl::Runtime, F: Pod> DeviceArray<R, F> {
         }
     }
 
+    /// Upload several host slices CONCATENATED into one device buffer, with the
+    /// same single host copy [`from_host`](Self::from_host) performs.
+    ///
+    /// For a caller holding `k` separate columns that a kernel wants to read as
+    /// one `k × n` buffer, the obvious spelling — build a packed `Vec<F>`, then
+    /// `from_host` it — copies the data TWICE: once to pack and once inside
+    /// `from_host`. This packs directly into the byte buffer that becomes
+    /// `Bytes`, so the total is one copy of `Σ chunk.len()`, exactly what `k`
+    /// separate `from_host` calls would have cost between them.
+    ///
+    /// That is not a micro-optimisation. Measured on rocm (gfx1151) for
+    /// `VotingRegressor`'s `predict` at n = 10⁶, k = 3, the double copy cost
+    /// **1.8 ms** — enough to turn a launch-count win into a net regression
+    /// (8.08 ms chained → 9.85 ms double-copied → see `docs/voting.md` for where
+    /// the single-copy version lands).
+    ///
+    /// Returns an array of `Σ chunk.len()` elements, chunk `j` occupying
+    /// `[Σ_{i<j} len_i, Σ_{i<=j} len_i)`.
+    pub fn from_host_chunks(pool: &mut BufferPool<R>, chunks: &[&[F]]) -> Self {
+        let len: usize = chunks.iter().map(|c| c.len()).sum();
+        let byte_size = len * size_of::<F>();
+
+        // Metered exactly as `from_host` does, for the same reason.
+        let metering_handle = pool.acquire(byte_size);
+        pool.release(metering_handle, byte_size);
+
+        let mut byte_vec: Vec<u8> = Vec::with_capacity(byte_size);
+        for chunk in chunks {
+            byte_vec.extend_from_slice(bytemuck::cast_slice::<F, u8>(chunk));
+        }
+        let mut bytes = cubecl::bytes::Bytes::from_bytes_vec(byte_vec);
+
+        // Same opt-in pinned-staging knob as `from_host`; see its comment for
+        // why it is off by default.
+        if crate::abflag::is_on("MLRS_UPLOAD_PINNED") {
+            pool.client().staging(std::iter::once(&mut bytes), false);
+        }
+        let handle = pool.client().create(bytes);
+
+        Self {
+            handle,
+            len,
+            _runtime: PhantomData,
+            _dtype: PhantomData,
+        }
+    }
+
     /// Wrap an already-populated CubeCL handle as a `DeviceArray` of `len`
     /// elements, without uploading or metering.
     ///

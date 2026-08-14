@@ -4,10 +4,11 @@
 //! A fitted `VotingRegressor` holds `k` members. Each answers `predict(X)` with
 //! an `n`-long column; the estimator then either stacks those columns into an
 //! `n × k` matrix (`transform`) or reduces them to a weighted mean
-//! (`predict`). This module runs both on the device:
-//! [`vote_transform_device`] is `k` launches of
-//! [`mlrs_kernels::voting::vote_write_col`], and [`vote_average_device`] is `k`
-//! accumulate launches followed by one divide.
+//! (`predict`). This module runs both on the device, each as ONE launch over ONE
+//! packed upload (VOTE-GPU-01): [`vote_average_device`] is
+//! [`mlrs_kernels::voting::vote_average_packed`] and [`vote_transform_device`]
+//! is [`mlrs_kernels::voting::vote_transform_packed`]. The original per-member
+//! CHAIN survives behind [`DEVICE_CHAINED_KNOB`] as the A/B alternative.
 //!
 //! ## Three arms, one knob
 //! [`vote_engine`] resolves `MLRS_VOTING_ENGINE` into [`VoteEngine`], mirroring
@@ -31,6 +32,13 @@
 //! `scripts/bench_voting.py`, not for a comment; the shipping default is
 //! whatever that ladder says, and today it says `numpy`.
 //!
+//! MEASURED on real GPU hardware (rocm gfx1151) rather than inferred from the
+//! cpu backend: the answer is no, by 2-5x at every shape, and `docs/voting.md`
+//! explains why it is a property of the problem rather than of the kernels. A
+//! weighted row mean is ~1 flop per 4 bytes; on an integrated GPU the arm does
+//! strictly MORE memory traffic than `np.average` to reach the same answer, and
+//! over 95% of its time is copy/transfer/sync rather than compute.
+//!
 //! The `transform` half has no such advantage — it is `stacking_meta`'s
 //! situation exactly, `n · k` each way with no arithmetic — and is here so the
 //! two methods can run on the same arm rather than silently splitting.
@@ -52,8 +60,9 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 use mlrs_core::PrimError;
 use mlrs_kernels::voting::{
-    vote_add_weighted, vote_argmax_bounded, vote_argmax_rows, vote_bincount_add, vote_counts_zero,
-    vote_divide, vote_hi_zero, vote_init_weighted, vote_write_block, vote_write_col,
+    vote_add_weighted, vote_argmax_bounded, vote_argmax_rows, vote_average_packed,
+    vote_bincount_add, vote_counts_zero, vote_divide, vote_hi_zero, vote_init_weighted,
+    vote_transform_packed, vote_write_block, vote_write_col,
 };
 
 use crate::device_array::DeviceArray;
@@ -85,6 +94,24 @@ impl VoteEngine {
 /// The A/B knob naming the voting-aggregation arm.
 pub const ENGINE_KNOB: &str = "MLRS_VOTING_ENGINE";
 
+/// The A/B knob selecting the DEVICE arm's internal shape (VOTE-GPU-01).
+///
+/// `1` = the CHAINED shape: one upload and one accumulate launch per member,
+/// then a divide pass. `0` (the default) = the PACKED shape: one upload of the
+/// members concatenated, one launch that reads each column once and writes the
+/// answer once.
+///
+/// Both compute the same thing in the same order; this exists so the two can be
+/// compared INTERLEAVED IN ONE PROCESS. Comparing them across two builds minutes
+/// apart is what produced this module's first, wrong, conclusion — the
+/// run-to-run spread on this box is comparable to the effect being measured.
+pub const DEVICE_CHAINED_KNOB: &str = "MLRS_VOTING_DEVICE_CHAINED";
+
+/// Whether the device arm should use the chained shape rather than the packed one.
+fn device_chained() -> bool {
+    crate::abflag::is_on(DEVICE_CHAINED_KNOB)
+}
+
 /// Resolve [`ENGINE_KNOB`] into the arm to use.
 ///
 /// An unrecognized value falls back to [`VoteEngine::Numpy`] rather than
@@ -107,9 +134,17 @@ pub fn vote_engine() -> VoteEngine {
 /// weight and `denom` is their sum, computed by the caller in the SAME order and
 /// dtype the host arm uses so the two arms divide by identical bits.
 ///
-/// Returns the `n_rows`-long weighted mean. The accumulator is the only device
-/// allocation beyond the uploads, and it is written by the first launch rather
-/// than zero-filled (see the kernel module for why that matters at `-0.0`).
+/// Returns the `n_rows`-long weighted mean, computed by ONE launch of
+/// [`vote_average_packed`] over ONE packed upload (VOTE-GPU-01).
+///
+/// The chained arm this replaced ran `k` accumulate launches plus a divide,
+/// each touching the whole `n`-long accumulator — `(3k + 2) · n` of device
+/// traffic against this one's `(k + 1) · n`. On rocm that chain made `predict`
+/// slower than `transform` at the same shape while moving FEWER bytes across the
+/// bus, which is what identified the accumulator round-trip rather than the
+/// crossing as the cost. The chain is still available as
+/// [`accumulate_weighted`], which [`vote_soft_predict_device`] needs because it
+/// consumes the accumulator device-resident.
 pub fn vote_average_device<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     preds: &[&[F]],
@@ -126,10 +161,87 @@ where
         return Ok(Vec::new());
     }
 
-    let acc_handle = accumulate_weighted(pool, preds, weights, denom, n_rows);
-    let acc = DeviceArray::<ActiveRuntime, F>::from_raw(acc_handle, n_rows);
-    let host = acc.to_host_metered(pool);
-    acc.release_into(pool);
+    if device_chained() {
+        let acc_handle = accumulate_weighted(pool, preds, weights, denom, n_rows);
+        let acc = DeviceArray::<ActiveRuntime, F>::from_raw(acc_handle, n_rows);
+        let host = acc.to_host_metered(pool);
+        acc.release_into(pool);
+        return Ok(host);
+    }
+
+    let k = preds.len();
+    // ONE host copy of `k * n_rows`, not two — see `from_host_chunks`.
+    let cols = DeviceArray::<ActiveRuntime, F>::from_host_chunks(pool, preds);
+    let w = DeviceArray::<ActiveRuntime, F>::from_host(pool, weights);
+    let out_handle = pool.acquire(n_rows * size_of::<F>());
+    let client = pool.client().clone();
+    let (count, dim) =
+        super::launch_dims_1d_folded(n_rows, crate::capability::gather_launch_width());
+
+    // SAFETY: `cols` is `k * n_rows` elements and `w` is `k`; the kernel forms
+    // `j * n + tid` for `j < k` and `tid < n`, whose largest value is
+    // `k * n - 1`, and reads `weights[j]` for `j < k`. `out` is `n_rows` long
+    // and the kernel bounds-checks `tid < out.len()`.
+    let cols_arg = unsafe { ArrayArg::from_raw_parts(cols.handle().clone(), k * n_rows) };
+    let w_arg = unsafe { ArrayArg::from_raw_parts(w.handle().clone(), k) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n_rows) };
+    vote_average_packed::launch::<F, ActiveRuntime>(
+        &client, count, dim, cols_arg, w_arg, out_arg, k as u32, denom,
+    );
+
+    let out = DeviceArray::<ActiveRuntime, F>::from_raw(out_handle, n_rows);
+    let host = out.to_host_metered(pool);
+    out.release_into(pool);
+    cols.release_into(pool);
+    w.release_into(pool);
+    Ok(host)
+}
+
+/// The `transform` transpose in the CHAINED shape: one upload and one scatter
+/// launch per member (VOTE-GPU-01's A/B alternative).
+///
+/// Retained behind [`DEVICE_CHAINED_KNOB`] so the packed shape can be measured
+/// against it interleaved in one process rather than across two builds.
+fn transform_chained<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    preds: &[&[F]],
+    n_rows: usize,
+    k: usize,
+    out_len: usize,
+) -> Result<Vec<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let out_handle = pool.acquire(out_len * size_of::<F>());
+    let client = pool.client().clone();
+    let (count, dim) =
+        super::launch_dims_1d_folded(n_rows, crate::capability::gather_launch_width());
+
+    let mut uploads: Vec<DeviceArray<ActiveRuntime, F>> = Vec::with_capacity(k);
+    for (j, &pred) in preds.iter().enumerate() {
+        let col = DeviceArray::<ActiveRuntime, F>::from_host(pool, pred);
+        // SAFETY: `pred.len() == n_rows` and `out` is `n_rows * k` long, so the
+        // largest index formed is `(n_rows - 1) * k + (k - 1) == out_len - 1`.
+        let pred_arg = unsafe { ArrayArg::from_raw_parts(col.handle().clone(), n_rows) };
+        let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
+        vote_write_col::launch::<F, ActiveRuntime>(
+            &client,
+            count.clone(),
+            dim,
+            pred_arg,
+            out_arg,
+            k as u32,
+            j as u32,
+        );
+        uploads.push(col);
+    }
+
+    let out = DeviceArray::<ActiveRuntime, F>::from_raw(out_handle, out_len);
+    let host = out.to_host_metered(pool);
+    out.release_into(pool);
+    for upload in uploads {
+        upload.release_into(pool);
+    }
     Ok(host)
 }
 
@@ -214,8 +326,10 @@ where
 /// The `n_rows × k` transform matrix — member `j`'s column at column `j`.
 ///
 /// The transpose sklearn writes as `np.asarray([est.predict(X) …]).T`, performed
-/// as `k` independent scatters into one output handle. The launches touch
-/// disjoint columns of every row, so they need no barrier between them.
+/// by ONE launch of [`vote_transform_packed`] over ONE packed upload
+/// (VOTE-GPU-01). The chained arm this replaced ran `k` scatter launches over
+/// `k` separate uploads; the traffic is the same either way (a transpose reads
+/// and writes each element once), but the launches and the transfers are not.
 pub fn vote_transform_device<F>(
     pool: &mut BufferPool<ActiveRuntime>,
     preds: &[&[F]],
@@ -231,37 +345,34 @@ where
     }
 
     let out_len = n_rows * k;
-    let elem = size_of::<F>();
-    let out_handle = pool.acquire(out_len * elem);
+    if device_chained() {
+        return transform_chained(pool, preds, n_rows, k, out_len);
+    }
+    let cols = DeviceArray::<ActiveRuntime, F>::from_host_chunks(pool, preds);
+    let out_handle = pool.acquire(out_len * size_of::<F>());
     let client = pool.client().clone();
     let (count, dim) =
         super::launch_dims_1d_folded(n_rows, crate::capability::gather_launch_width());
 
-    let mut uploads: Vec<DeviceArray<ActiveRuntime, F>> = Vec::with_capacity(k);
-    for (j, &pred) in preds.iter().enumerate() {
-        let col = DeviceArray::<ActiveRuntime, F>::from_host(pool, pred);
-        // SAFETY: `pred.len() == n_rows` and `out` is `n_rows * k` long, so the
-        // largest index formed is `(n_rows - 1) * k + (k - 1) == out_len - 1`.
-        let pred_arg = unsafe { ArrayArg::from_raw_parts(col.handle().clone(), n_rows) };
-        let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
-        vote_write_col::launch::<F, ActiveRuntime>(
-            &client,
-            count.clone(),
-            dim,
-            pred_arg,
-            out_arg,
-            k as u32,
-            j as u32,
-        );
-        uploads.push(col);
-    }
+    // SAFETY: `cols` is `k * n_rows` elements and `mat` is the same length; the
+    // kernel forms `j * n + tid` on the read side and `tid * k + j` on the write
+    // side for `j < k`, `tid < n`, whose largest values are both `k * n - 1`.
+    let cols_arg = unsafe { ArrayArg::from_raw_parts(cols.handle().clone(), out_len) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
+    vote_transform_packed::launch::<F, ActiveRuntime>(
+        &client,
+        count,
+        dim,
+        cols_arg,
+        out_arg,
+        k as u32,
+        n_rows as u32,
+    );
 
     let out = DeviceArray::<ActiveRuntime, F>::from_raw(out_handle, out_len);
     let host = out.to_host_metered(pool);
     out.release_into(pool);
-    for upload in uploads {
-        upload.release_into(pool);
-    }
+    cols.release_into(pool);
     Ok(host)
 }
 
