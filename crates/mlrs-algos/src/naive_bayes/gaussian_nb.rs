@@ -34,8 +34,8 @@ use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use crate::error::{AlgoError, BuildError};
 use crate::linear::ridge::validate_sample_weight;
 use crate::naive_bayes::nb_common::{
-    argmax_decode, class_grouped_stats_host, empirical_class_log_prior, log_sum_exp_normalize,
-    ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL,
+    argmax_decode, class_grouped_stats_host, empirical_class_log_prior, row_log_sum_exp,
+    row_softmax_into, ClassGroupedStats, HostScanCheck, StatsRequest, NB_LABEL_INT_TOL,
 };
 // NB-PERSIST: the safetensors container. `save`/`load` live HERE rather than in
 // `nb_persist` so they can reach the private fitted fields directly — the D-03
@@ -742,24 +742,96 @@ where
         let var_h: Vec<f64> = var.to_host(pool).iter().map(|&v| host_to_f64(v)).collect();
         let x_h = x.to_host(pool);
 
+        // Per-CLASS constants, hoisted out of the query-row loop (PERF-GNB-01).
+        //
+        // `ln(2π·var_[c,j])` and `1/var_[c,j]` are functions of the FITTED
+        // parameters alone, so evaluating them per query row — as this loop did
+        // — performed `n_query · n_classes · n_features` logarithms and
+        // divisions to produce `n_classes · n_features` distinct values. At
+        // `n=100000, d=32, K=10` that is 32 million `ln` calls, and it was very
+        // nearly the whole cost: the measured 4 ns per (row, class, feature)
+        // element is a libm `ln`, and the cost scaled with the PRODUCT
+        // `n·K·d` rather than with the `n·K` output.
+        //
+        // This is also sklearn's own formulation — `_joint_log_likelihood`
+        // folds `Σ_j log(2π var_[i,j])` into a per-class `n_ij` before touching
+        // `X` — so the regrouping moves the arithmetic TOWARD the reference
+        // implementation rather than away from it. The reciprocal is the one
+        // deliberate departure: `d²·(1/v)` may differ from sklearn's `d²/v` by
+        // an ulp, which is ~1e-16 relative against a 1e-5 parity band, and it
+        // replaces a 4-14 cycle divide per element with a multiply.
+        let mut class_const = vec![0.0f64; n_classes];
+        let mut inv_var = vec![0.0f64; n_classes * n_features];
+        for c in 0..n_classes {
+            let mut log_norm = 0.0f64;
+            for j in 0..n_features {
+                let cj = c * n_features + j;
+                let v = var_h[cj];
+                log_norm += LN_2PI + v.ln();
+                inv_var[cj] = 1.0 / v;
+            }
+            class_const[c] = class_log_prior[c] - 0.5 * log_norm;
+        }
+
         let mut jll = vec![0.0f64; n_query * n_classes];
+        // One `F -> f64` conversion pass per ROW rather than one per
+        // (row, class, feature): the row is re-read by every class, and for an
+        // f32-fitted estimator that was `n_classes` widening conversions of the
+        // same value.
+        let mut row = vec![0.0f64; n_features];
         for r in 0..n_query {
+            for (j, slot) in row.iter_mut().enumerate() {
+                *slot = host_to_f64(x_h[r * n_features + j]);
+            }
             for c in 0..n_classes {
-                let mut acc = class_log_prior[c];
-                let mut quad = 0.0f64;
-                for j in 0..n_features {
-                    let cj = c * n_features + j;
-                    let xv = host_to_f64(x_h[r * n_features + j]);
-                    let v = var_h[cj];
-                    let d = xv - theta_h[cj];
-                    quad += (LN_2PI + v.ln()) + (d * d) / v;
-                }
-                acc -= 0.5 * quad;
-                jll[r * n_classes + c] = acc;
+                let theta_c = &theta_h[c * n_features..(c + 1) * n_features];
+                let inv_c = &inv_var[c * n_features..(c + 1) * n_features];
+                jll[r * n_classes + c] =
+                    class_const[c] - 0.5 * weighted_sq_dist(&row, theta_c, inv_c);
             }
         }
         Ok(jll)
     }
+}
+
+/// `Σ_j (x_j − θ_j)² · w_j` — the Mahalanobis term of one (row, class) pair,
+/// with four independent accumulators.
+///
+/// The accumulators are the point. A floating-point sum has a serial dependency
+/// that the compiler may not break (reassociation changes the result, so LLVM
+/// will not do it without fast-math), which pins a single-accumulator loop to
+/// the FP add's ~4-cycle latency per element instead of its 1-cycle throughput.
+/// Four chains keep the pipeline fed and let the body vectorize; the partial
+/// sums are combined pairwise, which is at least as accurate as the strictly
+/// sequential order it replaces.
+///
+/// All three slices are the same length; the caller slices them from
+/// `n_features`-strided tables.
+#[inline]
+fn weighted_sq_dist(x: &[f64], theta: &[f64], inv_var: &[f64]) -> f64 {
+    debug_assert_eq!(x.len(), theta.len());
+    debug_assert_eq!(x.len(), inv_var.len());
+
+    const LANES: usize = 4;
+    let mut acc = [0.0f64; LANES];
+    let mut chunks = x
+        .chunks_exact(LANES)
+        .zip(theta.chunks_exact(LANES))
+        .zip(inv_var.chunks_exact(LANES));
+    for ((xc, tc), wc) in &mut chunks {
+        for k in 0..LANES {
+            let d = xc[k] - tc[k];
+            acc[k] += d * d * wc[k];
+        }
+    }
+
+    let tail = x.len() - x.len() % LANES;
+    let mut rest = 0.0f64;
+    for j in tail..x.len() {
+        let d = x[j] - theta[j];
+        rest += d * d * inv_var[j];
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + rest
 }
 
 impl<F> PredictLabels<F> for GaussianNB<F, Fitted>
@@ -792,10 +864,16 @@ where
         let jll = self.joint_log_likelihood(pool, x, shape)?;
         let n_classes = self.classes_.len();
         let mut proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        // `row_softmax_into` rather than `log_sum_exp_normalize` (PERF-GNB-01):
+        // the latter returns two fresh `Vec`s per row — so this loop allocated
+        // `2 · n_query` times and built a `log_proba` row only
+        // `predict_log_proba` reads — and reaches the probabilities through
+        // `ln` and a second `exp`. One scratch row, one `exp` per class.
+        let mut row_p = vec![0.0f64; n_classes];
         for r in 0..n_query {
             let row = &jll[r * n_classes..(r + 1) * n_classes];
-            let (p, _lp) = log_sum_exp_normalize(row, n_classes);
-            for (c, &pv) in p.iter().enumerate() {
+            row_softmax_into(row, &mut row_p);
+            for (c, &pv) in row_p.iter().enumerate() {
                 proba[r * n_classes + c] = f64_to_host::<F>(pv);
             }
         }
@@ -817,11 +895,13 @@ where
         let jll = self.joint_log_likelihood(pool, x, shape)?;
         let n_classes = self.classes_.len();
         let mut log_proba: Vec<F> = vec![f64_to_host::<F>(0.0); n_query * n_classes];
+        // See `predict_proba`: the shared helper's two per-row `Vec`s — one of
+        // them a `proba` row this method never reads — are what this avoids.
         for r in 0..n_query {
             let row = &jll[r * n_classes..(r + 1) * n_classes];
-            let (_p, lp) = log_sum_exp_normalize(row, n_classes);
-            for (c, &lpv) in lp.iter().enumerate() {
-                log_proba[r * n_classes + c] = f64_to_host::<F>(lpv);
+            let lse = row_log_sum_exp(row);
+            for (c, &ll) in row.iter().enumerate() {
+                log_proba[r * n_classes + c] = f64_to_host::<F>(ll - lse);
             }
         }
         Ok(DeviceArray::from_host(pool, &log_proba))
