@@ -123,6 +123,12 @@ pub mod tree;
 // single-owner — the umap_layout precedent).
 pub mod tsne;
 pub mod umap_layout;
+// VOTE-01: the prediction-voting accumulate/divide/scatter set behind
+// `mlrs.VotingRegressor`, driven by `prims/voting.rs`. Unlike `stacking`'s pure
+// scatter this one REDUCES (`n·k` in, `n` out), which is the whole reason the
+// device arm is worth a launch. Owns its `pub mod` (single-owner, no root
+// re-export — the `stacking` precedent).
+pub mod voting;
 
 pub use cholesky::{cholesky_solve, cholesky_solve_wide, CHOLESKY_WIDE_MAX_DIM};
 // Phase-13 KNN-graph (PRIM-11): direct pairwise distance kernels + per-row

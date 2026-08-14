@@ -210,6 +210,12 @@ pub mod tsne;
 // full warp divergence — and serves `method='exact'` wherever the host arm is
 // faster than the `tsne` device prim above.
 pub mod tsne_host;
+// VOTE-01: the device arm of `mlrs.VotingRegressor`'s aggregation, plus the
+// `MLRS_VOTING_ENGINE` knob that chooses between it, the algos host arm, and
+// the shim's `np.average`. Unlike `stacking_meta` the `predict` half REDUCES
+// (`n·k` up, `n` back), which is what makes a device arm defensible; the
+// shipping default is still a MEASUREMENT (docs/voting.md).
+pub mod voting;
 
 // ---------------------------------------------------------------------------
 // Shared 1-D launch geometry

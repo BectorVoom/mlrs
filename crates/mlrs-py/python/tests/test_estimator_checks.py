@@ -156,6 +156,19 @@ def _estimators():
             ],
             cv=2,
         ),
+        # --- VOTE-01: the voting meta-estimator. Two cheap host base
+        # regressors, and `weights` LEFT AT `None` — the harness clones and
+        # re-`set_params` the entry many times, and a weight vector is the one
+        # parameter whose length is tied to `estimators`, so pinning it here
+        # would test the harness's cloning rather than the estimator. The
+        # weighted path is covered exhaustively in
+        # `test_oracle_voting_regressor.py` instead.
+        mlrs.VotingRegressor(
+            estimators=[
+                ("lr", SkLinearRegression()),
+                ("ridge", SkRidge()),
+            ],
+        ),
     ]
 
 

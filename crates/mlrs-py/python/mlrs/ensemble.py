@@ -45,9 +45,11 @@ l2_regularization=0.0, min_samples_leaf=20``.
 """
 
 import sys as _sys
+import timeit as _timeit
 import warnings as _warnings
-from contextlib import suppress as _suppress
+from contextlib import contextmanager as _contextmanager, suppress as _suppress
 from copy import deepcopy as _deepcopy
+from numbers import Integral as _Integral
 
 import numpy as np
 from sklearn.base import (
@@ -713,16 +715,47 @@ def _raise_for_extra_fit_params(params, owner, method, allow=()):
         )
 
 
-def _fit_one(estimator, X, y, fit_params):
+@_contextmanager
+def _elapsed_time(source, message=None):
+    """sklearn ``_print_elapsed_time``: print ``message`` and the elapsed time.
+
+    Reimplemented rather than imported for the reason
+    :func:`_generate_input_feature_names` gives — it is a dozen lines behind a
+    private sklearn path. The LINE it prints is user-visible under
+    ``verbose=True``, so the padding rule (dots to column 70) and the two time
+    formats are reproduced character for character.
+    """
+    if message is None:
+        yield
+        return
+    start = _timeit.default_timer()
+    yield
+    elapsed = _timeit.default_timer() - start
+    head = "[%s] " % source
+    if elapsed > 60:
+        time_str = "%4.1fmin" % (elapsed / 60)
+    else:
+        time_str = " %5.1fs" % elapsed
+    tail = " %s, total=%s" % (message, time_str)
+    print("%s%s%s" % (head, max(70 - len(head) - len(tail), 0) * ".", tail))
+
+
+def _fit_one(estimator, X, y, fit_params, source=None, message=None):
     """sklearn ``_fit_single_estimator``: fit one composed estimator.
 
     With routing off, a ``sample_weight`` in ``fit_params`` is passed
     positionally-by-name and a ``TypeError`` from an estimator that does not
     accept it is re-raised as sklearn's clearer message.
+
+    ``source``/``message`` are :class:`VotingRegressor`'s ``verbose=True``
+    progress line, which sklearn emits from inside this same function; they are
+    ``None`` for every stacking caller, whose ``verbose`` is an int forwarded to
+    ``cross_val_predict`` instead.
     """
     if not _routing_enabled() and "sample_weight" in fit_params:
         try:
-            estimator.fit(X, y, sample_weight=fit_params["sample_weight"])
+            with _elapsed_time(source, message):
+                estimator.fit(X, y, sample_weight=fit_params["sample_weight"])
         except TypeError as exc:
             if "unexpected keyword argument 'sample_weight'" in str(exc):
                 raise TypeError(
@@ -732,7 +765,8 @@ def _fit_one(estimator, X, y, fit_params):
                 ) from exc
             raise
     else:
-        estimator.fit(X, y, **fit_params)
+        with _elapsed_time(source, message):
+            estimator.fit(X, y, **fit_params)
     return estimator
 
 
@@ -878,31 +912,26 @@ def _final_estimator_has(attr):
     return check
 
 
-class _StackComposition:
-    """The composition mechanics :class:`StackingRegressor` and
-    :class:`StackingClassifier` share (STACK-CLF-01).
+class _HeterogeneousComposition:
+    """The ``estimators``-list mechanics EVERY mlrs meta-ensemble shares.
 
-    Everything here is identical between the two by sklearn's own construction —
-    it is the `_BaseComposition` / `_BaseStacking` half that does not care what
-    the members predict:
+    This is sklearn's `_BaseComposition` / `_BaseHeterogeneousEnsemble` half —
+    the rules that care only that there is a list of ``(name, estimator)``
+    pairs, and not at all what the members predict or what is done with their
+    predictions:
 
     * the parameter surface over ``estimators`` (``get_params`` /
       ``set_params`` / ``named_estimators``), which is what makes
       ``set_params(lr="drop")`` and a ``GridSearchCV`` over ``lr__C`` work;
-    * the ``cv="prefit"`` classification, which asks Rust and re-raises under
-      ``InvalidParameterError``;
+    * the structural validation — the shape check, the name rules, the
+      ``'drop'`` bookkeeping;
     * the ``named_estimators_`` bookkeeping after a fit;
-    * the meta-matrix assembly from already-shaped 2-D blocks — layout in Rust,
-      copy on the arm ``MLRS_STACK_META_ENGINE`` names;
-    * ``n_features_in_``, ``get_feature_names_out``, ``get_metadata_routing``
-      and the derived tags.
+    * the ``allow_nan`` / ``sparse`` tags derived from the members.
 
-    What is NOT here is everything the two classes genuinely disagree about:
-    which sub-estimator type is legal, the default ``final_estimator``, the
-    response method each member is asked for (``stack_method``, classifier
-    only), the label encoding, and the shape of the blocks handed to
-    :meth:`_assemble_meta`. Those live on the two classes, where a reader
-    comparing mlrs against sklearn's source expects to find them.
+    :class:`_StackComposition` adds the stacking-specific half on top;
+    :class:`VotingRegressor` mixes this in directly, because its aggregation
+    (`np.average` over one column per member) has nothing in common with a meta
+    matrix beyond these three bullets.
 
     Not exported and not an estimator base class in its own right: it carries no
     ``__init__``, so ``get_params`` still reads each concrete class's own
@@ -998,22 +1027,6 @@ class _StackComposition:
         kept = ext.stacking_kept_indices(is_drop)
         return list(names), list(values), list(kept)
 
-    def _cv_is_prefit(self):
-        """Is ``cv`` the ``"prefit"`` string? Classified in Rust.
-
-        A non-string ``cv`` never reaches Rust — it stays here and goes to
-        :func:`mlrs.model_selection.check_cv`. A string that is not ``"prefit"``
-        raises sklearn's ``StrOptions`` message (naming THIS class), re-raised as
-        ``InvalidParameterError`` so that both ``except ValueError`` and
-        ``except TypeError`` callers migrating from sklearn still catch it.
-        """
-        if not isinstance(self.cv, str):
-            return False
-        try:
-            return _stack_ext().stacking_cv_is_prefit(self.cv, type(self).__name__)
-        except ValueError as exc:
-            raise InvalidParameterError(str(exc)) from None
-
     # -- fitted bookkeeping -------------------------------------------------- #
 
     def _record_named_estimators(self, names, kept):
@@ -1034,6 +1047,83 @@ class _StackComposition:
                     self.feature_names_in_ = current.feature_names_in_
             else:
                 self.named_estimators_[name] = _stack_ext().stacking_drop_sentinel()
+
+    # -- derived tags -------------------------------------------------------- #
+
+    def __sklearn_tags__(self):
+        """``allow_nan`` / ``sparse`` are the AND over the composed estimators.
+
+        A composition is only as permissive as its least permissive member, so —
+        as in sklearn's ``_BaseHeterogeneousEnsemble``, where this lives too —
+        these are derived rather than declared. Composing mlrs estimators
+        therefore reports ``sparse=False`` (they ingest dense Arrow), while
+        composing sklearn estimators can report ``True``.
+
+        This is NOT cosmetic: sklearn's ``check_estimator_sparse_tag`` asserts
+        that an estimator declaring ``sparse=False`` actually REJECTS sparse
+        input, and neither of these meta-estimators touches ``X`` itself — it
+        goes straight to the members — so declaring ``False`` over members that
+        accept sparse would be a tag the estimator contradicts.
+        """
+        tags = super().__sklearn_tags__()
+        try:
+            drop = _stack_ext().stacking_drop_sentinel()
+            tags.input_tags.allow_nan = all(
+                True if _is_drop(est, drop) else get_tags(est).input_tags.allow_nan
+                for _, est in self.estimators
+            )
+            tags.input_tags.sparse = all(
+                True if _is_drop(est, drop) else get_tags(est).input_tags.sparse
+                for _, est in self.estimators
+            )
+        except Exception:
+            # A malformed `estimators` must not break tag computation; `fit`'s
+            # own validation reports it properly.
+            pass
+        return tags
+
+
+class _StackComposition(_HeterogeneousComposition):
+    """The composition mechanics :class:`StackingRegressor` and
+    :class:`StackingClassifier` share (STACK-CLF-01).
+
+    Everything here is identical between the two by sklearn's own construction —
+    it is the `_BaseStacking` half, sitting on the list mechanics
+    :class:`_HeterogeneousComposition` already provides:
+
+    * the ``cv="prefit"`` classification, which asks Rust and re-raises under
+      ``InvalidParameterError``;
+    * the meta-matrix assembly from already-shaped 2-D blocks — layout in Rust,
+      copy on the arm ``MLRS_STACK_META_ENGINE`` names;
+    * ``n_features_in_``, ``get_feature_names_out`` and ``get_metadata_routing``
+      (the derived tags moved down to :class:`_HeterogeneousComposition`, which
+      is where sklearn keeps them too).
+
+    What is NOT here is everything the two classes genuinely disagree about:
+    which sub-estimator type is legal, the default ``final_estimator``, the
+    response method each member is asked for (``stack_method``, classifier
+    only), the label encoding, and the shape of the blocks handed to
+    :meth:`_assemble_meta`. Those live on the two classes, where a reader
+    comparing mlrs against sklearn's source expects to find them.
+    """
+
+    # -- validation --------------------------------------------------------- #
+
+    def _cv_is_prefit(self):
+        """Is ``cv`` the ``"prefit"`` string? Classified in Rust.
+
+        A non-string ``cv`` never reaches Rust — it stays here and goes to
+        :func:`mlrs.model_selection.check_cv`. A string that is not ``"prefit"``
+        raises sklearn's ``StrOptions`` message (naming THIS class), re-raised as
+        ``InvalidParameterError`` so that both ``except ValueError`` and
+        ``except TypeError`` callers migrating from sklearn still catch it.
+        """
+        if not isinstance(self.cv, str):
+            return False
+        try:
+            return _stack_ext().stacking_cv_is_prefit(self.cv, type(self).__name__)
+        except ValueError as exc:
+            raise InvalidParameterError(str(exc)) from None
 
     # -- meta-feature assembly ---------------------------------------------- #
 
@@ -1137,31 +1227,6 @@ class _StackComposition:
             method_mapping=MethodMapping().add(caller="predict", callee="predict"),
         )
         return router
-
-    def __sklearn_tags__(self):
-        """``allow_nan`` / ``sparse`` are the AND over the composed estimators.
-
-        A stack is only as permissive as its least permissive member, so — as in
-        sklearn — these are derived rather than declared. Stacking mlrs
-        estimators therefore reports ``sparse=False`` (they ingest dense Arrow),
-        while stacking sklearn estimators can report ``True``.
-        """
-        tags = super().__sklearn_tags__()
-        try:
-            drop = _stack_ext().stacking_drop_sentinel()
-            tags.input_tags.allow_nan = all(
-                True if _is_drop(est, drop) else get_tags(est).input_tags.allow_nan
-                for _, est in self.estimators
-            )
-            tags.input_tags.sparse = all(
-                True if _is_drop(est, drop) else get_tags(est).input_tags.sparse
-                for _, est in self.estimators
-            )
-        except Exception:
-            # A malformed `estimators` must not break tag computation; `fit`'s
-            # own validation reports it properly.
-            pass
-        return tags
 
 
 class StackingRegressor(
@@ -1921,6 +1986,513 @@ default="auto"
         """``final_estimator_``'s decision function over the meta features."""
         check_is_fitted(self)
         return self.final_estimator_.decision_function(self.transform(X))
+
+
+# =========================================================================== #
+# VotingRegressor (VOTE-01)
+# =========================================================================== #
+#
+# A voting regressor is the SIMPLEST heterogeneous ensemble sklearn ships: fit
+# every member on the whole of `X`, then answer `predict` with the weighted mean
+# of their predictions. There is no meta learner, no cross-validation, and no
+# `passthrough` — which is exactly why its Rust surface looks different from
+# `StackingRegressor`'s.
+#
+# ## What is in Rust, and why the split falls where it does
+#
+#   ============================  ============================================
+#   what                          where the work happens
+#   ============================  ============================================
+#   name / `'drop'` validation    Rust, SHARED with stacking
+#                                 (`stacking_validate_names`,
+#                                 `stacking_kept_indices`) — these are
+#                                 sklearn's own `_BaseHeterogeneousEnsemble`
+#                                 rules, not stacking's
+#   `weights` length rule         Rust (`voting_check_weights`)
+#   `_weights_not_none`           Rust (`voting_active_weight_slots` — POSITIONS,
+#                                 not values, so the weight objects' dtype
+#                                 survives; see `_active_weights`)
+#   `get_feature_names_out`       Rust (`voting_feature_names`)
+#   the aggregation itself        Rust/CubeCL (`voting_aggregate`) OR numpy,
+#                                 chosen by `MLRS_VOTING_ENGINE`
+#   ============================  ============================================
+#
+# ## The aggregation is the only part that carries data — and it REDUCES
+#
+# `transform` is the `n x k` column stack `np.asarray([...]).T`; `predict` is
+# `np.average(that, axis=1, weights=w)`. Stacking's equivalent operation is a
+# pure copy, which is why `docs/stacking.md` concluded that `np.hstack` wins on
+# every backend. `predict` here is different in kind: it consumes `n * k` and
+# emits `n`, so the device arm's download shrinks by a factor of `k` and there
+# is real arithmetic (`k` multiplies, `k - 1` adds per row) to amortise the
+# crossing against. That made the arms worth building and measuring rather than
+# assuming; `docs/voting.md` carries the ladder, and the DEFAULT is whatever it
+# says.
+#
+# ## `np.average`'s evaluation order is reproduced exactly, not approximated
+#
+# numpy forms `mat * w`, reduces the row, and then DIVIDES by `w.sum()`. All
+# three arms do those three things in that order, in the input dtype — so the
+# host and device arms are bit-identical to numpy, not merely within 1e-5, for
+# any `k` below numpy's pairwise-summation cutoff. That is what lets
+# `test_voting_engine.py` assert EXACT equality for the numpy and host arms,
+# which is the only assertion strong enough to catch an accumulation-order
+# regression. The `device` arm is the one exception, and a documented one: a GPU
+# contracts `acc + pred*w` into a fused multiply-add, rounding once where numpy
+# rounds twice, so it lands within one ULP (measured on rocm gfx1151) and is
+# gated to a few ULP rather than to equality. That is more accurate than the
+# reference, not less, and two orders inside the project's 1e-5 contract.
+#
+# ## `weights` is indexed against the FULL `estimators` list
+#
+# sklearn requires `len(weights) == len(estimators)` and only THEN drops the
+# weights of `'drop'`ped entries. So `set_params(lr='drop')` on a weighted
+# ensemble keeps working without the caller re-writing `weights` — and a shim
+# that filtered before checking would reject a fit sklearn completes.
+
+
+def _is_array_like_not_scalar(value):
+    """sklearn ``_is_arraylike_not_scalar``, for the ``weights`` constraint.
+
+    Reimplemented rather than imported for the reason
+    :func:`_generate_input_feature_names` gives — it is three lines behind a
+    private sklearn path. The ``np.isscalar`` half is what rejects a bare
+    ``3`` and a bare ``"abc"``, both of which have the duck-typed shape the
+    first half looks for.
+    """
+    array_like = (
+        hasattr(value, "__len__") or hasattr(value, "shape") or hasattr(value, "__array__")
+    )
+    return array_like and not np.isscalar(value)
+
+
+def _vote_via_rust(columns, mode, weights, engine):
+    """The aggregation from ``_mlrs.voting_aggregate``, or ``None`` for numpy.
+
+    ``columns`` is one 1-D prediction per kept member. Returns ``None`` —
+    deliberately, rather than raising — for every input the Rust arms cannot
+    represent, leaving numpy to handle it exactly as it did before this arm
+    existed:
+
+    * a non-float column (an integer or object array — a member is free to
+      return one, and ``np.average`` promotes it);
+    * a column that is not 1-D, or whose length disagrees with the others.
+
+    The dtype handed over is ``np.result_type`` of the columns AND the weights,
+    which is the promotion numpy would have applied — so the ``host`` arm is
+    bit-identical to numpy rather than merely close, and the ``device`` arm is
+    within a few ULP of it (a GPU contracts ``acc + pred*w`` into one FMA, which
+    rounds once where numpy rounds twice; see ``mlrs_kernels::voting``).
+    """
+    import pyarrow as pa
+
+    arrays = [np.asarray(c) for c in columns]
+    if any(a.ndim != 1 for a in arrays):
+        return None
+    dtypes = [a.dtype for a in arrays]
+    if weights is not None:
+        dtypes.append(np.asarray(weights).dtype)
+    try:
+        dtype = np.result_type(*dtypes)
+    except TypeError:
+        return None
+    if dtype != np.float32 and dtype != np.float64:
+        return None
+    n_rows = int(arrays[0].shape[0])
+    if any(int(a.shape[0]) != n_rows for a in arrays):
+        return None
+    if n_rows == 0:
+        # A zero-row aggregation is a zero-byte device allocation; numpy already
+        # produces the right empty shape and there is nothing to hand CubeCL.
+        return None
+
+    arrow_type = pa.float32() if dtype == np.float32 else pa.float64()
+    flats, capsules = [], []
+    for a in arrays:
+        # `ascontiguousarray` is a no-op view when `a` is already contiguous in
+        # the promoted dtype, and `py_buffer` does not copy — so a column reaches
+        # Rust without a staging copy, and the arms are compared on the work they
+        # actually do rather than on ingress overhead.
+        flat = np.ascontiguousarray(a, dtype=dtype)
+        flats.append(flat)
+        capsules.append(
+            pa.Array.from_buffers(arrow_type, flat.size, [None, pa.py_buffer(flat)])
+        )
+
+    flat_out, n_cols = _stack_ext().voting_aggregate(
+        capsules,
+        n_rows,
+        mode,
+        None if weights is None else [float(w) for w in weights],
+        engine,
+    )
+    # `flats` is referenced until here on purpose: `py_buffer` borrows those
+    # numpy buffers, and letting one be collected mid-call would free memory
+    # Rust is still reading.
+    del flats
+    shape = (n_rows,) if mode == "predict" else (n_rows, n_cols)
+    return _io.to_output(flat_out, shape, "numpy", dtype)
+
+
+class VotingRegressor(
+    RegressorMixin, TransformerMixin, MetaEstimatorMixin, _HeterogeneousComposition, BaseEstimator
+):
+    """Prediction voting regressor (VOTE-01).
+
+    ``VotingRegressor(estimators, *, weights=None, n_jobs=None, verbose=False)``
+    — the full :class:`sklearn.ensemble.VotingRegressor` parameter surface, with
+    the composition bookkeeping and the prediction aggregation in Rust.
+
+    Every member is fitted on the whole of ``X`` (there is no cross-validation
+    and no meta learner) and ``predict`` returns the weighted mean of their
+    predictions.
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator)
+        The regressors to average. An entry's estimator may be the string
+        ``'drop'`` (usually via ``set_params(name='drop')``) to disable it; a
+        dropped entry keeps its slot in ``named_estimators_`` (as ``'drop'``)
+        and its slot in ``weights``, but is never fitted and contributes no
+        column.
+    weights : array-like of shape (n_estimators,), default=None
+        Per-member weights for the average. ``None`` is uniform. Indexed against
+        the FULL ``estimators`` list — a dropped entry still needs its slot, and
+        its weight is discarded afterwards, so ``set_params(name='drop')`` does
+        not require rewriting ``weights``.
+    n_jobs : int, default=None
+        joblib parallelism for the member fits. ``None`` means 1. Reduced to
+        serial (with a warning) when a member is an mlrs estimator — see
+        :func:`_effective_n_jobs`.
+    verbose : bool, default=False
+        Print each member's fit time as it completes.
+
+    Attributes
+    ----------
+    estimators_ : list of estimator
+        The fitted members, dropped entries excluded.
+    named_estimators_ : :class:`sklearn.utils.Bunch`
+        ``name -> fitted estimator`` (or the string ``'drop'``).
+    n_features_in_ : int
+        Feature count of ``X``, read off ``estimators_[0]``.
+    feature_names_in_ : ndarray of str
+        Present only when a fitted member exposes it.
+
+    Notes
+    -----
+    ``allow_nan`` and ``sparse`` are DERIVED from the members (the AND over
+    them), because this estimator never touches ``X`` itself — it hands it
+    straight to the members. So a ``VotingRegressor`` over sklearn estimators
+    accepts sparse input and one over mlrs estimators does not.
+
+    The aggregation runs on the arm ``MLRS_VOTING_ENGINE`` names — ``numpy``
+    (the default), ``host`` (Rust), or ``device`` (CubeCL). ``numpy`` and
+    ``host`` produce bit-identical values; ``device`` agrees to within a few ULP
+    (a GPU fuses the multiply-add, rounding once where numpy rounds twice). See
+    ``docs/voting.md`` for the measured ladder behind the default.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import mlrs
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.standard_normal((200, 5)).astype(np.float32)
+    >>> y = (X[:, 0] * 3.0 - X[:, 1]).astype(np.float32)
+    >>> reg = mlrs.VotingRegressor(
+    ...     estimators=[("lr", mlrs.LinearRegression()), ("ridge", mlrs.Ridge())],
+    ...     weights=[2.0, 1.0],
+    ... )
+    >>> reg.fit(X, y).predict(X[:2]).shape
+    (2,)
+    """
+
+    def __init__(self, estimators, *, weights=None, n_jobs=None, verbose=False):
+        self.estimators = estimators
+        self.weights = weights
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+
+    # -- validation --------------------------------------------------------- #
+
+    def _validate_params(self):
+        """sklearn's ``_parameter_constraints`` for this class, reproduced with
+        its wording.
+
+        sklearn applies these through ``@_fit_context``, which runs BEFORE
+        ``fit``'s body — so a non-list ``estimators`` is an
+        ``InvalidParameterError`` about the TYPE, not the structural
+        "``'estimators'`` should be a non-empty list of (string, estimator)
+        tuples" message that the composition check would otherwise reach first.
+        The two are different exception classes and a caller can see which.
+
+        These stay in Python rather than joining the rest of the surface in
+        Rust, for the reason ``linear.py``'s ``_validate_params`` gives: every
+        rule here is a predicate on an arbitrary PYTHON object
+        (``isinstance``, ``np.isscalar``, "has ``__len__``"), which is not a
+        question Rust can be asked. Only the message templates could cross, and
+        four format strings are not worth an FFI call per ``fit``.
+
+        Unlike ``StackingClassifier``'s ``stack_method``, none of these render a
+        ``StrOptions`` set, so there is no ``PYTHONHASHSEED`` ordering trap here
+        and the texts are compared literally by the oracle.
+        """
+
+        def fail(name, expected, value):
+            raise InvalidParameterError(
+                f"The {name!r} parameter of {type(self).__name__} must be "
+                f"{expected}. Got {value!r} instead."
+            )
+
+        if not isinstance(self.estimators, list):
+            fail("estimators", "an instance of 'list'", self.estimators)
+        if self.weights is not None and not _is_array_like_not_scalar(self.weights):
+            fail("weights", "an array-like or None", self.weights)
+        if self.n_jobs is not None and not isinstance(self.n_jobs, _Integral):
+            fail("n_jobs", "None or an instance of 'int'", self.n_jobs)
+        verbose_ok = isinstance(self.verbose, (bool, np.bool_)) or (
+            isinstance(self.verbose, _Integral) and self.verbose >= 0
+        )
+        if not verbose_ok:
+            fail(
+                "verbose",
+                "an int in the range [0, inf), an instance of 'bool' or an "
+                "instance of 'numpy.bool'",
+                self.verbose,
+            )
+
+    def _validate_estimators(self):
+        """``(names, estimators, kept_indices)`` — the Rust-backed structural check.
+
+        The list rules are :meth:`_HeterogeneousComposition._validate_composition`
+        (shared with stacking, because they are sklearn's shared base-class
+        rules). What voting adds is the regressor type check, which sklearn's
+        ``_BaseHeterogeneousEnsemble._validate_estimators`` applies through
+        ``is_regressor`` for a ``VotingRegressor``.
+        """
+        names, values, kept = self._validate_composition()
+        for i in kept:
+            if not is_regressor(values[i]):
+                raise ValueError(
+                    "The estimator {} should be a regressor.".format(
+                        type(values[i]).__name__
+                    )
+                )
+        return names, values, kept
+
+    def _active_weights(self, is_drop):
+        """``_weights_not_none``: the surviving members' weights, or ``None``.
+
+        ``None`` in, ``None`` out — the uniform case never materialises a weight
+        vector, so ``np.average`` takes its own ``weights=None`` fast path (which
+        is measurably faster; see ``docs/voting.md``) and the Rust arms take
+        theirs.
+
+        The weight OBJECTS are never converted here, only selected: sklearn
+        returns them as they were given, and numpy infers ``predict``'s result
+        dtype from them — a ``float32`` weight array keeps an f32 problem in f32
+        where a Python-float list would promote it to f64. So Rust answers with
+        POSITIONS (the length rule and the drop filter are still its), and this
+        indexes the caller's own list.
+        """
+        if self.weights is None:
+            return None
+        # `list(...)`, matching sklearn's `zip(self.estimators, self.weights)`:
+        # any sequence works, and a numpy array yields its scalars with their
+        # dtype intact.
+        weights = list(self.weights)
+        slots = _stack_ext().voting_active_weight_slots(len(weights), list(is_drop))
+        return [weights[i] for i in slots]
+
+    def _log_message(self, name, idx, total):
+        """sklearn ``_BaseVoting._log_message``: the ``verbose=True`` line."""
+        if not self.verbose:
+            return None
+        return f"({idx} of {total}) Processing {name}"
+
+    # -- fit ---------------------------------------------------------------- #
+
+    def fit(self, X, y, **fit_params):
+        """Fit every member on the whole of ``X``.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+        y : array-like of shape (n_samples,)
+        **fit_params : dict
+            ``sample_weight`` is forwarded to every member's ``fit``. Anything
+            else requires ``sklearn.set_config(enable_metadata_routing=True)``.
+
+        Returns
+        -------
+        self : object
+        """
+        # FIRST, before anything else touches the arguments: sklearn's
+        # `@_fit_context` runs the constraint checks ahead of `fit`'s body, and
+        # the order is observable (a non-list `estimators` reports a TYPE error,
+        # not the structural one).
+        self._validate_params()
+        _raise_for_extra_fit_params(fit_params, self, "fit", allow=["sample_weight"])
+        y = column_or_1d(y, warn=True)
+
+        names, all_estimators, kept = self._validate_estimators()
+        # The length rule runs against the FULL list and BEFORE the drop filter,
+        # which is what makes `set_params(name='drop')` work on a weighted
+        # ensemble without the caller rewriting `weights`.
+        if self.weights is not None:
+            # `len(self.weights)`, exactly as sklearn writes it — so a weights
+            # object without a length raises the same TypeError there and here.
+            _stack_ext().voting_check_weights(len(self.weights), len(self.estimators))
+
+        if _routing_enabled():
+            routed_params = process_routing(self, "fit", **fit_params)
+        else:
+            routed_params = Bunch()
+            for name in names:
+                routed_params[name] = Bunch(fit={})
+                if "sample_weight" in fit_params:
+                    routed_params[name].fit["sample_weight"] = fit_params[
+                        "sample_weight"
+                    ]
+
+        n_jobs = _effective_n_jobs(
+            self.n_jobs, [all_estimators[i] for i in kept], owner="VotingRegressor"
+        )
+        total = len(kept)
+        self.estimators_ = _parallel(n_jobs, "2*n_jobs")(
+            _delayed(_fit_one)(
+                clone(all_estimators[i]),
+                X,
+                y,
+                routed_params[names[i]]["fit"],
+                "Voting",
+                self._log_message(names[i], idx + 1, total),
+            )
+            for idx, i in enumerate(kept)
+        )
+
+        self._record_named_estimators(names, kept)
+        return self
+
+    # -- aggregation -------------------------------------------------------- #
+
+    def _member_predictions(self, X):
+        """Each fitted member's prediction, in kept order, AS RETURNED.
+
+        Deliberately not reshaped or ravelled. sklearn's ``_BaseVoting._predict``
+        is ``np.asarray([est.predict(X) for est in self.estimators_]).T``, so a
+        member that answers with an ``(n, 1)`` column produces a 3-D stack there
+        — odd, but observable, and flattening it here would make mlrs disagree
+        with sklearn on exactly the input where sklearn is surprising. The Rust
+        arms decline anything that is not 1-D (:func:`_vote_via_rust` returns
+        ``None``), so numpy handles that shape on every arm.
+        """
+        return [np.asarray(est.predict(X)) for est in self.estimators_]
+
+    def _aggregate(self, columns, mode):
+        """Run ``mode`` on the arm ``MLRS_VOTING_ENGINE`` names.
+
+        ``numpy`` is the default arm AND the fallback for everything the Rust
+        arms cannot represent (see :func:`_vote_via_rust`), so this method always
+        has an answer.
+
+        ``weights`` is resolved only for ``"predict"``. sklearn's ``transform``
+        never reads them, and reading them here would let a ``weights`` mutated
+        AFTER the fit — the only way it can be wrong at this point — break a
+        ``transform`` that sklearn completes.
+        """
+        if mode == "predict":
+            drop = _stack_ext().stacking_drop_sentinel()
+            weights = self._active_weights(
+                [_is_drop(est, drop) for _, est in self.estimators]
+            )
+        else:
+            weights = None
+        engine = _stack_ext().voting_engine()
+        if engine != "numpy":
+            out = _vote_via_rust(columns, mode, weights, engine)
+            if out is not None:
+                return out
+        if mode == "predict":
+            return np.average(np.asarray(columns).T, axis=1, weights=weights)
+        return np.asarray(columns).T
+
+    # -- introspection ------------------------------------------------------ #
+
+    @property
+    def n_features_in_(self):
+        """Feature count of ``X``, read off ``estimators_[0]``.
+
+        sklearn's voting layer words this AttributeError differently from its
+        stacking layer (``has no n_features_in_ attribute.`` versus ``has no
+        attribute n_features_in_``). Both texts are reproduced where they
+        belong rather than unified, because a caller matching on one of them is
+        matching on the class it actually uses.
+        """
+        try:
+            check_is_fitted(self)
+        except NotFittedError as nfe:
+            raise AttributeError(
+                "{} object has no n_features_in_ attribute.".format(type(self).__name__)
+            ) from nfe
+        return self.estimators_[0].n_features_in_
+
+    def get_feature_names_out(self, input_features=None):
+        """``votingregressor_<name>`` per kept member.
+
+        One column per member and no ``passthrough``, so — unlike stacking —
+        there is no within-block index and no input-name tail. ``input_features``
+        is still VALIDATED and then discarded, which is sklearn's
+        ``_check_feature_names_in(..., generate_names=False)``.
+        """
+        check_is_fitted(self, "n_features_in_")
+        if input_features is not None:
+            _generate_input_feature_names(self, input_features)
+        drop = _stack_ext().stacking_drop_sentinel()
+        kept_names = [
+            name for name, est in self.estimators if not _is_drop(est, drop)
+        ]
+        names = _stack_ext().voting_feature_names(type(self).__name__.lower(), kept_names)
+        return np.asarray(names, dtype=object)
+
+    def get_metadata_routing(self):
+        """Route ``fit`` metadata to each named member.
+
+        No ``final_estimator`` node, unlike stacking's router — a voting
+        ensemble has no second stage for anything to be routed to.
+        """
+        router = MetadataRouter(owner=type(self).__name__)
+        for name, estimator in self.estimators:
+            router.add(
+                **{name: estimator},
+                method_mapping=MethodMapping().add(callee="fit", caller="fit"),
+            )
+        return router
+
+    # -- transform / predict ------------------------------------------------ #
+
+    def transform(self, X):
+        """Every member's prediction for ``X``, one column each.
+
+        Returns
+        -------
+        predictions : ndarray of shape (n_samples, n_estimators)
+        """
+        check_is_fitted(self)
+        return self._aggregate(self._member_predictions(X), "transform")
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """``fit(X, y).transform(X)`` — the members' training-row predictions."""
+        return self.fit(X, y, **fit_params).transform(X)
+
+    def predict(self, X):
+        """The weighted mean of the members' predictions.
+
+        Returns
+        -------
+        y : ndarray of shape (n_samples,)
+        """
+        check_is_fitted(self)
+        return self._aggregate(self._member_predictions(X), "predict")
 
 
 def _n_columns(X):

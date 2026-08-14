@@ -75,6 +75,10 @@ pub mod persist;
 // layout, `get_feature_names_out` strings and the `cv="prefit"` sentinel, over
 // `mlrs_algos::ensemble::stacking`. Host-only, like `metrics`.
 pub mod stacking;
+// The voting meta-estimator's PyO3 free-function surface (VOTE-BIND-01): the
+// `weights` rules, the `get_feature_names_out` strings, and the two
+// aggregations behind `transform`/`predict`, over `mlrs_algos::ensemble::voting`.
+pub mod voting;
 
 // The estimator `#[pyclass]` wrappers (Plan 03 onward, across every estimator
 // family landed since — linear/cluster/decomposition/neighbors/covariance/
@@ -261,6 +265,11 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The stacking composition surface (STACK-BIND-01) — six host-only free
     // functions backing `mlrs.StackingRegressor`.
     stacking::register(m)?;
+
+    // The voting composition surface (VOTE-BIND-01) — five free functions
+    // backing `mlrs.VotingRegressor`, one of which (`voting_aggregate`) carries
+    // the prediction columns to the host/device arms.
+    voting::register(m)?;
 
     // Register all estimator `#[pyclass]` wrappers (PY-01). The pure-Python
     // `mlrs` shim (Plan 04) subclasses sklearn and delegates to these.

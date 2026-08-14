@@ -48,6 +48,10 @@ pub mod tree_shap;
 pub mod random_forest_classifier;
 pub mod random_forest_regressor;
 pub mod stacking;
+// VOTE-01 — the prediction-voting composition behind `mlrs.VotingRegressor`:
+// the `weights` rules, the transform column names, and the two aggregations
+// (`n × k` column stack, weighted row mean) with host and CubeCL arms.
+pub mod voting;
 
 /// The sklearn `max_features` policy for per-node feature subsampling
 /// (resolved to a concrete count at `fit`, when `n_features` is known).
