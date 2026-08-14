@@ -327,6 +327,14 @@ def time_fit(n, d, k, n_classes, n_jobs, dtype, reps, balanced, voting):
     ``voting`` does NOT affect a fit — every member is fitted the same way
     either way — so this level is run at the default and the claim is asserted
     by the ``--level call`` ladder instead.
+
+    **This level is WALL-CLOCK only, and ``--cpu-time`` is refused for it.**
+    ``time.process_time()`` measures THIS process, and joblib runs the fan-out in
+    forked workers whose CPU the parent never sees — so a CPU-time cell at
+    ``n_jobs=2`` reports only the parent's bookkeeping and looks like a 100x+
+    speedup. That is not a subtle bias, it is a meaningless number, and it is the
+    one place in this harness where the contended-box remedy cannot be applied.
+    Run this level when the box is quiet instead.
     """
     import mlrs
 
@@ -646,6 +654,17 @@ def main():
     )
     args = p.parse_args()
     args.classes = [int(c) for c in str(args.classes).split(",") if c]
+
+    if args.level == "fit" and args.cpu_time:
+        # See `time_fit`: joblib forks, and `process_time()` cannot see a forked
+        # worker's CPU, so a CPU-time `n_jobs=2` cell reports the parent's
+        # bookkeeping alone and renders as a 100x+ "speedup". Refuse rather than
+        # print it — a plausible-looking wrong number is worse than no number.
+        p.error(
+            "--cpu-time is meaningless at --level fit: joblib's workers are "
+            "separate processes and process_time() only sees this one. Run the "
+            "fit ladder on a quiet box in wall clock."
+        )
 
     if args.cell:
         return cell(args)

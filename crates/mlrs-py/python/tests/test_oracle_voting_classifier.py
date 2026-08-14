@@ -187,7 +187,7 @@ def assert_same(a, b, X):
 
 
 def assert_same_error(mlrs_exc, sk_exc):
-    """Same exception CLASS NAME and same text.
+    """Same exception CLASS NAME and same message.
 
     The name rather than the class itself: mlrs mirrors
     ``sklearn.utils._param_validation.InvalidParameterError`` with its own
@@ -195,9 +195,23 @@ def assert_same_error(mlrs_exc, sk_exc):
     sklearn path, so an ``isinstance`` check against sklearn's would fail on an
     estimator that is behaving correctly. The NAME and the message are what a
     caller sees.
+
+    A message carrying a ``StrOptions`` set is compared with that set PARSED OUT
+    and the rest of the text compared literally — see the module docstring's
+    landmine. Doing this in the shared helper rather than at each call site is
+    not tidiness: a raw ``==`` on such a message PASSES on most
+    ``PYTHONHASHSEED`` values and fails on the rest, so a call site that forgets
+    is a test that goes red weeks later for no reason anyone changed. (Which is
+    exactly what happened to this file before this helper learned the rule.)
     """
     assert type(mlrs_exc.value).__name__ == type(sk_exc.value).__name__
-    assert str(mlrs_exc.value) == str(sk_exc.value)
+    mlrs_msg, sk_msg = str(mlrs_exc.value), str(sk_exc.value)
+    if "{" in sk_msg and "}" in sk_msg:
+        assert options_in(mlrs_msg) == options_in(sk_msg)
+        assert mlrs_msg.split("{")[0] == sk_msg.split("{")[0]
+        assert mlrs_msg.split("}")[-1] == sk_msg.split("}")[-1]
+        return
+    assert mlrs_msg == sk_msg
 
 
 def options_in(message):

@@ -336,8 +336,48 @@ aggregation into a 1 ms one, and the win grows with `n`. It is not made the
 default only because that would split the knob's meaning across the two `voting`
 values — a caller who wants it can set it, and the ladder above is the argument.
 
+## Measured: what `voting` costs a whole `predict`
+
+`scripts/bench_voting_classifier.py --level call`, cpu backend, four linear-time
+sklearn members. This is the ladder above with the members' own
+`predict` / `predict_proba` put back in, which is what a caller actually pays.
+
+The box was contended for this run and only the smallest row is clean enough to
+quote (the n=10⁵ rows record the host arm as *slower* than numpy on the same
+work, which is not physical). At n=10 000, d=32, k=4, `n_classes`=3:
+
+| arm | `voting='hard'` | `voting='soft'` | soft/hard |
+|---|---|---|---|
+| `numpy` | 36.50 ms | 13.31 ms | **0.36x** |
+| `host` | **11.84 ms** | 12.65 ms | 1.07x |
+
+Two things fall out of that, and both matter more than the microbenchmark:
+
+1. **On the default arm, `voting='hard'` — sklearn's own default — makes a whole
+   `predict` 2.8x SLOWER than `'soft'`**, on the same members and the same data.
+   Nothing about majority voting is intrinsically more expensive than averaging
+   probabilities; the entire gap is sklearn's per-row Python loop.
+2. **`MLRS_VOTING_ENGINE=host` removes it.** The hard call drops 3.1x
+   (36.50 → 11.84 ms) and the two `voting` values land at parity (1.07x), which
+   is what they should cost relative to each other. The aggregation was ~70% of
+   that call; the ladder above says it is ~30% at n=10⁵.
+
+So the arm is not a micro-optimisation for hard voting — it is the difference
+between `voting` being a modelling choice and `voting` being a performance
+choice.
+
 ## Measured: `n_jobs`
 
-See [voting.md](voting.md)'s `n_jobs` section: a voting classifier fits each
-member exactly once, so the ceiling is Amdahl's `total / slowest` over the
-members themselves, and `voting` does not enter a fit at all.
+Not tabulated here, and deliberately so. Two reasons:
+
+* **`voting` does not enter a fit at all** — every member is fitted identically
+  either way — so this ladder is [voting.md](voting.md)'s, unchanged: a voting
+  ensemble fits each member exactly **once**, so the ceiling is Amdahl's
+  `total / slowest` over the members themselves, not `k`.
+* **The fit ladder cannot be run on a contended box.** `--cpu-time`, this
+  harness's remedy everywhere else, is *invalid* here: joblib's workers are
+  separate processes and `time.process_time()` only sees the parent, so an
+  `n_jobs=2` cell measures the parent's bookkeeping alone and renders as a
+  128x-342x "speedup". The harness now **refuses** `--level fit --cpu-time`
+  rather than print it, because a plausible-looking wrong number is worse than
+  no number. Run it in wall clock on a quiet box.
