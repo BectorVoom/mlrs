@@ -277,3 +277,175 @@ fn zero_rows_aggregate_to_nothing_rather_than_failing() {
     assert!(weighted_average(&[&empty[..]], None, 0).unwrap().is_empty());
     assert!(stack_columns(&[&empty[..]], 0).unwrap().is_empty());
 }
+
+// --------------------------------------------------------------------------- //
+// VotingClassifier (VOTE-CLF-01)
+// --------------------------------------------------------------------------- //
+
+use mlrs_algos::ensemble::voting::{
+    argmax_rows, check_feature_names_supported, classifier_feature_names, hard_vote_labels,
+    hstack_blocks, voting_mode, Voting,
+};
+
+#[test]
+fn the_two_voting_spellings_round_trip() {
+    assert_eq!(voting_mode("hard").unwrap(), Voting::Hard);
+    assert_eq!(voting_mode("soft").unwrap(), Voting::Soft);
+    assert_eq!(voting_mode("hard").unwrap().as_str(), "hard");
+    assert_eq!(voting_mode("soft").unwrap().as_str(), "soft");
+}
+
+#[test]
+fn an_unrecognized_voting_value_reports_sklearns_constraint_message() {
+    let msg = value_message(voting_mode("majority").unwrap_err());
+    // The OPTION SET is asserted, not the whole string's ordering: sklearn
+    // renders it from a Python `set` whose order moves with `PYTHONHASHSEED`
+    // (the python oracle parses both sides for exactly this reason).
+    assert!(msg.starts_with("The 'voting' parameter of VotingClassifier must be a str among "));
+    assert!(msg.contains("'hard'"));
+    assert!(msg.contains("'soft'"));
+    assert!(msg.ends_with("Got 'majority' instead."));
+    // Case matters — sklearn's `StrOptions` is a plain set membership test.
+    assert!(voting_mode("Hard").is_err());
+    assert!(voting_mode("").is_err());
+}
+
+#[test]
+fn hard_voting_feature_names_are_one_per_member() {
+    let kept = vec!["lr".to_string(), "nb".to_string()];
+    assert_eq!(
+        classifier_feature_names("votingclassifier", &kept, Voting::Hard, 3),
+        vec!["votingclassifier_lr", "votingclassifier_nb"]
+    );
+}
+
+#[test]
+fn soft_voting_feature_names_append_the_class_index_without_a_separator() {
+    let kept = vec!["lr".to_string(), "nb".to_string()];
+    // Member-major, matching `np.hstack(probas)`, and `lr0` not `lr_0` — sklearn
+    // writes `f"{class_name}_{name}{i}"`, and a caller reading these back into a
+    // DataFrame is matching on the exact string.
+    assert_eq!(
+        classifier_feature_names("votingclassifier", &kept, Voting::Soft, 3),
+        vec![
+            "votingclassifier_lr0",
+            "votingclassifier_lr1",
+            "votingclassifier_lr2",
+            "votingclassifier_nb0",
+            "votingclassifier_nb1",
+            "votingclassifier_nb2",
+        ]
+    );
+}
+
+#[test]
+fn only_soft_voting_without_a_flattened_transform_has_no_feature_names() {
+    assert!(check_feature_names_supported(Voting::Hard, true).is_ok());
+    assert!(check_feature_names_supported(Voting::Hard, false).is_ok());
+    assert!(check_feature_names_supported(Voting::Soft, true).is_ok());
+    let msg = value_message(check_feature_names_supported(Voting::Soft, false).unwrap_err());
+    assert_eq!(
+        msg,
+        "get_feature_names_out is not supported when `voting='soft'` and \
+         `flatten_transform=False`"
+    );
+}
+
+#[test]
+fn uniform_hard_voting_is_a_plain_majority_with_the_lowest_index_winning_a_tie() {
+    // Rows: [0,0,1] -> 0 wins 2-1; [0,1,2] -> a three-way tie, first index wins;
+    // [2,2,2] -> unanimous; [1,2,1] -> 1 wins.
+    let a = [0u32, 0, 2, 1];
+    let b = [0u32, 1, 2, 2];
+    let c = [1u32, 2, 2, 1];
+    let got = hard_vote_labels(&[&a, &b, &c], None, 4, 3).unwrap();
+    assert_eq!(got, vec![0, 0, 2, 1]);
+}
+
+#[test]
+fn weights_change_which_label_wins_a_hard_vote() {
+    // One member votes 1, two vote 0 — but the dissenter carries weight 5.
+    let a = [1u32];
+    let b = [0u32];
+    let c = [0u32];
+    assert_eq!(
+        hard_vote_labels(&[&a, &b, &c], None, 1, 2).unwrap(),
+        vec![0]
+    );
+    assert_eq!(
+        hard_vote_labels(&[&a, &b, &c], Some(&[5.0, 1.0, 1.0]), 1, 2).unwrap(),
+        vec![1]
+    );
+}
+
+#[test]
+fn a_hard_vote_never_looks_above_the_rows_own_largest_label() {
+    // `np.bincount(x, weights=w)` is `x.max() + 1` long, so class 2 is not a
+    // candidate for a row whose members all voted 0 — even though its implicit
+    // count of 0.0 would beat these NEGATIVE weights. Reproducing that is the
+    // whole reason the argmax is bounded per row; a full-width tally answers 1.
+    let a = [0u32];
+    let b = [0u32];
+    let got = hard_vote_labels(&[&a, &b], Some(&[-1.0, -2.0]), 1, 3).unwrap();
+    assert_eq!(got, vec![0]);
+}
+
+#[test]
+fn the_hard_vote_tally_is_reset_between_rows() {
+    // A regression guard for the scratch tally: row 0 votes entirely for class
+    // 2, row 1 entirely for class 0. If the tally leaked, row 1 would still see
+    // class 2's three votes and answer 2.
+    let a = [2u32, 0];
+    let b = [2u32, 0];
+    let c = [2u32, 0];
+    assert_eq!(
+        hard_vote_labels(&[&a, &b, &c], None, 2, 3).unwrap(),
+        vec![2, 0]
+    );
+}
+
+#[test]
+fn a_label_outside_the_declared_class_count_is_rejected_before_any_launch() {
+    let a = [0u32, 7];
+    let msg = value_message(hard_vote_labels(&[&a], None, 2, 3).unwrap_err());
+    assert!(msg.contains("label 7"), "{msg}");
+    // The device arm cannot check this for itself — `counts[r * n_bins + label]`
+    // would land in the next row's tally — so the host validator is the only
+    // gate, and it must run on both arms.
+    assert!(hard_vote_labels(&[&a], None, 2, 8).is_ok());
+}
+
+#[test]
+fn argmax_rows_takes_the_first_maximum() {
+    let mat = [0.1f64, 0.5, 0.4, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0];
+    assert_eq!(argmax_rows(&mat, 3, 3).unwrap(), vec![1, 0, 2]);
+}
+
+#[test]
+fn hstack_blocks_lays_the_members_out_side_by_side() {
+    // Two members, two rows, three classes.
+    let a = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let b = [10.0f64, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let got = hstack_blocks(&[&a, &b], 2, 3).unwrap();
+    assert_eq!(
+        got,
+        vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 4.0, 5.0, 6.0, 40.0, 50.0, 60.0]
+    );
+}
+
+#[test]
+fn soft_voting_is_the_regressors_reduction_over_a_flattened_block() {
+    // The claim `mlrs_algos::ensemble::voting::vote_soft_proba` rests on: an
+    // `(n, C)` average over `k` members IS `weighted_average` with `n * C`
+    // elements per column. Asserted bit-exactly, because that identity is what
+    // lets soft voting inherit the regressor's numpy-parity guarantee.
+    let a = [0.1f64, 0.9, 0.8, 0.2];
+    let b = [0.5f64, 0.5, 0.4, 0.6];
+    let w = [3.0f64, 1.0];
+    let flat = weighted_average(&[&a, &b], Some(&w), 4).unwrap();
+    let expected: Vec<f64> = (0..4)
+        .map(|i| (a[i] * w[0] + b[i] * w[1]) / (w[0] + w[1]))
+        .collect();
+    assert_eq!(flat, expected);
+    assert_eq!(argmax_rows(&flat, 2, 2).unwrap(), vec![1, 0]);
+}

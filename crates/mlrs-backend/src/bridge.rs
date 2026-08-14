@@ -31,8 +31,10 @@ use std::mem::size_of;
 use bytemuck::Pod;
 use mlrs_core::error::BridgeError;
 
-use arrow::array::{Array, ArrowPrimitiveType, Float32Array, Float64Array, PrimitiveArray};
-use arrow::datatypes::{Float32Type, Float64Type};
+use arrow::array::{
+    Array, ArrowPrimitiveType, Float32Array, Float64Array, PrimitiveArray, UInt32Array,
+};
+use arrow::datatypes::{Float32Type, Float64Type, UInt32Type};
 
 /// Validate a [`Float32Array`] as untrusted input and return its values as
 /// `&[f32]`, or a typed [`BridgeError`] (offset / nulls / misalignment) — all
@@ -48,7 +50,21 @@ pub fn validate_f64(arr: &Float64Array) -> Result<&[f64], BridgeError> {
     validate_primitive::<Float64Type>(arr)
 }
 
-/// Generic hard-reject validator shared by [`validate_f32`] / [`validate_f64`].
+/// Validate a [`UInt32Array`] as untrusted input and return its values as
+/// `&[u32]`, or a typed [`BridgeError`].
+///
+/// The one NON-float ingress this bridge serves, and it exists for
+/// `VotingClassifier`'s hard-voting route (VOTE-CLF-01): the members answer with
+/// class LABELS, not with a measurement, so the column that crosses is an index
+/// array. It runs the identical offset → nulls → alignment gauntlet
+/// [`validate_f32`] does — an untrusted label array is exactly as capable of
+/// being a slice of someone else's buffer as an untrusted float one.
+pub fn validate_u32(arr: &UInt32Array) -> Result<&[u32], BridgeError> {
+    validate_primitive::<UInt32Type>(arr)
+}
+
+/// Generic hard-reject validator shared by [`validate_f32`] / [`validate_f64`]
+/// / [`validate_u32`].
 ///
 /// Runs all three checks (offset → nulls → alignment) BEFORE returning a `&[T]`.
 /// No `unsafe` is reachable until every check has passed.

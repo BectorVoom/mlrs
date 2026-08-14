@@ -49,8 +49,12 @@
 use bytemuck::Pod;
 use cubecl::prelude::*;
 
+use cubecl::server::Handle;
 use mlrs_core::PrimError;
-use mlrs_kernels::voting::{vote_add_weighted, vote_divide, vote_init_weighted, vote_write_col};
+use mlrs_kernels::voting::{
+    vote_add_weighted, vote_argmax_bounded, vote_argmax_rows, vote_bincount_add, vote_counts_zero,
+    vote_divide, vote_hi_zero, vote_init_weighted, vote_write_block, vote_write_col,
+};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
@@ -117,37 +121,62 @@ where
     F: Float + CubeElement + Pod,
 {
     validate_columns(preds, n_rows)?;
-    if weights.len() != preds.len() {
-        return Err(PrimError::ShapeMismatch {
-            operand: "vote_weights",
-            rows: preds.len(),
-            cols: 1,
-            len: weights.len(),
-        });
-    }
+    validate_weights(weights, preds.len())?;
     if n_rows == 0 {
         return Ok(Vec::new());
     }
 
+    let acc_handle = accumulate_weighted(pool, preds, weights, denom, n_rows);
+    let acc = DeviceArray::<ActiveRuntime, F>::from_raw(acc_handle, n_rows);
+    let host = acc.to_host_metered(pool);
+    acc.release_into(pool);
+    Ok(host)
+}
+
+/// The `Σⱼ predⱼ·wⱼ / Σⱼ wⱼ` accumulation, left DEVICE-RESIDENT.
+///
+/// Factored out of [`vote_average_device`] so [`vote_soft_predict_device`] can
+/// consume the accumulator with [`vote_argmax_rows`] instead of downloading it —
+/// which is the entire reason soft voting's device arm is worth its crossing.
+/// Both entry points therefore run byte-identical arithmetic; a second copy of
+/// this loop would be a second place for the summation order to drift from
+/// `np.average`'s.
+///
+/// Returns the accumulator handle, `len` elements long and already divided.
+/// Every uploaded column is released before returning; the caller owns what
+/// comes back.
+///
+/// Callers must have run [`validate_columns`] and [`validate_weights`] first —
+/// a kernel cannot return an error, and a short column would read past its
+/// upload rather than fail.
+fn accumulate_weighted<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    cols: &[&[F]],
+    weights: &[F],
+    denom: F,
+    len: usize,
+) -> Handle
+where
+    F: Float + CubeElement + Pod,
+{
     let elem = size_of::<F>();
-    let acc_handle = pool.acquire(n_rows * elem);
+    let acc_handle = pool.acquire(len * elem);
     let client = pool.client().clone();
-    let (count, dim) =
-        super::launch_dims_1d_folded(n_rows, crate::capability::gather_launch_width());
+    let (count, dim) = super::launch_dims_1d_folded(len, crate::capability::gather_launch_width());
 
     // Each upload stays alive until every launch that reads it has been
     // submitted; dropping a `DeviceArray` returns its handle to the pool, and a
     // recycled handle underneath an in-flight kernel is a use-after-free.
-    let mut uploads: Vec<DeviceArray<ActiveRuntime, F>> = Vec::with_capacity(preds.len());
+    let mut uploads: Vec<DeviceArray<ActiveRuntime, F>> = Vec::with_capacity(cols.len());
 
-    for (j, &pred) in preds.iter().enumerate() {
-        let col = DeviceArray::<ActiveRuntime, F>::from_host(pool, pred);
-        // SAFETY: `pred.len() == n_rows` (checked by `validate_columns`) and the
-        // accumulator handle is `n_rows` elements long (allocated just above),
-        // so every index either kernel forms is in range; both additionally
+    for (j, &col_host) in cols.iter().enumerate() {
+        let col = DeviceArray::<ActiveRuntime, F>::from_host(pool, col_host);
+        // SAFETY: `col_host.len() == len` (checked by the caller) and the
+        // accumulator handle is `len` elements long (allocated just above), so
+        // every index either kernel forms is in range; both additionally
         // bounds-check `tid < pred.len()`.
-        let pred_arg = unsafe { ArrayArg::from_raw_parts(col.handle().clone(), n_rows) };
-        let acc_arg = unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), n_rows) };
+        let pred_arg = unsafe { ArrayArg::from_raw_parts(col.handle().clone(), len) };
+        let acc_arg = unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), len) };
         if j == 0 {
             vote_init_weighted::launch::<F, ActiveRuntime>(
                 &client,
@@ -173,16 +202,13 @@ where
     }
 
     // SAFETY: same handle and length as every accumulate launch above.
-    let acc_arg = unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), n_rows) };
+    let acc_arg = unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), len) };
     vote_divide::launch::<F, ActiveRuntime>(&client, count, dim, acc_arg, denom);
 
-    let acc = DeviceArray::<ActiveRuntime, F>::from_raw(acc_handle, n_rows);
-    let host = acc.to_host_metered(pool);
-    acc.release_into(pool);
     for upload in uploads {
         upload.release_into(pool);
     }
-    Ok(host)
+    acc_handle
 }
 
 /// The `n_rows × k` transform matrix — member `j`'s column at column `j`.
@@ -239,12 +265,307 @@ where
     Ok(host)
 }
 
-/// The whole shape contract both entry points hold callers to: at least one
+// ------------------------------------------------------------------------- //
+// VotingClassifier (VOTE-CLF-01)
+// ------------------------------------------------------------------------- //
+
+/// `voting='hard'` — the weighted majority label per row, computed on the device.
+///
+/// `labels[j]` is member `j`'s `n_rows`-long **encoded** prediction (`0 ..
+/// n_bins`), `weights[j]` its weight. `n_bins` must be strictly greater than
+/// every label; the caller derives it from the same scan that proved the labels
+/// non-negative, because `np.bincount` rejects a negative element rather than
+/// wrapping it.
+///
+/// Three phases, `k + 3` launches: clear the `n_rows × n_bins` tally and the
+/// per-row ceiling, accumulate one member per launch
+/// ([`vote_bincount_add`]), then reduce each row ([`vote_argmax_bounded`]).
+/// The tally is the only sizeable allocation and it never leaves the device —
+/// the download is `n_rows` labels, `n_bins` times smaller than the tally and
+/// `k` times smaller than the uploads.
+///
+/// Returns the argmax indices, which are positions in the caller's class order.
+pub fn vote_hard_predict_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    labels: &[&[u32]],
+    weights: &[F],
+    n_rows: usize,
+    n_bins: u32,
+) -> Result<Vec<u32>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_columns(labels, n_rows)?;
+    validate_weights(weights, labels.len())?;
+    if n_bins == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "vote_n_bins",
+            rows: n_rows,
+            cols: 0,
+            len: 0,
+        });
+    }
+    if n_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let elem = size_of::<F>();
+    let n_bins_usize = n_bins as usize;
+    let counts_len = n_rows * n_bins_usize;
+    let counts_handle = pool.acquire(counts_len * elem);
+    let hi_handle = pool.acquire(n_rows * size_of::<u32>());
+    let out_handle = pool.acquire(n_rows * size_of::<u32>());
+    let client = pool.client().clone();
+    let width = crate::capability::gather_launch_width();
+    let (row_count, row_dim) = super::launch_dims_1d_folded(n_rows, width);
+    let (tally_count, tally_dim) = super::launch_dims_1d_folded(counts_len, width);
+
+    // SAFETY for every `from_raw_parts` below: `counts_handle` is
+    // `n_rows * n_bins` elements, `hi_handle` and `out_handle` are `n_rows`, and
+    // each kernel bounds-checks its own unit index against the array it walks.
+    // `vote_bincount_add`'s `r * n_bins + label` is in range because the caller
+    // guarantees `label < n_bins` (see the doc comment).
+    let counts_arg = unsafe { ArrayArg::from_raw_parts(counts_handle.clone(), counts_len) };
+    vote_counts_zero::launch::<F, ActiveRuntime>(&client, tally_count, tally_dim, counts_arg);
+    let hi_arg = unsafe { ArrayArg::from_raw_parts(hi_handle.clone(), n_rows) };
+    vote_hi_zero::launch::<ActiveRuntime>(&client, row_count.clone(), row_dim, hi_arg);
+
+    let mut uploads: Vec<DeviceArray<ActiveRuntime, u32>> = Vec::with_capacity(labels.len());
+    for (j, &col_host) in labels.iter().enumerate() {
+        let col = DeviceArray::<ActiveRuntime, u32>::from_host(pool, col_host);
+        let labels_arg = unsafe { ArrayArg::from_raw_parts(col.handle().clone(), n_rows) };
+        let counts_arg = unsafe { ArrayArg::from_raw_parts(counts_handle.clone(), counts_len) };
+        let hi_arg = unsafe { ArrayArg::from_raw_parts(hi_handle.clone(), n_rows) };
+        // Read-after-write against the previous member on BOTH `counts` and
+        // `hi`, ordered by the single client stream — the same guarantee
+        // `vote_add_weighted`'s chain relies on.
+        vote_bincount_add::launch::<F, ActiveRuntime>(
+            &client,
+            row_count.clone(),
+            row_dim,
+            labels_arg,
+            counts_arg,
+            hi_arg,
+            n_bins,
+            weights[j],
+        );
+        uploads.push(col);
+    }
+
+    let counts_arg = unsafe { ArrayArg::from_raw_parts(counts_handle.clone(), counts_len) };
+    let hi_arg = unsafe { ArrayArg::from_raw_parts(hi_handle.clone(), n_rows) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n_rows) };
+    vote_argmax_bounded::launch::<F, ActiveRuntime>(
+        &client, row_count, row_dim, counts_arg, hi_arg, out_arg, n_bins,
+    );
+
+    let out = DeviceArray::<ActiveRuntime, u32>::from_raw(out_handle, n_rows);
+    let host = out.to_host_metered(pool);
+    out.release_into(pool);
+    DeviceArray::<ActiveRuntime, F>::from_raw(counts_handle, counts_len).release_into(pool);
+    DeviceArray::<ActiveRuntime, u32>::from_raw(hi_handle, n_rows).release_into(pool);
+    for upload in uploads {
+        upload.release_into(pool);
+    }
+    Ok(host)
+}
+
+/// `voting='soft'` — the weighted probability average of `k` `n_rows × n_cols`
+/// blocks, computed on the device.
+///
+/// This is `np.average(probas, axis=0, weights=w)`, and it is
+/// [`vote_average_device`]'s arithmetic verbatim: the reduced axis is still the
+/// member axis, each member still contributes one contiguous run, so the
+/// accumulation runs over `n_rows · n_cols` elements instead of `n_rows`. No new
+/// kernel is involved — see [`accumulate_weighted`].
+pub fn vote_soft_proba_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    blocks: &[&[F]],
+    weights: &[F],
+    denom: F,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<Vec<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let len = n_rows * n_cols;
+    validate_columns(blocks, len)?;
+    validate_weights(weights, blocks.len())?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let acc_handle = accumulate_weighted(pool, blocks, weights, denom, len);
+    let acc = DeviceArray::<ActiveRuntime, F>::from_raw(acc_handle, len);
+    let host = acc.to_host_metered(pool);
+    acc.release_into(pool);
+    Ok(host)
+}
+
+/// `voting='soft'` — the argmax of that average, WITHOUT downloading it.
+///
+/// `argmax(np.average(probas, axis=0, weights=w), axis=1)`, fused: the
+/// accumulator stays on the device and [`vote_argmax_rows`] turns it into
+/// `n_rows` labels there. The download is therefore `n_rows` `u32`s rather than
+/// `n_rows · n_cols` floats — the one shape in this module where the device arm
+/// has a structural advantage over `numpy` rather than merely a chance at one,
+/// since numpy has to materialise the full average before it can reduce it.
+///
+/// The labels are bit-for-bit the same decision `predict_proba(...).argmax(1)`
+/// makes on the same arm: the average is the same kernel chain and
+/// [`vote_argmax_rows`] takes the FIRST maximum, as `np.argmax` does.
+pub fn vote_soft_predict_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    blocks: &[&[F]],
+    weights: &[F],
+    denom: F,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<Vec<u32>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    let len = n_rows * n_cols;
+    validate_columns(blocks, len)?;
+    validate_weights(weights, blocks.len())?;
+    if n_cols == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "vote_n_classes",
+            rows: n_rows,
+            cols: 0,
+            len: 0,
+        });
+    }
+    if n_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let acc_handle = accumulate_weighted(pool, blocks, weights, denom, len);
+    let out_handle = pool.acquire(n_rows * size_of::<u32>());
+    let client = pool.client().clone();
+    let (count, dim) =
+        super::launch_dims_1d_folded(n_rows, crate::capability::gather_launch_width());
+
+    // SAFETY: `acc_handle` is `n_rows * n_cols` elements and `out_handle` is
+    // `n_rows`; the kernel bounds-checks `tid < out.len()` and walks
+    // `[tid * n_cols, tid * n_cols + n_cols)`, the last of which is `len - 1`.
+    let acc_arg = unsafe { ArrayArg::from_raw_parts(acc_handle.clone(), len) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), n_rows) };
+    vote_argmax_rows::launch::<F, ActiveRuntime>(
+        &client,
+        count,
+        dim,
+        acc_arg,
+        out_arg,
+        n_cols as u32,
+    );
+
+    let out = DeviceArray::<ActiveRuntime, u32>::from_raw(out_handle, n_rows);
+    let host = out.to_host_metered(pool);
+    out.release_into(pool);
+    DeviceArray::<ActiveRuntime, F>::from_raw(acc_handle, len).release_into(pool);
+    Ok(host)
+}
+
+/// `voting='soft', flatten_transform=True` — `np.hstack(probas)`.
+///
+/// `k` blocks of `n_rows × width` laid side by side into one
+/// `n_rows × (k · width)` matrix, as `k` independent scatters
+/// ([`vote_write_block`]) into disjoint column ranges of the same output — so,
+/// like [`vote_transform_device`], the launches need no barrier between them.
+///
+/// This is the copy-shaped half of the classifier's device arm and carries the
+/// same warning `stacking_meta` does: `n · k · width` in, the same out, no
+/// arithmetic. It is here so a caller who has selected the `device` arm gets it
+/// for every method rather than for some of them, and `docs/voting.md` carries
+/// the measurement that says whether it should ever be the default.
+pub fn vote_hstack_device<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    blocks: &[&[F]],
+    n_rows: usize,
+    width: usize,
+) -> Result<Vec<F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    validate_columns(blocks, n_rows * width)?;
+    if width == 0 {
+        return Err(PrimError::ShapeMismatch {
+            operand: "vote_block_width",
+            rows: n_rows,
+            cols: 0,
+            len: 0,
+        });
+    }
+    let k = blocks.len();
+    if n_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let block_len = n_rows * width;
+    let out_stride = k * width;
+    let out_len = n_rows * out_stride;
+    let out_handle = pool.acquire(out_len * size_of::<F>());
+    let client = pool.client().clone();
+    let (count, dim) =
+        super::launch_dims_1d_folded(block_len, crate::capability::gather_launch_width());
+
+    let mut uploads: Vec<DeviceArray<ActiveRuntime, F>> = Vec::with_capacity(k);
+    for (j, &block_host) in blocks.iter().enumerate() {
+        let block = DeviceArray::<ActiveRuntime, F>::from_host(pool, block_host);
+        // SAFETY: the largest index the kernel forms is
+        // `(n_rows - 1) * out_stride + (k - 1) * width + (width - 1)`, which is
+        // `out_len - 1`; the kernel bounds-checks `tid < block.len()`.
+        let block_arg = unsafe { ArrayArg::from_raw_parts(block.handle().clone(), block_len) };
+        let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
+        vote_write_block::launch::<F, ActiveRuntime>(
+            &client,
+            count.clone(),
+            dim,
+            block_arg,
+            out_arg,
+            width as u32,
+            out_stride as u32,
+            (j * width) as u32,
+        );
+        uploads.push(block);
+    }
+
+    let out = DeviceArray::<ActiveRuntime, F>::from_raw(out_handle, out_len);
+    let host = out.to_host_metered(pool);
+    out.release_into(pool);
+    for upload in uploads {
+        upload.release_into(pool);
+    }
+    Ok(host)
+}
+
+/// One weight per member, checked before any launch.
+///
+/// Shared by every entry point that weights, so a mis-sized weight vector
+/// reports the same `PrimError` whichever aggregation the caller asked for.
+fn validate_weights<F>(weights: &[F], k: usize) -> Result<(), PrimError> {
+    if weights.len() != k {
+        return Err(PrimError::ShapeMismatch {
+            operand: "vote_weights",
+            rows: k,
+            cols: 1,
+            len: weights.len(),
+        });
+    }
+    Ok(())
+}
+
+/// The whole shape contract every entry point holds callers to: at least one
 /// member, every column exactly `n_rows` long.
 ///
 /// Validated BEFORE the first launch — a kernel cannot return an error, and a
 /// short column would read past its upload rather than fail.
-fn validate_columns<F>(preds: &[&[F]], n_rows: usize) -> Result<(), PrimError> {
+///
+/// Generic over the element type so the classifier's `u32` label columns are
+/// held to the same contract as the regressor's float ones; `n_rows` is the
+/// column's full LENGTH, which for a 2-D block is `n_rows · width`.
+fn validate_columns<T>(preds: &[&[T]], n_rows: usize) -> Result<(), PrimError> {
     if preds.is_empty() {
         return Err(PrimError::ShapeMismatch {
             operand: "vote_columns",

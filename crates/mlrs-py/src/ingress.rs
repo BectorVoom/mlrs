@@ -29,10 +29,12 @@
 //! these functions are plain Rust (no `Python<'_>` capture) so they are usable in
 //! the detached, GIL-released closure.
 
-use arrow::array::{make_array, Array, ArrayData, ArrayRef, Float32Array, Float64Array};
+use arrow::array::{
+    make_array, Array, ArrayData, ArrayRef, Float32Array, Float64Array, UInt32Array,
+};
 use arrow::datatypes::DataType;
 use arrow::pyarrow::FromPyArrow;
-use mlrs_backend::bridge::{validate_f32, validate_f64};
+use mlrs_backend::bridge::{validate_f32, validate_f64, validate_u32};
 use mlrs_backend::device_array::DeviceArray;
 use mlrs_backend::pool::BufferPool;
 use mlrs_backend::runtime::ActiveRuntime;
@@ -108,6 +110,18 @@ pub fn host_slice_f64<'a>(arr: &'a Float64Array) -> PyResult<&'a [f64]> {
     validate_f64(arr).map_err(bridge_err_to_py)
 }
 
+/// Label twin of [`host_slice_f32`], for `VotingClassifier`'s hard-voting route
+/// (VOTE-CLF-01).
+///
+/// The members' `predict` answers are ENCODED class labels — indices, not
+/// measurements — so the column that crosses is `uint32` and there is no
+/// f32/f64 dispatch to make. It runs the same `mlrs_backend::bridge` gauntlet as
+/// the float ingress; a label array reaching the FFI is no more trusted than a
+/// feature matrix.
+pub fn host_slice_u32<'a>(arr: &'a UInt32Array) -> PyResult<&'a [u32]> {
+    validate_u32(arr).map_err(bridge_err_to_py)
+}
+
 /// Is every value in `v` finite (no NaN, no ±inf)?
 ///
 /// The host-side half of the RELOCATED NaN/inf rejection: a wrapper that passes
@@ -180,6 +194,20 @@ pub fn as_f64(array: &ArrayRef) -> PyResult<&Float64Array> {
     array
         .as_any()
         .downcast_ref::<Float64Array>()
+        .ok_or_else(|| unsupported_dtype_err(array.data_type()))
+}
+
+/// Downcast an owned [`ArrayRef`] to a `UInt32Array`, or a `PyTypeError` if the
+/// array is not UInt32.
+///
+/// The shim promotes its label columns to `uint32` before the call rather than
+/// sending whatever integer width the members happened to return, so this
+/// downcast has a single accepted dtype rather than an integer dispatch — see
+/// `_vote_labels_via_rust`.
+pub fn as_u32(array: &ArrayRef) -> PyResult<&UInt32Array> {
+    array
+        .as_any()
+        .downcast_ref::<UInt32Array>()
         .ok_or_else(|| unsupported_dtype_err(array.data_type()))
 }
 

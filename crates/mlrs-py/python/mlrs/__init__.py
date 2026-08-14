@@ -38,6 +38,7 @@ from .ensemble import (
     RandomForestRegressor,
     StackingClassifier,
     StackingRegressor,
+    VotingClassifier,
     VotingRegressor,
 )
 from .kernel_ridge import KernelRidge
@@ -141,6 +142,7 @@ __all__ = [
     "StackingRegressor",
     "StackingClassifier",
     "VotingRegressor",
+    "VotingClassifier",
     "KMeans",
     "DBSCAN",
     "HDBSCAN",

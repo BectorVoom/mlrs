@@ -169,6 +169,28 @@ def _estimators():
                 ("ridge", SkRidge()),
             ],
         ),
+        # --- VOTE-CLF-01: the voting meta-CLASSIFIER, entered TWICE because
+        # `voting` forks it into two estimators that share only their
+        # composition bookkeeping. `'hard'` is sklearn's default and the route
+        # with no `predict_proba` at all; `'soft'` is the one the harness's
+        # probability checks (`check_classifiers_train`'s proba branch,
+        # `check_classifier_multioutput`) actually reach. Running only the
+        # default would leave the entire soft route uncovered here.
+        #
+        # `weights` is LEFT AT `None` for the reason given just above.
+        mlrs.VotingClassifier(
+            estimators=[
+                ("lr", SkLogisticRegression()),
+                ("nb", SkGaussianNB()),
+            ],
+        ),
+        mlrs.VotingClassifier(
+            estimators=[
+                ("lr", SkLogisticRegression()),
+                ("nb", SkGaussianNB()),
+            ],
+            voting="soft",
+        ),
     ]
 
 

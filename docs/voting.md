@@ -17,6 +17,12 @@ reg.fit(X, y).predict(X_test)
 Members may be mlrs estimators, scikit-learn estimators, or a mix — the
 composition only requires `fit`/`predict` and `is_regressor`.
 
+The classification counterpart is
+[`VotingClassifier`](voting_classifier.md), which adds one string-valued
+parameter (`voting`) that forks it into two aggregations with nothing in common.
+Everything on this page about `weights`, `'drop'`, `n_jobs` and the
+`MLRS_VOTING_ENGINE` knob applies to it unchanged.
+
 Compared with [stacking.md](stacking.md): stacking learns how to combine its
 members (a second-stage estimator fitted on out-of-fold predictions); voting is
 told, by `weights`. Voting is therefore much cheaper — one fit per member, no

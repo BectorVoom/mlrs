@@ -361,3 +361,259 @@ fn the_engine_knob_defaults_to_numpy_and_names_the_arm_it_resolves() {
         assert_eq!(vote_engine(), VoteEngine::Numpy);
     }
 }
+
+// --------------------------------------------------------------------------- //
+// VotingClassifier (VOTE-CLF-01)
+// --------------------------------------------------------------------------- //
+//
+// The classifier's device arm adds three claims to the two above:
+//
+// * `vote_hard_predict_device` is a weighted bincount argmax, and — unlike the
+//   average — it is held to EXACT equality. There is no `acc + a·b` for a GPU to
+//   contract: the kernel adds a scalar weight to a bin, which is one rounding
+//   everywhere. If this ever drifts, the cause is the tally or the tie-break,
+//   not the hardware.
+// * `vote_soft_predict_device` FUSES the argmax into the reduction, so its
+//   labels must equal the argmax of what `vote_soft_proba_device` returns
+//   separately. That is the assertion that catches a fused path reading the
+//   accumulator before the divide, or with the wrong stride.
+// * `vote_hstack_device` is a pure scatter and is held byte-for-byte, for the
+//   reason `vote_transform_device` is.
+
+use mlrs_backend::prims::voting::{
+    vote_hard_predict_device, vote_hstack_device, vote_soft_predict_device, vote_soft_proba_device,
+};
+
+/// A deterministic label matrix with the properties the tally has to survive:
+/// unanimous rows, split rows, three-way ties, and a row whose members all vote
+/// for a class ABOVE 0 (so a leaked tally from the previous row is visible).
+fn label_columns(k: usize, n_rows: usize, n_classes: u32) -> Vec<Vec<u32>> {
+    (0..k)
+        .map(|j| {
+            (0..n_rows)
+                .map(|r| ((r * 7 + j * 3 + r / 5) as u32) % n_classes)
+                .collect()
+        })
+        .collect()
+}
+
+/// The host reference for a weighted bincount argmax, written independently of
+/// `mlrs_algos` (which depends on this crate) — including `np.bincount`'s
+/// per-row length, which is the subtle half.
+fn host_hard_ref(cols: &[Vec<u32>], weights: &[f64], n_rows: usize, n_bins: usize) -> Vec<u32> {
+    (0..n_rows)
+        .map(|r| {
+            let mut tally = vec![0.0f64; n_bins];
+            let mut hi = 0u32;
+            for (j, col) in cols.iter().enumerate() {
+                tally[col[r] as usize] += weights[j];
+                hi = hi.max(col[r]);
+            }
+            let mut best = tally[0];
+            let mut best_idx = 0u32;
+            for c in 1..=hi {
+                if tally[c as usize] > best {
+                    best = tally[c as usize];
+                    best_idx = c;
+                }
+            }
+            best_idx
+        })
+        .collect()
+}
+
+fn hard_device<F>(cols: &[Vec<u32>], weights: &[f64], n_rows: usize, n_bins: u32) -> Vec<u32>
+where
+    F: Float + CubeElement + Pod,
+{
+    let refs: Vec<&[u32]> = cols.iter().map(|v| v.as_slice()).collect();
+    let typed: Vec<F> = weights.iter().copied().map(to_f::<F>).collect();
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    vote_hard_predict_device::<F>(&mut pool, &refs, &typed, n_rows, n_bins)
+        .expect("hard predict device arm")
+}
+
+#[test]
+fn hard_voting_on_the_device_equals_the_host_bincount_argmax_exactly() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(FloatKind::F32, backend, "default");
+
+    for (k, n_rows, n_classes) in [
+        (1usize, 17usize, 3u32),
+        (3, 257, 3),
+        (5, 1024, 7),
+        (8, 33, 2),
+    ] {
+        let cols = label_columns(k, n_rows, n_classes);
+        for weights in [vec![1.0f64; k], (1..=k).map(|j| j as f64 * 1.5).collect()] {
+            let expected = host_hard_ref(&cols, &weights, n_rows, n_classes as usize);
+            let got = hard_device::<f32>(&cols, &weights, n_rows, n_classes);
+            // EXACT: the tally is an add of a scalar into a bin, not a
+            // multiply-accumulate, so there is nothing for a GPU to contract.
+            assert_eq!(got, expected, "hard vote at k={k}, n={n_rows}");
+        }
+    }
+    println!("voting-clf backend={backend}: device hard vote matches the host tally exactly");
+}
+
+#[test]
+fn a_hard_vote_on_the_device_respects_each_rows_own_label_ceiling() {
+    // The negative-weight case from the algos suite, on the device: `np.bincount`
+    // never sizes past `x.max() + 1`, so class 2 is not a candidate here even
+    // though its implicit 0.0 beats both members' negative weights. A kernel
+    // that scanned the full `n_bins` would answer 1.
+    let a = vec![0u32];
+    let b = vec![0u32];
+    let got = hard_device::<f32>(&[a, b], &[-1.0, -2.0], 1, 3);
+    assert_eq!(got, vec![0]);
+}
+
+#[test]
+fn the_hard_vote_tally_is_zeroed_before_the_first_member_accumulates() {
+    // A pool handle is whatever its last owner left. Running twice through the
+    // SAME pool with different data is what makes a missing zero-fill visible:
+    // the second call would see the first call's counts.
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let all_two = vec![vec![2u32; 64], vec![2u32; 64], vec![2u32; 64]];
+    let all_zero = vec![vec![0u32; 64], vec![0u32; 64], vec![0u32; 64]];
+    let w = [1.0f32; 3];
+    for (cols, expected) in [(&all_two, 2u32), (&all_zero, 0u32)] {
+        let refs: Vec<&[u32]> = cols.iter().map(|v| v.as_slice()).collect();
+        let got = vote_hard_predict_device::<f32>(&mut pool, &refs, &w, 64, 3).unwrap();
+        assert_eq!(got, vec![expected; 64]);
+    }
+}
+
+#[test]
+fn soft_voting_fuses_the_argmax_without_changing_which_class_wins() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(FloatKind::F32, backend, "default");
+
+    let (n_rows, n_cols, k) = (200usize, 4usize, 3usize);
+    // Well-separated probabilities: the two arms are the same kernel chain, but
+    // holding a FUSED argmax to a near-tie would be gating on the contraction
+    // gap rather than on the fusion.
+    let blocks: Vec<Vec<f32>> = (0..k)
+        .map(|j| {
+            (0..n_rows * n_cols)
+                .map(|i| {
+                    let r = i / n_cols;
+                    let c = i % n_cols;
+                    if c == (r + j) % n_cols {
+                        0.7f32
+                    } else {
+                        0.1f32
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let refs: Vec<&[f32]> = blocks.iter().map(|v| v.as_slice()).collect();
+    let w = [2.0f32, 1.0, 1.0];
+    let denom = w[0] + w[1] + w[2];
+
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let proba = vote_soft_proba_device::<f32>(&mut pool, &refs, &w, denom, n_rows, n_cols).unwrap();
+    let fused =
+        vote_soft_predict_device::<f32>(&mut pool, &refs, &w, denom, n_rows, n_cols).unwrap();
+
+    assert_eq!(proba.len(), n_rows * n_cols);
+    let separate: Vec<u32> = (0..n_rows)
+        .map(|r| {
+            let row = &proba[r * n_cols..(r + 1) * n_cols];
+            let mut best = row[0];
+            let mut best_idx = 0u32;
+            for (c, &v) in row.iter().enumerate().skip(1) {
+                if v > best {
+                    best = v;
+                    best_idx = c as u32;
+                }
+            }
+            best_idx
+        })
+        .collect();
+    assert_eq!(
+        fused, separate,
+        "fused argmax disagreed with the downloaded one"
+    );
+    // Member 0 carries twice the weight, so its peak class wins every row.
+    let expected: Vec<u32> = (0..n_rows).map(|r| (r % n_cols) as u32).collect();
+    assert_eq!(fused, expected);
+    println!("voting-clf backend={backend}: fused soft predict matches the two-step route");
+}
+
+#[test]
+fn hstack_on_the_device_is_byte_identical_to_the_host_layout() {
+    for (k, n_rows, width) in [(1usize, 5usize, 3usize), (2, 128, 4), (4, 37, 1)] {
+        let blocks: Vec<Vec<f32>> = (0..k)
+            .map(|j| {
+                (0..n_rows * width)
+                    .map(|i| 1000.0 * (j as f32 + 1.0) + i as f32)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[f32]> = blocks.iter().map(|v| v.as_slice()).collect();
+        let client = runtime::active_client();
+        let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+        let got = vote_hstack_device::<f32>(&mut pool, &refs, n_rows, width).unwrap();
+
+        let stride = k * width;
+        let mut expected = vec![0.0f32; n_rows * stride];
+        for (j, block) in blocks.iter().enumerate() {
+            for r in 0..n_rows {
+                for c in 0..width {
+                    expected[r * stride + j * width + c] = block[r * width + c];
+                }
+            }
+        }
+        // No arithmetic, so equality — a column written at the wrong offset or a
+        // stride off by one is precisely what a tolerance would hide.
+        assert_eq!(got, expected, "hstack at k={k}, width={width}");
+    }
+}
+
+#[test]
+fn the_classifier_arms_reject_a_malformed_call_before_any_launch() {
+    let client = runtime::active_client();
+    let mut pool: BufferPool<ActiveRuntime> = BufferPool::new(client);
+    let a = [0u32, 1, 2];
+    let b = [0u32, 1];
+    // Mismatched column lengths, and a weight vector that does not match `k`:
+    // both would make a kernel read past its upload rather than fail.
+    assert!(
+        vote_hard_predict_device::<f32>(&mut pool, &[&a[..], &b[..]], &[1.0, 1.0], 3, 3).is_err()
+    );
+    assert!(vote_hard_predict_device::<f32>(&mut pool, &[&a[..]], &[1.0, 1.0], 3, 3).is_err());
+    // Zero classes has no argmax to take.
+    assert!(vote_hard_predict_device::<f32>(&mut pool, &[&a[..]], &[1.0], 3, 0).is_err());
+
+    let p = [0.5f32, 0.5, 0.25, 0.75];
+    let q = [0.5f32, 0.5];
+    assert!(
+        vote_soft_proba_device::<f32>(&mut pool, &[&p[..], &q[..]], &[1.0, 1.0], 2.0, 2, 2)
+            .is_err()
+    );
+    assert!(vote_soft_predict_device::<f32>(&mut pool, &[&p[..]], &[1.0], 1.0, 2, 0).is_err());
+    assert!(vote_hstack_device::<f32>(&mut pool, &[&p[..], &q[..]], 2, 2).is_err());
+}
+
+#[test]
+fn the_classifier_arms_run_at_f64_where_the_backend_has_f64_kernels() {
+    let backend = capability::active_backend_name();
+    capability::log_oracle_dtype(FloatKind::F64, backend, "default");
+    if !capability::f64_device_kernels_available() {
+        println!("voting-clf f64 backend={backend}: SKIPPED (no f64 device kernels)");
+        return;
+    }
+    // f64 is the width `np.bincount(x, weights=w)` accumulates in, so this is
+    // the configuration the Python `host` arm is compared against.
+    let cols = label_columns(4, 301, 5);
+    let weights: Vec<f64> = vec![0.25, 1.5, 3.0, 0.75];
+    let expected = host_hard_ref(&cols, &weights, 301, 5);
+    let got = hard_device::<f64>(&cols, &weights, 301, 5);
+    assert_eq!(got, expected);
+    println!("voting-clf f64 backend={backend}: device hard vote matches the host tally exactly");
+}
