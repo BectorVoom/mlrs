@@ -228,18 +228,29 @@ a fresh subprocess and the table reports the minimum of 3; cells are interleaved
 across arms, not blocked, so a drifting machine penalizes all of them equally.
 The one-time `_mlrs` load is warmed outside every timed region.
 
-**These are CPU-time cells, not wall clock, and that is deliberate.** The box was
-co-tenanted with another session throughout this run (loadavg 100-260), which is
-the condition this project has twice recorded as capable of *inverting* a verdict
-(`mlrs-cpu-bench-separate-processes`). CPU time is the load-robust metric, and it
-proved it here: the same cell measured in two independent runs hours apart, under
-loadavg 176 and loadavg 224, came out at 155.10x and 156.70x. A wall-clock run
-taken between them produced one cell at 3 749x — a pure contention artifact — and
-is not reported.
+**The tables below use two different clocks, and each says which.** The box was
+co-tenanted with another session for part of this work — the condition this
+project has twice recorded as capable of *inverting* a verdict
+(`mlrs-cpu-bench-separate-processes`) — and it does not have one right answer:
 
-Note also that the ladder cannot be gated behind a "wait for a quiet box" check:
-on the cpu backend the **device arm is itself the load**, since cubecl-cpu runs
-one OS thread per unit and pushes `procs_running` past 260 on its own.
+* the **hard** ladder was taken under load (loadavg 100-260) and is reported in
+  **CPU time**, the load-robust metric. It earned that trust: the same cell
+  measured in two independent runs hours apart, under loadavg 176 and 224, came
+  out at 155.10x and 156.70x. A wall-clock run taken between them produced one
+  cell at 3 749x — a pure artifact — and is not reported.
+* the **soft** ladders were re-run later on a **quiet box in wall clock**, which
+  is the preferred metric when it is available. That re-run was not cosmetic: the
+  contended data had the host arm *losing* at n=10⁵ where a quiet box shows it
+  winning, and had soft `predict` at 0.24x where it is really 1.8-4.2x. Those
+  tables were withheld until they could be measured properly.
+
+CPU time is also **invalid** for one level of this harness — see `n_jobs` below.
+
+Note that the ladder cannot simply be gated behind a "wait for a quiet box"
+check: on the cpu backend the **device arm is itself the load**, since cubecl-cpu
+runs one OS thread per unit and pushes `procs_running` past 260 on its own. The
+cheap in-band check is the reported `_mlrs` load spread — 690-750 ms across a
+whole run means nothing else was competing; 700 ms to 31 s means something was.
 
 ### `voting='hard'` — the ladder that matters
 
@@ -287,45 +298,90 @@ sklearn's per-row Python loop costs the same either way.
 Soft voting IS the regressor's reduction with `n · n_classes` elements per member
 (see above), so it inherits [voting.md](voting.md)'s ladder rather than
 establishing its own. Reproduced here to confirm that the extra axis does not
-change the shape — **wall clock, on a contended box**, so read the ratios as
-approximate:
+change the shape — **wall clock on a quiet box** (the `_mlrs` load varied only
+690-746 ms across the whole run, which is the cheapest available proof that
+nothing else was competing):
 
 `predict_proba`, weighted — `np.average(probas, axis=0, weights=w)`:
 
 | n, k | numpy | host | device | host/np | dev/np |
 |---|---|---|---|---|---|
-| n=1 000, k=3 | **0.015 ms** | 0.028 ms | 0.151 ms | 0.53x | 0.10x |
-| n=10 000, k=3 | **0.075 ms** | 0.125 ms | 0.416 ms | 0.60x | 0.18x |
-| n=100 000, k=3 | **1.153 ms** | 1.284 ms | 9.923 ms | 0.90x | 0.12x |
-| n=1 000 000, k=3 | 15.537 ms | **7.460 ms** | 38.665 ms | **2.08x** | 0.40x |
-| n=100 000, k=8 | **2.922 ms** | 4.122 ms | 8.493 ms | 0.71x | 0.34x |
-| n=1 000 000, k=8 | 45.622 ms | **20.751 ms** | 235.962 ms | **2.20x** | 0.19x |
+| n=1 000, k=3 | **0.014 ms** | 0.017 ms | 0.140 ms | 0.82x | 0.10x |
+| n=10 000, k=3 | **0.055 ms** | 0.074 ms | 0.486 ms | 0.74x | 0.11x |
+| n=100 000, k=3 | 0.785 ms | **0.691 ms** | 3.089 ms | 1.14x | 0.25x |
+| n=1 000 000, k=3 | 15.167 ms | **6.979 ms** | 34.972 ms | **2.17x** | 0.43x |
+| n=100 000, k=2 | 0.500 ms | **0.449 ms** | 2.988 ms | 1.11x | 0.17x |
+| n=100 000, k=8 | **2.384 ms** | 2.710 ms | 7.823 ms | 0.88x | 0.30x |
+| n=1 000 000, k=8 | 34.684 ms | **19.907 ms** | 88.819 ms | **1.74x** | 0.39x |
+
+The crossover is at roughly `n · k ≈ 3 · 10⁵` elements: below it numpy's already
+vectorised `np.average` beats an Arrow round-trip, above it the host arm's single
+pass repays the crossing. (An earlier contended run put the crossover a decade
+higher and had the host arm *losing* at n=10⁵ — which is exactly the kind of
+verdict shift this project has recorded before from a busy box, and the reason
+this ladder was re-run rather than published as measured.)
 
 `transform` (`flatten_transform=True`) — the `np.hstack` copy:
 
 | n, k | numpy | host | device | host/np | dev/np |
 |---|---|---|---|---|---|
-| n=1 000, k=3 | **0.015 ms** | 0.017 ms | 0.095 ms | 0.90x | 0.16x |
-| n=10 000, k=3 | 0.099 ms | **0.071 ms** | 0.363 ms | 1.39x | 0.27x |
-| n=100 000, k=3 | **0.960 ms** | 0.979 ms | 3.477 ms | 0.98x | 0.28x |
-| n=1 000 000, k=3 | 174.814 ms | **146.325 ms** | 369.112 ms | 1.19x | 0.47x |
-| n=100 000, k=8 | **7.050 ms** | 11.488 ms | 27.475 ms | 0.61x | 0.26x |
-| n=1 000 000, k=8 | **80.880 ms** | 187.231 ms | 980.457 ms | 0.43x | 0.08x |
+| n=1 000, k=3 | **0.010 ms** | 0.016 ms | 0.100 ms | 0.60x | 0.10x |
+| n=10 000, k=3 | 0.085 ms | **0.070 ms** | 0.251 ms | 1.20x | 0.34x |
+| n=100 000, k=3 | 0.898 ms | **0.754 ms** | 3.090 ms | 1.19x | 0.29x |
+| n=1 000 000, k=3 | **12.929 ms** | 14.711 ms | 37.916 ms | 0.88x | 0.34x |
+| n=100 000, k=2 | 0.557 ms | **0.504 ms** | 2.281 ms | 1.10x | 0.24x |
+| n=100 000, k=8 | 4.459 ms | **3.705 ms** | 7.762 ms | 1.20x | 0.57x |
+| n=1 000 000, k=8 | 57.408 ms | **53.729 ms** | 107.321 ms | 1.07x | 0.53x |
 
-Same conclusion as the regressor's, for the same reason: numpy is already
-vectorised here, the Rust arms start an Arrow round-trip in debt, and only at
-n ≳ 10⁶ does the host arm's single pass repay it. The device arm loses
-everywhere on this backend.
+This is the copy-shaped half, and it behaves like one: the two host-side arms sit
+within ±20% of each other at every size, because both are ultimately one pass of
+`memcpy`-shaped work and neither has any arithmetic to be better at. That is
+`docs/stacking.md`'s conclusion reproduced — a pure copy gives the Rust arm
+nothing to amortise its Arrow round-trip against. The device arm loses
+everywhere on this backend, as it does for stacking's meta-matrix.
 
-**`predict` under soft voting is deliberately NOT tabulated.** Its ladder was the
-last to run and the co-tenant had by then pushed the box to loadavg 255; the
-recorded cells are self-inconsistent (numpy reads 6.97 / 8.27 / 9.98 ms at
-n=10⁵ for k=8 / 3 / 2, when the cost must *increase* with `k`), so the table
-would be an artifact rather than a measurement. What is *not* in question is the
-structural claim, which `crates/mlrs-backend/tests/voting_test.rs` gates directly:
-the device arm fuses the argmax into the reduction, so it downloads `n` `u32`s
-where numpy must materialise the whole `n × n_classes` average first. Whether
-that pays on a given backend is still an open number.
+### What the soft ladders add up to
+
+`numpy` stays the default for soft voting, but not uniformly — the three
+aggregations rank exactly as their arithmetic content predicts:
+
+| aggregation | what it does | host arm at scale |
+|---|---|---|
+| `transform` | copy only | ~1.0-1.2x (a wash) |
+| `predict_proba` | reduce `k → 1` | 1.7-2.2x |
+| `predict` | reduce, then reduce again | **1.8-4.2x** |
+
+The more a call reduces, the more the single-pass Rust arm is worth — which is
+the same principle [voting.md](voting.md) used to predict that the regressor's
+`predict` would fare better than its `transform`, now confirmed across a third
+and fourth operation.
+
+`predict`, weighted — `argmax(np.average(...), axis=1)`, and **the one soft
+aggregation where the Rust arms win outright**:
+
+| n, k | numpy | host | device | host/np | dev/np |
+|---|---|---|---|---|---|
+| n=1 000, k=3 | **0.017 ms** | 0.019 ms | 0.164 ms | 0.93x | 0.10x |
+| n=10 000, k=3 | 0.103 ms | **0.084 ms** | 0.396 ms | 1.23x | 0.26x |
+| n=100 000, k=3 | 2.743 ms | **0.798 ms** | 3.314 ms | **3.44x** | 0.83x |
+| n=1 000 000, k=3 | 26.120 ms | **8.301 ms** | 38.379 ms | **3.15x** | 0.68x |
+| n=100 000, k=2 | 2.265 ms | **0.545 ms** | 2.958 ms | **4.15x** | 0.77x |
+| n=100 000, k=8 | 4.950 ms | **2.714 ms** | 8.008 ms | 1.82x | 0.62x |
+| n=1 000 000, k=8 | 45.285 ms | **21.021 ms** | 93.108 ms | **2.15x** | 0.49x |
+
+Compare it against `predict_proba` directly above — same members, same weights,
+same reduction, and the host arm goes from 1.1-2.2x to **1.8-4.2x**. The extra
+margin is the argmax: numpy must materialise the whole `n × n_classes` average
+before it can reduce it, while the host arm walks each row once. The `device`
+arm shows the same effect from the other side — 0.49-0.83x here against
+0.10-0.43x for `predict_proba`, because `vote_argmax_rows` consumes the average
+on the device and downloads `n` `u32`s instead of `n · n_classes` floats. It
+still does not overtake numpy on this backend, but the fusion is worth roughly a
+3x improvement in its position, which is what that kernel exists to buy.
+
+(This is the ladder an earlier contended run got completely wrong — it recorded
+the host arm at 0.24x, i.e. losing by 4x, where a quiet box shows it winning by
+2-4x. It was withheld rather than published; the numbers above are the re-run.)
 
 ### Should the default change?
 
@@ -368,16 +424,48 @@ choice.
 
 ## Measured: `n_jobs`
 
-Not tabulated here, and deliberately so. Two reasons:
+`scripts/bench_voting_classifier.py --level fit`, **wall clock on a quiet box**,
+min of 3. `voting` does not enter a fit at all — every member is fitted
+identically either way — so this is [voting.md](voting.md)'s ladder, and it
+reproduces its conclusion.
 
-* **`voting` does not enter a fit at all** — every member is fitted identically
-  either way — so this ladder is [voting.md](voting.md)'s, unchanged: a voting
-  ensemble fits each member exactly **once**, so the ceiling is Amdahl's
-  `total / slowest` over the members themselves, not `k`.
-* **The fit ladder cannot be run on a contended box.** `--cpu-time`, this
-  harness's remedy everywhere else, is *invalid* here: joblib's workers are
-  separate processes and `time.process_time()` only sees the parent, so an
-  `n_jobs=2` cell measures the parent's bookkeeping alone and renders as a
-  128x-342x "speedup". The harness now **refuses** `--level fit --cpu-time`
-  rather than print it, because a plausible-looking wrong number is worse than
-  no number. Run it in wall clock on a quiet box.
+**This needs two member pools, and reporting only one of them would have been
+wrong.** A voting ensemble fits each member exactly **once**, so there are only
+`k` units of work to spread and the speedup ceiling is Amdahl's
+`total / slowest` over the members themselves — not `k`.
+
+**Mixed pool** (the default: members of wildly different cost, which is what an
+ensemble usually looks like):
+
+| config | `n_jobs=None` | `n_jobs=2` | `n_jobs=4` | best/serial |
+|---|---|---|---|---|
+| n=10 000, d=32, k=4 | **201.4 ms** | 293.9 ms | 273.8 ms | 1.00x |
+| n=100 000, d=32, k=4 | 2 579.6 ms | 2 225.3 ms | **2 182.2 ms** | 1.18x |
+| n=100 000, d=128, k=4 | 9 588.8 ms | 8 466.1 ms | **8 268.0 ms** | 1.16x |
+
+**Balanced pool** (`--balanced`: four depth-8 trees at different seeds, so the
+ceiling really is `k` = 4):
+
+| config | `n_jobs=None` | `n_jobs=2` | `n_jobs=4` | best/serial |
+|---|---|---|---|---|
+| n=10 000, d=32, k=4 | 631.2 ms | 434.4 ms | **323.9 ms** | **1.95x** |
+| n=100 000, d=32, k=4 | 7 853.5 ms | 4 952.7 ms | **2 694.2 ms** | **2.91x** |
+| n=100 000, d=128, k=4 | 31 294.8 ms | 16 497.8 ms | **9 852.0 ms** | **3.18x** |
+
+Read together, those say something the mixed pool alone would have got wrong.
+On the mixed pool `n_jobs` looks nearly useless (1.16-1.18x, and an outright
+**loss** at n=10 000 where process spawn costs more than the ~200 ms of work it
+splits). On the balanced pool the identical machinery delivers **3.18x of a 4x
+ceiling**. The fan-out is not weak — one member dominates. A ladder run only on
+the mixed pool would have reported "`n_jobs` does nothing" and hidden *why*,
+which is why the harness carries `--balanced` at all.
+
+### `--cpu-time` is refused at this level, on purpose
+
+This is the one ladder where the contended-box remedy cannot be applied.
+`time.process_time()` measures the calling process, joblib runs the fan-out in
+forked workers, and the parent therefore sees only its own bookkeeping — so a
+CPU-time `n_jobs=2` cell renders as a **128x-342x "speedup"**. Those were the
+numbers an earlier run of this harness actually produced. `--level fit
+--cpu-time` now errors out with that explanation rather than printing them,
+because a plausible-looking wrong number is worse than no number.
