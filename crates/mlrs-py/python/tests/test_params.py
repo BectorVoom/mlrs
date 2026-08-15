@@ -329,12 +329,16 @@ EXPECTED_PARAMS = {
         "min_categories": None,
         "output_type": "input",
     },
+    # KernelRidge carries sklearn's FULL KernelRidge signature, in sklearn's
+    # ORDER (`alpha` first) — it previously led with `kernel`, which put the two
+    # signatures' positional prefixes out of step.
     "KernelRidge": {
-        "kernel": "linear",
         "alpha": 1.0,
+        "kernel": "linear",
         "gamma": None,
         "degree": 3.0,
         "coef0": 1.0,
+        "kernel_params": None,
         "output_type": "input",
     },
     "KernelDensity": {

@@ -19,11 +19,21 @@
 //! A `#[pyclass]` cannot be generic over `F`, and the precision-typed
 //! `Kernel<F>` / resolved bandwidth are only known once `n_features` is available
 //! (the `gamma=None → 1/n_features` and `scott`/`silverman` rules, D-05/D-09). So
-//! each `Unfit` arm stores the kernel NAME (a `u8` tag) + the raw scalar
-//! hyperparameters (`alpha`/`gamma`/`degree`/`coef0` for KernelRidge; the
-//! bandwidth spec for KernelDensity); the typed `KernelKind` / `KdKernel` /
-//! `BandwidthSpec` is built at `fit`, where the algos estimator then resolves the
-//! gamma / bandwidth from `n_features` (Open Q3 / D-05 gamma=None path).
+//! each `Unfit` arm stores the kernel NAME + the raw hyperparameters
+//! (`alphas`/`gamma`/`degree`/`coef0` for KernelRidge; the bandwidth spec for
+//! KernelDensity); the typed `KernelKind` / `KdKernel` / `BandwidthSpec` is
+//! built at `fit`, where the algos estimator then resolves the gamma /
+//! bandwidth from `n_features` (Open Q3 / D-05 gamma=None path).
+//!
+//! ## What the shim keeps, and why it is not "just passing through"
+//! `KernelRidge`'s `alpha` is a scalar OR an array-like in sklearn, and a
+//! `#[pyclass]` argument cannot be both without a custom `FromPyObject`, so this
+//! side takes ONE shape — a `Vec<f64>`, length 1 for the scalar case — and the
+//! Python shim does the widening it was already inspecting the value for. The
+//! same division puts a CALLABLE `kernel` and its `kernel_params` entirely on
+//! the Python side: they are a Python object and a Python call, and the shim
+//! evaluates them and routes the result through `kernel='precomputed'`, which is
+//! why that name has to be in the vocabulary here.
 //!
 //! Fitted-attribute accessors are dtype-suffixed (`dual_coef_f32`/`_f64`,
 //! `log_density_f32`/`_f64`) per the v2 incremental-wrap precedent (STATE.md
@@ -48,23 +58,21 @@ use mlrs_algos::typestate::{
 
 use crate::errors::{algo_err_to_py, build_err_to_py, not_fitted};
 use crate::ingress::{
-    as_f32, as_f64, capsule_to_array, float_dtype, validated_f32, validated_f64, FloatDtype,
+    as_f32, as_f64, capsule_to_array, float_dtype, host_slice_f32, host_slice_f64, validated_f32,
+    validated_f64, FloatDtype,
 };
 
 /// Parse a sklearn kernel name into the typed [`KernelKind`] (KernelRidge family).
 /// An unknown name is a `PyValueError` (the FFI validate-before-dispatch guard,
 /// T-08-05-02 sibling — the algos estimator also re-validates at `fit`).
 fn parse_kernel_kind(name: &str) -> PyResult<KernelKind> {
-    match name {
-        "linear" => Ok(KernelKind::Linear),
-        "rbf" => Ok(KernelKind::Rbf),
-        "poly" | "polynomial" => Ok(KernelKind::Poly),
-        "sigmoid" => Ok(KernelKind::Sigmoid),
-        other => Err(PyValueError::new_err(format!(
-            "KernelRidge: unknown kernel '{other}' (expected one of \
-             linear/rbf/poly/sigmoid)"
-        ))),
-    }
+    KernelKind::from_name(name).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "KernelRidge: unknown kernel '{name}' (expected one of \
+             additive_chi2/chi2/cosine/laplacian/linear/poly/polynomial/\
+             precomputed/rbf/sigmoid, or a callable)"
+        ))
+    })
 }
 
 /// Parse a sklearn KD kernel name into the typed [`KdKernel`] (KernelDensity
@@ -107,7 +115,7 @@ fn parse_bandwidth(value: &str, numeric: f64) -> PyResult<BandwidthSpec> {
 crate::any_estimator_typestate! {
     any:   AnyKernelRidge,
     algo:  mlrs_algos::kernel_ridge::kernel_ridge::KernelRidge,
-    unfit: { kernel: String, alpha: f64, gamma: Option<f64>, degree: f64, coef0: f64 },
+    unfit: { kernel: String, alphas: Vec<f64>, gamma: Option<f64>, degree: f64, coef0: f64 },
 }
 
 crate::impl_persistable_any! {
@@ -133,7 +141,7 @@ impl PyKernelRidge {
         Self {
             inner: AnyKernelRidge::Unfit {
                 kernel: "linear".to_string(),
-                alpha: 1.0,
+                alphas: vec![1.0],
                 gamma: None,
                 degree: 3.0,
                 coef0: 1.0,
@@ -149,14 +157,27 @@ impl PyKernelRidge {
 
 #[pymethods]
 impl PyKernelRidge {
-    /// `KernelRidge(kernel="linear", alpha=1.0, gamma=None, degree=3.0, coef0=1.0)`.
+    /// `KernelRidge(kernel="linear", alphas=[1.0], gamma=None, degree=3.0, coef0=1.0)`.
+    ///
+    /// `alphas` is a LIST even for sklearn's scalar `alpha` (a one-element list):
+    /// a `#[pyclass]` argument cannot be "float or array-like" without a custom
+    /// `FromPyObject`, and the shim already has to inspect the value to reject a
+    /// 2-D or a string, so the widening happens there and this side takes one
+    /// shape. Length 1 is the scalar case; length `n_targets` is the per-target
+    /// case; the algos `fit` checks it against `y`.
     #[new]
-    #[pyo3(signature = (kernel = "linear".to_string(), alpha = 1.0, gamma = None, degree = 3.0, coef0 = 1.0))]
-    fn new(kernel: String, alpha: f64, gamma: Option<f64>, degree: f64, coef0: f64) -> Self {
+    #[pyo3(signature = (kernel = "linear".to_string(), alphas = vec![1.0], gamma = None, degree = 3.0, coef0 = 1.0))]
+    fn new(
+        kernel: String,
+        alphas: Vec<f64>,
+        gamma: Option<f64>,
+        degree: f64,
+        coef0: f64,
+    ) -> Self {
         Self {
             inner: AnyKernelRidge::Unfit {
                 kernel,
-                alpha,
+                alphas,
                 gamma,
                 degree,
                 coef0,
@@ -168,7 +189,7 @@ impl PyKernelRidge {
     /// `rows × cols` row-major; `y` is `rows × n_targets` row-major (a single
     /// target is `n_targets = 1`). GIL released (PY-03); f64 guarded on an
     /// f64-incapable backend (D-04).
-    #[pyo3(signature = (x, y, rows, cols, n_targets = 1))]
+    #[pyo3(signature = (x, y, rows, cols, n_targets = 1, sample_weight = None))]
     fn fit(
         &mut self,
         py: Python<'_>,
@@ -177,19 +198,24 @@ impl PyKernelRidge {
         rows: usize,
         cols: usize,
         n_targets: usize,
+        sample_weight: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let xa = capsule_to_array(x)?;
         let ya = capsule_to_array(y)?;
+        // The weights arrive as their own Arrow capsule and are read on the HOST
+        // — they never reach a device buffer, because the transform they drive
+        // (`K *= outer(s, s)`) happens on the host pass that injects `alpha`.
+        let swa = sample_weight.map(capsule_to_array).transpose()?;
         let dt = float_dtype(&xa)?;
-        let (kernel, alpha, gamma, degree, coef0) = match &self.inner {
+        let (kernel, alphas, gamma, degree, coef0) = match &self.inner {
             AnyKernelRidge::Unfit {
                 kernel,
-                alpha,
+                alphas,
                 gamma,
                 degree,
                 coef0,
-            } => (kernel.clone(), *alpha, *gamma, *degree, *coef0),
-            _ => ("linear".to_string(), 1.0, None, 3.0, 1.0),
+            } => (kernel.clone(), alphas.clone(), *gamma, *degree, *coef0),
+            _ => ("linear".to_string(), vec![1.0], None, 3.0, 1.0),
         };
         let kind = parse_kernel_kind(&kernel)?;
         let fitted = py.detach(|| -> PyResult<AnyKernelRidge> {
@@ -198,39 +224,47 @@ impl PyKernelRidge {
                 FloatDtype::F32 => {
                     let xd = validated_f32(as_f32(&xa)?, &mut pool)?;
                     let yd = validated_f32(as_f32(&ya)?, &mut pool)?;
+                    let sw = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f32(as_f32(a)?)?),
+                        None => None,
+                    };
                     // n_targets is recovered from y's length by the consuming-self
                     // Fit (yd has length rows * n_targets); the explicit n_targets
                     // arg is retained for the PyO3 signature but no longer threaded.
                     let _ = n_targets;
                     let est = KernelRidge::<f32>::builder()
                         .kernel(kind)
-                        .alpha(alpha)
+                        .alphas(alphas)
                         .gamma(gamma)
                         .degree(degree)
                         .coef0(coef0)
                         .build::<f32>()
                         .map_err(build_err_to_py)?;
-                    let fitted =
-                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                            .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_weighted(&mut pool, &xd, Some(&yd), (rows, cols), sw)
+                        .map_err(algo_err_to_py)?;
                     Ok(AnyKernelRidge::F32(fitted))
                 }
                 FloatDtype::F64 => {
                     crate::capability::guard_f64()?;
                     let xd = validated_f64(as_f64(&xa)?, &mut pool)?;
                     let yd = validated_f64(as_f64(&ya)?, &mut pool)?;
+                    let sw = match swa.as_ref() {
+                        Some(a) => Some(host_slice_f64(as_f64(a)?)?),
+                        None => None,
+                    };
                     let _ = n_targets;
                     let est = KernelRidge::<f64>::builder()
                         .kernel(kind)
-                        .alpha(alpha)
+                        .alphas(alphas)
                         .gamma(gamma)
                         .degree(degree)
                         .coef0(coef0)
                         .build::<f64>()
                         .map_err(build_err_to_py)?;
-                    let fitted =
-                        TypestateFit::fit(est, &mut pool, &xd, Some(&yd), (rows, cols))
-                            .map_err(algo_err_to_py)?;
+                    let fitted = est
+                        .fit_weighted(&mut pool, &xd, Some(&yd), (rows, cols), sw)
+                        .map_err(algo_err_to_py)?;
                     Ok(AnyKernelRidge::F64(fitted))
                 }
             }
@@ -308,6 +342,21 @@ impl PyKernelRidge {
     fn is_fitted(&self) -> bool {
         !matches!(self.inner, AnyKernelRidge::Unfit { .. })
     }
+
+    /// Did the fit fall back from the Cholesky to the host least-squares solve?
+    ///
+    /// Single-typed (a `bool`, no dtype suffix) and read by the shim so it can
+    /// raise sklearn's "Singular matrix in solving dual problem" warning from
+    /// Python, where a `warnings.warn` is something a caller can filter,
+    /// promote, or assert on with `pytest.warns`.
+    fn used_lstsq_fallback(&self) -> PyResult<bool> {
+        match &self.inner {
+            AnyKernelRidge::F32(e) => Ok(e.used_lstsq_fallback()),
+            AnyKernelRidge::F64(e) => Ok(e.used_lstsq_fallback()),
+            _ => Err(not_fitted("kernel_ridge", "used_lstsq_fallback")),
+        }
+    }
+
     fn dtype(&self) -> Option<&'static str> {
         match &self.inner {
             AnyKernelRidge::Unfit { .. } => None,

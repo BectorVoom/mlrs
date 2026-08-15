@@ -232,10 +232,16 @@ pub enum AlgoError {
     /// A polynomial-kernel estimator (KernelRidge with `kernel="poly"`) was given
     /// a `degree` below 1. The polynomial kernel `(γ·⟨x,y⟩ + coef0)^degree`
     /// requires `degree ≥ 1` (sklearn's contract — `Interval(Real, 1, None,
-    /// closed='left')`); a degree below 1 is not a valid polynomial-kernel order.
-    /// Rejected at `fit` *before* any kernel launch (T-08-01-01 / ASVS V5).
+    /// closed='left')`); a negative degree is not a valid polynomial-kernel
+    /// order. Rejected at `fit` *before* any kernel launch (T-08-01-01 / ASVS V5).
+    ///
+    /// The bound is `>= 0`, not `>= 1`: sklearn's interval is left-closed at
+    /// zero and `KernelRidge(kernel='poly', degree=0.5)` fits there, so the
+    /// tighter guard this once carried rejected a configuration the reference
+    /// accepts. Fractional degrees are the reason the poly map evaluates
+    /// `F::powf` rather than an integer power in the first place.
     #[error(
-        "estimator '{estimator}': degree = {degree} is invalid (must be >= 1)"
+        "estimator '{estimator}': degree = {degree} is invalid (must be >= 0)"
     )]
     InvalidDegree {
         /// Which estimator rejected the value (e.g. `"kernel_ridge"`).
@@ -263,6 +269,97 @@ pub enum AlgoError {
         estimator: &'static str,
         /// The offending (non-finite) kernel coefficient.
         gamma: f64,
+    },
+
+    /// A kernel family that has NO `gamma` default was selected with
+    /// `gamma = None` (KERNEL-01 full parameter surface).
+    ///
+    /// Every other γ-taking family resolves `None` to `1/n_features`, so the
+    /// natural assumption is that `chi2` does too. It does not, in sklearn or
+    /// here: `chi2_kernel`'s own signature defaults `gamma=1.0`, but
+    /// `KernelRidge._get_kernel` forwards `self.gamma` unconditionally, so the
+    /// `None` reaches `K *= gamma` and sklearn raises. Resolving it to
+    /// `1/n_features` on our side would be the more forgiving behaviour and
+    /// exactly the wrong one — the same call would then return a number here and
+    /// raise there. This says so instead.
+    #[error(
+        "estimator '{estimator}': kernel '{kernel}' has no gamma default — pass \
+         an explicit gamma (sklearn raises here too; only rbf / poly / sigmoid / \
+         laplacian resolve gamma=None to 1/n_features)"
+    )]
+    KernelRequiresGamma {
+        /// Which estimator rejected the configuration (e.g. `"kernel_ridge"`).
+        estimator: &'static str,
+        /// The kernel family that has no `gamma` default (`"chi2"`).
+        kernel: &'static str,
+    },
+
+    /// A chi-squared kernel family (`chi2` / `additive_chi2`) was given an input
+    /// matrix containing a negative entry (KERNEL-01 full parameter surface).
+    ///
+    /// The chi² statistic `Σ (xₖ − yₖ)²/(xₖ + yₖ)` is defined for histogram-like
+    /// data; with a negative entry the denominator can pass through zero, and
+    /// the kernel's `nom > 0` term guard would then silently DROP the offending
+    /// feature instead of producing the infinity that would at least be visible.
+    /// sklearn's `check_non_negative` rejects it up front and so does this,
+    /// naming the first offending element.
+    #[error(
+        "estimator '{estimator}': kernel '{kernel}' requires non-negative input, \
+         but element {index} of '{operand}' is {value}"
+    )]
+    NegativeKernelInput {
+        /// Which estimator rejected the input (e.g. `"kernel_ridge"`).
+        estimator: &'static str,
+        /// The kernel family requiring non-negativity (`"chi2"` /
+        /// `"additive_chi2"`).
+        kernel: &'static str,
+        /// Which operand carried it (`"X"` at fit, `"X_test"` at predict).
+        operand: &'static str,
+        /// Flat row-major index of the first offending element.
+        index: usize,
+        /// The offending value.
+        value: f64,
+    },
+
+    /// A `KernelRidge` `alpha` given as a per-target array did not have one
+    /// entry per target (KERNEL-01 full parameter surface).
+    ///
+    /// sklearn accepts `alpha` as a scalar OR as an array-like of length
+    /// `n_targets`, and `_solve_cholesky_kernel` `zip`s the alphas against the
+    /// target columns. A `zip` over mismatched lengths does not raise — it
+    /// silently fits only `min(len)` targets and leaves the rest at whatever
+    /// `np.empty` held. This rejects the mismatch rather than reproducing that.
+    #[error(
+        "estimator '{estimator}': alpha has {n_alphas} entries but y has \
+         {n_targets} targets (alpha must be a scalar or one value per target)"
+    )]
+    AlphaTargetMismatch {
+        /// Which estimator rejected the configuration (e.g. `"kernel_ridge"`).
+        estimator: &'static str,
+        /// How many alphas were supplied.
+        n_alphas: usize,
+        /// How many targets `y` carries.
+        n_targets: usize,
+    },
+
+    /// `KernelRidge(kernel='precomputed')` was given a `fit` matrix that is not
+    /// square (KERNEL-01 full parameter surface).
+    ///
+    /// Under `precomputed` the `X` handed to `fit` IS the `n×n` training kernel
+    /// matrix, not a design matrix, so a non-square input is a caller error
+    /// about what the argument MEANS rather than a shape slip — hence a message
+    /// that says so instead of a bare `ShapeMismatch`.
+    #[error(
+        "estimator '{estimator}': kernel='precomputed' expects a square \
+         (n_samples x n_samples) kernel matrix at fit, got {rows} x {cols}"
+    )]
+    PrecomputedNotSquare {
+        /// Which estimator rejected the input (e.g. `"kernel_ridge"`).
+        estimator: &'static str,
+        /// Row count of the supplied matrix.
+        rows: usize,
+        /// Column count of the supplied matrix.
+        cols: usize,
     },
 
     /// A spectral estimator (SpectralEmbedding / SpectralClustering) was given
@@ -313,7 +410,9 @@ pub enum AlgoError {
 
     /// A kernel estimator (KernelRidge / KernelDensity) was given an unrecognised
     /// `kernel` name. Only the supported kernel families are accepted
-    /// (KernelRidge: `linear`/`rbf`/`poly`/`sigmoid`; KernelDensity:
+    /// (KernelRidge: `linear`/`rbf`/`poly`(`polynomial`)/`sigmoid`/`laplacian`/
+    /// `cosine`/`chi2`/`additive_chi2`/`precomputed` — sklearn's whole
+    /// `pairwise_kernels` vocabulary; KernelDensity:
     /// `gaussian`/`tophat`/`epanechnikov`/`exponential`/`linear`/`cosine`); any
     /// other name is rejected at `fit` *before* any kernel launch so an untrusted
     /// string becomes a typed error, not a silent fall-through (T-08-01-01 /
@@ -681,6 +780,22 @@ pub enum BuildError {
         estimator: &'static str,
         /// The offending penalty value.
         alpha: f64,
+    },
+
+    /// A kernel estimator was given a `gamma` outside sklearn's `[0, inf)`
+    /// interval — a negative or NaN kernel coefficient (KERNEL-01).
+    ///
+    /// This is the DATA-INDEPENDENT half of the `gamma` guard, which is why it
+    /// lives at `build()`: whether `-1.0` is a legal coefficient does not depend
+    /// on `n_features`. The other half — that the value `gamma = None` RESOLVES
+    /// to is finite — cannot be known until `fit` sees the feature count, and
+    /// stays there as [`AlgoError::InvalidGamma`].
+    #[error("estimator '{estimator}': gamma = {gamma} is invalid (must be >= 0)")]
+    InvalidGamma {
+        /// Which estimator's builder rejected the value.
+        estimator: &'static str,
+        /// The offending kernel coefficient.
+        gamma: f64,
     },
 
     /// An ElasticNet-penalty estimator was given an `l1_ratio` outside `[0, 1]`.

@@ -29,6 +29,7 @@
 //! |---|---|---|---|
 //! | `X_fit_` | `F` (`F32`/`F64`) | `[n_samples, n_features]` | both |
 //! | `dual_coef_` | `F` | `[n_samples, n_targets]` | `KernelRidge` |
+//! | `alpha_` | `F` | `[1]` or `[n_targets]` | `KernelRidge` — the one hyperparameter whose LENGTH is data-dependent, so it is a tensor rather than a `param:` scalar |
 //! | `param:kernel` | `__metadata__` | — | both, different vocabularies |
 //! | `param:alpha` / `param:gamma` / `param:degree` / `param:coef0` | `__metadata__` | — | `KernelRidge` |
 //! | `gamma_` | `__metadata__` | — | `KernelRidge`, see [`write_resolved_gamma`] |

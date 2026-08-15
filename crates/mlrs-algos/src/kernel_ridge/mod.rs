@@ -10,7 +10,10 @@
 //!   predicts `y = kernel_matrix(X_test, X_fit_, kernel) · dual_coef_`. Unlike
 //!   v1 `Ridge`, KernelRidge fits RAW data with NO centering and NO intercept
 //!   (sklearn KernelRidge — D-06 / RESEARCH Pitfall 1). `gamma=None` resolves to
-//!   `1/n_features` at `fit` (D-05). Added by plan **08-03**.
+//!   `1/n_features` at `fit` (D-05). Added by plan **08-03**; extended to
+//!   sklearn's FULL parameter surface (all nine `kernel` names including
+//!   `precomputed`, a scalar-or-per-target `alpha`, and `sample_weight`) by
+//!   KERNEL-PARAMS.
 //!
 //! The estimator plan ADDS its own `pub mod <estimator>;` line here and creates
 //! the matching file; it does NOT edit `lib.rs` (owned by the 08-01 Wave-0

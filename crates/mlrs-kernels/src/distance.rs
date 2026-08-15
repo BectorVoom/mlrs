@@ -90,6 +90,60 @@ pub fn manhattan_dist<F: Float + CubeElement>(
     }
 }
 
+/// Additive chi-squared kernel value (KERNEL-01 full parameter surface):
+/// `out[i*rows_y+j] = -sum_k (x_ik - y_jk)^2 / (x_ik + y_jk)`.
+///
+/// This is sklearn's `additive_chi2_kernel` verbatim — including the sign. The
+/// kernel VALUE is the negated chi² statistic, so the sum is accumulated
+/// positive and negated once at the store rather than accumulated negative;
+/// that keeps the accumulator's magnitude monotone, which is what the f32 path
+/// needs when the per-term ratios are wildly different in scale.
+///
+/// The `nom > 0` guard is sklearn's `if nom != 0` from `_chi2_kernel_fast`, and
+/// it is load-bearing rather than defensive: a feature that is zero in BOTH rows
+/// contributes `0/0`, and skipping it is the difference between agreeing with
+/// sklearn and returning NaN for every pair of rows that share a zero column —
+/// which is most pairs, since chi² is a histogram kernel and histograms are
+/// sparse. `x >= 0` is a caller obligation (checked host-side, as sklearn's
+/// `check_non_negative` does), so `nom != 0` and `nom > 0` coincide and the
+/// comparison is written in the form that lowers most predictably.
+///
+/// cpu-MLIR contract: per-element 2D launch (`ABSOLUTE_POS_{X,Y}`), bounded
+/// feature loop, `F`/`u32` accumulators only, STATEMENT-form `if` guard, no
+/// transcendental, no SharedMemory, no infinity constant.
+#[cube(launch)]
+pub fn additive_chi2_dist<F: Float + CubeElement>(
+    x: &Array<F>,
+    y: &Array<F>,
+    out: &mut Array<F>,
+    rows_x: u32,
+    rows_y: u32,
+    cols: u32,
+) {
+    let i = ABSOLUTE_POS_X;
+    let j = ABSOLUTE_POS_Y;
+    if i < rows_x {
+        if j < rows_y {
+            let xb = i * cols;
+            let yb = j * cols;
+            let zero = F::from_int(0i64);
+            let mut acc = F::from_int(0i64);
+            let mut kk = 0u32;
+            while kk < cols {
+                let a = x[(xb + kk) as usize];
+                let b = y[(yb + kk) as usize];
+                let nom = a + b;
+                if nom > zero {
+                    let diff = a - b;
+                    acc += diff * diff / nom;
+                }
+                kk += 1u32;
+            }
+            out[(i * rows_y + j) as usize] = -acc;
+        }
+    }
+}
+
 /// Chebyshev (L-infinity) pairwise distance: `out[i*rows_y+j] = max_k |x_ik - y_jk|`.
 ///
 /// cpu-MLIR contract: the running maximum is a mutable-variable STATEMENT-form

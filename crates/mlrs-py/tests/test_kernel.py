@@ -83,7 +83,7 @@ def test_kernel_ridge_predict(dtype):
     rows, cols = X.shape
     nq = Xq.shape[0]
 
-    est = _mlrs.KernelRidge(kernel="rbf", alpha=1.0, gamma=0.5)
+    est = _mlrs.KernelRidge(kernel="rbf", alphas=[1.0], gamma=0.5)
     est.fit(_arrow(X, dtype), _arrow(y, dtype), rows, cols, 1)
     assert est.is_fitted()
     assert est.dtype() == ("f32" if dtype == np.float32 else "f64")

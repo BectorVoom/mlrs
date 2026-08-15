@@ -1,12 +1,33 @@
 //! `kernel_matrix` — pairwise kernel-matrix primitive (PRIM-08).
 //!
 //! Computes the general kernel matrix `K(X, Y)` (an `rows_x × rows_y` matrix,
-//! D-02) for the four KernelRidge kernel families (D-01):
+//! D-02) for every non-`precomputed` kernel family sklearn's `pairwise_kernels`
+//! ships, which is the full string surface `KernelRidge(kernel=…)` accepts
+//! (D-01):
 //!   - `linear`:  `K = X·Yᵀ` (the GEMM base op, identity map).
 //!   - `rbf`:     `K = exp(-γ·‖xᵢ − yⱼ‖²)` (squared-euclidean distance base op,
 //!                then `exp(-γ··)` map).
 //!   - `poly`:    `K = (γ·⟨xᵢ, yⱼ⟩ + coef0)^degree` (GEMM base op, then powf map).
 //!   - `sigmoid`: `K = tanh(γ·⟨xᵢ, yⱼ⟩ + coef0)` (GEMM base op, then tanh map).
+//!   - `laplacian`: `K = exp(-γ·‖xᵢ − yⱼ‖₁)` (L1 pairwise base op, then the same
+//!                `exp(-γ··)` map as `rbf`).
+//!   - `cosine`:  `K = ⟨x̂ᵢ, ŷⱼ⟩` (GEMM over L2-normalised rows, identity map).
+//!   - `additive_chi2`: `K = -Σₖ (xᵢₖ − yⱼₖ)²/(xᵢₖ + yⱼₖ)` (a dedicated pairwise
+//!                base op, identity map; non-negative operands required).
+//!   - `chi2`:    `K = exp(γ·additive_chi2)` (the same base op, then the `rbf`
+//!                map with a NEGATED γ, which is exactly `exp(γ·A)`).
+//!
+//! `precomputed` is deliberately NOT a variant here: it names the absence of a
+//! kernel computation, and the estimator that has the caller's `K` in hand
+//! simply never calls this prim.
+//!
+//! ## Three base ops, eight kernels
+//! Only `additive_chi2` needed a new base op. `laplacian` and `cosine` reach
+//! their results by re-pointing existing ones (the L1 arm of `metric_distance`,
+//! and GEMM over normalised rows), and `chi2` reaches its by re-signing an
+//! existing map's argument. That is the point of the base-op → map factoring:
+//! the number of transcendental evaluations in this file did not grow when the
+//! kernel count doubled.
 //!
 //! ## Composition (the covariance.rs base-op → in-place-map idiom)
 //! Like [`crate::prims::covariance`], `kernel_matrix` is a thin host
@@ -43,12 +64,13 @@ use bytemuck::Pod;
 use cubecl::prelude::*;
 
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
-use mlrs_kernels::{poly_map, rbf_map, sigmoid_map};
+use mlrs_kernels::{additive_chi2_dist, poly_map, rbf_map, sigmoid_map};
 
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
-use crate::prims::distance::distance;
+use crate::prims::distance::{distance, metric_distance};
 use crate::prims::gemm::gemm;
+use crate::prims::knn_graph::Metric;
 use crate::runtime::ActiveRuntime;
 
 /// The typed kernel-family selector (D-01) `kernel_matrix` matches on to pick the
@@ -92,6 +114,42 @@ where
         /// Independent term `coef0`.
         coef0: F,
     },
+    /// Laplacian kernel `K = exp(-γ·‖xᵢ − yⱼ‖₁)` — the L1 (Manhattan) pairwise
+    /// distance base op, then the SAME `exp(-γ··)` map RBF uses.
+    ///
+    /// The only thing separating this from `Rbf` is which norm feeds the
+    /// exponential, which is why it reuses `rbf_map` rather than getting a map
+    /// of its own: `laplacian_kernel` in sklearn is `rbf_kernel` with
+    /// `manhattan_distances` substituted for the squared Euclidean, and keeping
+    /// one map means the two can never drift in how they evaluate `exp`.
+    Laplacian {
+        /// Kernel coefficient `γ` (resolved to `1/n_features` by the caller when
+        /// sklearn's `gamma=None` default is requested — D-05).
+        gamma: F,
+    },
+    /// Cosine kernel `K = ⟨x̂ᵢ, ŷⱼ⟩` over L2-normalised rows — sklearn's
+    /// `cosine_similarity`. Parameterless (`gamma`/`degree`/`coef0` do not apply).
+    Cosine,
+    /// Exponential chi-squared kernel `K = exp(γ·A)` where `A` is the
+    /// [`Kernel::AdditiveChi2`] value (already negative), i.e.
+    /// `exp(-γ·Σₖ (xᵢₖ − yⱼₖ)²/(xᵢₖ + yⱼₖ))`.
+    ///
+    /// Requires a NON-NEGATIVE `x`/`y` (checked by the caller, as sklearn's
+    /// `check_non_negative` does) and an EXPLICIT `γ` — see
+    /// `KernelRidge::fit` for why `gamma = None` is an error here and a
+    /// `1/n_features` default everywhere else.
+    Chi2 {
+        /// Kernel coefficient `γ`.
+        gamma: F,
+    },
+    /// Additive chi-squared kernel `K = -Σₖ (xᵢₖ − yⱼₖ)²/(xᵢₖ + yⱼₖ)` — sklearn's
+    /// `additive_chi2_kernel`. Parameterless, non-negative operands required.
+    ///
+    /// Note this kernel is NOT positive definite in the strict sense sklearn's
+    /// docs warn about; a `KernelRidge` fit on it can legitimately hit a
+    /// non-SPD `(K + αI)` for a small `α`, which surfaces as
+    /// `PrimError::NotPositiveDefinite` rather than a silently wrong solve.
+    AdditiveChi2,
 }
 
 /// Compute the general kernel matrix `K(X, Y)` (D-02): an `rows_x × rows_y`
@@ -205,7 +263,193 @@ where
             });
             Ok(base)
         }
+        // Laplacian: L1 (Manhattan) pairwise base, then the SAME exp(-γ··) map
+        // RBF uses. `metric_distance` returns the TRUE L1 distance (its
+        // needs-boundary-sqrt flag is false for Manhattan), so the base is fed to
+        // the map unmodified — the flag is discarded deliberately, not dropped by
+        // oversight, and the debug assertion below pins that.
+        Kernel::Laplacian { gamma } => {
+            let (base, needs_sqrt) = metric_distance::<F>(
+                pool,
+                x,
+                (rows_x, cols),
+                y,
+                (rows_y, cols_y),
+                Metric::Manhattan,
+                out,
+            )?;
+            debug_assert!(
+                !needs_sqrt,
+                "Manhattan returns the true L1 distance; a boundary sqrt would \
+                 mean the metric dispatch changed under this kernel"
+            );
+            let n = rows_x * rows_y;
+            if host_map_applicable::<F>() {
+                let g = host_to_f64(gamma);
+                return Ok(map_in_place_host::<F>(pool, base, n, |d1| (-g * d1).exp()));
+            }
+            launch_map_in_place(pool, &base, n, |client, count, dim, in_arg, out_arg| {
+                rbf_map::launch::<F, ActiveRuntime>(client, count, dim, in_arg, out_arg, gamma);
+            });
+            Ok(base)
+        }
+        // Cosine: the LINEAR kernel over L2-normalised rows — sklearn's
+        // `cosine_similarity` is `normalize(X) @ normalize(Y).T` and nothing
+        // else, so this is the linear arm with normalised operands and no map.
+        //
+        // The normalisation runs on the HOST (the `knn_graph` cosine precedent):
+        // it is an O(n·d) pass in front of the O(n²·d) GEMM, and doing it here
+        // rather than in a kernel is what lets the zero-row rule be sklearn's
+        // exactly — `normalize` divides by 1 where the norm is 0, leaving the row
+        // zero, and a device reciprocal would have to reproduce that guard.
+        Kernel::Cosine => {
+            let xn = l2_normalized_copy::<F>(pool, x, rows_x, cols);
+            // `y` may BE `x` (the symmetric training Gram passes `y = x`), so the
+            // second operand is normalised into its own buffer unconditionally
+            // rather than aliased — the buffers are released independently below.
+            let yn = l2_normalized_copy::<F>(pool, y, rows_y, cols_y);
+            let k = gemm::<F>(pool, &xn, (rows_x, cols), &yn, (cols, rows_y), false, true, out);
+            xn.release_into(pool);
+            yn.release_into(pool);
+            k
+        }
+        // Chi2: the additive-chi² base A (already negative), then exp(γ·A).
+        // `rbf_map` computes `exp(-γ'·v)`, so passing `γ' = -γ` gives exactly
+        // `exp(γ·A)` with no second map kernel — the sign lives in the argument,
+        // which is why `Chi2` needs no transcendental of its own.
+        Kernel::Chi2 { gamma } => {
+            let base =
+                additive_chi2_base::<F>(pool, x, (rows_x, cols), y, (rows_y, cols_y), out)?;
+            let n = rows_x * rows_y;
+            if host_map_applicable::<F>() {
+                let g = host_to_f64(gamma);
+                return Ok(map_in_place_host::<F>(pool, base, n, |a| (g * a).exp()));
+            }
+            let neg_gamma = f64_to_host::<F>(-host_to_f64(gamma));
+            launch_map_in_place(pool, &base, n, |client, count, dim, in_arg, out_arg| {
+                rbf_map::launch::<F, ActiveRuntime>(client, count, dim, in_arg, out_arg, neg_gamma);
+            });
+            Ok(base)
+        }
+        // AdditiveChi2: the base IS the kernel (identity map, like `linear`).
+        Kernel::AdditiveChi2 => {
+            additive_chi2_base::<F>(pool, x, (rows_x, cols), y, (rows_y, cols_y), out)
+        }
     }
+}
+
+/// An L2-row-normalised device copy of `m` (`rows × cols`), for the cosine
+/// kernel. A zero row stays zero (sklearn's `normalize` divides such a row by 1),
+/// which is what makes `cosine_similarity` return 0 rather than NaN against it.
+///
+/// Returns a NEW buffer; the caller owns it and must release it. `m` is left
+/// untouched — it is usually fitted state (`X_fit_`) or the caller's borrowed
+/// input, neither of which this prim may mutate.
+fn l2_normalized_copy<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    m: &DeviceArray<ActiveRuntime, F>,
+    rows: usize,
+    cols: usize,
+) -> DeviceArray<ActiveRuntime, F>
+where
+    F: Float + CubeElement + Pod,
+{
+    let host: Vec<F> = m.to_host(pool);
+    let mut out: Vec<F> = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        let row = &host[r * cols..(r + 1) * cols];
+        // Accumulate the norm in f64 regardless of `F`: at f32 a row of large
+        // features can overflow the sum of squares long before the row itself is
+        // anywhere near the f32 range, and the resulting `inf` norm would zero a
+        // perfectly ordinary row.
+        let norm = row
+            .iter()
+            .map(|&v| host_to_f64(v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+        for &v in row {
+            out.push(f64_to_host::<F>(host_to_f64(v) * inv));
+        }
+    }
+    DeviceArray::from_host(pool, &out)
+}
+
+/// The additive chi-squared base `A[i][j] = -Σₖ (xᵢₖ − yⱼₖ)²/(xᵢₖ + yⱼₖ)`
+/// (`rows_x × rows_y`, row-major), shared by [`Kernel::AdditiveChi2`] (which
+/// returns it as-is) and [`Kernel::Chi2`] (which exponentiates it).
+///
+/// Non-negative operands are a CALLER obligation, validated host-side by the
+/// estimator the way sklearn's `check_non_negative` does — the kernel's
+/// `nom > 0` term guard assumes it.
+fn additive_chi2_base<F>(
+    pool: &mut BufferPool<ActiveRuntime>,
+    x: &DeviceArray<ActiveRuntime, F>,
+    (rows_x, cols): (usize, usize),
+    y: &DeviceArray<ActiveRuntime, F>,
+    (rows_y, _cols_y): (usize, usize),
+    out: Option<DeviceArray<ActiveRuntime, F>>,
+) -> Result<DeviceArray<ActiveRuntime, F>, PrimError>
+where
+    F: Float + CubeElement + Pod,
+{
+    // WR-03 (the `distance_direct` precedent): the three dims are cast to u32 for
+    // the launch, so reject an overflowing dimension BEFORE the launch rather
+    // than let the cast truncate into a bad loop bound.
+    for (operand, dim) in [("rows_x", rows_x), ("rows_y", rows_y), ("cols", cols)] {
+        if dim > u32::MAX as usize {
+            return Err(PrimError::ShapeMismatch {
+                operand,
+                rows: dim,
+                cols: 0,
+                len: u32::MAX as usize,
+            });
+        }
+    }
+    let out_len = rows_x.checked_mul(rows_y).ok_or(PrimError::Overflow {
+        operand: "additive_chi2",
+        lhs: rows_x,
+        rhs: rows_y,
+    })?;
+    let out_handle = match &out {
+        Some(o) => o.handle().clone(),
+        None => pool.acquire(out_len * std::mem::size_of::<F>()),
+    };
+    let client = pool.client().clone();
+
+    // SAFETY: the operand lengths are the geometry-validated element counts the
+    // caller checked in `validate_geometry`, and the kernel bounds-checks
+    // `i < rows_x && j < rows_y` before any index.
+    let x_arg = unsafe { ArrayArg::from_raw_parts(x.handle().clone(), x.len()) };
+    let y_arg = unsafe { ArrayArg::from_raw_parts(y.handle().clone(), y.len()) };
+    let out_arg = unsafe { ArrayArg::from_raw_parts(out_handle.clone(), out_len) };
+
+    let (count, dim) = launch_dims_2d(rows_x, rows_y);
+    additive_chi2_dist::launch::<F, ActiveRuntime>(
+        &client,
+        count,
+        dim,
+        x_arg,
+        y_arg,
+        out_arg,
+        rows_x as u32,
+        rows_y as u32,
+        cols as u32,
+    );
+    Ok(DeviceArray::from_raw(out_handle, out_len))
+}
+
+/// 2D per-output-element launch config for [`additive_chi2_base`], the same
+/// 16×16 cube the direct pairwise distance kernels use (`distance.rs`).
+fn launch_dims_2d(rows: usize, cols: usize) -> (CubeCount, CubeDim) {
+    let bx = 16u32;
+    let by = 16u32;
+    let cx = ((rows as u32) + bx - 1) / bx;
+    let cy = ((cols as u32) + by - 1) / by;
+    (
+        CubeCount::Static(cx.max(1), cy.max(1), 1),
+        CubeDim { x: bx, y: by, z: 1 },
+    )
 }
 
 /// Must the per-element kernel map run on the HOST rather than as a device
