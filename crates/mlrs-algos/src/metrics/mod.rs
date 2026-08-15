@@ -294,6 +294,86 @@ fn validate_weight(len: usize, sample_weight: Option<&[f64]>) -> Result<(), Metr
 /// `y_true`/`y_pred` (or weight) length mismatch, and
 /// `Err(MetricError::InvalidWeight)` on a negative/NaN weight entry — no
 /// panic (SPEC §5 behavior clause).
+/// O(1) `label -> class index` lookup over a resolved class list
+/// (METR-PARAM-02).
+///
+/// The label-based metrics all need "which row of the matrix does this sample
+/// belong to", `n` times. Doing it with `classes.iter().position(...)` — the
+/// obvious spelling, and what this module used to do — is O(K) per sample, so
+/// the tabulation is O(n·K): measured on `confusion_matrix` at n = 1e6, that
+/// was 12.4 ms at K = 2 rising to 53.4 ms at K = 128, where it had almost
+/// erased the 4.9x lead over sklearn (whose own tabulation is K-independent).
+///
+/// Two representations, because a class LIST is not a class RANGE:
+///
+/// * [`ClassIndex::Dense`] — a direct table indexed by `label - min`. This is
+///   the case that matters: class ids are nearly always `0..K-1` (or another
+///   compact run), so the table has one slot per class and the lookup is a
+///   bounds check plus a load.
+/// * [`ClassIndex::Sparse`] — a `HashMap`, for a label set whose numeric SPAN
+///   dwarfs its cardinality (`labels=[0, 1_000_000]`). A dense table there
+///   would be a megabyte-scale allocation for two classes.
+///
+/// The dense/sparse choice is made on the span, budgeted at 8 slots per class
+/// (32 bytes/class) with a floor, so the table can never outgrow the class
+/// list by more than a constant factor.
+///
+/// A duplicated label resolves to its FIRST position, exactly as
+/// `Iterator::position` did — callers may pass an arbitrary `labels` list, and
+/// this type is a drop-in for the scan it replaces, not a new rule.
+pub(crate) enum ClassIndex {
+    Dense { min: i32, table: Vec<u32> },
+    Sparse(std::collections::HashMap<i32, u32>),
+}
+
+/// Table slot / map value meaning "no class here". `u32::MAX` cannot collide
+/// with a real index: a class list that long would need a `u32::MAX`-squared
+/// confusion matrix.
+const NO_CLASS: u32 = u32::MAX;
+
+impl ClassIndex {
+    pub(crate) fn new(classes: &[i32]) -> Self {
+        let (Some(&min), Some(&max)) = (classes.iter().min(), classes.iter().max()) else {
+            return ClassIndex::Sparse(std::collections::HashMap::new());
+        };
+        // i64 so a `[i32::MIN, i32::MAX]` label list cannot overflow the span.
+        let span = (max as i64 - min as i64 + 1) as u64;
+        let budget = (classes.len() as u64).saturating_mul(8).max(64);
+        if span <= budget {
+            let mut table = vec![NO_CLASS; span as usize];
+            for (i, &c) in classes.iter().enumerate() {
+                let slot = &mut table[(c as i64 - min as i64) as usize];
+                if *slot == NO_CLASS {
+                    *slot = i as u32;
+                }
+            }
+            ClassIndex::Dense { min, table }
+        } else {
+            let mut map = std::collections::HashMap::with_capacity(classes.len());
+            for (i, &c) in classes.iter().enumerate() {
+                map.entry(c).or_insert(i as u32);
+            }
+            ClassIndex::Sparse(map)
+        }
+    }
+
+    pub(crate) fn get(&self, label: i32) -> Option<usize> {
+        match self {
+            ClassIndex::Dense { min, table } => {
+                let offset = label as i64 - *min as i64;
+                if offset < 0 || offset >= table.len() as i64 {
+                    return None;
+                }
+                match table[offset as usize] {
+                    NO_CLASS => None,
+                    idx => Some(idx as usize),
+                }
+            }
+            ClassIndex::Sparse(map) => map.get(&label).map(|&idx| idx as usize),
+        }
+    }
+}
+
 pub fn class_bookkeeping(
     y_true: &[i32],
     y_pred: &[i32],

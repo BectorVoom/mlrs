@@ -10,8 +10,8 @@
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
 
 use super::{
-    class_bookkeeping, validate_weight, Average, MetricError, MultiClass, Normalize, PrfOut,
-    PrfResult, ZeroDivision,
+    class_bookkeeping, validate_weight, Average, ClassIndex, MetricError, MultiClass, Normalize,
+    PrfOut, PrfResult, ZeroDivision,
 };
 
 // ==================== TASK-03 — METR-CLS-01: accuracy_score ====================
@@ -95,10 +95,13 @@ pub fn confusion_matrix(
     };
     let n = classes.len();
     let mut matrix = vec![vec![0.0f64; n]; n];
-    let index_of = |c: i32| classes.iter().position(|&x| x == c);
+    // O(1) per lookup, so the tabulation is O(n) rather than the O(n·K) a
+    // `classes.iter().position(...)` scan per sample would cost — see
+    // [`ClassIndex`] for the measurement that motivated it (METR-PARAM-02).
+    let index = ClassIndex::new(&classes);
     for i in 0..y_true.len() {
         let w = sample_weight.map_or(1.0, |sw| sw[i]);
-        if let (Some(ti), Some(pi)) = (index_of(y_true[i]), index_of(y_pred[i])) {
+        if let (Some(ti), Some(pi)) = (index.get(y_true[i]), index.get(y_pred[i])) {
             matrix[ti][pi] += w;
         }
     }

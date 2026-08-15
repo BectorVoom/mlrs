@@ -164,6 +164,123 @@ fn assert_matrix_close(got: &[Vec<f64>], want_flat: &[f64], n: usize, tol: f64, 
     }
 }
 
+// ---- METR-PARAM-02: the O(1) class lookup must be a DROP-IN for the scan ----
+
+/// The `classes.iter().position(...)` scan `confusion_matrix` used to run per
+/// sample, kept here as the reference the O(1) [`ClassIndex`] path is compared
+/// against. Every semantic the scan had — first-occurrence wins on a duplicate
+/// label, an unknown label contributes nothing — has to survive.
+fn naive_confusion(
+    y_true: &[i32],
+    y_pred: &[i32],
+    classes: &[i32],
+    sample_weight: Option<&[f64]>,
+) -> Vec<Vec<f64>> {
+    let n = classes.len();
+    let mut matrix = vec![vec![0.0f64; n]; n];
+    let index_of = |c: i32| classes.iter().position(|&x| x == c);
+    for i in 0..y_true.len() {
+        let w = sample_weight.map_or(1.0, |sw| sw[i]);
+        if let (Some(ti), Some(pi)) = (index_of(y_true[i]), index_of(y_pred[i])) {
+            matrix[ti][pi] += w;
+        }
+    }
+    matrix
+}
+
+#[test]
+fn confusion_matrix_class_lookup_matches_the_linear_scan_it_replaced() {
+    // Each case is a label geometry the lookup has to get right: 0-based, the
+    // negative/{-1,1} target, a non-contiguous run, a span far larger than the
+    // class count (which selects the HashMap arm), a duplicated label, and a
+    // `labels` list disjoint from parts of the data.
+    let cases: Vec<(&str, Vec<i32>, Vec<i32>, Vec<i32>)> = vec![
+        (
+            "0-based dense",
+            vec![0, 1, 2, 1, 0, 2, 2, 1],
+            vec![0, 2, 2, 1, 1, 0, 2, 1],
+            vec![0, 1, 2],
+        ),
+        (
+            "negative labels",
+            vec![-1, 1, -1, 1, 1, -1],
+            vec![1, 1, -1, -1, 1, -1],
+            vec![-1, 1],
+        ),
+        (
+            "non-contiguous run",
+            vec![10, 40, 10, 90, 40, 90],
+            vec![10, 10, 40, 90, 90, 40],
+            vec![10, 40, 90],
+        ),
+        (
+            "span >> cardinality (sparse arm)",
+            vec![0, 1_000_000, 0, 1_000_000],
+            vec![1_000_000, 1_000_000, 0, 0],
+            vec![0, 1_000_000],
+        ),
+        (
+            "i32 extremes (span overflows i32)",
+            vec![i32::MIN, i32::MAX, i32::MIN, i32::MAX],
+            vec![i32::MAX, i32::MAX, i32::MIN, i32::MIN],
+            vec![i32::MIN, i32::MAX],
+        ),
+        (
+            "duplicated label: first position wins",
+            vec![0, 1, 2, 1, 0],
+            vec![1, 1, 2, 0, 0],
+            vec![0, 1, 0, 2],
+        ),
+        (
+            "labels omitting a class present in the data",
+            vec![0, 1, 2, 3, 1],
+            vec![2, 1, 0, 3, 3],
+            vec![1, 2],
+        ),
+    ];
+
+    for (what, y_true, y_pred, classes) in cases {
+        let sw: Vec<f64> = (0..y_true.len()).map(|i| 0.5 + i as f64).collect();
+        for weight in [None, Some(&sw[..])] {
+            let got = confusion_matrix(&y_true, &y_pred, Some(&classes), weight, None)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let want = naive_confusion(&y_true, &y_pred, &classes, weight);
+            assert_eq!(
+                flatten(&got),
+                flatten(&want),
+                "{what} (weighted={})",
+                weight.is_some()
+            );
+        }
+    }
+}
+
+#[test]
+fn confusion_matrix_derived_classes_match_the_linear_scan() {
+    // `labels = None` derives the class order itself (sorted unique of
+    // `y_true ∪ y_pred`); the lookup has to agree with the scan over THAT
+    // order too, including when the data is sparse in label space.
+    for (what, y_true, y_pred) in [
+        (
+            "small ids",
+            vec![3i32, 1, 4, 1, 5, 9, 2, 6],
+            vec![1i32, 1, 4, 5, 5, 2, 2, 9],
+        ),
+        (
+            "wide ids",
+            vec![-2_000_000i32, 7, -2_000_000, 7, 500_000],
+            vec![7i32, 7, 500_000, -2_000_000, 500_000],
+        ),
+    ] {
+        let got = confusion_matrix(&y_true, &y_pred, None, None, None).unwrap();
+        let mut classes: Vec<i32> = y_true.iter().chain(y_pred.iter()).copied().collect();
+        classes.sort_unstable();
+        classes.dedup();
+        let want = naive_confusion(&y_true, &y_pred, &classes, None);
+        assert_eq!(flatten(&got), flatten(&want), "{what}");
+    }
+}
+
 #[test]
 fn confusion_matrix_empty_class_via_explicit_labels() {
     let case = load("metrics_cls_degenerate_seed42.npz");

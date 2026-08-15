@@ -178,13 +178,36 @@ free.** Every `average` value lands at 14.0–14.3 ms (n = 1e6, K = 4); every
 `normalize` value at 14.6–14.9 ms. Both parameters act on the O(K)/O(K²)
 bookkeeping that follows an O(n) pass.
 
-### A scaling caveat that is not a parameter
+### The class-count slope, and what removed it
 
-`confusion_matrix` and the precision/recall/f1 bookkeeping resolve each sample's
-class with a LINEAR scan of the class list, so they are O(n·K): 14.9 ms at
-K = 4 versus 25.0 ms at K = 32 (n = 1e6), while sklearn stays flat at ~58 ms.
-mlrs still wins by 2.3x at K = 32, but the gap narrows with the class count and
-a hash/dense-index lookup would remove the slope.
+Resolving "which row of the matrix is this sample" with
+`classes.iter().position(...)` is O(K) per sample, so the tabulation was
+O(n·K) — a slope in the CLASS COUNT that no parameter controls and that sklearn
+(whose tabulation is K-independent) does not have. `confusion_matrix` now
+builds a [`ClassIndex`](../crates/mlrs-algos/src/metrics/mod.rs) first: a direct
+table indexed by `label - min` when the label span is proportional to the class
+count (the normal case — ids are almost always `0..K-1`), a `HashMap` when it is
+not (`labels=[0, 1_000_000]` would otherwise allocate a megabyte for two
+classes). Lookup is O(1) either way, and a duplicated label still resolves to
+its first position, exactly as the scan did.
+
+n = 1e6, wall clock on a quiet box, `--level confusion`:
+
+| n_classes | before | after | vs sklearn (before → after) |
+|---|---|---|---|
+| 2 | 12.4 ms | 8.7 ms | 4.9x → 6.8x |
+| 4 | 15.4 ms | 9.5 ms | 3.8x → 6.2x |
+| 32 | 26.4 ms | 12.2 ms | 2.2x → 4.9x |
+| 128 | 53.4 ms | 14.0 ms | 1.14x → 4.4x |
+
+The residual 8.7 → 14.0 ms growth is not a per-sample scan any more: it is the
+scatter's cache behavior (a `K × K` matrix of separately allocated rows) plus
+the O(K²) normalization pass. It is flat in `n`.
+
+The same linear scan still sits in three siblings — `class_bookkeeping` (which
+feeds precision/recall/f1), `log_loss`'s column lookup, and multiclass
+`roc_auc_score`'s `y_true` encoding. `ClassIndex` drops into all three
+unchanged; they are simply not done yet.
 
 ## Oracle tests
 
