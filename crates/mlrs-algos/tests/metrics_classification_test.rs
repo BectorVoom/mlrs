@@ -190,54 +190,22 @@ fn naive_confusion(
 
 #[test]
 fn confusion_matrix_class_lookup_matches_the_linear_scan_it_replaced() {
-    // Each case is a label geometry the lookup has to get right: 0-based, the
-    // negative/{-1,1} target, a non-contiguous run, a span far larger than the
-    // class count (which selects the HashMap arm), a duplicated label, and a
-    // `labels` list disjoint from parts of the data.
-    let cases: Vec<(&str, Vec<i32>, Vec<i32>, Vec<i32>)> = vec![
-        (
-            "0-based dense",
-            vec![0, 1, 2, 1, 0, 2, 2, 1],
-            vec![0, 2, 2, 1, 1, 0, 2, 1],
-            vec![0, 1, 2],
-        ),
-        (
-            "negative labels",
-            vec![-1, 1, -1, 1, 1, -1],
-            vec![1, 1, -1, -1, 1, -1],
-            vec![-1, 1],
-        ),
-        (
-            "non-contiguous run",
-            vec![10, 40, 10, 90, 40, 90],
-            vec![10, 10, 40, 90, 90, 40],
-            vec![10, 40, 90],
-        ),
-        (
-            "span >> cardinality (sparse arm)",
-            vec![0, 1_000_000, 0, 1_000_000],
-            vec![1_000_000, 1_000_000, 0, 0],
-            vec![0, 1_000_000],
-        ),
-        (
-            "i32 extremes (span overflows i32)",
-            vec![i32::MIN, i32::MAX, i32::MIN, i32::MAX],
-            vec![i32::MAX, i32::MAX, i32::MIN, i32::MIN],
-            vec![i32::MIN, i32::MAX],
-        ),
-        (
-            "duplicated label: first position wins",
-            vec![0, 1, 2, 1, 0],
-            vec![1, 1, 2, 0, 0],
-            vec![0, 1, 0, 2],
-        ),
-        (
-            "labels omitting a class present in the data",
-            vec![0, 1, 2, 3, 1],
-            vec![2, 1, 0, 3, 3],
-            vec![1, 2],
-        ),
-    ];
+    // The shared label geometries, plus the two rules specific to a
+    // caller-supplied `labels` list: a duplicate resolves to its first
+    // position, and a label the list omits contributes nothing.
+    let mut cases = lookup_geometries();
+    cases.push((
+        "duplicated label: first position wins",
+        vec![0, 1, 2, 1, 0],
+        vec![1, 1, 2, 0, 0],
+        vec![0, 1, 0, 2],
+    ));
+    cases.push((
+        "labels omitting a class present in the data",
+        vec![0, 1, 2, 3, 1],
+        vec![2, 1, 0, 3, 3],
+        vec![1, 2],
+    ));
 
     for (what, y_true, y_pred, classes) in cases {
         let sw: Vec<f64> = (0..y_true.len()).map(|i| 0.5 + i as f64).collect();
@@ -278,6 +246,225 @@ fn confusion_matrix_derived_classes_match_the_linear_scan() {
         classes.dedup();
         let want = naive_confusion(&y_true, &y_pred, &classes, None);
         assert_eq!(flatten(&got), flatten(&want), "{what}");
+    }
+}
+
+/// The label geometries the O(1) lookup has to get right, shared by the
+/// drop-in-equivalence tests below: 0-based, the `{-1, 1}` target, a
+/// non-contiguous run, a span that dwarfs the cardinality (which selects the
+/// HashMap arm), and the i32 extremes (whose span overflows i32).
+fn lookup_geometries() -> Vec<(&'static str, Vec<i32>, Vec<i32>, Vec<i32>)> {
+    vec![
+        (
+            "0-based dense",
+            vec![0, 1, 2, 1, 0, 2, 2, 1],
+            vec![0, 2, 2, 1, 1, 0, 2, 1],
+            vec![0, 1, 2],
+        ),
+        (
+            "negative labels",
+            vec![-1, 1, -1, 1, 1, -1],
+            vec![1, 1, -1, -1, 1, -1],
+            vec![-1, 1],
+        ),
+        (
+            "non-contiguous run",
+            vec![10, 40, 10, 90, 40, 90],
+            vec![10, 10, 40, 90, 90, 40],
+            vec![10, 40, 90],
+        ),
+        (
+            "span >> cardinality (sparse arm)",
+            vec![0, 1_000_000, 0, 1_000_000],
+            vec![1_000_000, 1_000_000, 0, 0],
+            vec![0, 1_000_000],
+        ),
+        (
+            "i32 extremes (span overflows i32)",
+            vec![i32::MIN, i32::MAX, i32::MIN, i32::MAX],
+            vec![i32::MAX, i32::MAX, i32::MIN, i32::MIN],
+            vec![i32::MIN, i32::MAX],
+        ),
+    ]
+}
+
+#[test]
+fn class_bookkeeping_lookup_matches_the_linear_scan_it_replaced() {
+    // `precision_score(average=None)` is `tp / (tp + fp)` straight off
+    // `class_bookkeeping`'s accumulation, so a per-class comparison against the
+    // scan pins the whole TP/FP/FN attribution — including "a label outside
+    // `classes` contributes nothing to any class" (METR-PARAM-02).
+    let mut cases = lookup_geometries();
+    cases.push((
+        "duplicated label: first position wins",
+        vec![0, 1, 2, 1, 0],
+        vec![1, 1, 2, 0, 0],
+        vec![0, 1, 0, 2],
+    ));
+    cases.push((
+        "labels omitting a class present in the data",
+        vec![0, 1, 2, 3, 1],
+        vec![2, 1, 0, 3, 3],
+        vec![1, 2],
+    ));
+
+    for (what, y_true, y_pred, classes) in cases {
+        let sw: Vec<f64> = (0..y_true.len()).map(|i| 0.5 + i as f64).collect();
+        for weight in [None, Some(&sw[..])] {
+            // The scan the lookup replaced, re-derived here as the reference.
+            let index_of = |c: i32| classes.iter().position(|&x| x == c);
+            let mut tp = vec![0.0f64; classes.len()];
+            let mut fp = vec![0.0f64; classes.len()];
+            for i in 0..y_true.len() {
+                let w = weight.map_or(1.0, |sw: &[f64]| sw[i]);
+                if y_true[i] == y_pred[i] {
+                    if let Some(idx) = index_of(y_true[i]) {
+                        tp[idx] += w;
+                    }
+                } else if let Some(idx) = index_of(y_pred[i]) {
+                    fp[idx] += w;
+                }
+            }
+            let want: Vec<f64> = (0..classes.len())
+                .map(|c| {
+                    if tp[c] + fp[c] > 0.0 {
+                        tp[c] / (tp[c] + fp[c])
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+
+            let got = prf_per_class(
+                precision_score(
+                    &y_true,
+                    &y_pred,
+                    Some(&classes),
+                    1,
+                    Average::None_,
+                    weight,
+                    ZeroDivision::Zero,
+                )
+                .unwrap_or_else(|e| panic!("{what}: {e}")),
+            );
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{what}: per-class length (weighted={})",
+                weight.is_some()
+            );
+            for (c, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= EXACT_TOL,
+                    "{what}[class {c}] (weighted={}): got {g}, want {w}",
+                    weight.is_some()
+                );
+            }
+        }
+    }
+}
+
+/// Relabel a class list and the targets drawn from it to `0..K-1`, PRESERVING
+/// the sorted order — the mapping every class-indexed metric resolves labels
+/// through. Any metric whose lookup is correct must return the identical value
+/// for both spellings of the same problem.
+fn relabel_to_dense(values: &[i32], classes: &[i32]) -> Vec<i32> {
+    let mut sorted = classes.to_vec();
+    sorted.sort_unstable();
+    values
+        .iter()
+        .map(|v| {
+            sorted
+                .iter()
+                .position(|c| c == v)
+                .expect("value in classes") as i32
+        })
+        .collect()
+}
+
+#[test]
+fn log_loss_is_invariant_to_relabeling_the_classes() {
+    // log_loss maps `y_true` to a PROBABILITY COLUMN through the class lookup,
+    // so a wrong lookup silently scores the wrong column rather than erroring
+    // (METR-PARAM-02).
+    let y_prob = [
+        0.7, 0.2, 0.1, //
+        0.1, 0.8, 0.1, //
+        0.2, 0.2, 0.6, //
+        0.3, 0.3, 0.4, //
+    ];
+    for (what, classes) in [
+        ("0-based", vec![0, 1, 2]),
+        ("negative + sparse", vec![-5, 7, 1_000_000]),
+        ("i32 extremes", vec![i32::MIN, 0, i32::MAX]),
+    ] {
+        let y_true: Vec<i32> = vec![classes[0], classes[1], classes[2], classes[0]];
+        let dense_true = relabel_to_dense(&y_true, &classes);
+        let sw = [1.0, 2.0, 0.5, 1.5];
+        for weight in [None, Some(&sw[..])] {
+            let got = log_loss(
+                &y_true,
+                &y_prob,
+                3,
+                Some(&classes),
+                weight,
+                f64::EPSILON,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let want = log_loss(
+                &dense_true,
+                &y_prob,
+                3,
+                Some(&[0, 1, 2]),
+                weight,
+                f64::EPSILON,
+                true,
+            )
+            .unwrap();
+            assert_close(got, want, EXACT_TOL, what);
+        }
+    }
+}
+
+#[test]
+fn roc_auc_multiclass_is_invariant_to_relabeling_the_classes() {
+    // The OvR/OvO paths encode `y_true` against the class order before any
+    // sweep runs; a wrong lookup would score class columns against the wrong
+    // indicator (METR-PARAM-02).
+    let y_score = [
+        0.7, 0.2, 0.1, //
+        0.1, 0.8, 0.1, //
+        0.2, 0.2, 0.6, //
+        0.3, 0.5, 0.2, //
+        0.25, 0.25, 0.5, //
+        0.4, 0.4, 0.2, //
+    ];
+    for (what, classes) in [
+        ("0-based", vec![0, 1, 2]),
+        ("negative + sparse", vec![-5, 7, 1_000_000]),
+        ("i32 extremes", vec![i32::MIN, 0, i32::MAX]),
+    ] {
+        let y_true: Vec<i32> = vec![
+            classes[0], classes[1], classes[2], classes[0], classes[2], classes[1],
+        ];
+        let dense_true = relabel_to_dense(&y_true, &classes);
+        for multi_class in [MultiClass::Ovr, MultiClass::Ovo] {
+            for average in [Average::Macro, Average::Weighted] {
+                let got = mc_auc(&y_true, &y_score, &classes, multi_class, average, None)
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                let want = mc_auc(
+                    &dense_true,
+                    &y_score,
+                    &[0, 1, 2],
+                    multi_class,
+                    average,
+                    None,
+                )
+                .unwrap();
+                assert_close(got, want, EXACT_TOL, what);
+            }
+        }
     }
 }
 

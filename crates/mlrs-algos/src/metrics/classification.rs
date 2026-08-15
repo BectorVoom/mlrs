@@ -411,13 +411,16 @@ pub fn log_loss(
     // belonging to the passed labels ...")`; return a typed error rather than
     // panicking (code-review fix — a panic across the PyO3 boundary aborts the
     // interpreter, whereas sklearn's ValueError is catchable).
-    let index_of = |c: i32| classes.iter().position(|&x| x == c);
+    //
+    // O(1) per lookup (METR-PARAM-02) — the scan it replaces cost O(K) on top
+    // of the O(K) probability row this loop already walks past.
+    let index = ClassIndex::new(&classes);
 
     let mut sum = 0.0f64;
     let mut weight_total = 0.0f64;
     for i in 0..y_true.len() {
         let w = sample_weight.map_or(1.0, |sw| sw[i]);
-        let col = index_of(y_true[i]).ok_or(MetricError::LabelNotInLabels)?;
+        let col = index.get(y_true[i]).ok_or(MetricError::LabelNotInLabels)?;
         let p = y_prob[i * n_classes + col].clamp(eps, 1.0 - eps);
         sum += -w * p.ln();
         weight_total += w;
@@ -678,15 +681,12 @@ pub fn roc_auc_score_multiclass(
         return Err(MetricError::UnsupportedAverage);
     }
 
-    // Encode y_true against the resolved class order once.
+    // Encode y_true against the resolved class order once, O(1) per sample
+    // ([`ClassIndex`], METR-PARAM-02) rather than a K-long scan each.
+    let index = ClassIndex::new(classes);
     let encoded: Vec<usize> = y_true
         .iter()
-        .map(|t| {
-            classes
-                .iter()
-                .position(|c| c == t)
-                .ok_or(MetricError::LabelNotInLabels)
-        })
+        .map(|&t| index.get(t).ok_or(MetricError::LabelNotInLabels))
         .collect::<Result<_, _>>()?;
 
     match multi_class {

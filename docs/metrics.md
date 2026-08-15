@@ -204,10 +204,40 @@ The residual 8.7 → 14.0 ms growth is not a per-sample scan any more: it is the
 scatter's cache behavior (a `K × K` matrix of separately allocated rows) plus
 the O(K²) normalization pass. It is flat in `n`.
 
-The same linear scan still sits in three siblings — `class_bookkeeping` (which
-feeds precision/recall/f1), `log_loss`'s column lookup, and multiclass
-`roc_auc_score`'s `y_true` encoding. `ClassIndex` drops into all three
-unchanged; they are simply not done yet.
+The same `ClassIndex` now serves the other three sites that scanned:
+`class_bookkeeping` (which feeds precision/recall/f1), `log_loss`'s column
+lookup, and multiclass `roc_auc_score`'s `y_true` encoding.
+
+`f1_score`, n = 1e6 (`--level prf`) — the same shape as `confusion_matrix`,
+since both are one O(n) tabulation:
+
+| n_classes | before | after | vs sklearn (before → after) |
+|---|---|---|---|
+| 2 | 11.1 ms | 8.8 ms | 6.3x → 8.1x |
+| 4 | 13.9 ms | 9.7 ms | 5.3x → 7.9x |
+| 32 | 21.8 ms | 11.7 ms | 4.5x → 8.6x |
+| 128 | 39.1 ms | 13.1 ms | 3.0x → 9.3x |
+
+`log_loss`, n = 1e6, `labels=[0..K-1]` (`--level logloss`):
+
+| n_classes | before | after | vs sklearn (before → after) |
+|---|---|---|---|
+| 2 | 8.1 ms | 5.0 ms | 8.7x → 14.4x |
+| 4 | 10.1 ms | 5.0 ms | 8.3x → 16.9x |
+| 32 | 39.1 ms | 25.8 ms | 8.4x → 12.7x |
+| 128 | 101.8 ms | 27.3 ms | 10.6x → 35.6x |
+
+`log_loss` keeps a K-slope after the fix, and that one is real work rather than
+a defect: its input IS an `n × K` probability matrix (1 GB at n = 1e6, K = 128),
+so past K ≈ 32 it is memory-bandwidth-bound — which is why K = 128 costs barely
+more than K = 32.
+
+**Multiclass `roc_auc_score` measured as a no-op**, and that is the honest
+result: 32.5 ms vs 30.0 ms at K = 3 and 246.7 ms vs 245.6 ms at K = 32
+(n = 2e5, OvR macro) — run-to-run noise. The encoding pass is O(n·K) with a
+tiny constant next to the K binary sweeps that follow it, each an
+O(n log n) sort, so the scan was never this metric's bottleneck. It was changed
+for consistency (one lookup type across the module), not for speed.
 
 ## Oracle tests
 

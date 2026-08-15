@@ -399,22 +399,24 @@ pub fn class_bookkeeping(
     let mut fp = vec![0.0f64; classes.len()];
     let mut fnn = vec![0.0f64; classes.len()];
 
-    // class -> index in `classes` (only classes we track contribute).
-    let index_of = |c: i32| classes.iter().position(|&x| x == c);
+    // class -> index in `classes` (only classes we track contribute). O(1) per
+    // lookup via [`ClassIndex`]; the `classes.iter().position(...)` scan this
+    // replaces made the whole pass O(n·K) (METR-PARAM-02).
+    let index = ClassIndex::new(&classes);
 
     for i in 0..y_true.len() {
         let w = sample_weight.map_or(1.0, |sw| sw[i]);
         let t = y_true[i];
         let p = y_pred[i];
         if t == p {
-            if let Some(idx) = index_of(t) {
+            if let Some(idx) = index.get(t) {
                 tp[idx] += w;
             }
         } else {
-            if let Some(idx) = index_of(p) {
+            if let Some(idx) = index.get(p) {
                 fp[idx] += w;
             }
-            if let Some(idx) = index_of(t) {
+            if let Some(idx) = index.get(t) {
                 fnn[idx] += w;
             }
         }

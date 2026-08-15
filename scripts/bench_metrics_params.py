@@ -30,6 +30,10 @@ and each gets a ``--level``:
                                                    must not cost a second pass
     ``confusion``       ``normalize``              O(K^2) after an O(n) tabulation
                                                    — expected to be free
+    ``logloss``         ``labels``, ``normalize``  neither should cost anything;
+                                                   the level exists to watch the
+                                                   per-sample CLASS LOOKUP scale
+                                                   with ``--classes``
     ``regression``      ``multioutput``            the 2-D path walks ``n*k``
                                                    elements and reduces ``k``
                                                    columns; ``'variance_weighted'``
@@ -237,6 +241,27 @@ def level_confusion(args):
             _row(label, t_m, t_s)
 
 
+def level_logloss(args):
+    print(f"\n== log_loss: labels / normalize (n={args.n}) ==")
+    for k in args.classes:
+        y_true, _, proba, sw = make_multiclass(args.n, k)
+        classes = list(range(k))
+        print(f"\n n_classes={k}")
+        for label, kw in [
+            ("labels=None", {}),
+            ("labels=[0..K-1]", dict(labels=classes)),
+            ("labels=[0..K-1], sample_weight", dict(labels=classes, sample_weight=sw)),
+            ("normalize=False", dict(normalize=False)),
+        ]:
+            t_m, t_s = _pair(
+                lambda kw=kw: mm.log_loss(y_true, proba, **kw),
+                lambda kw=kw: sk.log_loss(y_true, proba, **kw),
+                args.repeat,
+                args.clock,
+            )
+            _row(label, t_m, t_s)
+
+
 def level_regression(args):
     print(f"\n== r2/mse/mae: multioutput (n={args.n}) ==")
     for k in args.outputs:
@@ -298,6 +323,7 @@ LEVELS = {
     "prcurve": level_prcurve,
     "prf": level_prf,
     "confusion": level_confusion,
+    "logloss": level_logloss,
     "regression": level_regression,
 }
 
