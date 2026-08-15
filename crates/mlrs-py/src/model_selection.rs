@@ -73,7 +73,16 @@ fn ms_err_to_py(err: ModelSelectionError) -> PyErr {
 /// `log::warn!` is invisible to `pytest.warns` and to a user's
 /// `warnings.simplefilter("error")` — the shim re-raises them through
 /// `warnings.warn` so sklearn-compatible warning behavior is preserved.
-struct SplitsOut(Splits);
+///
+/// ## Why `pub`
+/// It is the return type of twelve `pub` `#[pyfunction]`s, and a type named in
+/// a `pub` signature has to be nameable at that visibility — leaving it private
+/// made rustc's `private_interfaces` lint fire once per splitter (twelve
+/// warnings on every build of this crate). Every `#[pyfunction]` in this crate
+/// is `pub`, so widening the type is the change that keeps the convention;
+/// narrowing the twelve functions to `pub(crate)` would silence the same lint
+/// but make these the only non-`pub` bindings in the extension.
+pub struct SplitsOut(Splits);
 
 impl<'py> IntoPyObject<'py> for SplitsOut {
     type Target = PyAny;
