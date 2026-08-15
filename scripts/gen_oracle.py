@@ -6419,6 +6419,285 @@ def gen_metrics_regression(seed: int = _METRICS_FIXTURE_SEED, dtype=np.float32) 
     return out_path
 
 
+# ---- Metrics FULL-PARAMETER fixtures (METR-PARAM-01) ----
+#
+# One fixture per dtype covering every STRING-valued parameter added by
+# METR-PARAM-01, plus the numeric ones whose value logic is new
+# (`max_fpr`, `force_finite`, array-like `multioutput`):
+#
+#   confusion_matrix        normalize = 'true' | 'pred' | 'all'
+#   precision/recall/f1     average   = 'binary' | 'micro' | 'macro' |
+#                                       'weighted' | None
+#                           zero_division = 'warn' | 0 | 1 | np.nan
+#   roc_auc_score           multi_class = 'ovr' | 'ovo'
+#                           average = 'micro' | 'macro' | 'weighted' | None
+#                           max_fpr, labels (incl. NON-0-based labels)
+#   precision_recall_curve  drop_intermediate = True | False, pos_label=None
+#   r2/mse/mae              multioutput = 'raw_values' | 'uniform_average' |
+#                                         'variance_weighted' | [w0, w1, w2]
+#                           force_finite = True | False
+#
+# Every ref is READ OFF the pinned `scikit-learn==1.9.0`, never hand-derived,
+# and every array is float-cast through `_c_metrics` (`load_npz` rejects any
+# non-float array and fails the WHOLE file).
+
+
+def gen_metrics_params(seed: int = _METRICS_FIXTURE_SEED, dtype=np.float32) -> str:
+    """Generate the full-parameter-surface metrics oracle fixture
+    (METR-PARAM-01). Requires ``scikit-learn==1.9.0``.
+
+    Inputs are cast to `dtype` BEFORE the reference values are computed, so a
+    f32 fixture pins sklearn's own f32 arithmetic rather than a f64 value the
+    f32 replay could never reproduce.
+
+    The class count is 4 (not 3) so the OvO path averages 6 class PAIRS — a
+    count a 3-class fixture (where pairs == classes == 3) could not tell apart
+    from a per-class loop.
+    """
+    from sklearn.metrics import (
+        confusion_matrix,
+        f1_score,
+        mean_absolute_error,
+        mean_squared_error,
+        precision_recall_curve,
+        precision_score,
+        r2_score,
+        recall_score,
+        roc_auc_score,
+    )
+
+    rng = np.random.default_rng(seed + 909)
+    n, n_classes = 80, 4
+
+    # ---- multiclass classification block ----
+    y_true = rng.integers(0, n_classes, size=n).astype(np.int64)
+    flip = rng.random(n) < 0.35
+    y_pred = np.where(flip, (y_true + 1) % n_classes, y_true).astype(np.int64)
+    sample_weight = np.asarray(rng.uniform(0.5, 2.5, size=n), dtype=dtype)
+    # Probabilities must sum to 1 per row — sklearn's multiclass roc_auc
+    # rejects anything else outright. Re-normalized AFTER the dtype cast so the
+    # row sums still pass its `np.allclose(1, ...)` gate in float32.
+    y_proba = rng.random((n, n_classes)) + 0.05
+    y_proba = np.asarray(y_proba / y_proba.sum(axis=1, keepdims=True), dtype=dtype)
+    y_proba = np.asarray(y_proba / y_proba.sum(axis=1, keepdims=True), dtype=dtype)
+    sw = np.asarray(sample_weight, dtype=np.float64)
+
+    # ---- binary block (tie-heavy scores exercise the grouped sweep) ----
+    y_true_bin = rng.integers(0, 2, size=n).astype(np.int64)
+    y_pred_bin = np.where(rng.random(n) < 0.3, 1 - y_true_bin, y_true_bin).astype(np.int64)
+    y_score_bin = np.asarray(np.round(rng.random(n) * 8) / 8.0, dtype=dtype)
+    # A CONTINUOUS-score twin: with (almost) every score distinct, many
+    # thresholds add a negative sample and leave `tps` unchanged, so
+    # `drop_intermediate=True` actually drops points. On the tie-heavy
+    # `y_score_bin` above it is very nearly a no-op — which is exactly why both
+    # score vectors are pinned.
+    y_score_cont = np.asarray(rng.random(n), dtype=dtype)
+    sw_bin = np.asarray(rng.uniform(0.5, 2.5, size=n), dtype=dtype)
+    # {-1, 1}-valued twin of the same problem: `pos_label=None` must resolve to
+    # 1 here exactly as it does for {0, 1}.
+    y_true_pm1 = np.where(y_true_bin == 0, -1, 1).astype(np.int64)
+
+    # ---- regression block (3 outputs) ----
+    n_reg = 40
+    Y_true = np.asarray(rng.normal(size=(n_reg, 3)), dtype=dtype)
+    Y_pred = np.asarray(Y_true + 0.3 * rng.normal(size=(n_reg, 3)), dtype=dtype)
+    sw_reg = np.asarray(rng.uniform(0.5, 2.5, size=n_reg), dtype=dtype)
+    mo_weights = np.asarray([0.2, 0.5, 0.3], dtype=dtype)
+    # Column 0 constant => ss_tot == 0 => the `force_finite` branch point.
+    Y_true_const = np.array(Y_true, copy=True)
+    Y_true_const[:, 0] = 1.5
+    Y_pred_const = np.array(Y_pred, copy=True)
+    Y_pred_const[:, 0] = 1.75  # constant but WRONG => -inf when unforced
+
+    def c(arr):
+        return _c_metrics(arr, dtype)
+
+    out = {
+        "y_true": c(y_true),
+        "y_pred": c(y_pred),
+        "y_proba": c(y_proba),
+        "sample_weight": c(sample_weight),
+        "y_true_bin": c(y_true_bin),
+        "y_pred_bin": c(y_pred_bin),
+        "y_true_pm1": c(y_true_pm1),
+        "y_score_bin": c(y_score_bin),
+        "y_score_cont": c(y_score_cont),
+        "sw_bin": c(sw_bin),
+        "Y_true": c(Y_true),
+        "Y_pred": c(Y_pred),
+        "sw_reg": c(sw_reg),
+        "mo_weights": c(mo_weights),
+        "Y_true_const": c(Y_true_const),
+        "Y_pred_const": c(Y_pred_const),
+    }
+
+    # ---- confusion_matrix normalize ----
+    for norm in ("true", "pred", "all"):
+        out["ref_cm_" + norm] = c(confusion_matrix(y_true, y_pred, normalize=norm))
+        out["ref_cm_" + norm + "_sw"] = c(
+            confusion_matrix(y_true, y_pred, sample_weight=sw, normalize=norm)
+        )
+
+    # ---- precision / recall / f1 over every `average` ----
+    for name, fn in (
+        ("precision", precision_score),
+        ("recall", recall_score),
+        ("f1", f1_score),
+    ):
+        for avg in ("micro", "macro", "weighted"):
+            out["ref_%s_%s" % (name, avg)] = c(
+                [fn(y_true, y_pred, average=avg, zero_division=0)]
+            )
+            out["ref_%s_%s_sw" % (name, avg)] = c(
+                [fn(y_true, y_pred, average=avg, sample_weight=sw, zero_division=0)]
+            )
+        out["ref_%s_none" % name] = c(fn(y_true, y_pred, average=None, zero_division=0))
+        out["ref_%s_none_sw" % name] = c(
+            fn(y_true, y_pred, average=None, sample_weight=sw, zero_division=0)
+        )
+        # `average='binary'` needs a binary problem.
+        out["ref_%s_binary" % name] = c(
+            [fn(y_true_bin, y_pred_bin, average="binary", zero_division=0)]
+        )
+
+    # ---- zero_division: a degenerate case where the policy IS consulted ----
+    # No sample is predicted positive, so precision's denominator is 0 for the
+    # positive class: 'warn' -> 0.0, 0 -> 0.0, 1 -> 1.0, nan -> NaN.
+    zd_true = np.array([0, 0, 1, 1], dtype=np.int64)
+    zd_pred = np.array([0, 0, 0, 0], dtype=np.int64)
+    out["zd_true"] = c(zd_true)
+    out["zd_pred"] = c(zd_pred)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out["ref_zd_warn"] = c([precision_score(zd_true, zd_pred, zero_division="warn")])
+    out["ref_zd_zero"] = c([precision_score(zd_true, zd_pred, zero_division=0)])
+    out["ref_zd_one"] = c([precision_score(zd_true, zd_pred, zero_division=1)])
+    out["ref_zd_nan"] = c([precision_score(zd_true, zd_pred, zero_division=np.nan)])
+
+    # ---- roc_auc_score: multi_class x average ----
+    for avg in ("macro", "weighted", "micro"):
+        out["ref_auc_ovr_" + avg] = c(
+            [roc_auc_score(y_true, y_proba, multi_class="ovr", average=avg)]
+        )
+        out["ref_auc_ovr_" + avg + "_sw"] = c(
+            [
+                roc_auc_score(
+                    y_true, y_proba, multi_class="ovr", average=avg, sample_weight=sw
+                )
+            ]
+        )
+    out["ref_auc_ovr_none"] = c(roc_auc_score(y_true, y_proba, multi_class="ovr", average=None))
+    out["ref_auc_ovr_none_sw"] = c(
+        roc_auc_score(y_true, y_proba, multi_class="ovr", average=None, sample_weight=sw)
+    )
+    for avg in ("macro", "weighted"):
+        out["ref_auc_ovo_" + avg] = c(
+            [roc_auc_score(y_true, y_proba, multi_class="ovo", average=avg)]
+        )
+    # `labels`: the same problem with NON-0-based labels must reproduce the
+    # plain value (it exercises the y_true -> class-index encoding).
+    out["y_true_shift"] = c(y_true + 10)
+    out["labels_shift"] = c(np.arange(10, 10 + n_classes))
+    out["ref_auc_ovr_labels_shift"] = c(
+        [
+            roc_auc_score(
+                y_true + 10,
+                y_proba,
+                multi_class="ovr",
+                average="macro",
+                labels=list(range(10, 10 + n_classes)),
+            )
+        ]
+    )
+
+    # ---- roc_auc_score: max_fpr (binary, McClish-corrected partial AUC) ----
+    max_fprs = [0.1, 0.3, 0.5, 1.0]
+    out["max_fprs"] = c(max_fprs)
+    out["ref_auc_maxfpr"] = c(
+        [roc_auc_score(y_true_bin, y_score_bin, max_fpr=m) for m in max_fprs]
+    )
+    out["ref_auc_maxfpr_sw"] = c(
+        [
+            roc_auc_score(
+                y_true_bin,
+                y_score_bin,
+                max_fpr=m,
+                sample_weight=np.asarray(sw_bin, dtype=np.float64),
+            )
+            for m in max_fprs
+        ]
+    )
+
+    # ---- precision_recall_curve: drop_intermediate + pos_label=None ----
+    for tag, drop in (("nodrop", False), ("drop", True)):
+        p, r, t = precision_recall_curve(y_true_bin, y_score_bin, drop_intermediate=drop)
+        out["ref_prc_p_" + tag] = c(p)
+        out["ref_prc_r_" + tag] = c(r)
+        out["ref_prc_t_" + tag] = c(t)
+        p, r, t = precision_recall_curve(
+            y_true_bin,
+            y_score_bin,
+            sample_weight=np.asarray(sw_bin, dtype=np.float64),
+            drop_intermediate=drop,
+        )
+        out["ref_prc_p_" + tag + "_sw"] = c(p)
+        out["ref_prc_r_" + tag + "_sw"] = c(r)
+        out["ref_prc_t_" + tag + "_sw"] = c(t)
+    # The continuous-score curve, where `drop_intermediate` really bites.
+    for tag, drop in (("cont_nodrop", False), ("cont_drop", True)):
+        p, r, t = precision_recall_curve(y_true_bin, y_score_cont, drop_intermediate=drop)
+        out["ref_prc_p_" + tag] = c(p)
+        out["ref_prc_r_" + tag] = c(r)
+        out["ref_prc_t_" + tag] = c(t)
+    # {-1, 1} target with pos_label=None must equal the {0, 1} curve.
+    p, r, t = precision_recall_curve(y_true_pm1, y_score_bin)
+    out["ref_prc_p_pm1"] = c(p)
+    out["ref_prc_r_pm1"] = c(r)
+    out["ref_prc_t_pm1"] = c(t)
+
+    # ---- regression multioutput ----
+    swr = np.asarray(sw_reg, dtype=np.float64)
+    mow = np.asarray(mo_weights, dtype=np.float64)
+    for name, fn, strings in (
+        ("r2", r2_score, ("raw_values", "uniform_average", "variance_weighted")),
+        ("mse", mean_squared_error, ("raw_values", "uniform_average")),
+        ("mae", mean_absolute_error, ("raw_values", "uniform_average")),
+    ):
+        for mo in strings:
+            out["ref_%s_%s" % (name, mo)] = c(
+                np.atleast_1d(fn(Y_true, Y_pred, multioutput=mo))
+            )
+            out["ref_%s_%s_sw" % (name, mo)] = c(
+                np.atleast_1d(fn(Y_true, Y_pred, multioutput=mo, sample_weight=swr))
+            )
+        out["ref_%s_weights" % name] = c(
+            np.atleast_1d(fn(Y_true, Y_pred, multioutput=list(mow)))
+        )
+
+    # ---- r2 force_finite (constant column 0) ----
+    out["ref_r2_ff_true_raw"] = c(
+        r2_score(Y_true_const, Y_pred_const, multioutput="raw_values", force_finite=True)
+    )
+    out["ref_r2_ff_true_uniform"] = c([r2_score(Y_true_const, Y_pred_const, force_finite=True)])
+    out["ref_r2_ff_true_varw"] = c(
+        [r2_score(Y_true_const, Y_pred_const, multioutput="variance_weighted", force_finite=True)]
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out["ref_r2_ff_false_raw"] = c(
+            r2_score(Y_true_const, Y_pred_const, multioutput="raw_values", force_finite=False)
+        )
+        out["ref_r2_ff_false_uniform"] = c(
+            [r2_score(Y_true_const, Y_pred_const, force_finite=False)]
+        )
+
+    dtype_tag = {np.float32: "f32", np.float64: "f64"}[dtype]
+    os.makedirs(_FIXTURE_DIR, exist_ok=True)
+    out_path = os.path.join(_FIXTURE_DIR, "metrics_params_%s_seed%d.npz" % (dtype_tag, seed))
+    np.savez(out_path, **out)
+    return out_path
+
+
 def _tree_shap_arrays(model, is_classifier):
     """Flatten a fitted sklearn forest's per-tree arrays (children/feature/
     threshold/value/node_sample_weight) plus per-tree node counts — the SAME
@@ -8226,6 +8505,9 @@ def main() -> None:
     print(f"wrote {gen_metrics_classification_degenerate()}")
     for dtype in (np.float32, np.float64):
         print(f"wrote {gen_metrics_regression(dtype=dtype)}")
+    # METR-PARAM-01 — the full-parameter-surface fixture.
+    for dtype in (np.float32, np.float64):
+        print(f"wrote {gen_metrics_params(dtype=dtype)}")
 
     # ---- Preprocessing scaler fixtures (PREP-01, Phase 24) ----
     for dtype in (np.float32, np.float64):

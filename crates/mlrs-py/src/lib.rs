@@ -421,6 +421,10 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(metrics::log_loss, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::roc_auc_score_binary, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::roc_auc_score_multiclass, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        metrics::roc_auc_score_multiclass_per_class,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(metrics::precision_recall_curve, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::r2_score, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::mean_squared_error, m)?)?;

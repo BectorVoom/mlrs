@@ -57,6 +57,57 @@ pub enum MultiClass {
     Ovo,
 }
 
+/// `confusion_matrix`'s `normalize` policy (METR-PARAM-01). sklearn's
+/// `normalize=None` is the `Option::None` of the parameter, so this enum only
+/// carries the three STRING values. Every variant divides by a sum that can
+/// itself be zero (an all-zero row for `True_`, column for `Pred`, or matrix
+/// for `All`); sklearn runs the division under `np.errstate(all="ignore")` and
+/// then `np.nan_to_num`s the result, so a `0/0` cell becomes `0.0` rather than
+/// NaN — [`classification::confusion_matrix`] reproduces that exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Normalize {
+    /// Divide each ROW by its sum (condition on the true class).
+    True_,
+    /// Divide each COLUMN by its sum (condition on the predicted class).
+    Pred,
+    /// Divide the whole matrix by its grand total.
+    All,
+}
+
+/// The regression `multioutput` reduction (METR-PARAM-01), applied to the
+/// per-output score vector of `r2_score`/`mean_squared_error`/
+/// `mean_absolute_error`.
+///
+/// `VarianceWeighted` is `r2_score`-ONLY in sklearn 1.9.0 (`mean_squared_error`
+/// / `mean_absolute_error` reject the string outright); the Rust layer returns
+/// [`MetricError::UnsupportedMultiOutput`] for that combination rather than
+/// inventing a meaning for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MultiOutput<'a> {
+    /// Return the per-output vector unreduced.
+    RawValues,
+    /// Unweighted mean over outputs.
+    UniformAverage,
+    /// Mean weighted by each output's weighted `y_true` variance (`r2_score`
+    /// only).
+    VarianceWeighted,
+    /// Mean weighted by caller-supplied per-output weights.
+    Weights(&'a [f64]),
+}
+
+/// The result of a regression metric: a scalar for every reduced
+/// `multioutput`, or the per-output vector for
+/// [`MultiOutput::RawValues`] (METR-PARAM-01).
+///
+/// A separate type from [`PrfOut`] on purpose: `PrfOut::PerClass` is indexed by
+/// CLASS and `MetricOut::Raw` by OUTPUT COLUMN, and conflating them would let a
+/// classification per-class vector flow into a regression reduction unnoticed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetricOut {
+    Scalar(f64),
+    Raw(Vec<f64>),
+}
+
 /// Typed metrics-surface error — mapped to `PyValueError` at the PyO3
 /// boundary by a NEW `metric_err_to_py` (a sibling of `algo_err_to_py`, which
 /// only accepts [`crate::AlgoError`] — `MetricError` is a distinct type, TASK-15).
@@ -101,6 +152,26 @@ pub enum MetricError {
     /// contain at least one non-zero number.")`; the previous code divided by
     /// the zero weight-total and returned a silent NaN (code-review fix).
     ZeroWeightSum,
+    /// `roc_auc_score` was given a `max_fpr` outside `(0, 1]` (METR-PARAM-01).
+    /// sklearn raises `ValueError("Expected max_fpr in range (0, 1], got: ...")`
+    /// from `_binary_roc_auc_score` (its own `validate_params` `Interval`
+    /// rejects the same range earlier, with a different message).
+    InvalidMaxFpr,
+    /// A regression metric was given a [`MultiOutput`] variant it does not
+    /// support — in practice `mean_squared_error`/`mean_absolute_error` with
+    /// [`MultiOutput::VarianceWeighted`], which sklearn 1.9.0 rejects for those
+    /// two functions (METR-PARAM-01).
+    UnsupportedMultiOutput,
+    /// A multiclass `roc_auc_score` was given an [`Average`] its
+    /// `multi_class` strategy does not support (METR-PARAM-01): `Binary` for
+    /// either strategy, `Micro` for `Ovo`, or `None_` for `Ovo` (sklearn
+    /// raises `NotImplementedError` for that last one and `ValueError` for the
+    /// others; both surface as `ValueError` here).
+    UnsupportedAverage,
+    /// A per-output `multioutput` weight vector's length does not match the
+    /// number of output columns (METR-PARAM-01). sklearn raises
+    /// `ValueError("There must be equally many custom weights ...")`.
+    BadMultiOutputWeights,
 }
 
 impl std::fmt::Display for MetricError {
@@ -127,6 +198,16 @@ impl std::fmt::Display for MetricError {
             MetricError::ZeroWeightSum => {
                 "mlrs.metrics: sample_weight must contain at least one non-zero number"
             }
+            MetricError::InvalidMaxFpr => "mlrs.metrics: expected max_fpr in range (0, 1]",
+            MetricError::UnsupportedMultiOutput => {
+                "mlrs.metrics: multioutput='variance_weighted' is only supported by r2_score"
+            }
+            MetricError::UnsupportedAverage => {
+                "mlrs.metrics: this average is not supported for the requested multi_class strategy"
+            }
+            MetricError::BadMultiOutputWeights => {
+                "mlrs.metrics: there must be equally many custom weights as outputs"
+            }
         };
         f.write_str(msg)
     }
@@ -141,6 +222,30 @@ impl std::error::Error for MetricError {}
 pub enum PrfOut {
     Scalar(f64),
     PerClass(Vec<f64>),
+}
+
+/// A `precision_score`/`recall_score`/`f1_score` result plus the fact that
+/// decides whether sklearn's default `zero_division="warn"` emits an
+/// `UndefinedMetricWarning` (METR-PARAM-01).
+///
+/// `zero_division_hit` is `true` when the reported value actually consulted
+/// the `zero_division` policy — i.e. a denominator that feeds the REPORTED
+/// number was zero (the `pos_label` class for `Average::Binary`, the summed
+/// denominator for `Average::Micro`, any per-class denominator otherwise).
+/// It is carried here rather than recomputed by the caller because detecting
+/// it from the outside would cost a second full O(n) pass over the labels.
+/// `classes` is the RESOLVED class order the value was computed over (the
+/// caller's `labels`, or the sorted unique of `y_true ∪ y_pred`) — the same
+/// order `PrfOut::PerClass` is indexed by. It is carried out because the
+/// Python shim needs it for two sklearn guards it cannot cheaply recompute:
+/// "Target is multiclass but average='binary'" and "pos_label=... is not a
+/// valid label", both of which would otherwise cost their own O(n log n)
+/// `np.unique` over the concatenated targets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrfResult {
+    pub out: PrfOut,
+    pub zero_division_hit: bool,
+    pub classes: Vec<i32>,
 }
 
 /// The shared label/weight bookkeeping result: the resolved class order

@@ -10,7 +10,8 @@
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
 
 use super::{
-    class_bookkeeping, validate_weight, Average, MetricError, MultiClass, PrfOut, ZeroDivision,
+    class_bookkeeping, validate_weight, Average, MetricError, MultiClass, Normalize, PrfOut,
+    PrfResult, ZeroDivision,
 };
 
 // ==================== TASK-03 — METR-CLS-01: accuracy_score ====================
@@ -61,6 +62,13 @@ pub fn accuracy_score(
 /// y_pred` when `labels=None`, else `labels` verbatim — including a class
 /// absent from the data, which gets a full zero row/column).
 ///
+/// `normalize` (METR-PARAM-01) divides the finished counts by the row sum
+/// ([`Normalize::True_`]), column sum ([`Normalize::Pred`]) or grand total
+/// ([`Normalize::All`]). A ZERO divisor yields `0.0`, not NaN — sklearn
+/// divides under `np.errstate(all="ignore")` and then `np.nan_to_num`s the
+/// result, so a class with no true (or no predicted) samples contributes an
+/// all-zero row (or column) rather than an all-NaN one.
+///
 /// Returns `Err(MetricError::LengthMismatch)`/`Err(MetricError::InvalidWeight)`
 /// on a bad `sample_weight` — no panic (code-review fix, same class of bug
 /// as `accuracy_score`).
@@ -69,6 +77,7 @@ pub fn confusion_matrix(
     y_pred: &[i32],
     labels: Option<&[i32]>,
     sample_weight: Option<&[f64]>,
+    normalize: Option<Normalize>,
 ) -> Result<Vec<Vec<f64>>, MetricError> {
     if y_true.len() != y_pred.len() {
         return Err(MetricError::LengthMismatch);
@@ -93,6 +102,39 @@ pub fn confusion_matrix(
             matrix[ti][pi] += w;
         }
     }
+
+    // `nan_to_num`-equivalent: a zero divisor leaves the (already zero) cells
+    // at 0.0 instead of producing NaN.
+    let divide = |cell: &mut f64, denom: f64| {
+        *cell = if denom == 0.0 { 0.0 } else { *cell / denom };
+    };
+    match normalize {
+        None => {}
+        Some(Normalize::True_) => {
+            for row in matrix.iter_mut() {
+                let denom: f64 = row.iter().sum();
+                for cell in row.iter_mut() {
+                    divide(cell, denom);
+                }
+            }
+        }
+        Some(Normalize::Pred) => {
+            for j in 0..n {
+                let denom: f64 = (0..n).map(|i| matrix[i][j]).sum();
+                for row in matrix.iter_mut() {
+                    divide(&mut row[j], denom);
+                }
+            }
+        }
+        Some(Normalize::All) => {
+            let denom: f64 = matrix.iter().flat_map(|row| row.iter()).sum();
+            for row in matrix.iter_mut() {
+                for cell in row.iter_mut() {
+                    divide(cell, denom);
+                }
+            }
+        }
+    }
     Ok(matrix)
 }
 
@@ -110,7 +152,7 @@ fn average_ratio(
     pos_label: i32,
     average: Average,
     zero_division: ZeroDivision,
-) -> PrfOut {
+) -> PrfResult {
     let zd = |zero_division: ZeroDivision| match zero_division {
         ZeroDivision::Zero => 0.0,
         ZeroDivision::One => 1.0,
@@ -126,8 +168,18 @@ fn average_ratio(
         })
         .collect();
 
+    // Whether the REPORTED value consulted the `zero_division` policy — the
+    // input to sklearn's `zero_division="warn"` UndefinedMetricWarning
+    // (METR-PARAM-01). Scoped per `average`: `Binary` only cares about the
+    // `pos_label` class, `Micro` only about the summed denominator.
+    let any_zero_denominator = denominators.iter().any(|&d| d <= 0.0);
+
     match average {
-        Average::None_ => PrfOut::PerClass(per_class),
+        Average::None_ => PrfResult {
+            out: PrfOut::PerClass(per_class),
+            zero_division_hit: any_zero_denominator,
+            classes: classes.to_vec(),
+        },
         Average::Binary => {
             // A pos_label absent from BOTH y_true and y_pred (e.g. the f1
             // zero-division degenerate, TASK-07) is not in `classes` at
@@ -135,34 +187,58 @@ fn average_ratio(
             // zero-division case (matches sklearn's own behavior on this
             // input, empirically confirmed at TASK-02 fixture generation).
             match classes.iter().position(|&c| c == pos_label) {
-                Some(idx) => PrfOut::Scalar(per_class[idx]),
-                None => PrfOut::Scalar(zd(zero_division)),
+                Some(idx) => PrfResult {
+                    out: PrfOut::Scalar(per_class[idx]),
+                    zero_division_hit: denominators[idx] <= 0.0,
+                    classes: classes.to_vec(),
+                },
+                None => PrfResult {
+                    out: PrfOut::Scalar(zd(zero_division)),
+                    zero_division_hit: true,
+                    classes: classes.to_vec(),
+                },
             }
         }
         Average::Macro => {
             let sum: f64 = per_class.iter().sum();
-            PrfOut::Scalar(sum / per_class.len() as f64)
+            PrfResult {
+                out: PrfOut::Scalar(sum / per_class.len() as f64),
+                zero_division_hit: any_zero_denominator,
+                classes: classes.to_vec(),
+            }
         }
         Average::Micro => {
             let num_sum: f64 = numerators.iter().sum();
             let den_sum: f64 = denominators.iter().sum();
-            PrfOut::Scalar(if den_sum > 0.0 {
-                num_sum / den_sum
-            } else {
-                zd(zero_division)
-            })
+            PrfResult {
+                out: PrfOut::Scalar(if den_sum > 0.0 {
+                    num_sum / den_sum
+                } else {
+                    zd(zero_division)
+                }),
+                zero_division_hit: den_sum <= 0.0,
+                classes: classes.to_vec(),
+            }
         }
         Average::Weighted => {
             let support_sum: f64 = supports.iter().sum();
             if support_sum <= 0.0 {
-                return PrfOut::Scalar(zd(zero_division));
+                return PrfResult {
+                    out: PrfOut::Scalar(zd(zero_division)),
+                    zero_division_hit: true,
+                    classes: classes.to_vec(),
+                };
             }
             let weighted: f64 = per_class
                 .iter()
                 .zip(supports.iter())
                 .map(|(&r, &s)| r * s)
                 .sum();
-            PrfOut::Scalar(weighted / support_sum)
+            PrfResult {
+                out: PrfOut::Scalar(weighted / support_sum),
+                zero_division_hit: any_zero_denominator,
+                classes: classes.to_vec(),
+            }
         }
     }
 }
@@ -181,7 +257,7 @@ pub fn precision_score(
     average: Average,
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
-) -> Result<PrfOut, MetricError> {
+) -> Result<PrfResult, MetricError> {
     let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
     let denom: Vec<f64> = bk
         .tp
@@ -219,7 +295,7 @@ pub fn recall_score(
     average: Average,
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
-) -> Result<PrfOut, MetricError> {
+) -> Result<PrfResult, MetricError> {
     let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
     let denom: Vec<f64> = bk
         .tp
@@ -254,7 +330,7 @@ pub fn f1_score(
     average: Average,
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
-) -> Result<PrfOut, MetricError> {
+) -> Result<PrfResult, MetricError> {
     let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
     let numer: Vec<f64> = bk.tp.iter().map(|&tp| 2.0 * tp).collect();
     let denom: Vec<f64> = (0..bk.classes.len())
@@ -437,6 +513,57 @@ fn auc_from_sweep(sw: &Sweep) -> f64 {
     auc
 }
 
+/// McClish-corrected PARTIAL AUC over `fpr ∈ [0, max_fpr]` (METR-PARAM-01,
+/// sklearn's `max_fpr`).
+///
+/// Integrates the same `(0,0)`-anchored ROC polyline as [`auc_from_sweep`] up
+/// to `max_fpr`, linearly interpolating the final point, then standardizes:
+/// `0.5 * (1 + (partial - min_area) / (max_area - min_area))` with `min_area =
+/// max_fpr²/2` (the chance diagonal) and `max_area = max_fpr` (a perfect
+/// classifier) — so a non-discriminant score still reads `0.5` and a perfect
+/// one `1.0`.
+///
+/// sklearn computes this from `roc_curve(...)`, whose default
+/// `drop_intermediate=True` removes points whose SECOND differences in both
+/// `fps` and `tps` are zero. Those points are exactly the collinear interior
+/// ones, so the polyline — and hence both the integral and the interpolated
+/// endpoint — is unchanged by working from the full sweep here.
+fn partial_auc_from_sweep(sw: &Sweep, max_fpr: f64) -> f64 {
+    // The ROC polyline, `(0,0)` first (sklearn's `roc_curve` prepends the same
+    // origin point).
+    let mut fpr = Vec::with_capacity(sw.scores_desc.len() + 1);
+    let mut tpr = Vec::with_capacity(sw.scores_desc.len() + 1);
+    fpr.push(0.0);
+    tpr.push(0.0);
+    for i in 0..sw.scores_desc.len() {
+        fpr.push(sw.cum_fp[i] / sw.total_neg);
+        tpr.push(sw.cum_tp[i] / sw.total_pos);
+    }
+
+    // `np.searchsorted(fpr, max_fpr, "right")`: the first index whose fpr is
+    // strictly greater than `max_fpr`. `max_fpr < 1 = fpr.last()` (the
+    // `max_fpr == 1` case is short-circuited by the caller), so this index
+    // always exists and is ≥ 1.
+    let stop = fpr
+        .iter()
+        .position(|&f| f > max_fpr)
+        .unwrap_or(fpr.len() - 1);
+    let (x0, x1) = (fpr[stop - 1], fpr[stop]);
+    let (y0, y1) = (tpr[stop - 1], tpr[stop]);
+    // x0 <= max_fpr < x1 by construction, so the span is strictly positive.
+    let y_at_max = y0 + (y1 - y0) * (max_fpr - x0) / (x1 - x0);
+
+    let mut partial = 0.0f64;
+    for i in 1..stop {
+        partial += (fpr[i] - fpr[i - 1]) * (tpr[i] + tpr[i - 1]) / 2.0;
+    }
+    partial += (max_fpr - x0) * (y_at_max + y0) / 2.0;
+
+    let min_area = 0.5 * max_fpr * max_fpr;
+    let max_area = max_fpr;
+    0.5 * (1.0 + (partial - min_area) / (max_area - min_area))
+}
+
 // ==================== TASK-09 — METR-CLS-07: roc_auc_score (binary) ====================
 
 /// Rank-based binary AUC (stable descending sort, average-rank tie
@@ -448,12 +575,23 @@ fn auc_from_sweep(sw: &Sweep) -> f64 {
 /// rather than mirroring sklearn's own (NaN + `UndefinedMetricWarning`)
 /// behavior on this specific input (documented divergence, TASK-02
 /// docstring / PLAN.md TASK-09).
+/// `max_fpr` (METR-PARAM-01) restricts the integral to `fpr ∈ [0, max_fpr]`
+/// and applies the McClish standardization — see [`partial_auc_from_sweep`].
+/// `None` and `Some(1.0)` both mean the full AUC (sklearn short-circuits
+/// `max_fpr == 1` before its own range check); anything outside `(0, 1]`
+/// returns `Err(MetricError::InvalidMaxFpr)`.
 pub fn roc_auc_score_binary(
     y_true: &[i32],
     y_score: &[f64],
     pos_label: i32,
     sample_weight: Option<&[f64]>,
+    max_fpr: Option<f64>,
 ) -> Result<f64, MetricError> {
+    if let Some(m) = max_fpr {
+        if !(m > 0.0 && m <= 1.0) {
+            return Err(MetricError::InvalidMaxFpr);
+        }
+    }
     if y_true.len() != y_score.len() {
         return Err(MetricError::LengthMismatch);
     }
@@ -477,7 +615,14 @@ pub fn roc_auc_score_binary(
     if sw.total_pos <= 0.0 || sw.total_neg <= 0.0 {
         return Err(MetricError::SingleClassRocAuc);
     }
-    Ok(auc_from_sweep(&sw))
+    Ok(match max_fpr {
+        None => auc_from_sweep(&sw),
+        // sklearn returns the FULL auc for `max_fpr == 1` rather than routing
+        // it through the (mathematically equal, but differently rounded)
+        // McClish formula.
+        Some(m) if m == 1.0 => auc_from_sweep(&sw),
+        Some(m) => partial_auc_from_sweep(&sw, m),
+    })
 }
 
 // ==================== TASK-10 — METR-CLS-08: roc_auc_score (multiclass) ====================
@@ -494,76 +639,147 @@ pub fn roc_auc_score_binary(
 /// rejection of `roc_auc_score(multi_class='ovo', sample_weight=...)`
 /// (empirically probed at TASK-02 Green time — Branch A, SPEC §2/§4 Q10,
 /// Plan-Check Issue 2).
+/// `classes` is the RESOLVED class order (sklearn's `labels`, or the sorted
+/// unique of `y_true` when `labels=None`) — column `c` of the row-major
+/// `y_score` belongs to `classes[c]`, and `y_true` is encoded against it, so
+/// arbitrary integer labels work (the previous version hard-coded
+/// `y_true ∈ {0..n_classes-1}`). A `y_true` value missing from `classes`
+/// returns `Err(MetricError::LabelNotInLabels)`.
+///
+/// `average` (METR-PARAM-01) now covers sklearn's full multiclass set:
+/// `Macro`, `Weighted` and `None_` (per-class vector) for OvR, plus `Micro`
+/// for OvR only — OvO accepts `Macro`/`Weighted` alone
+/// (`Err(MetricError::UnsupportedAverage)` otherwise, mirroring sklearn's
+/// `average must be one of ...` / `average=None is not implemented for
+/// multi_class='ovo'`).
+///
+/// `Micro` binarizes `y_true` into the `n_samples × n_classes` indicator
+/// matrix and runs ONE binary sweep over the raveled `(indicator, score)`
+/// pairs with each sample weight repeated `n_classes` times — sklearn's
+/// `_average_binary_score` micro path, exactly.
 pub fn roc_auc_score_multiclass(
     y_true: &[i32],
     y_score: &[f64],
-    n_classes: usize,
+    classes: &[i32],
     multi_class: MultiClass,
     average: Average,
     sample_weight: Option<&[f64]>,
-) -> Result<f64, MetricError> {
-    if y_true.len() * n_classes != y_score.len() {
+) -> Result<PrfOut, MetricError> {
+    let n_classes = classes.len();
+    let n = y_true.len();
+    if n * n_classes != y_score.len() {
         return Err(MetricError::BadShape);
     }
-    validate_weight(y_true.len(), sample_weight)?;
+    validate_weight(n, sample_weight)?;
+    if average == Average::Binary {
+        return Err(MetricError::UnsupportedAverage);
+    }
+
+    // Encode y_true against the resolved class order once.
+    let encoded: Vec<usize> = y_true
+        .iter()
+        .map(|t| {
+            classes
+                .iter()
+                .position(|c| c == t)
+                .ok_or(MetricError::LabelNotInLabels)
+        })
+        .collect::<Result<_, _>>()?;
 
     match multi_class {
         MultiClass::Ovr => {
-            let n = y_true.len();
+            if average == Average::Micro {
+                // One binary problem over the raveled indicator matrix.
+                let mut y_bin = Vec::with_capacity(n * n_classes);
+                for &e in encoded.iter() {
+                    for c in 0..n_classes {
+                        y_bin.push(if e == c { 1 } else { 0 });
+                    }
+                }
+                let sw_rep: Option<Vec<f64>> = sample_weight.map(|sw| {
+                    sw.iter()
+                        .flat_map(|&w| std::iter::repeat_n(w, n_classes))
+                        .collect()
+                });
+                let auc = roc_auc_score_binary(&y_bin, y_score, 1, sw_rep.as_deref(), None)?;
+                return Ok(PrfOut::Scalar(auc));
+            }
+
             let mut per_class_auc = Vec::with_capacity(n_classes);
             let mut prevalence = Vec::with_capacity(n_classes);
+            let mut scores_c = vec![0.0f64; n];
+            let mut y_bin = vec![0i32; n];
             for c in 0..n_classes {
-                let y_bin: Vec<i32> = y_true
-                    .iter()
-                    .map(|&t| if t == c as i32 { 1 } else { 0 })
-                    .collect();
-                let scores_c: Vec<f64> = (0..n).map(|i| y_score[i * n_classes + c]).collect();
-                let auc = roc_auc_score_binary(&y_bin, &scores_c, 1, sample_weight)?;
-                per_class_auc.push(auc);
-                let prev: f64 = (0..n)
-                    .filter(|&i| y_true[i] == c as i32)
-                    .map(|i| sample_weight.map_or(1.0, |sw| sw[i]))
-                    .sum();
-                prevalence.push(prev);
+                for i in 0..n {
+                    y_bin[i] = i32::from(encoded[i] == c);
+                    scores_c[i] = y_score[i * n_classes + c];
+                }
+                per_class_auc.push(roc_auc_score_binary(
+                    &y_bin,
+                    &scores_c,
+                    1,
+                    sample_weight,
+                    None,
+                )?);
+                prevalence.push(
+                    (0..n)
+                        .filter(|&i| encoded[i] == c)
+                        .map(|i| sample_weight.map_or(1.0, |sw| sw[i]))
+                        .sum::<f64>(),
+                );
             }
-            Ok(match average {
+            match average {
+                Average::None_ => Ok(PrfOut::PerClass(per_class_auc)),
                 Average::Weighted => {
                     let total: f64 = prevalence.iter().sum();
-                    per_class_auc
+                    // sklearn returns a bare 0 when the weights sum to zero
+                    // (every class empty under the weights) rather than
+                    // dividing by zero.
+                    if total == 0.0 {
+                        return Ok(PrfOut::Scalar(0.0));
+                    }
+                    // "Scores with 0 weights are forced to be 0" — sklearn's
+                    // guard against a NaN from an empty class polluting the
+                    // average.
+                    let weighted: f64 = per_class_auc
                         .iter()
                         .zip(prevalence.iter())
-                        .map(|(&a, &p)| a * p)
-                        .sum::<f64>()
-                        / total
+                        .map(|(&a, &p)| if p == 0.0 { 0.0 } else { a * p })
+                        .sum();
+                    Ok(PrfOut::Scalar(weighted / total))
                 }
-                _ => per_class_auc.iter().sum::<f64>() / n_classes as f64,
-            })
+                _ => Ok(PrfOut::Scalar(
+                    per_class_auc.iter().sum::<f64>() / n_classes as f64,
+                )),
+            }
         }
         MultiClass::Ovo => {
             if sample_weight.is_some() {
                 return Err(MetricError::WeightedOvoUnsupported);
             }
-            let n = y_true.len();
+            if matches!(average, Average::Micro | Average::None_) {
+                return Err(MetricError::UnsupportedAverage);
+            }
             let mut pair_aucs = Vec::new();
             let mut pair_weights = Vec::new();
             let prevalence: Vec<f64> = (0..n_classes)
-                .map(|c| y_true.iter().filter(|&&t| t == c as i32).count() as f64)
+                .map(|c| encoded.iter().filter(|&&e| e == c).count() as f64)
                 .collect();
             for i in 0..n_classes {
                 for j in (i + 1)..n_classes {
                     let idxs: Vec<usize> = (0..n)
-                        .filter(|&k| y_true[k] == i as i32 || y_true[k] == j as i32)
+                        .filter(|&k| encoded[k] == i || encoded[k] == j)
                         .collect();
-                    let y_sub: Vec<i32> = idxs.iter().map(|&k| y_true[k]).collect();
+                    let y_sub: Vec<i32> = idxs.iter().map(|&k| encoded[k] as i32).collect();
                     let sc_i: Vec<f64> = idxs.iter().map(|&k| y_score[k * n_classes + i]).collect();
                     let sc_j: Vec<f64> = idxs.iter().map(|&k| y_score[k * n_classes + j]).collect();
-                    let auc_i_vs_j = roc_auc_score_binary(&y_sub, &sc_i, i as i32, None)?;
-                    let auc_j_vs_i = roc_auc_score_binary(&y_sub, &sc_j, j as i32, None)?;
+                    let auc_i_vs_j = roc_auc_score_binary(&y_sub, &sc_i, i as i32, None, None)?;
+                    let auc_j_vs_i = roc_auc_score_binary(&y_sub, &sc_j, j as i32, None, None)?;
                     pair_aucs.push((auc_i_vs_j + auc_j_vs_i) / 2.0);
                     pair_weights.push(prevalence[i] + prevalence[j]);
                 }
             }
-            Ok(match average {
+            Ok(PrfOut::Scalar(match average {
                 Average::Weighted => {
                     let total: f64 = pair_weights.iter().sum();
                     pair_aucs
@@ -574,7 +790,7 @@ pub fn roc_auc_score_multiclass(
                         / total
                 }
                 _ => pair_aucs.iter().sum::<f64>() / pair_aucs.len() as f64,
-            })
+            }))
         }
     }
 }
@@ -587,6 +803,18 @@ pub fn roc_auc_score_multiclass(
 /// "threshold = +infinity, predict nothing positive" point), `thresholds`
 /// strictly ascending (the distinct score values, ascending).
 ///
+/// `drop_intermediate` (METR-PARAM-01, sklearn ≥1.3) drops every threshold
+/// whose true-positive count is unchanged from BOTH its neighbours — the
+/// interior points of a vertical run on the PR plot, which carry no extra
+/// recall. The first and last thresholds are always kept, and the sweep is
+/// left untouched when it has 2 or fewer points (sklearn's `fps.shape[0] > 2`
+/// guard).
+///
+/// When `y_true` contains NO positive sample the recall column is all `1.0`
+/// (sklearn's "No positive class found in y_true, recall is set to one for all
+/// thresholds" branch, which the Python shim accompanies with the matching
+/// warning) rather than the all-`0.0` an earlier version produced.
+///
 /// Returns `Err(MetricError::LengthMismatch)`/`Err(MetricError::InvalidWeight)`
 /// on a bad `sample_weight` — no panic (code-review fix: unlike
 /// `roc_auc_score_binary`/`_multiclass`, this function called [`sweep`]
@@ -597,6 +825,7 @@ pub fn precision_recall_curve(
     probas_pred: &[f64],
     pos_label: i32,
     sample_weight: Option<&[f64]>,
+    drop_intermediate: bool,
 ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), MetricError> {
     if y_true.len() != probas_pred.len() {
         return Err(MetricError::LengthMismatch);
@@ -610,19 +839,36 @@ pub fn precision_recall_curve(
     }
 
     let sw = sweep(y_true, probas_pred, pos_label, sample_weight);
-    let k = sw.scores_desc.len();
-    let mut thresholds = Vec::with_capacity(k);
-    let mut precision = Vec::with_capacity(k + 1);
-    let mut recall = Vec::with_capacity(k + 1);
-    for i in (0..k).rev() {
+    let m = sw.scores_desc.len();
+
+    // Indices INTO the sweep (descending threshold), after the optional drop.
+    let kept: Vec<usize> = if drop_intermediate && m > 2 {
+        (0..m)
+            .filter(|&k| {
+                k == 0
+                    || k == m - 1
+                    || sw.cum_tp[k] != sw.cum_tp[k - 1]
+                    || sw.cum_tp[k + 1] != sw.cum_tp[k]
+            })
+            .collect()
+    } else {
+        (0..m).collect()
+    };
+
+    let mut thresholds = Vec::with_capacity(kept.len());
+    let mut precision = Vec::with_capacity(kept.len() + 1);
+    let mut recall = Vec::with_capacity(kept.len() + 1);
+    for &i in kept.iter().rev() {
         thresholds.push(sw.scores_desc[i]);
         let tp = sw.cum_tp[i];
         let fp = sw.cum_fp[i];
-        precision.push(if tp + fp > 0.0 { tp / (tp + fp) } else { 1.0 });
+        // sklearn 1.9.0: `precision = where(ps != 0, tps / ps, 0.0)` — the
+        // zero-denominator cell is 0.0, not the 1.0 an earlier version used.
+        precision.push(if tp + fp > 0.0 { tp / (tp + fp) } else { 0.0 });
         recall.push(if sw.total_pos > 0.0 {
             tp / sw.total_pos
         } else {
-            0.0
+            1.0
         });
     }
     precision.push(1.0);

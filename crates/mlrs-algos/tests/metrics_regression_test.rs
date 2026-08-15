@@ -6,8 +6,9 @@
 
 use std::path::PathBuf;
 
-use mlrs_algos::metrics::regression::{mean_absolute_error, mean_squared_error, r2_score};
-use mlrs_algos::metrics::MetricError;
+use bytemuck::Pod;
+use mlrs_algos::metrics::regression as reg;
+use mlrs_algos::metrics::{MetricError, MetricOut, MultiOutput};
 use mlrs_core::{load_npz, OracleCase};
 
 const TOL: f64 = 1e-5;
@@ -36,6 +37,64 @@ fn f32_vec(case: &OracleCase, name: &str) -> Vec<f32> {
 
 fn scalar(case: &OracleCase, name: &str) -> f64 {
     case.expect_f64(name)[0]
+}
+
+/// Single-output shims over the METR-PARAM-01 signatures: `n_outputs = 1`
+/// with the default `multioutput='uniform_average'` (and `force_finite=true`
+/// for `r2_score`) is exactly the pre-parameter behavior these TASK-12..14
+/// oracle tests were written against. The new parameters get their own tests
+/// further down (METR-PARAM-01).
+fn scalar_of(out: MetricOut) -> f64 {
+    match out {
+        MetricOut::Scalar(v) => v,
+        MetricOut::Raw(v) => panic!("expected a reduced scalar, got {v:?}"),
+    }
+}
+
+fn r2_score<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    reg::r2_score(
+        y_true,
+        y_pred,
+        1,
+        sample_weight,
+        MultiOutput::UniformAverage,
+        true,
+    )
+    .map(scalar_of)
+}
+
+fn mean_squared_error<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    reg::mean_squared_error(
+        y_true,
+        y_pred,
+        1,
+        sample_weight,
+        MultiOutput::UniformAverage,
+    )
+    .map(scalar_of)
+}
+
+fn mean_absolute_error<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    reg::mean_absolute_error(
+        y_true,
+        y_pred,
+        1,
+        sample_weight,
+        MultiOutput::UniformAverage,
+    )
+    .map(scalar_of)
 }
 
 fn assert_close(got: f64, want: f64, tol: f64, what: &str) {

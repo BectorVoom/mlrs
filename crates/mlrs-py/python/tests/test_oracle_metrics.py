@@ -345,11 +345,21 @@ def test_mean_absolute_error_oracle(fixture):
     assert abs(got_perfect - d["ref_mae_perfect"][0]) <= _atol(fixture)
 
 
-def test_r2_score_2d_input_raises_not_implemented_error():
-    with pytest.raises(NotImplementedError):
-        mm.r2_score(np.zeros((3, 2)), np.zeros((3, 2)))
+# METR-PARAM-01 turned the two multioutput NON-GOALS below into supported
+# parameters; the pair of tests that used to assert `NotImplementedError` here
+# now assert the implemented behavior instead. The full multioutput oracle
+# replay lives in `test_oracle_metrics_params.py`.
 
 
-def test_mean_squared_error_non_default_multioutput_raises_not_implemented_error():
-    with pytest.raises(NotImplementedError):
-        mm.mean_squared_error(np.array([1.0, 2.0]), np.array([1.0, 2.0]), multioutput="raw_values")
+def test_r2_score_accepts_2d_input():
+    got = mm.r2_score(np.zeros((3, 2)), np.zeros((3, 2)), multioutput="raw_values")
+    assert got.shape == (2,)
+    assert np.array_equal(got, np.ones(2))
+
+
+def test_mean_squared_error_raw_values_returns_a_per_output_array():
+    got = mm.mean_squared_error(
+        np.array([1.0, 2.0]), np.array([1.0, 2.0]), multioutput="raw_values"
+    )
+    assert isinstance(got, np.ndarray) and got.shape == (1,)
+    assert got[0] == 0.0

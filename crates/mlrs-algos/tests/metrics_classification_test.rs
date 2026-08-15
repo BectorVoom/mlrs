@@ -11,7 +11,7 @@ use mlrs_algos::metrics::classification::{
     accuracy_score, confusion_matrix, f1_score, log_loss, precision_recall_curve, precision_score,
     recall_score, roc_auc_score_binary, roc_auc_score_multiclass,
 };
-use mlrs_algos::metrics::{Average, MetricError, MultiClass, PrfOut, ZeroDivision};
+use mlrs_algos::metrics::{Average, MetricError, MultiClass, PrfOut, PrfResult, ZeroDivision};
 use mlrs_backend::capability;
 use mlrs_core::{load_npz, OracleCase};
 
@@ -170,7 +170,7 @@ fn confusion_matrix_empty_class_via_explicit_labels() {
     let y_true = labels_i32(&case, "y_true_empty");
     let y_pred = labels_i32(&case, "y_pred_empty");
     let labels = labels_i32(&case, "labels_empty");
-    let got = confusion_matrix(&y_true, &y_pred, Some(&labels), None).unwrap();
+    let got = confusion_matrix(&y_true, &y_pred, Some(&labels), None, None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion_empty"),
@@ -185,7 +185,7 @@ fn confusion_matrix_all_one_class() {
     let case = load("metrics_cls_degenerate_seed42.npz");
     let y_true = labels_i32(&case, "y_true_one");
     let y_pred = labels_i32(&case, "y_pred_one");
-    let got = confusion_matrix(&y_true, &y_pred, None, None).unwrap();
+    let got = confusion_matrix(&y_true, &y_pred, None, None, None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion_one"),
@@ -200,7 +200,7 @@ fn confusion_matrix_matches_sklearn_oracle_binary() {
     let case = load("metrics_cls_binary_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
-    let got = confusion_matrix(&y_true, &y_pred, None, None).unwrap();
+    let got = confusion_matrix(&y_true, &y_pred, None, None, None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion"),
@@ -216,7 +216,7 @@ fn confusion_matrix_weighted_matches_sklearn_oracle_binary() {
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
     let sw = f64_vec(&case, "sample_weight");
-    let got = confusion_matrix(&y_true, &y_pred, None, Some(&sw)).unwrap();
+    let got = confusion_matrix(&y_true, &y_pred, None, Some(&sw), None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion_sw"),
@@ -231,7 +231,7 @@ fn confusion_matrix_matches_sklearn_oracle_multiclass() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_pred = labels_i32(&case, "y_pred");
-    let got = confusion_matrix(&y_true, &y_pred, None, None).unwrap();
+    let got = confusion_matrix(&y_true, &y_pred, None, None, None).unwrap();
     assert_matrix_close(
         &got,
         &f64_vec(&case, "ref_confusion"),
@@ -243,18 +243,45 @@ fn confusion_matrix_matches_sklearn_oracle_multiclass() {
 
 // ==================== TASK-05/06/07 — precision/recall/f1 ====================
 
-fn prf_scalar(out: PrfOut) -> f64 {
+fn out_scalar(out: PrfOut) -> f64 {
     match out {
         PrfOut::Scalar(v) => v,
         PrfOut::PerClass(_) => panic!("expected PrfOut::Scalar"),
     }
 }
 
-fn prf_per_class(out: PrfOut) -> Vec<f64> {
-    match out {
+fn prf_scalar(res: PrfResult) -> f64 {
+    out_scalar(res.out)
+}
+
+fn prf_per_class(res: PrfResult) -> Vec<f64> {
+    match res.out {
         PrfOut::PerClass(v) => v,
         PrfOut::Scalar(_) => panic!("expected PrfOut::PerClass"),
     }
+}
+
+/// `roc_auc_score_multiclass` returns a [`PrfOut`] since METR-PARAM-01 added
+/// `average=None` (the per-class vector). Every pre-existing test here asks
+/// for a reduced average, so they go through this scalar-unwrapping shim and
+/// keep asserting on an `f64`.
+fn mc_auc(
+    y_true: &[i32],
+    y_score: &[f64],
+    classes: &[i32],
+    multi_class: MultiClass,
+    average: Average,
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    roc_auc_score_multiclass(
+        y_true,
+        y_score,
+        classes,
+        multi_class,
+        average,
+        sample_weight,
+    )
+    .map(out_scalar)
 }
 
 #[test]
@@ -860,7 +887,7 @@ fn roc_auc_score_binary_single_class_returns_error() {
     let case = load("metrics_cls_degenerate_seed42.npz");
     let y_true = labels_i32(&case, "y_true_singleclass");
     let y_score = f64_vec(&case, "y_score_singleclass");
-    let got = roc_auc_score_binary(&y_true, &y_score, 1, None);
+    let got = roc_auc_score_binary(&y_true, &y_score, 1, None, None);
     assert!(
         matches!(got, Err(MetricError::SingleClassRocAuc)),
         "expected SingleClassRocAuc, got {got:?}"
@@ -872,7 +899,7 @@ fn roc_auc_score_binary_matches_sklearn_oracle_tie_heavy() {
     let case = load("metrics_cls_binary_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_score = f64_vec(&case, "y_score");
-    let got = roc_auc_score_binary(&y_true, &y_score, 1, None).expect("roc_auc_score_binary");
+    let got = roc_auc_score_binary(&y_true, &y_score, 1, None, None).expect("roc_auc_score_binary");
     assert_close(got, scalar(&case, "ref_roc_auc"), TOL, "roc_auc binary");
 }
 
@@ -882,7 +909,7 @@ fn roc_auc_score_binary_weighted_matches_sklearn_oracle() {
     let y_true = labels_i32(&case, "y_true");
     let y_score = f64_vec(&case, "y_score");
     let sw = f64_vec(&case, "sample_weight");
-    let got = roc_auc_score_binary(&y_true, &y_score, 1, Some(&sw))
+    let got = roc_auc_score_binary(&y_true, &y_score, 1, Some(&sw), None)
         .expect("roc_auc_score_binary weighted");
     assert_close(
         got,
@@ -899,8 +926,15 @@ fn roc_auc_score_multiclass_ovr_macro_matches_sklearn_oracle() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_proba = f64_vec(&case, "y_proba");
-    let got = roc_auc_score_multiclass(&y_true, &y_proba, 3, MultiClass::Ovr, Average::Macro, None)
-        .expect("ovr macro");
+    let got = mc_auc(
+        &y_true,
+        &y_proba,
+        &[0, 1, 2],
+        MultiClass::Ovr,
+        Average::Macro,
+        None,
+    )
+    .expect("ovr macro");
     assert_close(
         got,
         scalar(&case, "ref_roc_auc_ovr_macro"),
@@ -914,10 +948,10 @@ fn roc_auc_score_multiclass_ovr_weighted_matches_sklearn_oracle() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_proba = f64_vec(&case, "y_proba");
-    let got = roc_auc_score_multiclass(
+    let got = mc_auc(
         &y_true,
         &y_proba,
-        3,
+        &[0, 1, 2],
         MultiClass::Ovr,
         Average::Weighted,
         None,
@@ -936,8 +970,15 @@ fn roc_auc_score_multiclass_ovo_macro_matches_sklearn_oracle() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_proba = f64_vec(&case, "y_proba");
-    let got = roc_auc_score_multiclass(&y_true, &y_proba, 3, MultiClass::Ovo, Average::Macro, None)
-        .expect("ovo macro");
+    let got = mc_auc(
+        &y_true,
+        &y_proba,
+        &[0, 1, 2],
+        MultiClass::Ovo,
+        Average::Macro,
+        None,
+    )
+    .expect("ovo macro");
     assert_close(
         got,
         scalar(&case, "ref_roc_auc_ovo_macro"),
@@ -951,10 +992,10 @@ fn roc_auc_score_multiclass_ovo_weighted_matches_sklearn_oracle() {
     let case = load("metrics_cls_multiclass_f64_seed42.npz");
     let y_true = labels_i32(&case, "y_true");
     let y_proba = f64_vec(&case, "y_proba");
-    let got = roc_auc_score_multiclass(
+    let got = mc_auc(
         &y_true,
         &y_proba,
-        3,
+        &[0, 1, 2],
         MultiClass::Ovo,
         Average::Weighted,
         None,
@@ -974,10 +1015,10 @@ fn roc_auc_score_multiclass_ovr_weighted_sample_weight_matches_sklearn_oracle() 
     let y_true = labels_i32(&case, "y_true");
     let y_proba = f64_vec(&case, "y_proba");
     let sw = f64_vec(&case, "sample_weight");
-    let got_macro = roc_auc_score_multiclass(
+    let got_macro = mc_auc(
         &y_true,
         &y_proba,
-        3,
+        &[0, 1, 2],
         MultiClass::Ovr,
         Average::Macro,
         Some(&sw),
@@ -989,10 +1030,10 @@ fn roc_auc_score_multiclass_ovr_weighted_sample_weight_matches_sklearn_oracle() 
         TOL,
         "roc_auc ovr macro sw",
     );
-    let got_weighted = roc_auc_score_multiclass(
+    let got_weighted = mc_auc(
         &y_true,
         &y_proba,
-        3,
+        &[0, 1, 2],
         MultiClass::Ovr,
         Average::Weighted,
         Some(&sw),
@@ -1016,10 +1057,10 @@ fn roc_auc_score_multiclass_ovo_weighted_sample_weight_gate() {
     let y_true = labels_i32(&case, "y_true");
     let y_proba = f64_vec(&case, "y_proba");
     let sw = f64_vec(&case, "sample_weight");
-    let got = roc_auc_score_multiclass(
+    let got = mc_auc(
         &y_true,
         &y_proba,
-        3,
+        &[0, 1, 2],
         MultiClass::Ovo,
         Average::Macro,
         Some(&sw),
@@ -1038,7 +1079,7 @@ fn precision_recall_curve_sentinel_and_length_invariants() {
     let y_true = labels_i32(&case, "y_true");
     let y_score = f64_vec(&case, "y_score");
     let (precision, recall, thresholds) =
-        precision_recall_curve(&y_true, &y_score, 1, None).unwrap();
+        precision_recall_curve(&y_true, &y_score, 1, None, false).unwrap();
     assert_eq!(precision.len(), thresholds.len() + 1, "precision length");
     assert_eq!(recall.len(), thresholds.len() + 1, "recall length");
     assert_eq!(precision.last(), Some(&1.0), "precision sentinel");
@@ -1054,7 +1095,7 @@ fn precision_recall_curve_matches_sklearn_oracle_tie_heavy() {
     let y_true = labels_i32(&case, "y_true");
     let y_score = f64_vec(&case, "y_score");
     let (precision, recall, thresholds) =
-        precision_recall_curve(&y_true, &y_score, 1, None).unwrap();
+        precision_recall_curve(&y_true, &y_score, 1, None, false).unwrap();
     let want_p = f64_vec(&case, "ref_pr_precision");
     let want_r = f64_vec(&case, "ref_pr_recall");
     let want_t = f64_vec(&case, "ref_pr_thresholds");
@@ -1086,7 +1127,7 @@ fn precision_recall_curve_weighted_matches_sklearn_oracle() {
     let y_score = f64_vec(&case, "y_score");
     let sw = f64_vec(&case, "sample_weight");
     let (precision, recall, thresholds) =
-        precision_recall_curve(&y_true, &y_score, 1, Some(&sw)).unwrap();
+        precision_recall_curve(&y_true, &y_score, 1, Some(&sw), false).unwrap();
     let want_p = f64_vec(&case, "ref_pr_precision_sw");
     let want_r = f64_vec(&case, "ref_pr_recall_sw");
     let want_t = f64_vec(&case, "ref_pr_thresholds_sw");
@@ -1150,7 +1191,7 @@ fn confusion_matrix_bad_sample_weight_returns_err_not_panic() {
     let y_pred = [1i32, 0, 0];
     let too_short = [1.0f64];
     assert!(matches!(
-        confusion_matrix(&y_true, &y_pred, None, Some(&too_short)),
+        confusion_matrix(&y_true, &y_pred, None, Some(&too_short), None),
         Err(MetricError::LengthMismatch)
     ));
 }
@@ -1223,7 +1264,7 @@ fn precision_recall_curve_bad_sample_weight_returns_err_not_panic() {
     let y_score = [0.9, 0.2, 0.6];
     let too_short = [1.0f64];
     assert!(matches!(
-        precision_recall_curve(&y_true, &y_score, 1, Some(&too_short)),
+        precision_recall_curve(&y_true, &y_score, 1, Some(&too_short), false),
         Err(MetricError::LengthMismatch)
     ));
 }
@@ -1247,7 +1288,7 @@ fn roc_auc_binary_nan_score_returns_err_not_panic() {
     let y_true = [0i32, 1, 0, 1];
     let y_score = [0.1, f64::NAN, 0.3, 0.9];
     assert!(matches!(
-        roc_auc_score_binary(&y_true, &y_score, 1, None),
+        roc_auc_score_binary(&y_true, &y_score, 1, None, None),
         Err(MetricError::NaNScore)
     ));
 }
@@ -1257,7 +1298,7 @@ fn precision_recall_curve_nan_score_returns_err_not_panic() {
     let y_true = [0i32, 1, 0, 1];
     let probas = [0.1, f64::NAN, 0.3, 0.9];
     assert!(matches!(
-        precision_recall_curve(&y_true, &probas, 1, None),
+        precision_recall_curve(&y_true, &probas, 1, None, false),
         Err(MetricError::NaNScore)
     ));
 }
@@ -1271,7 +1312,14 @@ fn roc_auc_multiclass_nan_score_returns_err_not_panic() {
     let mut y_score = vec![0.2f64; 18];
     y_score[4] = f64::NAN;
     assert!(matches!(
-        roc_auc_score_multiclass(&y_true, &y_score, 3, MultiClass::Ovr, Average::Macro, None),
+        mc_auc(
+            &y_true,
+            &y_score,
+            &[0, 1, 2],
+            MultiClass::Ovr,
+            Average::Macro,
+            None
+        ),
         Err(MetricError::NaNScore)
     ));
 }
