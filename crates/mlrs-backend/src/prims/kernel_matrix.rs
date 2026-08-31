@@ -66,11 +66,13 @@ use cubecl::prelude::*;
 use mlrs_core::{f64_to_host, host_to_f64, PrimError};
 use mlrs_kernels::{additive_chi2_dist, poly_map, rbf_map, sigmoid_map};
 
+use crate::capability::gather_launch_width;
 use crate::device_array::DeviceArray;
 use crate::pool::BufferPool;
 use crate::prims::distance::{distance, metric_distance};
 use crate::prims::gemm::gemm;
 use crate::prims::knn_graph::Metric;
+use crate::prims::launch_dims_1d_folded;
 use crate::runtime::ActiveRuntime;
 
 /// The typed kernel-family selector (D-01) `kernel_matrix` matches on to pick the
@@ -523,7 +525,22 @@ fn launch_map_in_place<F, L>(
     ),
 {
     let client = pool.client().clone();
-    let (count, dim) = launch_dims_1d(n);
+    // The map kernels (`rbf_map` / `poly_map` / `sigmoid_map`) are
+    // split-independent — one unit per element at the FLATTENED `ABSOLUTE_POS`,
+    // bounds-checked, no `SharedMemory`, no `sync_cube`, no `CUBE_DIM`-dependent
+    // indexing — so the cube/unit split is a pure scheduling choice with no
+    // effect on the result. That makes them exactly the class
+    // `gather_launch_width` exists for: on the cpu backend a `cube_dim` IS an OS
+    // thread count, so the GPU-idiomatic 256 spawned 256 threads and paid a
+    // 256-way join for a pass that is `O(n²)` against the base op's `O(n²·d)`.
+    //
+    // FOLDED because this element count is PAIRWISE. `rows_x · rows_y` crosses
+    // `MAX_GRID_DIM · block` at `n ≈ 4096` for the old 256 width, and lower still
+    // at a cpu width — a single-axis cube count cannot express the grid past that
+    // point, which is a launch the old geometry had no way to make. Reading
+    // `ABSOLUTE_POS` (not `ABSOLUTE_POS_X`) is what makes the second grid axis
+    // transparent to the kernels.
+    let (count, dim) = launch_dims_1d_folded(n, gather_launch_width());
     // SAFETY: `n` is the carried base-op output element count (rows_x · rows_y,
     // itself derived from the validated geometry); each map kernel bounds-checks
     // `tid < input.len()` (T-08-02-01). input and output are the SAME handle so
@@ -532,27 +549,6 @@ fn launch_map_in_place<F, L>(
     let in_arg = unsafe { ArrayArg::from_raw_parts(base.handle().clone(), n) };
     let out_arg = unsafe { ArrayArg::from_raw_parts(base.handle().clone(), n) };
     launch(&client, count, dim, in_arg, out_arg);
-}
-
-/// Standard ceiling-division 1D launch config for the in-place map pass (the
-/// `elementwise` per-element launch idiom, copied from covariance.rs:266-273).
-fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256usize;
-    // Compute the cube count in `usize` and check the `u32` launch-grid cast
-    // (WR-02): an unchecked `n as u32` silently wraps for `n > u32::MAX`,
-    // under-provisioning threads so trailing elements are never mapped — a silent
-    // wrong-result. The kernel-matrix problem sizes are small today, but the guard
-    // turns the overflow into a loud panic instead.
-    let cubes = u32::try_from((n + block - 1) / block)
-        .expect("element count exceeds u32 launch-grid limit");
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim {
-            x: block as u32,
-            y: 1,
-            z: 1,
-        },
-    )
 }
 
 /// Validate the kernel-matrix operand geometry (ASVS V5 / T-08-01-01). `x` is

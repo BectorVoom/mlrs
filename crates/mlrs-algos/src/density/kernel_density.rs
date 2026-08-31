@@ -768,25 +768,20 @@ fn launch_kde_map_in_place<F>(
     }
 }
 
-/// Standard ceiling-division 1D launch config for the in-place map pass (the
-/// elementwise per-element launch idiom shared with the backend prims).
+/// Launch config for the in-place KDE map pass (`kde_*_map`).
+///
+/// The maps are split-independent — one unit per element at the FLATTENED
+/// `ABSOLUTE_POS`, bounds-checked, no `SharedMemory`, no `sync_cube`, no
+/// `CUBE_DIM`-dependent indexing — so the width is free to follow the backend.
+/// This used to be a private copy of the backend's shared helper pinned at
+/// `256`, which on the cpu backend is 256 OS threads per pass (a `cube_dim`
+/// there IS a thread count).
+///
+/// FOLDED because the element count is PAIRWISE (`n_queries · n_train`): it
+/// crosses `MAX_GRID_DIM · block` well inside the sizes `score_samples` is
+/// handed, and a single-axis cube count cannot express the grid past that.
 fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256usize;
-    // Compute the cube count in `usize` and check the `u32` launch-grid cast
-    // (WR-02): an unchecked `n as u32` silently wraps for `n > u32::MAX`,
-    // under-provisioning threads so trailing elements are never mapped — a silent
-    // wrong-result. The KDE problem sizes are small today, but the guard turns the
-    // overflow into a loud panic instead.
-    let cubes = u32::try_from((n + block - 1) / block)
-        .expect("element count exceeds u32 launch-grid limit");
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim {
-            x: block as u32,
-            y: 1,
-            z: 1,
-        },
-    )
+    mlrs_backend::prims::launch_dims_1d_folded(n, mlrs_backend::capability::gather_launch_width())
 }
 
 /// The per-kernel log-normalization constant `log_norm(h, d, kernel) = −factor −

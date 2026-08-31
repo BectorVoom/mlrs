@@ -81,22 +81,63 @@ fn the_installed_value_reaches_the_cubecl_config() {
     );
 }
 
-/// With no `cubecl.toml` and no env override, the effective value is the cap.
+/// With no env override and no CONFIGURED stream count, the effective value is
+/// the cap.
 ///
-/// Guarded on the repo actually having no `cubecl.toml` in scope: the loader
-/// walks parent directories, so a developer with one in `$HOME` would otherwise
-/// see a confusing failure rather than a skip.
+/// The guard is on rule 2 of `stream_cap`'s precedence — "a `cubecl.toml` that
+/// sets `streaming.max_streams` to a non-default value is the user's decision" —
+/// and NOT on a `cubecl.toml` merely existing. Those came apart when the repo
+/// gained its own root `cubecl.toml` for `[compilation] cache`: a file that says
+/// nothing about `[streaming]` leaves `max_streams` at cubecl's default, so the
+/// cap still applies and this test still has something to assert. Skipping on
+/// mere existence would have silently retired the only check that the cap is the
+/// value a default developer environment gets — and the cap is what stands
+/// between a thread fan-out and a deterministic device-OOM abort on gfx1151.
 #[test]
 fn default_environment_gets_the_cap() {
     if std::env::var(MAX_STREAMS_ENV).is_ok() {
         eprintln!("SKIP: {MAX_STREAMS_ENV} is set in this environment");
         return;
     }
-    if cubecl_toml_in_scope() {
-        eprintln!("SKIP: a cubecl.toml is in scope; its choice is respected by design");
+    // Load the same way `install_once` does. This is a pure loader — it does not
+    // touch the write-once global slot — so asking is free of side effects.
+    let configured = CubeClRuntimeConfig::from_current_dir()
+        .override_from_env()
+        .streaming
+        .max_streams;
+    if configured != CUBECL_DEFAULT_MAX_STREAMS {
+        eprintln!(
+            "SKIP: a config in scope sets streaming.max_streams = {configured};              its choice is respected by design"
+        );
         return;
     }
     assert_eq!(stream_cap::install(), MLRS_MAX_STREAMS);
+}
+
+/// The repo's own root `cubecl.toml` must not be the thing that disables the cap.
+///
+/// `default_environment_gets_the_cap` skips when something in scope configures a
+/// stream count. That guard is correct, but it is also exactly how the cap could
+/// be lost without a single test going red — someone adds `[streaming]` to the
+/// repo config, every stream-cap assertion turns into a SKIP, and the abort this
+/// module exists to prevent comes back. So assert the repo config's actual
+/// content: it is in scope (the loader walks up to it from any package dir) and
+/// it leaves `max_streams` alone.
+#[test]
+fn the_repo_config_does_not_configure_the_stream_count() {
+    if !cubecl_toml_in_scope() {
+        eprintln!("SKIP: no cubecl.toml in scope");
+        return;
+    }
+    if std::env::var(MAX_STREAMS_ENV).is_ok() {
+        eprintln!("SKIP: {MAX_STREAMS_ENV} would mask the file's value");
+        return;
+    }
+    let configured = CubeClRuntimeConfig::from_current_dir().streaming.max_streams;
+    assert_eq!(
+        configured, CUBECL_DEFAULT_MAX_STREAMS,
+        "a cubecl.toml in scope sets streaming.max_streams = {configured}, which          overrides the mlrs cap of {MLRS_MAX_STREAMS}. If that is deliberate, say          so here; if it is the repo's own root config, it is a mistake — see          crates/mlrs-backend/src/stream_cap.rs for why the cap exists."
+    );
 }
 
 /// The env escape hatch wins, proved in a FRESH process.

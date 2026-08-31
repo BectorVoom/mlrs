@@ -257,20 +257,21 @@ fn host_laplacian(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     (l, dd)
 }
 
-/// Standard ceiling-division 1D launch config for the per-element passes (the
-/// `elementwise` per-element launch idiom; mirrors `kernel_matrix.rs`).
+/// Launch config for the three per-element passes (`zero_diag_copy`,
+/// `degree_guard`, `laplacian_map`).
+///
+/// All three are split-independent — one unit per element at the FLATTENED
+/// `ABSOLUTE_POS`, bounds-checked, no `SharedMemory`, no `sync_cube`, no
+/// `CUBE_DIM`-dependent indexing — so the cube/unit split has no effect on the
+/// result and the width is free to follow the backend. This used to be a private
+/// copy of the shared helper pinned at `256`, which on the cpu backend is 256 OS
+/// threads per pass (a `cube_dim` there IS a thread count).
+///
+/// FOLDED because two of the three passes are over the `n × n` affinity: `n·n`
+/// crosses `MAX_GRID_DIM · block` at `n ≈ 4096` for a 256 width and lower for a
+/// cpu one, and a single-axis cube count cannot express the grid past that.
 fn launch_dims_1d(n: usize) -> (CubeCount, CubeDim) {
-    let block = 256usize;
-    let cubes = u32::try_from(n.div_ceil(block))
-        .expect("element count exceeds u32 launch-grid limit");
-    (
-        CubeCount::Static(cubes.max(1), 1, 1),
-        CubeDim {
-            x: block as u32,
-            y: 1,
-            z: 1,
-        },
-    )
+    crate::prims::launch_dims_1d_folded(n, crate::capability::gather_launch_width())
 }
 
 /// Validate the affinity geometry (ASVS V5): `a` must be a well-formed `n×n`

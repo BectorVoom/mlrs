@@ -237,6 +237,19 @@ use mlrs_kernels::colmean::MAX_GRID_DIM;
 /// measured on their own ladders, NOT a mechanical substitution.
 pub(crate) const PERF_TUNED_BLOCK: u32 = 256;
 
+/// `ceil(n / block)` as a `u32`, with the cast CHECKED (WR-02).
+///
+/// `n as u32` silently wraps above `u32::MAX`, under-provisioning the grid so
+/// the trailing elements are never visited — a silent wrong result rather than a
+/// failure. The private per-prim copies of the launch helpers each carried this
+/// guard; it belongs on the shared definitions that replaced them, not on the
+/// call sites.
+fn checked_cubes(n: usize, block: u32) -> u32 {
+    u32::try_from(n.div_ceil(block as usize))
+        .expect("element count exceeds u32 launch-grid limit")
+        .max(1)
+}
+
 /// Ceiling-division 1-D launch config: `ceil(n / block)` cubes of `block` units
 /// along X only.
 ///
@@ -255,8 +268,13 @@ pub(crate) const PERF_TUNED_BLOCK: u32 = 256;
 /// This is the ONE definition. Nine byte-identical private copies of it used to
 /// live across the prim modules, which is how three of them ended up fixed for
 /// the cpu thread-storm and the rest did not.
-pub(crate) fn launch_dims_1d(n: usize, block: u32) -> (CubeCount, CubeDim) {
-    let cubes = (n as u32).div_ceil(block).max(1);
+///
+/// `pub` rather than `pub(crate)` because the tenth and eleventh copies lived
+/// OUTSIDE this crate (`mlrs_algos::density::kernel_density`), where a
+/// `pub(crate)` definition is not shareable and the only way to reuse the fix is
+/// to paste it — which is exactly how the stragglers happened.
+pub fn launch_dims_1d(n: usize, block: u32) -> (CubeCount, CubeDim) {
+    let cubes = checked_cubes(n, block);
     (
         CubeCount::Static(cubes, 1, 1),
         CubeDim { x: block, y: 1, z: 1 },
@@ -271,8 +289,16 @@ pub(crate) fn launch_dims_1d(n: usize, block: u32) -> (CubeCount, CubeDim) {
 /// covers `[(y·CUBE_COUNT_X + x)·block, +block)`) and bounds-check it, so the
 /// second axis is transparent to them. A kernel reading `ABSOLUTE_POS_X` would
 /// silently process only the first grid column — use [`launch_dims_1d`] there.
-pub(crate) fn launch_dims_1d_folded(n: usize, block: u32) -> (CubeCount, CubeDim) {
-    let cubes = (n as u32).div_ceil(block).max(1);
+///
+/// Prefer this over [`launch_dims_1d`] for any PAIRWISE (`n_x · n_y`) element
+/// count. An `n × n` matrix crosses `MAX_GRID_DIM · block` at `n ≈ 4096` for
+/// `block = 256`, and at `n ≈ 1024` for a 16-unit cpu width — well inside the
+/// sizes these prims are handed — and the unfolded form has no way to express
+/// the resulting cube count.
+///
+/// `pub` for the same reason as [`launch_dims_1d`].
+pub fn launch_dims_1d_folded(n: usize, block: u32) -> (CubeCount, CubeDim) {
+    let cubes = checked_cubes(n, block);
     let y = cubes.div_ceil(MAX_GRID_DIM).max(1);
     let x = cubes.div_ceil(y).max(1);
     (
