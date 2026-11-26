@@ -60,23 +60,23 @@ use crate::ingress::{as_f64, capsule_to_array, host_slice_f64};
 /// when its values are borrowed — see [`crate::ingress`]). The returned
 /// [`ArrayRef`] must outlive every slice borrowed from it, which is why each
 /// binding below holds it in a local before calling [`f64_slice`]/[`labels`].
-fn capsule(x: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
+pub(crate) fn capsule(x: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
     capsule_to_array(x)
 }
 
 /// Optional-capsule twin of [`capsule`], for `sample_weight`.
-fn capsule_opt(x: Option<&Bound<'_, PyAny>>) -> PyResult<Option<ArrayRef>> {
+pub(crate) fn capsule_opt(x: Option<&Bound<'_, PyAny>>) -> PyResult<Option<ArrayRef>> {
     x.map(capsule).transpose()
 }
 
 /// Borrow an imported capsule's `float64` values.
-fn f64_slice(array: &ArrayRef) -> PyResult<&[f64]> {
+pub(crate) fn f64_slice(array: &ArrayRef) -> PyResult<&[f64]> {
     host_slice_f64(as_f64(array)?)
 }
 
 /// Borrow an imported capsule and round its (integral) `float64` values to the
 /// `i32` labels the algos layer takes.
-fn labels(array: &ArrayRef) -> PyResult<Vec<i32>> {
+pub(crate) fn labels(array: &ArrayRef) -> PyResult<Vec<i32>> {
     Ok(f64_slice(array)?
         .iter()
         .map(|&v| v.round() as i32)
@@ -141,7 +141,7 @@ fn normalize_from_str(normalize: Option<&str>) -> PyResult<Option<Normalize>> {
 /// per-output weight vector (METR-PARAM-01). The weights are consulted only
 /// for the `"weights"` sentinel the Python shim sends for sklearn's array-like
 /// form.
-fn multioutput_from<'a>(
+pub(crate) fn multioutput_from<'a>(
     multioutput: &str,
     weights: Option<&'a [f64]>,
 ) -> PyResult<MultiOutput<'a>> {
@@ -164,7 +164,7 @@ fn multioutput_from<'a>(
 /// it asked for, so no union return type is needed at the boundary — and the
 /// vector is O(n_outputs), never O(n_samples), so a plain `Vec` egress is the
 /// right shape here.
-fn metric_out_to_vec(out: MetricOut) -> Vec<f64> {
+pub(crate) fn metric_out_to_vec(out: MetricOut) -> Vec<f64> {
     match out {
         MetricOut::Scalar(v) => vec![v],
         MetricOut::Raw(v) => v,
@@ -184,7 +184,7 @@ fn multi_class_from_str(multi_class: &str) -> PyResult<MultiClass> {
 /// `zero_division` crosses the FFI boundary as `f64`: `0.0` → `Zero`, `1.0`
 /// → `One`, `NaN` → `Nan` (TASK-15 resolved-decision; any other finite value
 /// falls back to `Zero`, sklearn's own default).
-fn zero_division_from_f64(zero_division: f64) -> ZeroDivision {
+pub(crate) fn zero_division_from_f64(zero_division: f64) -> ZeroDivision {
     if zero_division.is_nan() {
         ZeroDivision::Nan
     } else if zero_division == 1.0 {

@@ -9,9 +9,10 @@
 //! Tests live in `crates/mlrs-algos/tests/metrics_classification_test.rs`
 //! (AGENTS.md §2 — no in-source `#[cfg(test)] mod tests`).
 
+use super::prfs::{prfs_multiclass, SetAverage};
 use super::{
-    class_bookkeeping, validate_weight, Average, ClassIndex, MetricError, MultiClass, Normalize,
-    PrfOut, PrfResult, ZeroDivision,
+    validate_weight, Average, ClassIndex, MetricError, MultiClass, Normalize, PrfOut, PrfResult,
+    ZeroDivision,
 };
 
 // ==================== TASK-03 — METR-CLS-01: accuracy_score ====================
@@ -142,116 +143,67 @@ pub fn confusion_matrix(
 }
 
 // ==================== TASK-05/06/07 — precision/recall/f1 ====================
+//
+// All three are views of ONE `precision_recall_fscore_support` computation
+// ([`super::prfs`]), so they share sklearn's exact divide-then-`_nanaverage`
+// rules — including the one the original per-metric `average_ratio` got wrong:
+// with `zero_division=np.nan`, a macro/weighted average SKIPS the undefined
+// classes rather than returning NaN.
 
-/// Shared per-`average` dispatch over a per-class ratio (precision =
-/// `tp/(tp+fp)`, recall = `tp/(tp+fn)`, f1 = `2*tp/(2*tp+fp+fn)`), reused by
-/// `precision_score`/`recall_score`/`f1_score` so all three share ONE
-/// average-dispatch implementation (TASK-05 Refactor step).
-fn average_ratio(
-    classes: &[i32],
-    numerators: &[f64],
-    denominators: &[f64],
-    supports: &[f64],
-    pos_label: i32,
-    average: Average,
-    zero_division: ZeroDivision,
-) -> PrfResult {
-    let zd = |zero_division: ZeroDivision| match zero_division {
-        ZeroDivision::Zero => 0.0,
-        ZeroDivision::One => 1.0,
-        ZeroDivision::Nan => f64::NAN,
-    };
-    let per_class: Vec<f64> = (0..classes.len())
-        .map(|i| {
-            if denominators[i] > 0.0 {
-                numerators[i] / denominators[i]
-            } else {
-                zd(zero_division)
-            }
-        })
-        .collect();
-
-    // Whether the REPORTED value consulted the `zero_division` policy — the
-    // input to sklearn's `zero_division="warn"` UndefinedMetricWarning
-    // (METR-PARAM-01). Scoped per `average`: `Binary` only cares about the
-    // `pos_label` class, `Micro` only about the summed denominator.
-    let any_zero_denominator = denominators.iter().any(|&d| d <= 0.0);
-
+/// Map the original [`Average`] onto the set-wise averaging modes.
+fn set_average(average: Average) -> SetAverage {
     match average {
-        Average::None_ => PrfResult {
-            out: PrfOut::PerClass(per_class),
-            zero_division_hit: any_zero_denominator,
-            classes: classes.to_vec(),
-        },
-        Average::Binary => {
-            // A pos_label absent from BOTH y_true and y_pred (e.g. the f1
-            // zero-division degenerate, TASK-07) is not in `classes` at
-            // all — its (tp, fp, fn) are all implicitly zero, so this is a
-            // zero-division case (matches sklearn's own behavior on this
-            // input, empirically confirmed at TASK-02 fixture generation).
-            match classes.iter().position(|&c| c == pos_label) {
-                Some(idx) => PrfResult {
-                    out: PrfOut::Scalar(per_class[idx]),
-                    zero_division_hit: denominators[idx] <= 0.0,
-                    classes: classes.to_vec(),
-                },
-                None => PrfResult {
-                    out: PrfOut::Scalar(zd(zero_division)),
-                    zero_division_hit: true,
-                    classes: classes.to_vec(),
-                },
-            }
-        }
-        Average::Macro => {
-            let sum: f64 = per_class.iter().sum();
-            PrfResult {
-                out: PrfOut::Scalar(sum / per_class.len() as f64),
-                zero_division_hit: any_zero_denominator,
-                classes: classes.to_vec(),
-            }
-        }
-        Average::Micro => {
-            let num_sum: f64 = numerators.iter().sum();
-            let den_sum: f64 = denominators.iter().sum();
-            PrfResult {
-                out: PrfOut::Scalar(if den_sum > 0.0 {
-                    num_sum / den_sum
-                } else {
-                    zd(zero_division)
-                }),
-                zero_division_hit: den_sum <= 0.0,
-                classes: classes.to_vec(),
-            }
-        }
-        Average::Weighted => {
-            let support_sum: f64 = supports.iter().sum();
-            if support_sum <= 0.0 {
-                return PrfResult {
-                    out: PrfOut::Scalar(zd(zero_division)),
-                    zero_division_hit: true,
-                    classes: classes.to_vec(),
-                };
-            }
-            let weighted: f64 = per_class
-                .iter()
-                .zip(supports.iter())
-                .map(|(&r, &s)| r * s)
-                .sum();
-            PrfResult {
-                out: PrfOut::Scalar(weighted / support_sum),
-                zero_division_hit: any_zero_denominator,
-                classes: classes.to_vec(),
-            }
-        }
+        Average::Binary => SetAverage::Binary,
+        Average::Macro => SetAverage::Macro,
+        Average::Micro => SetAverage::Micro,
+        Average::Weighted => SetAverage::Weighted,
+        Average::None_ => SetAverage::None_,
     }
 }
 
+/// Which of the three ratios a scalar metric reports.
+#[derive(Clone, Copy)]
+enum Ratio {
+    Precision,
+    Recall,
+    FScore,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prf_view(
+    ratio: Ratio,
+    y_true: &[i32],
+    y_pred: &[i32],
+    labels: Option<&[i32]>,
+    pos_label: i32,
+    average: Average,
+    sample_weight: Option<&[f64]>,
+    zero_division: ZeroDivision,
+) -> Result<PrfResult, MetricError> {
+    let r = prfs_multiclass(
+        y_true,
+        y_pred,
+        1.0,
+        labels,
+        pos_label,
+        set_average(average),
+        sample_weight,
+        zero_division,
+    )?;
+    let (out, zero_division_hit) = match ratio {
+        Ratio::Precision => (r.precision, r.precision_zd),
+        Ratio::Recall => (r.recall, r.recall_zd),
+        Ratio::FScore => (r.fscore, r.fscore_zd),
+    };
+    Ok(PrfResult {
+        out,
+        zero_division_hit,
+        classes: r.classes,
+    })
+}
+
 /// `precision = tp / (tp + fp)` per class, dispatched over `average` (SPEC
-/// §5 CLS-03).
-///
-/// Propagates [`class_bookkeeping`]'s `Result` (code-review fix: this
-/// previously `.expect()`-ed the Result, turning a documented graceful
-/// length-mismatch/invalid-weight `Err` into a Rust panic).
+/// §5 CLS-03). A view of [`super::prfs::prfs_multiclass`].
 pub fn precision_score(
     y_true: &[i32],
     y_pred: &[i32],
@@ -261,35 +213,20 @@ pub fn precision_score(
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
 ) -> Result<PrfResult, MetricError> {
-    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
-    let denom: Vec<f64> = bk
-        .tp
-        .iter()
-        .zip(bk.fp.iter())
-        .map(|(&tp, &fp)| tp + fp)
-        .collect();
-    let support: Vec<f64> = bk
-        .tp
-        .iter()
-        .zip(bk.fnn.iter())
-        .map(|(&tp, &fnv)| tp + fnv)
-        .collect();
-    Ok(average_ratio(
-        &bk.classes,
-        &bk.tp,
-        &denom,
-        &support,
+    prf_view(
+        Ratio::Precision,
+        y_true,
+        y_pred,
+        labels,
         pos_label,
         average,
+        sample_weight,
         zero_division,
-    ))
+    )
 }
 
 /// `recall = tp / (tp + fn)` per class, dispatched over `average` (SPEC §5
-/// CLS-04).
-///
-/// Propagates [`class_bookkeeping`]'s `Result` (code-review fix, same class
-/// of bug as `precision_score`).
+/// CLS-04). A view of [`super::prfs::prfs_multiclass`].
 pub fn recall_score(
     y_true: &[i32],
     y_pred: &[i32],
@@ -299,32 +236,22 @@ pub fn recall_score(
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
 ) -> Result<PrfResult, MetricError> {
-    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
-    let denom: Vec<f64> = bk
-        .tp
-        .iter()
-        .zip(bk.fnn.iter())
-        .map(|(&tp, &fnv)| tp + fnv)
-        .collect();
-    let support = denom.clone();
-    Ok(average_ratio(
-        &bk.classes,
-        &bk.tp,
-        &denom,
-        &support,
+    prf_view(
+        Ratio::Recall,
+        y_true,
+        y_pred,
+        labels,
         pos_label,
         average,
+        sample_weight,
         zero_division,
-    ))
+    )
 }
 
 /// `f1 = 2*tp / (2*tp + fp + fn)` per class, computed DIRECTLY from the
-/// shared weighted TP/FP/FN (harmonic mean) — NOT from
-/// `precision_score(...) × recall_score(...)` floats, to avoid
-/// double-rounding (SPEC §5 CLS-05 note, TASK-07).
-///
-/// Propagates [`class_bookkeeping`]'s `Result` (code-review fix, same class
-/// of bug as `precision_score`).
+/// weighted counts (never from the two rounded ratios), dispatched over
+/// `average` (SPEC §5 CLS-05). A view of [`super::prfs::prfs_multiclass`] at
+/// `beta = 1`.
 pub fn f1_score(
     y_true: &[i32],
     y_pred: &[i32],
@@ -334,26 +261,16 @@ pub fn f1_score(
     sample_weight: Option<&[f64]>,
     zero_division: ZeroDivision,
 ) -> Result<PrfResult, MetricError> {
-    let bk = class_bookkeeping(y_true, y_pred, sample_weight, labels)?;
-    let numer: Vec<f64> = bk.tp.iter().map(|&tp| 2.0 * tp).collect();
-    let denom: Vec<f64> = (0..bk.classes.len())
-        .map(|i| 2.0 * bk.tp[i] + bk.fp[i] + bk.fnn[i])
-        .collect();
-    let support: Vec<f64> = bk
-        .tp
-        .iter()
-        .zip(bk.fnn.iter())
-        .map(|(&tp, &fnv)| tp + fnv)
-        .collect();
-    Ok(average_ratio(
-        &bk.classes,
-        &numer,
-        &denom,
-        &support,
+    prf_view(
+        Ratio::FScore,
+        y_true,
+        y_pred,
+        labels,
         pos_label,
         average,
+        sample_weight,
         zero_division,
-    ))
+    )
 }
 
 // ==================== TASK-08 — METR-CLS-06: log_loss ====================
@@ -841,7 +758,23 @@ pub fn precision_recall_curve(
         return Err(MetricError::NaNScore);
     }
 
-    let sw = sweep(y_true, probas_pred, pos_label, sample_weight);
+    // sklearn drops zero-weight samples BEFORE sorting, so a score carried
+    // only by zero-weight samples is not a threshold. Filter only when some
+    // weight is actually zero, so the common path borrows the inputs as-is.
+    let filtered: Option<(Vec<i32>, Vec<f64>, Vec<f64>)> = sample_weight
+        .filter(|w| w.contains(&0.0))
+        .map(|w| {
+            let keep: Vec<usize> = (0..w.len()).filter(|&i| w[i] != 0.0).collect();
+            (
+                keep.iter().map(|&i| y_true[i]).collect(),
+                keep.iter().map(|&i| probas_pred[i]).collect(),
+                keep.iter().map(|&i| w[i]).collect(),
+            )
+        });
+    let sw = match &filtered {
+        Some((t, p, w)) => sweep(t, p, pos_label, Some(w)),
+        None => sweep(y_true, probas_pred, pos_label, sample_weight),
+    };
     let m = sw.scores_desc.len();
 
     // Indices INTO the sweep (descending threshold), after the optional drop.
@@ -877,4 +810,560 @@ pub fn precision_recall_curve(
     precision.push(1.0);
     recall.push(0.0);
     Ok((precision, recall, thresholds))
+}
+
+// ==================== The rest of sklearn's classification surface ====================
+//
+// Everything below reads either the weighted confusion matrix
+// ([`confusion_matrix`], one O(n) pass) or the per-row probability/decision
+// matrix, and then does O(K)/O(K²) bookkeeping — the same shape as the metrics
+// above. Label ENCODING (which column is which class) is done here, through
+// [`ClassIndex`], never in the shim.
+
+/// Weighted mean of a per-sample quantity (`np.average(values, weights)`), or
+/// `Err(ZeroWeightSum)` when the weights sum to zero (numpy raises
+/// `ZeroDivisionError` there).
+fn weighted_mean(values: impl Iterator<Item = f64>, sample_weight: Option<&[f64]>) -> Result<f64, MetricError> {
+    let mut sum = 0.0f64;
+    let mut total = 0.0f64;
+    for (i, v) in values.enumerate() {
+        let w = sample_weight.map_or(1.0, |sw| sw[i]);
+        sum += w * v;
+        total += w;
+    }
+    if total == 0.0 {
+        return Err(MetricError::ZeroWeightSum);
+    }
+    Ok(sum / total)
+}
+
+/// `balanced_accuracy_score`: the mean per-class recall over the classes
+/// present in `y_true`. Returns `(score, dropped)` where `dropped` is `true`
+/// when some class appears only in `y_pred` — sklearn drops that class's NaN
+/// recall and warns "y_pred contains classes not in y_true".
+///
+/// `adjusted = true` rescales so chance is 0 and perfect is 1:
+/// `(score - 1/K) / (1 - 1/K)` over the `K` kept classes.
+pub fn balanced_accuracy_score(
+    y_true: &[i32],
+    y_pred: &[i32],
+    sample_weight: Option<&[f64]>,
+    adjusted: bool,
+) -> Result<(f64, bool), MetricError> {
+    let c = confusion_matrix(y_true, y_pred, None, sample_weight, None)?;
+    let mut per_class = Vec::with_capacity(c.len());
+    let mut dropped = false;
+    for (i, row) in c.iter().enumerate() {
+        let support: f64 = row.iter().sum();
+        let r = row[i] / support;
+        if r.is_nan() {
+            dropped = true;
+        } else {
+            per_class.push(r);
+        }
+    }
+    let mut score = per_class.iter().sum::<f64>() / per_class.len() as f64;
+    if adjusted {
+        let chance = 1.0 / per_class.len() as f64;
+        score = (score - chance) / (1.0 - chance);
+    }
+    Ok((score, dropped))
+}
+
+/// `matthews_corrcoef` (the multiclass `R_K` statistic of Gorodkin 2004),
+/// from the weighted confusion matrix over the labels present in either
+/// vector. A zero covariance product returns `0.0`, as sklearn does.
+pub fn matthews_corrcoef(
+    y_true: &[i32],
+    y_pred: &[i32],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    let c = confusion_matrix(y_true, y_pred, None, sample_weight, None)?;
+    let k = c.len();
+    let t_sum: Vec<f64> = c.iter().map(|row| row.iter().sum()).collect();
+    let p_sum: Vec<f64> = (0..k).map(|j| (0..k).map(|i| c[i][j]).sum()).collect();
+    let n_correct: f64 = (0..k).map(|i| c[i][i]).sum();
+    let n: f64 = p_sum.iter().sum();
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let cov_ytyp = n_correct * n - dot(&t_sum, &p_sum);
+    let cov_ypyp = n * n - dot(&p_sum, &p_sum);
+    let cov_ytyt = n * n - dot(&t_sum, &t_sum);
+    let prod = cov_ypyp * cov_ytyt;
+    Ok(if prod == 0.0 { 0.0 } else { cov_ytyp / prod.sqrt() })
+}
+
+/// `cohen_kappa_score`'s disagreement weighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KappaWeights {
+    /// Unweighted: every off-diagonal cell counts 1.
+    None_,
+    /// `|i - j|`.
+    Linear,
+    /// `(i - j)²`.
+    Quadratic,
+}
+
+/// The outcome of [`cohen_kappa_score`]: a value, or one of sklearn's two
+/// undefined cases (the shim substitutes `replace_undefined_by` and emits the
+/// matching `UndefinedMetricWarning`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KappaOut {
+    Value(f64),
+    /// The confusion matrix is empty (no sample has both labels in `labels`).
+    NoSharedLabels,
+    /// The expected-disagreement denominator is zero (one label in common).
+    OneSharedLabel,
+}
+
+/// `cohen_kappa_score`: `1 - Σ w·C / Σ w·E`, where `E` is the outer product of
+/// the confusion matrix's marginals over its total.
+pub fn cohen_kappa_score(
+    y1: &[i32],
+    y2: &[i32],
+    labels: Option<&[i32]>,
+    weights: KappaWeights,
+    sample_weight: Option<&[f64]>,
+) -> Result<KappaOut, MetricError> {
+    let c = confusion_matrix(y1, y2, labels, sample_weight, None)?;
+    let k = c.len();
+    let sum0: Vec<f64> = (0..k).map(|j| (0..k).map(|i| c[i][j]).sum()).collect();
+    let sum1: Vec<f64> = c.iter().map(|row| row.iter().sum()).collect();
+    let total: f64 = sum0.iter().sum();
+    if total == 0.0 {
+        return Ok(KappaOut::NoSharedLabels);
+    }
+    let w = |i: usize, j: usize| -> f64 {
+        let d = i as f64 - j as f64;
+        match weights {
+            KappaWeights::None_ => f64::from(i != j),
+            KappaWeights::Linear => d.abs(),
+            KappaWeights::Quadratic => d * d,
+        }
+    };
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for i in 0..k {
+        for j in 0..k {
+            num += w(i, j) * c[i][j];
+            den += w(i, j) * sum0[i] * sum1[j] / total;
+        }
+    }
+    if den == 0.0 {
+        return Ok(KappaOut::OneSharedLabel);
+    }
+    Ok(KappaOut::Value(1.0 - num / den))
+}
+
+/// `hamming_loss` for a 1-D target: the weighted fraction of mismatches.
+pub fn hamming_loss(
+    y_true: &[i32],
+    y_pred: &[i32],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    if y_true.len() != y_pred.len() {
+        return Err(MetricError::LengthMismatch);
+    }
+    validate_weight(y_true.len(), sample_weight)?;
+    weighted_mean(
+        y_true.iter().zip(y_pred).map(|(t, p)| f64::from(t != p)),
+        sample_weight,
+    )
+}
+
+/// Validate a row-major `n × n_labels` indicator pair and return `n`.
+fn indicator_rows(
+    y_true: &[i32],
+    y_pred: &[i32],
+    n_labels: usize,
+    sample_weight: Option<&[f64]>,
+) -> Result<usize, MetricError> {
+    if y_true.len() != y_pred.len() {
+        return Err(MetricError::LengthMismatch);
+    }
+    if n_labels == 0 || y_true.len() % n_labels != 0 {
+        return Err(MetricError::BadShape);
+    }
+    let n = y_true.len() / n_labels;
+    validate_weight(n, sample_weight)?;
+    Ok(n)
+}
+
+/// `hamming_loss` for a multilabel indicator target: weighted count of
+/// differing cells over `n_samples * n_labels * mean(weight)`.
+pub fn hamming_loss_indicator(
+    y_true: &[i32],
+    y_pred: &[i32],
+    n_labels: usize,
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    let n = indicator_rows(y_true, y_pred, n_labels, sample_weight)?;
+    let mut diff = 0.0f64;
+    for i in 0..n {
+        let w = sample_weight.map_or(1.0, |sw| sw[i]);
+        let d = (0..n_labels)
+            .filter(|&j| y_true[i * n_labels + j] != y_pred[i * n_labels + j])
+            .count();
+        diff += w * d as f64;
+    }
+    let weight_average = match sample_weight {
+        Some(sw) => sw.iter().sum::<f64>() / n as f64,
+        None => 1.0,
+    };
+    Ok(diff / (n as f64 * n_labels as f64 * weight_average))
+}
+
+/// Subset accuracy for a multilabel indicator target (`accuracy_score` on 2-D
+/// input): a sample counts as correct only when EVERY label matches.
+pub fn accuracy_score_indicator(
+    y_true: &[i32],
+    y_pred: &[i32],
+    n_labels: usize,
+    sample_weight: Option<&[f64]>,
+    normalize: bool,
+) -> Result<f64, MetricError> {
+    let n = indicator_rows(y_true, y_pred, n_labels, sample_weight)?;
+    let (mut correct, mut total) = (0.0f64, 0.0f64);
+    for i in 0..n {
+        let w = sample_weight.map_or(1.0, |sw| sw[i]);
+        let row = i * n_labels..(i + 1) * n_labels;
+        total += w;
+        if y_true[row.clone()] == y_pred[row] {
+            correct += w;
+        }
+    }
+    Ok(if normalize { correct / total } else { correct })
+}
+
+/// `zero_one_loss`: `1 - accuracy` (normalized) or `total_weight - correct`.
+pub fn zero_one_loss(
+    y_true: &[i32],
+    y_pred: &[i32],
+    sample_weight: Option<&[f64]>,
+    normalize: bool,
+) -> Result<f64, MetricError> {
+    let score = accuracy_score(y_true, y_pred, sample_weight, normalize)?;
+    Ok(zero_one_from_accuracy(score, y_true.len(), sample_weight, normalize))
+}
+
+/// [`zero_one_loss`] for a multilabel indicator target (subset accuracy).
+pub fn zero_one_loss_indicator(
+    y_true: &[i32],
+    y_pred: &[i32],
+    n_labels: usize,
+    sample_weight: Option<&[f64]>,
+    normalize: bool,
+) -> Result<f64, MetricError> {
+    let score = accuracy_score_indicator(y_true, y_pred, n_labels, sample_weight, normalize)?;
+    Ok(zero_one_from_accuracy(score, y_true.len() / n_labels, sample_weight, normalize))
+}
+
+fn zero_one_from_accuracy(score: f64, n: usize, sample_weight: Option<&[f64]>, normalize: bool) -> f64 {
+    if normalize {
+        1.0 - score
+    } else {
+        let total = sample_weight.map_or(n as f64, |sw| sw.iter().sum());
+        total - score
+    }
+}
+
+/// Binary `hinge_loss`: `mean(max(0, 1 - y·f(x)))` with `y ∈ {-1, +1}`
+/// (`y_signed`, which the caller derives with sklearn's
+/// `LabelBinarizer(neg_label=-1)` rule: the larger class is `+1`).
+pub fn hinge_loss_binary(
+    y_signed: &[f64],
+    pred_decision: &[f64],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    if y_signed.len() != pred_decision.len() {
+        return Err(MetricError::LengthMismatch);
+    }
+    validate_weight(y_signed.len(), sample_weight)?;
+    weighted_mean(
+        y_signed
+            .iter()
+            .zip(pred_decision)
+            .map(|(&y, &d)| (1.0 - y * d).max(0.0)),
+        sample_weight,
+    )
+}
+
+/// Multiclass `hinge_loss` (Crammer–Singer): the margin is the true class's
+/// decision value minus the largest OTHER class's, over the row-major
+/// `n × K` `pred_decision`, whose column `c` belongs to `classes[c]`.
+pub fn hinge_loss_multiclass(
+    y_true: &[i32],
+    pred_decision: &[f64],
+    classes: &[i32],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    let k = classes.len();
+    let n = y_true.len();
+    if k < 2 || pred_decision.len() != n * k {
+        return Err(MetricError::BadShape);
+    }
+    validate_weight(n, sample_weight)?;
+    let index = ClassIndex::new(classes);
+    let mut losses = Vec::with_capacity(n);
+    for i in 0..n {
+        let yi = index.get(y_true[i]).ok_or(MetricError::LabelNotInLabels)?;
+        let row = &pred_decision[i * k..(i + 1) * k];
+        let other = row
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != yi)
+            .map(|(_, &v)| v)
+            .fold(f64::NEG_INFINITY, f64::max);
+        losses.push((1.0 - (row[yi] - other)).max(0.0));
+    }
+    weighted_mean(losses.into_iter(), sample_weight)
+}
+
+/// Encode `y_true` against `classes` into column indices.
+fn encode(y_true: &[i32], classes: &[i32]) -> Result<Vec<usize>, MetricError> {
+    let index = ClassIndex::new(classes);
+    y_true
+        .iter()
+        .map(|&t| index.get(t).ok_or(MetricError::LabelNotInLabels))
+        .collect()
+}
+
+/// Per-sample `Σ_k (onehot_k - p_k)²` over a row-major `n × K` probability
+/// matrix whose column `c` belongs to `classes[c]`.
+fn brier_rows(enc: &[usize], y_prob: &[f64], k: usize, null: Option<&[f64]>) -> Vec<f64> {
+    (0..enc.len())
+        .map(|i| {
+            (0..k)
+                .map(|c| {
+                    let p = null.map_or(y_prob[i * k + c], |q| q[c]);
+                    let t = f64::from(enc[i] == c);
+                    (t - p) * (t - p)
+                })
+                .sum()
+        })
+        .collect()
+}
+
+/// The (weighted) class prevalence vector — the "null model" probabilities the
+/// D² scores compare against.
+fn prevalence(enc: &[usize], k: usize, sample_weight: Option<&[f64]>) -> Result<Vec<f64>, MetricError> {
+    let mut p = vec![0.0f64; k];
+    let mut total = 0.0f64;
+    for (i, &e) in enc.iter().enumerate() {
+        let w = sample_weight.map_or(1.0, |sw| sw[i]);
+        p[e] += w;
+        total += w;
+    }
+    if total == 0.0 {
+        return Err(MetricError::ZeroWeightSum);
+    }
+    for v in p.iter_mut() {
+        *v /= total;
+    }
+    Ok(p)
+}
+
+fn check_prob_geometry(
+    y_true: &[i32],
+    y_prob: &[f64],
+    classes: &[i32],
+    sample_weight: Option<&[f64]>,
+) -> Result<Vec<usize>, MetricError> {
+    if classes.is_empty() || y_prob.len() != y_true.len() * classes.len() {
+        return Err(MetricError::BadShape);
+    }
+    validate_weight(y_true.len(), sample_weight)?;
+    if y_prob.iter().any(|&p| !(0.0..=1.0).contains(&p)) {
+        return Err(MetricError::DomainError);
+    }
+    encode(y_true, classes)
+}
+
+/// `brier_score_loss`: the weighted mean over samples of
+/// `Σ_k (onehot_k - p_k)²`, halved when `scale_by_half` (sklearn's
+/// `scale_by_half='auto'` halves for binary input, which is what makes the
+/// binary value the familiar `mean((y - p)²)`).
+///
+/// A binary call passes the two-column `[1-p, p]` matrix with `classes =
+/// [neg, pos]` — the caller resolves `pos_label`.
+pub fn brier_score_loss(
+    y_true: &[i32],
+    y_prob: &[f64],
+    classes: &[i32],
+    sample_weight: Option<&[f64]>,
+    scale_by_half: bool,
+) -> Result<f64, MetricError> {
+    let enc = check_prob_geometry(y_true, y_prob, classes, sample_weight)?;
+    let rows = brier_rows(&enc, y_prob, classes.len(), None);
+    let b = weighted_mean(rows.into_iter(), sample_weight)?;
+    Ok(if scale_by_half { 0.5 * b } else { b })
+}
+
+/// `d2_brier_score`: `1 - brier / brier_null`, the null model predicting the
+/// weighted class prevalence for every sample.
+pub fn d2_brier_score(
+    y_true: &[i32],
+    y_prob: &[f64],
+    classes: &[i32],
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    let enc = check_prob_geometry(y_true, y_prob, classes, sample_weight)?;
+    let k = classes.len();
+    let null = prevalence(&enc, k, sample_weight)?;
+    let b = weighted_mean(brier_rows(&enc, y_prob, k, None).into_iter(), sample_weight)?;
+    let b0 = weighted_mean(brier_rows(&enc, y_prob, k, Some(&null)).into_iter(), sample_weight)?;
+    Ok(1.0 - b / b0)
+}
+
+/// `d2_log_loss_score`: `1 - log_loss / log_loss_null` (both UNnormalized
+/// weighted sums, so the ratio is the same either way), the null model
+/// predicting the weighted class prevalence. Probabilities are clipped to
+/// `[eps, 1 - eps]` before the log, as `log_loss` does.
+pub fn d2_log_loss_score(
+    y_true: &[i32],
+    y_prob: &[f64],
+    classes: &[i32],
+    sample_weight: Option<&[f64]>,
+    eps: f64,
+) -> Result<f64, MetricError> {
+    let enc = check_prob_geometry(y_true, y_prob, classes, sample_weight)?;
+    let k = classes.len();
+    let null = prevalence(&enc, k, sample_weight)?;
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (i, &e) in enc.iter().enumerate() {
+        let w = sample_weight.map_or(1.0, |sw| sw[i]);
+        num -= w * y_prob[i * k + e].clamp(eps, 1.0 - eps).ln();
+        den -= w * null[e].clamp(eps, 1.0 - eps).ln();
+    }
+    Ok(1.0 - num / den)
+}
+
+/// `class_likelihood_ratios`' raw result. `lr_pos`/`lr_neg` are the plain
+/// ratios (`NaN`/`inf` where they divide by zero); the flags mark sklearn's
+/// three undefined cases, for which the shim substitutes
+/// `replace_undefined_by` and warns.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LikelihoodRatios {
+    pub lr_pos: f64,
+    pub lr_neg: f64,
+    /// No positive sample in `y_true`.
+    pub no_positive: bool,
+    /// `fp == 0`: `LR+` is undefined.
+    pub pos_undefined: bool,
+    /// `tp == 0` (with `fp == 0`): no sample was predicted positive at all.
+    pub no_predicted_positive: bool,
+    /// `tn == 0`: `LR-` is undefined.
+    pub neg_undefined: bool,
+}
+
+/// `class_likelihood_ratios` over the binary weighted confusion matrix (in the
+/// `labels` order, or the sorted unique — so the SECOND class is positive).
+/// `LR+ = sensitivity / (1 - specificity)`, `LR- = (1 - sensitivity) /
+/// specificity`.
+pub fn class_likelihood_ratios(
+    y_true: &[i32],
+    y_pred: &[i32],
+    labels: Option<&[i32]>,
+    sample_weight: Option<&[f64]>,
+) -> Result<LikelihoodRatios, MetricError> {
+    let c = confusion_matrix(y_true, y_pred, labels, sample_weight, None)?;
+    if c.len() != 2 {
+        return Err(MetricError::UnsupportedTarget);
+    }
+    let (tn, fp, fnn, tp) = (c[0][0], c[0][1], c[1][0], c[1][1]);
+    let support_pos = tp + fnn;
+    let support_neg = tn + fp;
+    Ok(LikelihoodRatios {
+        lr_pos: (tp * support_neg) / (fp * support_pos),
+        lr_neg: (fnn * support_neg) / (tn * support_pos),
+        no_positive: support_pos == 0.0,
+        pos_undefined: fp == 0.0,
+        no_predicted_positive: fp == 0.0 && tp == 0.0,
+        neg_undefined: tn == 0.0,
+    })
+}
+
+/// Multiclass `top_k_accuracy_score`: a sample is a hit when its true class is
+/// among the `k` highest-scoring columns of the row-major `n × K` `y_score`
+/// (column `c` = `classes[c]`).
+///
+/// Ties follow sklearn's `argsort(kind='mergesort')[:, ::-1]`: a stable
+/// ascending sort reversed, so among EQUAL scores the HIGHER column index ranks
+/// first. The rank of class `c` is therefore `#{c': s[c'] > s[c]} + #{c' > c:
+/// s[c'] == s[c]}`, an O(K) count per sample with no sort.
+pub fn top_k_accuracy_score(
+    y_true: &[i32],
+    y_score: &[f64],
+    classes: &[i32],
+    k: usize,
+    normalize: bool,
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    let n_classes = classes.len();
+    let n = y_true.len();
+    if n_classes == 0 || y_score.len() != n * n_classes {
+        return Err(MetricError::BadShape);
+    }
+    if k == 0 {
+        return Err(MetricError::InvalidParameter);
+    }
+    validate_weight(n, sample_weight)?;
+    let enc = encode(y_true, classes)?;
+    let hits = (0..n).map(|i| {
+        let row = &y_score[i * n_classes..(i + 1) * n_classes];
+        let c = enc[i];
+        let s = row[c];
+        let rank = (0..n_classes)
+            .filter(|&j| row[j] > s || (row[j] == s && j > c))
+            .count();
+        f64::from(rank < k)
+    });
+    hits_reduce(hits, n, normalize, sample_weight)
+}
+
+/// Binary `top_k_accuracy_score`. `y_true` is the 0/1 encoding against the
+/// sorted classes and `y_score` the positive-class score. With `k == 1` the
+/// prediction is `score > threshold` (0.5 for scores inside `[0, 1]`, else 0);
+/// with `k >= 2` every sample is a hit, as in sklearn.
+pub fn top_k_accuracy_score_binary(
+    y_true: &[i32],
+    y_score: &[f64],
+    k: usize,
+    normalize: bool,
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    let n = y_true.len();
+    if y_score.len() != n {
+        return Err(MetricError::LengthMismatch);
+    }
+    if k == 0 {
+        return Err(MetricError::InvalidParameter);
+    }
+    validate_weight(n, sample_weight)?;
+    let (lo, hi) = y_score
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let threshold = if lo >= 0.0 && hi <= 1.0 { 0.5 } else { 0.0 };
+    let hits = (0..n).map(|i| {
+        if k == 1 {
+            f64::from(i32::from(y_score[i] > threshold) == y_true[i])
+        } else {
+            1.0
+        }
+    });
+    hits_reduce(hits, n, normalize, sample_weight)
+}
+
+fn hits_reduce(
+    hits: impl Iterator<Item = f64>,
+    n: usize,
+    normalize: bool,
+    sample_weight: Option<&[f64]>,
+) -> Result<f64, MetricError> {
+    if normalize {
+        return weighted_mean(hits, sample_weight);
+    }
+    let _ = n;
+    Ok(hits
+        .enumerate()
+        .map(|(i, h)| h * sample_weight.map_or(1.0, |sw| sw[i]))
+        .sum())
 }

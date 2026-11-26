@@ -84,7 +84,7 @@ def _ext():
     that same file — mirrors `random_projection.py`'s
     `johnson_lindenstrauss_min_dim` lazy-import convention exactly.
     """
-    from . import _load_ext
+    from .. import _load_ext
 
     return _load_ext()
 
@@ -129,6 +129,18 @@ def _param_labels(labels):
     if labels is None:
         return None
     return [int(v) for v in np.asarray(labels).ravel()]
+
+
+def _owned(column, dtype=np.float64, shape=None):
+    """A WRITABLE numpy array from a pyarrow result column.
+
+    ``np.asarray`` of a pyarrow array is a zero-copy but READ-ONLY view; sklearn
+    returns ordinary writable arrays, and callers do modify them in place
+    (``D.flat[...] = 0``, ``np.fill_diagonal``). The copy is one ``memcpy`` of a
+    buffer the Rust side just spent O(n·m·d) producing.
+    """
+    out = np.array(column, dtype=dtype, copy=True)
+    return out if shape is None else out.reshape(shape)
 
 
 def _sw(sample_weight):

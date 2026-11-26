@@ -259,3 +259,436 @@ pub fn mean_absolute_error<F: Pod>(
     })?;
     reduce(scores, multioutput, None)
 }
+
+// ==================== The rest of sklearn's regression surface ====================
+//
+// Same contract as the three metrics above: row-major `n_samples × n_outputs`
+// input, f64 accumulation, one pass per statistic, and the `multioutput`
+// reduction in [`reduce`].
+
+/// sklearn's `_assemble_fraction_of_explained_deviance`: `1 - num/den` per
+/// output with the `force_finite` table [`r2_score`] documents, reduced over
+/// `multioutput` (`VarianceWeighted` weights by `den`, falling back to uniform
+/// when every `den` is zero).
+fn assemble_explained(
+    num: &[f64],
+    den: &[f64],
+    multioutput: MultiOutput<'_>,
+    force_finite: bool,
+) -> Result<MetricOut, MetricError> {
+    let scores = num
+        .iter()
+        .zip(den)
+        .map(|(&n, &d)| {
+            if !force_finite {
+                1.0 - n / d
+            } else if n == 0.0 {
+                1.0
+            } else if d == 0.0 {
+                0.0
+            } else {
+                1.0 - n / d
+            }
+        })
+        .collect();
+    reduce(scores, multioutput, Some(den))
+}
+
+/// `explained_variance_score`: `1 - Var(y_true - y_pred) / Var(y_true)` per
+/// output (both weighted variances), with `r2_score`'s `force_finite` policy.
+/// Unlike `r2_score`, a bias in the predictions is NOT penalized — the
+/// residual's own mean is subtracted.
+pub fn explained_variance_score<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    multioutput: MultiOutput<'_>,
+    force_finite: bool,
+) -> Result<MetricOut, MetricError> {
+    let n = geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    let t = |i: usize, j: usize| host_to_f64(y_true[i * n_outputs + j]);
+    let p = |i: usize, j: usize| host_to_f64(y_pred[i * n_outputs + j]);
+    let diff_mean = weighted_column_means(n, n_outputs, sample_weight, |i, j| t(i, j) - p(i, j))?;
+    let true_mean = weighted_column_means(n, n_outputs, sample_weight, t)?;
+    let num = weighted_column_means(n, n_outputs, sample_weight, |i, j| {
+        let d = t(i, j) - p(i, j) - diff_mean[j];
+        d * d
+    })?;
+    let den = weighted_column_means(n, n_outputs, sample_weight, |i, j| {
+        let d = t(i, j) - true_mean[j];
+        d * d
+    })?;
+    assemble_explained(&num, &den, multioutput, force_finite)
+}
+
+/// `max_error`: the largest absolute residual. Single-output only
+/// (`Err(UnsupportedTarget)` otherwise, sklearn's "Multioutput not supported").
+pub fn max_error<F: Pod>(y_true: &[F], y_pred: &[F], n_outputs: usize) -> Result<f64, MetricError> {
+    geometry(y_true, y_pred, n_outputs, None)?;
+    if n_outputs != 1 {
+        return Err(MetricError::UnsupportedTarget);
+    }
+    Ok(y_true
+        .iter()
+        .zip(y_pred)
+        .map(|(&t, &p)| (host_to_f64(t) - host_to_f64(p)).abs())
+        .fold(0.0, f64::max))
+}
+
+/// `mean_absolute_percentage_error`: `|y_pred - y_true| / max(|y_true|, eps)`
+/// averaged per output (`eps` = f64 machine epsilon, so a zero target gives a
+/// huge but finite term, exactly as sklearn).
+pub fn mean_absolute_percentage_error<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    let n = geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    let scores = weighted_column_means(n, n_outputs, sample_weight, |i, j| {
+        let t = host_to_f64(y_true[i * n_outputs + j]);
+        let p = host_to_f64(y_pred[i * n_outputs + j]);
+        (p - t).abs() / t.abs().max(f64::EPSILON)
+    })?;
+    reduce(scores, multioutput, None)
+}
+
+/// Per-output mean squared error of `f(y_true)` vs `f(y_pred)`, the shared
+/// body of the (root) mean squared (log) errors.
+fn column_mse<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    f: impl Fn(f64) -> f64,
+) -> Result<Vec<f64>, MetricError> {
+    let n = geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    weighted_column_means(n, n_outputs, sample_weight, |i, j| {
+        let d = f(host_to_f64(y_true[i * n_outputs + j])) - f(host_to_f64(y_pred[i * n_outputs + j]));
+        d * d
+    })
+}
+
+/// `Err(DomainError)` when any target or prediction is `<= -1` (the log1p
+/// metrics' domain).
+fn check_log1p_domain<F: Pod>(y_true: &[F], y_pred: &[F]) -> Result<(), MetricError> {
+    if y_true.iter().chain(y_pred).any(|&v| host_to_f64(v) <= -1.0) {
+        return Err(MetricError::DomainError);
+    }
+    Ok(())
+}
+
+/// `root_mean_squared_error`: the per-output square root of the MSE, THEN
+/// reduced over `multioutput` (so `uniform_average` is the mean of the RMSEs,
+/// not the root of the mean MSE — sklearn's definition).
+pub fn root_mean_squared_error<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    let mse = column_mse(y_true, y_pred, n_outputs, sample_weight, |v| v)?;
+    reduce(mse.into_iter().map(f64::sqrt).collect(), multioutput, None)
+}
+
+/// `mean_squared_log_error`: the MSE of `log1p(y_true)` vs `log1p(y_pred)`.
+/// `Err(DomainError)` for any value `<= -1`.
+pub fn mean_squared_log_error<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    check_log1p_domain(y_true, y_pred)?;
+    let mse = column_mse(y_true, y_pred, n_outputs, sample_weight, f64::ln_1p)?;
+    reduce(mse, multioutput, None)
+}
+
+/// `root_mean_squared_log_error`: the per-output root of
+/// [`mean_squared_log_error`], then reduced.
+pub fn root_mean_squared_log_error<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    check_log1p_domain(y_true, y_pred)?;
+    let mse = column_mse(y_true, y_pred, n_outputs, sample_weight, f64::ln_1p)?;
+    reduce(mse.into_iter().map(f64::sqrt).collect(), multioutput, None)
+}
+
+/// sklearn's `_weighted_percentile(values, weights, percentile_rank, average)`
+/// for ONE column, reproduced step for step (it is not the textbook weighted
+/// quantile, and the differences are observable):
+///
+/// 1. sort by value; NaN entries (sorted last) get zero weight;
+/// 2. `cdf = cumsum(sorted weights)`, target `= rank/100 * cdf[-1]` (nudged off
+///    zero with `nextafter` so rank 0 picks the first POSITIVE-weight value);
+/// 3. index = `searchsorted(cdf, target, 'left')`, clipped;
+/// 4. with `average = true`, if the cdf lands EXACTLY on the target (within
+///    f64 epsilon) the result is the mean of that value and the next
+///    positive-weight one.
+///
+/// Returns NaN when every weight is zero (sklearn's own early return).
+pub(crate) fn weighted_percentile(values: &[f64], weights: &[f64], rank: f64, average: bool) -> f64 {
+    if weights.iter().all(|&w| w == 0.0) {
+        return f64::NAN;
+    }
+    let n = values.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+    let sorted_w: Vec<f64> = idx
+        .iter()
+        .map(|&i| if values[i].is_nan() { 0.0 } else { weights[i] })
+        .collect();
+    let mut cdf = Vec::with_capacity(n);
+    let mut run = 0.0f64;
+    for &w in &sorted_w {
+        run += w;
+        cdf.push(run);
+    }
+    let mut target = rank / 100.0 * cdf[n - 1];
+    if target == 0.0 {
+        target = f64::from_bits(1); // nextafter(0, 1)
+    }
+    let max_idx = n - 1;
+    let pos = cdf.partition_point(|&c| c < target).min(max_idx);
+    let v = values[idx[pos]];
+    if !average {
+        return v;
+    }
+    let above = cdf[pos] - target > f64::EPSILON;
+    if above {
+        return v;
+    }
+    let mut next = (pos + 1).min(max_idx);
+    if sorted_w[next] == 0.0 {
+        let cdf_val = cdf[pos];
+        let right = cdf.partition_point(|&c| c <= cdf_val);
+        next = if right > max_idx { pos } else { right };
+    }
+    (v + values[idx[next]]) / 2.0
+}
+
+/// numpy's `median` (mean of the two middle values for an even count; NaN if
+/// any value is NaN). An O(n) selection, not a sort — numpy's `median` is a
+/// partition too, and a full sort measured 2x slower than it at n = 1e6.
+fn median(values: &mut [f64]) -> f64 {
+    let n = values.len();
+    if n == 0 || values.iter().any(|v| v.is_nan()) {
+        return f64::NAN;
+    }
+    let mid = n / 2;
+    let (lower, upper, _) = values.select_nth_unstable_by(mid, f64::total_cmp);
+    let hi = *upper;
+    if n % 2 == 1 {
+        hi
+    } else {
+        // The lower middle is the largest element of the left partition.
+        let lo = lower.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (lo + hi) / 2.0
+    }
+}
+
+/// Column `j` of a row-major buffer, as f64.
+fn column<F: Pod>(y: &[F], n: usize, n_outputs: usize, j: usize) -> Vec<f64> {
+    (0..n).map(|i| host_to_f64(y[i * n_outputs + j])).collect()
+}
+
+/// `median_absolute_error`: the per-output median of `|y_pred - y_true|` —
+/// numpy's median unweighted, sklearn's averaged weighted 50th percentile with
+/// `sample_weight`.
+pub fn median_absolute_error<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    let n = geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    let scores = (0..n_outputs)
+        .map(|j| {
+            let mut abs: Vec<f64> = (0..n)
+                .map(|i| (host_to_f64(y_pred[i * n_outputs + j]) - host_to_f64(y_true[i * n_outputs + j])).abs())
+                .collect();
+            match sample_weight {
+                None => median(&mut abs),
+                Some(w) => weighted_percentile(&abs, w, 50.0, true),
+            }
+        })
+        .collect();
+    reduce(scores, multioutput, None)
+}
+
+/// The pinball (quantile) loss of one residual: `alpha·d` above, `(alpha-1)·d`
+/// below.
+fn pinball(t: f64, p: f64, alpha: f64) -> f64 {
+    let d = t - p;
+    let sign = if d >= 0.0 { 1.0 } else { 0.0 };
+    alpha * sign * d - (1.0 - alpha) * (1.0 - sign) * d
+}
+
+/// `mean_pinball_loss` at quantile `alpha ∈ [0, 1]`.
+pub fn mean_pinball_loss<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    alpha: f64,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    if !(0.0..=1.0).contains(&alpha) {
+        return Err(MetricError::InvalidParameter);
+    }
+    let n = geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    let scores = weighted_column_means(n, n_outputs, sample_weight, |i, j| {
+        pinball(host_to_f64(y_true[i * n_outputs + j]), host_to_f64(y_pred[i * n_outputs + j]), alpha)
+    })?;
+    reduce(scores, multioutput, None)
+}
+
+/// `d2_pinball_score`: `1 - pinball(y, ŷ) / pinball(y, q_alpha(y))` per output,
+/// `q_alpha` being the (weighted, averaged) `alpha`-quantile of `y_true` —
+/// the best constant model. Always `force_finite`. Fewer than 2 samples give a
+/// scalar NaN (sklearn's early return, warned by the shim).
+pub fn d2_pinball_score<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    alpha: f64,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    if !(0.0..=1.0).contains(&alpha) {
+        return Err(MetricError::InvalidParameter);
+    }
+    let n = geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    if n < 2 {
+        return Ok(MetricOut::Scalar(f64::NAN));
+    }
+    let num = weighted_column_means(n, n_outputs, sample_weight, |i, j| {
+        pinball(host_to_f64(y_true[i * n_outputs + j]), host_to_f64(y_pred[i * n_outputs + j]), alpha)
+    })?;
+    let ones = vec![1.0f64; n];
+    let w = sample_weight.unwrap_or(&ones);
+    let quantile: Vec<f64> = (0..n_outputs)
+        .map(|j| weighted_percentile(&column(y_true, n, n_outputs, j), w, alpha * 100.0, true))
+        .collect();
+    let den = weighted_column_means(n, n_outputs, sample_weight, |i, j| {
+        pinball(host_to_f64(y_true[i * n_outputs + j]), quantile[j], alpha)
+    })?;
+    assemble_explained(&num, &den, multioutput, true)
+}
+
+/// `d2_absolute_error_score`: [`d2_pinball_score`] at `alpha = 0.5`.
+pub fn d2_absolute_error_score<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    multioutput: MultiOutput<'_>,
+) -> Result<MetricOut, MetricError> {
+    d2_pinball_score(y_true, y_pred, n_outputs, sample_weight, 0.5, multioutput)
+}
+
+/// Validate the Tweedie deviance domain for `power`, exactly sklearn's rules:
+/// `p < 0` needs `y_pred > 0`; `p = 0` anything; `1 <= p < 2` needs `y_true >=
+/// 0` and `y_pred > 0`; `p >= 2` needs both `> 0`; `0 < p < 1` has no
+/// distribution and is `Err(InvalidParameter)`.
+fn check_tweedie_domain(y_true: &[f64], y_pred: &[f64], power: f64) -> Result<(), MetricError> {
+    let bad = if power < 0.0 {
+        y_pred.iter().any(|&p| p <= 0.0)
+    } else if power == 0.0 {
+        false
+    } else if (1.0..2.0).contains(&power) {
+        y_true.iter().any(|&t| t < 0.0) || y_pred.iter().any(|&p| p <= 0.0)
+    } else if power >= 2.0 {
+        y_true.iter().any(|&t| t <= 0.0) || y_pred.iter().any(|&p| p <= 0.0)
+    } else {
+        return Err(MetricError::InvalidParameter);
+    };
+    if bad {
+        return Err(MetricError::DomainError);
+    }
+    Ok(())
+}
+
+/// The unit Tweedie deviance of one `(y, mu)` pair (sklearn's
+/// `_mean_tweedie_deviance` term, branch for branch: `xlogy` makes the
+/// Poisson term `0` at `y = 0`).
+fn tweedie_unit(t: f64, mu: f64, p: f64) -> f64 {
+    if p < 0.0 {
+        let tp = if t > 0.0 { t } else { 0.0 };
+        2.0 * (tp.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - t * mu.powf(1.0 - p) / (1.0 - p)
+            + mu.powf(2.0 - p) / (2.0 - p))
+    } else if p == 0.0 {
+        (t - mu) * (t - mu)
+    } else if p == 1.0 {
+        let xlogy = if t == 0.0 { 0.0 } else { t * (t / mu).ln() };
+        2.0 * (xlogy - t + mu)
+    } else if p == 2.0 {
+        2.0 * ((mu / t).ln() + t / mu - 1.0)
+    } else {
+        2.0 * (t.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - t * mu.powf(1.0 - p) / (1.0 - p)
+            + mu.powf(2.0 - p) / (2.0 - p))
+    }
+}
+
+fn mean_tweedie_f64(t: &[f64], mu: &[f64], sample_weight: Option<&[f64]>, power: f64) -> Result<f64, MetricError> {
+    let total = weight_total(t.len(), sample_weight)?;
+    let mut sum = 0.0f64;
+    for i in 0..t.len() {
+        sum += sample_weight.map_or(1.0, |sw| sw[i]) * tweedie_unit(t[i], mu[i], power);
+    }
+    Ok(sum / total)
+}
+
+/// `mean_tweedie_deviance` (single-output). `power = 0` is the MSE, `1` the
+/// Poisson and `2` the Gamma deviance.
+pub fn mean_tweedie_deviance<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    power: f64,
+) -> Result<f64, MetricError> {
+    geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    if n_outputs != 1 {
+        return Err(MetricError::UnsupportedTarget);
+    }
+    let t: Vec<f64> = y_true.iter().map(|&v| host_to_f64(v)).collect();
+    let p: Vec<f64> = y_pred.iter().map(|&v| host_to_f64(v)).collect();
+    check_tweedie_domain(&t, &p, power)?;
+    mean_tweedie_f64(&t, &p, sample_weight, power)
+}
+
+/// `d2_tweedie_score`: `1 - D(y, ŷ) / D(y, ȳ)`, `ȳ` the weighted mean target.
+/// Fewer than 2 samples give NaN (the shim warns).
+pub fn d2_tweedie_score<F: Pod>(
+    y_true: &[F],
+    y_pred: &[F],
+    n_outputs: usize,
+    sample_weight: Option<&[f64]>,
+    power: f64,
+) -> Result<f64, MetricError> {
+    let n = geometry(y_true, y_pred, n_outputs, sample_weight)?;
+    if n_outputs != 1 {
+        return Err(MetricError::UnsupportedTarget);
+    }
+    if n < 2 {
+        return Ok(f64::NAN);
+    }
+    let t: Vec<f64> = y_true.iter().map(|&v| host_to_f64(v)).collect();
+    let p: Vec<f64> = y_pred.iter().map(|&v| host_to_f64(v)).collect();
+    check_tweedie_domain(&t, &p, power)?;
+    let num = mean_tweedie_f64(&t, &p, sample_weight, power)?;
+    let total = weight_total(n, sample_weight)?;
+    let mean = (0..n).map(|i| sample_weight.map_or(1.0, |sw| sw[i]) * t[i]).sum::<f64>() / total;
+    let den = mean_tweedie_f64(&t, &vec![mean; n], sample_weight, power)?;
+    Ok(1.0 - num / den)
+}

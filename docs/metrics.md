@@ -1,8 +1,13 @@
 # `mlrs.metrics` — the full sklearn parameter surface
 
-`mlrs.metrics` implements eleven `sklearn.metrics` functions with **every
-parameter of their `scikit-learn==1.9.0` signatures**. They are free functions,
-not estimators: no `output_type` routing, no device buffers, no `fit`.
+`mlrs.metrics` implements **every public function of `sklearn.metrics`**
+(scikit-learn 1.9), plus the `mlrs.metrics.cluster` and `mlrs.metrics.pairwise`
+submodules and `DistanceMetric`. They are free functions, not estimators: no
+`output_type` routing, no device buffers, no `fit`. The plotting `*Display`
+classes are the one omission — they are matplotlib front ends, not metrics.
+
+The eleven original metrics are documented parameter by parameter below; the
+rest of the surface is summarized in [The rest of the surface](#the-rest-of-the-surface).
 
 ```python
 import numpy as np
@@ -257,3 +262,77 @@ reproduce. It deliberately uses 4 classes (so OvO averages 6 class pairs, a
 count a per-class loop cannot fake) and carries both a tie-heavy and a
 continuous score vector (so `drop_intermediate` has a cell where it actually
 drops points).
+
+## The rest of the surface
+
+Every value is computed in Rust; the Python package (`mlrs/metrics/`) owns
+sklearn's messages, warnings and output shapes, as for the original eleven.
+
+| area | functions | Rust module |
+|---|---|---|
+| set-wise classification | `precision_recall_fscore_support`, `fbeta_score`, `jaccard_score`, `multilabel_confusion_matrix`, `classification_report` (and `precision`/`recall`/`f1_score`, now views of the same core) | `prfs` |
+| label/probability scores | `balanced_accuracy_score`, `matthews_corrcoef`, `cohen_kappa_score`, `hamming_loss`, `zero_one_loss`, `hinge_loss`, `brier_score_loss`, `d2_brier_score`, `d2_log_loss_score`, `class_likelihood_ratios`, `top_k_accuracy_score` | `classification` |
+| regression | `explained_variance_score`, `max_error`, `mean_absolute_percentage_error`, `(root_)mean_squared_log_error`, `root_mean_squared_error`, `median_absolute_error`, `mean_pinball_loss`, `mean_{tweedie,poisson,gamma}_deviance`, `d2_{tweedie,pinball,absolute_error}_score` | `regression` |
+| ranking/thresholds | `roc_curve`, `det_curve`, `confusion_matrix_at_thresholds`, `metric_at_thresholds`, `auc`, `average_precision_score`, `coverage_error`, `label_ranking_average_precision_score`, `label_ranking_loss`, `dcg_score`, `ndcg_score` | `ranking` |
+| clustering | the MI family (`mutual_info`, `adjusted_`/`normalized_mutual_info`, `expected_mutual_information`), `homogeneity`/`completeness`/`v_measure`, `(adjusted_)rand_score`, `fowlkes_mallows_score`, `pair_confusion_matrix`, `contingency_matrix`, `entropy`, `silhouette_{samples,score}`, `calinski_harabasz_score`, `davies_bouldin_score`, `consensus_score` | `cluster` |
+| pairwise | `pairwise_distances` (all of sklearn's `_VALID_METRICS` except the removed `wminkowski`, plus `precomputed` and callables), `pairwise_kernels`, every named distance/kernel function, `paired_*`, `pairwise_distances_chunked`, `pairwise_distances_argmin(_min)`, `DistanceMetric` | `pairwise` |
+| scorers | `make_scorer`, `get_scorer`, `get_scorer_names`, `check_scoring` | Python only |
+
+Multilabel-indicator targets are now accepted wherever sklearn accepts them
+(`precision`/`recall`/`f1`/`fbeta`/`jaccard` with `average='samples'`,
+`accuracy_score`, `hamming_loss`, `zero_one_loss`, `average_precision_score`).
+
+### Semantics worth knowing
+
+- **`zero_division=np.nan` is skipped by the averages.** sklearn's
+  `_nanaverage` drops undefined classes; the original per-metric averaging
+  returned NaN. Fixed by routing precision/recall/F1 through `prfs`.
+  `jaccard_score` uses the plain `_average` (and rejects `np.nan`), as sklearn.
+- **Zero-weight samples are not thresholds.** Every curve drops them before
+  sorting, as sklearn does — `precision_recall_curve` did not, and now does.
+- **`median_absolute_error` with weights** reproduces sklearn's averaged
+  `_weighted_percentile`, including its "exactly on the 50% cdf" averaging.
+- **Pair counts are exact.** `adjusted_rand_score` and friends work in `i128`
+  (sklearn relies on Python's unbounded ints for the same products).
+- **Euclidean distances are direct**, `Σ (x − y)²`, not the norm expansion
+  sklearn uses — never less accurate. The `*_norm_squared` hints are accepted
+  and ignored.
+- **Output dtypes match sklearn**: float32 in → float32 out exactly for the
+  metrics whose sklearn implementation preserves it (euclidean, cosine,
+  nan_euclidean, paired distances, every kernel but laplacian).
+- **Scorers** reuse sklearn's `_Scorer` plumbing (response-method dispatch,
+  metadata routing) with each registered name bound to the mlrs metric of
+  the same name, so they plug into `cross_val_score`/`GridSearchCV` unchanged.
+
+### Performance (n as given, 16 cores, minimum of 3, wall clock)
+
+| case | sklearn | mlrs | |
+|---|---|---|---|
+| `pairwise_distances` euclidean 3000×2000×50 | 25.9 ms | 16.7 ms | 1.6x |
+| `pairwise_distances` manhattan 3000×2000×50 | 71.4 ms | 15.5 ms | 4.6x |
+| `pairwise_distances` cosine 3000×2000×50 | 23.0 ms | 24.5 ms | 0.94x |
+| `rbf_kernel` 3000×2000×50 | 27.4 ms | 23.3 ms | 1.2x |
+| `silhouette_score` n=5000 | 157 ms | 37 ms | 4.3x |
+| `adjusted_mutual_info_score` n=2e5, K=200 | 3101 ms | 922 ms | 3.4x |
+| `roc_curve` n=1e6 | 124 ms | 78 ms | 1.6x |
+| `average_precision_score` n=1e6 | 145 ms | 58 ms | 2.5x |
+| `median_absolute_error` n=1e6 | 10.1 ms | 2.0 ms | 5.2x |
+| `matthews_corrcoef` n=1e6 | 120 ms | 10 ms | 12x |
+| `precision_recall_fscore_support` macro n=1e6 | 65 ms | 10 ms | 6.5x |
+| `label_ranking_loss` 2e5×20 | 1675 ms | 111 ms | 15x |
+| `ndcg_score` 2e5×20 | 2773 ms | 94 ms | 30x |
+
+The pairwise engine is host-side (direct f64 loops, four-lane accumulators,
+parallel over output row blocks on scoped threads). At these sizes most of its
+time is writing the 48 MB output, not arithmetic. The device `metric_distance`
+/`kernel_matrix` prims are not used here yet.
+
+### Tests
+
+- `crates/mlrs-algos/tests/metrics_surface_test.rs` — the Rust API against
+  sklearn-computed values, one test per area.
+- `crates/mlrs-py/python/tests/test_oracle_metrics_surface.py` — the full
+  Python path against LIVE sklearn: every function, both input dtypes, with and
+  without `sample_weight`, every string parameter, warning categories, output
+  dtypes, and a completeness check that every non-Display name of
+  `sklearn.metrics`, `.cluster` and `.pairwise` exists in mlrs.

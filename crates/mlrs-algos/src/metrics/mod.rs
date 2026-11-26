@@ -14,15 +14,20 @@
 //! label/target vectors — none needs a device kernel, `BufferPool`, or the
 //! f64 capability guard (host-only by design, SPEC §3).
 //!
-//! `metrics/mod.rs` is edited EXACTLY ONCE in the whole metrics-surface plan
-//! (Plan-Check Issue 4, TASK-01): every later classification/regression task
-//! only appends functions to its own already-registered `classification.rs`/
-//! `regression.rs` file.
+//! The rest of sklearn's surface lives in its own submodules: [`prfs`] (the
+//! shared precision/recall/F-beta/Jaccard core and the multilabel confusion
+//! counts), [`ranking`] (threshold curves and ranking metrics), [`cluster`]
+//! (supervised and unsupervised clustering scores) and [`pairwise`] (the
+//! distance/kernel engine).
 //!
 //! Tests live in `crates/mlrs-algos/tests/metrics_infra_test.rs` (AGENTS.md
 //! §2 — no in-source `#[cfg(test)] mod tests`).
 
 pub mod classification;
+pub mod cluster;
+pub mod pairwise;
+pub mod prfs;
+pub mod ranking;
 pub mod regression;
 
 /// The averaging strategy for `precision_score`/`recall_score`/`f1_score`
@@ -172,6 +177,25 @@ pub enum MetricError {
     /// number of output columns (METR-PARAM-01). sklearn raises
     /// `ValueError("There must be equally many custom weights ...")`.
     BadMultiOutputWeights,
+    /// An input value lies outside the metric's mathematical domain (a
+    /// negative target for a log/deviance metric, a probability outside
+    /// `[0, 1]`, a non-positive prediction for a Tweedie deviance, …). The
+    /// Python shim raises sklearn's own message before reaching Rust; this is
+    /// the standalone-Rust guard against a NaN or panic.
+    DomainError,
+    /// A scalar parameter is outside its valid range (`power ∈ (0, 1)` for a
+    /// Tweedie deviance, `k == 0`, `alpha ∉ [0, 1]`, a negative `beta`, …).
+    InvalidParameter,
+    /// The target shape is one the metric does not support (multi-output for a
+    /// single-output metric, a multiclass target for a binary-only metric).
+    UnsupportedTarget,
+    /// `auc`'s `x` is neither monotonically increasing nor decreasing.
+    NonMonotonic,
+    /// An input needs more points/labels/samples than it has (`auc` with fewer
+    /// than 2 points, a clustering score with fewer than 2 labels, …).
+    TooFewPoints,
+    /// A distance metric or kernel name the pairwise module does not know.
+    UnknownMetric,
 }
 
 impl std::fmt::Display for MetricError {
@@ -208,6 +232,16 @@ impl std::fmt::Display for MetricError {
             MetricError::BadMultiOutputWeights => {
                 "mlrs.metrics: there must be equally many custom weights as outputs"
             }
+            MetricError::DomainError => "mlrs.metrics: input values outside the metric's domain",
+            MetricError::InvalidParameter => "mlrs.metrics: parameter value out of range",
+            MetricError::UnsupportedTarget => {
+                "mlrs.metrics: target type not supported by this metric"
+            }
+            MetricError::NonMonotonic => {
+                "mlrs.metrics: x is neither increasing nor decreasing"
+            }
+            MetricError::TooFewPoints => "mlrs.metrics: not enough points/labels for this metric",
+            MetricError::UnknownMetric => "mlrs.metrics: unknown metric",
         };
         f.write_str(msg)
     }
@@ -270,7 +304,7 @@ pub struct ClassBookkeeping {
 
 /// Validate `sample_weight` (if given): must be the same length as the
 /// labels and every entry finite and `>= 0.0`.
-fn validate_weight(len: usize, sample_weight: Option<&[f64]>) -> Result<(), MetricError> {
+pub(crate) fn validate_weight(len: usize, sample_weight: Option<&[f64]>) -> Result<(), MetricError> {
     if let Some(w) = sample_weight {
         if w.len() != len {
             return Err(MetricError::LengthMismatch);

@@ -62,6 +62,9 @@ pub mod ingress;
 // TASK-15): thin wrappers over `mlrs_algos::metrics::{classification,regression}`.
 pub mod feature_selection;
 pub mod metrics;
+// The rest of `sklearn.metrics` (classification, regression, ranking,
+// clustering, pairwise) — host-only, like `metrics`.
+pub mod metrics_ext;
 // The `mlrs.model_selection` PyO3 free-function surface (MODSEL-BIND-01):
 // splitter index generation, ParameterGrid/Sampler combinatorics, search +
 // halving schedules, CV aggregation and decision-threshold tuning, over
@@ -429,6 +432,8 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(metrics::r2_score, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::mean_squared_error, m)?)?;
     m.add_function(wrap_pyfunction!(metrics::mean_absolute_error, m)?)?;
+    // ...and the rest of the `sklearn.metrics` surface.
+    metrics_ext::register(m)?;
 
     // The host-only `sklearn.feature_selection` surface (FSEL-01): the five
     // closed-form score functions, both mutual-information estimators, and the
