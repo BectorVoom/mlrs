@@ -1,15 +1,18 @@
 """Coordinate-descent paths and joint-target regularized linear regressors."""
 
 import warnings
+from copy import copy
+from functools import lru_cache
 from numbers import Integral, Real
 
 import numpy as np
+import pyarrow as pa
 from joblib import Parallel, delayed
 from scipy import sparse
 from sklearn import get_config
 from sklearn.base import BaseEstimator, MultiOutputMixin, RegressorMixin
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.model_selection import check_cv
+from sklearn.model_selection import KFold, check_cv
 from sklearn.utils import check_random_state
 from sklearn.utils.metadata_routing import (
     MetadataRouter,
@@ -62,15 +65,51 @@ def _options(max_iter, tol, selection):
     return _count(max_iter, "max_iter"), _real(tol, "tol", 0), selection
 
 
+def _warn_nonconvergence(max_iter, gap):
+    warnings.warn(
+        f"Objective did not converge after {max_iter} iterations. Dual gap: {gap:.6g}.",
+        ConvergenceWarning,
+        stacklevel=4,
+    )
+
+
+@lru_cache(maxsize=1)
+def _native_cd():
+    from . import _load_ext
+
+    try:
+        return _load_ext().regularized_cd_gram
+    except (ImportError, AttributeError):
+        return None
+
+
+def _use_host_gram(X, options, precompute="auto"):
+    rows, features = X.shape
+    return (
+        options[2] == "cyclic"
+        and not sparse.issparse(X)
+        and (not isinstance(precompute, (bool, np.bool_)) or precompute)
+        and features <= 512
+        and (precompute is True or rows >= max(64, features))
+    )
+
+
+def _products(X, Y):
+    return X.T @ X, X.T @ Y, np.vdot(Y, Y).real
+
+
 class _Problem:
     """Centered, weighted least squares with a residual shared across features."""
 
-    def __init__(self, X, y, fit_intercept, weights=None, device="cpu"):
+    def __init__(
+        self, X, y, fit_intercept, weights=None, device="cpu", host_gram=False
+    ):
         self.n, self.d = X.shape
         self.multi = y.ndim == 2
         self.dtype = X.dtype
         self.sparse = sparse.issparse(X)
         self.device = device
+        self.gram = None
         self.scale = (
             None if weights is None else np.sqrt(weights * (self.n / weights.sum()))
         )
@@ -107,26 +146,57 @@ class _Problem:
                 self.X -= self.x_mean
             if self.scale is not None:
                 self.X *= self.scale[:, None]
-            if device == "cpu":
+            if device == "cpu" and not host_gram:
                 self.norms = np.einsum("ij,ij->j", self.X, self.X)
         if self.scale is not None:
             self.Y *= self.scale[:, None]
         self.shape = (self.d, self.Y.shape[1])
         if device == "gpu":
             gram, cross = device_gram(self.X, self.Y, self.dtype)
-            self.norms = gram.diagonal()
-            self.gram = np.asfortranarray(gram / self.n)
-            self.cross = cross / self.n
             # The Gram and target energy must use the same rounded input.
             stored_Y = self.Y.astype(self.dtype, copy=False).astype(
                 np.float64, copy=False
             )
-            self.target_energy = np.sum(stored_Y**2) / self.n
+            self._set_gram(gram, cross, np.vdot(stored_Y, stored_Y).real)
             self.X = None
             self.Y = None
+        elif host_gram:
+            self._set_gram(*_products(self.X, self.Y))
         else:
-            self.target_energy = np.sum(self.Y**2) / self.n
-        self.norms = np.maximum(self.norms / self.n, 0)
+            self.target_energy = np.vdot(self.Y, self.Y).real / self.n
+            self.norms = np.maximum(self.norms / self.n, 0)
+
+    def _set_gram(self, gram, cross, energy):
+        self.gram = np.ascontiguousarray(gram / self.n)
+        self.cross = np.ascontiguousarray(cross / self.n)
+        self.norms = np.maximum(self.gram.diagonal(), 0)
+        self.target_energy = energy / self.n
+
+    def native_path(self, alphas, ratio, initial, positive, options):
+        if self.gram is None or options[2] != "cyclic":
+            return None
+        native = _native_cd()
+        if native is None:
+            return None
+        max_iter, tol, _ = options
+        if initial is None:
+            initial = np.zeros(self.shape)
+        values, gaps, iterations, converged = native(
+            pa.array(self.gram.ravel()),
+            pa.array(self.cross.ravel()),
+            pa.array(np.ravel(initial)),
+            *self.shape,
+            self.target_energy,
+            alphas.tolist(),
+            ratio,
+            max_iter,
+            tol,
+            positive,
+        )
+        for gap, success in zip(gaps, converged):
+            if not success:
+                _warn_nonconvergence(max_iter, gap)
+        return np.asarray(values).reshape(-1, *self.shape), gaps, iterations
 
     def column(self, j):
         if not self.sparse:
@@ -148,12 +218,16 @@ class _Problem:
         ) / self.n
 
     def solve(self, alpha, ratio, initial, positive, options, rng):
+        native = self.native_path(np.array([alpha]), ratio, initial, positive, options)
+        if native is not None:
+            coefs, gaps, iterations = native
+            return coefs[0].copy(), gaps[0], iterations[0]
         max_iter, tol, selection = options
         l1 = alpha * ratio
         l2 = alpha * (1 - ratio)
         coef = np.zeros(self.shape) if initial is None else initial.copy()
         coef[self.norms == 0] = 0
-        use_gram = self.device == "gpu"
+        use_gram = self.gram is not None
         if use_gram:
             residual = self.cross - self.gram @ coef
         else:
@@ -237,11 +311,7 @@ class _Problem:
                 if converged:
                     break
         else:
-            warnings.warn(
-                f"Objective did not converge after {max_iter} iterations. Dual gap: {gap:.6g}.",
-                ConvergenceWarning,
-                stacklevel=3,
-            )
+            _warn_nonconvergence(max_iter, gap)
         return coef, gap, iteration
 
     def grid(self, ratio, eps, count, cross=None):
@@ -250,7 +320,7 @@ class _Problem:
                 "Automatic alpha grids require l1_ratio > 0. Supply explicit alphas."
             )
         if cross is None:
-            cross = self.cross if self.device == "gpu" else self.correlate(self.Y)
+            cross = self.cross if self.gram is not None else self.correlate(self.Y)
         maximum = np.linalg.norm(cross, axis=1).max() / ratio
         resolution = np.finfo(np.float64).resolution
         if maximum <= resolution:
@@ -341,7 +411,11 @@ def enet_path(
     if check_input:
         _validate_precompute(precompute, X.shape[1])
     weights = _weights(sample_weight, X.shape[0])
-    problem = _Problem(X, y, False, weights, fit_device(device, X))
+    options = _options(max_iter, tol, selection)
+    device = fit_device(device, X)
+    problem = _Problem(
+        X, y, False, weights, device, _use_host_gram(X, options, precompute)
+    )
     ratio = _real(l1_ratio, "l1_ratio", 0, 1)
     count = _alpha_grid_count(alphas, n_alphas)
     if count is not None:
@@ -368,8 +442,17 @@ def enet_path(
         coef = coef.reshape(problem.shape[1], problem.d).T
         if positive:
             coef = np.maximum(coef, 0)
-    options = _options(max_iter, tol, selection)
     rng = check_random_state(random_state)
+    native = problem.native_path(alphas, ratio, coef, positive, options)
+    if native is not None:
+        coefs, gaps, iterations = native
+        path = coefs.transpose(2, 1, 0) if problem.multi else coefs[:, :, 0].T
+        result = (
+            alphas,
+            path.astype(problem.dtype),
+            np.asarray(gaps, dtype=problem.dtype),
+        )
+        return (*result, iterations) if return_n_iter else result
     shape = (problem.shape[1], problem.d) if problem.multi else (problem.d,)
     path = np.empty((*shape, len(alphas)), dtype=problem.dtype)
     gaps = np.empty(len(alphas), dtype=problem.dtype)
@@ -449,7 +532,14 @@ class _MultiTaskRegressor(MultiOutputMixin, _RegularizedRegressor):
         ratio = _real(getattr(self, "l1_ratio", 1.0), "l1_ratio", 0, 1)
         rng = check_random_state(self.random_state)
         X, y = self._fit_data(X, y)
-        problem = _Problem(X, y, self.fit_intercept, device=fit_device(self.device, X))
+        device = fit_device(self.device, X)
+        problem = _Problem(
+            X,
+            y,
+            self.fit_intercept,
+            device=device,
+            host_gram=_use_host_gram(X, options),
+        )
         initial = None
         if (
             self.warm_start
@@ -522,6 +612,93 @@ class MultiTaskLasso(_MultiTaskRegressor):
         self.device = device
 
 
+def _validation_loss(problem, validation, coefs):
+    X, Y, weights, gram, cross, energy = validation
+    count, _, targets = coefs.shape
+    batch = coefs.transpose(1, 0, 2).reshape(problem.d, count * targets)
+    if len(X) < problem.d:
+        return _residual_losses(X, Y, weights, batch, targets)
+    quadratic = (batch * (gram @ batch)).reshape(problem.d, count, targets)
+    losses = (
+        energy + quadratic.sum(axis=(0, 2)) - 2 * np.einsum("mdk,dk->m", coefs, cross)
+    ) / targets
+    # When the model is nearly exact, cancellation in the quadratic formula
+    # could change grid selection. Score those candidates from the residual.
+    near_zero = losses <= 128 * np.finfo(float).eps * energy
+    if np.any(near_zero):
+        subset = batch.reshape(problem.d, count, targets)[:, near_zero].reshape(
+            problem.d, -1
+        )
+        losses[near_zero] = _residual_losses(X, Y, weights, subset, targets)
+    return losses
+
+
+def _residual_losses(X, Y, weights, coefficients, targets):
+    errors = Y[:, None, :] - (X @ coefficients).reshape(len(X), -1, targets)
+    return np.average(np.mean(errors**2, axis=2), axis=0, weights=weights)
+
+
+def _kfold_moments(full, train, test, fit_intercept):
+    # KFold's shuffled indices are sorted too. A contiguous validation fold can
+    # be a view of the globally centered design.
+    index = (
+        slice(test[0], test[-1] + 1) if test[-1] - test[0] + 1 == len(test) else test
+    )
+    X, Y = full.X[index], full.Y[index]
+    test_n = len(test)
+    train_n = full.n - test_n
+    gram, cross, energy = _products(X, Y)
+    x_mean = X.mean(axis=0)
+    y_mean = Y.mean(axis=0)
+    x_shift = -test_n / train_n * x_mean if fit_intercept else np.zeros_like(x_mean)
+    y_shift = -test_n / train_n * y_mean if fit_intercept else np.zeros_like(y_mean)
+
+    problem = copy(full)
+    problem.n = train_n
+    problem.x_mean = full.x_mean + x_shift
+    problem.y_mean = full.y_mean + y_shift
+    whole_gram = full.gram * full.n
+    whole_energy = full.target_energy * full.n
+    train_gram = whole_gram - gram - train_n * np.outer(x_shift, x_shift)
+    train_cross = full.cross * full.n - cross - train_n * np.outer(x_shift, y_shift)
+    train_energy = whole_energy - energy - train_n * np.vdot(y_shift, y_shift).real
+    floor = 128 * np.finfo(float).eps
+    diag = whole_gram.diagonal()
+    if (0 < whole_energy and train_energy <= floor * whole_energy) or np.any(
+        (diag > 0) & (train_gram.diagonal() <= floor * diag)
+    ):
+        # Subtracting nearly equal moments can turn a feature that is
+        # constant within the fold into a tiny nonzero diagonal.
+        train_X = full.X[train]
+        train_Y = full.Y[train]
+        if fit_intercept:
+            x_shift = train_X.mean(axis=0)
+            y_shift = train_Y.mean(axis=0)
+            problem.x_mean = full.x_mean + x_shift
+            problem.y_mean = full.y_mean + y_shift
+            train_X -= x_shift
+            train_Y -= y_shift
+        train_gram, train_cross, train_energy = _products(train_X, train_Y)
+    problem._set_gram(train_gram, train_cross, train_energy)
+    problem.X = problem.Y = None
+    test_gram = (
+        gram / test_n
+        - np.outer(x_mean, x_mean)
+        + np.outer(x_mean - x_shift, x_mean - x_shift)
+    )
+    test_cross = (
+        cross / test_n
+        - np.outer(x_mean, y_mean)
+        + np.outer(x_mean - x_shift, y_mean - y_shift)
+    )
+    test_energy = (
+        energy / test_n
+        - np.vdot(y_mean, y_mean).real
+        + np.vdot(y_mean - y_shift, y_mean - y_shift).real
+    )
+    return problem, (X - x_shift, Y - y_shift, None, test_gram, test_cross, test_energy)
+
+
 def _fold_path(
     X,
     y,
@@ -535,28 +712,68 @@ def _fold_path(
     options,
     seeds,
     device,
+    precompute,
+    shared,
 ):
-    train_weights = None if weights is None else weights[train]
-    test_weights = None if weights is None else weights[test]
-    X_train, X_test = X[train], X[test]
-    problem = _Problem(
-        X_train,
-        y[train],
-        intercept,
-        _weights(train_weights, X_train.shape[0]),
-        device,
-    )
-    target = y[test].reshape(X_test.shape[0], -1)
+    validation = None
+    if shared is not None:
+        problem, validation = _kfold_moments(shared, train, test, intercept)
+    else:
+        train_weights = None if weights is None else weights[train]
+        test_weights = None if weights is None else weights[test]
+        X_train, X_test = X[train], X[test]
+        problem = _Problem(
+            X_train,
+            y[train],
+            intercept,
+            _weights(train_weights, X_train.shape[0]),
+            device,
+            _use_host_gram(X_train, options, precompute),
+        )
+        target = y[test].reshape(X_test.shape[0], -1)
+        if problem.gram is not None and not problem.sparse and len(test) >= problem.d:
+            design = X_test - problem.x_mean
+            centered = target - problem.y_mean
+            if test_weights is None:
+                gram, cross, energy = _products(design, centered)
+                mass = len(test)
+            else:
+                scale = np.sqrt(test_weights[:, None])
+                gram, cross, energy = _products(design * scale, centered * scale)
+                mass = test_weights.sum()
+                if mass == 0:
+                    raise ZeroDivisionError("Weights sum to zero, can't be normalized")
+            validation = (
+                design,
+                centered,
+                test_weights,
+                gram / mass,
+                cross / mass,
+                energy / mass,
+            )
     losses = np.empty(grid.shape)
     for row, (alphas, ratio, seed) in enumerate(zip(grid, ratios, seeds)):
         rng = check_random_state(seed)
+        native = problem.native_path(alphas, ratio, None, positive, options)
+        if native is not None and validation is not None:
+            losses[row] = _validation_loss(problem, validation, native[0])
+            continue
+        if validation is not None:
+            # A source-only checkout can still solve from compact Gram inputs.
+            X_val, Y_val, val_weights, _, _, _ = validation
         coef = None
         for index, alpha in enumerate(alphas):
-            coef, _, _ = problem.solve(alpha, ratio, coef, positive, options, rng)
-            errors = target - (X_test @ coef + problem.intercept(coef))
-            losses[row, index] = np.average(
-                np.mean(errors**2, axis=1), weights=test_weights
-            )
+            if native is None:
+                coef, _, _ = problem.solve(alpha, ratio, coef, positive, options, rng)
+            else:
+                coef = native[0][index]
+            if validation is not None:
+                errors = Y_val - X_val @ coef
+                masses = val_weights
+            else:
+                errors = target - (X_test @ coef + problem.intercept(coef))
+                masses = test_weights
+            losses[row, index] = np.average(np.mean(errors**2, axis=1), weights=masses)
     return losses
 
 
@@ -596,9 +813,17 @@ class _RegularizedCV(_RegularizedRegressor):
         X, y = self._fit_data(X, y)
         weights = _weights(sample_weight, X.shape[0])
         device = fit_device(self.device, X)
-        problem = _Problem(X, y, self.fit_intercept, weights, device)
-        _validate_precompute(
-            getattr(self, "precompute", "auto"), X.shape[1], cross_validation=True
+        precompute = getattr(self, "precompute", "auto")
+        _validate_precompute(precompute, X.shape[1], cross_validation=True)
+        host_gram = _use_host_gram(X, options, precompute)
+        problem = _Problem(X, y, self.fit_intercept, weights, device, host_gram)
+        shared = (
+            problem
+            if type(splitter) is KFold
+            and host_gram
+            and weights is None
+            and device == "cpu"
+            else None
         )
         count = _alpha_grid_count(self.alphas, self.n_alphas)
         if count is not None:
@@ -629,6 +854,8 @@ class _RegularizedCV(_RegularizedRegressor):
                 options,
                 seeds[:, index],
                 device,
+                precompute,
+                shared,
             )
             for index, (train, test) in enumerate(folds)
         )

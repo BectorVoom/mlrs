@@ -102,8 +102,114 @@ bind_gram!(
     egress::f64_vec_to_pyarrow
 );
 
+fn values(array: &arrow::array::ArrayRef) -> PyResult<&[f64]> {
+    let floats = array
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| crate::errors::unsupported_dtype_err(array.data_type()))?;
+    ingress::host_slice_f64(floats)
+}
+#[pyfunction]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn regularized_cd_gram<'py>(
+    py: Python<'py>,
+    gram: &Bound<'py, PyAny>,
+    cross: &Bound<'py, PyAny>,
+    initial: &Bound<'py, PyAny>,
+    features: usize,
+    targets: usize,
+    target_energy: f64,
+    alphas: Vec<f64>,
+    ratio: f64,
+    max_iter: usize,
+    tol: f64,
+    positive: bool,
+) -> PyResult<(Bound<'py, PyAny>, Vec<f64>, Vec<usize>, Vec<bool>)> {
+    use mlrs_algos::linear::grouped_gram_cd::{solve_path, GramProblem, Options};
+
+    let gram_array = ingress::capsule_to_array(gram)?;
+    let cross_array = ingress::capsule_to_array(cross)?;
+    let initial_array = ingress::capsule_to_array(initial)?;
+    let gram = values(&gram_array)?;
+    let cross = values(&cross_array)?;
+    let initial = values(&initial_array)?;
+    if features == 0
+        || targets == 0
+        || features.checked_mul(features) != Some(gram.len())
+        || features.checked_mul(targets) != Some(cross.len())
+        || initial.len() != cross.len()
+        || initial.len().checked_mul(alphas.len()).is_none()
+        || max_iter == 0
+    {
+        return Err(PyValueError::new_err(
+            "Invalid coordinate-descent Gram geometry.",
+        ));
+    }
+    let problem = GramProblem {
+        gram,
+        cross,
+        features,
+        targets,
+        target_energy,
+    };
+    let options = Options {
+        ratio,
+        max_iter,
+        tol,
+        positive,
+    };
+    let result = py.detach(|| solve_path(problem, initial.to_vec(), &alphas, options));
+    Ok((
+        egress::f64_vec_to_pyarrow(py, result.coefficients)?,
+        result.gaps,
+        result.iterations,
+        result.converged,
+    ))
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn regularized_lars_gram<'py>(
+    py: Python<'py>,
+    gram: &Bound<'py, PyAny>,
+    cross: &Bound<'py, PyAny>,
+    rows: usize,
+    minimum: f64,
+    max_iter: usize,
+    eps: f64,
+    positive: bool,
+    keep_path: bool,
+) -> PyResult<(Vec<f64>, Vec<usize>, Bound<'py, PyAny>, bool)> {
+    use mlrs_algos::linear::gram_lasso_lars::{solve, Options};
+
+    let gram = ingress::capsule_to_array(gram)?;
+    let cross = ingress::capsule_to_array(cross)?;
+    let gram = values(&gram)?;
+    let cross = values(&cross)?;
+    if rows == 0 || cross.is_empty() || cross.len().checked_mul(cross.len()) != Some(gram.len()) {
+        return Err(PyValueError::new_err("Invalid least-angle Gram geometry."));
+    }
+    let options = Options {
+        rows,
+        minimum,
+        max_iter,
+        eps,
+        positive,
+        keep_path,
+    };
+    let path = py.detach(|| solve(gram, cross, options));
+    Ok((
+        path.alphas,
+        path.active,
+        egress::f64_vec_to_pyarrow(py, path.coefficients)?,
+        path.skipped,
+    ))
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(regularized_gram_backend, module)?)?;
+    module.add_function(wrap_pyfunction!(regularized_cd_gram, module)?)?;
+    module.add_function(wrap_pyfunction!(regularized_lars_gram, module)?)?;
     module.add_function(wrap_pyfunction!(regularized_gram_f32, module)?)?;
     module.add_function(wrap_pyfunction!(regularized_gram_f64, module)?)?;
     Ok(())
