@@ -1,8 +1,7 @@
-//! `decomposition` — closed-form matrix decompositions (DECOMP-01 / DECOMP-02).
+//! Matrix decompositions and host routines for sparse and non-negative models.
 //!
-//! Module index for the two Phase-4 decomposition estimators, both built on the
-//! Phase-3 thin SVD primitive + `sign_flip::align_rows` (the estimator applies
-//! `svd_flip`; the primitive stays raw — D-01/D-03):
+//! PCA and TruncatedSVD both use a thin SVD followed by deterministic sign
+//! alignment in the estimator:
 //!
 //! - `PCA` (DECOMP-01) — **SVD of CENTERED X** (NOT eig-of-covariance, D-01):
 //!   center by column means → thin SVD → `explained_variance_ = S²/(n−1)`,
@@ -12,18 +11,21 @@
 //!   `algorithm='arpack'` oracle (NOT randomized, D-07);
 //!   `explained_variance_ = var(transform columns)`. Added by plan **04-04**.
 //!
-//! The estimator plan UNCOMMENTS/adds its own `pub mod <estimator>;` line here
-//! and creates the matching file; it does NOT edit `lib.rs` (owned by 04-01),
-//! keeping the estimator plans file-disjoint and parallel-safe.
+//! The host routines also provide coordinate descent for non-negative
+//! factorization, sparse coding for dictionary learning, and variational
+//! document inference for latent Dirichlet allocation.
 //!
 //! Tests live in `crates/mlrs-algos/tests/` (AGENTS.md §2).
 
+pub mod coordinate_descent;
 /// The `mlrs-decomp` model-file container — the three estimators' `save`/`load`
 /// share the spectral core it defines (DECOMP-PERSIST, prototype).
 pub mod decomp_persist;
 
 pub mod incremental_pca;
+pub mod lda;
 pub mod pca;
+pub mod sparse_coding;
 pub mod truncated_svd;
 
 pub use incremental_pca::IncrementalPCA;
