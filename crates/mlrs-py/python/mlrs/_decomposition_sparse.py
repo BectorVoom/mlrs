@@ -13,6 +13,7 @@ from ._decomposition_common import (
     count,
     flip_vectors,
     matrix,
+    native_buffer,
     ridge_codes,
 )
 from ._decomposition_spectral import randomized_svd
@@ -85,23 +86,22 @@ def sparse_encode(
     from . import _mlrs
 
     steps = count(max_iter, "max_iter") if algorithm == "lasso_lars" else limit
-    gram = gram.ravel().tolist()
+    gram = native_buffer(gram)
 
     def solve(batch):
-        return _mlrs.decomp_sparse_code(
-            gram, batch.ravel().tolist(), k, steps, algorithm, alpha, positive
+        codes = _mlrs.decomp_sparse_code(
+            gram, native_buffer(batch), k, steps, algorithm, alpha, positive
         )
+        return np.frombuffer(codes, dtype=np.float64).reshape(len(batch), k)
 
     jobs = min(effective_n_jobs(n_jobs), n)
     if jobs <= 1:
-        return np.asarray(solve(cross), dtype=cross.dtype).reshape(n, k)
+        return solve(cross).astype(cross.dtype, copy=False)
     batches = np.array_split(cross, jobs)
     result = Parallel(n_jobs=jobs, prefer="threads", verbose=verbose)(
         delayed(solve)(batch) for batch in batches
     )
-    return np.asarray(
-        [value for batch in result for value in batch], dtype=cross.dtype
-    ).reshape(n, k)
+    return np.concatenate(result).astype(cross.dtype, copy=False)
 
 
 class _DictionaryTransform(DecompositionTransformer):

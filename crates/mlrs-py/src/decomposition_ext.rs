@@ -1,22 +1,27 @@
 //! Host decomposition bindings for sparse coding, NMF, and topic models.
 
 use mlrs_algos::decomposition::{coordinate_descent, lda, sparse_coding};
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyByteArray;
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn decomp_coordinate_descent(
     py: Python<'_>,
-    gram: Vec<f64>,
-    cross: Vec<f64>,
-    mut weights: Vec<f64>,
+    gram: PyBuffer<f64>,
+    cross: PyBuffer<f64>,
+    weights: PyBuffer<f64>,
     order: Vec<usize>,
     alpha: f64,
     positive: bool,
     max_iter: usize,
     tol: f64,
-) -> PyResult<(Vec<f64>, f64)> {
+) -> PyResult<(Bound<'_, PyByteArray>, f64)> {
+    let gram = gram.to_vec(py)?;
+    let cross = cross.to_vec(py)?;
+    let mut weights = weights.to_vec(py)?;
     let width = order.len();
     let mut sorted = order.clone();
     sorted.sort_unstable();
@@ -42,25 +47,33 @@ fn decomp_coordinate_descent(
             tol,
         )
     });
-    Ok((weights, violation))
+    Ok((
+        PyByteArray::new(py, bytemuck::cast_slice(&weights)),
+        violation,
+    ))
 }
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn decomp_lda_infer(
     py: Python<'_>,
-    offsets: Vec<usize>,
-    indices: Vec<usize>,
-    counts: Vec<f64>,
-    word_topics: Vec<f64>,
-    mut distributions: Vec<f64>,
+    offsets: PyBuffer<usize>,
+    indices: PyBuffer<usize>,
+    counts: PyBuffer<f64>,
+    word_topics: PyBuffer<f64>,
+    distributions: PyBuffer<f64>,
     topics: usize,
     prior: f64,
     max_iter: usize,
     tol: f64,
     epsilon: f64,
     collect_stats: bool,
-) -> PyResult<(Vec<f64>, Vec<f64>)> {
+) -> PyResult<(Bound<'_, PyByteArray>, Bound<'_, PyByteArray>)> {
+    let offsets = offsets.to_vec(py)?;
+    let indices = indices.to_vec(py)?;
+    let counts = counts.to_vec(py)?;
+    let word_topics = word_topics.to_vec(py)?;
+    let mut distributions = distributions.to_vec(py)?;
     if topics == 0
         || offsets.first() != Some(&0)
         || offsets.last() != Some(&indices.len())
@@ -93,21 +106,26 @@ fn decomp_lda_infer(
             collect_stats,
         )
     });
-    Ok((distributions, stats))
+    Ok((
+        PyByteArray::new(py, bytemuck::cast_slice(&distributions)),
+        PyByteArray::new(py, bytemuck::cast_slice(&stats)),
+    ))
 }
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-fn decomp_sparse_code(
-    py: Python<'_>,
-    gram: Vec<f64>,
-    cross: Vec<f64>,
+fn decomp_sparse_code<'py>(
+    py: Python<'py>,
+    gram: PyBuffer<f64>,
+    cross: PyBuffer<f64>,
     width: usize,
     steps: usize,
     method: &str,
     alpha: f64,
     positive: bool,
-) -> PyResult<Vec<f64>> {
+) -> PyResult<Bound<'py, PyByteArray>> {
+    let gram = gram.to_vec(py)?;
+    let cross = cross.to_vec(py)?;
     if width == 0
         || width.checked_mul(width) != Some(gram.len())
         || !cross.len().is_multiple_of(width)
@@ -121,7 +139,8 @@ fn decomp_sparse_code(
         "lasso_lars" => Coding::Lasso { alpha, positive },
         _ => return Err(PyValueError::new_err("Invalid sparse coding method.")),
     };
-    Ok(py.detach(|| sparse_coding::encode(&gram, &cross, width, steps, method)))
+    let codes = py.detach(|| sparse_coding::encode(&gram, &cross, width, steps, method));
+    Ok(PyByteArray::new(py, bytemuck::cast_slice(&codes)))
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

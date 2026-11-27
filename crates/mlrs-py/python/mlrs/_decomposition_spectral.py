@@ -121,9 +121,7 @@ class KernelPCA(DecompositionTransformer):
 
         if self.kernel == "precomputed":
             return X.toarray() if sparse.issparse(X) else X
-        # Kernel matrices are dense. Keep sparse linear products sparse until
-        # the product has been computed.
-        if self.kernel == "linear" and (sparse.issparse(X) or sparse.issparse(Y)):
+        if self.kernel == "linear":
             result = X @ (X if Y is None else Y).T
             return result.toarray() if sparse.issparse(result) else result
         if callable(self.kernel):
@@ -158,15 +156,27 @@ class KernelPCA(DecompositionTransformer):
         ):
             raise ValueError("alpha, gamma, and tol must be non-negative.")
         self.gamma_ = 1 / X.shape[1] if self.gamma is None else self.gamma
-        K = self._kernel(X)
-        if K.shape != (n, n):
-            raise ValueError("The precomputed training kernel must be square.")
-        self._kernel_mean = K.mean(axis=0)
-        self._kernel_grand_mean = self._kernel_mean.mean()
-        K = self._center(K)
         if solver == "auto":
             solver = "arpack" if n > 200 and k < 10 else "dense"
-        if solver == "arpack" and k < n:
+        linear = None
+        if (
+            self.kernel == "linear"
+            and self.eigen_solver in ("auto", "dense")
+            and not sparse.issparse(X)
+            and k <= X.shape[1]
+            and n >= 2 * X.shape[1]
+        ):
+            linear = self._linear_eigenpairs(X, k)
+        if linear is None:
+            K = self._kernel(X)
+            if K.shape != (n, n):
+                raise ValueError("The precomputed training kernel must be square.")
+            self._kernel_mean = K.mean(axis=0)
+            self._kernel_grand_mean = self._kernel_mean.mean()
+            K = self._center(K)
+        if linear is not None:
+            values, vectors = linear
+        elif solver == "arpack" and k < n:
             initial = check_random_state(self.random_state).uniform(-1, 1, n)
             values, vectors = eigsh(
                 K, k, which="LA", tol=self.tol, maxiter=self.max_iter, v0=initial
@@ -209,6 +219,23 @@ class KernelPCA(DecompositionTransformer):
         self.X_fit_ = X.copy() if self.copy_X else X
         self._record_fit(X, len(values))
         return self
+
+    def _linear_eigenpairs(self, X, k):
+        # Centered X Xᵀ and Xᵀ X share their nonzero eigenvalues. Recover the
+        # sample-space eigenvectors without constructing an n-by-n kernel.
+        mean = X.mean(axis=0)
+        centered = X - mean
+        width = X.shape[1]
+        values, vectors = linalg.eigh(
+            centered.T @ centered, subset_by_index=(width - k, width - 1)
+        )
+        relative_floor = 2e-7 if values.dtype == np.float32 else 1e-12
+        if values[0] <= relative_floor * values[-1]:
+            # Sample-space null vectors cannot be recovered by division.
+            return None
+        self._kernel_mean = X @ mean
+        self._kernel_grand_mean = self._kernel_mean.mean()
+        return values, (centered @ vectors) / np.sqrt(values)
 
     def _center(self, K):
         return (

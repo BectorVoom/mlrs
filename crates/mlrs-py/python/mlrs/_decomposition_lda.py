@@ -7,7 +7,7 @@ from joblib import Parallel, delayed, effective_n_jobs
 from scipy import sparse, special
 from sklearn.utils import check_random_state
 
-from ._decomposition_common import DecompositionTransformer, choice, count
+from ._decomposition_common import DecompositionTransformer, choice, count, native_buffer
 
 
 def _expectation(values):
@@ -112,38 +112,40 @@ class LatentDirichletAllocation(DecompositionTransformer):
             if training
             else np.ones(shape, dtype=X.dtype)
         )
-        weights = self.exp_dirichlet_component_.T.ravel().tolist()
+        weights = native_buffer(self.exp_dirichlet_component_.T)
+        epsilon = np.finfo(X.dtype).eps
 
         def infer(batch, starts):
             doc, stats = _mlrs.decomp_lda_infer(
-                batch.indptr.tolist(),
-                batch.indices.tolist(),
-                batch.data.tolist(),
+                native_buffer(batch.indptr, np.uintp),
+                native_buffer(batch.indices, np.uintp),
+                native_buffer(batch.data),
                 weights,
-                starts.ravel().tolist(),
+                native_buffer(starts),
                 k,
                 self.doc_topic_prior_,
                 self.max_doc_update_iter,
                 self.mean_change_tol,
-                np.finfo(X.dtype).eps,
+                epsilon,
                 training,
             )
-            return np.asarray(doc, dtype=X.dtype).reshape(batch.shape[0], k), stats
+            docs = np.frombuffer(doc, dtype=np.float64).astype(X.dtype, copy=False)
+            return docs.reshape(-1, k), np.frombuffer(stats, dtype=np.float64)
 
         jobs = min(effective_n_jobs(self.n_jobs), X.shape[0])
         if jobs == 1:
-            result = [infer(X, initial)]
+            docs, stats = infer(X, initial)
         else:
             edges = np.linspace(0, X.shape[0], jobs + 1, dtype=int)
             result = Parallel(n_jobs=jobs, prefer="threads")(
                 delayed(infer)(X[start:end], initial[start:end])
                 for start, end in itertools.pairwise(edges)
             )
-        docs = np.concatenate([doc for doc, _ in result])
+            docs = np.concatenate([doc for doc, _ in result])
+            stats = np.sum([values for _, values in result], axis=0)
         if not training:
             return docs, None
-        stats = np.sum([values for _, values in result], axis=0)
-        return docs, stats.reshape(X.shape[1], k).T.astype(X.dtype)
+        return docs, stats.reshape(X.shape[1], k).T.astype(X.dtype, copy=False)
 
     def _update(self, X, *, total_samples, online):
         _, stats = self._e_step(X, training=True)

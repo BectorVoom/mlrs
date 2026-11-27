@@ -98,6 +98,11 @@ def ridge_codes(X, dictionary, alpha):
     return linalg.lstsq(dictionary.T, X.T)[0].T
 
 
+def native_buffer(array, dtype=np.float64):
+    """Prepare a native-endian, aligned C-order buffer for the Rust host solvers."""
+    return np.require(array, dtype=dtype, requirements=["C", "A"])
+
+
 def coordinate_descent(
     gram, cross, initial, *, alpha, positive, max_iter, tol, order=None
 ):
@@ -106,13 +111,14 @@ def coordinate_descent(
     if order is None:
         order = list(range(len(gram)))
     values, violation = _mlrs.decomp_coordinate_descent(
-        gram.ravel().tolist(),
-        cross.ravel().tolist(),
-        initial.ravel().tolist(),
+        native_buffer(gram),
+        native_buffer(cross),
+        native_buffer(initial),
         order,
         alpha,
         positive,
         max_iter,
         tol,
     )
-    return np.asarray(values, dtype=cross.dtype).reshape(cross.shape), violation
+    result = np.frombuffer(values, dtype=np.float64).astype(cross.dtype, copy=False)
+    return result.reshape(cross.shape), violation

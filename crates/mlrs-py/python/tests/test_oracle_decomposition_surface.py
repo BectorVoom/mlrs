@@ -247,3 +247,59 @@ def test_public_decomposition_entries():
         "sparse_encode",
     }
     assert required <= set(decomposition.__all__)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("rank_deficient", [False, True])
+@pytest.mark.parametrize("solver", ["auto", "dense"])
+def test_linear_kernel_pca_tall(dtype, rank_deficient, solver):
+    X = np.random.RandomState(11).normal(size=(260, 8)).astype(dtype) + 2
+    if rank_deficient:
+        X[:, 1:] = X[:, :1]
+    options = dict(
+        n_components=3, kernel="linear", eigen_solver=solver,
+        remove_zero_eig=True, random_state=0
+    )
+    expected = reference.KernelPCA(**options).fit(X)
+    actual = decomposition.KernelPCA(**options).fit(X)
+    np.testing.assert_allclose(actual.eigenvalues_, expected.eigenvalues_, rtol=1e-5)
+    np.testing.assert_allclose(actual.transform(X[:8]), expected.transform(X[:8]), atol=2e-5)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_omp_preserves_dtype_and_support(dtype):
+    rng = np.random.RandomState(19)
+    X = rng.normal(size=(27, 32)).astype(dtype)
+    dictionary = rng.normal(size=(40, 32)).astype(dtype)
+    dictionary /= np.linalg.norm(dictionary, axis=1, keepdims=True)
+    kwargs = dict(algorithm="omp", n_nonzero_coefs=8, n_jobs=2)
+    expected = reference.sparse_encode(X, dictionary, **kwargs)
+    actual = decomposition.sparse_encode(X, dictionary, **kwargs)
+    assert actual.dtype == dtype
+    assert actual.flags.writeable
+    np.testing.assert_array_equal(actual != 0, expected != 0)
+    np.testing.assert_allclose(actual, expected, atol=2e-5)
+
+
+def test_nmf_float32_shuffled_update():
+    X = np.asfortranarray(
+        np.abs(np.random.RandomState(21).normal(size=(40, 15))), dtype=np.float32
+    )
+    options = dict(
+        n_components=4,
+        init="random",
+        random_state=0,
+        max_iter=20,
+        tol=0,
+        shuffle=True,
+        alpha_W=0.02,
+        alpha_H=0.03,
+        l1_ratio=0.5,
+    )
+    expected = reference.NMF(**options)
+    actual = decomposition.NMF(**options)
+    actual_weights = actual.fit_transform(X)
+    expected_weights = expected.fit_transform(X)
+    assert actual_weights.dtype == expected_weights.dtype == np.float32
+    np.testing.assert_allclose(actual_weights, expected_weights, atol=2e-5)
+    np.testing.assert_allclose(actual.components_, expected.components_, atol=2e-5)

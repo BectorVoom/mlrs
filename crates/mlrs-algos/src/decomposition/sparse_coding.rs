@@ -15,15 +15,14 @@ pub enum Coding {
 /// `gram` is a row-major symmetric matrix with `width * width` entries.
 /// `cross` contains an integer number of rows of length `width`.
 pub fn encode(gram: &[f64], cross: &[f64], width: usize, steps: usize, method: Coding) -> Vec<f64> {
+    let (alpha, lasso, positive) = match method {
+        Coding::Pursuit => return pursuit(gram, cross, width, steps.min(width)),
+        Coding::LeastAngle => (0.0, false, false),
+        Coding::Lasso { alpha, positive } => (alpha, true, positive),
+    };
     cross
         .chunks_exact(width)
-        .flat_map(|row| match method {
-            Coding::Pursuit => pursuit(gram, row, steps),
-            Coding::LeastAngle => least_angle(gram, row, steps, 0.0, false, false),
-            Coding::Lasso { alpha, positive } => {
-                least_angle(gram, row, steps, alpha, true, positive)
-            }
-        })
+        .flat_map(|row| least_angle(gram, row, steps, alpha, lasso, positive))
         .collect()
 }
 
@@ -46,11 +45,10 @@ fn solve_active(gram: &[f64], width: usize, active: &[usize], rhs: &[f64]) -> Op
     cholesky_ridge(&normalized, &target, active.len(), 0.0)
 }
 
-fn correlations(gram: &[f64], target: &[f64], weights: &[f64]) -> Vec<f64> {
-    gram.chunks_exact(weights.len())
-        .zip(target)
-        .map(|(row, value)| value - row.iter().zip(weights).map(|(a, b)| a * b).sum::<f64>())
-        .collect()
+fn subtract_atom(residual: &mut [f64], gram_row: &[f64], coefficient: f64) {
+    for (value, &entry) in residual.iter_mut().zip(gram_row) {
+        *value -= coefficient * entry;
+    }
 }
 
 fn best_atom(
@@ -68,26 +66,74 @@ fn best_atom(
     })
 }
 
-fn pursuit(gram: &[f64], target: &[f64], steps: usize) -> Vec<f64> {
-    let width = target.len();
-    let mut weights = vec![0.0; width];
-    let mut active = Vec::with_capacity(steps.min(width));
-    for _ in 0..steps.min(width) {
-        let residual = correlations(gram, target, &weights);
-        let j = best_atom(&residual, 0..width, false).expect("nonempty dictionary");
-        if active.contains(&j) || residual[j].abs() <= f64::EPSILON {
-            break;
-        }
-        active.push(j);
-        let rhs: Vec<_> = active.iter().map(|&i| target[i]).collect();
-        let Some(solution) = solve_active(gram, width, &active, &rhs) else {
-            break;
-        };
-        for (&i, weight) in active.iter().zip(solution) {
-            weights[i] = weight;
+fn pursuit(gram: &[f64], cross: &[f64], width: usize, steps: usize) -> Vec<f64> {
+    let mut codes = vec![0.0; cross.len()];
+    // Reuse the factor and work vectors across signals. Each new atom extends
+    // the Cholesky factor by one row and adds one forward-substitution term.
+    let mut factor = vec![0.0; steps * steps];
+    let mut rhs = vec![0.0; steps];
+    let mut solution = vec![0.0; steps];
+    let mut residual = vec![0.0; width];
+    let mut active = Vec::with_capacity(steps);
+    for (target, weights) in cross.chunks_exact(width).zip(codes.chunks_exact_mut(width)) {
+        residual.copy_from_slice(target);
+        active.clear();
+        let mut scale = 0.0_f64;
+        let mut min_pivot = f64::INFINITY;
+        for i in 0..steps {
+            let j = best_atom(&residual, 0..width, false).expect("nonempty dictionary");
+            if active.contains(&j) || residual[j].abs() <= f64::EPSILON {
+                break;
+            }
+            let gram_row = &gram[j * width..(j + 1) * width];
+            let (previous, current) = factor.split_at_mut(i * steps);
+            let current = &mut current[..=i];
+            let mut pivot = gram_row[j];
+            for (k, &atom) in active.iter().enumerate() {
+                let lower = &previous[k * steps..k * steps + k];
+                let mut value = gram_row[atom];
+                for (&a, &b) in current[..k].iter().zip(lower) {
+                    value -= a * b;
+                }
+                value /= previous[k * steps + k];
+                current[k] = value;
+                pivot -= value * value;
+            }
+            scale = scale.max(gram_row[j]);
+            // Match the relative pivot floor of the original active-set solve.
+            if !(pivot > 1e-12 * scale && min_pivot > 1e-12 * scale) {
+                break;
+            }
+            min_pivot = min_pivot.min(pivot);
+            let diagonal = pivot.sqrt();
+            current[i] = diagonal;
+            let mut value = target[j];
+            for (&a, &b) in current[..i].iter().zip(&rhs) {
+                value -= a * b;
+            }
+            rhs[i] = value / diagonal;
+            active.push(j);
+
+            solution[..=i].copy_from_slice(&rhs[..=i]);
+            for k in (0..=i).rev() {
+                let lower = &factor[k * steps..k * steps + k + 1];
+                let coefficient = solution[k] / lower[k];
+                weights[active[k]] = coefficient;
+                subtract_atom(&mut solution[..k], &lower[..k], coefficient);
+            }
+            if i + 1 < steps {
+                residual.copy_from_slice(target);
+                for &atom in &active {
+                    subtract_atom(
+                        &mut residual,
+                        &gram[atom * width..(atom + 1) * width],
+                        weights[atom],
+                    );
+                }
+            }
         }
     }
-    weights
+    codes
 }
 
 fn least_angle(
@@ -102,11 +148,19 @@ fn least_angle(
     let mut weights = vec![0.0; width];
     let mut active = Vec::new();
     let mut blocked = vec![false; width];
+    let mut residual = vec![0.0; width];
     let mut just_dropped = false;
     let tolerance = 8.0 * f64::EPSILON * target.iter().map(|v| v.abs()).fold(1.0, f64::max);
 
     for _ in 0..steps {
-        let residual = correlations(gram, target, &weights);
+        residual.copy_from_slice(target);
+        for &atom in &active {
+            subtract_atom(
+                &mut residual,
+                &gram[atom * width..(atom + 1) * width],
+                weights[atom],
+            );
+        }
         let mut remaining: Vec<_> = (0..width)
             .filter(|&i| !blocked[i] && !active.contains(&i))
             .collect();
