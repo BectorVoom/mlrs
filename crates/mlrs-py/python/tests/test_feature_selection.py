@@ -25,12 +25,83 @@ import warnings
 import numpy as np
 import pytest
 import sklearn.feature_selection as skfs
+from scipy import sparse
 
 from mlrs import feature_selection as mfs
 
 N_SAMPLES = 60
 N_FEATURES = 6
 N_CLASSES = 3
+
+
+@pytest.mark.parametrize(
+    "matrix_type", [sparse.csr_matrix, sparse.csc_array, sparse.coo_matrix]
+)
+@pytest.mark.parametrize(
+    "name,target",
+    [
+        ("f_classif", "class"),
+        ("chi2", "class"),
+        ("r_regression", "regression"),
+        ("f_regression", "regression"),
+        ("mutual_info_classif", "class"),
+        ("mutual_info_regression", "regression"),
+    ],
+)
+def test_sparse_scores_match_sklearn(matrix_type, name, target):
+    x = matrix_type([[0, 1], [1, 0], [0, 0], [2, 2], [1, 1], [2, 1]])
+    y = [0, 0, 0, 1, 1, 1] if target == "class" else [1, 5, 2, 7, 4, 6]
+    kwargs = {"random_state": 7} if name.startswith("mutual_info") else {}
+    np.testing.assert_allclose(
+        getattr(mfs, name)(x, y, **kwargs),
+        getattr(skfs, name)(x.tocsr(), np.asarray(y), **kwargs),
+    )
+
+
+def test_sparse_anova_groups_match_sklearn():
+    groups = [
+        sparse.csr_matrix([[0, 1], [1, 0], [0, 0]]),
+        sparse.csc_matrix([[2, 2], [1, 1], [2, 1]]),
+    ]
+    np.testing.assert_allclose(mfs.f_oneway(*groups), skfs.f_oneway(*groups))
+
+
+@pytest.mark.parametrize(
+    "name,params",
+    [
+        ("SelectKBest", {"k": 2}),
+        ("SelectPercentile", {"percentile": 50}),
+        ("SelectFpr", {"alpha": 0.25}),
+        ("SelectFdr", {"alpha": 0.25}),
+        ("SelectFwe", {"alpha": 0.25}),
+        ("GenericUnivariateSelect", {"mode": "k_best", "param": 2}),
+    ],
+)
+def test_sparse_univariate_filter_uses_sparse_scores_and_matches_sklearn(name, params):
+    x = sparse.csc_array([[0, 3, 0], [1, 0, 0], [0, 1, 0], [12, 2, 3], [6, 0, 4]])
+    y = ["first", "first", "first", "second", "second"]
+    want = getattr(skfs, name)(skfs.chi2, **params).fit(x, y)
+    actual = getattr(mfs, name)(mfs.chi2, **params).fit(x, y)
+    selected = actual.transform(x)
+    assert isinstance(selected, sparse.csr_array)
+    np.testing.assert_allclose(actual.scores_, want.scores_)
+    np.testing.assert_allclose(actual.pvalues_, want.pvalues_)
+    np.testing.assert_array_equal(actual.get_support(), want.get_support())
+    np.testing.assert_array_equal(selected.toarray(), want.transform(x).toarray())
+    np.testing.assert_array_equal(
+        actual.inverse_transform(selected).toarray(),
+        want.inverse_transform(selected).toarray(),
+    )
+
+
+def test_sparse_variance_retains_implicit_zeros_and_ignores_explicit_nan():
+    x = sparse.coo_matrix([[0, 4, 0], [2, 4, np.nan], [0, 4, 2]])
+    expected = skfs.VarianceThreshold().fit(x)
+    actual = mfs.VarianceThreshold().fit(x)
+    np.testing.assert_allclose(actual.variances_, expected.variances_)
+    np.testing.assert_array_equal(actual.get_support(), [True, False, True])
+    with pytest.raises(ValueError, match="different shape"):
+        actual.inverse_transform(x)
 
 
 @pytest.fixture(scope="module")

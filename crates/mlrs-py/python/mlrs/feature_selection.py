@@ -24,7 +24,7 @@ name                          provenance
 :class:`SelectorMixin`        :class:`MlrsSelectorMixin`, here
 ============================  ============================================
 
-## Container support: numpy, pandas, polars, pyarrow, python lists
+## Container support: numpy, pandas, polars, pyarrow, python lists, SciPy sparse
 
 Every selector here accepts all five and — under the default
 ``output_type="input"`` — returns ``transform``'s result as the SAME kind of
@@ -36,7 +36,9 @@ This is a deliberate divergence from sklearn, which returns numpy from
 package-wide ``output_type`` contract (D-03, "egress mirrors ingress"), and
 ``output_type="numpy"`` restores sklearn's exact behaviour for a caller who wants
 it. Numpy input gives numpy output either way, which is why the sklearn
-``estimator_checks`` harness sees no difference.
+``estimator_checks`` harness sees no difference. SciPy sparse inputs use
+scikit-learn's sparse scoring routines and stay sparse through selection and
+inverse transformation. Explicit ``output_type="numpy"`` returns a dense array.
 
 The SCORES are always computed on a ``float64`` view of the data
 (:func:`mlrs._io.normalize_X` widens once at the boundary), because the Rust
@@ -68,7 +70,11 @@ elimination step, re-acquiring the GIL inside the fit — strictly worse than
 letting Python drive.
 """
 
+from numbers import Real
+
 import numpy as np
+from scipy import sparse
+from sklearn import feature_selection as _sk_feature_selection
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_selection import RFE as _SkRFE
 from sklearn.feature_selection import RFECV as _SkRFECV
@@ -76,6 +82,8 @@ from sklearn.feature_selection import SelectFromModel as _SkSelectFromModel
 from sklearn.feature_selection import (
     SequentialFeatureSelector as _SkSequentialFeatureSelector,
 )
+from sklearn.utils import check_array, check_X_y
+from sklearn.utils.sparsefuncs import mean_variance_axis, min_max_axis
 from sklearn.utils.validation import check_is_fitted
 
 from . import _frame, _io
@@ -117,6 +125,8 @@ def f_classif(X, y):
     Returns ``(f_statistic, p_values)``, matching
     ``sklearn.feature_selection.f_classif``.
     """
+    if sparse.issparse(X):
+        return _sk_feature_selection.f_classif(X.tocsr(), y)
     x, yv, rows, cols = _as_xy(X, y)
     scores, pvalues = _ext().f_classif(x, yv, rows, cols)
     return np.asarray(scores), np.asarray(pvalues)
@@ -131,6 +141,8 @@ def f_oneway(*args):
     """
     if len(args) < 2:
         raise ValueError("f_oneway needs at least 2 sample groups")
+    if any(sparse.issparse(group) for group in args):
+        return _sk_feature_selection.f_oneway(*args)
     blocks = [np.ascontiguousarray(np.asarray(a, dtype=np.float64)) for a in args]
     cols = blocks[0].shape[1]
     if any(b.shape[1] != cols for b in blocks):
@@ -143,6 +155,8 @@ def f_oneway(*args):
 
 def chi2(X, y):
     """Chi-squared statistic of each NON-NEGATIVE feature against the class."""
+    if sparse.issparse(X):
+        return _sk_feature_selection.chi2(X, y)
     x, yv, rows, cols = _as_xy(X, y)
     scores, pvalues = _ext().chi2(x, yv, rows, cols)
     return np.asarray(scores), np.asarray(pvalues)
@@ -150,12 +164,20 @@ def chi2(X, y):
 
 def r_regression(X, y, *, center=True, force_finite=True):
     """Pearson's r between each feature and the target. Scores only."""
+    if sparse.issparse(X):
+        return _sk_feature_selection.r_regression(
+            X, y, center=center, force_finite=force_finite
+        )
     x, yv, rows, cols = _as_xy(X, y)
     return np.asarray(_ext().r_regression(x, yv, rows, cols, center, force_finite))
 
 
 def f_regression(X, y, *, center=True, force_finite=True):
     """Univariate linear-regression F-statistic and p-value per feature."""
+    if sparse.issparse(X):
+        return _sk_feature_selection.f_regression(
+            X, np.asarray(y), center=center, force_finite=force_finite
+        )
     x, yv, rows, cols = _as_xy(X, y)
     scores, pvalues = _ext().f_regression(x, yv, rows, cols, center, force_finite)
     return np.asarray(scores), np.asarray(pvalues)
@@ -216,12 +238,19 @@ def mutual_info_classif(
 ):
     """Mutual information between each feature and a DISCRETE target.
 
-    ``random_state`` reproduces ``numpy.random.RandomState(seed)`` bit-for-bit, so
-    a given seed gives the same tie-breaking noise sklearn would draw. ``None``
-    seeds ``0`` here rather than drawing from numpy's process-global stream — a
-    deliberate divergence documented on the Rust side, chosen because a
-    reproducible score is worth more than reproducing non-reproducible behaviour.
+    For dense inputs a given ``random_state`` seed reproduces the tie-breaking
+    noise sklearn would draw. The Rust implementation uses seed 0 for ``None``.
     """
+    if sparse.issparse(X):
+        return _sk_feature_selection.mutual_info_classif(
+            X,
+            y,
+            discrete_features=discrete_features,
+            n_neighbors=n_neighbors,
+            copy=copy,
+            random_state=random_state,
+            n_jobs=n_jobs,
+        )
     x, yv, rows, cols = _as_xy(X, y)
     d_all, d_mask = _discrete_args(discrete_features, cols)
     return np.asarray(
@@ -261,6 +290,16 @@ def mutual_info_regression(
     inside a radius one ULP below that distance — see ``knn_1d_kth`` in
     ``mutual_info.rs``.
     """
+    if sparse.issparse(X):
+        return _sk_feature_selection.mutual_info_regression(
+            X,
+            y,
+            discrete_features=discrete_features,
+            n_neighbors=n_neighbors,
+            copy=copy,
+            random_state=random_state,
+            n_jobs=n_jobs,
+        )
     x, yv, rows, cols = _as_xy(X, y)
     d_all, d_mask = _discrete_args(discrete_features, cols)
     return np.asarray(
@@ -352,6 +391,9 @@ class MlrsSelectorMixin(TransformerMixin):
         """
         check_is_fitted(self, attributes="n_features_in_")
         mask = np.asarray(self._get_support_mask(), dtype=bool)
+        is_sparse = sparse.issparse(X)
+        if is_sparse and X.ndim != 2:
+            raise ValueError("Expected a two-dimensional sparse input.")
         n = _n_features(X)
         if n != mask.shape[0]:
             raise ValueError(
@@ -367,7 +409,11 @@ class MlrsSelectorMixin(TransformerMixin):
                 UserWarning,
                 stacklevel=2,
             )
-        if getattr(self, "output_type", "input") == "numpy":
+        as_numpy = getattr(self, "output_type", "input") == "numpy"
+        if is_sparse:
+            selected = X.tocsr()[:, mask]
+            return selected.toarray() if as_numpy else selected
+        if as_numpy:
             # sklearn's own behaviour: a plain numpy result regardless of the
             # input container. `to_numpy_2d` rather than `np.asarray` so a
             # pandas/polars frame goes through its own `to_numpy`, which handles
@@ -379,6 +425,21 @@ class MlrsSelectorMixin(TransformerMixin):
         """Widen ``Z`` back to ``n_features_in_`` columns, dropped ones ZERO."""
         check_is_fitted(self, attributes="n_features_in_")
         mask = np.asarray(self._get_support_mask(), dtype=bool)
+        as_numpy = getattr(self, "output_type", "input") == "numpy"
+        if sparse.issparse(Z):
+            if Z.ndim != 2 or Z.shape[1] != mask.sum():
+                raise ValueError("X has a different shape than during fitting.")
+            Z = Z.tocsc()
+            # An empty column repeats the previous offset in a CSC indptr.
+            counts = np.zeros(mask.size, dtype=Z.indptr.dtype)
+            counts[mask] = np.diff(Z.indptr)
+            indptr = np.zeros(mask.size + 1, dtype=Z.indptr.dtype)
+            np.cumsum(counts, out=indptr[1:])
+            restored = type(Z)(
+                (Z.data.copy(), Z.indices.copy(), indptr),
+                shape=(Z.shape[0], mask.size),
+            )
+            return restored.toarray() if as_numpy else restored
         return _frame.restore_columns(
             Z,
             mask,
@@ -386,7 +447,7 @@ class MlrsSelectorMixin(TransformerMixin):
             # `feature_names_in_`: `Z` is the reduced frame and no longer carries
             # them.
             names=getattr(self, "feature_names_in_", None),
-            mirror_container=getattr(self, "output_type", "input") != "numpy",
+            mirror_container=not as_numpy,
         )
 
     def get_feature_names_out(self, input_features=None):
@@ -424,6 +485,8 @@ class _MlrsSelectorBase(MlrsSelectorMixin, BaseEstimator):
         names = _frame.column_names(X)
         if names is not None and all(isinstance(n, str) for n in names):
             self.feature_names_in_ = np.asarray(names, dtype=object)
+        elif hasattr(self, "feature_names_in_"):
+            del self.feature_names_in_
         self.support_ = np.asarray(mask, dtype=bool)
         return self
 
@@ -433,7 +496,7 @@ class _MlrsSelectorBase(MlrsSelectorMixin, BaseEstimator):
 
     def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()
-        tags.input_tags.sparse = False
+        tags.input_tags.sparse = True
         tags.array_api_support = False
         return tags
 
@@ -458,6 +521,30 @@ class VarianceThreshold(_MlrsSelectorBase):
         self.output_type = output_type
 
     def fit(self, X, y=None):
+        if sparse.issparse(X):
+            if not isinstance(self.threshold, Real) or not self.threshold >= 0:
+                raise ValueError("threshold must be a non-negative real number")
+            matrix = check_array(
+                X,
+                accept_sparse=("csr", "csc"),
+                dtype=np.float64,
+                **{_io._FINITE_KW: "allow-nan"},
+            )
+            _, variances = mean_variance_axis(matrix, axis=0)
+            if self.threshold == 0:
+                minimum, maximum = min_max_axis(matrix, axis=0)
+                variances = np.fmin(variances, maximum - minimum)
+            mask = variances > self.threshold
+            if not np.any(mask & np.isfinite(variances)):
+                message = (
+                    f"No feature in X meets the variance threshold {self.threshold:.5f}"
+                )
+                if matrix.shape[0] == 1:
+                    message += " (X contains only one sample)"
+                raise ValueError(message)
+            self.variances_ = variances
+            return self._record_fit(X, mask, matrix.shape[1])
+
         # `"allow-nan"` — NOT `False`. sklearn's `VarianceThreshold` validates
         # with exactly that string, so an INFINITY is still rejected while a NaN
         # passes through to the NaN-skipping Rust sweep. Passing `False` would
@@ -509,10 +596,21 @@ class _BaseFilter(_MlrsSelectorBase):
         return {}
 
     def fit(self, X, y=None):
-        x, yv, rows, cols = _as_xy(X, y)
-        builtin = _builtin_name(self.score_func)
-        mode, param = self._mode(), self._param()
+        is_sparse = sparse.issparse(X)
+        if is_sparse:
+            if y is None:
+                X_scoring = check_array(X, accept_sparse=("csr", "csc"))
+            else:
+                X_scoring, y = check_X_y(
+                    X, y, accept_sparse=("csr", "csc"), multi_output=True
+                )
+            cols = X_scoring.shape[1]
+        else:
+            x, yv, rows, cols = _as_xy(X, y)
+            X_scoring = X
 
+        builtin = None if is_sparse else _builtin_name(self.score_func)
+        mode, param = self._mode(), self._param()
         if builtin is not None:
             if yv is None:
                 raise ValueError(
@@ -524,17 +622,20 @@ class _BaseFilter(_MlrsSelectorBase):
                 x, yv, rows, cols, mode, param, builtin, **self._score_kwargs()
             )
         else:
-            # A custom callable: evaluate it HERE (Rust must never call back into
-            # Python mid-fit) and hand the scores to the same Rust selection rule
-            # the built-in path uses, so tie-breaking / percentile interpolation /
-            # Benjamini-Hochberg stay in one implementation.
-            ret = self.score_func(X, y)
+            # Score sparse inputs and custom callables in Python, then reuse
+            # the Rust selection rule for all score sources.
+            ret = self.score_func(X_scoring, y)
             if isinstance(ret, (list, tuple)):
                 scores, pvalues = ret
                 pvalues = [float(v) for v in np.asarray(pvalues).ravel()]
             else:
                 scores, pvalues = ret, None
             scores = [float(v) for v in np.asarray(scores).ravel()]
+            if len(scores) != cols or (pvalues is not None and len(pvalues) != cols):
+                raise ValueError(
+                    "score_func must return one score per feature and, if provided,"
+                    " one p-value per feature"
+                )
             self._warn_if_k_exceeds(cols)
             mask = _ext().univariate_select_from_scores(scores, pvalues, mode, param)
 
