@@ -1,4 +1,4 @@
-"""Decomposition estimator shims (PY-01/PY-02) delegating to ``_mlrs``.
+"""Matrix factorization, independent components, and sparse decomposition.
 
 PCA, TruncatedSVD, IncrementalPCA -> ``TransformerMixin`` (gives
 ``fit_transform``). sklearn-faithful ``__init__`` stores every ctor arg verbatim
@@ -11,6 +11,25 @@ additionally exposes ``partial_fit`` (the first v2 streaming ``partial_fit``).
 
 from sklearn.base import TransformerMixin
 
+from ._decomposition_lda import LatentDirichletAllocation
+from ._decomposition_nmf import NMF, MiniBatchNMF, non_negative_factorization
+from ._decomposition_sparse import (
+    DictionaryLearning,
+    MiniBatchDictionaryLearning,
+    MiniBatchSparsePCA,
+    SparseCoder,
+    SparsePCA,
+    dict_learning,
+    dict_learning_online,
+    sparse_encode,
+)
+from ._decomposition_spectral import (
+    FactorAnalysis,
+    FastICA,
+    KernelPCA,
+    fastica,
+    randomized_svd,
+)
 from .base import MlrsBase
 
 
@@ -243,3 +262,27 @@ class TruncatedSVD(TransformerMixin, MlrsBase):
             None,
             self._np_float(),
         )
+
+
+__all__ = [
+    "NMF",
+    "PCA",
+    "DictionaryLearning",
+    "FactorAnalysis",
+    "FastICA",
+    "IncrementalPCA",
+    "KernelPCA",
+    "LatentDirichletAllocation",
+    "MiniBatchDictionaryLearning",
+    "MiniBatchNMF",
+    "MiniBatchSparsePCA",
+    "SparseCoder",
+    "SparsePCA",
+    "TruncatedSVD",
+    "dict_learning",
+    "dict_learning_online",
+    "fastica",
+    "non_negative_factorization",
+    "randomized_svd",
+    "sparse_encode",
+]

@@ -28,7 +28,22 @@ from .cluster import (
     SpectralEmbedding,
 )
 from .covariance import EmpiricalCovariance, LedoitWolf
-from .decomposition import PCA, IncrementalPCA, TruncatedSVD
+from .decomposition import (
+    NMF,
+    PCA,
+    DictionaryLearning,
+    FactorAnalysis,
+    FastICA,
+    IncrementalPCA,
+    KernelPCA,
+    LatentDirichletAllocation,
+    MiniBatchDictionaryLearning,
+    MiniBatchNMF,
+    MiniBatchSparsePCA,
+    SparseCoder,
+    SparsePCA,
+    TruncatedSVD,
+)
 from .density import KernelDensity
 from .ensemble import (
     ForestInference,
@@ -153,6 +168,17 @@ __all__ = [
     "TSNE",
     "SpectralEmbedding",
     "UMAP",
+    "DictionaryLearning",
+    "FactorAnalysis",
+    "FastICA",
+    "KernelPCA",
+    "LatentDirichletAllocation",
+    "MiniBatchDictionaryLearning",
+    "MiniBatchNMF",
+    "MiniBatchSparsePCA",
+    "NMF",
+    "SparseCoder",
+    "SparsePCA",
     "PCA",
     "TruncatedSVD",
     "IncrementalPCA",

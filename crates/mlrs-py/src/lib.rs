@@ -51,6 +51,7 @@ use pyo3::prelude::*;
 // The `#[global_allocator]` definition. Source-only; its activation test is in
 // `tests/allocator_test.rs` (FOUND-09: source/test separation).
 mod allocator;
+mod decomposition_ext;
 
 // The shared binding primitives the `#[pyclass]` wrappers (Plan 03) consume.
 pub mod capability;
@@ -434,6 +435,7 @@ fn _mlrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(metrics::mean_absolute_error, m)?)?;
     // ...and the rest of the `sklearn.metrics` surface.
     metrics_ext::register(m)?;
+    decomposition_ext::register(m)?;
 
     // The host-only `sklearn.feature_selection` surface (FSEL-01): the five
     // closed-form score functions, both mutual-information estimators, and the
