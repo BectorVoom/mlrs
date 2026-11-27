@@ -3,14 +3,19 @@ import Lean
 open Lean
 
 /- Run from the repository root:
-   PYTHONPATH=crates/mlrs-py/python lean --run tests/lean/RegularizedLinear.lean -/
+   PYTHONPATH=crates/mlrs-py/python lean --run tests/lean/RegularizedLinear.lean
+   With a wgpu wheel installed, run with MLRS_LEAN_GPU_BACKEND=wgpu. -/
 
 private structure OracleCase where
   name : String
+  device : String
   fields : Json
   deriving FromJson
 
 private structure Observations where
+  device : String
+  backend : String
+  expectedBackend : String
   lasso : Array Float
   elastic : Array Float
   intercept : Array Float
@@ -36,6 +41,8 @@ private def vector (label : String) (actual expected : Array Float) (tol : Float
       s!"{label}[{i}]: expected {b}, got {a}"
 
 private def test (obs : Observations) : IO Unit := do
+  check (obs.backend == obs.expectedBackend)
+    s!"expected backend {obs.expectedBackend}, got {obs.backend}"
   -- Centered columns are orthogonal with norm²/n = 1. The first feature's
   -- group has norm 5, so Lasso shrinks (3, 4) by 1 - 1.5/5.
   vector "Lasso group shrinkage" obs.lasso #[2.1, 0, 0, 2.8, 0, 0] 1e-11
@@ -49,6 +56,7 @@ private def test (obs : Observations) : IO Unit := do
   check (obs.larsDropIterations > 9) "the LARS fixture must include feature drops"
   check (obs.observations.size == 10) "all nine estimators and enet_path should be exercised"
   for item in obs.observations do
+    check (item.device == obs.device) s!"{item.name}: expected to run on {obs.device}"
     let fields ← IO.ofExcept item.fields.getObj?
     for (field, pair) in fields.toList do
       let values : Array (Array Float) ← IO.ofExcept (fromJson? pair)
@@ -67,4 +75,4 @@ def main (args : List String) : IO Unit := do
   check (result.exitCode == 0) s!"Regression probe exited with {result.exitCode}\n{result.stderr}"
   let observations ← IO.ofExcept (Json.parse result.stdout >>= fromJson?)
   test observations
-  IO.println "Lean regularized linear regression checks passed."
+  IO.println s!"Lean regularized linear regression checks passed ({observations.backend})."

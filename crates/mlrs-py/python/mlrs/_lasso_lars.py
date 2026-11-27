@@ -15,6 +15,7 @@ from sklearn.utils.metadata_routing import MetadataRouter, MethodMapping
 from sklearn.utils.validation import validate_data
 
 from ._coordinate_descent import _count, _real, _RegularizedRegressor, _split_params
+from ._regularized_device import device_gram, fit_device
 
 _EPS = np.finfo(float).eps
 
@@ -42,6 +43,19 @@ def _gram(X, precompute):
             "precompute must have shape (n_features, n_features) and be finite."
         )
     return G
+
+
+def _products(X, y, precompute, device):
+    if device == "cpu":
+        return _gram(X, precompute), None
+    # Knot ordering and rank decisions need accurate inner products even
+    # when fitted coefficients will be returned as float32.
+    gram, cross = device_gram(X, y, np.float64)
+    if not isinstance(precompute, (str, bool, np.bool_)):
+        gram = _gram(X, precompute)
+    elif precompute not in ("auto", True, False):
+        raise ValueError("precompute must be 'auto', a boolean, or a Gram matrix.")
+    return gram, cross
 
 
 def _knots(X, y, gram, minimum, max_iter, eps, positive, cross=None, keep_path=True):
@@ -182,10 +196,10 @@ class _LassoLarsBase(_RegularizedRegressor):
             raise ValueError("max_iter must be an integer of at least 0.")
         return self.max_iter, _real(self.eps, "eps", 0), self.positive
 
-    def _fit_at(self, X, y, alpha, Xy, keep_path):
+    def _fit_at(self, X, y, alpha, Xy, keep_path, device):
         dtype = X.dtype
         X, y, x_mean, y_mean = _center(X, y, self.fit_intercept)
-        gram = _gram(X, self.precompute)
+        gram, cross = _products(X, y, self.precompute, device)
         targets = y.reshape(len(y), -1)
         if Xy is not None:
             Xy = np.asarray(Xy)
@@ -193,6 +207,7 @@ class _LassoLarsBase(_RegularizedRegressor):
                 Xy = Xy[:, None]
             if Xy.shape != (X.shape[1], targets.shape[1]):
                 raise ValueError("Xy must have shape (n_features, n_targets).")
+        cross = cross if Xy is None else Xy
         options = self._options()
         results = [
             _knots(
@@ -201,7 +216,7 @@ class _LassoLarsBase(_RegularizedRegressor):
                 gram,
                 alpha,
                 *options,
-                None if Xy is None else Xy[:, index],
+                None if cross is None else cross[:, index],
                 keep_path=keep_path,
             )
             for index, target in enumerate(targets.T)
@@ -216,6 +231,7 @@ class _LassoLarsBase(_RegularizedRegressor):
         self.intercept_ = intercept[0] if single else intercept
         self.alphas_ = alphas[0] if single else alphas
         self.n_iter_ = iterations[0] if single else iterations
+        self.device_ = device
         if keep_path:
             self.active_ = active[0] if single else active
             self.coef_path_ = paths[0] if single else paths
@@ -237,7 +253,11 @@ class _LassoLarsBase(_RegularizedRegressor):
 
 
 class LassoLars(MultiOutputMixin, _LassoLarsBase):
-    """Lasso trained along the least-angle path."""
+    """Lasso trained along the least-angle path.
+
+    With ``device="gpu"``, CubeCL forms the Gram matrix and target
+    cross-products in float64. The active-set updates run on the host.
+    """
 
     def __init__(
         self,
@@ -253,7 +273,9 @@ class LassoLars(MultiOutputMixin, _LassoLarsBase):
         positive=False,
         jitter=None,
         random_state=None,
+        device="cpu",
     ):
+        self.device = device
         self.alpha = alpha
         self.fit_path = fit_path
         self.jitter = jitter
@@ -268,12 +290,22 @@ class LassoLars(MultiOutputMixin, _LassoLarsBase):
         if self.jitter is not None:
             jitter = _real(self.jitter, "jitter", 0)
             y = y + check_random_state(self.random_state).uniform(0, jitter, y.shape)
-        return self._fit_at(X, y, alpha, Xy, self.fit_path)
+        return self._fit_at(
+            X,
+            y,
+            alpha,
+            Xy,
+            self.fit_path,
+            fit_device(self.device, X, require_float64=True),
+        )
 
 
-def _fold_knots(X, y, train, test, fit_intercept, precompute, options):
+def _fold_knots(X, y, train, test, fit_intercept, precompute, options, device):
     design, target, x_mean, y_mean = _center(X[train], y[train], fit_intercept)
-    alphas, _, path, _ = _knots(design, target, _gram(design, precompute), 0, *options)
+    gram, cross = _products(design, target, precompute, device)
+    alphas, _, path, _ = _knots(
+        design, target, gram, 0, *options, None if cross is None else cross[:, 0]
+    )
     residuals = (X[test] - x_mean) @ path + y_mean - y[test, None]
     return alphas[::-1], residuals[:, ::-1]
 
@@ -296,7 +328,9 @@ class LassoLarsCV(_LassoLarsBase):
         eps=_EPS,
         copy_X=True,
         positive=False,
+        device="cpu",
     ):
+        self.device = device
         self.cv = cv
         self.max_n_alphas = max_n_alphas
         self.n_jobs = n_jobs
@@ -316,6 +350,7 @@ class LassoLarsCV(_LassoLarsBase):
         split_params = _split_params(self, params)
         maximum = _count(self.max_n_alphas, "max_n_alphas")
         options = self._options()
+        device = fit_device(self.device, X, require_float64=True)
         precompute = self.precompute
         if not isinstance(precompute, (str, bool, np.bool_)):
             warnings.warn(
@@ -328,7 +363,7 @@ class LassoLarsCV(_LassoLarsBase):
             n_jobs=self.n_jobs, verbose=int(self.verbose), prefer="threads"
         )(
             delayed(_fold_knots)(
-                X, y, train, test, self.fit_intercept, precompute, options
+                X, y, train, test, self.fit_intercept, precompute, options, device
             )
             for train, test in splitter.split(X, y, **split_params)
         )
@@ -345,7 +380,7 @@ class LassoLarsCV(_LassoLarsBase):
             ]
         )
         alpha = grid[mse.mean(axis=1).argmin()]
-        self._fit_at(X, y, alpha, None, True)
+        self._fit_at(X, y, alpha, None, True, device)
         self.alpha_ = alpha
         self.cv_alphas_ = grid
         self.mse_path_ = mse
@@ -369,7 +404,9 @@ class LassoLarsIC(_LassoLarsBase):
         copy_X=True,
         positive=False,
         noise_variance=None,
+        device="cpu",
     ):
+        self.device = device
         self.criterion = criterion
         self.noise_variance = noise_variance
         self._set_lars_params(
@@ -381,6 +418,7 @@ class LassoLarsIC(_LassoLarsBase):
             raise ValueError("criterion must be 'aic' or 'bic'.")
         X, y = self._fit_data(X, y)
         dtype = X.dtype
+        device = fit_device(self.device, X, require_float64=True)
         X, y, x_mean, y_mean = _center(X, y, self.fit_intercept)
         n, d = X.shape
         variance = self.noise_variance
@@ -396,8 +434,9 @@ class LassoLarsIC(_LassoLarsBase):
             variance = np.sum((y - X @ least_squares) ** 2) / dof
         else:
             variance = _real(variance, "noise_variance", np.finfo(float).tiny)
+        gram, cross = _products(X, y, self.precompute, device)
         alphas, _, path, iterations = _knots(
-            X, y, _gram(X, self.precompute), 0, *self._options()
+            X, y, gram, 0, *self._options(), None if cross is None else cross[:, 0]
         )
         residual = y[:, None] - X @ path
         degrees = np.count_nonzero(np.abs(path) > np.finfo(dtype).eps, axis=0)
@@ -417,4 +456,5 @@ class LassoLarsIC(_LassoLarsBase):
         self.criterion_ = criterion
         self.noise_variance_ = variance
         self.n_iter_ = iterations
+        self.device_ = device
         return self

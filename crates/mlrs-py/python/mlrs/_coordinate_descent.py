@@ -18,6 +18,8 @@ from sklearn.utils.metadata_routing import (
 )
 from sklearn.utils.validation import check_array, check_is_fitted, validate_data
 
+from ._regularized_device import device_gram, fit_device
+
 
 def _real(value, name, lower, upper=np.inf):
     if (
@@ -63,11 +65,12 @@ def _options(max_iter, tol, selection):
 class _Problem:
     """Centered, weighted least squares with a residual shared across features."""
 
-    def __init__(self, X, y, fit_intercept, weights=None):
+    def __init__(self, X, y, fit_intercept, weights=None, device="cpu"):
         self.n, self.d = X.shape
         self.multi = y.ndim == 2
         self.dtype = X.dtype
         self.sparse = sparse.issparse(X)
+        self.device = device
         self.scale = (
             None if weights is None else np.sqrt(weights * (self.n / weights.sum()))
         )
@@ -97,17 +100,33 @@ class _Problem:
             else:
                 self.norms = squared.T @ (self.scale**2) - self.n * self.x_mean**2
         else:
-            self.X = np.array(X, dtype=np.float64, order="F", copy=True)
+            order = "C" if device == "gpu" else "F"
+            self.X = np.array(X, dtype=np.float64, order=order, copy=True)
             if fit_intercept:
                 self.x_mean = np.average(self.X, axis=0, weights=weights)
                 self.X -= self.x_mean
             if self.scale is not None:
                 self.X *= self.scale[:, None]
-            self.norms = np.einsum("ij,ij->j", self.X, self.X)
+            if device == "cpu":
+                self.norms = np.einsum("ij,ij->j", self.X, self.X)
         if self.scale is not None:
             self.Y *= self.scale[:, None]
-        self.norms = np.maximum(self.norms / self.n, 0)
         self.shape = (self.d, self.Y.shape[1])
+        if device == "gpu":
+            gram, cross = device_gram(self.X, self.Y, self.dtype)
+            self.norms = gram.diagonal()
+            self.gram = np.asfortranarray(gram / self.n)
+            self.cross = cross / self.n
+            # The Gram and target energy must use the same rounded input.
+            stored_Y = self.Y.astype(self.dtype, copy=False).astype(
+                np.float64, copy=False
+            )
+            self.target_energy = np.sum(stored_Y**2) / self.n
+            self.X = None
+            self.Y = None
+        else:
+            self.target_energy = np.sum(self.Y**2) / self.n
+        self.norms = np.maximum(self.norms / self.n, 0)
 
     def column(self, j):
         if not self.sparse:
@@ -134,13 +153,17 @@ class _Problem:
         l2 = alpha * (1 - ratio)
         coef = np.zeros(self.shape) if initial is None else initial.copy()
         coef[self.norms == 0] = 0
-        predicted = self.X @ coef
-        if self.sparse:
-            predicted -= self.x_mean @ coef
-            if self.scale is not None:
-                predicted *= self.scale[:, None]
-        residual = self.Y - predicted
-        scale = np.sum(self.Y**2) / self.n
+        use_gram = self.device == "gpu"
+        if use_gram:
+            residual = self.cross - self.gram @ coef
+        else:
+            predicted = self.X @ coef
+            if self.sparse:
+                predicted -= self.x_mean @ coef
+                if self.scale is not None:
+                    predicted *= self.scale[:, None]
+            residual = self.Y - predicted
+        scale = self.target_energy
         gap = np.inf
         for iteration in range(1, max_iter + 1):
             order = (
@@ -152,9 +175,13 @@ class _Problem:
             for j in order:
                 if self.norms[j] == 0:
                     continue
-                column = self.column(j)
                 old = coef[j].copy()
-                target = column @ residual / self.n + self.norms[j] * old
+                if use_gram:
+                    column = self.gram[:, j]
+                    target = residual[j] + self.norms[j] * old
+                else:
+                    column = self.column(j)
+                    target = column @ residual / self.n + self.norms[j] * old
                 if positive:
                     target = np.maximum(target, 0)
                 norm = np.linalg.norm(target)
@@ -169,7 +196,7 @@ class _Problem:
                     residual -= column[:, None] * update
 
             if iteration == max_iter or max_update <= tol * np.max(np.abs(coef)):
-                cross = self.correlate(residual)
+                cross = residual if use_gram else self.correlate(residual)
                 correlation = cross - l2 * coef
                 projected = np.maximum(correlation, 0) if positive else correlation
                 dual_norm = np.linalg.norm(projected, axis=1).max()
@@ -187,14 +214,23 @@ class _Problem:
                         converged = dual_norm <= tol * np.sqrt(scale)
                 else:
                     factor = min(1.0, l1 / dual_norm) if dual_norm else 1.0
+                    if use_gram:
+                        # With R = Y - XW, cross contains X.T @ R / n.
+                        residual_target = scale - np.sum(self.cross * coef)
+                        residual_energy = max(
+                            0.0, residual_target - np.sum(cross * coef)
+                        )
+                    else:
+                        residual_target = np.sum(residual * self.Y) / self.n
+                        residual_energy = np.sum(residual**2) / self.n
                     gap = max(
                         0.0,
                         (
                             (1 + factor**2)
-                            * (np.sum(residual**2) / self.n + l2 * np.sum(coef**2))
+                            * (residual_energy + l2 * np.sum(coef**2))
                             / 2
                             + l1 * np.linalg.norm(coef, axis=1).sum()
-                            - factor * np.sum(residual * self.Y) / self.n
+                            - factor * residual_target
                         ),
                     )
                     converged = gap <= tol * scale
@@ -213,7 +249,8 @@ class _Problem:
             raise ValueError(
                 "Automatic alpha grids require l1_ratio > 0. Supply explicit alphas."
             )
-        cross = self.correlate(self.Y) if cross is None else cross
+        if cross is None:
+            cross = self.cross if self.device == "gpu" else self.correlate(self.Y)
         maximum = np.linalg.norm(cross, axis=1).max() / ratio
         resolution = np.finfo(np.float64).resolution
         if maximum <= resolution:
@@ -280,12 +317,15 @@ def enet_path(
     random_state=None,
     selection="cyclic",
     sample_weight=None,
+    device="cpu",
 ):
     """Compute an Elastic Net path in descending alpha order.
 
     Center the input beforehand if an intercept is required. A 2-D target
-    selects a joint row-wise L2,1 penalty. The residual solver accepts
-    precompute and copy_X for compatibility and does not modify its inputs.
+    selects a joint row-wise L2,1 penalty. With ``device="gpu"``, CubeCL
+    computes the dense design's Gram matrix and target cross-products.
+    The CPU residual solver accepts ``precompute`` and ``copy_X`` for
+    compatibility and does not modify its inputs.
     """
     if check_input:
         X = check_array(X, accept_sparse="csc", dtype=[np.float64, np.float32])
@@ -301,7 +341,7 @@ def enet_path(
     if check_input:
         _validate_precompute(precompute, X.shape[1])
     weights = _weights(sample_weight, X.shape[0])
-    problem = _Problem(X, y, False, weights)
+    problem = _Problem(X, y, False, weights, fit_device(device, X))
     ratio = _real(l1_ratio, "l1_ratio", 0, 1)
     count = _alpha_grid_count(alphas, n_alphas)
     if count is not None:
@@ -380,6 +420,7 @@ class _RegularizedRegressor(RegressorMixin, BaseEstimator):
         self.intercept_ = intercept if problem.multi else intercept[0]
         self.dual_gap_ = problem.dtype.type(gap)
         self.n_iter_ = iterations
+        self.device_ = problem.device
 
     def predict(self, X):
         check_is_fitted(self, "coef_")
@@ -408,7 +449,7 @@ class _MultiTaskRegressor(MultiOutputMixin, _RegularizedRegressor):
         ratio = _real(getattr(self, "l1_ratio", 1.0), "l1_ratio", 0, 1)
         rng = check_random_state(self.random_state)
         X, y = self._fit_data(X, y)
-        problem = _Problem(X, y, self.fit_intercept)
+        problem = _Problem(X, y, self.fit_intercept, device=fit_device(self.device, X))
         initial = None
         if (
             self.warm_start
@@ -440,6 +481,7 @@ class MultiTaskElasticNet(_MultiTaskRegressor):
         warm_start=False,
         random_state=None,
         selection="cyclic",
+        device="cpu",
     ):
         self.alpha = alpha
         self.l1_ratio = l1_ratio
@@ -450,6 +492,7 @@ class MultiTaskElasticNet(_MultiTaskRegressor):
         self.warm_start = warm_start
         self.random_state = random_state
         self.selection = selection
+        self.device = device
 
 
 class MultiTaskLasso(_MultiTaskRegressor):
@@ -466,6 +509,7 @@ class MultiTaskLasso(_MultiTaskRegressor):
         warm_start=False,
         random_state=None,
         selection="cyclic",
+        device="cpu",
     ):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
@@ -475,25 +519,44 @@ class MultiTaskLasso(_MultiTaskRegressor):
         self.warm_start = warm_start
         self.random_state = random_state
         self.selection = selection
+        self.device = device
 
 
 def _fold_path(
-    X, y, weights, train, test, alphas, ratio, intercept, positive, options, seed
+    X,
+    y,
+    weights,
+    train,
+    test,
+    grid,
+    ratios,
+    intercept,
+    positive,
+    options,
+    seeds,
+    device,
 ):
     train_weights = None if weights is None else weights[train]
     test_weights = None if weights is None else weights[test]
     X_train, X_test = X[train], X[test]
     problem = _Problem(
-        X_train, y[train], intercept, _weights(train_weights, X_train.shape[0])
+        X_train,
+        y[train],
+        intercept,
+        _weights(train_weights, X_train.shape[0]),
+        device,
     )
     target = y[test].reshape(X_test.shape[0], -1)
-    rng = check_random_state(seed)
-    losses = np.empty(len(alphas))
-    coef = None
-    for index, alpha in enumerate(alphas):
-        coef, _, _ = problem.solve(alpha, ratio, coef, positive, options, rng)
-        errors = target - (X_test @ coef + problem.intercept(coef))
-        losses[index] = np.average(np.mean(errors**2, axis=1), weights=test_weights)
+    losses = np.empty(grid.shape)
+    for row, (alphas, ratio, seed) in enumerate(zip(grid, ratios, seeds)):
+        rng = check_random_state(seed)
+        coef = None
+        for index, alpha in enumerate(alphas):
+            coef, _, _ = problem.solve(alpha, ratio, coef, positive, options, rng)
+            errors = target - (X_test @ coef + problem.intercept(coef))
+            losses[row, index] = np.average(
+                np.mean(errors**2, axis=1), weights=test_weights
+            )
     return losses
 
 
@@ -532,7 +595,8 @@ class _RegularizedCV(_RegularizedRegressor):
         split_params = _split_params(self, params)
         X, y = self._fit_data(X, y)
         weights = _weights(sample_weight, X.shape[0])
-        problem = _Problem(X, y, self.fit_intercept, weights)
+        device = fit_device(self.device, X)
+        problem = _Problem(X, y, self.fit_intercept, weights, device)
         _validate_precompute(
             getattr(self, "precompute", "auto"), X.shape[1], cross_validation=True
         )
@@ -548,6 +612,7 @@ class _RegularizedCV(_RegularizedRegressor):
         folds = list(splitter.split(X, y, **split_params))
         if not folds:
             raise ValueError("cv must yield at least one train/test split.")
+        seeds = rng.randint(np.iinfo(np.int32).max, size=(len(ratios), len(folds)))
         paths = Parallel(
             n_jobs=self.n_jobs, verbose=int(self.verbose), prefer="threads"
         )(
@@ -557,21 +622,17 @@ class _RegularizedCV(_RegularizedRegressor):
                 weights,
                 train,
                 test,
-                row,
-                ratio,
+                grid,
+                ratios,
                 self.fit_intercept,
                 positive,
                 options,
-                rng.randint(np.iinfo(np.int32).max),
+                seeds[:, index],
+                device,
             )
-            for row, ratio in zip(grid, ratios)
-            for train, test in folds
+            for index, (train, test) in enumerate(folds)
         )
-        mse = (
-            np.asarray(paths)
-            .reshape(len(ratios), len(folds), grid.shape[1])
-            .transpose(0, 2, 1)
-        )
+        mse = np.asarray(paths).transpose(1, 2, 0)
         best_ratio, best_alpha = np.unravel_index(
             np.argmin(mse.mean(axis=2)), mse.shape[:2]
         )
@@ -620,8 +681,9 @@ class _RegularizedCV(_RegularizedRegressor):
 class LassoCV(_RegularizedCV):
     """Select the Lasso alpha by cross-validation and refit on all samples.
 
-    The residual solver accepts ``precompute`` and ``copy_X`` as API options.
-    It never forms a full Gram matrix or writes into the caller's design.
+    ``device="gpu"`` forms one Gram matrix and target cross-product per
+    dense fold on the device. The CPU residual solver accepts
+    ``precompute`` and ``copy_X`` without changing the caller's design.
     """
 
     def __init__(
@@ -641,7 +703,9 @@ class LassoCV(_RegularizedCV):
         positive=False,
         random_state=None,
         selection="cyclic",
+        device="cpu",
     ):
+        self.device = device
         self.precompute = precompute
         self.positive = positive
         self._set_cv_params(
@@ -686,6 +750,7 @@ class ElasticNetCV(LassoCV):
         positive=False,
         random_state=None,
         selection="cyclic",
+        device="cpu",
     ):
         self.l1_ratio = l1_ratio
         super().__init__(
@@ -703,6 +768,7 @@ class ElasticNetCV(LassoCV):
             positive=positive,
             random_state=random_state,
             selection=selection,
+            device=device,
         )
 
 
@@ -726,7 +792,9 @@ class MultiTaskLassoCV(MultiOutputMixin, _RegularizedCV):
         n_jobs=None,
         random_state=None,
         selection="cyclic",
+        device="cpu",
     ):
+        self.device = device
         self._set_cv_params(
             eps,
             n_alphas,
@@ -767,6 +835,7 @@ class MultiTaskElasticNetCV(MultiTaskLassoCV):
         n_jobs=None,
         random_state=None,
         selection="cyclic",
+        device="cpu",
     ):
         self.l1_ratio = l1_ratio
         super().__init__(
@@ -782,4 +851,5 @@ class MultiTaskElasticNetCV(MultiTaskLassoCV):
             n_jobs=n_jobs,
             random_state=random_state,
             selection=selection,
+            device=device,
         )

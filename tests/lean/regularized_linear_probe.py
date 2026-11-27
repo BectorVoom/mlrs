@@ -1,6 +1,7 @@
 """Observe public mlrs and scikit-learn regression outputs for the Lean runner."""
 
 import json
+import os
 
 import mlrs
 import numpy as np
@@ -14,13 +15,24 @@ def flat(value):
     return np.asarray(value).ravel().tolist()
 
 
+expected_backend = os.environ.get("MLRS_LEAN_GPU_BACKEND")
+device = "gpu" if expected_backend else "cpu"
+backend = "cpu"
+if expected_backend:
+    backend = mlrs._mlrs.regularized_gram_backend(9, True)
+
 basis = np.array([[-1, -1, 1], [-1, 1, -1], [1, -1, -1], [1, 1, 1]])
 X = np.tile(basis, (3, 1)) + [2, 0, 1]
 Y = (X - [2, 0, 1]) @ [[3, 4], [-1.2, 0], [0, 0]] + [7, -3]
-lasso = mlrs.MultiTaskLasso(alpha=1.5, tol=1e-11).fit(X, Y)
-elastic = mlrs.MultiTaskElasticNet(alpha=1.5, tol=1e-11).fit(X, Y)
+lasso = mlrs.MultiTaskLasso(alpha=1.5, tol=1e-11, device=device).fit(X, Y)
+elastic = mlrs.MultiTaskElasticNet(alpha=1.5, tol=1e-11, device=device).fit(X, Y)
 alphas, coefficients, gaps, iterations = lasso_path(
-    basis, Y[:4] - [7, -3], alphas=[1.5, 5.0, 0.5], tol=1e-11, return_n_iter=True
+    basis,
+    Y[:4] - [7, -3],
+    alphas=[1.5, 5.0, 0.5],
+    tol=1e-11,
+    return_n_iter=True,
+    device=device,
 )
 
 rng = np.random.default_rng(1)
@@ -78,8 +90,10 @@ examples = [
 ]
 observations = []
 for name, x, y, options, weight in examples:
+    if device == "gpu" and sparse.issparse(x):
+        x = x.toarray()
     params = {} if weight is None else {"sample_weight": weight}
-    actual = clone(getattr(mlrs, name)(**options)).fit(x, y, **params)
+    actual = clone(getattr(mlrs, name)(**options, device=device)).fit(x, y, **params)
     expected = getattr(oracle, name)(**options).fit(x, y, **params)
     fields = {}
     for attr in (
@@ -97,7 +111,7 @@ for name, x, y, options, weight in examples:
         if hasattr(expected, attr):
             fields[attr] = [flat(getattr(actual, attr)), flat(getattr(expected, attr))]
     fields["predict"] = [flat(actual.predict(x)), flat(expected.predict(x))]
-    observations.append({"name": name, "fields": fields})
+    observations.append({"name": name, "fields": fields, "device": actual.device_})
 
 enet_options = {
     "l1_ratio": 0.6,
@@ -105,12 +119,13 @@ enet_options = {
     "positive": True,
     "tol": 1e-9,
 }
-path_x = sparse.csc_matrix(design)
-actual_path = enet_path(path_x, target, **enet_options)
+path_x = design if device == "gpu" else sparse.csc_matrix(design)
+actual_path = enet_path(path_x, target, **enet_options, device=device)
 expected_path = oracle.enet_path(path_x, target, **enet_options)
 observations.append(
     {
         "name": "enet_path",
+        "device": device,
         "fields": {
             name: [flat(actual), flat(expected)]
             for name, actual, expected in zip(
@@ -126,6 +141,9 @@ observations.append(
 print(
     json.dumps(
         {
+            "device": device,
+            "backend": backend,
+            "expectedBackend": expected_backend or "cpu",
             "lasso": flat(lasso.coef_),
             "elastic": flat(elastic.coef_),
             "intercept": flat(lasso.intercept_),
@@ -133,7 +151,9 @@ print(
             "pathAtHalf": flat(coefficients[..., -1]),
             "gaps": flat(gaps),
             "iterations": iterations,
-            "larsDropIterations": mlrs.LassoLars(alpha=0.0, precompute=False)
+            "larsDropIterations": mlrs.LassoLars(
+                alpha=0.0, precompute=False, device=device
+            )
             .fit(design, target)
             .n_iter_,
             "observations": observations,
