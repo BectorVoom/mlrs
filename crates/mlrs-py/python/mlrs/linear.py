@@ -18,6 +18,21 @@ from sklearn.base import MetaEstimatorMixin
 from sklearn.base import MultiOutputMixin as _SkMultiOutputMixin
 from sklearn.base import RegressorMixin
 
+from ._coordinate_descent import (
+    ElasticNetCV as ElasticNetCV,
+    LassoCV as LassoCV,
+    MultiTaskElasticNet as MultiTaskElasticNet,
+    MultiTaskElasticNetCV as MultiTaskElasticNetCV,
+    MultiTaskLasso as MultiTaskLasso,
+    MultiTaskLassoCV as MultiTaskLassoCV,
+    enet_path as enet_path,
+    lasso_path as lasso_path,
+)
+from ._lasso_lars import (
+    LassoLars as LassoLars,
+    LassoLarsCV as LassoLarsCV,
+    LassoLarsIC as LassoLarsIC,
+)
 from .base import MlrsBase
 # RANSACRegressor's parameter rejections raise the SAME exception type
 # `mlrs.model_selection` already defines for the search estimators — sklearn's
@@ -1105,6 +1120,8 @@ class BayesianRidge(RegressorMixin, MlrsBase):
 class Lasso(RegressorMixin, MlrsBase):
     """L1-regularized least squares via coordinate descent (LINEAR-03)."""
 
+    path = staticmethod(lasso_path)
+
     def __init__(
         self,
         alpha=1.0,
@@ -1147,6 +1164,8 @@ class Lasso(RegressorMixin, MlrsBase):
 
 class ElasticNet(RegressorMixin, MlrsBase):
     """Combined L1/L2 coordinate descent (LINEAR-04)."""
+
+    path = staticmethod(enet_path)
 
     def __init__(
         self,
