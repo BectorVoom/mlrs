@@ -1,11 +1,14 @@
 """Least-angle Lasso and model selection by cross-validation or AIC/BIC."""
 
 import warnings
+from functools import lru_cache
 from numbers import Integral
 
 import numpy as np
+import pyarrow as pa
 from joblib import Parallel, delayed
 from scipy.linalg import LinAlgError, cho_factor, cho_solve
+from scipy.linalg.lapack import dpocon
 from scipy.optimize import nnls
 from sklearn.base import MultiOutputMixin
 from sklearn.exceptions import ConvergenceWarning
@@ -15,6 +18,7 @@ from sklearn.utils.metadata_routing import MetadataRouter, MethodMapping
 from sklearn.utils.validation import validate_data
 
 from ._coordinate_descent import _count, _real, _RegularizedRegressor, _split_params
+from ._coordinate_descent import _products as _cross_products
 from ._regularized_device import device_gram, fit_device
 
 _EPS = np.finfo(float).eps
@@ -25,7 +29,10 @@ def _center(X, y, fit_intercept):
     y = y.astype(np.float64, copy=False)
     x_mean = X.mean(axis=0) if fit_intercept else np.zeros(X.shape[1])
     y_mean = y.mean(axis=0) if fit_intercept else np.zeros(y.shape[1:])
-    return X - x_mean, y - y_mean, x_mean, y_mean
+    if fit_intercept:
+        X = X - x_mean
+        y = y - y_mean
+    return X, y, x_mean, y_mean
 
 
 def _gram(X, precompute):
@@ -58,12 +65,47 @@ def _products(X, y, precompute, device):
     return gram, cross
 
 
+@lru_cache(maxsize=1)
+def _native_lars():
+    from . import _load_ext
+
+    try:
+        return _load_ext().regularized_lars_gram
+    except (ImportError, AttributeError):
+        return None
+
+
 def _knots(X, y, gram, minimum, max_iter, eps, positive, cross=None, keep_path=True):
     """Follow the active-set equicorrelation direction to each entry or drop."""
     n, d = X.shape
     cross = X.T @ y if cross is None else np.asarray(cross, dtype=float)
     if cross.shape != (d,) or not np.isfinite(cross).all():
         raise ValueError("Xy must contain one finite correlation per feature.")
+    native = _native_lars() if gram is not None and d <= 1024 else None
+    if native is not None and np.array_equal(gram, gram.T):
+        alphas, active, values, skipped = native(
+            pa.array(gram.ravel()),
+            pa.array(cross),
+            n,
+            minimum,
+            max_iter,
+            eps,
+            positive,
+            keep_path,
+        )
+        if skipped:
+            warnings.warn(
+                "A degenerate feature was skipped on the Lasso LARS path.",
+                ConvergenceWarning,
+                stacklevel=3,
+            )
+        iterations = len(alphas) - 1
+        if keep_path:
+            coefficients = np.asarray(values).reshape(-1, d).T.copy()
+        else:
+            alphas = alphas[-1:]
+            coefficients = np.asarray(values).copy()
+        return np.asarray(alphas), active, coefficients, iterations
     coef = np.zeros(d)
     correlations = cross.copy()
     available = np.ones(d, dtype=bool)
@@ -89,18 +131,19 @@ def _knots(X, y, gram, minimum, max_iter, eps, positive, cross=None, keep_path=T
         if not active:
             break
 
-        design = X[:, active]
-        active_gram = (
-            design.T @ design if gram is None else gram[np.ix_(active, active)]
-        )
+        if gram is None:
+            design = X[:, active]
+            active_gram = design.T @ design
+        else:
+            active_gram = gram[np.ix_(active, active)]
         try:
-            factor = cho_factor(active_gram, lower=True)
+            factor = cho_factor(active_gram, lower=True, check_finite=False)
             rank_floor = np.sqrt(
                 _EPS * max(1, len(active)) * active_gram.diagonal().max()
             )
             if factor[0].diagonal().min() <= max(eps, rank_floor):
                 raise LinAlgError("singular active design")
-            direction = cho_solve(factor, signs)
+            direction = cho_solve(factor, signs, check_finite=False)
         except LinAlgError:
             if enter is None:
                 break
@@ -300,14 +343,53 @@ class LassoLars(MultiOutputMixin, _LassoLarsBase):
         )
 
 
+def _squared_path(X, y, path, gram, cross):
+    energy = y @ y
+    squares = energy + np.einsum("ij,ij->j", path, gram @ path) - 2 * (cross @ path)
+    # Recompute fits near the rounding floor before comparing AIC/BIC.
+    near_zero = squares <= 128 * _EPS * energy
+    if np.any(near_zero):
+        residual = y[:, None] - X @ path[:, near_zero]
+        squares[near_zero] = np.einsum("ij,ij->j", residual, residual)
+    return squares
+
+
 def _fold_knots(X, y, train, test, fit_intercept, precompute, options, device):
     design, target, x_mean, y_mean = _center(X[train], y[train], fit_intercept)
     gram, cross = _products(design, target, precompute, device)
     alphas, _, path, _ = _knots(
         design, target, gram, 0, *options, None if cross is None else cross[:, 0]
     )
-    residuals = (X[test] - x_mean) @ path + y_mean - y[test, None]
-    return alphas[::-1], residuals[:, ::-1]
+    design = X[test] - x_mean
+    target = y[test] - y_mean
+    path = path[:, ::-1]
+    if len(test) >= path.shape[0]:
+        gram, cross, _ = _cross_products(design, target)
+        squares = _squared_path(design, target, path, gram, cross)
+        steps = np.diff(path, axis=1)
+        distances = np.einsum("ij,ij->j", steps, gram @ steps)
+    else:
+        residuals = design @ path - target[:, None]
+        squares = np.einsum("ij,ij->j", residuals, residuals)
+        steps = np.diff(residuals, axis=1)
+        distances = np.einsum("ij,ij->j", steps, steps)
+    return alphas[::-1], squares / len(test), distances / len(test)
+
+
+def _interpolated_mse(grid, alphas, squares, distances):
+    if len(alphas) == 1:
+        return np.full(len(grid), squares[0])
+    right = np.clip(np.searchsorted(alphas, grid, side="right"), 1, len(alphas) - 1)
+    left = right - 1
+    bounded = np.clip(grid, alphas[0], alphas[-1])
+    step = (bounded - alphas[left]) / (alphas[right] - alphas[left])
+    # Squared norm of the linear interpolation between adjacent residuals.
+    return np.maximum(
+        (1 - step) * squares[left]
+        + step * squares[right]
+        - step * (1 - step) * distances[left],
+        0,
+    )
 
 
 class LassoLarsCV(_LassoLarsBase):
@@ -369,22 +451,29 @@ class LassoLarsCV(_LassoLarsBase):
         )
         if not folds:
             raise ValueError("cv must yield at least one train/test split.")
-        grid = np.unique(np.concatenate([alphas for alphas, _ in folds]))
+        grid = np.unique(np.concatenate([fold[0] for fold in folds]))
         grid = grid[:: max(1, len(grid) // maximum)]
-        mse = np.column_stack(
-            [
-                np.mean(
-                    [np.interp(grid, alphas, row) ** 2 for row in residuals], axis=0
-                )
-                for alphas, residuals in folds
-            ]
-        )
+        mse = np.column_stack([_interpolated_mse(grid, *fold) for fold in folds])
         alpha = grid[mse.mean(axis=1).argmin()]
         self._fit_at(X, y, alpha, None, True, device)
         self.alpha_ = alpha
         self.cv_alphas_ = grid
         self.mse_path_ = mse
         return self
+
+
+def _least_squares(X, y, gram, cross, positive):
+    if positive:
+        return nnls(X, y)[0]
+    if gram is not None:
+        try:
+            factor = cho_factor(gram, lower=True, check_finite=False)
+            rcond, status = dpocon(factor[0], np.linalg.norm(gram, 1), uplo="L")
+            if status == 0 and rcond > np.sqrt(_EPS):
+                return cho_solve(factor, cross, check_finite=False)
+        except LinAlgError:
+            pass
+    return np.linalg.lstsq(X, y, rcond=None)[0]
 
 
 class LassoLarsIC(_LassoLarsBase):
@@ -421,6 +510,12 @@ class LassoLarsIC(_LassoLarsBase):
         device = fit_device(self.device, X, require_float64=True)
         X, y, x_mean, y_mean = _center(X, y, self.fit_intercept)
         n, d = X.shape
+        gram, cross = _products(X, y, self.precompute, device)
+        cross = X.T @ y if cross is None else cross[:, 0]
+        # User-supplied Gram data pertains to the path only.
+        observed_gram = (
+            gram if isinstance(self.precompute, (str, bool, np.bool_)) else None
+        )
         variance = self.noise_variance
         if variance is None:
             dof = n - d - int(self.fit_intercept)
@@ -428,24 +523,23 @@ class LassoLarsIC(_LassoLarsBase):
                 raise ValueError(
                     "Noise variance cannot be estimated. Supply noise_variance explicitly."
                 )
-            least_squares = (
-                nnls(X, y)[0] if self.positive else np.linalg.lstsq(X, y, rcond=None)[0]
-            )
+            least_squares = _least_squares(X, y, observed_gram, cross, self.positive)
             variance = np.sum((y - X @ least_squares) ** 2) / dof
         else:
             variance = _real(variance, "noise_variance", np.finfo(float).tiny)
-        gram, cross = _products(X, y, self.precompute, device)
-        alphas, _, path, iterations = _knots(
-            X, y, gram, 0, *self._options(), None if cross is None else cross[:, 0]
-        )
-        residual = y[:, None] - X @ path
+        alphas, _, path, iterations = _knots(X, y, gram, 0, *self._options(), cross)
+        if observed_gram is None:
+            residual = y[:, None] - X @ path
+            squares = np.einsum("ij,ij->j", residual, residual)
+        else:
+            squares = _squared_path(X, y, path, observed_gram, cross)
         degrees = np.count_nonzero(np.abs(path) > np.finfo(dtype).eps, axis=0)
         penalty = 2 if self.criterion == "aic" else np.log(n)
         # A zero estimated variance is the limit where the residual term dominates.
         safe_variance = max(variance, np.finfo(float).tiny)
         criterion = (
             n * np.log(2 * np.pi * safe_variance)
-            + np.sum(residual**2, axis=0) / safe_variance
+            + squares / safe_variance
             + penalty * degrees
         )
         best = int(criterion.argmin())

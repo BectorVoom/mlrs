@@ -126,6 +126,8 @@ pub mod linear_persist;
 
 pub mod bayesian_ridge;
 pub mod coordinate_descent;
+pub mod gram_lasso_lars;
+pub mod grouped_gram_cd;
 pub mod huber;
 pub mod elastic_net;
 pub mod lasso;
